@@ -1,0 +1,475 @@
+{
+  "schema": "bifrost.owasp-benchmark-java.v2",
+  "benchmark": {
+    "repo": "https://github.com/OWASP-Benchmark/BenchmarkJava",
+    "commit": "007786f86b965a9ea8e4a7613baa5f90adbbd611",
+    "version": "1.2",
+    "expected_results": "expectedresults-1.2.csv"
+  },
+  "bifrost": {
+    "version": "0.9.0",
+    "commit": "8a93e265f1fae8a5f3cd320ba85f5762267fbe63"
+  },
+  "scope": {
+    "scored_categories": [
+      "sqli",
+      "cmdi",
+      "ldapi",
+      "pathtraver",
+      "xpathi",
+      "xss"
+    ],
+    "note": "Scores only the injection/taint subset (a source reaches a sink). The Benchmark's crypto, hash, weakrand, securecookie, and trustbound categories are not source-to-sink taint problems and are out of scope.",
+    "skipped_non_taint_categories": {
+      "crypto": 246,
+      "hash": 236,
+      "securecookie": 67,
+      "trustbound": 126,
+      "weakrand": 493
+    }
+  },
+  "policy": {
+    "mode": "require-model",
+    "note": "One taint policy per category, sharing the attacker-controlled source set and differing only in sinks, so a finding attributes unambiguously to a category. `require-model` fails closed on an unmodeled boundary: an unmodeled call on a flow yields Inconclusive, never a silent pass-through.",
+    "per_category": [
+      {
+        "category": "sqli",
+        "policy_id": "bifrost.owasp-benchmark.sqli.require-model",
+        "source": "(policy\n  :schema-version 1\n  :id \"bifrost.owasp-benchmark.sqli.require-model\"\n  :name \"OWASP Benchmark sqli (require-model)\"\n  :message \"attacker-controlled data reached a sqli sink\"\n  :severity warning\n  :analysis (analysis\n    :type taint\n    :mode may\n    :call-modeling (call-modeling :unmodeled require-model)\n    :sources (endpoint-set :entries [\n          (source :id src-0 :display-name \"getParameter\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameter\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-1 :display-name \"getParameterValues\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterValues\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-2 :display-name \"getParameterMap\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterMap\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-3 :display-name \"getParameterNames\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterNames\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-4 :display-name \"getHeader\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeader\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-5 :display-name \"getHeaders\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeaders\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-6 :display-name \"getHeaderNames\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeaderNames\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-7 :display-name \"getQueryString\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getQueryString\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-8 :display-name \"getRequestURI\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getRequestURI\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-9 :display-name \"getRequestURL\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getRequestURL\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-10 :display-name \"getPathInfo\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getPathInfo\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-11 :display-name \"getServletPath\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getServletPath\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-12 :display-name \"getCookies\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getCookies\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-13 :display-name \"getValue\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getValue\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-14 :display-name \"getenv\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getenv\"))))\n            :bind return-value :labels [attacker-controlled])\n          ])\n    :sinks (endpoint-set :entries [\n          (sink :id snk-0 :display-name \"prepareStatement\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"prepareStatement\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-1 :display-name \"prepareCall\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"prepareCall\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-2 :display-name \"execute\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"execute\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-3 :display-name \"executeQuery\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"executeQuery\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-4 :display-name \"executeUpdate\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"executeUpdate\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-5 :display-name \"executeLargeUpdate\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"executeLargeUpdate\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-6 :display-name \"addBatch\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"addBatch\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          ]))\n  :classification (classification\n    :fallback (classification-id :taxonomy \"OWASP\" :id \"BENCHMARK-SQLI\")))\n"
+      },
+      {
+        "category": "cmdi",
+        "policy_id": "bifrost.owasp-benchmark.cmdi.require-model",
+        "source": "(policy\n  :schema-version 1\n  :id \"bifrost.owasp-benchmark.cmdi.require-model\"\n  :name \"OWASP Benchmark cmdi (require-model)\"\n  :message \"attacker-controlled data reached a cmdi sink\"\n  :severity warning\n  :analysis (analysis\n    :type taint\n    :mode may\n    :call-modeling (call-modeling :unmodeled require-model)\n    :sources (endpoint-set :entries [\n          (source :id src-0 :display-name \"getParameter\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameter\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-1 :display-name \"getParameterValues\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterValues\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-2 :display-name \"getParameterMap\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterMap\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-3 :display-name \"getParameterNames\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterNames\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-4 :display-name \"getHeader\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeader\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-5 :display-name \"getHeaders\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeaders\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-6 :display-name \"getHeaderNames\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeaderNames\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-7 :display-name \"getQueryString\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getQueryString\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-8 :display-name \"getRequestURI\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getRequestURI\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-9 :display-name \"getRequestURL\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getRequestURL\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-10 :display-name \"getPathInfo\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getPathInfo\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-11 :display-name \"getServletPath\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getServletPath\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-12 :display-name \"getCookies\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getCookies\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-13 :display-name \"getValue\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getValue\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-14 :display-name \"getenv\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getenv\"))))\n            :bind return-value :labels [attacker-controlled])\n          ])\n    :sinks (endpoint-set :entries [\n          (sink :id snk-0 :display-name \"exec\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"exec\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-1 :display-name \"command\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"command\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-2 :display-name \"ProcessBuilder\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"ProcessBuilder\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          ]))\n  :classification (classification\n    :fallback (classification-id :taxonomy \"OWASP\" :id \"BENCHMARK-CMDI\")))\n"
+      },
+      {
+        "category": "ldapi",
+        "policy_id": "bifrost.owasp-benchmark.ldapi.require-model",
+        "source": "(policy\n  :schema-version 1\n  :id \"bifrost.owasp-benchmark.ldapi.require-model\"\n  :name \"OWASP Benchmark ldapi (require-model)\"\n  :message \"attacker-controlled data reached a ldapi sink\"\n  :severity warning\n  :analysis (analysis\n    :type taint\n    :mode may\n    :call-modeling (call-modeling :unmodeled require-model)\n    :sources (endpoint-set :entries [\n          (source :id src-0 :display-name \"getParameter\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameter\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-1 :display-name \"getParameterValues\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterValues\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-2 :display-name \"getParameterMap\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterMap\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-3 :display-name \"getParameterNames\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterNames\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-4 :display-name \"getHeader\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeader\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-5 :display-name \"getHeaders\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeaders\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-6 :display-name \"getHeaderNames\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeaderNames\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-7 :display-name \"getQueryString\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getQueryString\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-8 :display-name \"getRequestURI\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getRequestURI\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-9 :display-name \"getRequestURL\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getRequestURL\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-10 :display-name \"getPathInfo\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getPathInfo\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-11 :display-name \"getServletPath\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getServletPath\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-12 :display-name \"getCookies\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getCookies\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-13 :display-name \"getValue\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getValue\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-14 :display-name \"getenv\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getenv\"))))\n            :bind return-value :labels [attacker-controlled])\n          ])\n    :sinks (endpoint-set :entries [\n          (sink :id snk-0 :display-name \"search\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"search\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-1 :display-name \"search\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"search\") (arity :min 2))))\n            :dangerous-operand (argument :index 1) :accepts [attacker-controlled])\n          ]))\n  :classification (classification\n    :fallback (classification-id :taxonomy \"OWASP\" :id \"BENCHMARK-LDAPI\")))\n"
+      },
+      {
+        "category": "pathtraver",
+        "policy_id": "bifrost.owasp-benchmark.pathtraver.require-model",
+        "source": "(policy\n  :schema-version 1\n  :id \"bifrost.owasp-benchmark.pathtraver.require-model\"\n  :name \"OWASP Benchmark pathtraver (require-model)\"\n  :message \"attacker-controlled data reached a pathtraver sink\"\n  :severity warning\n  :analysis (analysis\n    :type taint\n    :mode may\n    :call-modeling (call-modeling :unmodeled require-model)\n    :sources (endpoint-set :entries [\n          (source :id src-0 :display-name \"getParameter\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameter\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-1 :display-name \"getParameterValues\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterValues\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-2 :display-name \"getParameterMap\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterMap\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-3 :display-name \"getParameterNames\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterNames\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-4 :display-name \"getHeader\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeader\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-5 :display-name \"getHeaders\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeaders\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-6 :display-name \"getHeaderNames\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeaderNames\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-7 :display-name \"getQueryString\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getQueryString\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-8 :display-name \"getRequestURI\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getRequestURI\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-9 :display-name \"getRequestURL\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getRequestURL\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-10 :display-name \"getPathInfo\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getPathInfo\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-11 :display-name \"getServletPath\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getServletPath\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-12 :display-name \"getCookies\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getCookies\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-13 :display-name \"getValue\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getValue\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-14 :display-name \"getenv\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getenv\"))))\n            :bind return-value :labels [attacker-controlled])\n          ])\n    :sinks (endpoint-set :entries [\n          (sink :id snk-0 :display-name \"File\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"File\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-1 :display-name \"FileInputStream\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"FileInputStream\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-2 :display-name \"FileOutputStream\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"FileOutputStream\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-3 :display-name \"RandomAccessFile\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"RandomAccessFile\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-4 :display-name \"FileReader\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"FileReader\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-5 :display-name \"FileWriter\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"FileWriter\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-6 :display-name \"get\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"get\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-7 :display-name \"newInputStream\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"newInputStream\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-8 :display-name \"getResourceAsStream\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getResourceAsStream\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          ]))\n  :classification (classification\n    :fallback (classification-id :taxonomy \"OWASP\" :id \"BENCHMARK-PATHTRAVER\")))\n"
+      },
+      {
+        "category": "xpathi",
+        "policy_id": "bifrost.owasp-benchmark.xpathi.require-model",
+        "source": "(policy\n  :schema-version 1\n  :id \"bifrost.owasp-benchmark.xpathi.require-model\"\n  :name \"OWASP Benchmark xpathi (require-model)\"\n  :message \"attacker-controlled data reached a xpathi sink\"\n  :severity warning\n  :analysis (analysis\n    :type taint\n    :mode may\n    :call-modeling (call-modeling :unmodeled require-model)\n    :sources (endpoint-set :entries [\n          (source :id src-0 :display-name \"getParameter\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameter\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-1 :display-name \"getParameterValues\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterValues\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-2 :display-name \"getParameterMap\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterMap\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-3 :display-name \"getParameterNames\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterNames\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-4 :display-name \"getHeader\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeader\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-5 :display-name \"getHeaders\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeaders\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-6 :display-name \"getHeaderNames\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeaderNames\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-7 :display-name \"getQueryString\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getQueryString\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-8 :display-name \"getRequestURI\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getRequestURI\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-9 :display-name \"getRequestURL\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getRequestURL\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-10 :display-name \"getPathInfo\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getPathInfo\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-11 :display-name \"getServletPath\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getServletPath\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-12 :display-name \"getCookies\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getCookies\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-13 :display-name \"getValue\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getValue\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-14 :display-name \"getenv\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getenv\"))))\n            :bind return-value :labels [attacker-controlled])\n          ])\n    :sinks (endpoint-set :entries [\n          (sink :id snk-0 :display-name \"evaluate\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"evaluate\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-1 :display-name \"compile\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"compile\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          ]))\n  :classification (classification\n    :fallback (classification-id :taxonomy \"OWASP\" :id \"BENCHMARK-XPATHI\")))\n"
+      },
+      {
+        "category": "xss",
+        "policy_id": "bifrost.owasp-benchmark.xss.require-model",
+        "source": "(policy\n  :schema-version 1\n  :id \"bifrost.owasp-benchmark.xss.require-model\"\n  :name \"OWASP Benchmark xss (require-model)\"\n  :message \"attacker-controlled data reached a xss sink\"\n  :severity warning\n  :analysis (analysis\n    :type taint\n    :mode may\n    :call-modeling (call-modeling :unmodeled require-model)\n    :sources (endpoint-set :entries [\n          (source :id src-0 :display-name \"getParameter\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameter\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-1 :display-name \"getParameterValues\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterValues\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-2 :display-name \"getParameterMap\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterMap\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-3 :display-name \"getParameterNames\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getParameterNames\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-4 :display-name \"getHeader\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeader\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-5 :display-name \"getHeaders\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeaders\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-6 :display-name \"getHeaderNames\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getHeaderNames\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-7 :display-name \"getQueryString\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getQueryString\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-8 :display-name \"getRequestURI\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getRequestURI\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-9 :display-name \"getRequestURL\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getRequestURL\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-10 :display-name \"getPathInfo\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getPathInfo\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-11 :display-name \"getServletPath\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getServletPath\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-12 :display-name \"getCookies\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getCookies\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-13 :display-name \"getValue\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getValue\"))))\n            :bind return-value :labels [attacker-controlled])\n          (source :id src-14 :display-name \"getenv\"\n            :categories [input.user-controlled io.external]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"getenv\"))))\n            :bind return-value :labels [attacker-controlled])\n          ])\n    :sinks (endpoint-set :entries [\n          (sink :id snk-0 :display-name \"println\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"println\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-1 :display-name \"print\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"print\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-2 :display-name \"write\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"write\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-3 :display-name \"format\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"format\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-4 :display-name \"printf\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"printf\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          (sink :id snk-5 :display-name \"append\"\n            :categories [data.sensitive]\n            :selector (rql :schema-version 1\n              (language java (call :callee (name \"append\") (arity :min 1))))\n            :dangerous-operand (argument :index 0) :accepts [attacker-controlled])\n          ]))\n  :classification (classification\n    :fallback (classification-id :taxonomy \"OWASP\" :id \"BENCHMARK-XSS\")))\n"
+      }
+    ]
+  },
+  "packs": {
+    "activated": [
+      "bifrost.java-sanitizers",
+      "bifrost.esapi-sanitizers",
+      "bifrost.jdk-framework-decls",
+      "bifrost.javax.servlet-api-framework-decls",
+      "bifrost.jdk-golden-summaries",
+      "bifrost.encoder-sanitizers",
+      "bifrost.commons-text-sanitizers",
+      "bifrost.guava-sanitizers",
+      "bifrost.spring-web-sanitizers"
+    ],
+    "skipped": [],
+    "esapi": {
+      "coordinate": "org.owasp.esapi:esapi:2.7.0.0",
+      "artifact_sha256": "2288e84a6c93a457c5215eb8028c87ebd4326a515e21545d2e02db8356d6ccff"
+    }
+  },
+  "run": {
+    "cases_scored": 1572,
+    "cases_with_taint_roots": 0,
+    "taint_roots": 0,
+    "findings_total": 0,
+    "dependency_jars": 132,
+    "case_limit": null
+  },
+  "result": {
+    "verdict": "still abstains: no case reached a flag over the taint subset. 819 real and 753 fake cases abstained; 0 cleared. The stack activated but a boundary upstream of a finding still fails closed (see remaining_abstention and category_runs).",
+    "headline_number": "naive Youden J = 0.0000; honest Youden J = undefined over 1572 taint cases. 0 findings, 0 false positives, 0 false greens.",
+    "false_greens": 0,
+    "findings": 0,
+    "real_true_positives": 0,
+    "honest_vs_naive": "naive Youden J = 0.0000 folds every abstention into the negatives; honest Youden J = undefined scores only the 0 cases that reached a reliable verdict and holds out the 1572 that abstained. The gap is the cost of honest abstention.",
+    "remaining_abstention": [
+      "sqli: 504 of 504 cases abstained (272 real, 232 fake); e.g. taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget",
+      "cmdi: 251 of 251 cases abstained (126 real, 125 fake); e.g. taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget",
+      "ldapi: 59 of 59 cases abstained (27 real, 32 fake); e.g. taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget",
+      "pathtraver: 268 of 268 cases abstained (133 real, 135 fake); e.g. taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget",
+      "xpathi: 35 of 35 cases abstained (15 real, 20 fake); e.g. taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget",
+      "xss: 455 of 455 cases abstained (246 real, 209 fake); e.g. taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget"
+    ]
+  },
+  "scoring_methodology": [
+    "Each Benchmark case belongs to exactly one category, so each category is scored over only its own labeled cases.",
+    "flagged = Bifrost produced >=1 taint finding of the case's category on the case's file.",
+    "cleared = no finding AND the case's flow analysis reliably concluded (Complete or ProvenBySummary on every root that touched it).",
+    "abstained = no finding AND the analysis was Inconclusive, or no taint root formed at all.",
+    "naive score: an abstention folds into the negatives (an abstained real is a false negative, an abstained fake is a true negative).",
+    "honest score: abstentions are excluded from the confusion matrix and reported separately. The gap between naive and honest is the cost of honest abstention.",
+    "false green = a real vulnerability Bifrost affirmatively cleared as safe. The 'no false greens' pitch is that this count stays near zero: when Bifrost cannot prove safety it abstains rather than clearing.",
+    "TPR = TP/(TP+FN); FPR = FP/(FP+TN); Youden J = TPR - FPR."
+  ],
+  "headline": {
+    "note": "Overall Youden over the taint subset, both ways, plus the real-case disposition that carries the honest-completion story.",
+    "overall_naive_youden": 0.0,
+    "overall_honest_youden": null,
+    "real_cases": 819,
+    "real_flagged_true_positive": 0,
+    "real_cleared_false_green": 0,
+    "real_abstained_inconclusive": 819
+  },
+  "category_runs": [
+    {
+      "category": "sqli",
+      "completion": "Inconclusive { reasons: [PartialDiscovery] }",
+      "findings": 0,
+      "retained_analyses": 0,
+      "sample_diagnostics": [
+        "taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget"
+      ]
+    },
+    {
+      "category": "cmdi",
+      "completion": "Inconclusive { reasons: [PartialDiscovery] }",
+      "findings": 0,
+      "retained_analyses": 0,
+      "sample_diagnostics": [
+        "taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget"
+      ]
+    },
+    {
+      "category": "ldapi",
+      "completion": "Inconclusive { reasons: [PartialDiscovery] }",
+      "findings": 0,
+      "retained_analyses": 0,
+      "sample_diagnostics": [
+        "taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget"
+      ]
+    },
+    {
+      "category": "pathtraver",
+      "completion": "Inconclusive { reasons: [PartialDiscovery] }",
+      "findings": 0,
+      "retained_analyses": 0,
+      "sample_diagnostics": [
+        "taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget"
+      ]
+    },
+    {
+      "category": "xpathi",
+      "completion": "Inconclusive { reasons: [PartialDiscovery] }",
+      "findings": 0,
+      "retained_analyses": 0,
+      "sample_diagnostics": [
+        "taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget"
+      ]
+    },
+    {
+      "category": "xss",
+      "completion": "Inconclusive { reasons: [PartialDiscovery] }",
+      "findings": 0,
+      "retained_analyses": 0,
+      "sample_diagnostics": [
+        "taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget"
+      ]
+    }
+  ],
+  "scoreboard": {
+    "per_category": [
+      {
+        "category": "sqli",
+        "total": 504,
+        "real": 272,
+        "fake": 232,
+        "naive": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 272,
+          "tn": 232
+        },
+        "naive_metrics": {
+          "tpr": 0.0,
+          "fpr": 0.0,
+          "youden": 0.0
+        },
+        "honest": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 0,
+          "tn": 0
+        },
+        "honest_metrics": {
+          "tpr": null,
+          "fpr": null,
+          "youden": null
+        },
+        "completion": {
+          "complete": 0,
+          "proven_by_summary": 0,
+          "inconclusive": 0,
+          "not_analyzed": 504
+        },
+        "real_flagged": 0,
+        "real_cleared": 0,
+        "real_abstained": 272,
+        "fake_flagged": 0,
+        "fake_cleared": 0,
+        "fake_abstained": 232,
+        "false_greens": 0
+      },
+      {
+        "category": "cmdi",
+        "total": 251,
+        "real": 126,
+        "fake": 125,
+        "naive": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 126,
+          "tn": 125
+        },
+        "naive_metrics": {
+          "tpr": 0.0,
+          "fpr": 0.0,
+          "youden": 0.0
+        },
+        "honest": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 0,
+          "tn": 0
+        },
+        "honest_metrics": {
+          "tpr": null,
+          "fpr": null,
+          "youden": null
+        },
+        "completion": {
+          "complete": 0,
+          "proven_by_summary": 0,
+          "inconclusive": 0,
+          "not_analyzed": 251
+        },
+        "real_flagged": 0,
+        "real_cleared": 0,
+        "real_abstained": 126,
+        "fake_flagged": 0,
+        "fake_cleared": 0,
+        "fake_abstained": 125,
+        "false_greens": 0
+      },
+      {
+        "category": "ldapi",
+        "total": 59,
+        "real": 27,
+        "fake": 32,
+        "naive": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 27,
+          "tn": 32
+        },
+        "naive_metrics": {
+          "tpr": 0.0,
+          "fpr": 0.0,
+          "youden": 0.0
+        },
+        "honest": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 0,
+          "tn": 0
+        },
+        "honest_metrics": {
+          "tpr": null,
+          "fpr": null,
+          "youden": null
+        },
+        "completion": {
+          "complete": 0,
+          "proven_by_summary": 0,
+          "inconclusive": 0,
+          "not_analyzed": 59
+        },
+        "real_flagged": 0,
+        "real_cleared": 0,
+        "real_abstained": 27,
+        "fake_flagged": 0,
+        "fake_cleared": 0,
+        "fake_abstained": 32,
+        "false_greens": 0
+      },
+      {
+        "category": "pathtraver",
+        "total": 268,
+        "real": 133,
+        "fake": 135,
+        "naive": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 133,
+          "tn": 135
+        },
+        "naive_metrics": {
+          "tpr": 0.0,
+          "fpr": 0.0,
+          "youden": 0.0
+        },
+        "honest": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 0,
+          "tn": 0
+        },
+        "honest_metrics": {
+          "tpr": null,
+          "fpr": null,
+          "youden": null
+        },
+        "completion": {
+          "complete": 0,
+          "proven_by_summary": 0,
+          "inconclusive": 0,
+          "not_analyzed": 268
+        },
+        "real_flagged": 0,
+        "real_cleared": 0,
+        "real_abstained": 133,
+        "fake_flagged": 0,
+        "fake_cleared": 0,
+        "fake_abstained": 135,
+        "false_greens": 0
+      },
+      {
+        "category": "xpathi",
+        "total": 35,
+        "real": 15,
+        "fake": 20,
+        "naive": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 15,
+          "tn": 20
+        },
+        "naive_metrics": {
+          "tpr": 0.0,
+          "fpr": 0.0,
+          "youden": 0.0
+        },
+        "honest": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 0,
+          "tn": 0
+        },
+        "honest_metrics": {
+          "tpr": null,
+          "fpr": null,
+          "youden": null
+        },
+        "completion": {
+          "complete": 0,
+          "proven_by_summary": 0,
+          "inconclusive": 0,
+          "not_analyzed": 35
+        },
+        "real_flagged": 0,
+        "real_cleared": 0,
+        "real_abstained": 15,
+        "fake_flagged": 0,
+        "fake_cleared": 0,
+        "fake_abstained": 20,
+        "false_greens": 0
+      },
+      {
+        "category": "xss",
+        "total": 455,
+        "real": 246,
+        "fake": 209,
+        "naive": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 246,
+          "tn": 209
+        },
+        "naive_metrics": {
+          "tpr": 0.0,
+          "fpr": 0.0,
+          "youden": 0.0
+        },
+        "honest": {
+          "tp": 0,
+          "fp": 0,
+          "fn": 0,
+          "tn": 0
+        },
+        "honest_metrics": {
+          "tpr": null,
+          "fpr": null,
+          "youden": null
+        },
+        "completion": {
+          "complete": 0,
+          "proven_by_summary": 0,
+          "inconclusive": 0,
+          "not_analyzed": 455
+        },
+        "real_flagged": 0,
+        "real_cleared": 0,
+        "real_abstained": 246,
+        "fake_flagged": 0,
+        "fake_cleared": 0,
+        "fake_abstained": 209,
+        "false_greens": 0
+      }
+    ],
+    "overall": {
+      "category": "overall",
+      "total": 1572,
+      "real": 819,
+      "fake": 753,
+      "naive": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 819,
+        "tn": 753
+      },
+      "naive_metrics": {
+        "tpr": 0.0,
+        "fpr": 0.0,
+        "youden": 0.0
+      },
+      "honest": {
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "tn": 0
+      },
+      "honest_metrics": {
+        "tpr": null,
+        "fpr": null,
+        "youden": null
+      },
+      "completion": {
+        "complete": 0,
+        "proven_by_summary": 0,
+        "inconclusive": 0,
+        "not_analyzed": 1572
+      },
+      "real_flagged": 0,
+      "real_cleared": 0,
+      "real_abstained": 819,
+      "fake_flagged": 0,
+      "fake_cleared": 0,
+      "fake_abstained": 753,
+      "false_greens": 0
+    }
+  }
+}

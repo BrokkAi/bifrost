@@ -1,0 +1,1237 @@
+use crate::imports::{
+    CommonJsRequireBindingKind, commonjs_require_module_specifier_from_declarator,
+    parse_commonjs_require_bindings_from_node,
+};
+use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
+use brokk_bifrost_core::analyzer::usages::model::{ImportBinding, ImportKind};
+use brokk_bifrost_core::analyzer::{Language, ProjectFile, Range};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
+use tree_sitter::{Node, Parser, Tree};
+
+pub const MAX_STATIC_IMPORT_BINDINGS_PER_NAME: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JsTsImportBinding {
+    binding: ImportBinding,
+    is_static: bool,
+}
+
+/// JS/TS imports are usually unique by local name, but malformed or generated
+/// sources can bind the same local name more than once. Keep those static
+/// candidates together so every JS/TS consumer observes the same ambiguity.
+/// CommonJS declarations retain the historical last-declaration-wins model;
+/// source-position-sensitive CommonJS assignment flow is a separate concern.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct JsTsImportBinder {
+    bindings: HashMap<String, Vec<JsTsImportBinding>>,
+    truncated_names: HashSet<String>,
+}
+
+impl JsTsImportBinder {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    fn bind_static(&mut self, local_name: String, binding: ImportBinding) {
+        let bindings = self.bindings.entry(local_name.clone()).or_default();
+        if bindings
+            .iter()
+            .any(|existing| existing.is_static && existing.binding == binding)
+        {
+            return;
+        }
+        if bindings.len() == MAX_STATIC_IMPORT_BINDINGS_PER_NAME {
+            self.truncated_names.insert(local_name);
+            return;
+        }
+        bindings.push(JsTsImportBinding {
+            binding,
+            is_static: true,
+        });
+    }
+
+    fn bind_commonjs(&mut self, local_name: String, binding: ImportBinding) {
+        self.bindings.insert(
+            local_name,
+            vec![JsTsImportBinding {
+                binding,
+                is_static: false,
+            }],
+        );
+    }
+
+    pub fn binding(&self, local_name: &str) -> Option<&ImportBinding> {
+        Some(&self.bindings.get(local_name)?.last()?.binding)
+    }
+
+    pub fn bindings_for(&self, local_name: &str) -> impl Iterator<Item = &ImportBinding> {
+        self.bindings
+            .get(local_name)
+            .into_iter()
+            .flat_map(|bindings| bindings.iter().map(|binding| &binding.binding))
+    }
+
+    pub fn direct_bindings_for(&self, local_name: &str) -> impl Iterator<Item = &ImportBinding> {
+        self.bindings
+            .get(local_name)
+            .into_iter()
+            .flat_map(|bindings| bindings.iter())
+            .filter(|binding| {
+                binding.is_static
+                    && matches!(
+                        binding.binding.kind,
+                        ImportKind::Named | ImportKind::Default
+                    )
+            })
+            .map(|binding| &binding.binding)
+    }
+
+    pub fn resolvable_direct_bindings_for(
+        &self,
+        local_name: &str,
+    ) -> impl Iterator<Item = &ImportBinding> {
+        self.bindings_for(local_name)
+            .filter(|binding| matches!(binding.kind, ImportKind::Named | ImportKind::Default))
+    }
+
+    pub fn has_competing_direct_imports(&self, local_name: &str) -> bool {
+        self.direct_bindings_for(local_name).nth(1).is_some()
+    }
+
+    pub fn was_truncated(&self, local_name: &str) -> bool {
+        self.truncated_names.contains(local_name)
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.bindings.keys().map(String::as_str)
+    }
+
+    pub fn all_bindings(&self) -> impl Iterator<Item = (&str, &ImportBinding)> {
+        self.bindings.iter().flat_map(|(local_name, bindings)| {
+            bindings
+                .iter()
+                .map(move |binding| (local_name.as_str(), &binding.binding))
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JsTsLexicalBindingScope {
+    start_byte: usize,
+    end_byte: usize,
+}
+
+/// Tree-sitter-derived lexical bindings, indexed by the source range in which
+/// each name shadows an outer/global binding. Declaration order is deliberately
+/// irrelevant: `var` is hoisted and lexical declarations are in the TDZ for
+/// their entire scope.
+pub struct JsTsLexicalBindingIndex {
+    scopes_by_name: HashMap<String, Vec<JsTsLexicalBindingScope>>,
+    binding_ranges_by_name: HashMap<String, Vec<(JsTsLexicalBindingScope, Range)>>,
+    /// Byte offsets of assignment targets, keyed by the assigned name. An
+    /// assignment site whose name resolves to the program scope rebinds the
+    /// program-level callable, so calls through that name stay ambiguous.
+    assignments_by_name: HashMap<String, Vec<usize>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsTsDirectPropertyDefinition<'tree> {
+    pub receiver: JsTsStaticMemberReceiver<'tree>,
+    pub property_range: Range,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsTsStaticMemberReceiver<'tree> {
+    pub root: Node<'tree>,
+    pub members: Vec<Node<'tree>>,
+}
+
+impl JsTsLexicalBindingIndex {
+    pub fn build(root: Node<'_>, source: &str) -> Self {
+        let mut index = Self {
+            scopes_by_name: HashMap::default(),
+            binding_ranges_by_name: HashMap::default(),
+            assignments_by_name: HashMap::default(),
+        };
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "import_statement" => {
+                    let mut binder = JsTsImportBinder::empty();
+                    visit_import_statement(node, source, &mut binder);
+                    let scope = node_scope(root);
+                    for name in binder.names() {
+                        index.insert(name, scope);
+                    }
+                    let imported_names: HashSet<_> = binder.names().collect();
+                    let mut import_stack = vec![node];
+                    while let Some(import_node) = import_stack.pop() {
+                        if matches!(import_node.kind(), "identifier" | "type_identifier")
+                            && is_declaration_identifier(import_node)
+                        {
+                            let name = slice(import_node, source);
+                            if imported_names.contains(name) {
+                                index.insert_binding(name, scope, import_node);
+                            }
+                        }
+                        for child_index in (0..import_node.named_child_count()).rev() {
+                            if let Some(child) = import_node.named_child(child_index) {
+                                import_stack.push(child);
+                            }
+                        }
+                    }
+                }
+                "variable_declarator" => {
+                    if let Some(pattern) = node.child_by_field_name("name")
+                        && let Some(scope) = variable_binding_scope(node)
+                    {
+                        index.insert_pattern(pattern, source, scope);
+                    }
+                }
+                "for_in_statement" => {
+                    if let Some(pattern) = node.child_by_field_name("left")
+                        && let Some(declaration_kind) = for_in_declaration_kind(node, pattern)
+                    {
+                        let scope = if declaration_kind == "var" {
+                            enclosing_var_binding_scope(node)
+                        } else {
+                            Some(node_scope(node))
+                        };
+                        if let Some(scope) = scope {
+                            index.insert_pattern(pattern, source, scope);
+                        }
+                    }
+                }
+                "function_declaration" | "generator_function_declaration" | "class_declaration" => {
+                    if let Some(name) = node.child_by_field_name("name")
+                        && let Some(scope) = enclosing_lexical_scope(node)
+                    {
+                        index.insert_pattern(name, source, scope);
+                    }
+                    index.insert_parameters(node, source);
+                }
+                "function_expression"
+                | "generator_function"
+                | "arrow_function"
+                | "method_definition" => {
+                    if matches!(node.kind(), "function_expression" | "generator_function")
+                        && let Some(name) = node.child_by_field_name("name")
+                    {
+                        index.insert_pattern(name, source, node_scope(node));
+                    }
+                    index.insert_parameters(node, source);
+                }
+                "class" => {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        index.insert_pattern(name, source, node_scope(node));
+                    }
+                }
+                "catch_clause" => {
+                    if let Some(parameter) = node.child_by_field_name("parameter") {
+                        index.insert_pattern(parameter, source, node_scope(node));
+                    }
+                }
+                "assignment_expression" | "augmented_assignment_expression" => {
+                    if let Some(target) = node.child_by_field_name("left") {
+                        index.record_assignment_targets(target, source);
+                    }
+                }
+                "update_expression" => {
+                    if let Some(target) = node.child_by_field_name("argument") {
+                        index.record_assignment_targets(target, source);
+                    }
+                }
+                _ => {}
+            }
+
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        index
+    }
+
+    pub fn is_bound_at(&self, name: &str, byte: usize) -> bool {
+        self.binding_scope_at(name, byte).is_some()
+    }
+
+    pub fn binding_scope_at(&self, name: &str, byte: usize) -> Option<JsTsLexicalBindingScope> {
+        self.scopes_by_name
+            .get(name)?
+            .iter()
+            .copied()
+            .filter(|scope| scope.start_byte <= byte && byte < scope.end_byte)
+            .min_by_key(|scope| scope.end_byte - scope.start_byte)
+    }
+
+    /// Declaration-token ranges for the active lexical binding. Consumers use
+    /// these ranges to distinguish a program binding from a same-spelled object
+    /// member in the same file without guessing from either FQN shape.
+    pub fn binding_identifier_ranges_at(&self, name: &str, byte: usize) -> Vec<Range> {
+        let Some(scope) = self.binding_scope_at(name, byte) else {
+            return Vec::new();
+        };
+        self.binding_ranges_by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter_map(|(binding_scope, range)| (*binding_scope == scope).then_some(*range))
+            .collect()
+    }
+
+    pub fn is_program_binding_at(&self, name: &str, byte: usize, root: Node<'_>) -> bool {
+        self.binding_scope_at(name, byte) == Some(node_scope(root))
+    }
+
+    /// Whether an assignment somewhere in the program rebinds `name` at the
+    /// program scope: at the assignment site, `name` resolves to the program
+    /// binding, not to a local shadow.
+    pub fn is_program_binding_reassigned(&self, name: &str, root: Node<'_>) -> bool {
+        self.assignments_by_name
+            .get(name)
+            .is_some_and(|assignments| {
+                assignments
+                    .iter()
+                    .any(|byte| self.is_program_binding_at(name, *byte, root))
+            })
+    }
+
+    fn record_assignment_targets(&mut self, target: Node<'_>, source: &str) {
+        for binder in pattern_binder_identifiers(target) {
+            let name = slice(binder, source);
+            if !name.is_empty() {
+                self.assignments_by_name
+                    .entry(name.to_string())
+                    .or_default()
+                    .push(binder.start_byte());
+            }
+        }
+    }
+
+    fn insert_parameters(&mut self, function: Node<'_>, source: &str) {
+        let Some(parameters) = function
+            .child_by_field_name("parameters")
+            .or_else(|| function.child_by_field_name("parameter"))
+        else {
+            return;
+        };
+        self.insert_pattern(parameters, source, node_scope(function));
+    }
+
+    fn insert_pattern(&mut self, pattern: Node<'_>, source: &str, scope: JsTsLexicalBindingScope) {
+        for binder in pattern_binder_identifiers(pattern) {
+            let name = slice(binder, source);
+            if !name.is_empty() {
+                self.insert_binding(name, scope, binder);
+            }
+        }
+    }
+
+    fn insert_binding(&mut self, name: &str, scope: JsTsLexicalBindingScope, binder: Node<'_>) {
+        self.insert(name, scope);
+        let range = Range {
+            start_byte: binder.start_byte(),
+            end_byte: binder.end_byte(),
+            start_line: binder.start_position().row,
+            end_line: binder.end_position().row,
+        };
+        let ranges = self
+            .binding_ranges_by_name
+            .entry(name.to_string())
+            .or_default();
+        if !ranges.contains(&(scope, range)) {
+            ranges.push((scope, range));
+        }
+    }
+
+    fn insert(&mut self, name: &str, scope: JsTsLexicalBindingScope) {
+        let scopes = self.scopes_by_name.entry(name.to_string()).or_default();
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+    }
+}
+
+/// Collects the binder identifier nodes of a binding pattern in source order:
+/// plain identifiers, object/array destructuring (including renamed
+/// `pair_pattern` values, defaults, and rest binders), and parameter wrappers.
+pub fn pattern_binder_identifiers(pattern: Node<'_>) -> Vec<Node<'_>> {
+    let mut binders = Vec::new();
+    let mut stack = vec![pattern];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" | "type_identifier" | "shorthand_property_identifier_pattern" => {
+                binders.push(node)
+            }
+            "required_parameter" | "optional_parameter" => {
+                if let Some(pattern) = node
+                    .child_by_field_name("pattern")
+                    .or_else(|| node.child_by_field_name("name"))
+                {
+                    stack.push(pattern);
+                }
+            }
+            "assignment_pattern" | "object_assignment_pattern" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    stack.push(left);
+                }
+            }
+            "pair_pattern" => {
+                if let Some(value) = node.child_by_field_name("value") {
+                    stack.push(value);
+                }
+            }
+            "formal_parameters" | "object_pattern" | "array_pattern" | "rest_pattern" => {
+                let mut cursor = node.walk();
+                let children: Vec<_> = node.named_children(&mut cursor).collect();
+                stack.extend(children.into_iter().rev());
+            }
+            _ => {}
+        }
+    }
+    binders
+}
+
+pub fn direct_property_definitions<'tree>(
+    root: Node<'tree>,
+    source: &str,
+    target_ranges: &[Range],
+    target_member: &str,
+) -> Vec<JsTsDirectPropertyDefinition<'tree>> {
+    let mut definitions = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let receiver = match node.kind() {
+            "assignment_expression" | "augmented_assignment_expression" => node
+                .child_by_field_name("left")
+                .and_then(|left| direct_assignment_receiver(left, source, target_member)),
+            "pair" => direct_object_pair_receiver(node, source, target_member),
+            _ => None,
+        };
+        if let Some((receiver, property)) = receiver
+            && target_ranges
+                .iter()
+                .any(|range| range_contains_node(range, property))
+        {
+            let definition = JsTsDirectPropertyDefinition {
+                receiver,
+                property_range: Range {
+                    start_byte: property.start_byte(),
+                    end_byte: property.end_byte(),
+                    start_line: property.start_position().row,
+                    end_line: property.end_position().row,
+                },
+            };
+            definitions.push(definition);
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    definitions
+}
+
+fn direct_assignment_receiver<'tree>(
+    left: Node<'tree>,
+    source: &str,
+    target_member: &str,
+) -> Option<(JsTsStaticMemberReceiver<'tree>, Node<'tree>)> {
+    if left.kind() != "member_expression" {
+        return None;
+    }
+    let receiver = left.child_by_field_name("object")?;
+    let property = left.child_by_field_name("property")?;
+    if slice(property, source) != target_member {
+        return None;
+    }
+    static_member_receiver(receiver, source).map(|receiver| (receiver, property))
+}
+
+fn direct_object_pair_receiver<'tree>(
+    pair: Node<'tree>,
+    source: &str,
+    target_member: &str,
+) -> Option<(JsTsStaticMemberReceiver<'tree>, Node<'tree>)> {
+    let property = pair.child_by_field_name("key")?;
+    if slice(property, source) != target_member {
+        return None;
+    }
+    let object = pair.parent().filter(|parent| parent.kind() == "object")?;
+    let mut value = object;
+    while let Some(parent) = value.parent()
+        && parent.kind() == "parenthesized_expression"
+        && parent
+            .named_child(0)
+            .is_some_and(|child| child.id() == value.id())
+    {
+        value = parent;
+    }
+    let bound = value.parent()?;
+    // The literal is the whole value of a binding, so its keys are properties of
+    // whatever that binding names: `const x = { key: ... }` mints `x.key`, and
+    // `x.y = { key: ... }` mints `x.y.key`. A chained receiver is kept whole --
+    // the read side compares receiver member chains element-wise.
+    let receiver = match bound.kind() {
+        "variable_declarator" => bound
+            .child_by_field_name("value")
+            .filter(|bound_value| bound_value.id() == value.id())
+            .and_then(|_| bound.child_by_field_name("name")),
+        "assignment_expression" => bound
+            .child_by_field_name("right")
+            .filter(|right| right.id() == value.id())
+            .and_then(|_| bound.child_by_field_name("left")),
+        _ => None,
+    }?;
+    static_member_receiver(receiver, source).map(|receiver| (receiver, property))
+}
+
+pub fn static_member_receiver<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<JsTsStaticMemberReceiver<'tree>> {
+    let mut current = node;
+    let mut members = Vec::new();
+    while current.kind() == "member_expression" {
+        let property = current.child_by_field_name("property")?;
+        if property.kind() != "property_identifier" || slice(property, source).is_empty() {
+            return None;
+        }
+        members.push(property);
+        current = current.child_by_field_name("object")?;
+    }
+    if current.kind() != "identifier" || slice(current, source).is_empty() {
+        return None;
+    }
+    members.reverse();
+    Some(JsTsStaticMemberReceiver {
+        root: current,
+        members,
+    })
+}
+
+/// The identifier at the root of a static member chain (`module` in
+/// `module.exports.foo`).
+fn static_member_root(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "identifier" => return Some(node),
+            "member_expression" => node = node.child_by_field_name("object")?,
+            _ => return None,
+        }
+    }
+}
+
+/// Whether this program is an external module rather than a browser script:
+/// it carries an ESM import/export, a `require(...)` call, or a CommonJS
+/// `exports` / `module.exports` assignment.
+///
+/// A browser script's top-level `var` is a property of the one shared global
+/// object, so a later script sees it; a module's top-level binding is
+/// file-private. That is the whole reason an unexported `NS.Field = ...` can
+/// be read from another file at all, so the forward definition lookup
+/// (`jsts_cross_file_dotted_receiver_has_global_identity`) and the inverse
+/// usage scan must decide it the same way -- hence one function here rather
+/// than one per direction.
+pub fn js_program_is_external_module(root: Node<'_>, source: &str) -> bool {
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor).any(|statement| {
+        matches!(statement.kind(), "import_statement" | "export_statement")
+            || subtree_contains(statement, |node| {
+                (node.kind() == "call_expression"
+                    && node.child_by_field_name("function").is_some_and(|callee| {
+                        callee.kind() == "identifier" && slice(callee, source) == "require"
+                    }))
+                    || (node.kind() == "assignment_expression"
+                        && node
+                            .child_by_field_name("left")
+                            .and_then(static_member_root)
+                            .is_some_and(|root| {
+                                matches!(slice(root, source), "exports" | "module")
+                            }))
+            })
+    })
+}
+
+fn range_contains_node(range: &Range, node: Node<'_>) -> bool {
+    range.start_byte <= node.start_byte() && node.end_byte() <= range.end_byte
+}
+
+fn node_scope(node: Node<'_>) -> JsTsLexicalBindingScope {
+    JsTsLexicalBindingScope {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+    }
+}
+
+fn variable_binding_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
+    js_ts_variable_declarator_binding_scope(node).map(node_scope)
+}
+
+/// The lexical scope that owns a JavaScript or TypeScript variable declarator.
+///
+/// `var` attaches to its nearest function or program. `let` and `const` attach
+/// to their nearest block-like scope. The declaration order does not change
+/// that identity: a lexical binding exists for its complete scope, including
+/// its temporal-dead-zone portion before initialization.
+pub fn js_ts_variable_declarator_binding_scope<'tree>(
+    declarator: Node<'tree>,
+) -> Option<Node<'tree>> {
+    if declarator.kind() != "variable_declarator" {
+        return None;
+    }
+    let declaration = declarator.parent()?;
+    if declaration.kind() == "variable_declaration" {
+        return var_binding_scope_node(declaration);
+    }
+    let mut current = Some(declaration);
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "program"
+                | "statement_block"
+                | "for_statement"
+                | "for_in_statement"
+                | "switch_body"
+                | "catch_clause"
+        ) {
+            return Some(parent);
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn enclosing_var_binding_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
+    var_binding_scope_node(node).map(node_scope)
+}
+
+/// The node a `var` binder attaches to: JavaScript hoists `var` to the nearest
+/// enclosing function-like node, or to the program. `None` for a `let`/`const`
+/// declarator, whose binder is block scoped and stays in its TDZ until its
+/// declaration.
+pub fn js_ts_var_declarator_binding_scope<'tree>(declarator: Node<'tree>) -> Option<Node<'tree>> {
+    let declaration = declarator.parent()?;
+    if declaration.kind() != "variable_declaration" {
+        return None;
+    }
+    js_ts_variable_declarator_binding_scope(declarator)
+}
+
+fn var_binding_scope_node(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "program"
+                | "function_declaration"
+                | "generator_function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "arrow_function"
+                | "method_definition"
+        ) {
+            return Some(parent);
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn for_in_declaration_kind<'tree>(
+    statement: Node<'tree>,
+    left: Node<'tree>,
+) -> Option<&'static str> {
+    let mut cursor = statement.walk();
+    statement
+        .children(&mut cursor)
+        .take_while(|child| child.id() != left.id())
+        .find_map(|child| match child.kind() {
+            "const" => Some("const"),
+            "let" => Some("let"),
+            "var" => Some("var"),
+            _ => None,
+        })
+}
+
+fn enclosing_lexical_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(parent.kind(), "program" | "statement_block") {
+            return Some(node_scope(parent));
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+pub fn slice<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
+}
+
+pub fn nested_type_identifier_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    (node.kind() == "nested_type_identifier").then_some(())?;
+    Some((
+        node.child_by_field_name("module")?,
+        node.child_by_field_name("name")?,
+    ))
+}
+
+pub fn is_lexically_nested_type_declaration(node: Node<'_>) -> bool {
+    if !matches!(
+        node.kind(),
+        "class_declaration"
+            | "abstract_class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "type_alias_declaration"
+            | "internal_module"
+    ) {
+        return false;
+    }
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "statement_block"
+                | "function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "arrow_function"
+                | "method_definition"
+        ) {
+            return true;
+        }
+        if parent.kind() == "program" {
+            return false;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+pub fn is_declaration_identifier(node: Node<'_>) -> bool {
+    if is_export_alias_identifier(node) {
+        return true;
+    }
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    let parent_kind = parent.kind();
+    if matches!(
+        parent_kind,
+        "variable_declarator"
+            | "function_declaration"
+            | "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "type_alias_declaration"
+            | "method_definition"
+            | "method_signature"
+            | "abstract_method_signature"
+            | "public_field_definition"
+            | "property_signature"
+            | "field_definition"
+            | "import_specifier"
+            | "namespace_import"
+            | "import_clause"
+            | "labeled_statement"
+            | "function_signature"
+    ) {
+        if let Some(name_node) = parent
+            .child_by_field_name("name")
+            .or_else(|| parent.child_by_field_name("property"))
+            && name_node.id() == node.id()
+        {
+            return true;
+        }
+        if matches!(
+            parent_kind,
+            "import_specifier" | "namespace_import" | "import_clause"
+        ) {
+            return true;
+        }
+    }
+    if matches!(
+        parent_kind,
+        "formal_parameters"
+            | "required_parameter"
+            | "optional_parameter"
+            | "rest_pattern"
+            | "object_pattern"
+            | "array_pattern"
+            | "pair_pattern"
+            | "shorthand_property_identifier_pattern"
+    ) {
+        return true;
+    }
+    if parent_kind == "assignment_pattern"
+        && let Some(pattern) = parent.named_child(0)
+    {
+        return pattern.start_byte() <= node.start_byte() && node.end_byte() <= pattern.end_byte();
+    }
+    false
+}
+
+/// Return the enclosing enum declaration and current member assignment when
+/// `node` lies in that assignment's initializer. Deferred function and class
+/// bodies introduce their own lexical scope and do not inherit bare enum-member
+/// lookup from the surrounding initializer.
+pub fn typescript_enclosing_enum_initializer(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let mut current = node;
+    let assignment = loop {
+        let parent = current.parent()?;
+        if matches!(
+            parent.kind(),
+            "function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "arrow_function"
+                | "class_declaration"
+        ) {
+            return None;
+        }
+        if parent.kind() == "enum_assignment" {
+            let value = parent.child_by_field_name("value")?;
+            if value.start_byte() <= node.start_byte() && node.end_byte() <= value.end_byte() {
+                break parent;
+            }
+            return None;
+        }
+        current = parent;
+    };
+    let declaration = assignment
+        .parent()
+        .and_then(|body| body.parent())
+        .filter(|parent| parent.kind() == "enum_declaration")?;
+    Some((declaration, assignment))
+}
+
+pub fn is_export_alias_identifier(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "export_specifier"
+            && parent
+                .child_by_field_name("alias")
+                .is_some_and(|alias| alias == node)
+    })
+}
+
+pub fn is_explicit_object_literal_key(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.kind() == "pair"
+        && parent
+            .child_by_field_name("key")
+            .is_some_and(|key| key.id() == node.id())
+}
+
+pub fn is_property_key_in_member(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != "member_expression" {
+        return false;
+    }
+    parent
+        .child_by_field_name("property")
+        .map(|property| property.id() == node.id())
+        .unwrap_or(false)
+}
+
+pub fn is_object_in_member_expression(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != "member_expression" {
+        return false;
+    }
+    parent
+        .child_by_field_name("object")
+        .map(|object| object.id() == node.id())
+        .unwrap_or(false)
+}
+
+pub fn compute_import_binder(source: &str, tree: &Tree) -> JsTsImportBinder {
+    let mut binder = JsTsImportBinder::empty();
+    let root = tree.root_node();
+
+    for index_id in 0..root.named_child_count() {
+        let Some(child) = root.named_child(index_id) else {
+            continue;
+        };
+        if child.kind() == "import_statement" {
+            visit_import_statement(child, source, &mut binder);
+        } else if matches!(child.kind(), "lexical_declaration" | "variable_declaration") {
+            visit_commonjs_require_statement(child, source, &mut binder);
+        }
+    }
+    binder
+}
+
+fn visit_commonjs_require_statement(node: Node<'_>, source: &str, binder: &mut JsTsImportBinder) {
+    for binding in parse_commonjs_require_bindings_from_node(node, source) {
+        let (kind, imported_name) = match binding.kind {
+            CommonJsRequireBindingKind::ModuleObject => (ImportKind::CommonJsRequire, None),
+            CommonJsRequireBindingKind::Named => (ImportKind::Named, Some(binding.imported_name)),
+        };
+        binder.bind_commonjs(
+            binding.local_name,
+            ImportBinding {
+                module_specifier: binding.module_specifier,
+                namespace_imported_module: None,
+                kind,
+                imported_name,
+            },
+        );
+    }
+}
+
+pub fn is_commonjs_require_declarator(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "variable_declarator"
+        && commonjs_require_module_specifier_from_declarator(node, source).is_some()
+}
+
+fn visit_import_statement(node: Node<'_>, source: &str, binder: &mut JsTsImportBinder) {
+    let Some(source_node) = node.child_by_field_name("source") else {
+        return;
+    };
+    let module_specifier = unquote(slice(source_node, source));
+    if module_specifier.is_empty() {
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "import_clause" {
+            continue;
+        }
+        let mut clause_cursor = child.walk();
+        for clause_child in child.named_children(&mut clause_cursor) {
+            match clause_child.kind() {
+                "identifier" => {
+                    let local = slice(clause_child, source).to_string();
+                    if !local.is_empty() {
+                        binder.bind_static(
+                            local,
+                            ImportBinding {
+                                module_specifier: module_specifier.clone(),
+                                namespace_imported_module: None,
+                                kind: ImportKind::Default,
+                                imported_name: None,
+                            },
+                        );
+                    }
+                }
+                "namespace_import" => {
+                    let mut ns_cursor = clause_child.walk();
+                    let identifier = clause_child
+                        .named_children(&mut ns_cursor)
+                        .find(|node| node.kind() == "identifier")
+                        .map(|node| slice(node, source).to_string());
+                    if let Some(local) = identifier
+                        && !local.is_empty()
+                    {
+                        binder.bind_static(
+                            local,
+                            ImportBinding {
+                                module_specifier: module_specifier.clone(),
+                                namespace_imported_module: None,
+                                kind: ImportKind::Namespace,
+                                imported_name: None,
+                            },
+                        );
+                    }
+                }
+                "named_imports" => {
+                    let mut spec_cursor = clause_child.walk();
+                    for spec in clause_child.named_children(&mut spec_cursor) {
+                        if spec.kind() != "import_specifier" {
+                            continue;
+                        }
+                        let imported_name = spec
+                            .child_by_field_name("name")
+                            .map(|node| slice(node, source).to_string());
+                        let alias = spec
+                            .child_by_field_name("alias")
+                            .map(|node| slice(node, source).to_string());
+                        let local_name = alias
+                            .clone()
+                            .or_else(|| imported_name.clone())
+                            .unwrap_or_default();
+                        if local_name.is_empty() {
+                            continue;
+                        }
+                        binder.bind_static(
+                            local_name,
+                            ImportBinding {
+                                module_specifier: module_specifier.clone(),
+                                namespace_imported_module: None,
+                                kind: ImportKind::Named,
+                                imported_name,
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn unquote(text: &str) -> String {
+    let trimmed = text.trim();
+    let stripped = trimmed
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        });
+    stripped.unwrap_or(trimmed).to_string()
+}
+
+pub fn parse_js_ts_tree(file: &ProjectFile, source: &str, language: Language) -> Option<Tree> {
+    let mut parser = Parser::new();
+    let tree_sitter_language = crate::parse::js_ts_tree_sitter_language_for_file(file, language)?;
+    parser.set_language(&tree_sitter_language).ok()?;
+    parser.parse(source, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse_javascript(source: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .expect("JavaScript grammar");
+        parser.parse(source, None).expect("JavaScript tree")
+    }
+
+    fn parse_typescript(source: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .expect("TypeScript grammar");
+        parser.parse(source, None).expect("TypeScript tree")
+    }
+
+    #[test]
+    fn program_binding_reassignment_is_recorded_and_local_shadows_are_not() {
+        let source = r#"
+function target() {}
+function untouched() {}
+
+target = function () {};
+
+function local_shadow() {
+  let untouched = 1;
+  untouched = 2;
+}
+
+function property_write(box) {
+  box.untouched = 3;
+}
+"#;
+        let tree = parse_javascript(source);
+        let index = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        assert!(index.is_program_binding_reassigned("target", tree.root_node()));
+        assert!(!index.is_program_binding_reassigned("untouched", tree.root_node()));
+        assert!(!index.is_program_binding_reassigned("missing", tree.root_node()));
+    }
+
+    #[test]
+    fn commonjs_redeclaration_replaces_binding_without_static_ambiguity() {
+        let source = r#"
+var { relay } = require("./a");
+relay();
+var { relay } = require("./b");
+relay();
+"#;
+        let tree = parse_javascript(source);
+        let imports = compute_import_binder(source, &tree);
+
+        assert_eq!(imports.bindings_for("relay").count(), 1);
+        assert_eq!(
+            imports
+                .binding("relay")
+                .map(|binding| binding.module_specifier.as_str()),
+            Some("./b")
+        );
+        assert!(!imports.has_competing_direct_imports("relay"));
+    }
+
+    #[test]
+    fn commonjs_binding_does_not_count_as_competing_static_import() {
+        let source = r#"
+var { relay } = require("./commonjs");
+import { relay } from "./static";
+relay();
+"#;
+        let tree = parse_javascript(source);
+        let imports = compute_import_binder(source, &tree);
+
+        assert_eq!(imports.direct_bindings_for("relay").count(), 1);
+        assert_eq!(imports.resolvable_direct_bindings_for("relay").count(), 2);
+        assert!(!imports.has_competing_direct_imports("relay"));
+    }
+
+    #[test]
+    fn duplicate_static_imports_are_deduplicated_and_bounded() {
+        let mut source = String::new();
+        source.push_str("import { relay } from \"./same\";\n");
+        source.push_str("import { relay } from \"./same\";\n");
+        for index in 0..MAX_STATIC_IMPORT_BINDINGS_PER_NAME {
+            source.push_str(&format!("import {{ relay }} from \"./module-{index}\";\n"));
+        }
+        let tree = parse_javascript(&source);
+        let imports = compute_import_binder(&source, &tree);
+
+        assert_eq!(
+            imports.bindings_for("relay").count(),
+            MAX_STATIC_IMPORT_BINDINGS_PER_NAME
+        );
+        assert!(imports.was_truncated("relay"));
+    }
+
+    fn find_node<'tree>(root: Node<'tree>, source: &str, text: &str) -> Node<'tree> {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if slice(node, source) == text {
+                return node;
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+        panic!("missing node `{text}`");
+    }
+
+    #[test]
+    fn static_member_receiver_rejects_private_property_segments() {
+        let source = "class Box { #inner; read(other) { return other.#inner.value; } }";
+        let tree = parse_javascript(source);
+        let private_receiver = find_node(tree.root_node(), source, "other.#inner");
+
+        assert_eq!("member_expression", private_receiver.kind());
+        assert_eq!(
+            "private_property_identifier",
+            private_receiver
+                .child_by_field_name("property")
+                .expect("private property")
+                .kind()
+        );
+        assert!(static_member_receiver(private_receiver, source).is_none());
+    }
+
+    #[test]
+    fn lexical_binding_index_tracks_for_of_and_single_arrow_parameters() {
+        let source = r#"
+function render(tasks) {
+  for (const task of tasks) {
+    consume(task.status);
+  }
+  return tasks.filter(task => task.status);
+}
+"#;
+        let tree = parse_javascript(source);
+        let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let for_of_use = source.find("task.status").expect("for-of task");
+        let arrow_use = source.rfind("task.status").expect("arrow task");
+
+        assert!(bindings.is_bound_at("task", for_of_use));
+        assert!(bindings.is_bound_at("task", arrow_use));
+        assert_ne!(
+            bindings.binding_scope_at("task", for_of_use),
+            bindings.binding_scope_at("task", arrow_use)
+        );
+    }
+
+    #[test]
+    fn lexical_binding_index_retains_the_active_declaration_token() {
+        let source = r#"
+const fresh = require("fresh");
+function outer(fresh) {
+  return fresh();
+}
+fresh();
+"#;
+        let tree = parse_javascript(source);
+        let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let program_use = source.rfind("fresh();").expect("program fresh use");
+        let parameter_use = source.find("return fresh").expect("parameter fresh use") + 7;
+
+        assert_eq!(
+            bindings.binding_identifier_ranges_at("fresh", program_use),
+            vec![Range {
+                start_byte: source.find("fresh =").expect("program binder"),
+                end_byte: source.find("fresh =").expect("program binder") + "fresh".len(),
+                start_line: 1,
+                end_line: 1,
+            }]
+        );
+        assert_eq!(
+            bindings.binding_identifier_ranges_at("fresh", parameter_use),
+            vec![Range {
+                start_byte: source.find("fresh) {").expect("parameter binder"),
+                end_byte: source.find("fresh) {").expect("parameter binder") + "fresh".len(),
+                start_line: 2,
+                end_line: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn lexical_binding_index_tracks_typescript_class_names() {
+        let source = r#"
+export class ApiClient {
+  static create() {}
+}
+
+ApiClient.create();
+"#;
+        let tree = parse_typescript(source);
+        let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let use_byte = source.rfind("ApiClient.create").expect("static class use");
+
+        assert!(bindings.is_program_binding_at("ApiClient", use_byte, tree.root_node()));
+    }
+
+    #[test]
+    fn lexical_binding_index_keeps_var_for_of_function_scoped() {
+        let source = r#"
+function render(tasks) {
+  for (var task of tasks) {
+    consume(task.status);
+  }
+  return task.status;
+}
+"#;
+        let tree = parse_javascript(source);
+        let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let loop_use = source.find("task.status").expect("loop task");
+        let later_use = source.rfind("task.status").expect("later task");
+
+        assert_eq!(
+            bindings.binding_scope_at("task", loop_use),
+            bindings.binding_scope_at("task", later_use)
+        );
+    }
+
+    #[test]
+    fn lexical_binding_index_does_not_declare_bare_for_of_target() {
+        let source = "for (task of tasks) { consume(task.status); }";
+        let tree = parse_javascript(source);
+        let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let use_byte = source.find("task.status").expect("task use");
+
+        assert!(!bindings.is_bound_at("task", use_byte));
+    }
+}

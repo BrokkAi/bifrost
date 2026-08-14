@@ -1,0 +1,297 @@
+# Benchmark Harness
+
+`benchmark/targets.toml` is the checked-in pinned corpus manifest for the `bifrost` benchmark harness.
+
+The manifest is intentionally explicit. Each repo entry carries:
+
+- the remote URL
+- the exact pinned commit SHA
+- the language slice this repo is meant to cover
+- optional extension filters when the repo is multi-language
+- the enabled benchmark scenarios
+- the deterministic probe inputs those scenarios need
+
+Current probe-input fields are:
+
+- `search_patterns` for `search_symbols`
+- `location_symbols` for `get_symbol_locations`
+- `ancestor_symbols` for `get_symbol_ancestors`
+- `summary_targets` for `get_summaries`
+- `seed_file_paths` for `most_relevant_files`
+- `usage_symbols` for `scan_usages`
+- `[[repos.code_quality_probes]]` for every code-quality (SlopCop) scenario:
+  `dead_code_smells`, `comment_density_files`, `comment_density_code_unit`,
+  `exception_smells`, `test_assertion_smells`, `structural_clone_smells`,
+  `long_method_smells`, `secret_like_code`, and `git_hotspots`
+- `definition_queries` for `get_definition`
+
+Each code-quality probe names its `scenario` plus the exact tool inputs and a
+Markdown-report oracle. `file_paths` (required for every scenario except
+`git_hotspots` and `comment_density_code_unit`) both feeds the tool and pins
+those files for `--max-files` subset runs. `fq_names` carries symbol inputs:
+exactly one for `comment_density_code_unit`, one or more for
+`dead_code_smells`. `arguments` is an optional raw table merged over the
+scenario's default tool payload, so per-tool tuning knobs (`min_score`,
+`shingle_size`, `since_iso`, ...) never need new manifest fields.
+`expect_report_contains` is mandatory and should quote a specific finding line
+from the pinned repo, never generic header text an empty report also contains
+-- a probe whose oracle accepts an empty report cannot distinguish a fast
+regression that silently stopped finding anything. `expect_report_absent` pins
+failure text that must not appear, such as unresolved-symbol skips or
+unsupported-language placeholders. A repo that enables a code-quality scenario
+must define at least one probe for it; a scenario with several probes issues
+one tool call per probe inside each timed iteration.
+
+`git_hotspots` probes on pinned repos must set `since_iso`/`until_iso` in
+`arguments`: the tool's default window is relative to the current time, and a
+pinned commit's history ages out of it. An explicit window bracketing the
+pinned history keeps the churn report deterministic.
+
+Code-quality coverage matrix: `comment_density_files`,
+`comment_density_code_unit`, `long_method_smells`, and `git_hotspots` run on
+all eleven corpus repos. `dead_code_smells` runs everywhere except fmt-cpp.
+Exclusions are evidence-backed and enforced by the
+`code_quality_scenarios_cover_the_expected_language_matrix` test in
+`tests/suite_bench_policy/benchmark_manifest.rs`: Kotlin clone smells are
+unimplemented (#1371); the express-js, fastroute-php, scala-xml, and (for
+exceptions) fmt-cpp corpora have genuinely zero exception/test-assertion
+findings even at min_score 1 -- fmt throws through FMT_THROW rather than
+catch blocks -- so those scenarios are off there rather than pinned to an
+empty report; only the java, javascript, cpp, and csharp repos have pinnable
+secret-like findings (exposed-kotlin has real docker-compose password findings,
+but the scan exceeds the MCP request budget on that multi-module workspace, so
+the scenario is off there until the latency is fixed).
+Ruby is intentionally absent from all scenarios because the pinned corpus
+does not include a Ruby repo.
+
+`definition_queries` entries are source-location probes. Each entry defines a
+project-relative `path`, either `line` plus `column` or a byte range, optional
+`symbol`, required `expected_status`, and optional `expected_fqn`. The benchmark
+fails the `get_definition` scenario when the returned status differs or when an
+expected FQN is not present in the returned definitions. Unsupported languages
+should assert `unsupported_language` until first-class support is added.
+
+Milestone 1 validation fails when any of these drift:
+
+- the union of repo languages no longer covers every supported analyzer language from `README.md`
+- the union of repo scenarios no longer covers the minimum smoke set
+- a repo enables a scenario without the exact inputs that scenario needs
+
+The initial corpus is kept small on purpose. It is meant to be stable enough for daily CI, not a clone of Brokk's much larger baseline suite.
+
+`interactive-latency.toml` is a separate release-mode gate for common
+code-intelligence requests against a pinned Bifrost checkout. Every case has a
+5,000 ms warm-p95 budget and a correctness oracle. It covers batched symbol
+search, exact source lookup, definition lookup, summaries, the exact and
+line-only `SemanticProcedureSummary` usage scans from issue #1228, and an MCP
+fairness case that overlaps a heavy scan with a lightweight source request.
+Reports include p50 and p95 for every scenario and explicitly count measured
+scan iterations that met the latency contract by returning a truthful bounded
+incomplete result. `--profile` preserves the per-request queue, execution,
+response-queue, and writer-delivery timing traces.
+
+## Layout
+
+Benchmark-local runtime artifacts stay under ignored directories:
+
+- repo cache: `benchmark/.cache/repos`
+- subset workspaces: `benchmark/.cache/repos/.subsets`
+- JSON reports: `benchmark/benchmark-output`
+
+The repo cache holds full clones. A blobless clone (`--filter=blob:none`) of a
+network remote is not a valid fixture: `most_relevant_files` refuses the git
+co-change history walk on such a clone (issue #1373), which silently changes
+the measured code path to the import-only fallback. The harness upgrades a
+cached partial clone in place with `git fetch --refetch` and removes the
+promisor markers.
+
+The important checked-in files in this directory are:
+
+- `targets.toml`: pinned corpus, per-repo probes, and default local paths
+- `interactive-latency.toml`: pinned Bifrost self-corpus with absolute latency budgets
+- `README.md`: operator documentation for the harness and the planned daily workflow
+- `get_definition_observations.md`: manually inspected definition-lookup probe results and follow-up notes
+- `baselines/`: blessed compare targets and promotion notes for the scheduled workflow
+
+## Local Use
+
+Validate the checked-in corpus:
+
+```bash
+cargo run --bin bifrost_benchmark -- validate --manifest benchmark/targets.toml
+```
+
+Run one repo against the full pinned checkout:
+
+```bash
+cargo build --bin bifrost --bin bifrost_benchmark
+./target/debug/bifrost_benchmark run --manifest benchmark/targets.toml --repo gin-go
+```
+
+Run the interactive latency gate in the same release configuration as CI:
+
+```bash
+scripts/with-isolated-cargo-target.sh \
+  scripts/run-interactive-latency.sh --profile
+```
+
+The harness verifies the MCP server's embedded build identity during
+initialization and fails if either sibling binary is stale. Rebuild both
+binaries after changing or updating the checkout.
+
+For each `query_code` case, the harness first runs the correctness-checked
+query in an untimed scan-only process to populate durable structural facts.
+It then starts a fresh measured process, so first-request timings include
+persisted hydration but exclude process-local facts, postings, and derived
+layers. The report records hydration and extraction counters to verify that
+cold contract.
+
+For faster local iteration, `bifrost_benchmark run` also supports `--max-files N`:
+
+```bash
+cargo run --bin bifrost_benchmark -- run \
+  --manifest benchmark/targets.toml \
+  --repo gin-go \
+  --max-files 100
+```
+
+That mode creates a deterministic subset workspace under the benchmark repo cache, pins the manifest's explicit probe files first, and preserves `.git` metadata so `most_relevant_files` keeps its git-churn relevance signal. It is intended for smoke-checking the harness itself, not for baseline-quality timing comparisons.
+
+Compare a candidate report against the blessed baseline:
+
+```bash
+cargo run --bin bifrost_benchmark -- compare \
+  --baseline benchmark/baselines/ubuntu-latest.json \
+  --candidate benchmark/benchmark-output/run-20260604T130836Z.json \
+  --output benchmark/benchmark-output/compare-local.json
+```
+
+Add `--strict` when you want the command to exit nonzero on regressions instead of only writing the compare JSON and human summary.
+
+## Daily Harness Shape
+
+The intended daily workflow contract is:
+
+1. Run `bifrost_benchmark validate` against the checked-in manifest.
+2. Run `bifrost_benchmark run` against the same manifest on `ubuntu-latest`.
+3. Upload the JSON report artifact from `benchmark/benchmark-output`.
+4. Compare that report against `benchmark/baselines/ubuntu-latest.json` when that blessed baseline exists.
+5. Publish a short human-readable summary, with optional Slack notification, after the compare step.
+
+The same workflow also runs the independent `interactive-latency` job. It
+builds release binaries, executes the pinned Bifrost self-corpus with profiling
+enabled, publishes a p50/p95 table, uploads all raw timing traces, and fails on
+either an oracle failure or a warm-p95 budget violation.
+
+The harness already guarantees two useful operator properties for that workflow:
+
+- cached repos can be reused offline once the pinned commit is present locally
+- failed scenarios still produce a written report before the CLI exits nonzero
+
+The checked-in GitHub Actions workflow lives at `.github/workflows/benchmark.yml`.
+
+- Scheduled runs execute from the workflow cron at `17 9 * * *` on `ubuntu-latest`.
+- Manual runs use `workflow_dispatch` and can optionally scope to one manifest repo and/or `--max-files`.
+- Compare runs are strict only when `workflow_dispatch` sets `strict_compare = true`.
+- If `benchmark/baselines/ubuntu-latest.json` is not present yet, the workflow uploads the run artifact and records that compare was skipped.
+
+The manual workflow inputs are:
+
+- `repo`: optional manifest repo name, for example `gin-go`
+- `max_files`: optional subset cap for smoke runs, for example `100`
+- `strict_compare`: when `true`, fail the workflow if the compare step finds regressions
+
+## Slack Hook
+
+The benchmark workflow can optionally trigger a Slack Workflow Builder webhook after the run summary is prepared.
+
+GitHub-side setup:
+
+- configure a repository secret named `SLACK_DAILY_PERF_WEBHOOK_URL`
+- keep the webhook URL in that secret, not in a GitHub variable
+- if the secret is absent, the workflow skips Slack delivery cleanly
+- Slack delivery is best-effort only; webhook or Slack-side failures do not change the benchmark workflow outcome
+
+The webhook payload is benchmark-specific. The workflow sends these fields:
+
+- `ok`
+- `error_text`
+- `workflow_run_url`
+- `head_sha_short`
+- `base_sha_short`
+- `event_name`
+- `repo_input`
+- `max_files_input`
+- `strict_compare`
+- `run_outcome`
+- `compare_outcome`
+- `report_path`
+- `compare_path`
+- `compare_summary_path`
+- `generated_at`
+- `selected_repo`
+- `report_max_files`
+- `repo_count`
+- `failed_scenarios_count`
+- `compared_scenarios_count`
+- `regression_count`
+- `actionable_regression_count`
+- `improvement_count`
+- `missing_candidate_count`
+- `new_candidate_count`
+- `has_regressions`
+- `has_actionable_regressions`
+- `environment_variance_detected`
+- `environment_variance_detail`
+- `environment_variance_covered_regression_count`
+- `environment_variance_workspace_build_regression_count`
+- `summary_text`
+
+`has_regressions` preserves the raw compare result: it is true whenever any
+scenario crosses the regression threshold. `has_actionable_regressions` is the
+operator-facing status bit: it remains false when all threshold hits are covered
+by a suspected whole-run environment variance classification. Slack Workflow
+Builder templates should use the flat `environment_variance_*` fields above;
+when `environment_variance_detected` is true, render
+`environment_variance_detail` and
+`environment_variance_covered_regression_count` as warning context, not as a
+failed benchmark by itself.
+
+When a candidate report declares `selected_repo`, comparison is limited to that
+repository. Scenarios from other baseline repositories were intentionally not
+run and are not reported as missing-candidate regressions.
+
+Slack-side setup:
+
+- update the Slack Workflow Builder message template to consume the benchmark payload above rather than the older Brokk perf-only fields
+- the existing shared fields `ok`, `error_text`, `workflow_run_url`, `head_sha_short`, and `base_sha_short` can be reused directly
+- replace old perf-specific fields such as `time_*`, `fps_*`, and `coarse_memory_ok` with benchmark-oriented summary content
+- keep the current two-message shape if desired: a top-level run summary plus a threaded follow-up with benchmark-specific operator guidance
+- do not assume the old Brokk bisect guidance still applies unless the Slack-side thread text is intentionally updated for this workflow
+
+## Configuration Surface
+
+This directory should be the first place to document any new benchmark-specific workflow variables or secrets.
+
+Current stable configuration comes from `targets.toml`:
+
+- `warmup_iterations`
+- `measured_iterations`
+- `output_dir`
+- `repo_cache_dir`
+- `required_languages`
+- `required_scenarios`
+
+Future workflow-level settings should stay documented here rather than being introduced only in a GitHub Actions YAML or Slack hook. Expected examples include:
+
+- baseline report path for `compare`
+- strict-vs-summary failure mode for scheduled runs
+- artifact retention knobs
+- Slack channel-routing variables for daily notifications
+
+Slack-facing settings should stay benchmark-scoped and documented here alongside:
+
+- when the notification fires
+- what report path or compare summary it links to
+- whether a nonzero benchmark exit suppresses or changes the Slack message
+- which Slack workflow fields or message templates are expected to consume the payload

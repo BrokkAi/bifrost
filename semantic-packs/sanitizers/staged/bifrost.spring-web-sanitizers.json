@@ -1,0 +1,252 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.spring-web-sanitizers",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-sanitizer-foundry",
+    "version": "0.9.0"
+  },
+  "language": "java",
+  "ecosystem": "maven",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <0.10.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "audited k3 sanitizer content over org.springframework:spring-web:7.0.8 (staged: artifact digest not pinned)",
+    "revision": "k3-sanitizers"
+  },
+  "license": "LGPL-3.0-or-later",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "sanitizers.maven",
+      "activation": [
+        {
+          "package": {
+            "name": "org.springframework:spring-web"
+          },
+          "targets": [
+            "jvm"
+          ],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "org.springframework.web.util.htmlutils.htmlescape",
+            "target": {
+              "path": "org/springframework/web/util/HtmlUtils.java",
+              "symbol": "org.springframework.web.util.HtmlUtils.htmlEscape",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "html",
+                  "html_attr",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.springframework.web.util.uriutils.encode",
+            "target": {
+              "path": "org/springframework/web/util/UriUtils.java",
+              "symbol": "org.springframework.web.util.UriUtils.encode",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css",
+                  "html",
+                  "html_attr",
+                  "js",
+                  "log",
+                  "url",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.springframework.web.util.uriutils.encodepath",
+            "target": {
+              "path": "org/springframework/web/util/UriUtils.java",
+              "symbol": "org.springframework.web.util.UriUtils.encodePath",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "log",
+                  "url"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.springframework.web.util.uriutils.encodepathsegment",
+            "target": {
+              "path": "org/springframework/web/util/UriUtils.java",
+              "symbol": "org.springframework.web.util.UriUtils.encodePathSegment",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "log",
+                  "url"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.springframework.web.util.uriutils.encodequeryparam",
+            "target": {
+              "path": "org/springframework/web/util/UriUtils.java",
+              "symbol": "org.springframework.web.util.UriUtils.encodeQueryParam",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css",
+                  "html",
+                  "html_attr",
+                  "js",
+                  "log",
+                  "url",
+                  "xml"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

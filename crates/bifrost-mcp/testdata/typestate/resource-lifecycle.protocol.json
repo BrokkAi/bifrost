@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "states": ["unallocated", "open", "closed", "violated"],
+  "initial_state": "unallocated",
+  "accepting_states": ["unallocated", "closed"],
+  "error_states": ["violated"],
+  "events": [
+    {"id": "acquire", "observation": {"occurrence": {"type": "allocation"}}},
+    {"id": "use", "observation": {"occurrence": {"type": "endpoint", "phase": "before_call"}}},
+    {"id": "close", "observation": {"occurrence": {"type": "endpoint", "phase": "after_normal_return"}}}
+  ],
+  "transitions": [
+    {"from": "unallocated", "on": "acquire", "to": "open"},
+    {"from": "open", "on": "use", "to": "open"},
+    {"from": "open", "on": "close", "to": "closed"},
+    {"from": "unallocated", "on": "use", "to": "violated"},
+    {"from": "closed", "on": "use", "to": "violated"},
+    {"from": "closed", "on": "close", "to": "violated"},
+    {"from": "violated", "on": "acquire", "to": "open"}
+  ],
+  "terminal_expectations": [
+    {"id": "normal-exit-closed", "on": {"type": "analysis_root_exit", "kind": "normal"}, "expected_states": ["unallocated", "closed"]},
+    {"id": "exceptional-exit-closed", "on": {"type": "analysis_root_exit", "kind": "exceptional"}, "expected_states": ["unallocated", "closed"]}
+  ],
+  "semantics": {
+    "analysis_mode": "may",
+    "unmatched_event": "preserve_state",
+    "uncertainty": {
+      "ambiguous_dispatch": "preserve_uncertainty",
+      "unknown_call": "preserve_uncertainty",
+      "external_call": "preserve_uncertainty",
+      "escape": "abstain",
+      "incomplete_analysis": "abstain"
+    }
+  }
+}

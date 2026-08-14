@@ -1,0 +1,3470 @@
+use super::*;
+use crate::analyzer::BoundedDefinitionLookup;
+use crate::analyzer::structural::resolution::RejectionReason;
+use crate::analyzer::usages::applicability::{ApplicabilityOutcome, arity_applicability};
+use crate::analyzer::usages::receiver_analysis::{
+    ReceiverAnalysisBudget, ReceiverAnalysisWork, ReceiverBudgetLimit,
+};
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+use brokk_bifrost_jvm::java::graph_support::JavaSource;
+use brokk_bifrost_jvm::java::hierarchy::java_preferred_declaring_owners;
+use std::cell::RefCell;
+use std::collections::VecDeque;
+
+#[derive(Debug, Clone, Copy)]
+enum JavaResolutionStop {
+    Exceeded(ReceiverBudgetLimit),
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct JavaResolutionState {
+    work: ReceiverAnalysisWork,
+    stop: Option<JavaResolutionStop>,
+}
+
+/// A single bounded lookup view shared by every structured Java resolver
+/// expansion in one receiver-compatibility request.
+pub(crate) struct JavaResolutionSession<'a> {
+    support: &'a dyn BoundedDefinitionLookup,
+    budget: Option<ReceiverAnalysisBudget>,
+    cancellation: Option<CancellationToken>,
+    state: RefCell<JavaResolutionState>,
+}
+
+impl<'a> JavaResolutionSession<'a> {
+    fn unbounded(support: &'a dyn BoundedDefinitionLookup) -> Self {
+        Self {
+            support,
+            budget: None,
+            cancellation: None,
+            state: RefCell::new(JavaResolutionState::default()),
+        }
+    }
+
+    pub(crate) fn bounded(
+        support: &'a dyn BoundedDefinitionLookup,
+        budget: ReceiverAnalysisBudget,
+        cancellation: Option<&CancellationToken>,
+    ) -> Self {
+        Self {
+            support,
+            budget: Some(budget),
+            cancellation: cancellation.cloned(),
+            state: RefCell::new(JavaResolutionState::default()),
+        }
+    }
+
+    pub(crate) fn finish<T>(&self, value: T) -> BoundedResolution<T> {
+        self.observe_cancellation();
+        let state = *self.state.borrow();
+        match state.stop {
+            Some(JavaResolutionStop::Exceeded(limit)) => BoundedResolution::Exceeded {
+                work: state.work,
+                limit,
+            },
+            Some(JavaResolutionStop::Cancelled) => {
+                BoundedResolution::Cancelled { work: state.work }
+            }
+            None => BoundedResolution::Complete {
+                value,
+                work: state.work,
+            },
+        }
+    }
+
+    fn observe_cancellation(&self) -> bool {
+        if self.budget.is_none() && self.cancellation.is_none() {
+            return true;
+        }
+        let mut state = self.state.borrow_mut();
+        if state.stop.is_none()
+            && self
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        {
+            state.stop = Some(JavaResolutionStop::Cancelled);
+        }
+        state.stop.is_none()
+    }
+
+    fn charge_scope_step(&self) -> bool {
+        self.charge(ReceiverBudgetLimit::ScopeNodes)
+    }
+
+    fn charge_hierarchy_expansion(&self) -> bool {
+        self.charge(ReceiverBudgetLimit::SummaryExpansions)
+    }
+
+    fn enclosing_unit(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        byte: usize,
+    ) -> Option<CodeUnit> {
+        self.enclosing_units(analyzer, file, byte)
+            .into_iter()
+            .next()
+    }
+
+    /// Every class that lexically encloses `byte`, from the innermost class
+    /// outward. Java simple-name lookup must exhaust each class's own and
+    /// inherited members before it checks the next enclosing class (#1905).
+    fn enclosing_units(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        byte: usize,
+    ) -> Vec<CodeUnit> {
+        let start = self.query_optional_row(|| {
+            analyzer.enclosing_code_unit(
+                file,
+                &Range {
+                    start_byte: byte,
+                    end_byte: byte.saturating_add(1),
+                    start_line: 0,
+                    end_line: 0,
+                },
+            )
+        });
+        let Some(start) = start else {
+            return Vec::new();
+        };
+        crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
+            self.parent_of(analyzer, unit)
+        })
+        .filter(CodeUnit::is_class)
+        .collect()
+    }
+
+    fn enclosing_static_context(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        node: Node<'_>,
+    ) -> (bool, bool) {
+        let byte = node.start_byte();
+        let start = self.query_optional_row(|| {
+            analyzer.enclosing_code_unit(
+                file,
+                &Range {
+                    start_byte: byte,
+                    end_byte: byte.saturating_add(1),
+                    start_line: 0,
+                    end_line: 0,
+                },
+            )
+        });
+        let Some(start) = start else {
+            return (false, false);
+        };
+        let mut saw_class = false;
+        let mut ancestor = Some(node);
+        let mut current_static = false;
+        while let Some(current) = ancestor {
+            if current.kind() == "static_initializer" {
+                current_static = true;
+                break;
+            }
+            ancestor = current.parent();
+        }
+        let mut outer_static = false;
+        for unit in crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
+            self.parent_of(analyzer, unit)
+        }) {
+            if unit.is_class() {
+                saw_class = true;
+                continue;
+            }
+            if (unit.is_function() || unit.is_field())
+                && self
+                    .signature_metadata(analyzer, &unit)
+                    .iter()
+                    .any(|metadata| {
+                        if unit.is_function() {
+                            metadata.callable_is_static()
+                        } else {
+                            metadata.field_is_static()
+                        }
+                    })
+            {
+                if saw_class {
+                    outer_static = true;
+                } else {
+                    current_static = true;
+                }
+            }
+        }
+        (current_static, outer_static)
+    }
+
+    fn structured_query<T>(&self, query: impl FnOnce() -> T) -> Option<T> {
+        if !self.charge_scope_step() {
+            return None;
+        }
+        let value = query();
+        self.observe_cancellation().then_some(value)
+    }
+
+    fn query_optional_row<T>(&self, query: impl FnOnce() -> Option<T>) -> Option<T> {
+        let row = self.structured_query(query)??;
+        self.charge_scope_step().then_some(row)
+    }
+
+    fn query_rows<T>(&self, query: impl FnOnce() -> Vec<T>) -> Vec<T> {
+        let Some(rows) = self.structured_query(query) else {
+            return Vec::new();
+        };
+        self.track_rows(rows)
+    }
+
+    fn track_rows<T>(&self, rows: Vec<T>) -> Vec<T> {
+        if self.budget.is_none() && self.cancellation.is_none() {
+            return rows;
+        }
+        for _ in &rows {
+            if !self.charge_scope_step() {
+                return Vec::new();
+            }
+        }
+        rows
+    }
+
+    fn resolve_type_name_in_file(
+        &self,
+        java: &JavaAnalyzer,
+        file: &ProjectFile,
+        name: &str,
+    ) -> Option<CodeUnit> {
+        self.query_optional_row(|| java.resolve_type_name_in_file(file, name))
+    }
+
+    /// The full candidate set for a type name, ambiguous wildcard peers
+    /// included. Reference sites use this so colliding on-demand imports
+    /// become an `Ambiguous` outcome; receiver and qualifier lookups keep
+    /// [`Self::resolve_type_name_in_file`], which demands a unique answer.
+    fn resolve_type_name_candidates_in_file(
+        &self,
+        java: &JavaAnalyzer,
+        file: &ProjectFile,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        self.query_rows(|| java.resolve_type_name_candidates_in_file(file, name))
+    }
+
+    /// Whether `name` resolves once the external surface is consulted. The
+    /// activated packs come from the dispatching analyzer, which is the only
+    /// one activation publishes onto (#1893).
+    fn type_name_resolves_with_external(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        java: &JavaAnalyzer,
+        file: &ProjectFile,
+        name: &str,
+    ) -> bool {
+        self.query_optional_row(|| {
+            java.resolve_type_name_with_external(analyzer.semantic_model_overlay(), file, name)
+        })
+        .is_some()
+    }
+
+    fn import_infos(
+        &self,
+        java: &JavaAnalyzer,
+        file: &ProjectFile,
+    ) -> Vec<crate::analyzer::ImportInfo> {
+        self.query_rows(|| java.import_info_of(file))
+    }
+
+    fn ranges(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<Range> {
+        self.query_rows(|| analyzer.ranges(unit))
+    }
+
+    fn signatures(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<String> {
+        self.query_rows(|| analyzer.signatures(unit))
+    }
+
+    fn signature_metadata(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+    ) -> Vec<crate::analyzer::SignatureMetadata> {
+        self.query_rows(|| analyzer.signature_metadata(unit))
+    }
+
+    fn read_source(&self, file: &ProjectFile) -> Option<String> {
+        self.query_optional_row(|| file.read_to_string().ok())
+    }
+
+    fn parse_java_source(&self, source: &str) -> Option<Tree> {
+        self.structured_query(|| parse_java_tree(source)).flatten()
+    }
+
+    fn smallest_named_node_covering<'tree>(
+        &self,
+        mut node: Node<'tree>,
+        start: usize,
+        end: usize,
+    ) -> Option<Node<'tree>> {
+        if !self.charge_scope_step() || node.end_byte() < end || node.start_byte() > start {
+            return None;
+        }
+        loop {
+            let mut cursor = node.walk();
+            let mut containing_child = None;
+            for child in node.named_children(&mut cursor) {
+                if !self.charge_scope_step() {
+                    return None;
+                }
+                if child.start_byte() <= start && child.end_byte() >= end {
+                    containing_child = Some(child);
+                    break;
+                }
+            }
+            match containing_child {
+                Some(child) => node = child,
+                None => return Some(node),
+            }
+        }
+    }
+
+    fn parent_of(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<CodeUnit> {
+        if !self.charge_hierarchy_expansion() {
+            return None;
+        }
+        let parent = analyzer.parent_of(unit);
+        if !self.observe_cancellation() {
+            return None;
+        }
+        let parent = parent?;
+        self.charge_scope_step().then_some(parent)
+    }
+
+    fn direct_ancestors(
+        &self,
+        provider: &dyn crate::analyzer::TypeHierarchyProvider,
+        unit: &CodeUnit,
+    ) -> Vec<CodeUnit> {
+        if !self.charge_hierarchy_expansion() {
+            return Vec::new();
+        }
+        let ancestors = provider.get_direct_ancestors(unit);
+        if !self.observe_cancellation() {
+            return Vec::new();
+        }
+        self.track_rows(ancestors)
+    }
+
+    fn charge(&self, limit: ReceiverBudgetLimit) -> bool {
+        if self.budget.is_none() && self.cancellation.is_none() {
+            return true;
+        }
+        if !self.observe_cancellation() {
+            return false;
+        }
+        let Some(budget) = self.budget else {
+            return true;
+        };
+        let mut state = self.state.borrow_mut();
+        let (used, maximum) = match limit {
+            ReceiverBudgetLimit::ScopeNodes => {
+                (&mut state.work.scope_nodes, budget.max_scope_nodes)
+            }
+            ReceiverBudgetLimit::SummaryExpansions => (
+                &mut state.work.summary_expansions,
+                budget.max_summary_expansions,
+            ),
+        };
+        if *used == maximum {
+            state.stop = Some(JavaResolutionStop::Exceeded(limit));
+            false
+        } else {
+            *used += 1;
+            true
+        }
+    }
+
+    fn bool_query(&self, query: impl FnOnce() -> bool) -> bool {
+        self.structured_query(query).unwrap_or(false)
+    }
+}
+
+impl BoundedDefinitionLookup for JavaResolutionSession<'_> {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.query_rows(|| self.support.fqn(fqn))
+    }
+
+    fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
+        self.query_rows(|| self.support.fqn_in_language(fqn, language))
+    }
+
+    fn fqn_in_any_language(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.query_rows(|| self.support.fqn_in_any_language(fqn))
+    }
+
+    fn package_exists_in_any_language(&self, package: &str) -> bool {
+        self.bool_query(|| self.support.package_exists_in_any_language(package))
+    }
+
+    fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
+        self.query_rows(|| self.support.file_identifier(file, ident))
+    }
+
+    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.query_rows(|| self.support.fqn_direct_children(fqn))
+    }
+
+    fn fqn_exists(&self, fqn: &str) -> bool {
+        self.bool_query(|| self.support.fqn_exists(fqn))
+    }
+
+    fn package_exists(&self, package: &str) -> bool {
+        self.bool_query(|| self.support.package_exists(package))
+    }
+
+    fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
+        self.bool_query(|| self.support.package_exists_in_language(package, language))
+    }
+
+    fn fqn_prefix_exists(&self, prefix: &str) -> bool {
+        self.bool_query(|| self.support.fqn_prefix_exists(prefix))
+    }
+}
+
+pub(crate) enum JavaTypeLookupResolution {
+    Type {
+        fqn: String,
+        target_kind: TypeLookupTargetKind,
+    },
+    InappropriateSymbolContext,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JavaMemberLookupKind {
+    Field,
+    Method,
+    Type,
+}
+
+pub(crate) fn java_type_lookup_resolution_in_session(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+) -> Option<JavaTypeLookupResolution> {
+    if !session.observe_cancellation() {
+        return None;
+    }
+    let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
+    let node =
+        session.smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    java_type_lookup_node_fqn(analyzer, java, session, file, source, root, node)
+}
+
+pub(crate) fn resolve_java(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+) -> DefinitionLookupOutcome {
+    let session = JavaResolutionSession::unbounded(support);
+    match resolve_java_in_session(analyzer, &session, file, source, tree, site) {
+        BoundedResolution::Complete { value, .. } => value,
+        BoundedResolution::Exceeded { .. } | BoundedResolution::Cancelled { .. } => {
+            unreachable!("unbounded Java resolution cannot be interrupted")
+        }
+    }
+}
+
+pub(crate) fn resolve_java_bounded(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    resolve_java_in_session(analyzer, session, file, source, tree, site)
+}
+
+fn resolve_java_in_session(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    // Java's tier ladder resolves the reference this site names, so the deep
+    // scope covers the whole dispatch: the type-name tiers in
+    // `java::imports::resolve_type_name_with`, the member tier, the
+    // static-import tier and the boundary gate. A nested lookup for another
+    // name -- a receiver type, an owner -- falls outside it and therefore
+    // attributes nothing to this reference.
+    let _deep = trace::DeepScope::enter(&site.text);
+    if !session.observe_cancellation() {
+        return session.finish(no_definition(
+            "java_resolution_cancelled",
+            "Java resolution was cancelled",
+        ));
+    }
+    let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
+        return session.finish(no_definition(
+            "java_analyzer_unavailable",
+            "Java analyzer is unavailable",
+        ));
+    };
+    let Some(tree) = tree else {
+        return session.finish(no_definition(
+            "java_parse_failed",
+            "Java source could not be parsed",
+        ));
+    };
+
+    let root = tree.root_node();
+    let Some(node) =
+        session.smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
+    else {
+        return session.finish(no_definition(
+            "no_indexed_definition",
+            format!(
+                "`{}` did not resolve to an indexed Java definition",
+                site.text
+            ),
+        ));
+    };
+
+    if is_java_declaration_or_import_name(node) {
+        return session.finish(no_definition(
+            "declaration_or_import_site",
+            format!("`{}` is not a Java reference site", site.text),
+        ));
+    }
+
+    let outcome = match node.kind() {
+        "type_identifier" | "scoped_type_identifier" | "generic_type" => {
+            if let Some(creation) = java_enclosing_object_creation(session, node)
+                && java_object_creation_focus_is_terminal_type(session, creation, node)
+            {
+                return session.finish(resolve_java_constructor_call(
+                    analyzer, java, session, file, source, creation,
+                ));
+            }
+            resolve_java_type_reference(analyzer, java, session, file, source, node)
+        }
+        "object_creation_expression" => {
+            resolve_java_constructor_call(analyzer, java, session, file, source, node)
+        }
+        "method_invocation" => {
+            resolve_java_method_invocation(analyzer, session, file, source, root, node)
+        }
+        "method_reference" => {
+            resolve_java_method_reference(analyzer, java, session, file, source, root, node)
+        }
+        "field_access" => resolve_java_field_access(analyzer, session, file, source, root, node),
+        "identifier" => {
+            if let Some(parent) = node.parent() {
+                match parent.kind() {
+                    "method_invocation" => {
+                        return session.finish(
+                            match qualified_access_focus(node, parent, &["object"], &["name"]) {
+                                Some(QualifiedAccessFocus::Qualifier) => {
+                                    resolve_java_bare_identifier(
+                                        analyzer, java, session, file, source, root, node,
+                                    )
+                                }
+                                Some(QualifiedAccessFocus::Member) => {
+                                    resolve_java_method_invocation(
+                                        analyzer, session, file, source, root, parent,
+                                    )
+                                }
+                                None => resolve_java_bare_identifier(
+                                    analyzer, java, session, file, source, root, node,
+                                ),
+                            },
+                        );
+                    }
+                    "field_access" => {
+                        return session.finish(match qualified_access_focus(
+                            node,
+                            parent,
+                            &["object"],
+                            &["field"],
+                        ) {
+                            Some(QualifiedAccessFocus::Qualifier) => resolve_java_bare_identifier(
+                                analyzer, java, session, file, source, root, node,
+                            ),
+                            Some(QualifiedAccessFocus::Member) => resolve_java_field_access(
+                                analyzer, session, file, source, root, parent,
+                            ),
+                            None => no_definition(
+                                "unsupported_java_reference_shape",
+                                format!(
+                                    "`{}` is a Java `{}` reference shape that get_definition does not resolve yet",
+                                    site.text,
+                                    node.kind()
+                                ),
+                            ),
+                        });
+                    }
+                    "method_reference" => {
+                        return session.finish(
+                            if java_method_reference_receiver_contains_focus(parent, node) {
+                                resolve_java_bare_identifier(
+                                    analyzer, java, session, file, source, root, node,
+                                )
+                            } else {
+                                resolve_java_method_reference(
+                                    analyzer, java, session, file, source, root, parent,
+                                )
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            resolve_java_bare_identifier(analyzer, java, session, file, source, root, node)
+        }
+        _ => no_definition(
+            "unsupported_java_reference_shape",
+            format!(
+                "`{}` is a Java `{}` reference shape that get_definition does not resolve yet",
+                site.text,
+                node.kind()
+            ),
+        ),
+    };
+    session.finish(outcome)
+}
+
+fn java_type_lookup_node_fqn(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+) -> Option<JavaTypeLookupResolution> {
+    if matches!(
+        node.kind(),
+        "type_identifier" | "scoped_type_identifier" | "generic_type"
+    ) {
+        return java_type_from_node_with_context(analyzer, java, session, file, source, node).map(
+            |unit| JavaTypeLookupResolution::Type {
+                fqn: unit.fq_name().to_string(),
+                target_kind: TypeLookupTargetKind::TypeReference,
+            },
+        );
+    }
+
+    if node.kind() != "identifier" {
+        return None;
+    }
+
+    if let Some(parent) = node.parent() {
+        if parent.kind() == "field_access"
+            && parent.child_by_field_name("object") == Some(node)
+            && let Some(receiver) = java_receiver_type(analyzer, session, file, source, root, node)
+        {
+            return Some(JavaTypeLookupResolution::Type {
+                fqn: receiver.fq_name().to_string(),
+                target_kind: TypeLookupTargetKind::ValueExpression,
+            });
+        }
+        if parent.kind() == "method_invocation"
+            && parent.child_by_field_name("object") == Some(node)
+            && let Some(receiver) = java_receiver_type(analyzer, session, file, source, root, node)
+        {
+            return Some(JavaTypeLookupResolution::Type {
+                fqn: receiver.fq_name().to_string(),
+                target_kind: TypeLookupTargetKind::ValueExpression,
+            });
+        }
+        if java_is_callable_declaration_name(parent, node) {
+            return Some(JavaTypeLookupResolution::InappropriateSymbolContext);
+        }
+        if let Some(declared) =
+            java_declaration_name_type(analyzer, java, session, file, source, root, parent, node)
+        {
+            return Some(JavaTypeLookupResolution::Type {
+                fqn: declared.fq_name().to_string(),
+                target_kind: TypeLookupTargetKind::ValueExpression,
+            });
+        }
+    }
+
+    let name = java_node_text(node, source);
+    java_type_of_identifier_before(
+        analyzer,
+        java,
+        session,
+        file,
+        source,
+        root,
+        name,
+        node.start_byte(),
+    )
+    .map(|unit| JavaTypeLookupResolution::Type {
+        fqn: unit.fq_name().to_string(),
+        target_kind: TypeLookupTargetKind::ValueExpression,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_declaration_name_type(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    parent: Node<'_>,
+    name: Node<'_>,
+) -> Option<CodeUnit> {
+    match parent.kind() {
+        "formal_parameter" | "resource" if parent.child_by_field_name("name") == Some(name) => {
+            parent.child_by_field_name("type").and_then(|type_node| {
+                java_type_from_node_with_context(analyzer, java, session, file, source, type_node)
+            })
+        }
+        "variable_declarator" if parent.child_by_field_name("name") == Some(name) => {
+            let declaration = parent.parent()?;
+            if !matches!(
+                declaration.kind(),
+                "local_variable_declaration" | "field_declaration"
+            ) {
+                return None;
+            }
+            declaration
+                .child_by_field_name("type")
+                .and_then(|type_node| {
+                    java_type_from_node_with_context(
+                        analyzer, java, session, file, source, type_node,
+                    )
+                })
+        }
+        _ => java_type_of_identifier_before(
+            analyzer,
+            java,
+            session,
+            file,
+            source,
+            root,
+            java_node_text(name, source),
+            name.end_byte(),
+        ),
+    }
+}
+
+pub(super) fn parse_java_tree(source: &str) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .ok()?;
+    parser.parse(source, None)
+}
+
+fn java_next_named_preorder<'tree>(
+    root: Node<'tree>,
+    current: Node<'tree>,
+    descend: bool,
+) -> Option<Node<'tree>> {
+    if descend && let Some(child) = current.named_child(0) {
+        return Some(child);
+    }
+    let mut cursor = current;
+    loop {
+        if cursor.id() == root.id() {
+            return None;
+        }
+        if let Some(sibling) = cursor.next_named_sibling() {
+            return Some(sibling);
+        }
+        cursor = cursor.parent()?;
+    }
+}
+
+fn is_java_declaration_or_import_name(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() == "import_declaration" || parent.kind() == "package_declaration" {
+        return true;
+    }
+    parent.child_by_field_name("name") == Some(node)
+        && matches!(
+            parent.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "method_declaration"
+                | "constructor_declaration"
+                | "compact_constructor_declaration"
+                | "field_declaration"
+                | "variable_declarator"
+                | "formal_parameter"
+        )
+}
+
+fn resolve_java_type_reference(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let raw = java_node_text(node, source);
+    let normalized = normalize_java_type_text(raw);
+    if normalized.is_empty() {
+        return no_definition("no_reference_text", "Java type reference is blank");
+    }
+    if let Some(outcome) =
+        java_explicit_scoped_type_reference(analyzer, java, session, file, source, node)
+    {
+        return outcome;
+    }
+    if let Some(unit) =
+        java_nested_type_from_context(analyzer, session, file, normalized, node.start_byte())
+    {
+        return candidates_outcome(vec![unit]);
+    }
+    let candidates = session.resolve_type_name_candidates_in_file(java, file, normalized);
+    if !candidates.is_empty() {
+        return candidates_outcome(candidates);
+    }
+    if let Some(unit) = java_qualified_nested_type(analyzer, java, session, file, source, node) {
+        return candidates_outcome(vec![unit]);
+    }
+    // `java_import_boundary_for_type` fuses the unresolved-import signal with the
+    // workspace-type check; its negation is the workspace-internal gate.
+    gated_boundary(
+        || !java_import_boundary_for_type(java, session, file, normalized),
+        format!(
+            "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
+        ),
+        "no_indexed_definition",
+        format!("`{normalized}` did not resolve to an indexed Java type"),
+    )
+}
+
+fn java_explicit_scoped_type_reference(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Option<DefinitionLookupOutcome> {
+    let support: &dyn BoundedDefinitionLookup = session;
+    let scoped = java_enclosing_scoped_type_identifier(session, node)?;
+    let focused_prefix = source.get(scoped.start_byte()..node.end_byte())?;
+    let normalized = normalize_java_type_text(focused_prefix);
+    let terminal = normalize_java_type_text(java_node_text(node, source));
+    if normalized.is_empty() || normalized == terminal {
+        return None;
+    }
+
+    let candidates = session.resolve_type_name_candidates_in_file(java, file, normalized);
+    if !candidates.is_empty() {
+        return Some(candidates_outcome(candidates));
+    }
+    if let Some(unit) = java_qualified_nested_type(analyzer, java, session, file, source, node) {
+        return Some(candidates_outcome(vec![unit]));
+    }
+    if session.type_name_resolves_with_external(analyzer, java, file, normalized) {
+        // gated upstream: `resolve_type_name_in_file` and `java_qualified_nested_type`
+        // above return early for any workspace-internal type; reaching here means
+        // the name only resolves once external imports are considered.
+        return Some(boundary_unchecked(format!(
+            "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
+        )));
+    }
+    if java_scoped_type_qualifier_resolves_in_source(session, java, file, source, scoped) {
+        return Some(no_definition(
+            "no_indexed_definition",
+            format!("`{normalized}` did not resolve to an indexed Java type"),
+        ));
+    }
+    let qualifier_is_in_workspace = java_scoped_type_qualifier_text(session, scoped, source)
+        .is_some_and(|qualifier| java_workspace_package_exists(support, qualifier));
+    // The `!qualifier_is_in_workspace` disjunct is the #1089 workspace-namespace
+    // check, so the negation of the whole condition is the workspace gate.
+    Some(gated_boundary(
+        || {
+            !java_import_boundary_for_type(java, session, file, normalized)
+                && qualifier_is_in_workspace
+        },
+        format!(
+            "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
+        ),
+        "no_indexed_definition",
+        format!("`{normalized}` did not resolve to an indexed Java type"),
+    ))
+}
+
+fn resolve_java_method_invocation(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return no_definition("no_method_name", "Java method invocation has no name");
+    };
+    let name = java_node_text(name_node, source);
+    if name.is_empty() {
+        return no_definition("no_method_name", "Java method invocation has a blank name");
+    }
+    let arity = java_argument_count(node);
+
+    if let Some(object) = node.child_by_field_name("object") {
+        if let Some(owner) = java_receiver_type(analyzer, session, file, source, root, object) {
+            return java_member_candidates(
+                analyzer,
+                session,
+                &owner,
+                name,
+                JavaMemberLookupKind::Method,
+                Some(arity),
+            );
+        }
+        return java_unresolved_receiver_outcome(
+            analyzer,
+            session,
+            file,
+            source,
+            object,
+            name,
+            format!("receiver for Java method `{name}` is not resolved"),
+        );
+    }
+
+    let static_import = java_static_import_candidates(
+        analyzer,
+        session,
+        file,
+        name,
+        JavaMemberLookupKind::Method,
+        Some(arity),
+    );
+    // The tier took the call's arity, so anything it names already accepts the
+    // argument list. A static-import boundary claim does not short-circuit: the
+    // enclosing class below can still declare the method (#1126's invariant).
+    if !static_import.definitions.is_empty() {
+        return static_import;
+    }
+
+    let (initial_static_context, outer_static_context) =
+        session.enclosing_static_context(analyzer, file, name_node);
+    let outcome = java_member_candidates_in_enclosing_chain(
+        analyzer,
+        session,
+        session.enclosing_units(analyzer, file, name_node.start_byte()),
+        initial_static_context,
+        outer_static_context,
+        name,
+        JavaMemberLookupKind::Method,
+        Some(arity),
+    );
+    if outcome.status != DefinitionLookupStatus::NoDefinition {
+        return outcome;
+    }
+
+    no_definition(
+        "no_indexed_definition",
+        format!("`{name}` did not resolve to an indexed Java method"),
+    )
+}
+
+fn resolve_java_method_reference(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let Some(receiver_node) = java_method_reference_receiver_node(node) else {
+        return no_definition(
+            "malformed_java_method_reference",
+            "Java method reference has no receiver",
+        );
+    };
+    let receiver_text = java_node_text(receiver_node, source);
+    if receiver_text.is_empty() {
+        return no_definition(
+            "malformed_java_method_reference",
+            "Java method reference has a blank receiver",
+        );
+    }
+    let owner =
+        java_receiver_type(analyzer, session, file, source, root, receiver_node).or_else(|| {
+            java_type_text_with_context(
+                analyzer,
+                java,
+                session,
+                file,
+                normalize_java_type_text(receiver_text),
+                receiver_node.start_byte(),
+            )
+        });
+    if java_method_reference_is_constructor(session, node) {
+        if let Some(owner) = owner {
+            return java_constructor_outcome(analyzer, session, owner, None);
+        }
+        return no_definition(
+            "unsupported_java_receiver",
+            "receiver for Java constructor reference is not resolved",
+        );
+    }
+
+    let Some(member_node) = java_method_reference_member_node(session, node) else {
+        return no_definition(
+            "malformed_java_method_reference",
+            "Java method reference has no member",
+        );
+    };
+    let member = java_node_text(member_node, source);
+    if member.is_empty() {
+        return no_definition(
+            "malformed_java_method_reference",
+            "Java method reference has a blank member",
+        );
+    }
+    if let Some(owner) = owner {
+        return java_member_candidates(
+            analyzer,
+            session,
+            &owner,
+            member,
+            JavaMemberLookupKind::Method,
+            None,
+        );
+    }
+
+    no_definition(
+        "unsupported_java_receiver",
+        format!("receiver for Java method reference `{member}` is not resolved"),
+    )
+}
+
+fn java_method_reference_receiver_node(node: Node<'_>) -> Option<Node<'_>> {
+    (node.kind() == "method_reference")
+        .then(|| node.named_child(0))
+        .flatten()
+}
+
+fn java_method_reference_member_node<'tree>(
+    session: &JavaResolutionSession<'_>,
+    node: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let receiver = java_method_reference_receiver_node(node)?;
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor).skip(1) {
+        if !session.charge_scope_step() {
+            return None;
+        }
+        if child.id() != receiver.id() && child.kind() == "identifier" {
+            return Some(child);
+        }
+    }
+    None
+}
+
+fn java_method_reference_is_constructor(
+    session: &JavaResolutionSession<'_>,
+    node: Node<'_>,
+) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !session.charge_scope_step() {
+            return false;
+        }
+        if child.kind() == "new" {
+            return true;
+        }
+    }
+    false
+}
+
+fn resolve_java_constructor_call(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return no_definition("no_indexed_definition", "Java constructor call has no type");
+    };
+    let owner = java_type_from_node_with_context(analyzer, java, session, file, source, type_node)
+        .or_else(|| {
+            let raw = java_node_text(type_node, source);
+            java_type_text_with_context(
+                analyzer,
+                java,
+                session,
+                file,
+                normalize_java_type_text(raw),
+                type_node.start_byte(),
+            )
+        });
+    if let Some(owner) = owner {
+        return java_constructor_outcome(analyzer, session, owner, Some(java_argument_count(node)));
+    }
+    resolve_java_type_reference(analyzer, java, session, file, source, type_node)
+}
+
+fn java_constructor_outcome(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    owner: CodeUnit,
+    arity: Option<usize>,
+) -> DefinitionLookupOutcome {
+    let support: &dyn BoundedDefinitionLookup = session;
+    let mut constructors = support.fqn(&format!("{}.{}", owner.fq_name(), owner.identifier()));
+    constructors.retain(|unit| unit.is_function() && !unit.is_synthetic());
+    constructors = java_filter_candidates_by_arity(analyzer, session, constructors, arity);
+    if !constructors.is_empty() {
+        return candidates_outcome(constructors);
+    }
+
+    if java_modeled_constructor_exists(analyzer, session, &owner, arity) {
+        return no_definition(
+            "modeled_java_constructor",
+            format!(
+                "`{}.{}` is supplied by an active Java semantic model",
+                owner.fq_name(),
+                owner.identifier()
+            ),
+        );
+    }
+
+    let indexed_owner = support.fqn(&owner.fq_name());
+    if indexed_owner.is_empty() {
+        candidates_outcome(vec![owner])
+    } else {
+        candidates_outcome(indexed_owner)
+    }
+}
+
+fn java_modeled_constructor_exists(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    owner: &CodeUnit,
+    arity: Option<usize>,
+) -> bool {
+    let Some(overlay) = analyzer.semantic_model_overlay() else {
+        return false;
+    };
+    session
+        .query_rows(|| overlay.members_of(&owner.fq_name()).records)
+        .into_iter()
+        .any(|symbol| {
+            symbol.language == "java"
+                && symbol.kind
+                    == crate::analyzer::semantic_model::SemanticModelSymbolKind::Constructor
+                && symbol.name == owner.identifier()
+                && arity.is_none_or(|arity| {
+                    symbol
+                        .structured_signature
+                        .as_ref()
+                        .is_some_and(|signature| signature.parameters.len() == arity)
+                })
+        })
+}
+
+fn java_enclosing_object_creation<'tree>(
+    session: &JavaResolutionSession<'_>,
+    node: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if !session.charge_scope_step() {
+            return None;
+        }
+        if matches!(
+            parent.kind(),
+            "type_identifier" | "scoped_type_identifier" | "generic_type"
+        ) {
+            current = parent;
+            continue;
+        }
+        if parent.kind() == "object_creation_expression"
+            && parent.child_by_field_name("type") == Some(current)
+        {
+            return Some(parent);
+        }
+        return None;
+    }
+    None
+}
+
+fn java_object_creation_focus_is_terminal_type(
+    session: &JavaResolutionSession<'_>,
+    creation: Node<'_>,
+    focus: Node<'_>,
+) -> bool {
+    let Some(mut terminal) = creation.child_by_field_name("type") else {
+        return false;
+    };
+    loop {
+        let next = match terminal.kind() {
+            "scoped_type_identifier" => {
+                let mut cursor = terminal.walk();
+                let mut last = None;
+                for child in terminal.named_children(&mut cursor) {
+                    if !session.charge_scope_step() {
+                        return false;
+                    }
+                    if !matches!(child.kind(), "annotation" | "marker_annotation") {
+                        last = Some(child);
+                    }
+                }
+                last
+            }
+            "generic_type" => {
+                let mut cursor = terminal.walk();
+                let mut found = None;
+                for child in terminal.named_children(&mut cursor) {
+                    if !session.charge_scope_step() {
+                        return false;
+                    }
+                    if child.kind() != "type_arguments" {
+                        found = Some(child);
+                        break;
+                    }
+                }
+                found
+            }
+            "annotated_type" => {
+                let mut cursor = terminal.walk();
+                let mut found = None;
+                for child in terminal.named_children(&mut cursor) {
+                    if !session.charge_scope_step() {
+                        return false;
+                    }
+                    if !matches!(child.kind(), "annotation" | "marker_annotation") {
+                        found = Some(child);
+                        break;
+                    }
+                }
+                found
+            }
+            _ => None,
+        };
+        let Some(next) = next else {
+            break;
+        };
+        terminal = next;
+    }
+    node_contains_focus(terminal, focus)
+}
+
+/// The one Java applicability check (#1478 M3).
+///
+/// Every Java seam that discriminates overloads calls this, and it returns both
+/// halves of the answer in one value: the candidates the resolver binds
+/// (`winners`) and the per-candidate verdict with its typed rejection reason
+/// (`verdicts`). Before this factoring the same check ran twice in spirit --
+/// once as a `filter` that produced the binding and once as a trace loop that
+/// re-derived who had lost -- and only the survivors escaped. There is now one
+/// computation, so the rows a policy reads and the declaration the resolver
+/// bound cannot drift apart.
+fn java_candidate_applicability(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    candidates: &[CodeUnit],
+    arity: Option<usize>,
+) -> ApplicabilityOutcome {
+    arity_applicability(candidates, arity, |unit| {
+        Some(java_declared_arity(analyzer, Some(session), unit))
+    })
+}
+
+/// The parameter list a Java callable declares, as the resolver has always read
+/// it: the persisted arity when the extractor recorded one, and otherwise the
+/// count the indexed signature states. Java therefore always has a declared
+/// arity, which is why a Java candidate is never an undecided verdict once the
+/// call's argument count is known.
+fn java_declared_arity(
+    analyzer: &dyn IAnalyzer,
+    session: Option<&JavaResolutionSession<'_>>,
+    unit: &CodeUnit,
+) -> crate::analyzer::CallableArity {
+    java_signature_metadata(analyzer, session, unit)
+        .into_iter()
+        .find_map(|metadata| metadata.callable_arity())
+        .unwrap_or_else(|| {
+            crate::analyzer::CallableArity::exact(java_signature_arity(unit.signature()))
+        })
+}
+
+/// Narrow `candidates` to the overloads that accept the call, binding nothing
+/// when none does.
+///
+/// An earlier form of this filter kept the whole candidate set when no overload
+/// accepted the call. `e9033e203` removed that fallback so a constructor a
+/// semantic model supplies -- a Lombok `@NoArgsConstructor`, for example -- can
+/// be reported instead of an authored constructor the call cannot reach, and the
+/// same answer is what #1478's rule contract states: zero applicable candidates
+/// stay unresolved. Every refused candidate therefore becomes a rejected
+/// applicability row carrying its typed reason, and the site's selection summary
+/// reports `unresolved` rather than a bound set nobody accepted.
+fn java_filter_candidates_by_arity(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    candidates: Vec<CodeUnit>,
+    arity: Option<usize>,
+) -> Vec<CodeUnit> {
+    if arity.is_none() {
+        return candidates;
+    }
+    let applicability = java_candidate_applicability(analyzer, session, &candidates, arity);
+    java_record_callable_applicability(&applicability, &applicability.winners);
+    applicability.winners
+}
+
+/// Emit the callable-applicability trace for a seam with no member walk behind
+/// it, such as a constructor call or a static import.
+///
+/// A refused candidate the seam did **not** bind becomes a rejected row
+/// carrying its typed reason; a candidate the seam bound gets its verdict
+/// staged for the outcome constructor. Since `e9033e203` removed the
+/// no-accept fallback, every Java seam binds `ApplicabilityOutcome::winners`
+/// or nothing, so a bound candidate is never `inapplicable`: a site no overload
+/// accepts binds nothing, and its rows are the rejected ones. The one bound
+/// verdict that is not `applicable` is `unknown`, which the static-import seam
+/// stages when the call's argument count is unreadable and no candidate was
+/// measured at all.
+fn java_record_callable_applicability(applicability: &ApplicabilityOutcome, bound: &[CodeUnit]) {
+    if !trace::recording() {
+        return;
+    }
+    for verdict in &applicability.verdicts {
+        if verdict.verdict != ApplicabilityVerdict::Inapplicable
+            || bound.contains(&verdict.candidate)
+        {
+            continue;
+        }
+        trace::record(
+            trace::TraceCandidate::rejected(
+                trace::TraceCandidateRef::Unit(verdict.candidate.clone()),
+                None,
+                RejectionReason::CallableApplicabilityDeferred,
+            )
+            .with_callable(trace::CallableApplicabilityRecord {
+                verdict: verdict.verdict,
+                reason: verdict.reason,
+            }),
+        );
+    }
+    trace::stage_callable_context(
+        applicability
+            .verdicts
+            .iter()
+            .filter(|verdict| bound.contains(&verdict.candidate))
+            .map(|verdict| {
+                (
+                    verdict.candidate.fq_name(),
+                    trace::CallableApplicabilityRecord {
+                        verdict: verdict.verdict,
+                        reason: verdict.reason,
+                    },
+                )
+            })
+            .collect(),
+    );
+}
+
+fn java_signature_metadata(
+    analyzer: &dyn IAnalyzer,
+    session: Option<&JavaResolutionSession<'_>>,
+    unit: &CodeUnit,
+) -> Vec<crate::analyzer::SignatureMetadata> {
+    match session {
+        Some(session) => session.signature_metadata(analyzer, unit),
+        None => analyzer.signature_metadata(unit),
+    }
+}
+
+fn java_argument_count(node: Node<'_>) -> usize {
+    node.child_by_field_name("arguments")
+        .map(|arguments| arguments.named_child_count())
+        .unwrap_or(0)
+}
+
+fn java_method_reference_receiver_contains_focus(reference: Node<'_>, focus: Node<'_>) -> bool {
+    java_method_reference_receiver_node(reference)
+        .is_some_and(|receiver| node_contains_focus(receiver, focus))
+}
+
+fn resolve_java_field_access(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let support: &dyn BoundedDefinitionLookup = session;
+    let Some(field_node) = node.child_by_field_name("field") else {
+        return no_definition("no_field_name", "Java field access has no field name");
+    };
+    let field = java_node_text(field_node, source);
+    let Some(object) = node.child_by_field_name("object") else {
+        return no_definition("no_field_receiver", "Java field access has no receiver");
+    };
+    if let Some(owner) = java_receiver_type(analyzer, session, file, source, root, object) {
+        let qualified_name = format!("{}.{}", owner.fq_name(), field);
+        let has_indexed_field = support.fqn(&qualified_name).iter().any(CodeUnit::is_field);
+        if !has_indexed_field && java_field_access_is_selector_receiver(node) {
+            let nested_types = support
+                .fqn(&qualified_name)
+                .into_iter()
+                .filter(CodeUnit::is_class)
+                .collect::<Vec<_>>();
+            if !nested_types.is_empty() {
+                return candidates_outcome(nested_types);
+            }
+        }
+        return java_member_candidates(
+            analyzer,
+            session,
+            &owner,
+            field,
+            JavaMemberLookupKind::Field,
+            None,
+        );
+    }
+    java_unresolved_receiver_outcome(
+        analyzer,
+        session,
+        file,
+        source,
+        object,
+        field,
+        format!("receiver for Java field `{field}` is not resolved"),
+    )
+}
+
+/// What a member reference reports when its receiver is not a type this
+/// workspace indexes.
+///
+/// A receiver whose written spelling resolves to an *external* type, on which
+/// the external declaration surface declares `member`, is a reference the
+/// workspace cannot index rather than one nothing declares. That is the import
+/// boundary the resolver actually crossed, and reporting it is what lets the
+/// trace name the external declaration the reference landed on (#1900).
+/// Anything else keeps the plain unresolved-receiver miss, so a receiver of
+/// unknown type and a member no surface declares are both unchanged.
+fn java_unresolved_receiver_outcome(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    object: Node<'_>,
+    member: &str,
+    unresolved_message: String,
+) -> DefinitionLookupOutcome {
+    let spelling = format!("{}.{}", java_node_text(object, source), member);
+    gated_boundary(
+        || {
+            resolve_analyzer::<JavaAnalyzer>(analyzer).is_none_or(|java| {
+                session
+                    .query_optional_row(|| {
+                        java.resolve_member_name_with_external(
+                            analyzer.semantic_model_overlay(),
+                            file,
+                            &spelling,
+                        )
+                    })
+                    .is_none()
+            })
+        },
+        format!(
+            "`{spelling}` appears to cross a Java import boundary not indexed in this workspace"
+        ),
+        "unsupported_java_receiver",
+        unresolved_message,
+    )
+}
+
+fn java_field_access_is_selector_receiver(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| match parent.kind() {
+        "field_access" | "method_invocation" => parent.child_by_field_name("object") == Some(node),
+        "method_reference" => true,
+        _ => false,
+    })
+}
+
+fn resolve_java_bare_identifier(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+) -> DefinitionLookupOutcome {
+    let name = java_node_text(node, source);
+    if java_identifier_is_annotation_name(node) {
+        if let Some(unit) =
+            java_type_text_with_context(analyzer, java, session, file, name, node.start_byte())
+        {
+            return candidates_outcome(vec![unit]);
+        }
+        return java_bare_name_static_import_or_boundary(analyzer, java, session, file, name);
+    }
+    // JLS 6.4.2 (obscuring) and 6.5.2 (ambiguous names): outside a type context
+    // a simple name denotes a variable whenever one is in scope -- a local, a
+    // parameter, or a field of the enclosing class, inherited ones included --
+    // and the same-named type only when none is. A qualifier head
+    // (`Widget.CONST`, `Widget.of()`, `Widget::run`) is an ambiguous name and
+    // takes the same order. The inverse usage scan already refuses such a site
+    // as a type reference, so resolving the type first made the two surfaces
+    // disagree (#1754).
+    let locally_bound = java_local_binding_before(
+        analyzer,
+        java,
+        session,
+        file,
+        source,
+        root,
+        name,
+        node.start_byte(),
+    );
+    if !locally_bound {
+        let (initial_static_context, outer_static_context) =
+            session.enclosing_static_context(analyzer, file, node);
+        let outcome = java_member_candidates_in_enclosing_chain(
+            analyzer,
+            session,
+            session.enclosing_units(analyzer, file, node.start_byte()),
+            initial_static_context,
+            outer_static_context,
+            name,
+            JavaMemberLookupKind::Field,
+            None,
+        );
+        if outcome.status != DefinitionLookupStatus::NoDefinition {
+            return outcome;
+        }
+    }
+    if locally_bound {
+        return no_definition(
+            "local_binding",
+            format!("`{name}` resolves to a local Java binding"),
+        );
+    }
+    if let Some(unit) =
+        java_type_text_with_context(analyzer, java, session, file, name, node.start_byte())
+    {
+        return candidates_outcome(vec![unit]);
+    }
+    java_bare_name_static_import_or_boundary(analyzer, java, session, file, name)
+}
+
+/// tree-sitter-java spells every Java type reference as `type_identifier`,
+/// `scoped_type_identifier` or `generic_type` -- except an annotation name,
+/// which is a plain `identifier`. So this is the complete set of type contexts
+/// a bare-identifier reference site can sit in; everything else that reaches
+/// [`resolve_java_bare_identifier`] is an expression name or an ambiguous-name
+/// qualifier, where a variable in scope wins over a same-named type.
+fn java_identifier_is_annotation_name(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "annotation" | "marker_annotation")
+            && parent.child_by_field_name("name") == Some(node)
+    })
+}
+
+/// The last two tiers a bare Java name falls through to once neither a
+/// variable, a member of the enclosing class, nor a type name claimed it:
+/// static imports, then the import-boundary gate.
+fn java_bare_name_static_import_or_boundary(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    name: &str,
+) -> DefinitionLookupOutcome {
+    let static_import = java_static_import_candidates(
+        analyzer,
+        session,
+        file,
+        name,
+        JavaMemberLookupKind::Field,
+        None,
+    );
+    if static_import.status != DefinitionLookupStatus::NoDefinition {
+        return static_import;
+    }
+    // Workspace gate is the negation of the fused import-boundary predicate.
+    gated_boundary(
+        || !java_import_boundary_for_type(java, session, file, name),
+        format!("`{name}` appears to cross a Java import boundary not indexed in this workspace"),
+        "no_indexed_definition",
+        format!("`{name}` did not resolve to an indexed Java definition"),
+    )
+}
+
+fn java_receiver_type(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    object: Node<'_>,
+) -> Option<CodeUnit> {
+    let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
+    java_receiver_type_for_java(analyzer, java, session, file, source, root, object).or_else(|| {
+        matches!(object.kind(), "this" | "super")
+            .then(|| session.enclosing_unit(analyzer, file, object.start_byte()))
+            .flatten()
+    })
+}
+
+fn java_receiver_type_for_java(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    object: Node<'_>,
+) -> Option<CodeUnit> {
+    match object.kind() {
+        "object_creation_expression" => object.child_by_field_name("type").and_then(|type_node| {
+            java_type_from_node_with_context(analyzer, java, session, file, source, type_node)
+        }),
+        "type_identifier" | "scoped_type_identifier" | "generic_type" | "annotated_type" => {
+            let raw = java_node_text(object, source);
+            java_type_text_with_context(
+                analyzer,
+                java,
+                session,
+                file,
+                normalize_java_type_text(raw),
+                object.start_byte(),
+            )
+        }
+        "identifier" => {
+            let name = java_node_text(object, source);
+            // One scope-aware seeding pass answers both questions: the
+            // identifier's precise local type, and whether any binding on the
+            // active lexical path shadows the spelling. A binding in a sibling
+            // scope must not block resolving the name as a type (#1569).
+            let bindings = java_bindings_before_scoped(
+                analyzer,
+                java,
+                session,
+                file,
+                source,
+                root,
+                object.start_byte(),
+            );
+            first_precise(&bindings, name)
+                .or_else(|| {
+                    java_lambda_parameter_type_before(
+                        analyzer,
+                        java,
+                        session,
+                        file,
+                        source,
+                        root,
+                        name,
+                        object.start_byte(),
+                    )
+                })
+                .or_else(|| {
+                    (!bindings.is_shadowed(name))
+                        .then(|| {
+                            java_type_text_with_context(
+                                analyzer,
+                                java,
+                                session,
+                                file,
+                                name,
+                                object.start_byte(),
+                            )
+                        })
+                        .flatten()
+                })
+        }
+        // A method-call receiver (`getABC().i`) is typed by the called method's
+        // declared return type.
+        "method_invocation" => {
+            let outcome =
+                resolve_java_method_invocation(analyzer, session, file, source, root, object);
+            let method_unit = outcome.definitions.into_iter().next()?;
+            java_method_return_type_unit(analyzer, java, session, file, source, root, &method_unit)
+        }
+        "field_access" => {
+            let field_node = object.child_by_field_name("field")?;
+            let field = java_node_text(field_node, source);
+            let receiver = object.child_by_field_name("object")?;
+            let owner = java_receiver_type(analyzer, session, file, source, root, receiver)?;
+            let qualified_name = format!("{}.{}", owner.fq_name(), field);
+            let candidates = session.fqn(&qualified_name);
+            if let Some(field_unit) = candidates.iter().find(|unit| unit.is_field()) {
+                let type_text = java_signature_metadata(analyzer, Some(session), field_unit)
+                    .into_iter()
+                    .find_map(|metadata| metadata.return_type_text().map(str::to_owned))?;
+                return session
+                    .fqn(&format!("{}.{}", owner.fq_name(), type_text))
+                    .into_iter()
+                    .find(CodeUnit::is_class)
+                    .or_else(|| {
+                        java_type_text_with_context(
+                            analyzer,
+                            java,
+                            session,
+                            file,
+                            normalize_java_type_text(&type_text),
+                            object.start_byte(),
+                        )
+                    });
+            }
+            candidates.into_iter().find(CodeUnit::is_class)
+        }
+        _ => None,
+    }
+}
+
+/// Resolve the class named by a method's declared return type. The return type
+/// lives on the method's declaration AST node (the stored signature keeps only
+/// the parameter list), so read the `type` field from the declaration — using
+/// the current tree when the method is in this file, otherwise re-parsing the
+/// method's own file.
+fn java_method_return_type_unit(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    method_unit: &CodeUnit,
+) -> Option<CodeUnit> {
+    let method_range = session.ranges(analyzer, method_unit).first().copied()?;
+    let method_file = method_unit.source();
+    if method_file == file {
+        let type_node = java_return_type_node_covering(session, root, &method_range)?;
+        return java_type_from_node_with_context(analyzer, java, session, file, source, type_node);
+    }
+    let method_source = session.read_source(method_file)?;
+    let tree = session.parse_java_source(&method_source)?;
+    let type_node = java_return_type_node_covering(session, tree.root_node(), &method_range)?;
+    java_type_from_node_with_context(
+        analyzer,
+        java,
+        session,
+        method_file,
+        &method_source,
+        type_node,
+    )
+}
+
+/// The `type` (return-type) node of the innermost `method_declaration` whose
+/// span covers `range`.
+fn java_return_type_node_covering<'tree>(
+    session: &JavaResolutionSession<'_>,
+    root: Node<'tree>,
+    range: &Range,
+) -> Option<Node<'tree>> {
+    let mut result = None;
+    let mut next = Some(root);
+    while let Some(node) = next {
+        if !session.charge_scope_step() {
+            return None;
+        }
+        let contains = node.start_byte() <= range.start_byte && node.end_byte() >= range.end_byte;
+        if contains
+            && node.kind() == "method_declaration"
+            && let Some(type_node) = node.child_by_field_name("type")
+        {
+            result = Some(type_node);
+        }
+        next = java_next_named_preorder(root, node, contains);
+    }
+    result
+}
+
+fn java_is_callable_declaration_name(parent: Node<'_>, name: Node<'_>) -> bool {
+    parent.child_by_field_name("name") == Some(name)
+        && matches!(
+            parent.kind(),
+            "method_declaration" | "constructor_declaration" | "compact_constructor_declaration"
+        )
+}
+
+/// Resolve the name of a `scoped_type_identifier` (`B.Foo`) by resolving the
+/// qualifier (`B`) and finding the nested type `Foo` in it — directly or via a
+/// superclass/interface. Handles cases the from-context nested lookup misses,
+/// like `class A extends B.Foo`.
+fn java_qualified_nested_type(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Option<CodeUnit> {
+    let parent = node.parent()?;
+    if parent.kind() != "scoped_type_identifier" {
+        return None;
+    }
+    let mut cursor = parent.walk();
+    let mut qualifier = None;
+    for child in parent.named_children(&mut cursor) {
+        if !session.charge_scope_step() {
+            return None;
+        }
+        if child.id() != node.id() && child.end_byte() <= node.start_byte() {
+            qualifier = Some(child);
+            break;
+        }
+    }
+    let qualifier = qualifier?;
+    let qualifier_type =
+        java_type_from_node_with_context(analyzer, java, session, file, source, qualifier)?;
+    let name = java_node_text(node, source);
+
+    let nested = |owner: &CodeUnit| {
+        session
+            .fqn(&format!("{}.{}", owner.fq_name(), name))
+            .into_iter()
+            .find(|unit| unit.is_class())
+    };
+    if let Some(unit) = nested(&qualifier_type) {
+        return Some(unit);
+    }
+    let provider = analyzer.type_hierarchy_provider()?;
+    let mut queue = VecDeque::from(session.direct_ancestors(provider, &qualifier_type));
+    let mut seen = HashSet::default();
+    seen.insert(qualifier_type);
+    while let Some(ancestor) = queue.pop_front() {
+        if !session.observe_cancellation() {
+            return None;
+        }
+        if !seen.insert(ancestor.clone()) {
+            continue;
+        }
+        if let Some(unit) = nested(&ancestor) {
+            return Some(unit);
+        }
+        queue.extend(session.direct_ancestors(provider, &ancestor));
+    }
+    None
+}
+
+fn java_enclosing_scoped_type_identifier<'tree>(
+    session: &JavaResolutionSession<'_>,
+    node: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let mut current = node;
+    loop {
+        if !session.charge_scope_step() {
+            return None;
+        }
+        if current.kind() == "scoped_type_identifier" {
+            return Some(current);
+        }
+        let parent = current.parent()?;
+        if !matches!(
+            parent.kind(),
+            "annotated_type" | "generic_type" | "scoped_type_identifier"
+        ) {
+            return None;
+        }
+        current = parent;
+    }
+}
+
+fn java_scoped_type_qualifier_resolves_in_source(
+    session: &JavaResolutionSession<'_>,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    scoped: Node<'_>,
+) -> bool {
+    java_scoped_type_qualifier_text(session, scoped, source)
+        .and_then(|qualifier| session.resolve_type_name_in_file(java, file, qualifier))
+        .is_some()
+}
+
+fn java_scoped_type_qualifier_text<'a>(
+    session: &JavaResolutionSession<'_>,
+    scoped: Node<'_>,
+    source: &'a str,
+) -> Option<&'a str> {
+    let mut cursor = scoped.walk();
+    for child in scoped.named_children(&mut cursor) {
+        if !session.charge_scope_step() {
+            return None;
+        }
+        if child.end_byte() < scoped.end_byte() {
+            let qualifier = java_node_text(child, source);
+            return (!qualifier.is_empty()).then_some(qualifier);
+        }
+    }
+    None
+}
+
+fn java_type_from_node_with_context(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    type_node: Node<'_>,
+) -> Option<CodeUnit> {
+    java_type_text_with_context(
+        analyzer,
+        java,
+        session,
+        file,
+        normalize_java_type_text(java_node_text(type_node, source)),
+        type_node.start_byte(),
+    )
+}
+
+fn java_type_text_with_context(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    normalized: &str,
+    byte: usize,
+) -> Option<CodeUnit> {
+    if normalized.is_empty() {
+        return None;
+    }
+    if !normalized.contains('.')
+        && let Some(unit) = java_nested_type_from_context(analyzer, session, file, normalized, byte)
+    {
+        return Some(unit);
+    }
+    session.resolve_type_name_in_file(java, file, normalized)
+}
+
+fn java_nested_type_from_context(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    normalized: &str,
+    byte: usize,
+) -> Option<CodeUnit> {
+    if normalized.contains('.') || normalized.is_empty() {
+        return None;
+    }
+    let mut owner = session.enclosing_unit(analyzer, file, byte);
+    while let Some(current) = owner {
+        let child_fqn = format!("{}.{}", current.fq_name(), normalized);
+        if let Some(child) = session.fqn(&child_fqn).into_iter().find(CodeUnit::is_class) {
+            return Some(child);
+        }
+        // Packages are module parents in the analyzer graph, not lexical type scopes.
+        owner = session
+            .parent_of(analyzer, &current)
+            .filter(CodeUnit::is_class);
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_type_of_identifier_before(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    name: &str,
+    before_byte: usize,
+) -> Option<CodeUnit> {
+    let bindings =
+        java_bindings_before_scoped(analyzer, java, session, file, source, root, before_byte);
+    first_precise(&bindings, name)
+}
+
+const JAVA_TYPE_LOOKUP_SCOPE_NODES: &[&str] = &[
+    "method_declaration",
+    "constructor_declaration",
+    "compact_constructor_declaration",
+    "block",
+    "lambda_expression",
+    "catch_clause",
+    "enhanced_for_statement",
+    "for_statement",
+    "try_with_resources_statement",
+];
+
+fn java_bindings_before_scoped(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    cutoff_start: usize,
+) -> LocalInferenceEngine<CodeUnit> {
+    java_bindings_before_scoped_inner(
+        analyzer,
+        java,
+        session,
+        file,
+        source,
+        root,
+        cutoff_start,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_local_binding_before(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    name: &str,
+    cutoff_start: usize,
+) -> bool {
+    java_bindings_before_scoped_inner(
+        analyzer,
+        java,
+        session,
+        file,
+        source,
+        root,
+        cutoff_start,
+        false,
+    )
+    .is_shadowed(name)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_bindings_before_scoped_inner(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    cutoff_start: usize,
+    include_fields: bool,
+) -> LocalInferenceEngine<CodeUnit> {
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    java_seed_active_path(
+        analyzer,
+        java,
+        session,
+        file,
+        source,
+        root,
+        cutoff_start,
+        include_fields,
+        &mut bindings,
+    );
+    bindings
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_seed_active_path(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    cutoff_start: usize,
+    include_fields: bool,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    let root = node;
+    let mut next = Some(root);
+    while let Some(node) = next {
+        if !session.charge_scope_step() {
+            return;
+        }
+        if node.start_byte() >= cutoff_start {
+            next = java_next_named_preorder(root, node, false);
+            continue;
+        }
+        let enters_scope = JAVA_TYPE_LOOKUP_SCOPE_NODES.contains(&node.kind());
+        if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
+            next = java_next_named_preorder(root, node, false);
+            continue;
+        }
+        if enters_scope {
+            bindings.enter_scope();
+            java_seed_scope_declarations(
+                analyzer,
+                java,
+                session,
+                file,
+                source,
+                node,
+                cutoff_start,
+                bindings,
+            );
+        } else {
+            java_seed_inline_typed_binding_inner(
+                analyzer,
+                java,
+                session,
+                file,
+                source,
+                node,
+                include_fields,
+                bindings,
+            );
+        }
+
+        next = java_next_named_preorder(root, node, true);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_seed_scope_declarations(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    cutoff_start: usize,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    match node.kind() {
+        "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
+            if let Some(parameters) = node.child_by_field_name("parameters") {
+                let mut cursor = parameters.walk();
+                for parameter in parameters.named_children(&mut cursor) {
+                    if !session.charge_scope_step() {
+                        return;
+                    }
+                    if parameter.kind() == "formal_parameter" {
+                        java_seed_inline_typed_binding(
+                            analyzer, java, session, file, source, parameter, bindings,
+                        );
+                    }
+                }
+            }
+        }
+        "catch_clause" => {
+            if let Some(parameter) = node.child_by_field_name("parameter") {
+                java_seed_inline_typed_binding(
+                    analyzer, java, session, file, source, parameter, bindings,
+                );
+            }
+        }
+        "enhanced_for_statement" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                bindings.declare_shadow(java_node_text(name, source));
+            }
+        }
+        "try_with_resources_statement" => {
+            let Some(resources) = node.child_by_field_name("resources") else {
+                return;
+            };
+            let cutoff_in_resources =
+                resources.start_byte() <= cutoff_start && cutoff_start < resources.end_byte();
+            let cutoff_in_body = node.child_by_field_name("body").is_some_and(|body| {
+                body.start_byte() <= cutoff_start && cutoff_start < body.end_byte()
+            });
+            if !cutoff_in_resources && !cutoff_in_body {
+                return;
+            }
+            let mut cursor = resources.walk();
+            for resource in resources.named_children(&mut cursor) {
+                if !session.charge_scope_step() {
+                    return;
+                }
+                if resource.kind() == "resource"
+                    && (cutoff_in_body || resource.end_byte() <= cutoff_start)
+                {
+                    java_seed_typed_name_binding(
+                        analyzer, java, session, file, source, resource, bindings,
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn java_seed_inline_typed_binding(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    java_seed_inline_typed_binding_inner(
+        analyzer, java, session, file, source, node, true, bindings,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_seed_inline_typed_binding_inner(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    include_fields: bool,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    match node.kind() {
+        "local_variable_declaration" | "field_declaration"
+            if include_fields || node.kind() == "local_variable_declaration" =>
+        {
+            let resolved = node.child_by_field_name("type").and_then(|type_node| {
+                java_type_from_node_with_context(analyzer, java, session, file, source, type_node)
+            });
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if !session.charge_scope_step() {
+                    return;
+                }
+                if child.kind() != "variable_declarator" {
+                    continue;
+                }
+                let Some(name) = child.child_by_field_name("name") else {
+                    continue;
+                };
+                let binding_name = java_node_text(name, source);
+                if let Some(unit) = resolved.as_ref() {
+                    bindings.seed_symbol(binding_name, unit.clone());
+                } else {
+                    bindings.declare_shadow(binding_name);
+                }
+            }
+        }
+        "formal_parameter" => {
+            java_seed_typed_name_binding(analyzer, java, session, file, source, node, bindings)
+        }
+        _ => {}
+    }
+}
+
+fn java_seed_typed_name_binding(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    let binding_name = java_node_text(name, source);
+    if let Some(unit) = node.child_by_field_name("type").and_then(|type_node| {
+        java_type_from_node_with_context(analyzer, java, session, file, source, type_node)
+    }) {
+        bindings.seed_symbol(binding_name, unit);
+    } else {
+        bindings.declare_shadow(binding_name);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_lambda_parameter_type_before(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    name: &str,
+    before_byte: usize,
+) -> Option<CodeUnit> {
+    let type_text = java_lambda_parameter_type_text_before(
+        analyzer,
+        java,
+        session,
+        file,
+        source,
+        root,
+        name,
+        before_byte,
+    )?;
+    java_type_text_with_context(
+        analyzer,
+        java,
+        session,
+        file,
+        normalize_java_type_text(&type_text),
+        before_byte,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_lambda_parameter_type_text_before(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    name: &str,
+    before_byte: usize,
+) -> Option<String> {
+    let lambda = java_matching_lambda_parameter(session, root, source, name, before_byte)?;
+    let invocation = java_ancestor_method_invocation(session, lambda)?;
+    let method = invocation
+        .child_by_field_name("name")
+        .map(|node| java_node_text(node, source))?;
+    let object = invocation.child_by_field_name("object")?;
+    match method {
+        "filter" => {
+            if object.kind() == "method_invocation"
+                && object
+                    .child_by_field_name("name")
+                    .is_some_and(|node| java_node_text(node, source) == "stream")
+                && let Some(collection) = object.child_by_field_name("object")
+            {
+                return java_collection_element_type_text(
+                    analyzer,
+                    java,
+                    session,
+                    file,
+                    source,
+                    root,
+                    collection,
+                    lambda.start_byte(),
+                );
+            }
+            java_collection_element_type_text(
+                analyzer,
+                java,
+                session,
+                file,
+                source,
+                root,
+                object,
+                lambda.start_byte(),
+            )
+        }
+        "forEach" => java_collection_element_type_text(
+            analyzer,
+            java,
+            session,
+            file,
+            source,
+            root,
+            object,
+            lambda.start_byte(),
+        ),
+        _ => None,
+    }
+}
+
+fn java_matching_lambda_parameter<'tree>(
+    session: &JavaResolutionSession<'_>,
+    root: Node<'tree>,
+    source: &str,
+    name: &str,
+    before_byte: usize,
+) -> Option<Node<'tree>> {
+    let mut best = None;
+    let mut next = Some(root);
+    while let Some(node) = next {
+        if !session.charge_scope_step() {
+            return None;
+        }
+        let contains = node.start_byte() <= before_byte && node.end_byte() >= before_byte;
+        if contains
+            && node.kind() == "lambda_expression"
+            && java_lambda_has_parameter(session, node, source, name, before_byte)
+        {
+            let span = node.end_byte() - node.start_byte();
+            if best
+                .map(|current: Node<'_>| span < current.end_byte() - current.start_byte())
+                .unwrap_or(true)
+            {
+                best = Some(node);
+            }
+        }
+        next = java_next_named_preorder(root, node, contains);
+    }
+    best
+}
+
+fn java_lambda_has_parameter(
+    session: &JavaResolutionSession<'_>,
+    lambda: Node<'_>,
+    source: &str,
+    name: &str,
+    before_byte: usize,
+) -> bool {
+    let mut cursor = lambda.walk();
+    for child in lambda.named_children(&mut cursor) {
+        if !session.charge_scope_step() {
+            return false;
+        }
+        if child.start_byte() >= before_byte {
+            continue;
+        }
+        if child.kind() == "identifier" && java_node_text(child, source) == name {
+            return true;
+        }
+        if matches!(child.kind(), "formal_parameters" | "inferred_parameters") {
+            let mut inner = child.walk();
+            for parameter in child.named_children(&mut inner) {
+                if !session.charge_scope_step() {
+                    return false;
+                }
+                if parameter.kind() == "identifier" && java_node_text(parameter, source) == name {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn java_ancestor_method_invocation<'tree>(
+    session: &JavaResolutionSession<'_>,
+    mut node: Node<'tree>,
+) -> Option<Node<'tree>> {
+    while let Some(parent) = node.parent() {
+        if !session.charge_scope_step() {
+            return None;
+        }
+        if parent.kind() == "method_invocation" {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_collection_element_type_text(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+    before_byte: usize,
+) -> Option<String> {
+    if expression.kind() == "method_invocation"
+        && expression
+            .child_by_field_name("name")
+            .is_some_and(|node| java_node_text(node, source) == "values")
+        && let Some(object) = expression.child_by_field_name("object")
+    {
+        let type_text = java_expression_type_text(
+            analyzer,
+            java,
+            session,
+            file,
+            source,
+            root,
+            object,
+            before_byte,
+        )?;
+        if !java_is_map_type(&type_text) {
+            return None;
+        }
+        return java_generic_arg(&type_text, 1);
+    }
+    let type_text = java_expression_type_text(
+        analyzer,
+        java,
+        session,
+        file,
+        source,
+        root,
+        expression,
+        before_byte,
+    )?;
+    if !java_is_collection_type(&type_text) {
+        return None;
+    }
+    java_generic_arg(&type_text, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn java_expression_type_text(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    expression: Node<'_>,
+    before_byte: usize,
+) -> Option<String> {
+    match expression.kind() {
+        "identifier" => {
+            let name = java_node_text(expression, source);
+            java_identifier_type_text_before(session, java, file, source, root, name, before_byte)
+                .or_else(|| {
+                    java_lambda_parameter_type_text_before(
+                        analyzer,
+                        java,
+                        session,
+                        file,
+                        source,
+                        root,
+                        name,
+                        before_byte,
+                    )
+                })
+        }
+        "field_access" => {
+            let field_node = expression.child_by_field_name("field")?;
+            let field = java_node_text(field_node, source);
+            let object = expression.child_by_field_name("object")?;
+            let owner = java_receiver_type(analyzer, session, file, source, root, object)?;
+            let unit = session
+                .fqn(&format!("{}.{}", owner.fq_name(), field))
+                .into_iter()
+                .next()?;
+            let signature = unit
+                .signature()
+                .map(str::to_string)
+                .or_else(|| session.signatures(analyzer, &unit).first().cloned())?;
+            java_field_type_text_from_signature(&signature, field)
+        }
+        "method_invocation" => {
+            if expression
+                .child_by_field_name("name")
+                .is_some_and(|node| java_node_text(node, source) == "values")
+                && let Some(object) = expression.child_by_field_name("object")
+            {
+                let type_text = java_expression_type_text(
+                    analyzer,
+                    java,
+                    session,
+                    file,
+                    source,
+                    root,
+                    object,
+                    before_byte,
+                )?;
+                if !java_is_map_type(&type_text) {
+                    return None;
+                }
+                return java_generic_arg(&type_text, 1);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn java_identifier_type_text_before(
+    session: &JavaResolutionSession<'_>,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    name: &str,
+    before_byte: usize,
+) -> Option<String> {
+    let mut found = None;
+    let mut next = Some(root);
+    while let Some(node) = next {
+        if !session.charge_scope_step() {
+            return found;
+        }
+        if node.start_byte() >= before_byte {
+            next = java_next_named_preorder(root, node, false);
+            continue;
+        }
+        match node.kind() {
+            "local_variable_declaration" | "field_declaration" => {
+                if let Some(type_node) = node.child_by_field_name("type") {
+                    let type_text = normalize_java_type_text(java_node_text(type_node, source));
+                    let mut cursor = node.walk();
+                    for child in node.named_children(&mut cursor) {
+                        if !session.charge_scope_step() {
+                            return found;
+                        }
+                        if child.kind() == "variable_declarator"
+                            && let Some(name_node) = child.child_by_field_name("name")
+                            && name_node.start_byte() < before_byte
+                            && java_node_text(name_node, source) == name
+                        {
+                            found = Some(type_text.to_string());
+                        }
+                    }
+                }
+            }
+            "formal_parameter" | "resource" => {
+                if let Some(name_node) = node.child_by_field_name("name")
+                    && name_node.start_byte() < before_byte
+                    && java_node_text(name_node, source) == name
+                    && let Some(type_node) = node.child_by_field_name("type")
+                {
+                    found = Some(
+                        normalize_java_type_text(java_node_text(type_node, source)).to_string(),
+                    );
+                }
+            }
+            _ => {}
+        }
+        next = java_next_named_preorder(root, node, true);
+    }
+    if found.is_none()
+        && session
+            .resolve_type_name_in_file(java, file, name)
+            .is_some()
+    {
+        found = Some(name.to_string());
+    }
+    found
+}
+
+fn java_field_type_text_from_signature(signature: &str, field: &str) -> Option<String> {
+    let before_initializer = signature.split('=').next().unwrap_or(signature);
+    let field_start = before_initializer.rfind(field)?;
+    let mut type_text = before_initializer[..field_start].trim();
+    for modifier in [
+        "public",
+        "protected",
+        "private",
+        "static",
+        "final",
+        "transient",
+        "volatile",
+    ] {
+        type_text = type_text
+            .strip_prefix(modifier)
+            .unwrap_or(type_text)
+            .trim_start();
+    }
+    (!type_text.is_empty()).then(|| type_text.to_string())
+}
+
+fn java_generic_arg(type_text: &str, index: usize) -> Option<String> {
+    let start = type_text.find('<')?;
+    let end = type_text.rfind('>')?;
+    if end <= start {
+        return None;
+    }
+    let mut args = Vec::new();
+    let mut depth = 0usize;
+    let mut arg_start = start + 1;
+    let inner = &type_text[start + 1..end];
+    for (offset, ch) in inner.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                args.push(inner[arg_start - start - 1..offset].trim().to_string());
+                arg_start = start + 1 + offset + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    args.push(type_text[arg_start..end].trim().to_string());
+    args.get(index).filter(|arg| !arg.is_empty()).cloned()
+}
+
+fn java_is_map_type(type_text: &str) -> bool {
+    matches!(
+        java_raw_type_name(type_text).as_deref(),
+        Some("Map")
+            | Some("HashMap")
+            | Some("LinkedHashMap")
+            | Some("NavigableMap")
+            | Some("SortedMap")
+            | Some("TreeMap")
+            | Some("ConcurrentMap")
+            | Some("ConcurrentHashMap")
+    )
+}
+
+fn java_is_collection_type(type_text: &str) -> bool {
+    matches!(
+        java_raw_type_name(type_text).as_deref(),
+        Some("Iterable")
+            | Some("Collection")
+            | Some("List")
+            | Some("ArrayList")
+            | Some("LinkedList")
+            | Some("Set")
+            | Some("HashSet")
+            | Some("LinkedHashSet")
+            | Some("SortedSet")
+            | Some("NavigableSet")
+            | Some("Stream")
+    )
+}
+
+fn java_raw_type_name(type_text: &str) -> Option<String> {
+    let raw = type_text
+        .trim()
+        .split('<')
+        .next()
+        .unwrap_or(type_text)
+        .trim();
+    java_terminal_segment(raw)
+}
+
+/// The final `.`-joined segment of a Java-spelled qualified name (an import
+/// path or type reference, with any generic argument list already stripped by
+/// the caller). Java identifiers never contain a literal `.`, so re-tokenizing
+/// with the shared structured splitter and taking the last segment reproduces
+/// `rsplit('.').next()`'s terminal split exactly.
+fn java_terminal_segment(path: &str) -> Option<String> {
+    crate::analyzer::symbol_lookup::parse_symbol_path(Language::Java, path)
+        .pop()
+        .filter(|segment| !segment.is_empty())
+}
+
+/// The per-candidate attribution the Java member walk records while it runs,
+/// built only when a trace is being recorded (#1477). The walk itself decides
+/// nothing from it; it is an emission of facts the walk already holds: which
+/// hierarchy type each candidate was found on, at which BFS depth, and through
+/// which first-discovery parent chain.
+#[derive(Default)]
+struct JavaMemberTrace {
+    /// First-discovery parent of each ancestor the walk expanded, which makes
+    /// the route reconstruction a bounded walk back to the receiver's owner.
+    parents: HashMap<CodeUnit, CodeUnit>,
+    /// Candidate declaration -> (hierarchy type it was found on, BFS depth).
+    found: HashMap<CodeUnit, (CodeUnit, usize)>,
+}
+
+impl JavaMemberTrace {
+    fn record_found(&mut self, candidates: &[CodeUnit], found_on: &CodeUnit, depth: usize) {
+        for candidate in candidates {
+            self.found
+                .entry(candidate.clone())
+                .or_insert_with(|| (found_on.clone(), depth));
+        }
+    }
+
+    /// The exact hierarchy route from `base` to the type `candidate` was found
+    /// on, as first-discovery hops. The provider reports undifferentiated
+    /// ancestors, so every hop is [`HierarchyRelation::Supertype`].
+    fn route(&self, base: &CodeUnit, candidate: &CodeUnit) -> Vec<trace::HierarchyHopRecord> {
+        use crate::analyzer::structural::HierarchyRelation;
+
+        let Some((found_on, depth)) = self.found.get(candidate) else {
+            return Vec::new();
+        };
+        let mut chain = vec![found_on.clone()];
+        while chain.last() != Some(base) {
+            let Some(parent) = self
+                .parents
+                .get(chain.last().expect("chain is never empty"))
+            else {
+                break;
+            };
+            chain.push(parent.clone());
+        }
+        chain.reverse();
+        debug_assert_eq!(
+            chain.len(),
+            depth + 1,
+            "the first-discovery chain must be exactly the BFS depth"
+        );
+        chain
+            .windows(2)
+            .enumerate()
+            .map(|(hop, pair)| trace::HierarchyHopRecord {
+                hop,
+                from: pair[0].clone(),
+                to: pair[1].clone(),
+                relation: HierarchyRelation::Supertype,
+            })
+            .collect()
+    }
+
+    fn enrichment(
+        &self,
+        base: &CodeUnit,
+        candidate: &CodeUnit,
+        applicability: brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict,
+    ) -> Option<trace::MemberEnrichment> {
+        use crate::analyzer::structural::MemberDispatchTier;
+
+        let (found_on, depth) = self.found.get(candidate)?;
+        let dispatch_tier = if *depth == 0 {
+            MemberDispatchTier::InherentOrDirect
+        } else {
+            MemberDispatchTier::InheritedOrPromoted
+        };
+        Some(trace::MemberEnrichment {
+            owner: found_on.clone(),
+            hierarchy_depth: *depth,
+            dispatch_tier,
+            applicability,
+            route: self.route(base, candidate),
+        })
+    }
+
+    /// Stage attribution for the candidates this lookup is about to bind, and
+    /// record every refused candidate it discarded as a rejected row.
+    ///
+    /// `applicability` is the *same* value the caller used to decide what to
+    /// bind (#1478 M3): the winners here are the winners the resolver bound,
+    /// and each row's verdict and typed reason are the ones the check produced.
+    /// `bound` is what the seam actually returns, which is `winners` where the
+    /// call's argument count is known, the whole considered set where it is not
+    /// (every verdict is then `unknown`), and empty where nothing accepted the
+    /// call. A bound candidate is never reported as rejected.
+    ///
+    /// On the resolution axis a refused candidate keeps
+    /// [`RejectionReason::CallableApplicabilityDeferred`]: that reason now
+    /// points at real evidence rather than standing in for it, because the
+    /// candidate's applicability row carries the exact callable reason.
+    fn stage_selection(
+        &self,
+        base: &CodeUnit,
+        applicability: &ApplicabilityOutcome,
+        bound: &[CodeUnit],
+    ) {
+        use crate::analyzer::structural::PrecedenceTier;
+
+        let tier_of = |unit: &CodeUnit| {
+            self.found.get(unit).map(|(_, depth)| {
+                if *depth == 0 {
+                    PrecedenceTier::OwnMember
+                } else {
+                    PrecedenceTier::InheritedMember
+                }
+            })
+        };
+        for verdict in &applicability.verdicts {
+            if verdict.verdict != ApplicabilityVerdict::Inapplicable
+                || bound.contains(&verdict.candidate)
+            {
+                continue;
+            }
+            let mut row = trace::TraceCandidate::rejected(
+                trace::TraceCandidateRef::Unit(verdict.candidate.clone()),
+                tier_of(&verdict.candidate),
+                RejectionReason::CallableApplicabilityDeferred,
+            )
+            .with_callable(trace::CallableApplicabilityRecord {
+                verdict: verdict.verdict,
+                reason: verdict.reason,
+            });
+            if let Some(enrichment) =
+                self.enrichment(base, &verdict.candidate, ApplicabilityVerdict::Inapplicable)
+            {
+                row = row.with_member(enrichment);
+            }
+            trace::record(row);
+        }
+        let winner_tier = bound
+            .iter()
+            .filter_map(|unit| self.found.get(unit))
+            .map(|(_, depth)| *depth)
+            .min()
+            .map(|depth| {
+                if depth == 0 {
+                    PrecedenceTier::OwnMember
+                } else {
+                    PrecedenceTier::InheritedMember
+                }
+            });
+        if let Some(tier) = winner_tier {
+            trace::stage_tier(tier, bound.iter().map(|unit| unit.fq_name()).collect());
+        }
+        let verdict_of = |unit: &CodeUnit| {
+            applicability
+                .verdicts
+                .iter()
+                .find(|verdict| verdict.candidate == *unit)
+        };
+        trace::stage_member_context(
+            bound
+                .iter()
+                .filter_map(|unit| {
+                    let applicability = verdict_of(unit)
+                        .map(|verdict| verdict.verdict)
+                        .unwrap_or(ApplicabilityVerdict::Unknown);
+                    self.enrichment(base, unit, applicability)
+                        .map(|enrichment| (unit.fq_name(), enrichment))
+                })
+                .collect(),
+        );
+        trace::stage_callable_context(
+            bound
+                .iter()
+                .filter_map(|unit| {
+                    verdict_of(unit).map(|verdict| {
+                        (
+                            unit.fq_name(),
+                            trace::CallableApplicabilityRecord {
+                                verdict: verdict.verdict,
+                                reason: verdict.reason,
+                            },
+                        )
+                    })
+                })
+                .collect(),
+        );
+    }
+}
+
+/// Resolve a bare Java member through each lexical class scope, from the
+/// innermost class outward. Each scope runs its complete member and ancestor
+/// walk before the next scope starts (#1905).
+#[allow(clippy::too_many_arguments)]
+fn java_member_candidates_in_enclosing_chain(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    owners: Vec<CodeUnit>,
+    initial_static_context: bool,
+    outer_static_context: bool,
+    member: &str,
+    kind: JavaMemberLookupKind,
+    arity: Option<usize>,
+) -> DefinitionLookupOutcome {
+    let mut innermost_failure = None;
+    let mut static_context = initial_static_context;
+    for (owner_index, owner) in owners.into_iter().enumerate() {
+        if owner_index > 0 {
+            static_context |= outer_static_context;
+        }
+        if !session.charge_scope_step() {
+            return no_definition(
+                "java_resolution_stopped",
+                "Java member resolution stopped before completion",
+            );
+        }
+        let outcome = java_member_candidates(analyzer, session, &owner, member, kind, arity);
+        let outcome = if static_context {
+            java_static_context_member_outcome(analyzer, session, outcome, kind, member)
+        } else {
+            outcome
+        };
+        if outcome.status != DefinitionLookupStatus::NoDefinition {
+            return outcome;
+        }
+        if java_member_declared_in_hierarchy(analyzer, session, &owner, member, kind) {
+            return outcome;
+        }
+        innermost_failure.get_or_insert(outcome);
+        static_context |= java_class_is_static(analyzer, session, &owner);
+    }
+    innermost_failure.unwrap_or_else(|| {
+        no_definition(
+            "no_enclosing_class",
+            format!("`{member}` has no enclosing indexed Java class"),
+        )
+    })
+}
+
+fn java_class_is_static(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    owner: &CodeUnit,
+) -> bool {
+    session
+        .signature_metadata(analyzer, owner)
+        .iter()
+        .any(|metadata| metadata.class_like_is_static())
+}
+
+fn java_member_is_static(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    member: &CodeUnit,
+    kind: JavaMemberLookupKind,
+) -> bool {
+    session
+        .signature_metadata(analyzer, member)
+        .iter()
+        .any(|metadata| match kind {
+            JavaMemberLookupKind::Field => metadata.field_is_static(),
+            JavaMemberLookupKind::Method => metadata.callable_is_static(),
+            JavaMemberLookupKind::Type => false,
+        })
+}
+
+fn java_static_context_member_outcome(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    outcome: DefinitionLookupOutcome,
+    kind: JavaMemberLookupKind,
+    member: &str,
+) -> DefinitionLookupOutcome {
+    if outcome.definitions.is_empty() {
+        return outcome;
+    }
+    let definitions: Vec<_> = outcome
+        .definitions
+        .iter()
+        .filter(|candidate| java_member_is_static(analyzer, session, candidate, kind))
+        .cloned()
+        .collect();
+    if definitions.is_empty() {
+        return no_definition(
+            "java_static_context",
+            format!("`{member}` is an instance Java member outside a static context"),
+        );
+    }
+    if definitions.len() == outcome.definitions.len() {
+        outcome
+    } else {
+        candidates_outcome(definitions)
+    }
+}
+
+fn java_member_declared_in_hierarchy(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    owner: &CodeUnit,
+    member: &str,
+    kind: JavaMemberLookupKind,
+) -> bool {
+    let Some(provider) = analyzer.type_hierarchy_provider() else {
+        return false;
+    };
+    let mut seen = HashSet::default();
+    let mut level = vec![owner.clone()];
+    while !level.is_empty() {
+        let mut next = Vec::new();
+        for current in level {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            if !java_filter_member_candidates(
+                session.fqn(&format!("{}.{}", current.fq_name(), member)),
+                kind,
+            )
+            .is_empty()
+            {
+                return true;
+            }
+            next.extend(session.direct_ancestors(provider, &current));
+        }
+        level = next;
+    }
+    false
+}
+
+fn java_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    owner: &CodeUnit,
+    member: &str,
+    kind: JavaMemberLookupKind,
+    arity: Option<usize>,
+) -> DefinitionLookupOutcome {
+    let support: &dyn BoundedDefinitionLookup = session;
+    let owner_fqn = owner.fq_name();
+    let mut member_trace = trace::recording().then(JavaMemberTrace::default);
+    let mut candidates =
+        java_filter_member_candidates(support.fqn(&format!("{owner_fqn}.{member}")), kind);
+    sort_units(&mut candidates);
+    candidates.dedup();
+    if let Some(state) = member_trace.as_mut() {
+        state.record_found(&candidates, owner, 0);
+    }
+    // One applicability computation decides what to bind and what to report
+    // (#1478 M3): `winners` is the production filter, `verdicts` is the
+    // evidence, and neither can drift from the other.
+    let applicability = java_candidate_applicability(analyzer, session, &candidates, arity);
+    if arity.is_some() && !applicability.winners.is_empty() {
+        if let Some(state) = member_trace.as_ref() {
+            state.stage_selection(owner, &applicability, &applicability.winners);
+        }
+        return candidates_outcome(applicability.winners);
+    }
+    if !candidates.is_empty() && arity.is_none() {
+        if let Some(state) = member_trace.as_ref() {
+            state.stage_selection(owner, &applicability, &candidates);
+        }
+        return candidates_outcome(candidates);
+    }
+    if !candidates.is_empty() {
+        // Arity is known and nothing accepted (#1755): the direct set is
+        // discarded, never bound. Record the discard as rejected rows.
+        if let Some(state) = member_trace.as_ref() {
+            state.stage_selection(owner, &applicability, &[]);
+        }
+    }
+
+    if let Some(provider) = analyzer.type_hierarchy_provider() {
+        let mut seen = HashSet::default();
+        let mut level = session.direct_ancestors(provider, owner);
+        if let Some(state) = member_trace.as_mut() {
+            for ancestor in &level {
+                state
+                    .parents
+                    .entry(ancestor.clone())
+                    .or_insert_with(|| owner.clone());
+            }
+        }
+        seen.insert(owner.clone());
+        let mut depth = 0usize;
+        while !level.is_empty() {
+            depth += 1;
+            let mut level_candidates = Vec::new();
+            let mut declaring_owner_by_candidate = HashMap::default();
+            let mut next_level = Vec::new();
+            for ancestor in level {
+                if !session.observe_cancellation() {
+                    return no_definition(
+                        "java_resolution_interrupted",
+                        "Java member hierarchy resolution was interrupted",
+                    );
+                }
+                if !seen.insert(ancestor.clone()) {
+                    continue;
+                }
+                let found = java_filter_member_candidates(
+                    support.fqn(&format!("{}.{}", ancestor.fq_name(), member)),
+                    kind,
+                );
+                if let Some(state) = member_trace.as_mut() {
+                    state.record_found(&found, &ancestor, depth);
+                }
+                for candidate in &found {
+                    declaring_owner_by_candidate.insert(candidate.clone(), ancestor.clone());
+                }
+                level_candidates.extend(found);
+                let expanded = session.direct_ancestors(provider, &ancestor);
+                if let Some(state) = member_trace.as_mut() {
+                    for next in &expanded {
+                        state
+                            .parents
+                            .entry(next.clone())
+                            .or_insert_with(|| ancestor.clone());
+                    }
+                }
+                next_level.extend(expanded);
+            }
+            sort_units(&mut level_candidates);
+            level_candidates.dedup();
+            let level_applicability =
+                java_candidate_applicability(analyzer, session, &level_candidates, arity);
+            if arity.is_some() && !level_applicability.winners.is_empty() {
+                let winners = java_prefer_class_method_candidates(
+                    analyzer,
+                    kind,
+                    level_applicability.winners.clone(),
+                    &declaring_owner_by_candidate,
+                );
+                if let Some(state) = member_trace.as_ref() {
+                    state.stage_selection(owner, &level_applicability, &winners);
+                }
+                return candidates_outcome(winners);
+            }
+            if !level_candidates.is_empty() {
+                if arity.is_none() {
+                    let candidates = java_prefer_class_method_candidates(
+                        analyzer,
+                        kind,
+                        level_candidates,
+                        &declaring_owner_by_candidate,
+                    );
+                    if let Some(state) = member_trace.as_ref() {
+                        state.stage_selection(owner, &level_applicability, &candidates);
+                    }
+                    return candidates_outcome(candidates);
+                }
+                // JLS 15.12.2 applicability (#1755): a level set with no
+                // accepting overload is discarded, never bound. Record the
+                // discard as rejected rows while the walk still knows them.
+                if let Some(state) = member_trace.as_ref() {
+                    state.stage_selection(owner, &level_applicability, &[]);
+                }
+            }
+            level = next_level;
+        }
+    }
+    let Some(expected) = arity else {
+        return no_definition(
+            "no_indexed_definition",
+            format!("`{owner_fqn}.{member}` is not indexed as a Java definition"),
+        );
+    };
+    // JLS 15.12.2 applicability: an overload whose parameter list cannot accept
+    // this argument list is not the target, and the inverse usage scan already
+    // refuses such a site (`callable_arity_matches_target`). Binding it anyway
+    // was the forward side's #1755 defect. When the owner's hierarchy leaves the
+    // indexed workspace, the accepting declaration is on the far side of that
+    // boundary, which is what the site must report.
+    gated_boundary(
+        || !java_hierarchy_crosses_unindexed_supertype(analyzer, session, owner),
+        format!(
+            "`{owner_fqn}.{member}` is inherited from a Java supertype not indexed in this workspace"
+        ),
+        "no_accepting_overload",
+        format!("no indexed `{owner_fqn}.{member}` overload accepts {expected} arguments"),
+    )
+}
+
+fn java_prefer_class_method_candidates(
+    analyzer: &dyn IAnalyzer,
+    kind: JavaMemberLookupKind,
+    candidates: Vec<CodeUnit>,
+    declaring_owner_by_candidate: &HashMap<CodeUnit, CodeUnit>,
+) -> Vec<CodeUnit> {
+    if kind != JavaMemberLookupKind::Method || candidates.len() < 2 {
+        return candidates;
+    }
+    let mut owners = candidates
+        .iter()
+        .map(|candidate| {
+            declaring_owner_by_candidate
+                .get(candidate)
+                .expect("hierarchy candidate has its declaring owner")
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    sort_units(&mut owners);
+    owners.dedup();
+    let preferred = java_preferred_declaring_owners(analyzer, &owners);
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            preferred.contains(
+                declaring_owner_by_candidate
+                    .get(candidate)
+                    .expect("hierarchy candidate has its declaring owner"),
+            )
+        })
+        .collect()
+}
+
+/// Whether `owner`'s supertype closure names a type this workspace does not
+/// index.
+///
+/// `java_direct_ancestors` drops a supertype spelling it cannot resolve, so the
+/// resolved ancestors alone cannot tell a complete hierarchy from a truncated
+/// one. The raw `extends`/`implements` spellings can, put through the very same
+/// forward type-name tiers that dropped them.
+fn java_hierarchy_crosses_unindexed_supertype(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    owner: &CodeUnit,
+) -> bool {
+    let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
+        return false;
+    };
+    let Some(provider) = analyzer.type_hierarchy_provider() else {
+        return false;
+    };
+    let mut seen = HashSet::default();
+    seen.insert(owner.clone());
+    let mut queue = VecDeque::from([owner.clone()]);
+    while let Some(unit) = queue.pop_front() {
+        if !session.observe_cancellation() {
+            return false;
+        }
+        for raw in java.raw_supertypes_of(&unit) {
+            if session
+                .resolve_type_name_in_file(java, unit.source(), normalize_java_type_text(&raw))
+                .is_none()
+            {
+                return true;
+            }
+        }
+        for ancestor in session.direct_ancestors(provider, &unit) {
+            if seen.insert(ancestor.clone()) {
+                queue.push_back(ancestor);
+            }
+        }
+    }
+    false
+}
+
+fn java_filter_member_candidates(
+    candidates: Vec<CodeUnit>,
+    kind: JavaMemberLookupKind,
+) -> Vec<CodeUnit> {
+    candidates
+        .into_iter()
+        .filter(|unit| match kind {
+            JavaMemberLookupKind::Field => unit.is_field(),
+            JavaMemberLookupKind::Method => unit.is_function(),
+            JavaMemberLookupKind::Type => unit.is_class(),
+        })
+        .collect()
+}
+
+fn java_static_import_candidates(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    member: &str,
+    kind: JavaMemberLookupKind,
+    arity: Option<usize>,
+) -> DefinitionLookupOutcome {
+    let support: &dyn BoundedDefinitionLookup = session;
+    let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
+        return no_definition(
+            "no_java_analyzer",
+            "no Java analyzer is available for static import resolution",
+        );
+    };
+    let mut candidates = Vec::new();
+    let mut saw_external = false;
+    for import in session.import_infos(java, file) {
+        let Some(path) = import.path.as_ref() else {
+            continue;
+        };
+        if path.kind != Some(crate::analyzer::StructuredImportPathKind::StaticMember) {
+            continue;
+        }
+        if import.is_wildcard {
+            let owner = path.render_segments(".");
+            let mut owner_candidates =
+                java_filter_member_candidates(support.fqn(&format!("{owner}.{member}")), kind);
+            if owner_candidates.is_empty() {
+                // Static imports may also name nested types.
+                owner_candidates = java_filter_member_candidates(
+                    support.fqn(&format!("{owner}.{member}")),
+                    JavaMemberLookupKind::Type,
+                );
+            }
+            if owner_candidates.is_empty()
+                && let Some((leaf, outer_segments)) = path.segments.split_last()
+                && !outer_segments.is_empty()
+            {
+                // On-demand static imports may land on nested types too.
+                owner_candidates = java_filter_member_candidates(
+                    support.fqn(&format!("{}${leaf}.{member}", outer_segments.join("."))),
+                    kind,
+                );
+            }
+            if owner_candidates.is_empty() && !java_workspace_fqn_exists(support, &owner) {
+                saw_external = true;
+            }
+            candidates.extend(owner_candidates);
+            continue;
+        }
+        let Some((imported_member, owner_segments)) = path.segments.split_last() else {
+            continue;
+        };
+        if owner_segments.is_empty() || imported_member != member {
+            continue;
+        }
+        let owner = owner_segments.join(".");
+        let path_fqn = path.render_segments(".");
+        let mut imported = java_filter_member_candidates(support.fqn(&path_fqn), kind);
+        if imported.is_empty() {
+            // Static imports may also name nested types
+            // (`import static com.x.Tacos.Burritos`).
+            imported =
+                java_filter_member_candidates(support.fqn(&path_fqn), JavaMemberLookupKind::Type);
+        }
+        if imported.is_empty() {
+            // The index keys nested types with `$`, not `.` (tier-4
+            // spoon/mockito static-import claims).
+            imported = java_filter_member_candidates(
+                support.fqn(&format!("{owner}${imported_member}")),
+                kind,
+            );
+        }
+        if imported.is_empty() && !java_workspace_fqn_exists(support, &owner) {
+            saw_external = true;
+        }
+        candidates.extend(imported);
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    let applicability = java_candidate_applicability(analyzer, session, &candidates, arity);
+    if arity.is_some() && !applicability.winners.is_empty() {
+        java_record_callable_applicability(&applicability, &applicability.winners);
+        return candidates_outcome(applicability.winners);
+    }
+    // A statically imported overload that cannot accept the call's argument list
+    // is not the target (#1755), so it never stands in for one that can.
+    if !candidates.is_empty() && arity.is_none() {
+        java_record_callable_applicability(&applicability, &candidates);
+        return candidates_outcome(candidates);
+    }
+    if !candidates.is_empty() {
+        java_record_callable_applicability(&applicability, &[]);
+    }
+    // `saw_external` is set only when an import target is both unindexed and
+    // `!java_workspace_fqn_exists(owner)`, so `!saw_external` is the workspace
+    // gate (no double work — the flag already carries the check).
+    gated_boundary(
+        || !saw_external,
+        format!(
+            "`{member}` appears to cross a Java static import boundary not indexed in this workspace"
+        ),
+        "no_static_import_match",
+        format!("`{member}` did not match an indexed Java static import"),
+    )
+}
+
+fn java_import_boundary_for_type(
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    name: &str,
+) -> bool {
+    let support: &dyn BoundedDefinitionLookup = session;
+    for import in session.import_infos(java, file) {
+        let Some(path) = import.path.as_ref() else {
+            continue;
+        };
+        if path.kind == Some(crate::analyzer::StructuredImportPathKind::StaticMember) {
+            continue;
+        }
+        if import.is_wildcard {
+            let package = path.render_segments(".");
+            if !package.is_empty() && !java_workspace_package_exists(support, &package) {
+                return true;
+            }
+            continue;
+        }
+        if path.segments.last().map(String::as_str) == Some(name) {
+            let package = path.segments[..path.segments.len() - 1].join(".");
+            return !java_workspace_package_exists(support, &package);
+        }
+    }
+    false
+}
+
+fn java_workspace_fqn_exists(support: &dyn BoundedDefinitionLookup, fqn: &str) -> bool {
+    support.fqn_exists(fqn)
+}
+
+fn java_workspace_package_exists(support: &dyn BoundedDefinitionLookup, package: &str) -> bool {
+    support.package_exists(package) || support.fqn_prefix_exists(package)
+}
+
+fn java_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or_default()
+        .trim()
+}
+
+fn normalize_java_type_text(raw: &str) -> &str {
+    raw.split('<')
+        .next()
+        .unwrap_or(raw)
+        .trim()
+        .trim_end_matches("[]")
+        .trim()
+}

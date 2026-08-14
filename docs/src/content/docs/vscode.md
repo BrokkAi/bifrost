@@ -1,0 +1,124 @@
+---
+title: VS Code LSP
+description: Use the Bifrost VS Code extension for editor navigation.
+---
+
+Install the extension from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=Brokk.bifrost-vscode).
+
+Requirements:
+
+- VS Code 1.90 or newer.
+- A supported platform for extension-managed Bifrost binary downloads, or a `bifrost` binary available through one of the launch modes below.
+
+The extension source lives in `editors/vscode`. It starts Bifrost with:
+
+```bash
+bifrost --root <workspace-root> --lsp
+```
+
+For extension development:
+
+```bash
+cd editors/vscode
+npm install
+npm test
+```
+
+Use the extension setting `bifrost.serverPath` when testing a locally built Bifrost binary.
+
+The extension associates [`.rune` files](/rune-ir/) with **Bifrost Rune IR**
+and uses that language mode for **Bifrost: Show Rune IR** previews. Canonical
+kinds, roles, metadata, spans, strings, and `;` comments receive syntax
+highlighting.
+
+## RQL Queries
+
+The extension automatically recognizes `.rql` files as **Bifrost RQL** and
+highlights RQL query structure, known forms, literals, and comments. When the
+Bifrost language server is ready, the Play button in the editor title executes
+the current query text, including unsaved edits. Results appear in the
+**Bifrost Query Results** Explorer view; select a match to open its source
+range.
+
+See [RQL in VS Code](/rql-vscode/) for an execution example, scope rules, and
+the results view. Opening a query file does not start the language server or
+wait for indexing. If another extension owns `.rql` in a workspace, use VS
+Code's language-mode picker to select **Bifrost RQL**. The Bifrost helmet is
+its default file icon when the active VS Code icon theme does not provide a
+more specific `.rql` icon.
+
+The Play action runs through the extension's language-server connection, including unsaved editor text. It is separate from agent MCP: installing the extension does not expose `query_code` to an agent, and an MCP agent can execute saved RQL only through a query-capable toolset and `query_file`. See [MCP query and RQL availability](/mcp/#query-and-rql-availability).
+
+## Static-Analysis Policies
+
+The extension associates `.rqlp` files with the separate **Bifrost RQL
+Policy** language and policy file icon. It validates unsaved `(policy ...)` and
+`(endpoint ...)` source, provides schema-resolution hover and optional-version
+completion, formats complete documents at 100 columns, and highlights nested
+RQL only inside `(rql ...)`. Source-only editor validation does not read
+referenced `.rql` files, endpoint directories, or catalogs; those are resolved
+during a real workspace-backed policy load.
+
+Policy files deliberately do not satisfy the RQL Play command's language
+condition and do not reuse the RQL results tree. Run a saved policy from the
+CLI with `--policy-file`; loading a diagnostic-neutral endpoint as an execution
+root is an error. See [RQL in VS Code](/rql-vscode/#rql-policy-documents) and
+[Static-Analysis Policies](/static-analysis-policies/).
+
+## Extension Settings
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `bifrost.launchMode` | `auto` | How to start Bifrost: `auto`, `bundled`, or `path`. |
+| `bifrost.serverPath` | `bifrost` | Path to the `bifrost` binary, or command name to resolve on `PATH`. |
+| `bifrost.debug` | `false` | Enable verbose LSP request and notification tracing. |
+| `bifrost.slowRequestMs` | `2000` | Log LSP requests and notifications that take at least this many milliseconds. |
+| `bifrost.extraArgs` | `[]` | Additional command-line arguments appended when launching the Bifrost LSP server. |
+| `bifrost.roots` | `[]` | Workspace-relative or absolute directories to index instead of the full VS Code workspace. Empty means use VS Code workspace folders. |
+| `bifrost.exclude` | `[]` | Workspace-relative or absolute files or directories to exclude from Bifrost indexing and LSP lookups. |
+| `bifrost.formatterCommands` | `[]` | Ordered formatter command rules passed to Bifrost from user settings only. Rules run without a shell, receive document text on stdin, and write the formatted document to stdout. |
+| `bifrost.unrecognizedSymbolDiagnostics` | `false` | Enable experimental unrecognized-symbol and member diagnostics. C++ requires a matching valid `compile_commands.json` entry and reports only high-confidence unknown type references. |
+
+Changes to `bifrost.roots`, `bifrost.exclude`, `bifrost.formatterCommands`, and `bifrost.unrecognizedSymbolDiagnostics` apply to the running language server without a restart. Root and exclusion changes rebuild the workspace index; formatter changes affect subsequent formatting requests. Removing one of these settings sends its default value so the previous runtime setting is cleared.
+
+Changes to process-launch settings still require a restart: `bifrost.launchMode`, `bifrost.serverPath`, `bifrost.debug`, `bifrost.slowRequestMs`, and `bifrost.extraArgs`. The extension prompts before restarting for those settings.
+
+Launch mode behavior:
+
+- `auto`: use `bifrost.serverPath` when explicitly configured, then the extension-managed binary when available, then a local development binary under `target/`, then `bifrost` on `PATH`.
+- `bundled`: require the extension-managed binary for this platform and prompt to install it when missing.
+- `path`: use `bifrost.serverPath`, falling back to `bifrost` on `PATH`.
+
+`bifrost.formatterCommands` entries support:
+
+| Field | Description |
+| --- | --- |
+| `include` | Workspace-relative glob patterns this formatter rule applies to. |
+| `exclude` | Workspace-relative glob patterns this formatter rule must not apply to. |
+| `language` | Optional Bifrost language filter, such as `rust`, `go`, `typescript`, `java`, `csharp`, `php`, or `ruby`. |
+| `command` | Executable name or path. This is executed directly and is not shell-parsed. |
+| `args` | Command arguments. Supports `{file}`, `{relativeFile}`, `{workspaceRoot}`, and `{language}` placeholders. |
+| `cwd` | Working directory for the formatter. Relative paths are resolved against the workspace root and support placeholders. |
+
+## MCP Setup
+
+Run `Bifrost: Open MCP Setup` from the Command Palette to choose a setup action: copy generic `mcp.json`, copy a Codex CLI command, copy a Claude Code command, or open the Bifrost MCP docs. `Bifrost: Copy MCP Config` remains available when you only want the generic JSON entry.
+
+These commands are manual. The extension does not open MCP setup on activation, does not mutate external host configuration, and does not prompt again after dismissal.
+
+The MCP setup commands use the same binary resolution settings as the language server where practical: a configured `bifrost.serverPath`, the extension-managed binary, a local development build, or `bifrost` on `PATH`.
+
+The copied entry uses the current workspace root and starts a separate Bifrost MCP process:
+
+```json
+{
+  "mcpServers": {
+    "bifrost": {
+      "command": "/path/to/bifrost",
+      "args": ["--root", "/path/to/workspace", "--mcp", "searchtools"]
+    }
+  }
+}
+```
+
+Do not point MCP hosts at the VS Code LSP process. The extension and MCP hosts should launch separate stdio processes from the same Bifrost binary or release.

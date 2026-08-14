@@ -1,0 +1,681 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.javax.servlet-api-framework-decls",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-framework-foundry",
+    "version": "0.9.0"
+  },
+  "language": "java",
+  "ecosystem": "maven",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <0.10.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "hand-authored framework declarations over javax.servlet:javax.servlet-api:4.0.1",
+    "revision": "framework-decls"
+  },
+  "license": "LGPL-3.0-or-later",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "declarations.maven",
+      "activation": [
+        {
+          "package": {
+            "name": "javax.servlet:javax.servlet-api",
+            "version": "=4.0.1"
+          },
+          "targets": [
+            "jvm"
+          ],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "servlet.javax-servlet-http-cookie",
+            "name": "javax.servlet.http.Cookie",
+            "type_kind": "class",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [
+              {
+                "hierarchy_kind": "extends",
+                "target": {
+                  "kind": "named",
+                  "name": "java.lang.Object",
+                  "arguments": [],
+                  "nullable": false
+                }
+              },
+              {
+                "hierarchy_kind": "implements",
+                "target": {
+                  "kind": "named",
+                  "name": "java.lang.Cloneable",
+                  "arguments": [],
+                  "nullable": false
+                }
+              },
+              {
+                "hierarchy_kind": "implements",
+                "target": {
+                  "kind": "named",
+                  "name": "java.io.Serializable",
+                  "arguments": [],
+                  "nullable": false
+                }
+              }
+            ],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/http/Cookie.java",
+              "symbol": "javax.servlet.http.Cookie"
+            }
+          },
+          {
+            "id": "servlet.javax-servlet-http-httpservletrequest",
+            "name": "javax.servlet.http.HttpServletRequest",
+            "type_kind": "interface",
+            "visibility": "public",
+            "is_abstract": true,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [
+              {
+                "hierarchy_kind": "extends",
+                "target": {
+                  "kind": "named",
+                  "name": "javax.servlet.ServletRequest",
+                  "arguments": [],
+                  "nullable": false
+                }
+              }
+            ],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "javax.servlet.http.HttpServletRequest"
+            }
+          },
+          {
+            "id": "servlet.javax-servlet-servletrequest",
+            "name": "javax.servlet.ServletRequest",
+            "type_kind": "interface",
+            "visibility": "public",
+            "is_abstract": true,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/ServletRequest.java",
+              "symbol": "javax.servlet.ServletRequest"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.cookie.getname",
+            "owner": "servlet.javax-servlet-http-cookie",
+            "name": "getName",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.String",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/http/Cookie.java",
+              "symbol": "getName()"
+            }
+          },
+          {
+            "id": "member.cookie.getvalue",
+            "owner": "servlet.javax-servlet-http-cookie",
+            "name": "getValue",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.String",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/http/Cookie.java",
+              "symbol": "getValue()"
+            }
+          },
+          {
+            "id": "member.httpservletrequest.getcookies",
+            "owner": "servlet.javax-servlet-http-httpservletrequest",
+            "name": "getCookies",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "array",
+                "element": {
+                  "kind": "named",
+                  "name": "javax.servlet.http.Cookie",
+                  "arguments": [],
+                  "nullable": false
+                }
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "getCookies()"
+            }
+          },
+          {
+            "id": "member.httpservletrequest.getheader",
+            "owner": "servlet.javax-servlet-http-httpservletrequest",
+            "name": "getHeader",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "name",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.String",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "getHeader(java.lang.String)"
+            }
+          },
+          {
+            "id": "member.httpservletrequest.getheadernames",
+            "owner": "servlet.javax-servlet-http-httpservletrequest",
+            "name": "getHeaderNames",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.util.Enumeration",
+                "arguments": [
+                  {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                ],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "getHeaderNames()"
+            }
+          },
+          {
+            "id": "member.httpservletrequest.getheaders",
+            "owner": "servlet.javax-servlet-http-httpservletrequest",
+            "name": "getHeaders",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "name",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.util.Enumeration",
+                "arguments": [
+                  {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                ],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "getHeaders(java.lang.String)"
+            }
+          },
+          {
+            "id": "member.httpservletrequest.getmethod",
+            "owner": "servlet.javax-servlet-http-httpservletrequest",
+            "name": "getMethod",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.String",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "getMethod()"
+            }
+          },
+          {
+            "id": "member.httpservletrequest.getpathinfo",
+            "owner": "servlet.javax-servlet-http-httpservletrequest",
+            "name": "getPathInfo",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.String",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "getPathInfo()"
+            }
+          },
+          {
+            "id": "member.httpservletrequest.getquerystring",
+            "owner": "servlet.javax-servlet-http-httpservletrequest",
+            "name": "getQueryString",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.String",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "getQueryString()"
+            }
+          },
+          {
+            "id": "member.httpservletrequest.getrequesturi",
+            "owner": "servlet.javax-servlet-http-httpservletrequest",
+            "name": "getRequestURI",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.String",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "getRequestURI()"
+            }
+          },
+          {
+            "id": "member.httpservletrequest.getrequesturl",
+            "owner": "servlet.javax-servlet-http-httpservletrequest",
+            "name": "getRequestURL",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.StringBuffer",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "getRequestURL()"
+            }
+          },
+          {
+            "id": "member.servletrequest.getinputstream",
+            "owner": "servlet.javax-servlet-servletrequest",
+            "name": "getInputStream",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "javax.servlet.ServletInputStream",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/ServletRequest.java",
+              "symbol": "getInputStream()"
+            }
+          },
+          {
+            "id": "member.servletrequest.getparameter",
+            "owner": "servlet.javax-servlet-servletrequest",
+            "name": "getParameter",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "name",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.String",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/ServletRequest.java",
+              "symbol": "getParameter(java.lang.String)"
+            }
+          },
+          {
+            "id": "member.servletrequest.getparametermap",
+            "owner": "servlet.javax-servlet-servletrequest",
+            "name": "getParameterMap",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.util.Map",
+                "arguments": [
+                  {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  {
+                    "kind": "array",
+                    "element": {
+                      "kind": "named",
+                      "name": "java.lang.String",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  }
+                ],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/ServletRequest.java",
+              "symbol": "getParameterMap()"
+            }
+          },
+          {
+            "id": "member.servletrequest.getparameternames",
+            "owner": "servlet.javax-servlet-servletrequest",
+            "name": "getParameterNames",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.util.Enumeration",
+                "arguments": [
+                  {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                ],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/ServletRequest.java",
+              "symbol": "getParameterNames()"
+            }
+          },
+          {
+            "id": "member.servletrequest.getparametervalues",
+            "owner": "servlet.javax-servlet-servletrequest",
+            "name": "getParameterValues",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "name",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "array",
+                "element": {
+                  "kind": "named",
+                  "name": "java.lang.String",
+                  "arguments": [],
+                  "nullable": false
+                }
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/ServletRequest.java",
+              "symbol": "getParameterValues(java.lang.String)"
+            }
+          },
+          {
+            "id": "member.servletrequest.getreader",
+            "owner": "servlet.javax-servlet-servletrequest",
+            "name": "getReader",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.io.BufferedReader",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "javax/servlet/ServletRequest.java",
+              "symbol": "getReader()"
+            }
+          }
+        ],
+        "relations": []
+      }
+    }
+  ]
+}

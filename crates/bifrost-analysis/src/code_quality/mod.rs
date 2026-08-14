@@ -1,0 +1,352 @@
+//! MCP code-quality tools (cyclomatic + cognitive complexity, comment
+//! density, exception-handling smells, long-method / god-object). Each
+//! tool lives in its own submodule; shared helpers (file resolution,
+//! markdown line buffer, weights formatter, sentinel weight pickers,
+//! cyclomatic primitive) sit here in `mod.rs`.
+//!
+//! All public handler functions and their `*Params` / `*Result` types
+//! are re-exported at this module's surface so the import paths in
+//! `searchtools_service.rs` (and any future caller) stay flat:
+//! `crate::code_quality::compute_cyclomatic_complexity` etc.
+
+use crate::analyzer::{CodeUnit, IAnalyzer, Project, ProjectFile, SummaryFileProjection};
+use crate::hash::HashMap;
+use crate::path_utils::{AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver};
+use regex::Regex;
+use std::collections::{BTreeSet, VecDeque};
+use std::sync::LazyLock;
+
+// Bound MCP-supplied path lists so a single call cannot allocate an
+// unbounded `Vec<String>` of report lines or pin the analyzer scanning
+// thousands of files. Mirrors the per-tool caps already used in
+// `file_tools.rs`.
+pub(crate) const MAX_FILE_PATHS: usize = 200;
+
+// Hard cap on report lines (one line per flagged function). Protects the
+// JSON-RPC transport from megabyte-scale responses on pathological input.
+pub(crate) const MAX_REPORT_LINES: usize = 500;
+
+// Per-function source-text size cap before the regex scan. Beyond this,
+// the function's complexity defaults to the base of 1 — treating an
+// unanalyzably large body as opaque rather than spinning the regex engine
+// over multiple megabytes per code unit.
+pub(crate) const MAX_SOURCE_BYTES: usize = 1_000_000;
+
+// Heuristic cyclomatic-complexity decision points. Mirrors brokk-shared
+// `IAnalyzer.COMPLEXITY_KEYWORDS` / `COMPLEXITY_OPERATORS` exactly so the
+// scores produced here match the brokk-core MCP byte-for-byte.
+static COMPLEXITY_KEYWORDS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(if|while|for|switch|case|catch)\b").expect("valid regex"));
+static COMPLEXITY_OPERATORS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"&&|\|\||\?").expect("valid regex"));
+
+/// Outcome of resolving a list of caller-supplied file paths against the
+/// project. Shared across the per-tool handlers in this module that follow
+/// the same trim → workspace_rel_path → file_by_rel_path → exists pipeline.
+///
+/// Note: `report_comment_density_for_files` deliberately doesn't use this
+/// helper — it emits per-input "Missing file (skipped)" inline lines and
+/// has its own cap accounting that wouldn't fit the silent-skip contract.
+pub(crate) struct ResolvedFiles {
+    pub files: Vec<ProjectFile>,
+    /// Count of inputs that were silently dropped (empty / unresolvable /
+    /// not in the project / missing on disk). Duplicates that pass all
+    /// checks are NOT counted here — callers that want dedup can apply
+    /// it after.
+    pub skipped_inputs: usize,
+    /// `true` when the caller supplied more than [`MAX_FILE_PATHS`] inputs.
+    /// The tail beyond the cap is dropped without further inspection.
+    pub input_truncated: bool,
+    /// Non-empty when a bare filename matched multiple project files and the
+    /// helper refused to guess.
+    pub ambiguous_paths: Vec<AmbiguousPathInput>,
+}
+
+/// Resolve a flat list of caller-supplied paths to [`ProjectFile`]s. Trims
+/// each input, rejects empty strings, runs them through
+/// [`workspace_rel_path`] (workspace-escape guard), looks them up in the
+/// project, and requires `exists()` to be true. Inputs beyond
+/// [`MAX_FILE_PATHS`] are dropped (sets `input_truncated`).
+///
+/// Caller is responsible for any further filtering (dedup, file-cap,
+/// language gating).
+pub(crate) fn resolve_project_files(project: &dyn Project, inputs: Vec<String>) -> ResolvedFiles {
+    let input_truncated = inputs.len() > MAX_FILE_PATHS;
+    let resolver = WorkspaceFileResolver::new(project);
+    let mut files: Vec<ProjectFile> = Vec::new();
+    let mut skipped_inputs: usize = 0;
+    let mut ambiguous_paths: Vec<AmbiguousPathInput> = Vec::new();
+    for input in inputs.into_iter().take(MAX_FILE_PATHS) {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            skipped_inputs += 1;
+            continue;
+        }
+        match resolver.resolve_literal(trimmed) {
+            ResolvedFileInput::File(file) if file.exists() => files.push(file),
+            ResolvedFileInput::File(_) | ResolvedFileInput::NotFound(_) => skipped_inputs += 1,
+            ResolvedFileInput::Ambiguous(item) => ambiguous_paths.push(item),
+        }
+    }
+    ResolvedFiles {
+        files,
+        skipped_inputs,
+        input_truncated,
+        ambiguous_paths,
+    }
+}
+
+pub(crate) fn append_ambiguous_path_notes(
+    lines: &mut ReportLines,
+    ambiguous: &[AmbiguousPathInput],
+) {
+    for item in ambiguous {
+        lines.line(format!(
+            "- Note: ambiguous input `{}`; matches: {}",
+            item.input,
+            item.matches.join(", ")
+        ));
+    }
+}
+
+/// Thin wrapper around `Vec<String>` for handlers that build markdown
+/// reports line-by-line. Saves the per-handler boilerplate of forgetting
+/// `String::new()` for blank lines and joining with `\n` at the end.
+/// Doesn't try to be smart about structure — handlers vary too much
+/// (flat lists, markdown tables, multi-line findings) for a richer
+/// abstraction to pay off.
+pub(crate) struct ReportLines {
+    buf: Vec<String>,
+}
+
+impl ReportLines {
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(cap),
+        }
+    }
+    pub fn line(&mut self, line: impl Into<String>) -> &mut Self {
+        self.buf.push(line.into());
+        self
+    }
+    pub fn blank(&mut self) -> &mut Self {
+        self.buf.push(String::new());
+        self
+    }
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+    pub fn build(self) -> String {
+        self.buf.join("\n")
+    }
+}
+
+/// Render a list of (label, value) pairs as `label1=value1, label2=value2,
+/// ...`. Used by the per-tool weights-line renderers. The labels are
+/// literal strings (NOT Rust field names) because they need to match the
+/// brokk-core MCP wire format verbatim — pulling them from `stringify!`
+/// would silently desync if a Rust field is later renamed.
+macro_rules! format_weights {
+    ($($label:literal => $value:expr),+ $(,)?) => {{
+        let parts: Vec<String> = vec![
+            $(format!("{}={}", $label, $value)),+
+        ];
+        parts.join(", ")
+    }};
+}
+// Make the macro callable as `format_weights!` from child modules. Modern
+// Rust resolves macro_rules via textual scope, but the `pub(crate) use`
+// hop is required for `format_weights!(...)` to be reachable from
+// `super::*` imports without a per-file `use super::format_weights;`.
+#[allow(unused_imports)]
+pub(crate) use format_weights;
+
+/// Heuristic cyclomatic complexity for a single function-like code unit.
+/// Returns 0 for non-function units. Counts a base of 1 plus each
+/// occurrence of `if/while/for/switch/case/catch` keywords and each
+/// `&&`/`||`/`?` operator in the unit's source. Source bodies above
+/// `MAX_SOURCE_BYTES` are treated as opaque (returns the base of 1).
+pub fn cyclomatic_complexity_for(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> u32 {
+    if !code_unit.is_function() {
+        return 0;
+    }
+    let source = analyzer.get_source(code_unit, false).unwrap_or_default();
+    cyclomatic_complexity_for_sources(std::iter::once(source.as_str()))
+}
+
+/// Compute every function's cyclomatic complexity from one lightweight file
+/// projection and one source read. The fallback preserves support for analyzer
+/// implementations that do not expose summary projections.
+pub(crate) fn cyclomatic_complexities_for_file(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Vec<(CodeUnit, u32)> {
+    match (
+        analyzer.summary_file_projection(file),
+        analyzer.indexed_source(file),
+    ) {
+        (Some(projection), Some(source)) => {
+            cyclomatic_complexities_from_projection(&projection, &source)
+        }
+        _ => cyclomatic_complexities_from_analyzer(analyzer, file),
+    }
+}
+
+fn cyclomatic_complexities_from_projection(
+    projection: &SummaryFileProjection,
+    source: &str,
+) -> Vec<(CodeUnit, u32)> {
+    // `get_source` groups same-file overload ranges by fully-qualified name.
+    // Build those groups once so this batch preserves the existing scores
+    // without repeating a definition lookup for every function.
+    let mut sources_by_fq_name: HashMap<String, BTreeSet<&str>> = HashMap::default();
+    for (code_unit, ranges) in &projection.ranges {
+        if !code_unit.is_function() {
+            continue;
+        }
+        let sources = sources_by_fq_name.entry(code_unit.fq_name()).or_default();
+        for range in ranges {
+            if let Some(fragment) = source.get(range.start_byte..range.end_byte) {
+                sources.insert(fragment);
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+    let mut work: VecDeque<CodeUnit> = projection
+        .top_level_declarations
+        .iter()
+        .filter(|code_unit| !code_unit.is_file_scope())
+        .cloned()
+        .collect();
+    while let Some(code_unit) = work.pop_front() {
+        if code_unit.is_function() {
+            let complexity = sources_by_fq_name
+                .get(&code_unit.fq_name())
+                .map(|sources| cyclomatic_complexity_for_sources(sources.iter().copied()))
+                .unwrap_or(1);
+            result.push((code_unit.clone(), complexity));
+        }
+        if let Some(children) = projection.children.get(&code_unit) {
+            work.extend(children.iter().cloned());
+        }
+    }
+    result
+}
+
+fn cyclomatic_complexities_from_analyzer(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Vec<(CodeUnit, u32)> {
+    let mut result = Vec::new();
+    let mut work: VecDeque<CodeUnit> = analyzer.top_level_declarations(file).into();
+    while let Some(code_unit) = work.pop_front() {
+        if code_unit.is_function() {
+            let complexity = cyclomatic_complexity_for(analyzer, &code_unit);
+            result.push((code_unit.clone(), complexity));
+        }
+        work.extend(analyzer.direct_children(&code_unit));
+    }
+    result
+}
+
+fn cyclomatic_complexity_for_sources<'a>(sources: impl Iterator<Item = &'a str>) -> u32 {
+    let sources = sources.collect::<Vec<_>>();
+    let total_bytes = sources
+        .iter()
+        .map(|source| source.len())
+        .fold(0usize, usize::saturating_add)
+        .saturating_add(sources.len().saturating_sub(1).saturating_mul(2));
+    if total_bytes > MAX_SOURCE_BYTES {
+        return 1;
+    }
+    sources.iter().fold(1u32, |complexity, source| {
+        complexity
+            .saturating_add(COMPLEXITY_KEYWORDS.find_iter(source).count() as u32)
+            .saturating_add(COMPLEXITY_OPERATORS.find_iter(source).count() as u32)
+    })
+}
+
+/// Pick `candidate` when non-negative, otherwise fall back to `fallback`.
+/// `0` is treated as a valid explicit override (semantically: "disable this
+/// rule"). Use this for the exception-handling-smells weight knobs. For
+/// knobs where `0` is meaningless and should map to the brokk default,
+/// use [`pick_positive`] instead.
+pub(crate) fn pick_weight(candidate: i32, fallback: i32) -> i32 {
+    if candidate >= 0 { candidate } else { fallback }
+}
+
+/// Pick `candidate` when strictly positive, otherwise fall back to
+/// `fallback`. Use this for the maintainability-size weight knobs (and any
+/// other knob where `0` is meaningless and should fall back to the brokk
+/// default). For knobs where `0` is a valid explicit override (e.g.
+/// exception-handling-smells weights — `0` correctly disables the rule),
+/// use [`pick_weight`] instead.
+pub(crate) fn pick_positive(candidate: i32, fallback: i32) -> i32 {
+    if candidate > 0 { candidate } else { fallback }
+}
+
+/// Defensive replacement of markdown-breaking characters in table cells.
+/// Mirrors brokk's [`CodeQualityToolsMcp.sanitizeTableCell`]: pipe characters
+/// are escaped, backticks become apostrophes (so attacker-controlled paths
+/// cannot break out of the inline code span and inject markdown into
+/// downstream LLM consumers), and control characters collapse to a single
+/// space so each row remains valid GFM.
+pub(crate) fn sanitize_table_cell(value: &str) -> String {
+    let escaped = value.replace('|', "\\|").replace('`', "'");
+    escaped
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+mod cognitive;
+mod comment_density;
+mod cyclomatic;
+pub(crate) mod dead_code_smells;
+mod exception_smells;
+mod git_hotspots;
+mod maintainability_size;
+mod secret_like_code;
+mod structural_clone_smells;
+mod test_assertion_smells;
+
+pub use cognitive::{
+    ComputeCognitiveComplexityParams, ComputeCognitiveComplexityResult,
+    compute_cognitive_complexity,
+};
+pub use comment_density::{
+    ReportCommentDensityForCodeUnitParams, ReportCommentDensityForCodeUnitResult,
+    ReportCommentDensityForFilesParams, ReportCommentDensityForFilesResult,
+    report_comment_density_for_code_unit, report_comment_density_for_files,
+};
+pub use cyclomatic::{
+    ComputeCyclomaticComplexityParams, ComputeCyclomaticComplexityResult,
+    compute_cyclomatic_complexity,
+};
+pub use dead_code_smells::{
+    ReportDeadCodeAndUnusedAbstractionSmellsParams, ReportDeadCodeAndUnusedAbstractionSmellsResult,
+    report_dead_code_and_unused_abstraction_smells,
+};
+pub use exception_smells::{
+    ExceptionAnalysisNote, ReportExceptionHandlingSmellsParams,
+    ReportExceptionHandlingSmellsResult, report_exception_handling_smells,
+};
+pub use git_hotspots::{AnalyzeGitHotspotsParams, AnalyzeGitHotspotsResult, analyze_git_hotspots};
+pub use maintainability_size::{
+    ReportLongMethodAndGodObjectSmellsParams, ReportLongMethodAndGodObjectSmellsResult,
+    find_long_method_and_god_object_smells, report_long_method_and_god_object_smells,
+};
+pub use secret_like_code::{
+    ReportSecretLikeCodeParams, ReportSecretLikeCodeResult, report_secret_like_code,
+};
+pub use structural_clone_smells::{
+    ReportStructuralCloneSmellsParams, ReportStructuralCloneSmellsResult,
+    report_structural_clone_smells,
+};
+pub use test_assertion_smells::{
+    ReportTestAssertionSmellsParams, ReportTestAssertionSmellsResult, report_test_assertion_smells,
+};

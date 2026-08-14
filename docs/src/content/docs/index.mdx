@@ -1,0 +1,45 @@
+---
+title: Bifrost
+description: Code intelligence for AI, with structural queries, usage graphs, and repository-scale multi-language analysis.
+template: splash
+hero:
+  title: Code intelligence for AI.
+  tagline: Structured repository context for coding agents.
+  actions:
+    - text: Choose Bifrost
+      link: choose-bifrost/
+      icon: right-arrow
+      variant: primary
+    - text: Overview
+      link: overview/
+      variant: secondary
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+<div class="capability-deck">
+  <div class="capability-deck__inner">
+    <CardGrid>
+      <LinkCard
+        title="Multi-language analysis"
+        href="capabilities/"
+        description="Parse mixed-language repositories into structured symbols, definitions, declarations, and cross-file relationships."
+      />
+      <LinkCard
+        title="Structural code queries"
+        href="code-querying/"
+        description="Match syntax and relationships with composable, AST-aware queries instead of fragile text patterns."
+      />
+      <LinkCard
+        title="Deep usage graphs"
+        href="code-querying/#choose-the-right-tool"
+        description="Trace definitions, references, call sites, and usages across files without falling back to raw text search."
+      />
+      <LinkCard
+        title="Built for agent workflows"
+        href="choose-bifrost/#then-choose-the-interface"
+        description="Run Bifrost through MCP, LSP, the CLI, or native libraries. Keep analysis local and give agents repository-scale context."
+      />
+    </CardGrid>
+  </div>
+</div>

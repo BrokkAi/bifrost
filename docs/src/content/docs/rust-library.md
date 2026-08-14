@@ -1,0 +1,163 @@
+---
+title: Rust Library
+description: Embed Bifrost directly as a Rust crate.
+---
+
+The Cargo package is `brokk-bifrost`, and the Rust crate name is `brokk_bifrost`. It exports the analyzer core, project abstractions, searchtools service, and common result types from `src/lib.rs`.
+
+## Add to a Project
+
+Add the released crate with Cargo:
+
+```bash
+cargo add brokk-bifrost
+```
+
+That produces a dependency like:
+
+```toml
+[dependencies]
+brokk-bifrost = "0.9.5"
+```
+
+For local development against a checkout, use a path dependency:
+
+```bash
+cargo add brokk-bifrost --path /path/to/bifrost
+```
+
+The package name uses a hyphen, but Rust imports use the crate name with an underscore:
+
+```rust
+use brokk_bifrost::{AnalyzerConfig, FilesystemProject, WorkspaceAnalyzer};
+```
+
+## Choose a Package
+
+`brokk-bifrost` is the supported default dependency. It is the compatibility
+facade: it re-exports the analyzer and service API, and Cargo resolves the
+analysis, language-adapter, runtime, MCP, and LSP implementation crates
+automatically. Most applications should depend on this package alone.
+
+### Language Adapters
+
+Each language family is now a separate published adapter crate. This split
+keeps language-specific parser and resolver code separate from the shared
+analysis engine.
+
+| Source language | Cargo package | Rust crate |
+| --- | --- | --- |
+| C and C++ | `brokk-bifrost-cpp` | `brokk_bifrost_cpp` |
+| C# | `brokk-bifrost-csharp` | `brokk_bifrost_csharp` |
+| Go | `brokk-bifrost-go` | `brokk_bifrost_go` |
+| JavaScript and TypeScript | `brokk-bifrost-js-ts` | `brokk_bifrost_js_ts` |
+| Java, Kotlin, and Scala | `brokk-bifrost-jvm` | `brokk_bifrost_jvm` |
+| PHP | `brokk-bifrost-php` | `brokk_bifrost_php` |
+| Python | `brokk-bifrost-python` | `brokk_bifrost_python` |
+| Ruby | `brokk-bifrost-ruby` | `brokk_bifrost_ruby` |
+| Rust | `brokk-bifrost-rust` | `brokk_bifrost_rust` |
+
+`brokk-bifrost` and `brokk-bifrost-analysis` currently depend on all of these
+adapters. Adding one adapter directly does not limit the languages that
+`WorkspaceAnalyzer` loads or reduce the facade dependency set.
+
+Use a direct adapter dependency only when you own a focused host or an adapter
+integration. Keep every direct Bifrost dependency on the same release version.
+The adapter APIs are internal and can change between releases.
+
+For an application that only hosts Bifrost over the Language Server Protocol,
+depend directly on the focused LSP host instead:
+
+```bash
+cargo add brokk-bifrost-lsp@0.8
+```
+
+Start its stdio server with a deterministic fallback workspace root:
+
+```rust
+use std::path::PathBuf;
+
+fn main() -> Result<(), String> {
+    brokk_bifrost_lsp::run_lsp_stdio_server(PathBuf::from("/path/to/project"))
+}
+```
+
+The LSP client can replace that fallback with its advertised workspace folders
+during initialization. Reserve the process's standard input and output for LSP
+messages, and follow the [LSP server guide](/lsp/) for protocol configuration.
+
+`brokk-bifrost-core`, the language adapters above, `brokk-bifrost-analysis`,
+`brokk-bifrost-policy`, `brokk-bifrost-nlp`, `brokk-bifrost-runtime`, and
+`brokk-bifrost-mcp` are lower-level workspace components. They are published
+so focused hosts can compose them, but they are not necessary for ordinary
+library consumers. Prefer the facade unless you own one of those boundaries.
+
+## Stability
+
+`brokk-bifrost`'s exported surface is the supported tier. While the project is
+pre-1.0 nothing is contractually frozen, but that surface is curated
+item by item, and we do not break it gratuitously: changes to it are
+deliberate, and release notes call them out.
+
+Everything beneath the facade may change in any release, including in a patch.
+The lower-level packages listed above exist so that a host owning one of those
+protocol boundaries can compose them, not as a general-purpose API; their types,
+traits, module paths, and crate boundaries move whenever the internal design
+calls for it. Each of them carries the same note on its crates.io and docs.rs
+page. `brokk-bifrost-lsp` is the one documented exception: its stdio server
+entry point above is a supported way to host Bifrost over LSP.
+
+There is no sealing and no `#[doc(hidden)]` sweep enforcing this. Depending
+directly on an internal package compiles and works; it just means you are
+tracking our internals, and an upgrade may require source changes.
+
+## Minimal Analyzer
+
+```rust
+use std::sync::Arc;
+
+use brokk_bifrost::{AnalyzerConfig, FilesystemProject, WorkspaceAnalyzer};
+
+fn main() -> Result<(), String> {
+    let project = Arc::new(FilesystemProject::new(".")?);
+    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+
+    println!("languages: {:?}", analyzer.languages());
+    println!("files: {}", analyzer.get_analyzed_files().len());
+    println!("declarations: {}", analyzer.get_all_declarations().len());
+    Ok(())
+}
+```
+
+## Main Public Exports
+
+The top-level crate re-exports the public analyzer and service types most callers need:
+
+| Export | Use |
+| --- | --- |
+| `WorkspaceAnalyzer` | Build a workspace-backed analyzer with default multi-language routing. |
+| `MultiAnalyzer` | Route analysis across multiple language analyzers. |
+| `IAnalyzer` | Trait for common analyzer operations. |
+| `FilesystemProject`, `FileSetProject`, `OverlayProject`, `MultiRootProject` | Project backends for different file-source shapes. |
+| `ProjectFile`, `CodeUnit`, `DeclarationInfo`, `Language`, `Range` | Core source and symbol model types. |
+| `SearchToolsService`, `ToolOutput` | In-process access to the same tool implementations exposed over MCP. |
+| `CodeQuery`, `CodeQueryExecutionMode`, `CodeQueryResponse` | Parse a canonical JSON/RQL query and select ordinary results, planning-only explain, or an opt-in profile. |
+| `CodeQueryExplain`, `CodeQueryProfile` | Stable versioned public report models; internal benchmark/profiler structs are not exposed. |
+| `ImportAnalysisProvider`, `TypeHierarchyProvider`, `TypeAliasProvider`, `TestDetectionProvider` | Optional analyzer capability traits. |
+| `RustAnalyzerConfig`, `RustDependencyApiEvidence`, `RustSelectedTarget`, `RustPackageApiArtifact` | Describe passive, exact Cargo and rustdoc evidence supplied by a host. |
+| `resolve_rust_semantic_pack_dependencies`, `RustDependencyPackAdapter` | Validate exact Rust dependency selections and prepare reusable semantic-model packs without invoking build tools. |
+| `RubyAnalyzerConfig`, `RubyDependencyApiEvidence`, `RubyGemApiArtifact` | Describe passive, exact Bundler and local gem archive evidence supplied by a host. |
+| `resolve_ruby_semantic_pack_dependencies`, `RubyDependencyPackAdapter` | Validate exact Ruby dependency selections and prepare reusable RBS/RBI/source semantic-model packs without invoking Ruby tools. |
+
+For most embedded code-intelligence workflows, prefer `SearchToolsService` over manually composing individual analyzer calls. It keeps the tool argument and rendering behavior aligned with MCP and the Python client.
+
+`analyzer::structural::execute` always returns ordinary rows for embedders that own execution policy. Use the top-level `execute_request` to honor the query's root `execution_mode`; its untagged `CodeQueryResponse::Results` variant preserves the existing serialized result shape. Explain performs logical lowering and physical selection without reading analyzer data during that phase, while profile nests the exact ordinary result. Cancellable embedders can call `execute_request_with_cancellation` with a top-level `CancellationToken` and receive the versioned profile, including cancellation observations and a cancellation-safe partial result. See [Explain and Profile CodeQuery](/code-query-explain-profile/) for the stable wire contract and measurement caveats.
+
+## Features
+
+The default Rust build has no optional features enabled.
+
+`nlp` enables semantic search support. It adds the model download, tokenization, and semantic-index plumbing, while the embedding sidecar selects CUDA, Apple Metal, or CPU at runtime.
+
+`python` enables the PyO3 extension module used by the Python package. Maturin turns this on automatically through `pyproject.toml`; ordinary CLI and library builds do not need it.

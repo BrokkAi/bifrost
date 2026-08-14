@@ -1,0 +1,554 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.esapi-sanitizers",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-sanitizer-foundry",
+    "version": "0.9.0"
+  },
+  "language": "java",
+  "ecosystem": "maven",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <0.10.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "audited k3 sanitizer content over org.owasp.esapi:esapi:2.7.0.0 (staged: artifact digest not pinned)",
+    "revision": "k3-sanitizers"
+  },
+  "license": "LGPL-3.0-or-later",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "sanitizers.maven",
+      "activation": [
+        {
+          "package": {
+            "name": "org.owasp.esapi:esapi"
+          },
+          "targets": [
+            "jvm"
+          ],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "org.owasp.esapi.encoder.encodeforcss",
+            "target": {
+              "path": "org/owasp/esapi/Encoder.java",
+              "symbol": "org.owasp.esapi.Encoder.encodeForCSS",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.esapi.encoder.encodefordn",
+            "target": {
+              "path": "org/owasp/esapi/Encoder.java",
+              "symbol": "org.owasp.esapi.Encoder.encodeForDN",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "ldap"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.esapi.encoder.encodeforhtml",
+            "target": {
+              "path": "org/owasp/esapi/Encoder.java",
+              "symbol": "org.owasp.esapi.Encoder.encodeForHTML",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "html",
+                  "html_attr",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.esapi.encoder.encodeforhtmlattribute",
+            "target": {
+              "path": "org/owasp/esapi/Encoder.java",
+              "symbol": "org.owasp.esapi.Encoder.encodeForHTMLAttribute",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "html",
+                  "html_attr",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.esapi.encoder.encodeforjavascript",
+            "target": {
+              "path": "org/owasp/esapi/Encoder.java",
+              "symbol": "org.owasp.esapi.Encoder.encodeForJavaScript",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "js"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.esapi.encoder.encodeforjson",
+            "target": {
+              "path": "org/owasp/esapi/Encoder.java",
+              "symbol": "org.owasp.esapi.Encoder.encodeForJSON",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "js"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.esapi.encoder.encodeforldap",
+            "target": {
+              "path": "org/owasp/esapi/Encoder.java",
+              "symbol": "org.owasp.esapi.Encoder.encodeForLDAP",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "ldap"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.esapi.encoder.encodeforos",
+            "target": {
+              "path": "org/owasp/esapi/Encoder.java",
+              "symbol": "org.owasp.esapi.Encoder.encodeForOS",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "shell"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.esapi.encoder.encodeforsql",
+            "target": {
+              "path": "org/owasp/esapi/Encoder.java",
+              "symbol": "org.owasp.esapi.Encoder.encodeForSQL",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "sql"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.esapi.encoder.encodeforurl",
+            "target": {
+              "path": "org/owasp/esapi/Encoder.java",
+              "symbol": "org.owasp.esapi.Encoder.encodeForURL",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css",
+                  "html",
+                  "html_attr",
+                  "js",
+                  "log",
+                  "url",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.esapi.encoder.encodeforxml",
+            "target": {
+              "path": "org/owasp/esapi/Encoder.java",
+              "symbol": "org.owasp.esapi.Encoder.encodeForXML",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "html",
+                  "html_attr",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.esapi.encoder.encodeforxmlattribute",
+            "target": {
+              "path": "org/owasp/esapi/Encoder.java",
+              "symbol": "org.owasp.esapi.Encoder.encodeForXMLAttribute",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "html",
+                  "html_attr",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.esapi.encoder.encodeforxpath",
+            "target": {
+              "path": "org/owasp/esapi/Encoder.java",
+              "symbol": "org.owasp.esapi.Encoder.encodeForXPath",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "xpath"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+# Reduced verbatim slice of github/codeql java/ql/lib/ext/javax.servlet.http.model.yml
+# Revision c9142680f5b6409dbe0944350321c54e8c801e61, MIT. See PROVENANCE.md.
+# Distinctive request-controlled sources and response-splitting/leak sinks.
+extensions:
+  - addsTo:
+      pack: codeql/java-all
+      extensible: sourceModel
+    data:
+      - ["javax.servlet.http", "HttpServletRequest", False, "getHeader", "(String)", "", "ReturnValue", "remote", "manual"]
+      - ["javax.servlet.http", "HttpServletRequest", False, "getHeaderNames", "()", "", "ReturnValue", "remote", "manual"]
+      - ["javax.servlet.http", "HttpServletRequest", False, "getHeaders", "(String)", "", "ReturnValue", "remote", "manual"]
+      - ["javax.servlet.http", "HttpServletRequest", False, "getParameter", "(String)", "", "ReturnValue", "remote", "manual"]
+      - ["javax.servlet.http", "HttpServletRequest", False, "getParameterMap", "()", "", "ReturnValue", "remote", "manual"]
+      - ["javax.servlet.http", "HttpServletRequest", False, "getParameterNames", "()", "", "ReturnValue", "remote", "manual"]
+      - ["javax.servlet.http", "HttpServletRequest", False, "getParameterValues", "(String)", "", "ReturnValue", "remote", "manual"]
+      - ["javax.servlet.http", "HttpServletRequest", False, "getPathInfo", "()", "", "ReturnValue", "remote", "manual"]
+      - ["javax.servlet.http", "HttpServletRequest", False, "getQueryString", "()", "", "ReturnValue", "remote", "manual"]
+      - ["javax.servlet.http", "HttpServletRequest", False, "getRequestURI", "()", "", "ReturnValue", "remote", "manual"]
+      - ["javax.servlet.http", "HttpServletRequest", False, "getRequestURL", "()", "", "ReturnValue", "remote", "manual"]
+      - ["javax.servlet.http", "HttpServletRequest", False, "getServletPath", "()", "", "ReturnValue", "remote", "manual"]
+  - addsTo:
+      pack: codeql/java-all
+      extensible: sinkModel
+    data:
+      - ["javax.servlet.http", "HttpServletResponse", False, "addCookie", "", "", "Argument[0]", "response-splitting", "manual"]
+      - ["javax.servlet.http", "HttpServletResponse", False, "addHeader", "", "", "Argument[0..1]", "response-splitting", "manual"]
+      - ["javax.servlet.http", "HttpServletResponse", False, "sendError", "(int,String)", "", "Argument[1]", "information-leak", "manual"]
+      - ["javax.servlet.http", "HttpServletResponse", False, "setHeader", "", "", "Argument[0..1]", "response-splitting", "manual"]

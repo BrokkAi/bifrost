@@ -1,0 +1,1212 @@
+---
+import { LinkButton } from '@astrojs/starlight/components';
+import type { StarlightRouteData } from '@astrojs/starlight/route-data';
+
+const { data } = (Astro.locals as { starlightRoute: StarlightRouteData }).starlightRoute.entry;
+const { actions = [] } = data.hero || {};
+
+// The beam is one cubic Bézier from lower-left to upper-right, crossing behind
+// the console card. Every layer — spectral ribbons, fibers, sparks, the exit
+// flare, and the user-space gradients — derives from these four control
+// points, so the composition is tuned here and nowhere else.
+const A = { x: 6, y: 667 };
+const B = { x: 435, y: 558 };
+const C = { x: 845, y: 360 };
+const D = { x: 1434, y: 62 };
+
+const beamArc = `M ${A.x} ${A.y} C ${B.x} ${B.y}, ${C.x} ${C.y}, ${D.x} ${D.y}`;
+
+const cubicPoint = (t: number) => {
+	const u = 1 - t;
+	return {
+		x: u ** 3 * A.x + 3 * u ** 2 * t * B.x + 3 * u * t ** 2 * C.x + t ** 3 * D.x,
+		y: u ** 3 * A.y + 3 * u ** 2 * t * B.y + 3 * u * t ** 2 * C.y + t ** 3 * D.y,
+	};
+};
+
+const cubicTangent = (t: number) => {
+	const u = 1 - t;
+	return {
+		x: 3 * u ** 2 * (B.x - A.x) + 6 * u * t * (C.x - B.x) + 3 * t ** 2 * (D.x - C.x),
+		y: 3 * u ** 2 * (B.y - A.y) + 6 * u * t * (C.y - B.y) + 3 * t ** 2 * (D.y - C.y),
+	};
+};
+
+// The spectrum gradients live in user space, perpendicular to the arc where it
+// crosses the console card: warm fringe up-left, cool fringe down-right.
+const anchor = cubicPoint(0.71);
+const anchorTangent = cubicTangent(0.71);
+const anchorLength = Math.hypot(anchorTangent.x, anchorTangent.y);
+const normal = { x: -anchorTangent.y / anchorLength, y: anchorTangent.x / anchorLength };
+
+const spectrumBand = (halfWidth: number) => ({
+	x1: (anchor.x - normal.x * halfWidth).toFixed(1),
+	y1: (anchor.y - normal.y * halfWidth).toFixed(1),
+	x2: (anchor.x + normal.x * halfWidth).toFixed(1),
+	y2: (anchor.y + normal.y * halfWidth).toFixed(1),
+});
+
+const auraBand = spectrumBand(150);
+const haloBand = spectrumBand(68);
+const bodyBand = spectrumBand(26);
+
+const rampFrom = cubicPoint(0.5);
+const rampTo = cubicPoint(0.98);
+
+// Spectral fibers ride the same arc shifted along the beam normal, so each hue
+// holds its own track across the ribbon.
+const fibers = [
+	{ k: 21, color: '#ff4a2d', width: 2.6, dash: 150, gap: 940, dur: '8.4s', delay: '-1.2s', opacity: 0.6 },
+	{ k: 12, color: '#ff9438', width: 2.3, dash: 110, gap: 820, dur: '6.8s', delay: '-3.4s', opacity: 0.65 },
+	{ k: 5, color: '#ffd76a', width: 2.0, dash: 80, gap: 700, dur: '5.6s', delay: '-0.8s', opacity: 0.7 },
+	{ k: -4, color: '#7df0cf', width: 2.0, dash: 95, gap: 760, dur: '6.1s', delay: '-2.6s', opacity: 0.65 },
+	{ k: -11, color: '#55b6ff', width: 2.3, dash: 120, gap: 860, dur: '7.2s', delay: '-4.5s', opacity: 0.6 },
+	{ k: -19, color: '#8f6bff', width: 2.6, dash: 140, gap: 920, dur: '8.9s', delay: '-1.9s', opacity: 0.55 },
+].map((f) => ({ ...f, dx: (-f.k * normal.x).toFixed(1), dy: (-f.k * normal.y).toFixed(1) }));
+
+// Two brighter threads with slightly perturbed control points for organic wobble.
+const threads = [
+	{ d: `M ${A.x} ${A.y + 4} C ${B.x + 2} ${B.y + 6}, ${C.x + 2} ${C.y - 6}, ${D.x} ${D.y + 4}`, color: '#ffe9a8', width: 1.2, dash: 60, gap: 520, dur: '4.8s', delay: '-2.2s', opacity: 0.7 },
+	{ d: `M ${A.x} ${A.y - 4} C ${B.x - 2} ${B.y - 6}, ${C.x - 2} ${C.y + 6}, ${D.x} ${D.y - 4}`, color: '#9fd8ff', width: 1.2, dash: 70, gap: 560, dur: '5.3s', delay: '-0.4s', opacity: 0.65 },
+];
+
+// Embers that drift along the beam direction and fade.
+const sparkDrift = (() => {
+	const tangent = cubicTangent(0.75);
+	const length = Math.hypot(tangent.x, tangent.y);
+	return { x: `${((tangent.x / length) * 42).toFixed(1)}px`, y: `${((tangent.y / length) * 42).toFixed(1)}px` };
+})();
+
+const sparks = [
+	{ t: 0.55, r: 2.2, dur: '3.6s', delay: '-0.6s' },
+	{ t: 0.65, r: 1.7, dur: '4.2s', delay: '-2.1s' },
+	{ t: 0.75, r: 2.6, dur: '3.2s', delay: '-1.4s' },
+	{ t: 0.85, r: 1.8, dur: '4.7s', delay: '-3.3s' },
+	{ t: 0.92, r: 2.3, dur: '3.9s', delay: '-2.8s' },
+].map((s) => {
+	const p = cubicPoint(s.t);
+	return { ...s, x: p.x.toFixed(1), y: p.y.toFixed(1) };
+});
+
+// The exit flare sits on the arc near the right edge so it crops with the beam
+// at every viewport width instead of being positioned against the hero box.
+const flarePoint = cubicPoint(0.9);
+const flareTangent = cubicTangent(0.9);
+const flareAngle = ((Math.atan2(flareTangent.y, flareTangent.x) * 180) / Math.PI).toFixed(1);
+
+// Deterministic starfield so every build renders the same sky.
+function mulberry32(seed: number) {
+	return () => {
+		seed |= 0;
+		seed = (seed + 0x6d2b79f5) | 0;
+		let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+const rand = mulberry32(1408);
+const tints = ['#f4f1ec', '#f4f1ec', '#ffe3c2', '#cfe0ff'];
+const stars = Array.from({ length: 46 }, () => ({
+	x: Math.round(rand() * 1440),
+	y: Math.round(rand() * 700),
+	r: (0.5 + rand() * 1.2).toFixed(2),
+	o: (0.1 + rand() * 0.3).toFixed(2),
+	tint: tints[Math.floor(rand() * tints.length)],
+	twinkles: rand() < 0.45,
+	dur: `${(3.5 + rand() * 4).toFixed(2)}s`,
+	delay: `${(-rand() * 6).toFixed(2)}s`,
+}));
+
+// The beam is split across two sibling layers so the browser can cache the
+// expensive one. Everything blurred is static and rasterizes exactly once;
+// everything that moves is filter-free and repaints cheaply. Mixing the two —
+// as a single SVG does — makes every animation frame re-run every Gaussian
+// blur across the whole viewport, which is what made this hero crawl.
+const staticStars = stars.filter((s) => !s.twinkles);
+const liveStars = stars.filter((s) => s.twinkles);
+---
+
+<div class="beam-wrap" aria-hidden="true" data-beam-wrap>
+		<svg class="beam-layer beam-layer--static" viewBox="0 0 1440 720" preserveAspectRatio="xMidYMid slice">
+			<defs>
+			<linearGradient id="beam-spectrum-aura" gradientUnits="userSpaceOnUse" x1={auraBand.x1} y1={auraBand.y1} x2={auraBand.x2} y2={auraBand.y2}>
+				<stop offset="0" stop-color="#ff3b2c" stop-opacity="0" />
+				<stop offset="0.1" stop-color="#ff5a33" stop-opacity="0.65" />
+				<stop offset="0.22" stop-color="#ff9a3c" stop-opacity="0.85" />
+				<stop offset="0.36" stop-color="#ffd975" />
+				<stop offset="0.47" stop-color="#fffdf4" />
+				<stop offset="0.58" stop-color="#8ff0d8" />
+				<stop offset="0.74" stop-color="#4fa8ff" stop-opacity="0.95" />
+				<stop offset="0.9" stop-color="#8a63ff" stop-opacity="0.75" />
+				<stop offset="1" stop-color="#8a63ff" stop-opacity="0" />
+			</linearGradient>
+			<linearGradient id="beam-spectrum-halo" gradientUnits="userSpaceOnUse" x1={haloBand.x1} y1={haloBand.y1} x2={haloBand.x2} y2={haloBand.y2}>
+				<stop offset="0" stop-color="#ff3b2c" stop-opacity="0" />
+				<stop offset="0.1" stop-color="#ff5a33" stop-opacity="0.65" />
+				<stop offset="0.22" stop-color="#ff9a3c" stop-opacity="0.85" />
+				<stop offset="0.36" stop-color="#ffd975" />
+				<stop offset="0.47" stop-color="#fffdf4" />
+				<stop offset="0.58" stop-color="#8ff0d8" />
+				<stop offset="0.74" stop-color="#4fa8ff" stop-opacity="0.95" />
+				<stop offset="0.9" stop-color="#8a63ff" stop-opacity="0.75" />
+				<stop offset="1" stop-color="#8a63ff" stop-opacity="0" />
+			</linearGradient>
+				<linearGradient id="beam-spectrum-body" gradientUnits="userSpaceOnUse" x1={bodyBand.x1} y1={bodyBand.y1} x2={bodyBand.x2} y2={bodyBand.y2}>
+					<stop offset="0" stop-color="#ff3b2c" stop-opacity="0" />
+					<stop offset="0.08" stop-color="#ff5a33" stop-opacity="0.75" />
+					<stop offset="0.24" stop-color="#ff9a3c" stop-opacity="0.95" />
+					<stop offset="0.38" stop-color="#ffd975" />
+					<stop offset="0.5" stop-color="#fffdf4" />
+					<stop offset="0.62" stop-color="#8ff0d8" />
+					<stop offset="0.76" stop-color="#4fa8ff" stop-opacity="0.95" />
+					<stop offset="0.92" stop-color="#8a63ff" stop-opacity="0.75" />
+					<stop offset="1" stop-color="#8a63ff" stop-opacity="0" />
+				</linearGradient>
+				<linearGradient id="beam-ramp-gradient" gradientUnits="userSpaceOnUse" x1={rampFrom.x} y1={rampFrom.y} x2={rampTo.x} y2={rampTo.y}>
+					<stop offset="0" stop-color="#fff3d9" stop-opacity="0" />
+					<stop offset="0.55" stop-color="#fff3d9" stop-opacity="0" />
+					<stop offset="0.82" stop-color="#ffe9bd" stop-opacity="0.3" />
+					<stop offset="1" stop-color="#fffdf4" stop-opacity="0.75" />
+				</linearGradient>
+				<linearGradient id="beam-entry" x1="0" y1="0" x2="1" y2="0">
+					<stop offset="0" stop-color="black" />
+					<stop offset="0.2" stop-color="black" />
+					<stop offset="0.46" stop-color="white" />
+					<stop offset="1" stop-color="white" />
+				</linearGradient>
+				<mask id="beam-entry-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="1440" height="720">
+					<rect width="1440" height="720" fill="url(#beam-entry)" />
+				</mask>
+				<!-- Filter regions are sized to half the stroke plus the blur's ~3σ
+				     spread and no further. The old uniform -40%/-80%/180%/260% box
+				     rasterised roughly 4M pixels per pass, most of it empty. -->
+				<filter id="beam-blur-xl" x="-20%" y="-50%" width="140%" height="200%">
+					<feGaussianBlur stdDeviation="30" />
+				</filter>
+				<filter id="beam-blur-lg" x="-12%" y="-25%" width="124%" height="150%">
+					<feGaussianBlur stdDeviation="13" />
+				</filter>
+				<filter id="beam-blur-sm" x="-5%" y="-12%" width="110%" height="124%">
+					<feGaussianBlur stdDeviation="1.6" />
+				</filter>
+			<filter id="core-glow" x="-5%" y="-12%" width="110%" height="124%">
+				<feGaussianBlur stdDeviation="4" result="blur" />
+				<feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+			</filter>
+			<radialGradient id="flare-glow">
+				<stop offset="0" stop-color="#fffdf4" stop-opacity="0.75" />
+				<stop offset="0.24" stop-color="#ffe9bd" stop-opacity="0.32" />
+				<stop offset="0.52" stop-color="#ffb27a" stop-opacity="0.1" />
+				<stop offset="1" stop-color="#ffb27a" stop-opacity="0" />
+			</radialGradient>
+			<!-- The flare's hot centre was a solid disc pushed through a Gaussian
+			     blur. Baking the same falloff into a gradient costs no filter pass,
+			     which lets the flare animate on the cheap live layer. -->
+			<radialGradient id="flare-core">
+				<stop offset="0" stop-color="#fffdf4" stop-opacity="0.92" />
+				<stop offset="0.34" stop-color="#fffdf4" stop-opacity="0.6" />
+				<stop offset="0.68" stop-color="#fffdf4" stop-opacity="0.16" />
+				<stop offset="1" stop-color="#fffdf4" stop-opacity="0" />
+			</radialGradient>
+		</defs>
+
+			<g class="starfield">
+				{
+					staticStars.map((s) => (
+						<circle class="star" cx={s.x} cy={s.y} r={s.r} fill={s.tint} style={`--o:${s.o}`} />
+					))
+				}
+			</g>
+
+			<g class="beam" mask="url(#beam-entry-mask)">
+				<path class="beam-aura" d={beamArc} fill="none" stroke="url(#beam-spectrum-aura)" stroke-width="300" filter="url(#beam-blur-xl)" />
+				<path class="beam-halo" d={beamArc} fill="none" stroke="url(#beam-spectrum-halo)" stroke-width="130" filter="url(#beam-blur-lg)" />
+				<path class="beam-ramp" d={beamArc} fill="none" stroke="url(#beam-ramp-gradient)" stroke-width="90" filter="url(#beam-blur-lg)" />
+				<path class="beam-body" d={beamArc} fill="none" stroke="url(#beam-spectrum-body)" stroke-width="46" filter="url(#beam-blur-sm)" />
+				<path class="beam-core-soft" d={beamArc} fill="none" stroke="#ffffff" stroke-width="20" opacity="0.22" filter="url(#beam-blur-lg)" />
+				<path class="beam-core" d={beamArc} fill="none" stroke="#fff8ea" stroke-width="6" opacity="0.82" filter="url(#core-glow)" />
+			</g>
+	</svg>
+
+	<svg class="beam-layer beam-layer--live" viewBox="0 0 1440 720" preserveAspectRatio="xMidYMid slice">
+			<g class="starfield">
+				{
+					liveStars.map((s) => (
+						<circle
+							class="star twinkle"
+							cx={s.x}
+							cy={s.y}
+							r={s.r}
+							fill={s.tint}
+							style={`--o:${s.o};--dur:${s.dur};--delay:${s.delay}`}
+						/>
+					))
+				}
+			</g>
+
+			<g>
+				{
+					fibers.map((f) => (
+						<path
+							class="beam-fiber"
+							d={beamArc}
+							stroke={f.color}
+							stroke-width={f.width}
+							stroke-dasharray={`${f.dash} ${f.gap}`}
+							opacity={f.opacity}
+							transform={`translate(${f.dx} ${f.dy})`}
+							style={`--dur:${f.dur};--delay:${f.delay};--cycle:${f.dash + f.gap}`}
+						/>
+					))
+				}
+				{
+					threads.map((t) => (
+						<path
+							class="beam-fiber"
+							d={t.d}
+							stroke={t.color}
+							stroke-width={t.width}
+							stroke-dasharray={`${t.dash} ${t.gap}`}
+							opacity={t.opacity}
+							style={`--dur:${t.dur};--delay:${t.delay};--cycle:${t.dash + t.gap}`}
+						/>
+					))
+				}
+				<path class="beam-core-pulse" d={beamArc} fill="none" stroke="#fff8ea" stroke-width="6" />
+			</g>
+
+			<g>
+				{
+					sparks.map((s) => (
+						<circle
+							class="beam-spark"
+							cx={s.x}
+							cy={s.y}
+							r={s.r}
+							fill="#fff8ea"
+							style={`--dur:${s.dur};--delay:${s.delay};--dx:${sparkDrift.x};--dy:${sparkDrift.y}`}
+						/>
+					))
+				}
+			</g>
+
+			<g transform={`translate(${flarePoint.x.toFixed(1)} ${flarePoint.y.toFixed(1)})`}>
+				<g class="exit-flare">
+					<circle r="200" fill="url(#flare-glow)" />
+					<ellipse rx="230" ry="10" fill="url(#flare-glow)" opacity="0.8" transform={`rotate(${flareAngle})`} />
+					<circle r="72" fill="url(#flare-core)" />
+				</g>
+			</g>
+	</svg>
+</div>
+
+<script is:inline>
+	// The beam is a page-level backdrop: hoist it out of the constrained content
+	// column so it spans the full viewport width from the very top of the page.
+	// Structural move only — no measurement. Runs inline to avoid a first-paint flash.
+	const beamWrap = document.querySelector('[data-beam-wrap]');
+	if (beamWrap && beamWrap.parentElement !== document.body) {
+		document.body.prepend(beamWrap);
+	}
+</script>
+
+<section class="bifrost-hero" aria-labelledby="_top">
+	<div class="hero-copy">
+		<p class="hero-eyebrow">
+			<span></span> Bifrost by <a href="https://brokk.ai" rel="external">Brokk</a>
+		</p>
+		<h1
+			id="_top"
+			data-page-title
+			aria-label="Code intelligence for AI, developers, researchers, security teams, and tool builders."
+		>
+			Code intelligence
+			<em><span class="hero-audience" data-hero-audience aria-hidden="true">for AI.</span></em>
+		</h1>
+		<p class="hero-tagline">
+			Give agents and teams a structured model of the repository instead of another pile of text.
+			Query symbols, trace usage graphs, enforce structural policies, and analyze large multi-language
+			codebases locally.
+		</p>
+		{
+			actions.length > 0 && (
+				<div class="hero-actions">
+					{actions.map(
+						({ icon, link: href, text, variant }) => (
+							<LinkButton href={href} variant={variant} icon={icon?.name}>
+								{text}
+								{icon?.html && <Fragment set:html={icon.html} />}
+							</LinkButton>
+						)
+					)}
+				</div>
+			)
+		}
+
+		<section class="install-strip" aria-labelledby="install-bifrost">
+			<div class="install-strip__heading">
+				<p id="install-bifrost">Install Bifrost</p>
+				<div role="tablist" aria-label="Installation methods">
+					<button id="install-curl-tab" type="button" role="tab" aria-selected="true" aria-controls="install-curl-panel" tabindex="0">
+						curl
+					</button>
+					<button id="install-homebrew-tab" type="button" role="tab" aria-selected="false" aria-controls="install-homebrew-panel" tabindex="-1">
+						Homebrew
+					</button>
+					<button id="install-uv-tab" type="button" role="tab" aria-selected="false" aria-controls="install-uv-panel" tabindex="-1">
+						uv
+					</button>
+					<button id="install-npm-tab" type="button" role="tab" aria-selected="false" aria-controls="install-npm-panel" tabindex="-1">
+						npm
+					</button>
+				</div>
+			</div>
+			<div id="install-curl-panel" class="install-strip__command" role="tabpanel" aria-labelledby="install-curl-tab">
+				<code title="curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/refs/heads/master/install.sh | bash">curl -fsSL https://raw.githubusercontent.com/BrokkAi/bifrost/refs/heads/master/install.sh | bash</code>
+				<button type="button" data-install-copy aria-label="Copy installation command">Copy</button>
+			</div>
+			<div id="install-homebrew-panel" class="install-strip__command" role="tabpanel" aria-labelledby="install-homebrew-tab" hidden>
+				<code title="brew install brokkai/tap/bifrost">brew install brokkai/tap/bifrost</code>
+				<button type="button" data-install-copy aria-label="Copy installation command">Copy</button>
+			</div>
+			<div id="install-uv-panel" class="install-strip__command" role="tabpanel" aria-labelledby="install-uv-tab" hidden>
+				<code title="uv tool install brokk-bifrost">uv tool install brokk-bifrost</code>
+				<button type="button" data-install-copy aria-label="Copy installation command">Copy</button>
+			</div>
+			<div id="install-npm-panel" class="install-strip__command" role="tabpanel" aria-labelledby="install-npm-tab" hidden>
+				<code title="npm install -g @brokkai/bifrost">npm install -g @brokkai/bifrost</code>
+				<button type="button" data-install-copy aria-label="Copy installation command">Copy</button>
+			</div>
+		</section>
+
+		<ul class="hero-proof" aria-label="Core capabilities">
+			<li><span>01</span><strong>Structural queries</strong><small>AST-aware matching</small></li>
+			<li><span>02</span><strong>Usage graphs</strong><small>Definitions to call sites</small></li>
+			<li><span>03</span><strong>Repository scale</strong><small>Multi-language context</small></li>
+		</ul>
+	</div>
+
+	<div class="query-console bifrost-panel bifrost-panel--reverse" aria-hidden="true">
+		<div class="console-topline">WHAT IS CODE INTELLIGENCE?</div>
+		<p class="console-brief">
+			One structured model of the whole repository — symbols, references, and call edges
+			resolved across files, never text matching.
+		</p>
+		<div class="console-spec">
+			<span>LANGUAGES</span>
+			<small>PYTHON · JAVA · JS · TS · GO · C · C++ · RUST · PHP · SCALA · C# · RUBY · KOTLIN</small>
+		</div>
+		<div class="console-spec">
+			<span>INTERFACES</span>
+			<small>MCP · LSP · CLI · PYTHON · RUST</small>
+		</div>
+	</div>
+</section>
+
+<script>
+	const audiences = [
+		'for AI.',
+		'for developers.',
+		'for researchers.',
+		'for security teams.',
+		'for tool builders.',
+	];
+
+	function startAudienceRotation() {
+		const audience = document.querySelector<HTMLElement>('[data-hero-audience]');
+		if (
+			!audience ||
+			audience.dataset.rotationStarted ||
+			window.matchMedia('(prefers-reduced-motion: reduce)').matches
+		) {
+			return;
+		}
+
+		audience.dataset.rotationStarted = 'true';
+		let audienceIndex = 0;
+		const interval = window.setInterval(() => {
+			if (!audience.isConnected) {
+				window.clearInterval(interval);
+				return;
+			}
+			if (document.hidden) return;
+
+			audience.classList.add('is-changing');
+			window.setTimeout(() => {
+				if (!audience.isConnected) return;
+				audienceIndex = (audienceIndex + 1) % audiences.length;
+				const nextAudience = audiences[audienceIndex];
+				audience.textContent = nextAudience;
+				audience.classList.remove('is-changing');
+			}, 180);
+		}, 3600);
+	}
+
+	startAudienceRotation();
+	document.addEventListener('astro:page-load', startAudienceRotation);
+
+	function startInstallControls() {
+		const tablist = document.querySelector<HTMLElement>('.install-strip [role="tablist"]');
+		if (!tablist || tablist.dataset.controlsStarted) return;
+
+		tablist.dataset.controlsStarted = 'true';
+		const tabs = Array.from(tablist.querySelectorAll<HTMLButtonElement>('[role="tab"]'));
+		const selectTab = (selectedTab: HTMLButtonElement) => {
+			for (const tab of tabs) {
+				const selected = tab === selectedTab;
+				tab.setAttribute('aria-selected', String(selected));
+				tab.tabIndex = selected ? 0 : -1;
+				const panelId = tab.getAttribute('aria-controls');
+				const panel = panelId ? document.getElementById(panelId) : null;
+				if (panel) panel.hidden = !selected;
+			}
+		};
+
+		tabs.forEach((tab, index) => {
+			tab.addEventListener('click', () => selectTab(tab));
+			tab.addEventListener('keydown', (event) => {
+				if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+				event.preventDefault();
+				const offset = event.key === 'ArrowRight' ? 1 : -1;
+				const nextTab = tabs[(index + offset + tabs.length) % tabs.length];
+				selectTab(nextTab);
+				nextTab.focus();
+			});
+		});
+
+		for (const button of document.querySelectorAll<HTMLButtonElement>('[data-install-copy]')) {
+			button.addEventListener('click', async () => {
+				const command = button.previousElementSibling?.textContent?.trim();
+				if (!command) return;
+
+				await navigator.clipboard.writeText(command);
+				button.textContent = 'Copied';
+				window.setTimeout(() => {
+					button.textContent = 'Copy';
+				}, 1800);
+			});
+		}
+	}
+
+	startInstallControls();
+	document.addEventListener('astro:page-load', startInstallControls);
+</script>
+
+<style>
+	@layer starlight.user {
+		.bifrost-hero {
+			/* Legibility over the beam. Wide, soft shadows spread the same ink over
+			   a large area, so density at the glyph edge — the only place it does
+			   any work — ends up near zero against a bright backdrop. These stack
+			   short radii at high opacity instead: a contact shadow that hugs the
+			   letterform, then one or two tighter falloffs to seat it. */
+			--bifrost-text-shadow-sm:
+				0 0 2px rgb(5 5 5 / 0.95),
+				0 1px 3px rgb(5 5 5 / 0.9),
+				0 1px 6px rgb(5 5 5 / 0.7);
+			--bifrost-text-shadow-md:
+				0 0 2px rgb(5 5 5 / 0.96),
+				0 1px 4px rgb(5 5 5 / 0.92),
+				0 1px 8px rgb(5 5 5 / 0.72);
+			--bifrost-text-shadow-lg:
+				0 0 3px rgb(5 5 5 / 0.94),
+				0 2px 6px rgb(5 5 5 / 0.9),
+				0 2px 12px rgb(5 5 5 / 0.7);
+
+			position: relative;
+			isolation: isolate;
+			min-height: min(43rem, calc(100vh - var(--sl-nav-height) - 3rem));
+			display: grid;
+			align-items: center;
+			padding:
+				clamp(var(--bifrost-space-8), 4.5vw, 4.5rem)
+				clamp(0rem, 2vw, var(--bifrost-space-6))
+				clamp(6rem, 13vw, 11rem);
+			/* Deliberately not clipped. The copy's scrim has to run off the left
+			   of the page, and clipping it here cut it at the hero's edge — which
+			   on a wide display lands in the middle of the lit area and reads as
+			   a hard vertical line. Nothing inside the hero overflows now that
+			   ::before is capped, verified from 520px to 2400px. */
+			overflow: visible;
+		}
+
+		.bifrost-hero::before {
+			position: absolute;
+			z-index: -1;
+			inset: 6% auto auto 45%;
+			/* Capped at half the hero so it cannot spill off the right edge at
+			   narrow widths. A fixed 36rem starting at 45% overflowed by ~290px
+			   at 520px wide, and that was the only reason the hero had to clip. */
+			width: min(36rem, 50%);
+			aspect-ratio: 1;
+			border-radius: 50%;
+			/* A radial gradient is already smooth; blurring it only bought a
+			   full-size filter pass on every repaint. */
+			background: radial-gradient(circle, rgb(235 63 51 / 0.14), transparent 66%);
+			content: '';
+		}
+
+		.hero-copy {
+			position: relative;
+			z-index: 3;
+			width: 100%;
+		}
+
+		/* The beam passes directly behind this column and its core is near-white,
+		   which no amount of text shadow can hold contrast against — a shadow can
+		   only darken the few pixels it reaches, and against a bright backdrop
+		   the glyph itself is still light-on-light. So the copy sits on a soft
+		   scrim that darkens the backdrop only where the words actually are and
+		   fades out well before any edge, leaving the beam intact around it. */
+		.hero-copy::before {
+			position: absolute;
+			z-index: -1;
+			/* Runs off the left of the hero rather than stopping beside the text.
+			   The hero's own overflow clips it, but by that point the beam is
+			   behind its entry mask and the scrim is the same colour as the page
+			   background, so there is nothing there for a cut edge to show
+			   against. Stopping at -4rem put the cut in the middle of the lit
+			   area, which read as a hard border. */
+			inset: -3rem auto -2.5rem -50vw;
+			width: min(52rem, 70%);
+			/* Stops are measured from the right edge so the falloff keeps its
+			   shape instead of stretching with the box. */
+			background: linear-gradient(
+				270deg,
+				transparent 0,
+				rgb(5 5 5 / 0.45) 7rem,
+				rgb(5 5 5 / 0.85) 22rem,
+				rgb(5 5 5 / 0.88) 100%
+			);
+			/* Softens the top and bottom so those edges do not cut either. */
+			mask-image: linear-gradient(180deg, transparent 0, black 14%, black 82%, transparent 100%);
+			content: '';
+			pointer-events: none;
+		}
+
+		.hero-eyebrow {
+			display: flex;
+			align-items: center;
+			gap: var(--bifrost-space-3);
+			margin: 0 0 var(--bifrost-space-6);
+			color: #cbc4b7;
+			font-family: var(--bifrost-font-mono);
+			font-size: var(--bifrost-text-sm);
+			font-weight: var(--bifrost-weight-bold);
+			letter-spacing: var(--bifrost-tracking-widest);
+			text-shadow: var(--bifrost-text-shadow-sm);
+			text-transform: uppercase;
+		}
+
+		.hero-eyebrow > span {
+			width: 0.5rem;
+			height: 0.5rem;
+			background: #eb3f33;
+			box-shadow: 0 0 14px #eb3f33;
+			transform: rotate(45deg);
+		}
+
+		.hero-eyebrow a {
+			color: #f4f1ec;
+			text-decoration-color: rgb(244 241 236 / 0.38);
+			text-decoration-thickness: 1px;
+			text-underline-offset: 0.2em;
+			transition: color 140ms ease, text-decoration-color 140ms ease;
+		}
+
+		.hero-eyebrow a:hover,
+		.hero-eyebrow a:focus-visible {
+			color: #ff6a5f;
+			text-decoration-color: currentColor;
+		}
+
+		h1 {
+			max-width: 11ch;
+			margin: 0;
+			color: #f4f1ec;
+			font-family: var(--bifrost-font-display);
+			font-size: var(--bifrost-text-display-hero);
+			font-weight: var(--bifrost-weight-regular);
+			letter-spacing: var(--bifrost-tracking-tightest);
+			line-height: var(--bifrost-leading-hero);
+			text-shadow: var(--bifrost-text-shadow-lg);
+			text-wrap: balance;
+		}
+
+		h1 em {
+			display: block;
+			color: #eb3f33;
+			font-style: normal;
+			/* Keeps a trace of the red bloom, but behind the same tight dark stack
+			   so the red never has to carry legibility on its own. */
+			text-shadow:
+				var(--bifrost-text-shadow-lg),
+				0 0 20px rgb(235 63 51 / 0.18);
+		}
+
+		.hero-audience {
+			display: inline-block;
+			white-space: nowrap;
+			transform: translateY(0);
+			transform-origin: left center;
+			transition: opacity 180ms ease, transform 180ms ease;
+		}
+
+		.hero-audience.is-changing {
+			opacity: 0;
+			transform: translateY(0.08em);
+		}
+
+		.hero-tagline {
+			max-width: 56ch;
+			margin: var(--bifrost-space-8) 0 0;
+			color: #cbc4b7;
+			font-size: var(--bifrost-text-tagline);
+			font-weight: var(--bifrost-weight-medium);
+			line-height: var(--bifrost-leading-body);
+			text-shadow: var(--bifrost-text-shadow-md);
+		}
+
+		.hero-actions {
+			display: flex;
+			flex-wrap: wrap;
+			gap: var(--bifrost-space-3);
+			margin-top: var(--bifrost-space-8);
+		}
+
+		.hero-actions :global(a) {
+			position: relative;
+			border-radius: 999rem;
+			font-family: var(--bifrost-font-mono);
+			font-size: var(--bifrost-text-sm);
+			font-weight: var(--bifrost-weight-bold);
+			letter-spacing: var(--bifrost-tracking-wider);
+			text-transform: uppercase;
+			transition:
+				background-color 180ms ease,
+				border-color 180ms ease,
+				box-shadow 180ms ease,
+				color 180ms ease,
+				transform 180ms ease;
+		}
+
+		.hero-actions :global(a svg) {
+			transition: transform 180ms ease;
+		}
+
+		.hero-actions :global(a.secondary) {
+			border-color: var(--bifrost-line-strong);
+			background: color-mix(in srgb, var(--bifrost-surface-raised) 92%, transparent);
+		}
+
+		/* Each button answers for itself. The previous version dimmed the whole
+		   group on :hover/:focus-within and then restored the active one, which
+		   made the gap between the buttons a dead zone where both went flat, and
+		   left both stuck at 48% after a mouse click — :focus-within matched the
+		   dimming but :focus-visible never matched the restore. */
+		.hero-actions :global(a:hover),
+		.hero-actions :global(a:focus-visible) {
+			transform: translateY(-2px);
+		}
+
+		.hero-actions :global(a.primary:hover),
+		.hero-actions :global(a.primary:focus-visible) {
+			border-color: #ff6a5f;
+			background: #eb3f33;
+			box-shadow:
+				0 0 0 1px rgb(255 106 95 / 0.24),
+				0 10px 30px rgb(235 63 51 / 0.32);
+			color: #050505;
+		}
+
+		.hero-actions :global(a.primary:hover svg),
+		.hero-actions :global(a.primary:focus-visible svg) {
+			transform: translateX(3px);
+		}
+
+		.hero-actions :global(a.secondary:hover),
+		.hero-actions :global(a.secondary:focus-visible) {
+			border-color: #f4f1ec;
+			background: #f4f1ec;
+			box-shadow:
+				0 0 0 1px rgb(244 241 236 / 0.18),
+				0 10px 28px rgb(244 241 236 / 0.14);
+			color: #050505;
+		}
+
+		.hero-actions :global(a:active) {
+			transform: translateY(0);
+		}
+
+		.install-strip {
+			width: 100%;
+			min-width: 0;
+			max-width: 100%;
+			box-sizing: border-box;
+			margin-top: var(--bifrost-space-8);
+			border: 1px solid rgb(255 255 255 / 0.16);
+			background: rgb(7 8 10 / 0.76);
+			box-shadow: 0 20px 44px rgb(0 0 0 / 0.24);
+			backdrop-filter: blur(12px);
+		}
+
+		.install-strip__heading {
+			display: flex;
+			align-items: end;
+			justify-content: space-between;
+			padding: var(--bifrost-space-3) var(--bifrost-space-4) 0;
+			border-bottom: 1px solid rgb(255 255 255 / 0.12);
+		}
+
+		.install-strip [role='tablist'] {
+			display: flex;
+			gap: var(--bifrost-space-4);
+		}
+
+		.install-strip__heading p,
+		.install-strip [role='tab'] {
+			margin: 0;
+			font-family: var(--bifrost-font-mono);
+			font-size: var(--bifrost-text-sm);
+			font-weight: var(--bifrost-weight-semibold);
+			letter-spacing: var(--bifrost-tracking-wider);
+			text-transform: uppercase;
+		}
+
+		.install-strip__heading p {
+			padding-bottom: var(--bifrost-space-3);
+			color: #f4f1ec;
+		}
+
+		.install-strip [role='tab'] {
+			padding: 0 0 var(--bifrost-space-3);
+			border: 0;
+			border-bottom: 2px solid transparent;
+			background: transparent;
+			color: #f4f1ec;
+			cursor: pointer;
+		}
+
+		.install-strip [role='tab'][aria-selected='true'] {
+			border-bottom-color: #ff6a5f;
+			color: #ff6a5f;
+		}
+
+		.install-strip__command {
+			display: flex;
+			min-width: 0;
+			max-width: 100%;
+			box-sizing: border-box;
+			overflow: hidden;
+			align-items: center;
+			gap: var(--bifrost-space-3);
+			padding: var(--bifrost-space-4);
+		}
+
+		.install-strip__command[hidden] {
+			display: none;
+		}
+
+		.install-strip__command code {
+			display: block;
+			width: 0;
+			min-width: 0;
+			flex: 1 1 0;
+			overflow: hidden;
+			color: #f4f1ec;
+			font-family: var(--bifrost-font-mono);
+			font-size: var(--bifrost-text-sm);
+			line-height: 1.5;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+		}
+
+		.install-strip__command button {
+			flex: none;
+			white-space: nowrap;
+			padding: 0.42rem 0.62rem;
+			border: 1px solid rgb(255 255 255 / 0.2);
+			background: transparent;
+			color: #cbc4b7;
+			font-family: var(--bifrost-font-mono);
+			font-size: var(--bifrost-text-xs);
+			font-weight: var(--bifrost-weight-semibold);
+			letter-spacing: var(--bifrost-tracking-wider);
+			text-transform: uppercase;
+			transition: border-color 180ms ease, background-color 180ms ease, color 180ms ease;
+		}
+
+		.install-strip__command button:hover,
+		.install-strip__command button:focus-visible {
+			border-color: #f4f1ec;
+			background: #f4f1ec;
+			color: #050505;
+		}
+
+		.hero-proof {
+			display: grid;
+			grid-template-columns: repeat(3, 1fr);
+			gap: 0;
+			max-width: 46rem;
+			margin: calc(var(--bifrost-space-12) + var(--bifrost-space-2)) 0 0;
+			padding: 0;
+			border-block: 1px solid rgb(255 255 255 / 0.1);
+			list-style: none;
+		}
+
+		/* Single column: the index sits on its own row above the label rather
+		   than beside it. */
+		.hero-proof li {
+			display: grid;
+			gap: var(--bifrost-space-1);
+			padding: var(--bifrost-space-5) var(--bifrost-space-4) var(--bifrost-space-5) 0;
+		}
+
+		.hero-proof li + li {
+			padding-inline-start: var(--bifrost-space-5);
+			border-inline-start: 1px solid rgb(255 255 255 / 0.1);
+		}
+
+		/* #eb3f33 lost against the beam's warm band; #ff6a5f is the same hue with
+		   enough lightness to separate from it. */
+		.hero-proof span {
+			margin-bottom: var(--bifrost-space-1);
+			color: #ff6a5f;
+			font-family: var(--bifrost-font-mono);
+			font-size: var(--bifrost-text-sm);
+			font-weight: var(--bifrost-weight-semibold);
+			letter-spacing: var(--bifrost-tracking-wider);
+			text-shadow: var(--bifrost-text-shadow-sm);
+		}
+
+		.hero-proof strong,
+		.hero-proof small {
+			font-family: var(--bifrost-font-mono);
+			text-shadow: var(--bifrost-text-shadow-sm);
+		}
+
+		.hero-proof strong {
+			color: #f4f1ec;
+			font-size: var(--bifrost-text-xl);
+			font-weight: var(--bifrost-weight-semibold);
+		}
+
+		/* Was #948b7e — a mid grey with nowhere near enough contrast once the
+		   beam is behind it. */
+		.hero-proof small {
+			color: #cbc4b7;
+			font-size: var(--bifrost-text-sm);
+		}
+
+		.beam-wrap {
+			position: absolute;
+			z-index: 0;
+			inset: 0 0 auto 0;
+			height: min(62rem, 100vh);
+			overflow: hidden;
+			contain: layout paint;
+			pointer-events: none;
+			mask-image: linear-gradient(180deg, black 80%, transparent 99%);
+		}
+
+		.beam-layer {
+			position: absolute;
+			inset: 0;
+			width: 100%;
+			height: 100%;
+			/* Promote both layers so the static raster is retained across frames
+			   instead of being regenerated whenever the live layer ticks. */
+			transform: translateZ(0);
+		}
+
+		/* Holds every Gaussian blur, and nothing that animates: painted once. */
+		.beam-layer--static {
+			z-index: 0;
+		}
+
+		/* Holds everything that animates, and no filter at all. Blending once at
+		   the layer level replaces the 13 per-element blends this used to do, and
+		   the entry fade is a composited CSS mask rather than an SVG mask that
+		   would force an offscreen pass every frame. */
+		.beam-layer--live {
+			z-index: 1;
+			mix-blend-mode: screen;
+			mask-image: linear-gradient(90deg, transparent 0 20%, black 46%);
+		}
+
+		.star {
+			opacity: var(--o, 0.3);
+		}
+
+		.star.twinkle {
+			animation: star-twinkle var(--dur, 5s) ease-in-out var(--delay, 0s) infinite;
+		}
+
+		.beam-aura {
+			mix-blend-mode: screen;
+			opacity: 0.17;
+		}
+
+		.beam-halo {
+			mix-blend-mode: screen;
+			opacity: 0.42;
+		}
+
+		.beam-ramp {
+			mix-blend-mode: screen;
+		}
+
+		.beam-core-soft {
+			mix-blend-mode: screen;
+		}
+
+		.beam-core {
+			mix-blend-mode: screen;
+		}
+
+		/* The core's breathing is now an additive, filter-free overlay on the live
+		   layer. Animating the filtered core directly re-ran its glow every frame. */
+		.beam-core-pulse {
+			animation: core-breathe 4.6s ease-in-out infinite;
+		}
+
+		.beam-fiber {
+			fill: none;
+			stroke-linecap: round;
+			animation: fiber-flow var(--dur, 7s) linear var(--delay, 0s) infinite;
+		}
+
+		.beam-spark {
+			opacity: 0;
+			animation: spark-drift var(--dur, 4s) ease-in-out var(--delay, 0s) infinite;
+		}
+
+		.exit-flare {
+			opacity: 0.75;
+			transform-box: fill-box;
+			transform-origin: center;
+			animation: flare-pulse 5.4s ease-in-out infinite;
+		}
+
+		.query-console {
+			z-index: 4;
+			inset-inline-end: 1.5%;
+			inset-block-start: 18.5%;
+			/* Held at 34% so the panel keeps clear of .hero-copy; the larger type
+			   is absorbed by growing downward, which the hero has room for. */
+			width: min(29rem, 34%);
+			padding: var(--bifrost-space-5);
+			font-family: var(--bifrost-font-mono);
+			transform: none;
+			background: linear-gradient(
+				112deg,
+				rgb(255 92 60 / 0.6),
+				rgb(255 196 92 / 0.62) 26%,
+				rgb(244 241 236 / 0.66) 50%,
+				rgb(94 190 255 / 0.62) 76%,
+				rgb(141 107 255 / 0.6)
+			);
+		}
+
+		.query-console::after {
+			background:
+				linear-gradient(112deg, rgb(255 122 77 / 0.08), transparent 32%, transparent 68%, rgb(85 140 255 / 0.08)),
+				linear-gradient(150deg, rgb(255 255 255 / 0.055), transparent 50%),
+				rgb(8 8 8 / 0.94);
+			box-shadow: 0 28px 70px rgb(0 0 0 / 0.46);
+		}
+
+		.console-topline,
+		.console-brief,
+		.console-spec {
+			position: relative;
+			z-index: 1;
+		}
+
+		.console-topline {
+			padding-bottom: var(--bifrost-space-3);
+			border-bottom: 1px solid rgb(255 255 255 / 0.09);
+			color: #cbc4b7;
+			font-family: var(--bifrost-font-mono);
+			font-size: var(--bifrost-text-base);
+			font-weight: var(--bifrost-weight-semibold);
+			letter-spacing: var(--bifrost-tracking-widest);
+		}
+
+		.console-brief {
+			margin: var(--bifrost-space-4) 0;
+			color: #cbc4b7;
+			font-family: var(--bifrost-font-body);
+			font-size: var(--bifrost-text-xl);
+			font-weight: var(--bifrost-weight-medium);
+			line-height: 1.55;
+		}
+
+		/* Label stacked above its list rather than beside it, so the values get
+		   the panel's full width instead of sharing it with a label column. */
+		.console-spec {
+			padding-top: var(--bifrost-space-3);
+			border-top: 1px solid rgb(255 255 255 / 0.06);
+		}
+
+		.console-spec + .console-spec {
+			margin-top: var(--bifrost-space-3);
+		}
+
+		.console-spec > span {
+			display: block;
+			margin-bottom: var(--bifrost-space-2);
+			color: #ff6a5f;
+			font-size: var(--bifrost-text-sm);
+			font-weight: var(--bifrost-weight-semibold);
+			letter-spacing: var(--bifrost-tracking-widest);
+		}
+
+		.console-spec > small {
+			display: block;
+			color: #cbc4b7;
+			font-size: var(--bifrost-text-base);
+			letter-spacing: var(--bifrost-tracking-wide);
+			line-height: 1.65;
+		}
+
+		@keyframes fiber-flow {
+			to { stroke-dashoffset: calc(-1 * var(--cycle, 1000)); }
+		}
+
+		@keyframes core-breathe {
+			0%, 100% { opacity: 0; }
+			50% { opacity: 0.28; }
+		}
+
+		@keyframes spark-drift {
+			0% { opacity: 0; transform: translate(0, 0); }
+			16% { opacity: 0.85; }
+			100% { opacity: 0; transform: translate(var(--dx, 42px), var(--dy, -16px)); }
+		}
+
+		@keyframes star-twinkle {
+			0%, 100% { opacity: calc(var(--o, 0.3) * 0.35); }
+			50% { opacity: var(--o, 0.3); }
+		}
+
+		@keyframes flare-pulse {
+			0%, 100% { opacity: 0.6; transform: scale(1); }
+			50% { opacity: 0.85; transform: scale(1.04); }
+		}
+
+		/* At intermediate desktop widths the full-width installer reaches higher
+		   than it does on a wide display. Raise the floating console into the
+		   available whitespace instead of letting their borders touch. */
+		@media (68rem <= width < 78rem) {
+			.query-console {
+				inset-block-start: 15%;
+			}
+		}
+
+		@media (width < 68rem) {
+			.query-console {
+				inset-block-start: 21%;
+				width: 36%;
+			}
+
+			.hero-copy {
+				/* The console grows to 36% at this breakpoint. Keep the content
+				   column at 60%, leaving a real gutter instead of letting the new
+				   installer command run beneath the panel. */
+				width: 60%;
+			}
+
+			.hero-proof {
+				max-width: 38rem;
+			}
+
+			.install-strip {
+				max-width: 38rem;
+			}
+		}
+
+		@media (width < 50rem) {
+			.bifrost-hero {
+				min-height: 41rem;
+				align-items: start;
+				padding-block: 3.5rem 10rem;
+			}
+
+			.hero-copy {
+				width: 100%;
+			}
+
+			/* .hero-copy is full width here, so the scrim's right overhang would
+			   push past the viewport and raise a horizontal scrollbar now that
+			   the hero no longer clips. It has nothing to fade past at this size
+			   anyway. */
+			.hero-copy::before {
+				right: 0;
+			}
+
+			.query-console {
+				display: none;
+			}
+
+			.beam-wrap {
+				opacity: 0.45;
+			}
+
+			.hero-tagline {
+				max-width: 42ch;
+			}
+
+			.hero-proof {
+				grid-template-columns: 1fr;
+				max-width: 22rem;
+				margin-top: 2rem;
+			}
+
+			.install-strip {
+				max-width: 100%;
+			}
+
+			.hero-proof li,
+			.hero-proof li + li {
+				padding: 0.62rem 0;
+				border-inline-start: 0;
+			}
+
+			.hero-proof li + li {
+				border-top: 1px solid rgb(255 255 255 / 0.08);
+			}
+		}
+
+		@media (prefers-reduced-motion: reduce) {
+			.hero-audience {
+				transition: none;
+			}
+
+			.hero-actions :global(a),
+			.hero-actions :global(a svg) {
+				transition: none;
+			}
+
+			.hero-actions :global(a:hover),
+			.hero-actions :global(a:focus-visible),
+			.hero-actions :global(a:active),
+			.hero-actions :global(a.primary:hover svg),
+			.hero-actions :global(a.primary:focus-visible svg) {
+				transform: none;
+			}
+
+			.star.twinkle,
+			.beam-core-pulse,
+			.exit-flare {
+				animation: none;
+			}
+
+			.beam-fiber,
+			.beam-spark {
+				display: none;
+			}
+		}
+	}
+</style>

@@ -1,0 +1,23 @@
+# Policy sources and formatter golds are compared with exact byte ranges.
+*.rqlp text eol=lf
+
+# Typestate canonical contracts are compared byte for byte.
+tests/fixtures/typestate/*.canonical*.json text eol=lf
+
+# Semantic-model source, schema, and text goldens are exact cross-platform contracts.
+schemas/semantic-model-pack-v1.schema.json text eol=lf
+tests/fixtures/semantic-model-packs/*.json text eol=lf
+tests/fixtures/semantic-model-packs/*.yaml text eol=lf
+tests/fixtures/semantic-model-packs/*.deflate binary
+docs/src/content/docs/semantic-model-packs.md text eol=lf
+
+# This reviewed upstream artifact is verified by its exact SHA-256 digest.
+tests/fixtures/sarif/sarif-schema-2.1.0.json text eol=lf
+
+# The vendored Scala parse table is generated from the reviewed pinned grammar.
+vendor/tree-sitter-scala/src/parser.c linguist-generated=true -diff
+
+# The vendored Kotlin parse table is generated from the reviewed pinned grammar.
+vendor/tree-sitter-kotlin/src/parser.c linguist-generated=true -diff
+# Preserve the scanner's reviewed upstream bytes, including its existing space.
+vendor/tree-sitter-kotlin/src/scanner.c whitespace=-trailing-space

@@ -1,0 +1,204 @@
+{
+  "format": "bifrost_summary_foundry_demand_sweep/v1",
+  "slice": {
+    "selection_rule": "The first 12 corpus directories, in sorted-name order, that carry a root-level Maven or Gradle build file (pom.xml, build.gradle, or build.gradle.kts) and hold between one and 400 .java files. A repo's git HEAD is recorded when the clone is a git checkout.",
+    "repos": [
+      {
+        "name": "ACINQ__eclair",
+        "java_files": 2,
+        "commit": "7fb9460183490260537c2e80c0ce4f1af144ea90"
+      },
+      {
+        "name": "AStrizh__WordShuffle",
+        "java_files": 7,
+        "commit": "47025fdf3dea726ca9de769312f7ebde81c84a86"
+      },
+      {
+        "name": "AbsaOSS__cobrix",
+        "java_files": 11,
+        "commit": "62dab4555d489fe49cda7f9857a8bde1ba574eda"
+      },
+      {
+        "name": "AbsaOSS__spline-spark-agent",
+        "java_files": 9,
+        "commit": "d094160031537586db51a8adb1d60fb232a94030"
+      },
+      {
+        "name": "AdAway__AdAway",
+        "java_files": 148,
+        "commit": "fa16432c3b8f3fa7fa42d76d094b2f285879726f"
+      },
+      {
+        "name": "AdoptOpenJDK__jitwatch",
+        "java_files": 341,
+        "commit": "f49eeaf3137be0cc9d1e76d35023f30100aad0ef"
+      },
+      {
+        "name": "AlchemistSimulator__Alchemist",
+        "java_files": 317,
+        "commit": "83372dc779d8e2229c6c83cf0cf89a7662b8013e"
+      },
+      {
+        "name": "Angel-ML__PyTorch-On-Angel",
+        "java_files": 3,
+        "commit": "281a283028d9616523c9f3786c1b0bf5c5768328"
+      },
+      {
+        "name": "Appendium__flatpack",
+        "java_files": 102,
+        "commit": "d1f643abb6689eb35cae10b93cc6b7d49afcc8fb"
+      },
+      {
+        "name": "AsyncHttpClient__async-http-client",
+        "java_files": 367,
+        "commit": "d07dbc79f5cf378f63c246f6101d7579ace55acc"
+      },
+      {
+        "name": "Athou__commafeed",
+        "java_files": 196,
+        "commit": "98a261d4571d24446a68ce95976f41303ba027bd"
+      },
+      {
+        "name": "AutoParams__AutoParams",
+        "java_files": 372,
+        "commit": "5585bb4dbf8c81b65cfe62926d7c8dabd8e87090"
+      }
+    ]
+  },
+  "repo_count": 12,
+  "evaluated_runs": 12,
+  "clean_conclusion_runs": 12,
+  "clean_conclusion_permille": 1000,
+  "outcomes": {
+    "complete": 12,
+    "proven_by_summary": 0,
+    "proven_subset": 0,
+    "inconclusive": 0,
+    "unsupported": 0,
+    "failed": 0,
+    "workspace_build_failed": 0,
+    "evaluation_failed": 0,
+    "timed_out": 0
+  },
+  "verdict_split": {
+    "blocked_verdicts": 0,
+    "verdicts_all_summary_closable": 0,
+    "verdicts_with_engine_blocker": 0,
+    "engine_blocked_verdict_permille": 0
+  },
+  "blocker_bucket_totals": {
+    "summary_closable": 0,
+    "engine_blocked": 0
+  },
+  "ranked_blockers": [],
+  "repo_outcomes": [
+    {
+      "repo": "ACINQ__eclair",
+      "java_files": 2,
+      "outcome": {
+        "status": "ran",
+        "completion": "complete",
+        "findings": 0
+      }
+    },
+    {
+      "repo": "AStrizh__WordShuffle",
+      "java_files": 7,
+      "outcome": {
+        "status": "ran",
+        "completion": "complete",
+        "findings": 0
+      }
+    },
+    {
+      "repo": "AbsaOSS__cobrix",
+      "java_files": 11,
+      "outcome": {
+        "status": "ran",
+        "completion": "complete",
+        "findings": 0
+      }
+    },
+    {
+      "repo": "AbsaOSS__spline-spark-agent",
+      "java_files": 9,
+      "outcome": {
+        "status": "ran",
+        "completion": "complete",
+        "findings": 0
+      }
+    },
+    {
+      "repo": "AdAway__AdAway",
+      "java_files": 148,
+      "outcome": {
+        "status": "ran",
+        "completion": "complete",
+        "findings": 0
+      }
+    },
+    {
+      "repo": "AdoptOpenJDK__jitwatch",
+      "java_files": 341,
+      "outcome": {
+        "status": "ran",
+        "completion": "complete",
+        "findings": 0
+      }
+    },
+    {
+      "repo": "AlchemistSimulator__Alchemist",
+      "java_files": 317,
+      "outcome": {
+        "status": "ran",
+        "completion": "complete",
+        "findings": 0
+      }
+    },
+    {
+      "repo": "Angel-ML__PyTorch-On-Angel",
+      "java_files": 3,
+      "outcome": {
+        "status": "ran",
+        "completion": "complete",
+        "findings": 0
+      }
+    },
+    {
+      "repo": "Appendium__flatpack",
+      "java_files": 102,
+      "outcome": {
+        "status": "ran",
+        "completion": "complete",
+        "findings": 0
+      }
+    },
+    {
+      "repo": "AsyncHttpClient__async-http-client",
+      "java_files": 367,
+      "outcome": {
+        "status": "ran",
+        "completion": "complete",
+        "findings": 0
+      }
+    },
+    {
+      "repo": "Athou__commafeed",
+      "java_files": 196,
+      "outcome": {
+        "status": "ran",
+        "completion": "complete",
+        "findings": 0
+      }
+    },
+    {
+      "repo": "AutoParams__AutoParams",
+      "java_files": 372,
+      "outcome": {
+        "status": "ran",
+        "completion": "complete",
+        "findings": 0
+      }
+    }
+  ]
+}

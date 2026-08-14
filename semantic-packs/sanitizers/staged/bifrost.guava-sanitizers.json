@@ -1,0 +1,248 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.guava-sanitizers",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-sanitizer-foundry",
+    "version": "0.9.0"
+  },
+  "language": "java",
+  "ecosystem": "maven",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <0.10.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "audited k3 sanitizer content over com.google.guava:guava:33.6.0-jre (staged: artifact digest not pinned)",
+    "revision": "k3-sanitizers"
+  },
+  "license": "LGPL-3.0-or-later",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "sanitizers.maven",
+      "activation": [
+        {
+          "package": {
+            "name": "com.google.guava:guava"
+          },
+          "targets": [
+            "jvm"
+          ],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "com.google.common.html.htmlescapers.htmlescaper-.escape",
+            "target": {
+              "path": "com/google/common/html/HtmlEscapers.java",
+              "symbol": "com.google.common.html.HtmlEscapers.htmlEscaper().escape",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "html",
+                  "html_attr",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "com.google.common.net.urlescapers.urlformparameterescaper-.escape",
+            "target": {
+              "path": "com/google/common/net/UrlEscapers.java",
+              "symbol": "com.google.common.net.UrlEscapers.urlFormParameterEscaper().escape",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css",
+                  "html",
+                  "html_attr",
+                  "js",
+                  "log",
+                  "url",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "com.google.common.net.urlescapers.urlfragmentescaper-.escape",
+            "target": {
+              "path": "com/google/common/net/UrlEscapers.java",
+              "symbol": "com.google.common.net.UrlEscapers.urlFragmentEscaper().escape",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "log",
+                  "url"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "com.google.common.net.urlescapers.urlpathsegmentescaper-.escape",
+            "target": {
+              "path": "com/google/common/net/UrlEscapers.java",
+              "symbol": "com.google.common.net.UrlEscapers.urlPathSegmentEscaper().escape",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "log",
+                  "url"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "com.google.common.xml.xmlescapers.xmlescaper-.escape",
+            "target": {
+              "path": "com/google/common/xml/XmlEscapers.java",
+              "symbol": "com.google.common.xml.XmlEscapers.xmlEscaper().escape",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "html",
+                  "html_attr",
+                  "xml"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

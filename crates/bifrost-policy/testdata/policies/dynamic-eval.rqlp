@@ -1,0 +1,15 @@
+; Minimal source-owned fixture for public policy unit contracts.
+(policy
+  :id "bifrost.security.dynamic-eval"
+  :name "No dynamic evaluation"
+  :message "Dynamic evaluation is forbidden"
+  :severity warning
+  :description "Reject calls that execute source text as Python code."
+  :tags ["security" "code-execution"]
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          (language python
+            (call :callee (name "eval"))))))

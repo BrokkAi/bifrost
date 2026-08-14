@@ -1,0 +1,159 @@
+(policy
+  :schema-version 1
+  :id "bifrost.summary-foundry.attacker-controlled-injection.require-model"
+  :name "Attacker-controlled data reaches an injection sink (require-model)"
+  :message "attacker-controlled data reached an injection sink"
+  :severity warning
+  :analysis (analysis
+    :type taint
+    :mode may
+    :call-modeling (call-modeling :unmodeled require-model)
+    :sources (endpoint-set :entries [
+      (source :id src-getheader-0 :display-name "HttpServletRequest.getHeader"
+        :categories [input.user-controlled io.external]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "getHeader"))))
+        :bind return-value :labels [attacker-controlled])
+      (source :id src-getheadernames-1 :display-name "HttpServletRequest.getHeaderNames"
+        :categories [input.user-controlled io.external]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "getHeaderNames"))))
+        :bind return-value :labels [attacker-controlled])
+      (source :id src-getheaders-2 :display-name "HttpServletRequest.getHeaders"
+        :categories [input.user-controlled io.external]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "getHeaders"))))
+        :bind return-value :labels [attacker-controlled])
+      (source :id src-getparameter-3 :display-name "HttpServletRequest.getParameter"
+        :categories [input.user-controlled io.external]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "getParameter"))))
+        :bind return-value :labels [attacker-controlled])
+      (source :id src-getparametermap-4 :display-name "HttpServletRequest.getParameterMap"
+        :categories [input.user-controlled io.external]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "getParameterMap"))))
+        :bind return-value :labels [attacker-controlled])
+      (source :id src-getparameternames-5 :display-name "HttpServletRequest.getParameterNames"
+        :categories [input.user-controlled io.external]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "getParameterNames"))))
+        :bind return-value :labels [attacker-controlled])
+      (source :id src-getparametervalues-6 :display-name "HttpServletRequest.getParameterValues"
+        :categories [input.user-controlled io.external]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "getParameterValues"))))
+        :bind return-value :labels [attacker-controlled])
+      (source :id src-getpathinfo-7 :display-name "HttpServletRequest.getPathInfo"
+        :categories [input.user-controlled io.external]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "getPathInfo"))))
+        :bind return-value :labels [attacker-controlled])
+      (source :id src-getquerystring-8 :display-name "HttpServletRequest.getQueryString"
+        :categories [input.user-controlled io.external]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "getQueryString"))))
+        :bind return-value :labels [attacker-controlled])
+      (source :id src-getrequesturi-9 :display-name "HttpServletRequest.getRequestURI"
+        :categories [input.user-controlled io.external]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "getRequestURI"))))
+        :bind return-value :labels [attacker-controlled])
+      (source :id src-getrequesturl-10 :display-name "HttpServletRequest.getRequestURL"
+        :categories [input.user-controlled io.external]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "getRequestURL"))))
+        :bind return-value :labels [attacker-controlled])
+      (source :id src-getservletpath-11 :display-name "HttpServletRequest.getServletPath"
+        :categories [input.user-controlled io.external]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "getServletPath"))))
+        :bind return-value :labels [attacker-controlled])
+      (source :id src-getenv-12 :display-name "System.getenv"
+        :categories [input.user-controlled io.external]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "getenv"))))
+        :bind return-value :labels [attacker-controlled])])
+    :sinks (endpoint-set :entries [
+      (sink :id snk-processbuilder-0 :display-name "ProcessBuilder.ProcessBuilder"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "ProcessBuilder"))))
+        :dangerous-operand (argument :index 0) :accepts [attacker-controlled])
+      (sink :id snk-addbatch-1 :display-name "Statement.addBatch"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "addBatch"))))
+        :dangerous-operand (argument :index 0) :accepts [attacker-controlled])
+      (sink :id snk-addcookie-2 :display-name "HttpServletResponse.addCookie"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "addCookie"))))
+        :dangerous-operand (argument :index 0) :accepts [attacker-controlled])
+      (sink :id snk-addheader-3 :display-name "HttpServletResponse.addHeader"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "addHeader"))))
+        :dangerous-operand (argument :index 0) :accepts [attacker-controlled])
+      (sink :id snk-addheader-4 :display-name "HttpServletResponse.addHeader"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "addHeader"))))
+        :dangerous-operand (argument :index 1) :accepts [attacker-controlled])
+      (sink :id snk-command-5 :display-name "ProcessBuilder.command"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "command"))))
+        :dangerous-operand (argument :index 0) :accepts [attacker-controlled])
+      (sink :id snk-exec-6 :display-name "Runtime.exec"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "exec"))))
+        :dangerous-operand (argument :index 0) :accepts [attacker-controlled])
+      (sink :id snk-execute-7 :display-name "Statement.execute"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "execute"))))
+        :dangerous-operand (argument :index 0) :accepts [attacker-controlled])
+      (sink :id snk-executelargeupdate-8 :display-name "Statement.executeLargeUpdate"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "executeLargeUpdate"))))
+        :dangerous-operand (argument :index 0) :accepts [attacker-controlled])
+      (sink :id snk-executequery-9 :display-name "Statement.executeQuery"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "executeQuery"))))
+        :dangerous-operand (argument :index 0) :accepts [attacker-controlled])
+      (sink :id snk-executeupdate-10 :display-name "Statement.executeUpdate"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "executeUpdate"))))
+        :dangerous-operand (argument :index 0) :accepts [attacker-controlled])
+      (sink :id snk-preparecall-11 :display-name "Connection.prepareCall"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "prepareCall"))))
+        :dangerous-operand (argument :index 0) :accepts [attacker-controlled])
+      (sink :id snk-preparestatement-12 :display-name "Connection.prepareStatement"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "prepareStatement"))))
+        :dangerous-operand (argument :index 0) :accepts [attacker-controlled])
+      (sink :id snk-senderror-13 :display-name "HttpServletResponse.sendError"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "sendError"))))
+        :dangerous-operand (argument :index 1) :accepts [attacker-controlled])
+      (sink :id snk-setheader-14 :display-name "HttpServletResponse.setHeader"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "setHeader"))))
+        :dangerous-operand (argument :index 0) :accepts [attacker-controlled])
+      (sink :id snk-setheader-15 :display-name "HttpServletResponse.setHeader"
+        :categories [data.sensitive]
+        :selector (rql :schema-version 1
+          (language java (call :callee (name "setHeader"))))
+        :dangerous-operand (argument :index 1) :accepts [attacker-controlled])]))
+  :classification (classification
+    :fallback (classification-id :taxonomy "Foundry" :id "SUMMARY-INJECTION")))

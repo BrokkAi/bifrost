@@ -1,0 +1,20 @@
+# Test slice of CodeQL Models-as-Data for Java.
+#
+# Upstream: https://github.com/github/codeql
+#   path:     java/ql/lib/ext/java.util.model.yml
+#   revision: c9142680f5b6409dbe0944350321c54e8c801e61
+#   license:  MIT (see LICENSE in the upstream repository)
+#
+# These are the corpus's `java.util.Objects` summary rows, copied verbatim. The
+# derivation tests use the pinned `Objects` sources for the same members, so
+# this slice is what the three-way join compares the derived slot against.
+extensions:
+  - addsTo:
+      pack: codeql/java-all
+      extensible: summaryModel
+    data:
+      - ["java.util", "Objects", False, "requireNonNull", "", "", "Argument[0]", "ReturnValue", "value", "manual"]
+      - ["java.util", "Objects", False, "requireNonNullElse", "", "", "Argument[0]", "ReturnValue", "value", "manual"]
+      - ["java.util", "Objects", False, "requireNonNullElse", "", "", "Argument[1]", "ReturnValue", "value", "manual"]
+      - ["java.util", "Objects", False, "requireNonNullElseGet", "", "", "Argument[0]", "ReturnValue", "value", "manual"]
+      - ["java.util", "Objects", False, "toString", "", "", "Argument[1]", "ReturnValue", "value", "manual"]

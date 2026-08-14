@@ -1,0 +1,12 @@
+{
+  "binaryVersion": "0.9.5",
+  "minimumBinaryVersion": "0.9.0",
+  "allowPrerelease": false,
+  "archiveSha256": {
+    "aarch64-pc-windows-msvc": "35d03fd4a041366f95b9b0f5f6b72ddf73e1ef671c6c932fb75fd49dda1113bb",
+    "aarch64-unknown-linux-gnu": "5578286a4c82a4f757f24d478bbea135bb68c8c17d2a423885ac5df7c9250ad2",
+    "universal-apple-darwin": "e5a2fdd5c11dd3d4fce6b06f580cadca56439178345402bf565fb3551d86ee85",
+    "x86_64-pc-windows-msvc": "96b7b7769207ff8f5307298fc66d68f0f11b1e672f9cb20e737ef14595926b07",
+    "x86_64-unknown-linux-gnu": "6d1c09bc9c8a40cfce5c347c61ec23e362a5d705fb309eeb45fa1c809a568025"
+  }
+}

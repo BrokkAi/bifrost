@@ -1,0 +1,169 @@
+---
+title: Reproduce an Analysis
+description: Preserve the inputs, environment, execution contract, and outputs needed to rerun a Bifrost result.
+---
+
+A reproducible Bifrost analysis needs more than a saved query or policy. Preserve the engine, source, workspace, configuration, resolved policy dependency closure, execution limits, and complete typed response so another person can distinguish a changed program from a changed analyzer or policy.
+
+## Recommended Artifact Layout
+
+```text
+bifrost-analysis/
+├── manifest.json
+├── queries/
+│   ├── rule.rql
+│   └── rule.json
+├── policies/
+│   ├── rule.rqlp
+│   └── endpoints/
+│       ├── source.rqlp
+│       └── sink.rqlp
+├── suppressions.json
+├── results/
+│   ├── query-result.json
+│   └── policy-report.json
+└── README.md
+```
+
+For a raw query, commit the RQL used for exploration and the canonical JSON used as the stable integration contract. Pin `schema_version` in the query JSON. For a policy, commit every explicitly selected `.rqlp` and `.rql` source plus any registered catalog input. Preserve the canonical policy JSON report before transforming it into a dashboard or prose; human, JSON, and SARIF policy outputs share one canonical model, but JSON is easiest to compare mechanically.
+
+## Run Manifest
+
+Independent extensions should use the authoritative
+`brokk_bifrost_runtime::extension::ExtensionRunManifest` schema and its
+`encode_run_manifest_json`, `decode_canonical_run_manifest_json`,
+`verify_extension_bundle`, and reproduction APIs. The canonical bundle places
+`manifest.json` at its root and keeps requests, observations, relation
+snapshots, mappings, protocols, and results in external content-addressed
+files. Paths are normalized relative paths; symlinks, escapes, duplicate roles,
+dependency cycles, hash/length mismatches, and a complete aggregate containing
+incomplete evidence are rejected.
+
+The manifest digest excludes only the schema-defined `volatile` measurements;
+the hash of the complete `manifest.json` file includes them. Reproduction first
+returns every engine, workspace, extension, semantic, environment, cache, or
+artifact mismatch in stable order. It executes only after that preflight, uses
+a typed executor rather than a command string from the manifest, stages into a
+new directory, verifies the result, and atomically publishes only equal
+deterministic artifacts. Never include secrets or absolute checkout paths in
+deterministic identity fields.
+
+Use a machine-readable manifest such as:
+
+```json
+{
+  "bifrost": {
+    "version": "0.8.5",
+    "commit": "<full Bifrost commit>",
+    "features": [],
+    "interface": "cli"
+  },
+  "source": {
+    "repository": "<source repository URL>",
+    "commit": "<full source commit>",
+    "workspace_root": ".",
+    "dirty": false
+  },
+  "query": {
+    "path": "queries/rule.json",
+    "sha256": "<query file hash>",
+    "schema_version": 1
+  },
+  "execution": {
+    "command": "bifrost --root . --query-file queries/rule.json",
+    "toolset": null,
+    "result_detail": "full",
+    "cache_state": "warm",
+    "environment": {}
+  },
+  "result": {
+    "path": "results/result.json",
+    "sha256": "<result file hash>",
+    "truncated": false,
+    "provenance_truncated": false,
+    "diagnostic_count": 0
+  }
+}
+```
+
+Replace example values with observed values; do not copy `0.8.5` into a future run without checking the binary. Record only environment variables that affect Bifrost behavior, and redact secrets before publication.
+
+### Policy runs
+
+For `--policy-file`, record the source pins and the resolved meaning separately.
+Omitted policy/endpoint and nested RQL versions select the latest compatible
+compiled-in lineage; an explicit version is an exact reproducibility pin. The
+report retains the actual version and origin either way, but publication
+artifacts should normally use explicit pins or show that strict mode accepted
+the complete dependency closure.
+
+Add fields such as:
+
+```json
+{
+  "policy": {
+    "roots": ["policies/rule.rqlp"],
+    "source_sha256": {"policies/rule.rqlp": "<source hash>"},
+    "policy_schema": {"version": 1, "origin": "explicit"},
+    "semantic_hash": "<loaded policy semantic hash>",
+    "resolved_rql_schemas": [{"version": 2, "origin": "explicit"}],
+    "endpoint_manifests": ["<selected endpoint manifest hash>"],
+    "catalogs": [],
+    "suppression_path": "suppressions.json",
+    "suppression_sha256": "<suppression file hash>"
+  },
+  "execution": {
+    "command": "bifrost --root . --policy-file policies/rule.rqlp --suppressions-file suppressions.json --evaluation-date 2026-07-27 --format json --fail-on never --require-explicit-schema-versions",
+    "format": "json",
+    "fail_on": "never",
+    "evaluation_date": "2026-07-27"
+  },
+  "result": {
+    "path": "results/policy-report.json",
+    "sha256": "<report hash>",
+    "completion": "complete",
+    "exit_status": 0,
+    "diagnostics_truncated": false
+  }
+}
+```
+
+The source hash explains byte-level changes such as comments or formatting.
+The loaded semantic hash explains changes to resolved schema, selector,
+endpoint, catalog, or precedence meaning. Preserve both rather than treating
+one as a substitute for the other. A selected endpoint-directory manifest is
+part of the policy meaning; the directory path and unselected leaves are not.
+
+## Capture The Execution Contract
+
+- **Engine:** binary version, full source commit when known, build features/profile, and plugin or package version.
+- **Source:** repository and full commit, dirty-tree status or patch, workspace root, submodules, generated/vendor policy, and relevant file filters.
+- **Query:** both RQL and canonical JSON when applicable, `schema_version`, file hash, result detail, limits, languages, and path filters.
+- **Policy:** every root and dependency source, source hashes, resolved policy/endpoint and nested RQL schema versions plus origins, loaded semantic hash, selected endpoint and catalog manifests, precedence manifest, suppression source and hash, evaluation date, report limits, output format, `--fail-on`, and strict-version mode.
+- **Interface:** exact CLI command, MCP toolset and arguments, Python package version and call, or Rust dependency revision.
+- **Environment:** operating system and hardware when timing matters; semantic model ID/directory and accelerator settings when semantic search is involved.
+- **Response:** every typed result variant, diagnostics, `truncated`, proof tiers, provenance, and `provenance_truncated` before downstream filtering.
+
+For MCP, record the configured workspace root and the exact `query_code` or
+`run_policy` arguments. A saved `query_file` path is workspace-relative and
+exclusive with inline query fields; policy files, suppression override, fixed
+evaluation date, and threshold are independent `run_policy` fields. For VS
+Code, record the extension and server versions, whether the RQL or policy
+buffer was unsaved, and the UTC evaluation date reported by the policy run;
+unsaved text is an input that must be preserved separately.
+
+## Cold and Warm Runs
+
+Label cache state precisely. Bifrost's persistent repository cache is `.bifrost/cache/bifrost_cache.v<N>.db` at the primary Git repository root, where `<N>` is the cache schema version the build reads, and linked worktrees share it. Client-root MCP sessions resolve the same primary-root database rather than a per-root copy; an explicit `BIFROST_CACHE_DIR` instead uses `$BIFROST_CACHE_DIR/bifrost_cache.v<N>.db`. A new process using any of those databases is not a fully cold run. Record whether you removed the cache while Bifrost was stopped, reused it, warmed the same process, or changed branches between samples.
+
+Use the [evaluation protocol](/evaluation-evidence/) when publishing timing, memory, precision, or recall. Keep installation downloads and optional semantic-model downloads separate unless they are intentionally part of the measurement.
+
+## Verify Before Publication
+
+1. Check out the recorded Bifrost and source revisions in clean environments.
+2. Verify the query and result hashes.
+3. Run the exact command or API call and compare complete structured output, allowing only fields explicitly documented as nondeterministic.
+4. Confirm diagnostics, policy completion, and all truncation fields before comparing match or finding counts. Status 2 is never a clean zero-finding result.
+5. Document any mismatch as an engine, grammar, corpus, environment, or policy difference rather than silently updating the expected artifact.
+
+Finally, attach a [software citation](/cite-bifrost/) and state the bounded claim supported by the result. The [agent result-safety rules](/agent-result-safety/) apply equally to human-authored reports.

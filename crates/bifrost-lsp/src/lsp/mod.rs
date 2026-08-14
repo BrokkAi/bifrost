@@ -1,0 +1,28 @@
+//! LSP server entry point. The server is a hand-rolled dispatcher built on the
+//! `lsp-server` crate (Content-Length framed JSON-RPC over stdio) and
+//! `lsp-types` for protocol message shapes.
+//!
+//! `bifrost --server lsp` launches the server. The initial workspace is
+//! bootstrapped from every usable `initialize.workspaceFolders` entry when
+//! present; otherwise legacy root params and finally the `--root` path are used
+//! as fallbacks.
+
+mod capabilities;
+pub mod conversion;
+pub(crate) mod dependency_packs;
+pub(crate) mod handlers;
+mod progress;
+mod request_context;
+mod server;
+mod text_sync;
+
+pub use server::run_lsp_stdio_server;
+
+/// Typed hierarchy handlers used by the repository's benchmark application.
+///
+/// These remain outside the stable facade API; the benchmark sits above both
+/// protocol hosts and intentionally measures the same handler path as LSP.
+#[doc(hidden)]
+pub mod benchmark_api {
+    pub use super::handlers::{call_hierarchy, definition, hover, signature_help, type_hierarchy};
+}

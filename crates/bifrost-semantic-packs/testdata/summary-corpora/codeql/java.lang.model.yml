@@ -1,0 +1,39 @@
+# Test slice of CodeQL Models-as-Data for Java.
+#
+# Upstream: https://github.com/github/codeql
+#   path:     java/ql/lib/ext/java.lang.model.yml (and java.io.model.yml)
+#   revision: c9142680f5b6409dbe0944350321c54e8c801e61
+#   license:  MIT (see LICENSE in the upstream repository)
+#
+# Every row below is copied verbatim from the pinned upstream files. The slice
+# exists so translator tests never touch the network and never vendor the whole
+# corpus; scripts/fetch-pinned-summary-corpora.sh fetches the full corpus for a
+# foundry run.
+extensions:
+  - addsTo:
+      pack: codeql/java-all
+      extensible: summaryModel
+    data:
+      - ["java.lang", "String", False, "concat", "(String)", "", "Argument[this]", "ReturnValue", "taint", "manual"]
+      - ["java.lang", "String", False, "concat", "(String)", "", "Argument[0]", "ReturnValue", "taint", "manual"]
+      - ["java.lang", "String", False, "join", "", "", "Argument[0..1]", "ReturnValue", "taint", "manual"]
+      - ["java.lang", "AbstractStringBuilder", True, "AbstractStringBuilder", "(String)", "", "Argument[0]", "Argument[this]", "taint", "manual"]
+      - ["java.lang", "String", False, "format", "(String,Object[])", "", "Argument[1].ArrayElement", "ReturnValue", "taint", "manual"]
+      - ["java.lang", "Iterable", True, "iterator", "()", "", "Argument[this].Element", "ReturnValue.Element", "value", "manual"]
+      - ["java.lang", "String", False, "getBytes", "", "", "Argument[this]", "Argument[2]", "taint", "manual"]
+  - addsTo:
+      pack: codeql/java-all
+      extensible: neutralModel
+    data:
+      - ["java.lang", "String", "length", "()", "summary", "manual"]
+      - ["java.lang", "String", "isEmpty", "()", "sink", "manual"]
+  - addsTo:
+      pack: codeql/java-all
+      extensible: sourceModel
+    data:
+      - ["java.lang", "System", False, "getenv", "", "", "ReturnValue", "environment", "manual"]
+  - addsTo:
+      pack: codeql/java-all
+      extensible: sinkModel
+    data:
+      - ["java.lang", "Runtime", True, "exec", "(String)", "", "Argument[0]", "command-injection", "ai-manual"]

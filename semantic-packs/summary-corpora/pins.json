@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "corpora": [
+    {
+      "corpus": "codeql",
+      "upstream": "https://github.com/github/codeql",
+      "revision": "c9142680f5b6409dbe0944350321c54e8c801e61",
+      "license": "MIT",
+      "archive": {
+        "url": "https://codeload.github.com/github/codeql/tar.gz/c9142680f5b6409dbe0944350321c54e8c801e61",
+        "sha256": "2a5b5922dc7cd0684d90957ad63e08587f32a5dbc0c9fa3e6856f2fd6be1c94c",
+        "member": "codeql-c9142680f5b6409dbe0944350321c54e8c801e61/java/ql/lib/ext"
+      }
+    },
+    {
+      "corpus": "joern",
+      "upstream": "https://github.com/joernio/joern",
+      "revision": "8a73ec09be8fa59dba3cfed5959690c003d7ca52",
+      "license": "Apache-2.0",
+      "archive": {
+        "url": "https://codeload.github.com/joernio/joern/tar.gz/8a73ec09be8fa59dba3cfed5959690c003d7ca52",
+        "sha256": "b68a175fe071053777fd2a51143323b80cc2a098a5f493af72054d6720425c90",
+        "member": "joern-8a73ec09be8fa59dba3cfed5959690c003d7ca52/dataflowengineoss/src/main/scala/io/joern/dataflowengineoss/DefaultSemantics.scala"
+      }
+    }
+  ]
+}

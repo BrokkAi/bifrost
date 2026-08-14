@@ -1,0 +1,48 @@
+[package]
+name = "brokk-bifrost-jvm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "JVM language knowledge for brokk-bifrost: Java, Scala and Kotlin declarations, imports and hierarchy, and the shared JVM source realm"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+publish = true
+exclude = [
+    "resources/treesitter/kotlin/tags.scm",
+]
+
+[lib]
+name = "brokk_bifrost_jvm"
+
+[dependencies]
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.9.5" }
+brokk-tree-sitter-kotlin = "=0.4.0"
+regex = "1.12.2"
+# Scala's supertype lookup path is stored as its own JSON envelope inside the
+# declaration index, so the type that owns that encoding travels with `serde`.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tree-sitter = "0.25.10"
+# tree-sitter-java is a grammar generation behind the fleet's 0.25 line, in the
+# same class as tree-sitter-cpp 0.23.4, tree-sitter-c-sharp 0.23.1,
+# tree-sitter-php 0.23.11 and tree-sitter-ruby 0.23.1.
+tree-sitter-java = "0.23.5"
+tree-sitter-scala = "=0.26.2"
+
+[features]
+default = []
+# Mirrors `brokk-bifrost-analysis`'s feature of the same name, chained exactly
+# like `brokk-bifrost-cpp`'s: Scala's definition route records build counters
+# from production paths under the same gate, so the hooks must stay reachable
+# across the crate boundary.
+test-support = ["brokk-bifrost-core/test-support"]
+
+[dev-dependencies]
+# Cargo unifies this with the plain `[dependencies]` entry above for this
+# crate's test targets, which is what makes core's test-support surface exist
+# while this crate's unit tests are built.
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.9.5", features = ["test-support"] }

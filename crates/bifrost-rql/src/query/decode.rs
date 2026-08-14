@@ -1,0 +1,2119 @@
+use super::ir::{
+    ArityConstraint, BindingFilter, BindingOfOptions, BindingSeed, CallInputSelector,
+    CallSiteTraversalFilter, CallTraversalFilter, CandidateFilter, CandidateOutcomeLabel,
+    CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed,
+    DEFAULT_LIMIT, DeclarationStateFilter, EdgeFilter, ExportFilter, ExportSeed,
+    FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal, MAX_ARITY,
+    MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH,
+    MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
+    MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
+    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, OccurrenceFilter, OccurrenceSeed, PathFilter,
+    PathSeed, Pattern, QueryError, QueryStep, ReceiverTraversalFilter, ReferenceTraversalFilter,
+    RewritePathFilter, ScopeFilter, ScopeSeed, SegmentsOfOptions, SetOperator, StateEventFilter,
+    StringPredicate, TaintTraversal, TypestateTraversal, UNATTRIBUTED_TIER_LABEL,
+    ValueFlowTraversal, WitnessTraversal,
+};
+use super::schema::{
+    ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
+    StringPredicateField, call_traversal_completeness_from_label, reference_kind_from_label,
+    rql_schema_version_registry, usage_kind_from_label, usage_proof_from_label,
+    usage_surface_from_label,
+};
+use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::structural::edges::{OwnerRelation, SiteClass};
+use brokk_bifrost_core::analyzer::structural::flow_state::{
+    FlowCertainty, FlowRelation as FlowRelationLabel, FlowSubjectKind, StateEventClass,
+};
+use brokk_bifrost_core::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
+use brokk_bifrost_core::analyzer::structural::materialization::{
+    DeclarationOrigin, ExportForm, GenerationInputClass, GenerationKind,
+};
+use brokk_bifrost_core::analyzer::structural::occurrences::{
+    Namespace, OccurrenceClass, OccurrenceRole,
+};
+use brokk_bifrost_core::analyzer::structural::resolution::{
+    BindingKind, BoundaryStatus, HoistingClass, PrecedenceTier, RejectionReason,
+};
+use brokk_bifrost_core::analyzer::structural::rewrite_path::{
+    RewriteDomainKind, RewriteOutcomeKind,
+};
+use brokk_bifrost_core::schema_version::SchemaVersionRegistry;
+use regex::Regex;
+use serde_json::{Map, Value};
+use std::num::NonZeroUsize;
+
+impl CodeQuery {
+    pub fn from_json(value: &Value) -> Result<Self, QueryError> {
+        Self::from_json_with_schema_registry(value, rql_schema_version_registry())
+    }
+
+    pub(super) fn from_json_with_schema_registry(
+        value: &Value,
+        schema_versions: &SchemaVersionRegistry,
+    ) -> Result<Self, QueryError> {
+        let object = as_object(value, "")?;
+        let mut budget = QueryBudget::default();
+        let fields = collect_query_fields(object, "")?;
+        let schema_version =
+            decode_schema_version(fields.schema_version, "schema_version", schema_versions)?;
+
+        let limit = match fields.limit {
+            None => DEFAULT_LIMIT,
+            Some(value) => decode_limit(value, "limit")?,
+        };
+        let result_detail = match fields.result_detail {
+            None => CodeQueryResultDetail::Compact,
+            Some(value) => decode_result_detail(value, "result_detail")?,
+        };
+        let execution_mode = match fields.execution_mode {
+            None => CodeQueryExecutionMode::default(),
+            Some(value) => decode_execution_mode(value, "execution_mode")?,
+        };
+
+        let query = Self {
+            schema_version,
+            plan: decode_plan(fields, "", &mut budget, true, 0)?,
+            limit,
+            result_detail,
+            execution_mode,
+        };
+        query.validate_steps()?;
+        Ok(query)
+    }
+}
+
+#[derive(Default)]
+struct QueryBudget {
+    pattern_nodes: usize,
+    plan_nodes: usize,
+}
+
+fn as_object<'a>(value: &'a Value, path: &str) -> Result<&'a Map<String, Value>, QueryError> {
+    value.as_object().ok_or_else(|| {
+        QueryError::new(
+            path,
+            format!("expected an object, got {}", type_name(value)),
+        )
+    })
+}
+
+fn type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+fn child_path(path: &str, field: &str) -> String {
+    if path.is_empty() {
+        field.to_string()
+    } else {
+        format!("{path}.{field}")
+    }
+}
+
+fn index_path(path: &str, index: usize) -> String {
+    format!("{path}[{index}]")
+}
+
+#[derive(Clone, Copy, Default)]
+struct QueryFields<'a> {
+    where_globs: Option<&'a Value>,
+    languages: Option<&'a Value>,
+    root: Option<&'a Value>,
+    union: Option<&'a Value>,
+    intersect: Option<&'a Value>,
+    except: Option<&'a Value>,
+    inside: Option<&'a Value>,
+    inside_decl: Option<&'a Value>,
+    not_inside: Option<&'a Value>,
+    occurrences: Option<&'a Value>,
+    scopes: Option<&'a Value>,
+    bindings: Option<&'a Value>,
+    generation_sites: Option<&'a Value>,
+    exports: Option<&'a Value>,
+    paths: Option<&'a Value>,
+    steps: Option<&'a Value>,
+    limit: Option<&'a Value>,
+    result_detail: Option<&'a Value>,
+    execution_mode: Option<&'a Value>,
+    schema_version: Option<&'a Value>,
+}
+
+fn collect_query_fields<'a>(
+    object: &'a Map<String, Value>,
+    path: &str,
+) -> Result<QueryFields<'a>, QueryError> {
+    let mut fields = QueryFields::default();
+    for (key, value) in object {
+        let Some(field) = QueryField::from_label(key) else {
+            return Err(QueryError::new(
+                child_path(path, key),
+                "unknown field in query object",
+            ));
+        };
+        match field {
+            QueryField::Where => fields.where_globs = Some(value),
+            QueryField::Languages => fields.languages = Some(value),
+            QueryField::Match => fields.root = Some(value),
+            QueryField::Union => fields.union = Some(value),
+            QueryField::Intersect => fields.intersect = Some(value),
+            QueryField::Except => fields.except = Some(value),
+            QueryField::Inside => fields.inside = Some(value),
+            QueryField::InsideDecl => fields.inside_decl = Some(value),
+            QueryField::NotInside => fields.not_inside = Some(value),
+            QueryField::Occurrences => fields.occurrences = Some(value),
+            QueryField::Scopes => fields.scopes = Some(value),
+            QueryField::Bindings => fields.bindings = Some(value),
+            QueryField::GenerationSites => fields.generation_sites = Some(value),
+            QueryField::Exports => fields.exports = Some(value),
+            QueryField::Paths => fields.paths = Some(value),
+            QueryField::Steps => fields.steps = Some(value),
+            QueryField::Limit => fields.limit = Some(value),
+            QueryField::ResultDetail => fields.result_detail = Some(value),
+            QueryField::ExecutionMode => fields.execution_mode = Some(value),
+            QueryField::SchemaVersion => fields.schema_version = Some(value),
+        }
+    }
+    Ok(fields)
+}
+
+fn decode_plan(
+    fields: QueryFields<'_>,
+    path: &str,
+    budget: &mut QueryBudget,
+    root: bool,
+    depth: usize,
+) -> Result<CodeQueryPlan, QueryError> {
+    if depth > MAX_QUERY_PLAN_DEPTH {
+        return Err(QueryError::new(
+            path,
+            format!("query plan depth must be at most {MAX_QUERY_PLAN_DEPTH}"),
+        ));
+    }
+    budget.plan_nodes += 1;
+    if budget.plan_nodes > MAX_QUERY_PLAN_NODES {
+        return Err(QueryError::new(
+            path,
+            format!("query plan may contain at most {MAX_QUERY_PLAN_NODES} nodes"),
+        ));
+    }
+    if !root {
+        for (label, value) in [
+            ("schema_version", fields.schema_version),
+            ("limit", fields.limit),
+            ("result_detail", fields.result_detail),
+            ("execution_mode", fields.execution_mode),
+        ] {
+            if value.is_some() {
+                return Err(QueryError::new(
+                    child_path(path, label),
+                    "field is allowed only on the root query",
+                ));
+            }
+        }
+    }
+
+    let sources = [
+        ("match", fields.root),
+        ("occurrences", fields.occurrences),
+        ("scopes", fields.scopes),
+        ("bindings", fields.bindings),
+        ("generation_sites", fields.generation_sites),
+        ("exports", fields.exports),
+        ("paths", fields.paths),
+        ("union", fields.union),
+        ("intersect", fields.intersect),
+        ("except", fields.except),
+    ];
+    let present = sources
+        .iter()
+        .filter_map(|(label, value)| value.map(|value| (*label, value)))
+        .collect::<Vec<_>>();
+    if present.is_empty() {
+        return Err(QueryError::new(
+            child_path(path, "match"),
+            "one of match, occurrences, scopes, bindings, paths, union, intersect, or except is required",
+        ));
+    }
+    if present.len() > 1 {
+        return Err(QueryError::new(
+            child_path(path, present[1].0),
+            format!(
+                "query plan source is mutually exclusive with {}",
+                present[0].0
+            ),
+        ));
+    }
+
+    let source = if let Some(value) = fields.root {
+        let match_path = child_path(path, "match");
+        let root_pattern = decode_pattern(value, &match_path, budget, 0)?;
+        if root_pattern.kinds.is_empty()
+            && root_pattern.name.is_none()
+            && root_pattern.text.is_none()
+        {
+            return Err(QueryError::new(
+                match_path,
+                "root pattern must constrain at least one of \"kind\", \"name\", or \"text\"",
+            ));
+        }
+        let inside_path = child_path(path, "inside");
+        let inside = fields
+            .inside
+            .map(|value| decode_pattern(value, &inside_path, budget, 0))
+            .transpose()?;
+        if let Some(pattern) = &inside
+            && pattern.is_empty()
+        {
+            return Err(QueryError::new(inside_path, "pattern must not be empty"));
+        }
+        let inside_decl_path = child_path(path, "inside_decl");
+        let inside_decl = fields
+            .inside_decl
+            .map(|value| decode_pattern(value, &inside_decl_path, budget, 0))
+            .transpose()?;
+        if let Some(pattern) = &inside_decl
+            && pattern.is_empty()
+        {
+            return Err(QueryError::new(
+                inside_decl_path,
+                "pattern must not be empty",
+            ));
+        }
+        let not_inside_path = child_path(path, "not_inside");
+        let not_inside = fields
+            .not_inside
+            .map(|value| decode_pattern(value, &not_inside_path, budget, 0))
+            .transpose()?;
+        if let Some(pattern) = &not_inside
+            && pattern.is_empty()
+        {
+            return Err(QueryError::new(
+                not_inside_path,
+                "pattern must not be empty",
+            ));
+        }
+        CodeQueryPlanSource::Seed(Box::new(CodeQuerySeed {
+            where_globs: fields
+                .where_globs
+                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .transpose()?
+                .unwrap_or_default(),
+            languages: fields
+                .languages
+                .map(|value| decode_languages(value, &child_path(path, "languages")))
+                .transpose()?
+                .unwrap_or_default(),
+            root: root_pattern,
+            inside,
+            inside_decl,
+            not_inside,
+        }))
+    } else if let Some(value) = fields.occurrences {
+        let occurrences_path = child_path(path, "occurrences");
+        for (label, value) in [
+            ("inside", fields.inside),
+            ("inside_decl", fields.inside_decl),
+            ("not_inside", fields.not_inside),
+        ] {
+            if value.is_some() {
+                return Err(QueryError::new(
+                    child_path(path, label),
+                    "structural containment requires a match source; use occurrences_in over a structural query",
+                ));
+            }
+        }
+        let object = as_object(value, &occurrences_path)?;
+        CodeQueryPlanSource::Occurrences(Box::new(OccurrenceSeed {
+            where_globs: fields
+                .where_globs
+                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .transpose()?
+                .unwrap_or_default(),
+            languages: fields
+                .languages
+                .map(|value| decode_languages(value, &child_path(path, "languages")))
+                .transpose()?
+                .unwrap_or_default(),
+            filter: decode_occurrence_filter(object, &occurrences_path)?,
+        }))
+    } else if let Some(value) = fields.scopes {
+        let scopes_path = child_path(path, "scopes");
+        reject_structural_containment(&fields, path, "scope_of")?;
+        let object = as_object(value, &scopes_path)?;
+        CodeQueryPlanSource::Scopes(Box::new(ScopeSeed {
+            where_globs: fields
+                .where_globs
+                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .transpose()?
+                .unwrap_or_default(),
+            languages: fields
+                .languages
+                .map(|value| decode_languages(value, &child_path(path, "languages")))
+                .transpose()?
+                .unwrap_or_default(),
+            filter: decode_scope_filter(object, &scopes_path)?,
+        }))
+    } else if let Some(value) = fields.bindings {
+        let bindings_path = child_path(path, "bindings");
+        reject_structural_containment(&fields, path, "bindings_in")?;
+        let object = as_object(value, &bindings_path)?;
+        CodeQueryPlanSource::Bindings(Box::new(BindingSeed {
+            where_globs: fields
+                .where_globs
+                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .transpose()?
+                .unwrap_or_default(),
+            languages: fields
+                .languages
+                .map(|value| decode_languages(value, &child_path(path, "languages")))
+                .transpose()?
+                .unwrap_or_default(),
+            filter: decode_binding_filter(object, &bindings_path)?,
+        }))
+    } else if let Some(value) = fields.paths {
+        let paths_path = child_path(path, "paths");
+        reject_structural_containment(&fields, path, "segments_of")?;
+        let object = as_object(value, &paths_path)?;
+        CodeQueryPlanSource::Paths(Box::new(PathSeed {
+            where_globs: fields
+                .where_globs
+                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .transpose()?
+                .unwrap_or_default(),
+            languages: fields
+                .languages
+                .map(|value| decode_languages(value, &child_path(path, "languages")))
+                .transpose()?
+                .unwrap_or_default(),
+            filter: decode_path_filter(object, &paths_path)?,
+        }))
+    } else if let Some(value) = fields.generation_sites {
+        let sites_path = child_path(path, "generation_sites");
+        reject_structural_containment(&fields, path, "generated_by")?;
+        let object = as_object(value, &sites_path)?;
+        CodeQueryPlanSource::GenerationSites(Box::new(GenerationSiteSeed {
+            where_globs: fields
+                .where_globs
+                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .transpose()?
+                .unwrap_or_default(),
+            languages: fields
+                .languages
+                .map(|value| decode_languages(value, &child_path(path, "languages")))
+                .transpose()?
+                .unwrap_or_default(),
+            filter: decode_generation_site_filter(object, &sites_path)?,
+        }))
+    } else if let Some(value) = fields.exports {
+        let exports_path = child_path(path, "exports");
+        reject_structural_containment(&fields, path, "export_target")?;
+        let object = as_object(value, &exports_path)?;
+        CodeQueryPlanSource::Exports(Box::new(ExportSeed {
+            where_globs: fields
+                .where_globs
+                .map(|value| decode_globs(value, &child_path(path, "where")))
+                .transpose()?
+                .unwrap_or_default(),
+            languages: fields
+                .languages
+                .map(|value| decode_languages(value, &child_path(path, "languages")))
+                .transpose()?
+                .unwrap_or_default(),
+            filter: decode_export_filter(object, &exports_path)?,
+        }))
+    } else {
+        for (label, value) in [
+            ("where", fields.where_globs),
+            ("languages", fields.languages),
+            ("inside", fields.inside),
+            ("inside_decl", fields.inside_decl),
+            ("not_inside", fields.not_inside),
+        ] {
+            if value.is_some() {
+                return Err(QueryError::new(
+                    child_path(path, label),
+                    "structural scope field requires a match source",
+                ));
+            }
+        }
+        let (op, value) = if let Some(value) = fields.union {
+            (SetOperator::Union, value)
+        } else if let Some(value) = fields.intersect {
+            (SetOperator::Intersect, value)
+        } else {
+            (
+                SetOperator::Except,
+                fields.except.expect("set source is present"),
+            )
+        };
+        let op_path = child_path(path, op.label());
+        let entries = value.as_array().ok_or_else(|| {
+            QueryError::new(&op_path, "expected an array of query branch objects")
+        })?;
+        if entries.len() < 2 {
+            return Err(QueryError::new(
+                &op_path,
+                format!("{} requires at least two branches", op.label()),
+            ));
+        }
+        if entries.len() > MAX_QUERY_BRANCHES {
+            return Err(QueryError::new(
+                &op_path,
+                format!("at most {MAX_QUERY_BRANCHES} branches are allowed"),
+            ));
+        }
+        let mut branches = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            let branch_path = index_path(&op_path, index);
+            let object = as_object(entry, &branch_path)?;
+            let branch_fields = collect_query_fields(object, &branch_path)?;
+            branches.push(decode_plan(
+                branch_fields,
+                &branch_path,
+                budget,
+                false,
+                depth + 1,
+            )?);
+        }
+        CodeQueryPlanSource::Set { op, branches }
+    };
+
+    let steps_path = child_path(path, "steps");
+    let steps = fields
+        .steps
+        .map(|value| decode_steps(value, &steps_path))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(CodeQueryPlan { source, steps })
+}
+
+/// Decode the shared `class` / `role` / `namespace` filter block.
+///
+/// Both spellings — an array of labels and a single label string — are accepted
+/// so the JSON frontend mirrors the RQL one, which lowers `:role binder` and
+/// `:role [binder value_reference]` to the same shape.
+fn decode_occurrence_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<OccurrenceFilter, QueryError> {
+    fn decode_axis<T: PartialEq>(
+        object: &Map<String, Value>,
+        path: &str,
+        field: &str,
+        noun: &str,
+        from_label: impl Fn(&str) -> Option<T>,
+    ) -> Result<Vec<T>, QueryError> {
+        let Some(value) = object.get(field) else {
+            return Ok(Vec::new());
+        };
+        let field_path = child_path(path, field);
+        let entries: Vec<&Value> = match value {
+            Value::Array(entries) => entries.iter().collect(),
+            Value::String(_) => vec![value],
+            _ => {
+                return Err(QueryError::new(
+                    field_path,
+                    format!("expected a {noun} label or an array of {noun} labels"),
+                ));
+            }
+        };
+        if entries.is_empty() {
+            return Err(QueryError::new(
+                field_path,
+                format!("{field} must not be empty"),
+            ));
+        }
+        if entries.len() > MAX_OCCURRENCE_FILTER_ENTRIES {
+            return Err(QueryError::new(
+                field_path,
+                format!("at most {MAX_OCCURRENCE_FILTER_ENTRIES} {noun} labels are allowed"),
+            ));
+        }
+        let mut decoded = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.into_iter().enumerate() {
+            let entry_path = index_path(&field_path, index);
+            let label = entry
+                .as_str()
+                .ok_or_else(|| QueryError::new(&entry_path, format!("expected a {noun} label")))?;
+            let decoded_entry = from_label(label)
+                .ok_or_else(|| QueryError::new(&entry_path, format!("unknown {noun} {label:?}")))?;
+            if !decoded.contains(&decoded_entry) {
+                decoded.push(decoded_entry);
+            }
+        }
+        Ok(decoded)
+    }
+
+    for key in object.keys() {
+        if !matches!(key.as_str(), "class" | "role" | "namespace" | "op") {
+            return Err(QueryError::new(
+                child_path(path, key),
+                "unknown field in occurrence filter object",
+            ));
+        }
+    }
+
+    Ok(OccurrenceFilter {
+        classes: decode_axis(object, path, "class", "occurrence class", |label| {
+            OccurrenceClass::from_label(label)
+        })?,
+        roles: decode_axis(object, path, "role", "occurrence role", |label| {
+            OccurrenceRole::from_label(label)
+        })?,
+        namespaces: decode_axis(object, path, "namespace", "namespace", |label| {
+            Namespace::from_label(label)
+        })?,
+    })
+}
+
+/// A non-structural seed cannot take structural containment patterns, for the
+/// same reason the occurrence seed cannot: containment over its rows is a real
+/// step, so the containment verifier exists exactly once.
+fn reject_structural_containment(
+    fields: &QueryFields<'_>,
+    path: &str,
+    alternative_step: &str,
+) -> Result<(), QueryError> {
+    for (label, value) in [
+        ("inside", fields.inside),
+        ("inside_decl", fields.inside_decl),
+        ("not_inside", fields.not_inside),
+    ] {
+        if value.is_some() {
+            return Err(QueryError::new(
+                child_path(path, label),
+                format!(
+                    "structural containment requires a match source; use {alternative_step} over a structural query"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Decode one constrained-value axis that accepts either a single label or an
+/// array of labels. Shared by every lexical-environment filter for the same
+/// reason the occurrence decoder shares its own: one place validates a label.
+fn decode_environment_axis<T: PartialEq>(
+    object: &Map<String, Value>,
+    path: &str,
+    field: &str,
+    noun: &str,
+    from_label: impl Fn(&str) -> Option<T>,
+) -> Result<Vec<T>, QueryError> {
+    let Some(value) = object.get(field) else {
+        return Ok(Vec::new());
+    };
+    let field_path = child_path(path, field);
+    let entries: Vec<&Value> = match value {
+        Value::Array(entries) => entries.iter().collect(),
+        Value::String(_) => vec![value],
+        _ => {
+            return Err(QueryError::new(
+                field_path,
+                format!("expected a {noun} label or an array of {noun} labels"),
+            ));
+        }
+    };
+    if entries.is_empty() {
+        return Err(QueryError::new(
+            field_path,
+            format!("{field} must not be empty"),
+        ));
+    }
+    if entries.len() > MAX_ENVIRONMENT_FILTER_ENTRIES {
+        return Err(QueryError::new(
+            field_path,
+            format!("at most {MAX_ENVIRONMENT_FILTER_ENTRIES} {noun} labels are allowed"),
+        ));
+    }
+    let mut decoded = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.into_iter().enumerate() {
+        let entry_path = index_path(&field_path, index);
+        let label = entry
+            .as_str()
+            .ok_or_else(|| QueryError::new(&entry_path, format!("expected a {noun} label")))?;
+        let decoded_entry = from_label(label)
+            .ok_or_else(|| QueryError::new(&entry_path, format!("unknown {noun} {label:?}")))?;
+        if !decoded.contains(&decoded_entry) {
+            decoded.push(decoded_entry);
+        }
+    }
+    Ok(decoded)
+}
+
+fn reject_unknown_filter_fields(
+    object: &Map<String, Value>,
+    path: &str,
+    accepted: &[&str],
+    noun: &str,
+) -> Result<(), QueryError> {
+    for key in object.keys() {
+        if !accepted.contains(&key.as_str()) {
+            return Err(QueryError::new(
+                child_path(path, key),
+                format!("unknown field in {noun} filter object"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn decode_scope_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<ScopeFilter, QueryError> {
+    reject_unknown_filter_fields(object, path, &["kind"], "lexical scope")?;
+    Ok(ScopeFilter {
+        kinds: decode_environment_axis(object, path, "kind", "normalized kind", |label| {
+            NormalizedKind::from_label(label)
+        })?,
+    })
+}
+
+pub(super) fn decode_path_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<PathFilter, QueryError> {
+    reject_unknown_filter_fields(object, path, &["min_segments"], "qualified path")?;
+    let min_segments = match object.get("min_segments") {
+        Some(value) => {
+            let count = value.as_u64().filter(|count| *count > 0).ok_or_else(|| {
+                QueryError::new(
+                    child_path(path, "min_segments"),
+                    "min_segments must be a positive integer",
+                )
+            })?;
+            Some(u32::try_from(count).map_err(|_| {
+                QueryError::new(
+                    child_path(path, "min_segments"),
+                    "min_segments must fit in 32 bits",
+                )
+            })?)
+        }
+        None => None,
+    };
+    Ok(PathFilter { min_segments })
+}
+
+pub(super) fn decode_binding_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<BindingFilter, QueryError> {
+    reject_unknown_filter_fields(object, path, &["kind", "name", "hoisting", "op"], "binding")?;
+    let names = decode_environment_axis(object, path, "name", "binding name", |label| {
+        (!label.is_empty() && label.len() <= MAX_BINDING_NAME_LENGTH).then(|| label.to_string())
+    })?;
+    Ok(BindingFilter {
+        kinds: decode_environment_axis(object, path, "kind", "binding kind", |label| {
+            BindingKind::from_label(label)
+        })?,
+        names,
+        hoisting: decode_environment_axis(object, path, "hoisting", "hoisting class", |label| {
+            HoistingClass::from_label(label)
+        })?,
+    })
+}
+
+pub(super) fn decode_edge_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<EdgeFilter, QueryError> {
+    reject_unknown_filter_fields(
+        object,
+        path,
+        &[
+            "reference_kinds",
+            "proof",
+            "surface",
+            "usage",
+            "relation",
+            "site_class",
+            "op",
+        ],
+        "reference edge",
+    )?;
+    let proof = object
+        .get("proof")
+        .map(|value| {
+            let field_path = child_path(path, "proof");
+            let label = value
+                .as_str()
+                .ok_or_else(|| QueryError::new(&field_path, "expected proven or unproven"))?;
+            usage_proof_from_label(label)
+                .ok_or_else(|| QueryError::new(&field_path, "expected proven or unproven"))
+        })
+        .transpose()?;
+    let surface = object
+        .get("surface")
+        .map(|value| {
+            let field_path = child_path(path, "surface");
+            let label = value.as_str().ok_or_else(|| {
+                QueryError::new(&field_path, "expected external_usages or lsp_references")
+            })?;
+            usage_surface_from_label(label).ok_or_else(|| {
+                QueryError::new(&field_path, "expected external_usages or lsp_references")
+            })
+        })
+        .transpose()?;
+    Ok(EdgeFilter {
+        reference_kinds: decode_environment_axis(
+            object,
+            path,
+            "reference_kinds",
+            "reference kind",
+            reference_kind_from_label,
+        )?,
+        proof,
+        surface,
+        usage_kinds: decode_environment_axis(
+            object,
+            path,
+            "usage",
+            "usage kind",
+            usage_kind_from_label,
+        )?,
+        relations: decode_environment_axis(
+            object,
+            path,
+            "relation",
+            "owner relation",
+            OwnerRelation::from_label,
+        )?,
+        site_classes: decode_environment_axis(
+            object,
+            path,
+            "site_class",
+            "site class",
+            SiteClass::from_label,
+        )?,
+    })
+}
+
+pub(super) fn decode_state_event_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<StateEventFilter, QueryError> {
+    let classes = QueryStepField::StateEventClasses.label();
+    let subjects = QueryStepField::StateEventSubjects.label();
+    reject_unknown_filter_fields(object, path, &[classes, subjects, "op"], "state event")?;
+    Ok(StateEventFilter {
+        classes: decode_environment_axis(
+            object,
+            path,
+            classes,
+            "state event class",
+            StateEventClass::from_label,
+        )?,
+        subjects: decode_environment_axis(
+            object,
+            path,
+            subjects,
+            "flow subject kind",
+            FlowSubjectKind::from_label,
+        )?,
+    })
+}
+
+pub(super) fn decode_flow_relation_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<FlowRelationFilter, QueryError> {
+    let relations = QueryStepField::FlowRelations.label();
+    let certainties = QueryStepField::FlowCertainties.label();
+    reject_unknown_filter_fields(
+        object,
+        path,
+        &[relations, certainties, "op"],
+        "flow relation",
+    )?;
+    Ok(FlowRelationFilter {
+        relations: decode_environment_axis(
+            object,
+            path,
+            relations,
+            "flow relation",
+            FlowRelationLabel::from_label,
+        )?,
+        certainties: decode_environment_axis(
+            object,
+            path,
+            certainties,
+            "flow certainty",
+            FlowCertainty::from_label,
+        )?,
+    })
+}
+
+pub(super) fn decode_rewrite_path_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<RewritePathFilter, QueryError> {
+    let domains = QueryStepField::RewriteDomains.label();
+    let outcomes = QueryStepField::RewriteOutcomes.label();
+    reject_unknown_filter_fields(object, path, &[domains, outcomes, "op"], "rewrite path")?;
+    Ok(RewritePathFilter {
+        domains: decode_environment_axis(
+            object,
+            path,
+            domains,
+            "rewrite domain",
+            RewriteDomainKind::from_label,
+        )?,
+        outcomes: decode_environment_axis(
+            object,
+            path,
+            outcomes,
+            "rewrite outcome",
+            RewriteOutcomeKind::from_label,
+        )?,
+    })
+}
+
+pub(super) fn decode_candidate_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<CandidateFilter, QueryError> {
+    reject_unknown_filter_fields(
+        object,
+        path,
+        &["tier", "outcome", "boundary", "op"],
+        "resolution candidate",
+    )?;
+    // `unattributed` is a value of the tier axis rather than the absence of a
+    // filter, because a trace row whose seam could not name a tier is a real
+    // answer an author must be able to select without it colliding with a tier.
+    #[derive(PartialEq)]
+    enum TierEntry {
+        Unattributed,
+        Named(PrecedenceTier),
+    }
+    let tier_entries = decode_environment_axis(object, path, "tier", "precedence tier", |label| {
+        if label == UNATTRIBUTED_TIER_LABEL {
+            Some(TierEntry::Unattributed)
+        } else {
+            PrecedenceTier::from_label(label).map(TierEntry::Named)
+        }
+    })?;
+    #[derive(PartialEq)]
+    enum OutcomeEntry {
+        Coarse(CandidateOutcomeLabel),
+        Reason(RejectionReason),
+    }
+    let outcome_entries = decode_environment_axis(
+        object,
+        path,
+        "outcome",
+        "candidate outcome",
+        |label| match label {
+            "selected" => Some(OutcomeEntry::Coarse(CandidateOutcomeLabel::Selected)),
+            "rejected" => Some(OutcomeEntry::Coarse(CandidateOutcomeLabel::Rejected)),
+            _ => RejectionReason::from_label(label).map(OutcomeEntry::Reason),
+        },
+    )?;
+    Ok(CandidateFilter {
+        unattributed_tier: tier_entries.contains(&TierEntry::Unattributed),
+        tiers: tier_entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                TierEntry::Named(tier) => Some(tier),
+                TierEntry::Unattributed => None,
+            })
+            .collect(),
+        outcomes: outcome_entries
+            .iter()
+            .filter_map(|entry| match entry {
+                OutcomeEntry::Coarse(outcome) => Some(*outcome),
+                OutcomeEntry::Reason(_) => None,
+            })
+            .collect(),
+        rejection_reasons: outcome_entries
+            .iter()
+            .filter_map(|entry| match entry {
+                OutcomeEntry::Reason(reason) => Some(*reason),
+                OutcomeEntry::Coarse(_) => None,
+            })
+            .collect(),
+        boundaries: decode_environment_axis(
+            object,
+            path,
+            "boundary",
+            "boundary status",
+            BoundaryStatus::from_label,
+        )?,
+    })
+}
+
+pub(super) fn decode_generation_site_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<GenerationSiteFilter, QueryError> {
+    reject_unknown_filter_fields(object, path, &["kind", "input"], "generation site")?;
+    Ok(GenerationSiteFilter {
+        kinds: decode_environment_axis(object, path, "kind", "generation kind", |label| {
+            GenerationKind::from_label(label)
+        })?,
+        inputs: decode_environment_axis(
+            object,
+            path,
+            "input",
+            "generation input class",
+            GenerationInputClass::from_label,
+        )?,
+    })
+}
+
+pub(super) fn decode_export_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<ExportFilter, QueryError> {
+    reject_unknown_filter_fields(object, path, &["form", "name"], "export")?;
+    Ok(ExportFilter {
+        forms: decode_environment_axis(object, path, "form", "export form", |label| {
+            ExportForm::from_label(label)
+        })?,
+        names: decode_environment_axis(object, path, "name", "exported name", |label| {
+            (!label.is_empty() && label.len() <= MAX_BINDING_NAME_LENGTH).then(|| label.to_string())
+        })?,
+    })
+}
+
+pub(super) fn decode_declaration_state_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<DeclarationStateFilter, QueryError> {
+    reject_unknown_filter_fields(
+        object,
+        path,
+        &["origin", "declaration_only", "config_gated", "op"],
+        "declaration state",
+    )?;
+    let decode_bool = |field: &str| -> Result<Option<bool>, QueryError> {
+        object
+            .get(field)
+            .map(|value| {
+                value
+                    .as_bool()
+                    .ok_or_else(|| QueryError::new(child_path(path, field), "expected a boolean"))
+            })
+            .transpose()
+    };
+    Ok(DeclarationStateFilter {
+        origins: decode_environment_axis(object, path, "origin", "declaration origin", |label| {
+            DeclarationOrigin::from_label(label)
+        })?,
+        declaration_only: decode_bool("declaration_only")?,
+        config_gated: decode_bool("config_gated")?,
+    })
+}
+
+fn decode_globs(value: &Value, path: &str) -> Result<Vec<glob::Pattern>, QueryError> {
+    let entries = value
+        .as_array()
+        .ok_or_else(|| QueryError::new(path, "expected an array of glob strings"))?;
+    if entries.len() > MAX_WHERE_GLOBS {
+        return Err(QueryError::new(
+            path,
+            format!("at most {MAX_WHERE_GLOBS} globs are allowed"),
+        ));
+    }
+    let mut globs = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_path = index_path(path, index);
+        let text = entry
+            .as_str()
+            .ok_or_else(|| QueryError::new(&entry_path, "expected a glob string"))?;
+        reject_too_long(text, &entry_path, MAX_GLOB_LENGTH, "glob")?;
+        let compiled = glob::Pattern::new(text)
+            .map_err(|error| QueryError::new(&entry_path, format!("invalid glob: {error}")))?;
+        globs.push(compiled);
+    }
+    Ok(globs)
+}
+
+fn decode_languages(value: &Value, path: &str) -> Result<Vec<Language>, QueryError> {
+    let entries = value
+        .as_array()
+        .ok_or_else(|| QueryError::new(path, "expected an array of language labels"))?;
+    if entries.len() > MAX_LANGUAGE_FILTERS {
+        return Err(QueryError::new(
+            path,
+            format!("at most {MAX_LANGUAGE_FILTERS} language filters are allowed"),
+        ));
+    }
+    let mut languages = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_path = index_path(path, index);
+        let text = entry
+            .as_str()
+            .ok_or_else(|| QueryError::new(&entry_path, "expected a language label string"))?;
+        let language = Language::from_config_label(text)
+            .ok_or_else(|| QueryError::new(&entry_path, format!("unknown language {text:?}")))?;
+        languages.push(language);
+    }
+    Ok(languages)
+}
+
+fn decode_limit(value: &Value, path: &str) -> Result<usize, QueryError> {
+    let limit = value
+        .as_u64()
+        .ok_or_else(|| QueryError::new(path, "expected a positive integer"))?;
+    if limit == 0 {
+        return Err(QueryError::new(path, "limit must be at least 1"));
+    }
+    if limit > MAX_LIMIT as u64 {
+        return Err(QueryError::new(
+            path,
+            format!("limit must be at most {MAX_LIMIT}"),
+        ));
+    }
+    Ok(limit as usize)
+}
+
+fn decode_schema_version(
+    value: Option<&Value>,
+    path: &str,
+    schema_versions: &SchemaVersionRegistry,
+) -> Result<u64, QueryError> {
+    let authored_version = value
+        .map(|value| {
+            let version = value.as_u64().ok_or_else(|| {
+                QueryError::new(path, "expected an unsigned integer schema version")
+            })?;
+            u32::try_from(version).map_err(|_| {
+                QueryError::new(
+                    path,
+                    "schema version must fit in an unsigned 32-bit integer",
+                )
+            })
+        })
+        .transpose()?;
+    schema_versions
+        .resolve(authored_version)
+        .map(|resolution| u64::from(resolution.version))
+        .map_err(|error| QueryError::new(path, error.to_string()))
+}
+
+fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError> {
+    let entries = value
+        .as_array()
+        .ok_or_else(|| QueryError::new(path, "expected an array of step objects"))?;
+    if entries.len() > MAX_QUERY_STEPS {
+        return Err(QueryError::new(
+            path,
+            format!("at most {MAX_QUERY_STEPS} query steps are allowed"),
+        ));
+    }
+
+    let mut steps = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let entry_path = index_path(path, index);
+        let object = as_object(entry, &entry_path)?;
+        let op_path = child_path(&entry_path, "op");
+        let label = object
+            .get("op")
+            .ok_or_else(|| QueryError::new(&op_path, "required field is missing"))?
+            .as_str()
+            .ok_or_else(|| QueryError::new(&op_path, "expected a step name string"))?;
+        let op = super::schema::QueryStepOp::from_label(label).ok_or_else(|| {
+            let expected = ALL_QUERY_STEP_OPS
+                .iter()
+                .map(|op| op.label())
+                .collect::<Vec<_>>()
+                .join(", ");
+            QueryError::new(
+                &op_path,
+                format!("unknown query step {label:?}; expected {expected}"),
+            )
+        })?;
+        let mut step = match op {
+            super::schema::QueryStepOp::Typestate => {
+                let protocol_ref_path = child_path(&entry_path, "protocol_ref");
+                let protocol_ref = object
+                    .get("protocol_ref")
+                    .ok_or_else(|| {
+                        QueryError::new(&protocol_ref_path, "required field is missing")
+                    })?
+                    .as_str()
+                    .ok_or_else(|| {
+                        QueryError::new(&protocol_ref_path, "expected a protocol reference string")
+                    })?
+                    .parse()
+                    .map_err(|error: crate::refs::ProtocolRefError| {
+                        QueryError::new(protocol_ref_path, error.to_string())
+                    })?;
+                QueryStep::Typestate(TypestateTraversal { protocol_ref })
+            }
+            super::schema::QueryStepOp::ValueFlow => {
+                let plan_ref_path = child_path(&entry_path, "plan_ref");
+                let plan_ref = object
+                    .get("plan_ref")
+                    .ok_or_else(|| QueryError::new(&plan_ref_path, "required field is missing"))?
+                    .as_str()
+                    .ok_or_else(|| {
+                        QueryError::new(
+                            &plan_ref_path,
+                            "expected a value-flow plan reference string",
+                        )
+                    })?
+                    .parse()
+                    .map_err(|error: crate::refs::ValueFlowPlanRefError| {
+                        QueryError::new(plan_ref_path, error.to_string())
+                    })?;
+                QueryStep::ValueFlow(ValueFlowTraversal { plan_ref })
+            }
+            super::schema::QueryStepOp::Taint => {
+                let taint_ref_path = child_path(&entry_path, "taint_ref");
+                let taint_ref = object
+                    .get("taint_ref")
+                    .ok_or_else(|| QueryError::new(&taint_ref_path, "required field is missing"))?
+                    .as_str()
+                    .ok_or_else(|| {
+                        QueryError::new(&taint_ref_path, "expected a taint result reference string")
+                    })?
+                    .parse()
+                    .map_err(|error: crate::refs::TaintResultRefError| {
+                        QueryError::new(taint_ref_path, error.to_string())
+                    })?;
+                QueryStep::Taint(TaintTraversal { taint_ref })
+            }
+            super::schema::QueryStepOp::Witness => QueryStep::Witness(WitnessTraversal::default()),
+            _ => QueryStep::from_label(label)
+                .expect("option-free and defaultable query steps construct from their labels"),
+        };
+        let hierarchy = matches!(step, QueryStep::Supertypes(_) | QueryStep::Subtypes(_));
+        let reference = matches!(
+            step,
+            QueryStep::ReferencesOf(_) | QueryStep::UsedBy(_) | QueryStep::Uses(_)
+        );
+        let call = matches!(step, QueryStep::Callers(_) | QueryStep::Callees(_));
+        let call_site = matches!(
+            step,
+            QueryStep::CallSitesTo(_) | QueryStep::CallSitesFrom(_)
+        );
+        let call_input = matches!(step, QueryStep::CallInput(_));
+        let receiver = matches!(
+            step,
+            QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_) | QueryStep::MemberTargets(_)
+        );
+        let typestate = matches!(step, QueryStep::Typestate(_));
+        let value_flow = matches!(step, QueryStep::ValueFlow(_));
+        let taint = matches!(step, QueryStep::Taint(_));
+        let witness = matches!(step, QueryStep::Witness(_));
+        let occurrence = matches!(
+            step,
+            QueryStep::OccurrencesOf(_) | QueryStep::OccurrencesIn(_)
+        );
+        let binding = matches!(step, QueryStep::BindingsIn(_));
+        let candidate = matches!(step, QueryStep::CandidatesOf(_));
+        let binding_of = matches!(step, QueryStep::BindingOf(_));
+        let declaration_state = matches!(step, QueryStep::DeclarationStateOf(_));
+        let edge = matches!(step, QueryStep::EdgesOf(_) | QueryStep::EdgesFrom(_));
+        let state_event = matches!(step, QueryStep::StateEventsOf(_));
+        let flow_relation = matches!(step, QueryStep::FlowRelationsOf(_));
+        let rewrite_path = matches!(step, QueryStep::RewritePathsOf(_));
+        let segments = matches!(step, QueryStep::SegmentsOf(_));
+        for key in object.keys() {
+            match QueryStepField::from_label(key) {
+                Some(QueryStepField::Op) => {}
+                Some(QueryStepField::Depth | QueryStepField::Transitive) if hierarchy => {}
+                Some(
+                    QueryStepField::Depth | QueryStepField::Proof | QueryStepField::Completeness,
+                ) if call => {}
+                Some(QueryStepField::Proof) if call_site => {}
+                Some(
+                    QueryStepField::Receiver
+                    | QueryStepField::ParameterIndex
+                    | QueryStepField::ParameterName,
+                ) if call_input => {}
+                Some(QueryStepField::Capture) if receiver => {}
+                Some(QueryStepField::ProtocolRef) if typestate => {}
+                Some(QueryStepField::PlanRef) if value_flow => {}
+                Some(QueryStepField::TaintRef) if taint => {}
+                Some(QueryStepField::MaxSteps | QueryStepField::MaxBytes) if witness => {}
+                Some(
+                    QueryStepField::OccurrenceClasses
+                    | QueryStepField::OccurrenceRoles
+                    | QueryStepField::OccurrenceNamespaces,
+                ) if occurrence => {}
+                Some(
+                    QueryStepField::BindingKinds
+                    | QueryStepField::BindingNames
+                    | QueryStepField::BindingHoisting,
+                ) if binding => {}
+                Some(
+                    QueryStepField::CandidateTiers
+                    | QueryStepField::CandidateOutcomes
+                    | QueryStepField::CandidateBoundaries,
+                ) if candidate => {}
+                Some(QueryStepField::IncludeShadowed) if binding_of => {}
+                Some(QueryStepField::Resolved) if segments => {}
+                Some(
+                    QueryStepField::DeclarationOrigins
+                    | QueryStepField::DeclarationOnly
+                    | QueryStepField::ConfigGated,
+                ) if declaration_state => {}
+                Some(
+                    QueryStepField::ReferenceKinds
+                    | QueryStepField::Proof
+                    | QueryStepField::Surface,
+                ) if reference => {}
+                Some(
+                    QueryStepField::ReferenceKinds
+                    | QueryStepField::Proof
+                    | QueryStepField::Surface
+                    | QueryStepField::EdgeUsageKinds
+                    | QueryStepField::EdgeRelations
+                    | QueryStepField::EdgeSiteClasses,
+                ) if edge => {}
+                Some(QueryStepField::StateEventClasses | QueryStepField::StateEventSubjects)
+                    if state_event => {}
+                Some(QueryStepField::FlowRelations | QueryStepField::FlowCertainties)
+                    if flow_relation => {}
+                Some(QueryStepField::RewriteDomains | QueryStepField::RewriteOutcomes)
+                    if rewrite_path => {}
+                Some(
+                    QueryStepField::Depth
+                    | QueryStepField::Transitive
+                    | QueryStepField::ReferenceKinds
+                    | QueryStepField::Proof
+                    | QueryStepField::Completeness
+                    | QueryStepField::Surface
+                    | QueryStepField::Receiver
+                    | QueryStepField::ParameterIndex
+                    | QueryStepField::ParameterName
+                    | QueryStepField::Capture
+                    | QueryStepField::ProtocolRef
+                    | QueryStepField::PlanRef
+                    | QueryStepField::TaintRef
+                    | QueryStepField::MaxSteps
+                    | QueryStepField::MaxBytes
+                    | QueryStepField::OccurrenceClasses
+                    | QueryStepField::OccurrenceRoles
+                    | QueryStepField::OccurrenceNamespaces
+                    | QueryStepField::BindingKinds
+                    | QueryStepField::BindingNames
+                    | QueryStepField::BindingHoisting
+                    | QueryStepField::IncludeShadowed
+                    | QueryStepField::CandidateTiers
+                    | QueryStepField::CandidateOutcomes
+                    | QueryStepField::CandidateBoundaries
+                    | QueryStepField::DeclarationOrigins
+                    | QueryStepField::DeclarationOnly
+                    | QueryStepField::ConfigGated
+                    | QueryStepField::EdgeUsageKinds
+                    | QueryStepField::EdgeRelations
+                    | QueryStepField::EdgeSiteClasses
+                    | QueryStepField::StateEventClasses
+                    | QueryStepField::StateEventSubjects
+                    | QueryStepField::FlowRelations
+                    | QueryStepField::FlowCertainties
+                    | QueryStepField::RewriteDomains
+                    | QueryStepField::RewriteOutcomes
+                    | QueryStepField::Resolved,
+                )
+                | None => {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, key),
+                        "unknown field in query step object",
+                    ));
+                }
+            }
+        }
+        if occurrence {
+            let filter = decode_occurrence_filter(object, &entry_path)?;
+            step = match step {
+                QueryStep::OccurrencesOf(_) => QueryStep::OccurrencesOf(filter),
+                QueryStep::OccurrencesIn(_) => QueryStep::OccurrencesIn(filter),
+                _ => unreachable!("occurrence step filtered above"),
+            };
+        } else if binding {
+            step = QueryStep::BindingsIn(decode_binding_filter(object, &entry_path)?);
+        } else if candidate {
+            step = QueryStep::CandidatesOf(decode_candidate_filter(object, &entry_path)?);
+        } else if declaration_state {
+            step = QueryStep::DeclarationStateOf(decode_declaration_state_filter(
+                object,
+                &entry_path,
+            )?);
+        } else if segments {
+            let resolved = match object.get("resolved") {
+                Some(value) => {
+                    if value.as_bool() != Some(true) {
+                        return Err(QueryError::new(
+                            child_path(&entry_path, "resolved"),
+                            "resolved must be true when present",
+                        ));
+                    }
+                    true
+                }
+                None => false,
+            };
+            step = QueryStep::SegmentsOf(SegmentsOfOptions { resolved });
+        } else if binding_of {
+            let include_shadowed = match object.get("include_shadowed") {
+                Some(value) => {
+                    if value.as_bool() != Some(true) {
+                        return Err(QueryError::new(
+                            child_path(&entry_path, "include_shadowed"),
+                            "include_shadowed must be true when present",
+                        ));
+                    }
+                    true
+                }
+                None => false,
+            };
+            step = QueryStep::BindingOf(BindingOfOptions { include_shadowed });
+        } else if state_event {
+            step = QueryStep::StateEventsOf(decode_state_event_filter(object, &entry_path)?);
+        } else if flow_relation {
+            step = QueryStep::FlowRelationsOf(decode_flow_relation_filter(object, &entry_path)?);
+        } else if rewrite_path {
+            step = QueryStep::RewritePathsOf(decode_rewrite_path_filter(object, &entry_path)?);
+        } else if edge {
+            let filter = decode_edge_filter(object, &entry_path)?;
+            step = match step {
+                QueryStep::EdgesOf(_) => QueryStep::EdgesOf(filter),
+                QueryStep::EdgesFrom(_) => QueryStep::EdgesFrom(filter),
+                _ => unreachable!("edge step filtered above"),
+            };
+        } else if witness {
+            let decode_bound = |field: &str| -> Result<Option<usize>, QueryError> {
+                object
+                    .get(field)
+                    .map(|value| {
+                        let path = child_path(&entry_path, field);
+                        value
+                            .as_u64()
+                            .and_then(|raw| usize::try_from(raw).ok())
+                            .ok_or_else(|| QueryError::new(path, "expected a non-negative integer"))
+                    })
+                    .transpose()
+            };
+            step = QueryStep::Witness(WitnessTraversal {
+                max_steps: decode_bound("max_steps")?,
+                max_bytes: decode_bound("max_bytes")?,
+            });
+        } else if hierarchy {
+            let depth = object.get("depth");
+            let transitive = object.get("transitive");
+            if depth.is_some() && transitive.is_some() {
+                return Err(QueryError::new(
+                    child_path(&entry_path, "transitive"),
+                    "depth and transitive are mutually exclusive",
+                ));
+            }
+            let traversal = if let Some(value) = depth {
+                let raw = value.as_u64().ok_or_else(|| {
+                    QueryError::new(
+                        child_path(&entry_path, "depth"),
+                        "expected a positive integer",
+                    )
+                })?;
+                let depth = usize::try_from(raw)
+                    .ok()
+                    .and_then(NonZeroUsize::new)
+                    .ok_or_else(|| {
+                        QueryError::new(
+                            child_path(&entry_path, "depth"),
+                            "depth must be a positive platform-sized integer",
+                        )
+                    })?;
+                HierarchyTraversal::Depth(depth)
+            } else if let Some(value) = transitive {
+                if value.as_bool() != Some(true) {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, "transitive"),
+                        "transitive must be true when present",
+                    ));
+                }
+                HierarchyTraversal::Transitive
+            } else {
+                HierarchyTraversal::Direct
+            };
+            step = match step {
+                QueryStep::Supertypes(_) => QueryStep::Supertypes(traversal),
+                QueryStep::Subtypes(_) => QueryStep::Subtypes(traversal),
+                _ => unreachable!("hierarchy step filtered above"),
+            };
+        } else if reference {
+            let reference_kinds = match object.get("reference_kinds") {
+                Some(value) => {
+                    let values = value.as_array().ok_or_else(|| {
+                        QueryError::new(
+                            child_path(&entry_path, "reference_kinds"),
+                            "expected an array of reference-kind strings",
+                        )
+                    })?;
+                    if values.is_empty() {
+                        return Err(QueryError::new(
+                            child_path(&entry_path, "reference_kinds"),
+                            "reference_kinds must not be empty",
+                        ));
+                    }
+                    let mut kinds = Vec::with_capacity(values.len());
+                    for (kind_index, value) in values.iter().enumerate() {
+                        let path =
+                            index_path(&child_path(&entry_path, "reference_kinds"), kind_index);
+                        let label = value.as_str().ok_or_else(|| {
+                            QueryError::new(&path, "expected a reference-kind string")
+                        })?;
+                        let kind = reference_kind_from_label(label).ok_or_else(|| {
+                            QueryError::new(&path, format!("unknown reference kind {label:?}"))
+                        })?;
+                        if !kinds.contains(&kind) {
+                            kinds.push(kind);
+                        }
+                    }
+                    kinds
+                }
+                None => Vec::new(),
+            };
+            let proof = object
+                .get("proof")
+                .map(|value| {
+                    let path = child_path(&entry_path, "proof");
+                    let label = value
+                        .as_str()
+                        .ok_or_else(|| QueryError::new(&path, "expected proven or unproven"))?;
+                    usage_proof_from_label(label)
+                        .ok_or_else(|| QueryError::new(&path, "expected proven or unproven"))
+                })
+                .transpose()?;
+            let surface = object
+                .get("surface")
+                .map(|value| {
+                    let path = child_path(&entry_path, "surface");
+                    let label = value.as_str().ok_or_else(|| {
+                        QueryError::new(&path, "expected external_usages or lsp_references")
+                    })?;
+                    usage_surface_from_label(label).ok_or_else(|| {
+                        QueryError::new(&path, "expected external_usages or lsp_references")
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let filter = ReferenceTraversalFilter {
+                reference_kinds,
+                proof,
+                surface,
+            };
+            step = match step {
+                QueryStep::ReferencesOf(_) => QueryStep::ReferencesOf(filter),
+                QueryStep::UsedBy(_) => QueryStep::UsedBy(filter),
+                QueryStep::Uses(_) => QueryStep::Uses(filter),
+                _ => unreachable!("reference step filtered above"),
+            };
+        } else if call {
+            let depth = object
+                .get("depth")
+                .map(|value| {
+                    let path = child_path(&entry_path, "depth");
+                    value
+                        .as_u64()
+                        .and_then(|raw| usize::try_from(raw).ok())
+                        .and_then(NonZeroUsize::new)
+                        .ok_or_else(|| QueryError::new(path, "expected a positive integer"))
+                })
+                .transpose()?
+                .unwrap_or(NonZeroUsize::MIN);
+            let proof = decode_optional_proof(object.get("proof"), &entry_path)?;
+            let completeness = object
+                .get("completeness")
+                .map(|value| {
+                    let path = child_path(&entry_path, "completeness");
+                    let label = value.as_str().ok_or_else(|| {
+                        QueryError::new(&path, "expected exhaustive or proven_subset")
+                    })?;
+                    call_traversal_completeness_from_label(label).ok_or_else(|| {
+                        QueryError::new(path, "expected exhaustive or proven_subset")
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default();
+            if matches!(
+                completeness,
+                super::schema::CallTraversalCompleteness::ProvenSubset
+            ) {
+                if !matches!(step, QueryStep::Callers(_)) {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, "completeness"),
+                        "proven_subset is currently supported only for callers",
+                    ));
+                }
+                if proof != Some(brokk_bifrost_core::analyzer::usages::model::UsageProof::Proven) {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, "completeness"),
+                        "proven_subset requires proof to be proven",
+                    ));
+                }
+            }
+            let filter = CallTraversalFilter {
+                depth,
+                proof,
+                completeness,
+            };
+            step = match step {
+                QueryStep::Callers(_) => QueryStep::Callers(filter),
+                QueryStep::Callees(_) => QueryStep::Callees(filter),
+                _ => unreachable!("call step filtered above"),
+            };
+        } else if call_site {
+            let filter = CallSiteTraversalFilter {
+                proof: decode_optional_proof(object.get("proof"), &entry_path)?,
+            };
+            step = match step {
+                QueryStep::CallSitesTo(_) => QueryStep::CallSitesTo(filter),
+                QueryStep::CallSitesFrom(_) => QueryStep::CallSitesFrom(filter),
+                _ => unreachable!("call-site step filtered above"),
+            };
+        } else if call_input {
+            let selector_count = ["receiver", "parameter_index", "parameter_name"]
+                .into_iter()
+                .filter(|field| object.contains_key(*field))
+                .count();
+            if selector_count != 1 {
+                return Err(QueryError::new(
+                    &entry_path,
+                    "call_input requires exactly one of receiver, parameter_index, or parameter_name",
+                ));
+            }
+            let selector = if let Some(value) = object.get("receiver") {
+                if value.as_bool() != Some(true) {
+                    return Err(QueryError::new(
+                        child_path(&entry_path, "receiver"),
+                        "receiver must be true when present",
+                    ));
+                }
+                CallInputSelector::Receiver
+            } else if let Some(value) = object.get("parameter_index") {
+                let path = child_path(&entry_path, "parameter_index");
+                let index = value
+                    .as_u64()
+                    .and_then(|raw| usize::try_from(raw).ok())
+                    .ok_or_else(|| QueryError::new(path, "expected a non-negative integer"))?;
+                CallInputSelector::ParameterIndex(index)
+            } else {
+                let path = child_path(&entry_path, "parameter_name");
+                let shape = QueryStepField::ParameterName.value_shape();
+                let name = object["parameter_name"]
+                    .as_str()
+                    .filter(|name| shape.accepts_string(name))
+                    .ok_or_else(|| {
+                        let (minimum, maximum) = shape
+                            .string_length_bounds()
+                            .expect("parameter-name shape has string bounds");
+                        QueryError::new(
+                            path,
+                            format!("expected a string between {minimum} and {maximum} bytes"),
+                        )
+                    })?;
+                CallInputSelector::ParameterName(name.to_owned())
+            };
+            step = QueryStep::CallInput(selector);
+        } else if receiver {
+            let capture = object
+                .get("capture")
+                .map(|value| {
+                    let path = child_path(&entry_path, "capture");
+                    let shape = QueryStepField::Capture.value_shape();
+                    value
+                        .as_str()
+                        .filter(|name| shape.accepts_string(name))
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            let (minimum, maximum) = shape
+                                .string_length_bounds()
+                                .expect("capture-name shape has string bounds");
+                            QueryError::new(
+                                path,
+                                format!("expected a string between {minimum} and {maximum} bytes"),
+                            )
+                        })
+                })
+                .transpose()?;
+            let filter = ReceiverTraversalFilter { capture };
+            step = match step {
+                QueryStep::ReceiverTargets(_) => QueryStep::ReceiverTargets(filter),
+                QueryStep::PointsTo(_) => QueryStep::PointsTo(filter),
+                QueryStep::MemberTargets(_) => QueryStep::MemberTargets(filter),
+                _ => unreachable!("receiver step filtered above"),
+            };
+        }
+        steps.push(step);
+    }
+    Ok(steps)
+}
+
+fn decode_optional_proof(
+    value: Option<&Value>,
+    path: &str,
+) -> Result<Option<brokk_bifrost_core::analyzer::usages::model::UsageProof>, QueryError> {
+    value
+        .map(|value| {
+            let path = child_path(path, "proof");
+            let label = value
+                .as_str()
+                .ok_or_else(|| QueryError::new(&path, "expected proven or unproven"))?;
+            usage_proof_from_label(label)
+                .ok_or_else(|| QueryError::new(path, "expected proven or unproven"))
+        })
+        .transpose()
+}
+
+fn decode_result_detail(value: &Value, path: &str) -> Result<CodeQueryResultDetail, QueryError> {
+    let label = value
+        .as_str()
+        .ok_or_else(|| QueryError::new(path, "expected \"compact\" or \"full\""))?;
+    CodeQueryResultDetail::from_label(label).ok_or_else(|| {
+        QueryError::new(
+            path,
+            format!("unknown result detail {label:?}; expected \"compact\" or \"full\""),
+        )
+    })
+}
+
+fn decode_execution_mode(value: &Value, path: &str) -> Result<CodeQueryExecutionMode, QueryError> {
+    let label = value.as_str().ok_or_else(|| {
+        QueryError::new(path, "expected \"results\", \"explain\", or \"profile\"")
+    })?;
+    CodeQueryExecutionMode::from_label(label).ok_or_else(|| {
+        QueryError::new(
+            path,
+            format!(
+                "unknown execution mode {label:?}; expected \"results\", \"explain\", or \"profile\""
+            ),
+        )
+    })
+}
+
+fn reject_too_long(text: &str, path: &str, max_len: usize, label: &str) -> Result<(), QueryError> {
+    if text.len() <= max_len {
+        return Ok(());
+    }
+    Err(QueryError::new(
+        path,
+        format!("{label} must be at most {max_len} bytes"),
+    ))
+}
+
+#[derive(Default)]
+struct PatternFields<'a> {
+    kind: Option<&'a Value>,
+    not_kind: Option<&'a Value>,
+    name: Option<&'a Value>,
+    text: Option<&'a Value>,
+    arity: Option<&'a Value>,
+    capture: Option<&'a Value>,
+    has: Option<&'a Value>,
+    not_has: Option<&'a Value>,
+    roles: Vec<(Role, &'a Value)>,
+}
+
+fn collect_pattern_fields<'a>(
+    object: &'a Map<String, Value>,
+    path: &str,
+) -> Result<PatternFields<'a>, QueryError> {
+    let mut fields = PatternFields::default();
+    for (key, value) in object {
+        if let Some(field) = PatternField::from_label(key) {
+            match field {
+                PatternField::Kind => fields.kind = Some(value),
+                PatternField::NotKind => fields.not_kind = Some(value),
+                PatternField::Name => fields.name = Some(value),
+                PatternField::Text => fields.text = Some(value),
+                PatternField::Arity => fields.arity = Some(value),
+                PatternField::Capture => fields.capture = Some(value),
+                PatternField::Has => fields.has = Some(value),
+                PatternField::NotHas => fields.not_has = Some(value),
+            }
+        } else if let Some(role) = Role::from_label(key) {
+            fields.roles.push((role, value));
+        } else {
+            return Err(QueryError::new(
+                child_path(path, key),
+                "unknown field in pattern object",
+            ));
+        }
+    }
+    Ok(fields)
+}
+
+fn decode_pattern(
+    value: &Value,
+    path: &str,
+    budget: &mut QueryBudget,
+    depth: usize,
+) -> Result<Pattern, QueryError> {
+    if depth > MAX_PATTERN_DEPTH {
+        return Err(QueryError::new(
+            path,
+            format!("pattern nesting must be at most {MAX_PATTERN_DEPTH} levels"),
+        ));
+    }
+    budget.pattern_nodes += 1;
+    if budget.pattern_nodes > MAX_PATTERN_NODES {
+        return Err(QueryError::new(
+            path,
+            format!("query may contain at most {MAX_PATTERN_NODES} pattern nodes"),
+        ));
+    }
+    let object = as_object(value, path)?;
+    let fields = collect_pattern_fields(object, path)?;
+
+    let kinds = match fields.kind {
+        None => Vec::new(),
+        Some(value) => decode_kind_list(value, &child_path(path, "kind"))?,
+    };
+    let not_kinds = match fields.not_kind {
+        None => Vec::new(),
+        Some(value) => decode_kind_list(value, &child_path(path, "not_kind"))?,
+    };
+
+    let name = fields
+        .name
+        .map(|value| decode_string_predicate(value, &child_path(path, "name"), true))
+        .transpose()?;
+
+    let text = fields
+        .text
+        .map(|value| decode_string_predicate(value, &child_path(path, "text"), false))
+        .transpose()?;
+
+    let arity = fields
+        .arity
+        .map(|value| decode_arity_constraint(value, &child_path(path, "arity")))
+        .transpose()?;
+
+    let capture = fields
+        .capture
+        .map(|value| {
+            let capture_path = child_path(path, "capture");
+            let label = value
+                .as_str()
+                .ok_or_else(|| QueryError::new(&capture_path, "expected a string label"))?;
+            if label.is_empty() {
+                return Err(QueryError::new(
+                    &capture_path,
+                    "capture label must not be empty",
+                ));
+            }
+            reject_too_long(label, &capture_path, MAX_CAPTURE_LENGTH, "capture label")?;
+            Ok(label.to_string())
+        })
+        .transpose()?;
+
+    let has = decode_boxed_sub_pattern(fields.has, path, "has", budget, depth + 1)?;
+    let not_has = decode_boxed_sub_pattern(fields.not_has, path, "not_has", budget, depth + 1)?;
+
+    let mut pattern = Pattern {
+        kinds,
+        not_kinds,
+        name,
+        text,
+        arity,
+        capture,
+        has,
+        not_has,
+        ..Pattern::default()
+    };
+
+    decode_role_fields(&fields.roles, path, &mut pattern, budget, depth + 1)?;
+    Ok(pattern)
+}
+
+/// Decode an `arity` value: a non-negative integer (exact), or an object with
+/// optional `min`/`max` non-negative-integer bounds (inclusive range). At
+/// least one bound must be present and `min <= max` when both are, so the
+/// decoded constraint is always satisfiable.
+fn decode_arity_constraint(value: &Value, path: &str) -> Result<ArityConstraint, QueryError> {
+    match value {
+        Value::Number(_) => Ok(ArityConstraint::exact(decode_arity_bound(value, path)?)),
+        Value::Object(object) => {
+            reject_unknown_filter_fields(object, path, &["min", "max"], "arity")?;
+            let min = object
+                .get("min")
+                .map(|value| decode_arity_bound(value, &child_path(path, "min")))
+                .transpose()?;
+            let max = object
+                .get("max")
+                .map(|value| decode_arity_bound(value, &child_path(path, "max")))
+                .transpose()?;
+            if min.is_none() && max.is_none() {
+                return Err(QueryError::new(
+                    path,
+                    "arity range must set at least one of \"min\" or \"max\"",
+                ));
+            }
+            if let (Some(min), Some(max)) = (min, max)
+                && min > max
+            {
+                return Err(QueryError::new(
+                    path,
+                    format!("arity \"min\" {min} must not exceed \"max\" {max}"),
+                ));
+            }
+            Ok(ArityConstraint { min, max })
+        }
+        _ => Err(QueryError::new(
+            path,
+            "arity must be a non-negative integer or a { \"min\", \"max\" } range object",
+        )),
+    }
+}
+
+/// Decode a single arity bound: a JSON non-negative integer within [`MAX_ARITY`].
+fn decode_arity_bound(value: &Value, path: &str) -> Result<u32, QueryError> {
+    let count = value
+        .as_u64()
+        .ok_or_else(|| QueryError::new(path, "arity bound must be a non-negative integer"))?;
+    if count > u64::from(MAX_ARITY) {
+        return Err(QueryError::new(
+            path,
+            format!("arity bound must be at most {MAX_ARITY}"),
+        ));
+    }
+    Ok(count as u32)
+}
+
+/// Decode a `kind` / `not_kind` value: a single kind label or a non-empty
+/// array of them.
+fn decode_kind_list(value: &Value, path: &str) -> Result<Vec<NormalizedKind>, QueryError> {
+    match value {
+        Value::String(label) => Ok(vec![decode_kind_label(label, path)?]),
+        Value::Array(entries) => {
+            if entries.is_empty() {
+                return Err(QueryError::new(path, "kind array must not be empty"));
+            }
+            if entries.len() > MAX_KIND_LIST_ENTRIES {
+                return Err(QueryError::new(
+                    path,
+                    format!("kind array may contain at most {MAX_KIND_LIST_ENTRIES} entries"),
+                ));
+            }
+            let mut kinds = Vec::with_capacity(entries.len());
+            for (index, entry) in entries.iter().enumerate() {
+                let entry_path = index_path(path, index);
+                let label = entry
+                    .as_str()
+                    .ok_or_else(|| QueryError::new(&entry_path, "expected a kind label string"))?;
+                kinds.push(decode_kind_label(label, &entry_path)?);
+            }
+            Ok(kinds)
+        }
+        _ => Err(QueryError::new(
+            path,
+            "expected a kind label string or an array of kind labels",
+        )),
+    }
+}
+
+fn decode_kind_label(label: &str, path: &str) -> Result<NormalizedKind, QueryError> {
+    NormalizedKind::from_label(label).ok_or_else(|| {
+        QueryError::new(
+            path,
+            format!(
+                "unknown kind {label:?}; expected one of: {}",
+                ALL_KINDS
+                    .iter()
+                    .map(|kind| kind.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+    })
+}
+
+fn decode_string_predicate(
+    value: &Value,
+    path: &str,
+    allow_exact_shorthand: bool,
+) -> Result<StringPredicate, QueryError> {
+    match value {
+        Value::String(text) if allow_exact_shorthand => {
+            reject_too_long(text, path, MAX_STRING_PREDICATE_LENGTH, "exact string")?;
+            Ok(StringPredicate::Exact(text.clone()))
+        }
+        Value::Object(object) => {
+            for key in object.keys() {
+                let Some(field) = StringPredicateField::from_label(key) else {
+                    return Err(QueryError::new(
+                        child_path(path, key),
+                        "unknown field in string predicate object",
+                    ));
+                };
+                match field {
+                    StringPredicateField::Regex => {}
+                }
+            }
+            let regex_path = child_path(path, "regex");
+            let source = object
+                .get("regex")
+                .ok_or_else(|| QueryError::new(&regex_path, "required field is missing"))?
+                .as_str()
+                .ok_or_else(|| QueryError::new(&regex_path, "expected a regex string"))?;
+            reject_too_long(source, &regex_path, MAX_STRING_PREDICATE_LENGTH, "regex")?;
+            let compiled = Regex::new(source)
+                .map_err(|error| QueryError::new(&regex_path, format!("invalid regex: {error}")))?;
+            Ok(StringPredicate::Regex(compiled))
+        }
+        _ if allow_exact_shorthand => Err(QueryError::new(
+            path,
+            "expected a string (exact match) or { \"regex\": ... }",
+        )),
+        _ => Err(QueryError::new(path, "expected { \"regex\": ... }")),
+    }
+}
+
+fn decode_boxed_sub_pattern(
+    value: Option<&Value>,
+    path: &str,
+    field: &str,
+    budget: &mut QueryBudget,
+    depth: usize,
+) -> Result<Option<Box<Pattern>>, QueryError> {
+    match value {
+        None => Ok(None),
+        Some(value) => {
+            let field_path = child_path(path, field);
+            let pattern = decode_pattern(value, &field_path, budget, depth)?;
+            if pattern.is_empty() {
+                return Err(QueryError::new(&field_path, "pattern must not be empty"));
+            }
+            Ok(Some(Box::new(pattern)))
+        }
+    }
+}
+
+/// Decode the role fields (`callee`, `args`, `left`, ...) into `pattern`,
+/// enforcing that each present role is valid for the pattern's declared kind.
+fn decode_role_fields(
+    roles: &[(Role, &Value)],
+    path: &str,
+    pattern: &mut Pattern,
+    budget: &mut QueryBudget,
+    depth: usize,
+) -> Result<(), QueryError> {
+    let present_roles = roles.iter().map(|(role, _)| *role).collect::<Vec<_>>();
+    if present_roles.is_empty() {
+        return Ok(());
+    }
+
+    if pattern.kinds.is_empty() {
+        return Err(QueryError::new(
+            child_path(path, present_roles[0].label()),
+            format!(
+                "role {:?} requires the pattern to declare a \"kind\"",
+                present_roles[0].label()
+            ),
+        ));
+    }
+    // A role must be satisfiable by at least one of the declared kinds;
+    // otherwise the pattern is provably empty and almost certainly a mistake.
+    for role in &present_roles {
+        if !pattern.kinds.iter().any(|&kind| role.valid_for(kind)) {
+            let kind_labels = pattern
+                .kinds
+                .iter()
+                .map(|kind| kind.label())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(QueryError::new(
+                child_path(path, role.label()),
+                format!(
+                    "role {:?} is not valid for kind(s) {kind_labels}",
+                    role.label(),
+                ),
+            ));
+        }
+    }
+
+    for &role in Role::single_target_roles() {
+        if let Some(value) = role_value(roles, role) {
+            let role_path = child_path(path, role.label());
+            let sub_pattern = Box::new(decode_pattern(value, &role_path, budget, depth)?);
+            match role {
+                Role::Callee => pattern.callee = Some(sub_pattern),
+                Role::Receiver => pattern.receiver = Some(sub_pattern),
+                Role::Left => pattern.left = Some(sub_pattern),
+                Role::Right => pattern.right = Some(sub_pattern),
+                Role::Module => pattern.module = Some(sub_pattern),
+                Role::Object => pattern.object = Some(sub_pattern),
+                Role::Field => pattern.field = Some(sub_pattern),
+                Role::Arg | Role::Kwarg | Role::Decorator => unreachable!("non-single role"),
+            }
+        }
+    }
+
+    for &role in Role::list_target_roles() {
+        if let Some(value) = role_value(roles, role) {
+            let role_path = child_path(path, role.label());
+            let entries = value
+                .as_array()
+                .ok_or_else(|| QueryError::new(&role_path, "expected an array of patterns"))?;
+            if entries.len() > MAX_ROLE_LIST_ENTRIES {
+                return Err(QueryError::new(
+                    &role_path,
+                    format!("role array may contain at most {MAX_ROLE_LIST_ENTRIES} entries"),
+                ));
+            }
+            let mut patterns = Vec::with_capacity(entries.len());
+            for (index, entry) in entries.iter().enumerate() {
+                patterns.push(decode_pattern(
+                    entry,
+                    &index_path(&role_path, index),
+                    budget,
+                    depth,
+                )?);
+            }
+            match role {
+                Role::Arg => pattern.args = patterns,
+                Role::Decorator => pattern.decorators = patterns,
+                Role::Callee
+                | Role::Receiver
+                | Role::Kwarg
+                | Role::Left
+                | Role::Right
+                | Role::Module
+                | Role::Object
+                | Role::Field => unreachable!("non-list role"),
+            }
+        }
+    }
+
+    if let Some(value) = role_value(roles, Role::Kwarg) {
+        let role_path = child_path(path, Role::Kwarg.label());
+        let entries = as_object(value, &role_path)?;
+        if entries.len() > MAX_KWARGS {
+            return Err(QueryError::new(
+                &role_path,
+                format!("kwargs may contain at most {MAX_KWARGS} entries"),
+            ));
+        }
+        let mut kwargs = Vec::with_capacity(entries.len());
+        for (keyword, entry) in entries {
+            let keyword_path = child_path(&role_path, keyword);
+            reject_too_long(keyword, &keyword_path, MAX_KWARG_NAME_LENGTH, "keyword")?;
+            kwargs.push((
+                keyword.clone(),
+                decode_pattern(entry, &keyword_path, budget, depth)?,
+            ));
+        }
+        pattern.kwargs = kwargs;
+    }
+
+    Ok(())
+}
+
+fn role_value<'a>(roles: &[(Role, &'a Value)], expected: Role) -> Option<&'a Value> {
+    roles
+        .iter()
+        .find_map(|(role, value)| (*role == expected).then_some(*value))
+}

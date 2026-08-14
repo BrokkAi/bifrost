@@ -1,0 +1,828 @@
+//! Whole-workspace inverted edge builder for Python.
+//!
+//! Walks each file once and resolves every reference to the callee fqn it names,
+//! via the shared [`build_edges`] driver. Python node fqns are dotted module
+//! paths (`pkg.util.format_value`, `app.helper`), so a reference resolves through
+//! the file's import binder:
+//!
+//! - a `from pkg.util import f` binding resolves a bare `f` to `pkg.util.f`;
+//! - an `import pkg.util as u` binding resolves `u.f` to `pkg.util.f`;
+//! - a same-file/same-module name resolves to that declaration's fqn.
+//!
+//! Parameters and local assignments shadow same-named imports and module-level
+//! declarations (Python scopes are function-wide), matching the forward scan's
+//! shadow handling so a local named like an import does not produce a false edge.
+//! A typed receiver — a `recv: Foo` parameter or a `recv = Foo()` local —
+//! resolves `recv.method` to `Foo.method` via the forward scan's shared receiver
+//! typing ([`collect_scope_facts`] + [`resolve_receiver_type`]).
+
+use super::extractor::{
+    call_result_types, collect_assigned_identifiers, collect_function_scope_facts_from_node,
+    collect_scope_facts_from_parsed_source, enclosing_scope_facts, is_declaration_identifier,
+    slice,
+};
+use super::resolver::{
+    annotation_reference_candidates, resolve_callable_parameter_default_types,
+    resolve_constructor_types, resolve_receiver_type,
+};
+use crate::graph::PythonGraphSource;
+use crate::graph_support::PythonUsageSource;
+use crate::imports::resolve_fqn_candidates;
+use crate::usage_index::{usage_resolve_module_files, usage_scope_facts};
+use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    FileEdgeScanInput, PerFileEdges, classify_reference_node,
+};
+use brokk_bifrost_core::analyzer::usages::local_inference::LocalBindingsSnapshot;
+use brokk_bifrost_core::analyzer::usages::model::ImportKind;
+use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile, Range};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use tree_sitter::Node;
+
+/// The whole-pass state the per-file walk shares: the terminal-segment index
+/// over `targets`, and the namespace-candidate memo the walk fills as it goes.
+///
+/// Built once per inverted pass and then borrowed by every worker, so
+/// `brokk-bifrost-analysis`'s fan-out (`build_edge_output` + `parse_and_collect`,
+/// both analysis-owned) can hold it across the parallel closure.
+pub struct PythonEdgeScan<'a> {
+    targets: &'a HashSet<String>,
+    targets_by_terminal: HashMap<String, Vec<String>>,
+    canonical_namespace_candidates: Mutex<HashMap<String, Arc<Vec<String>>>>,
+}
+
+impl<'a> PythonEdgeScan<'a> {
+    /// `nodes` remains the complete caller/callee graph domain. `targets` is the
+    /// subset whose inbound references this build must resolve and retain.
+    pub fn new(nodes: &HashSet<String>, targets: &'a HashSet<String>) -> Self {
+        debug_assert!(targets.is_subset(nodes));
+        let mut targets_by_terminal: HashMap<String, Vec<String>> = HashMap::default();
+        for target in targets {
+            // Python fqns are dotted module paths with no other delimiter (per the
+            // module doc comment above), so re-tokenizing with the shared structured
+            // splitter and taking the terminal segment reproduces
+            // `rsplit('.').next()`'s terminal split exactly.
+            let terminal = parse_symbol_path(Language::Python, target)
+                .pop()
+                .unwrap_or_else(|| target.clone());
+            targets_by_terminal
+                .entry(terminal)
+                .or_default()
+                .push(target.clone());
+        }
+        Self {
+            targets,
+            targets_by_terminal,
+            canonical_namespace_candidates: Mutex::new(HashMap::default()),
+        }
+    }
+
+    /// Resolve every reference in one already-parsed file.
+    ///
+    /// Reaches no other file's tree: the import binder, same-file declarations,
+    /// and the receiver-type facts are all derived from this file plus the
+    /// analyzer's own (tree-free) caches.
+    pub fn scan_file(
+        &self,
+        graph: &PythonGraphSource<'_>,
+        python: &dyn PythonUsageSource,
+        file: &ProjectFile,
+        input: &FileEdgeScanInput<'_>,
+    ) -> PerFileEdges {
+        let source = input.source;
+
+        // Per-file resolution context from the import binder. A namespace
+        // binding's module_specifier is either the full fqn (for
+        // `from m import f`) or the module prefix (for `import m as u`); the
+        // node-membership check downstream disambiguates which applies.
+        let binder = python.import_binder_of(file);
+        let mut named: HashMap<String, String> = HashMap::default();
+        let mut namespace: HashMap<String, NamespaceBinding> = HashMap::default();
+        for (local, binding) in &binder.bindings {
+            match binding.kind {
+                ImportKind::Named => {
+                    if let Some(imported) = &binding.imported_name {
+                        let module = canonical_import_module_fqn(
+                            graph,
+                            python,
+                            file,
+                            &binding.module_specifier,
+                        )
+                        .unwrap_or_else(|| binding.module_specifier.clone());
+                        let imported_fqn = if module.ends_with('.') {
+                            format!("{module}{imported}")
+                        } else {
+                            format!("{module}.{imported}")
+                        };
+                        if let Some(imported_module) =
+                            canonical_import_module_fqn(graph, python, file, &imported_fqn)
+                        {
+                            namespace.insert(
+                                local.clone(),
+                                NamespaceBinding {
+                                    module: imported_module,
+                                    workspace_module: true,
+                                    consumed_attributes: 0,
+                                },
+                            );
+                        } else {
+                            named.insert(local.clone(), imported_fqn);
+                        }
+                    }
+                }
+                ImportKind::Namespace => {
+                    let direct_module = binding.module_specifier.clone();
+                    let imported_module = binding
+                        .namespace_imported_module
+                        .as_deref()
+                        .unwrap_or(&direct_module);
+                    let module = canonical_import_module_fqn(graph, python, file, imported_module);
+                    let workspace_module = module.is_some();
+                    let consumed_attributes = module.as_ref().map_or(0, |_| {
+                        let imported_segments =
+                            parse_symbol_path(Language::Python, imported_module);
+                        let bound_segments = parse_symbol_path(Language::Python, &direct_module);
+                        imported_segments.len().saturating_sub(bound_segments.len())
+                    });
+                    namespace.insert(
+                        local.clone(),
+                        NamespaceBinding {
+                            module: module.unwrap_or(direct_module),
+                            workspace_module,
+                            consumed_attributes,
+                        },
+                    );
+                }
+                ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => {}
+            }
+        }
+        let same_file: HashMap<String, String> = graph
+            .index
+            .declarations(file)
+            .into_iter()
+            .map(|unit| (unit.identifier().to_string(), unit.fq_name()))
+            .collect();
+
+        // Per-function receiver-type facts (typed params + `x = Foo()`),
+        // computed by the same routine the forward scan uses, so a typed
+        // `recv.method` resolves to the receiver's class fqn.
+        let scope_facts = usage_scope_facts(python, file, || {
+            collect_scope_facts_from_parsed_source(graph, python, file, source, input.root())
+        });
+
+        let mut ctx = PyScan {
+            graph,
+            python,
+            targets: self.targets,
+            targets_by_terminal: &self.targets_by_terminal,
+            file,
+            source,
+            named,
+            namespace,
+            same_file,
+            scope_facts: scope_facts.as_ref(),
+            canonical_namespace_candidates: &self.canonical_namespace_candidates,
+            input,
+            edges: PerFileEdges::default(),
+        };
+        scan_tree(input.root(), &mut ctx);
+        ctx.edges
+    }
+}
+
+fn canonical_import_module_fqn(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
+    importing_file: &ProjectFile,
+    module_specifier: &str,
+) -> Option<String> {
+    let resolved = usage_resolve_module_files(python, importing_file, module_specifier);
+    let [module_file] = resolved.as_slice() else {
+        return None;
+    };
+    graph
+        .index
+        .declarations(module_file)
+        .into_iter()
+        .find(CodeUnit::is_module)
+        .map(|module| module.fq_name())
+}
+
+struct PyScan<'a> {
+    graph: &'a PythonGraphSource<'a>,
+    python: &'a dyn PythonUsageSource,
+    targets: &'a HashSet<String>,
+    targets_by_terminal: &'a HashMap<String, Vec<String>>,
+    file: &'a ProjectFile,
+    source: &'a str,
+    named: HashMap<String, String>,
+    namespace: HashMap<String, NamespaceBinding>,
+    same_file: HashMap<String, String>,
+    scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
+    canonical_namespace_candidates: &'a Mutex<HashMap<String, Arc<Vec<String>>>>,
+    input: &'a FileEdgeScanInput<'a>,
+    edges: PerFileEdges,
+}
+
+struct NamespaceBinding {
+    module: String,
+    workspace_module: bool,
+    consumed_attributes: usize,
+}
+
+impl PyScan<'_> {
+    /// The callee fqn a bare name refers to: a named import, a namespace import of
+    /// a symbol (module_specifier is the full fqn), or a same-file declaration.
+    fn bare_callee(&self, text: &str) -> Option<String> {
+        if let Some(fqn) = self.named.get(text) {
+            return Some(fqn.clone());
+        }
+        if let Some(fqn) = self.namespace.get(text) {
+            return Some(fqn.module.clone());
+        }
+        if let Some(fqn) = self.same_file.get(text) {
+            return Some(fqn.clone());
+        }
+        None
+    }
+
+    /// The class fqn `receiver` is typed as within the given scope `facts` — a
+    /// typed parameter or a `recv = Class()` local — so `recv.method` resolves to
+    /// `Class.method`. Reuses the forward scan's receiver typing.
+    fn receiver_type_fqn(
+        &self,
+        facts: &LocalBindingsSnapshot<String>,
+        receiver: &str,
+    ) -> Option<String> {
+        let resolution = facts.resolution_for(receiver);
+        let type_name = resolution
+            .as_precise()
+            .and_then(|targets| targets.iter().next())?;
+        // `target_self_file = false`: resolve only via this file's imports and its
+        // own declarations. The forward path's workspace-wide first-match fallback
+        // is gated on matching a known target owner; the inverted builder has no
+        // target to validate against, so enabling it would let an unimported,
+        // non-local type name bind to an unrelated same-named class elsewhere.
+        resolve_receiver_type(self.graph, self.python, self.file, type_name, false)
+            .map(|unit| unit.fq_name())
+    }
+
+    fn record(&mut self, callee: String, node: Node<'_>) {
+        if !self.targets.contains(&callee) {
+            return;
+        }
+        self.edges.record_kind(
+            self.input,
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
+    }
+
+    fn record_unproven_name(&mut self, name: &str, node: Node<'_>) {
+        let Some(targets) = self.targets_by_terminal.get(name) else {
+            return;
+        };
+        for target in targets {
+            self.edges.record_unproven(
+                self.input,
+                target.clone(),
+                node.start_byte(),
+                node.end_byte(),
+            );
+        }
+    }
+
+    fn canonical_namespace_candidates(&self, direct: &str) -> Arc<Vec<String>> {
+        if let Some(cached) = self
+            .canonical_namespace_candidates
+            .lock()
+            .expect("Python namespace candidate cache mutex poisoned")
+            .get(direct)
+            .cloned()
+        {
+            return cached;
+        }
+
+        let resolved: Arc<Vec<String>> = Arc::new(
+            resolve_fqn_candidates(self.python, direct, |name| {
+                self.graph.index.definitions(name).collect()
+            })
+            .into_iter()
+            .map(|unit| unit.fq_name())
+            .collect(),
+        );
+        self.canonical_namespace_candidates
+            .lock()
+            .expect("Python namespace candidate cache mutex poisoned")
+            .entry(direct.to_string())
+            .or_insert_with(|| resolved.clone())
+            .clone()
+    }
+}
+
+fn scan_tree(root: Node<'_>, ctx: &mut PyScan<'_>) {
+    // A stack of in-scope local names, one frame per enclosing function. A name
+    // bound in any frame shadows a same-named import/declaration.
+    let mut scopes: Vec<FunctionScope> = Vec::new();
+    walk(root, ctx, &mut scopes, None);
+}
+
+fn walk(
+    node: Node<'_>,
+    ctx: &mut PyScan<'_>,
+    scopes: &mut Vec<FunctionScope>,
+    facts: Option<usize>,
+) {
+    let mut merged_facts = Vec::new();
+    let mut stack = vec![WalkFrame::Enter { node, facts }];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            WalkFrame::Enter { node, facts } => match node.kind() {
+                "import_statement" | "import_from_statement" => {}
+                // A function (or lambda) opens a scope; its parameters and the names it
+                // assigns are local throughout it, so collect them up front. Resolve the
+                // scope's receiver-type facts once here and thread them down.
+                "function_definition" | "lambda" => {
+                    let function_scope = collect_function_scope(node, ctx.source);
+                    let scope_facts = merged_enclosing_scope_facts(
+                        ctx.graph,
+                        ctx.file,
+                        ctx.scope_facts,
+                        &mut merged_facts,
+                        node,
+                        ctx.source,
+                        facts,
+                    );
+                    push_function_children(node, facts, scope_facts, function_scope, &mut stack);
+                }
+                // A class body is not a function scope: code at the class-body level has
+                // no enclosing-function facts. Methods inside re-resolve their own facts.
+                "class_definition" => push_children(node, None, &mut stack),
+                "identifier" => {
+                    if !handle_annotation_reference(node, ctx) {
+                        handle_identifier(node, ctx, scopes);
+                    }
+                    push_children(node, facts, &mut stack);
+                }
+                "attribute" => {
+                    if handle_annotation_reference(node, ctx) {
+                        continue;
+                    }
+                    let scope_facts = facts.and_then(|id| merged_facts.get(id));
+                    handle_attribute(node, ctx, scopes, scope_facts);
+                    push_children(node, facts, &mut stack);
+                }
+                "string_content" => {
+                    handle_annotation_reference(node, ctx);
+                }
+                "keyword_argument" => {
+                    handle_keyword_argument(node, ctx, scopes);
+                    if let Some(value) = node.child_by_field_name("value") {
+                        stack.push(WalkFrame::Enter { node: value, facts });
+                    }
+                }
+                _ => push_children(node, facts, &mut stack),
+            },
+            WalkFrame::ExitScope => {
+                scopes.pop();
+            }
+            WalkFrame::EnterScope(scope) => scopes.push(scope),
+        }
+    }
+}
+
+enum WalkFrame<'tree> {
+    Enter {
+        node: Node<'tree>,
+        facts: Option<usize>,
+    },
+    EnterScope(FunctionScope),
+    ExitScope,
+}
+
+fn push_children<'tree>(
+    node: Node<'tree>,
+    facts: Option<usize>,
+    stack: &mut Vec<WalkFrame<'tree>>,
+) {
+    for index in (0..node.named_child_count()).rev() {
+        if let Some(child) = node.named_child(index) {
+            stack.push(WalkFrame::Enter { node: child, facts });
+        }
+    }
+}
+
+fn push_function_children<'tree>(
+    function: Node<'tree>,
+    enclosing_facts: Option<usize>,
+    body_facts: Option<usize>,
+    function_scope: FunctionScope,
+    stack: &mut Vec<WalkFrame<'tree>>,
+) {
+    let body = function.child_by_field_name("body");
+    let mut function_scope = Some(function_scope);
+    for index in (0..function.named_child_count()).rev() {
+        if let Some(child) = function.named_child(index) {
+            // Defaults and annotations are evaluated while defining the
+            // function, before its parameters and locals exist. Only the body
+            // executes in the new lexical scope.
+            let facts = if body == Some(child) {
+                body_facts
+            } else {
+                enclosing_facts
+            };
+            if body == Some(child) {
+                stack.push(WalkFrame::ExitScope);
+                stack.push(WalkFrame::Enter { node: child, facts });
+                stack.push(WalkFrame::EnterScope(
+                    function_scope
+                        .take()
+                        .expect("a function has exactly one body scope"),
+                ));
+            } else {
+                stack.push(WalkFrame::Enter { node: child, facts });
+            }
+        }
+    }
+}
+
+fn merged_enclosing_scope_facts(
+    graph: &PythonGraphSource<'_>,
+    file: &ProjectFile,
+    scope_facts: &HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
+    merged_facts: &mut Vec<LocalBindingsSnapshot<String>>,
+    node: Node<'_>,
+    source: &str,
+    inherited: Option<usize>,
+) -> Option<usize> {
+    let structural_local = collect_function_scope_facts_from_node(node, source);
+    // A top-level function or class method has a complete indexed snapshot,
+    // including factory-return facts that the node-only structural pass cannot
+    // reconstruct. Nested functions and lambdas instead need their structural
+    // declarations to shadow the inherited outer snapshot.
+    let local = if inherited.is_none() && node.kind() == "function_definition" {
+        enclosing_scope_facts(graph.index, file, scope_facts, node)
+            .cloned()
+            .unwrap_or(structural_local)
+    } else {
+        structural_local
+    };
+    match (local, inherited) {
+        (local, Some(inherited_id)) => {
+            let inherited = merged_facts.get(inherited_id)?;
+            let merged = inherited.merged_with_shadowing(&local);
+            let next_id = merged_facts.len();
+            merged_facts.push(merged);
+            Some(next_id)
+        }
+        (local, None) => {
+            let next_id = merged_facts.len();
+            merged_facts.push(local);
+            Some(next_id)
+        }
+    }
+}
+
+#[derive(Default)]
+struct FunctionScope {
+    locals: HashSet<String>,
+    parameters: HashSet<String>,
+}
+
+fn is_shadowed(scopes: &[FunctionScope], name: &str) -> bool {
+    scopes.iter().any(|scope| scope.locals.contains(name))
+}
+
+fn is_receiver_parameter(scopes: &[FunctionScope], name: &str) -> bool {
+    scopes
+        .iter()
+        .rev()
+        .any(|scope| scope.parameters.contains(name))
+}
+
+fn handle_identifier(node: Node<'_>, ctx: &mut PyScan<'_>, scopes: &[FunctionScope]) {
+    // The object of an `attribute` is handled by handle_attribute.
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "attribute")
+    {
+        return;
+    }
+    if is_declaration_identifier(node) {
+        return;
+    }
+    let text = slice(node, ctx.source);
+    if text.is_empty() || is_shadowed(scopes, text) {
+        return;
+    }
+    if let Some(callee) = ctx.bare_callee(text) {
+        ctx.record(callee, node);
+    }
+}
+
+fn handle_annotation_reference(node: Node<'_>, ctx: &mut PyScan<'_>) -> bool {
+    let Some(candidates) =
+        annotation_reference_candidates(ctx.graph, ctx.python, ctx.file, ctx.source, node, false)
+    else {
+        return false;
+    };
+    let [candidate] = candidates.as_slice() else {
+        return !(node.kind() == "attribute" && candidates.is_empty());
+    };
+
+    let site = if node.kind() == "attribute" {
+        node.child_by_field_name("attribute").unwrap_or(node)
+    } else {
+        node
+    };
+    ctx.record(candidate.fq_name(), site);
+    true
+}
+
+fn handle_attribute(
+    node: Node<'_>,
+    ctx: &mut PyScan<'_>,
+    scopes: &[FunctionScope],
+    facts: Option<&LocalBindingsSnapshot<String>>,
+) {
+    let (Some(object), Some(attribute)) = (
+        node.child_by_field_name("object"),
+        node.child_by_field_name("attribute"),
+    ) else {
+        return;
+    };
+    let object_text = slice(object, ctx.source);
+    let attribute_text = slice(attribute, ctx.source);
+    if object_text.is_empty() || attribute_text.is_empty() {
+        return;
+    }
+    if object.kind() == "call" && ctx.targets_by_terminal.contains_key(attribute_text) {
+        for class in call_result_types(ctx.graph, ctx.python, ctx.file, ctx.source, object, facts) {
+            let direct = format!("{}.{attribute_text}", class.fq_name());
+            if ctx.targets.contains(&direct) {
+                ctx.record(direct, attribute);
+                continue;
+            }
+            if let Some(provider) = ctx.graph.hierarchy {
+                for ancestor in provider.get_ancestors(&class) {
+                    let inherited = format!("{}.{attribute_text}", ancestor.fq_name());
+                    if ctx.targets.contains(&inherited) {
+                        ctx.record(inherited, attribute);
+                    }
+                }
+            }
+        }
+    }
+    // `module.symbol` or a deeper `module.ns.symbol` chain rooted at a
+    // namespace import. Walk the attribute structure from the leftmost imported
+    // root so deep chains stay exact without source-text splitting.
+    if let Some((root, attributes)) = attribute_chain(node) {
+        let root_text = slice(root, ctx.source);
+        if !root_text.is_empty()
+            && !is_shadowed(scopes, root_text)
+            && let Some(binding) = ctx.namespace.get(root_text)
+        {
+            let mut direct = binding.module.clone();
+            let workspace_module = binding.workspace_module;
+            let consumed_attributes = binding.consumed_attributes;
+            if object.kind() == "identifier" && ctx.targets.contains(&direct) {
+                ctx.record(direct.clone(), object);
+            }
+            for member in attributes.into_iter().skip(consumed_attributes) {
+                let member_text = slice(member, ctx.source);
+                if member_text.is_empty() {
+                    return;
+                }
+                direct.push('.');
+                direct.push_str(member_text);
+            }
+            if ctx.targets.contains(&direct) {
+                ctx.record(direct, attribute);
+                return;
+            }
+            // A re-export alias can change the terminal name (`proto.module` may
+            // canonically resolve to `proto.modules.define_module`), so terminal-name
+            // filtering is not sound here. Namespace imports are already a narrow,
+            // structured subset of attributes; resolve their workspace candidates
+            // and let `record` retain only requested targets.
+            if workspace_module {
+                for resolved in ctx.canonical_namespace_candidates(&direct).iter() {
+                    ctx.record(resolved.clone(), attribute);
+                }
+            }
+            return;
+        }
+    }
+
+    // `recv.method` where recv is a typed local/parameter: resolve to the
+    // receiver's class fqn. Unknown or ambiguous receiver facts are not enough
+    // for a proven edge, but they are structured evidence that a same-named
+    // member may be reachable, so bulk dead-code treats the candidate as
+    // inconclusive instead of dead.
+    if let Some(facts) = facts
+        && ctx.targets_by_terminal.contains_key(attribute_text)
+    {
+        if matches!(object_text, "self" | "cls") {
+            // `self.member` / `cls.member` is a same-owner reference (#1138):
+            // record it as unproven inbound rather than a proven edge, so a
+            // member reachable only through same-owner access reads
+            // INCONCLUSIVE, never confidently dead — matching the other
+            // languages.
+            ctx.record_unproven_name(attribute_text, attribute);
+        } else if let Some(type_fqn) = ctx.receiver_type_fqn(facts, object_text) {
+            ctx.record(format!("{type_fqn}.{attribute_text}"), attribute);
+        } else if object.kind() == "identifier" && !ctx.named.contains_key(object_text) {
+            let resolution = facts.resolution_for(object_text);
+            if resolution.is_ambiguous()
+                || (resolution.is_unknown() && is_receiver_parameter(scopes, object_text))
+            {
+                ctx.record_unproven_name(attribute_text, attribute);
+            }
+        }
+    }
+}
+
+fn handle_keyword_argument(node: Node<'_>, ctx: &mut PyScan<'_>, scopes: &[FunctionScope]) {
+    let (Some(name), Some(arguments)) = (node.child_by_field_name("name"), node.parent()) else {
+        return;
+    };
+    if name.kind() != "identifier" || arguments.kind() != "argument_list" {
+        return;
+    }
+    let Some(call) = arguments.parent().filter(|parent| parent.kind() == "call") else {
+        return;
+    };
+    let Some(function) = call.child_by_field_name("function") else {
+        return;
+    };
+    let member = slice(name, ctx.source);
+    if member.is_empty() || !ctx.targets_by_terminal.contains_key(member) {
+        return;
+    }
+    let scoped_class_fqn = if function.kind() == "identifier" {
+        enclosing_scope_facts(ctx.graph.index, ctx.file, ctx.scope_facts, function)
+            .and_then(|facts| ctx.receiver_type_fqn(facts, slice(function, ctx.source)))
+    } else {
+        None
+    };
+    let function_name = (function.kind() == "identifier").then(|| slice(function, ctx.source));
+    let mut default_classes = function_name.map_or_else(Vec::new, |local_name| {
+        resolve_callable_parameter_default_types(
+            ctx.graph, ctx.python, ctx.file, ctx.source, function, local_name,
+        )
+    });
+    let root_shadowed = leftmost_identifier(function)
+        .is_some_and(|root| is_shadowed(scopes, slice(root, ctx.source)));
+    let mut classes = if function_name == Some("cls") {
+        lexical_class(ctx, function).into_iter().collect()
+    } else {
+        if root_shadowed && scoped_class_fqn.is_none() && default_classes.is_empty() {
+            return;
+        }
+        if !root_shadowed {
+            default_classes.extend(resolve_constructor_types(
+                ctx.graph, ctx.python, ctx.file, ctx.source, function,
+            ));
+        }
+        default_classes
+    };
+    if let Some(fqn) = scoped_class_fqn {
+        classes.extend(ctx.graph.index.definitions(&fqn).filter(CodeUnit::is_class));
+        classes.sort();
+        classes.dedup();
+    }
+    for class in classes {
+        let direct = format!("{}.{member}", class.fq_name());
+        if ctx.targets.contains(&direct) {
+            ctx.record(direct, name);
+            continue;
+        }
+        if let Some(provider) = ctx.graph.hierarchy {
+            for ancestor in provider.get_ancestors(&class) {
+                let inherited = format!("{}.{member}", ancestor.fq_name());
+                if ctx.targets.contains(&inherited) {
+                    ctx.record(inherited, name);
+                }
+            }
+        }
+    }
+}
+
+fn lexical_class(ctx: &PyScan<'_>, node: Node<'_>) -> Option<CodeUnit> {
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: 0,
+        end_line: 0,
+    };
+    let enclosing = ctx.graph.index.enclosing_code_unit(ctx.file, &range)?;
+    if enclosing.is_class() {
+        Some(enclosing)
+    } else {
+        ctx.graph
+            .index
+            .parent_of(&enclosing)
+            .filter(CodeUnit::is_class)
+    }
+}
+
+fn leftmost_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "identifier" => return Some(node),
+            "attribute" => node = node.child_by_field_name("object")?,
+            _ => return None,
+        }
+    }
+}
+
+fn attribute_chain<'a>(node: Node<'a>) -> Option<(Node<'a>, Vec<Node<'a>>)> {
+    let mut attributes = Vec::new();
+    let mut current = node;
+    loop {
+        if current.kind() != "attribute" {
+            return None;
+        }
+        attributes.push(current.child_by_field_name("attribute")?);
+        current = current.child_by_field_name("object")?;
+        if current.kind() == "identifier" {
+            attributes.reverse();
+            return Some((current, attributes));
+        }
+    }
+}
+
+/// The local names a function binds: its parameters plus every name it assigns.
+/// Python scoping is function-wide, so a name assigned anywhere in the body is
+/// local throughout; nested function/class scopes are skipped (they get their
+/// own frame), but the names they bind in *this* scope are kept.
+fn collect_function_scope(func: Node<'_>, source: &str) -> FunctionScope {
+    let mut scope = FunctionScope::default();
+    if let Some(params) = func.child_by_field_name("parameters") {
+        collect_parameter_names(params, source, &mut scope.parameters);
+        scope.locals.extend(scope.parameters.iter().cloned());
+    }
+    if let Some(body) = func.child_by_field_name("body") {
+        collect_bound_targets(body, source, &mut scope.locals);
+    }
+    scope
+}
+
+fn collect_parameter_names(params: Node<'_>, source: &str, out: &mut HashSet<String>) {
+    let mut cursor = params.walk();
+    for child in params.named_children(&mut cursor) {
+        let name = match child.kind() {
+            "identifier" => Some(child),
+            // typed / default / splat parameters carry the binding either in a
+            // `name` field or as their first identifier child.
+            _ => child
+                .child_by_field_name("name")
+                .or_else(|| child.named_child(0).filter(|n| n.kind() == "identifier")),
+        };
+        if let Some(name) = name {
+            let text = slice(name, source).trim();
+            if !text.is_empty() {
+                out.insert(text.to_string());
+            }
+        }
+    }
+}
+
+/// Collect names bound by assignment within a scope, without descending into
+/// nested function/class scopes (only the nested definition's own name is bound
+/// here).
+fn collect_bound_targets(node: Node<'_>, source: &str, out: &mut HashSet<String>) {
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "function_definition" | "class_definition" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let text = slice(name, source).trim();
+                    if !text.is_empty() {
+                        out.insert(text.to_string());
+                    }
+                }
+                continue;
+            }
+            "lambda" => continue,
+            "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    collect_assigned_identifiers(left, source, out);
+                }
+            }
+            "named_expression" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    collect_assigned_identifiers(name, source, out);
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+}

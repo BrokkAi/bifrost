@@ -1,0 +1,744 @@
+use crate::providers::JsTsSource;
+use crate::syntax::JsTsImportBinder;
+use crate::tsconfig::AliasResolver;
+use crate::type_text::{jsts_type_space_candidates, jsts_value_space_candidates};
+use brokk_bifrost_core::analyzer::definition_lookup::sort_units;
+use brokk_bifrost_core::analyzer::model::ImportInfo;
+use brokk_bifrost_core::analyzer::usages::model::ImportKind;
+use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, Language, ProjectFile};
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use tree_sitter::Node;
+
+pub fn parse_es_import_infos_from_node(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
+    if node.kind() != "import_statement" {
+        return Vec::new();
+    }
+    let raw = node_text(node, source).trim().to_string();
+    let Some(source_node) = node.child_by_field_name("source") else {
+        return Vec::new();
+    };
+    if node_text(source_node, source).trim().is_empty() {
+        return Vec::new();
+    }
+
+    let Some(import_clause) = named_child_of_kind(node, "import_clause") else {
+        return vec![ImportInfo {
+            raw_snippet: raw,
+            is_wildcard: false,
+            is_global: false,
+            identifier: None,
+            alias: None,
+            path: None,
+            binder_span: None,
+        }];
+    };
+
+    let mut imports = Vec::new();
+    let mut cursor = import_clause.walk();
+    for child in import_clause.named_children(&mut cursor) {
+        match child.kind() {
+            "identifier" => {
+                let identifier = node_text(child, source).trim();
+                if !identifier.is_empty() {
+                    imports.push(ImportInfo {
+                        raw_snippet: raw.clone(),
+                        is_wildcard: false,
+                        is_global: false,
+                        identifier: Some(identifier.to_string()),
+                        alias: None,
+                        path: None,
+                        binder_span: Some(brokk_bifrost_core::analyzer::common::node_span(child)),
+                    });
+                }
+            }
+            "namespace_import" => {
+                if let Some(alias_node) = first_identifier_child_node(child) {
+                    let alias = node_text(alias_node, source).trim().to_string();
+                    if !alias.is_empty() {
+                        imports.push(ImportInfo {
+                            raw_snippet: raw.clone(),
+                            is_wildcard: true,
+                            is_global: false,
+                            identifier: None,
+                            alias: Some(alias),
+                            path: None,
+                            // A namespace import binds one name: its alias token.
+                            binder_span: Some(brokk_bifrost_core::analyzer::common::node_span(
+                                alias_node,
+                            )),
+                        });
+                    }
+                }
+            }
+            "named_imports" => collect_named_es_imports(child, source, &raw, &mut imports),
+            _ => {}
+        }
+    }
+    imports
+}
+
+pub fn parse_commonjs_require_import_infos_from_node(
+    node: Node<'_>,
+    source: &str,
+) -> Vec<ImportInfo> {
+    if matches!(node.kind(), "lexical_declaration" | "variable_declaration") {
+        return parse_commonjs_require_bindings_from_node(node, source)
+            .into_iter()
+            .map(|binding| ImportInfo {
+                raw_snippet: binding.raw_snippet,
+                is_wildcard: false,
+                is_global: false,
+                identifier: Some(binding.imported_name),
+                alias: binding.alias,
+                path: None,
+                binder_span: None,
+            })
+            .collect();
+    }
+
+    if node.kind() == "expression_statement" {
+        let raw = node_text(node, source).trim();
+        if raw.is_empty() || !direct_require_expression(node, source) {
+            return Vec::new();
+        }
+        return vec![ImportInfo {
+            raw_snippet: raw.to_string(),
+            is_wildcard: false,
+            is_global: false,
+            identifier: None,
+            alias: None,
+            path: None,
+            binder_span: None,
+        }];
+    }
+
+    Vec::new()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommonJsRequireBinding {
+    pub raw_snippet: String,
+    pub module_specifier: String,
+    pub local_name: String,
+    pub imported_name: String,
+    pub alias: Option<String>,
+    pub kind: CommonJsRequireBindingKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommonJsRequireBindingKind {
+    ModuleObject,
+    Named,
+}
+
+pub fn parse_commonjs_require_bindings_from_node(
+    node: Node<'_>,
+    source: &str,
+) -> Vec<CommonJsRequireBinding> {
+    if !matches!(node.kind(), "lexical_declaration" | "variable_declaration") {
+        return Vec::new();
+    }
+    let raw = node_text(node, source).trim().to_string();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+
+    let mut bindings = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "variable_declarator" {
+            bindings.extend(commonjs_require_bindings_from_declarator(
+                child, &raw, source,
+            ));
+        }
+    }
+    bindings
+}
+
+fn commonjs_require_bindings_from_declarator(
+    declarator: Node<'_>,
+    raw: &str,
+    source: &str,
+) -> Vec<CommonJsRequireBinding> {
+    let Some(module_specifier) =
+        commonjs_require_module_specifier_from_declarator(declarator, source)
+    else {
+        return Vec::new();
+    };
+    let Some(name) = declarator.child_by_field_name("name") else {
+        return Vec::new();
+    };
+    commonjs_require_bindings_from_name(name, raw, &module_specifier, source)
+}
+
+fn commonjs_require_bindings_from_name(
+    node: Node<'_>,
+    raw: &str,
+    module_specifier: &str,
+    source: &str,
+) -> Vec<CommonJsRequireBinding> {
+    match node.kind() {
+        "identifier" | "type_identifier" => {
+            let identifier = node_text(node, source).trim();
+            if identifier.is_empty() {
+                Vec::new()
+            } else {
+                vec![CommonJsRequireBinding {
+                    raw_snippet: raw.to_string(),
+                    module_specifier: module_specifier.to_string(),
+                    local_name: identifier.to_string(),
+                    imported_name: identifier.to_string(),
+                    alias: None,
+                    kind: CommonJsRequireBindingKind::ModuleObject,
+                }]
+            }
+        }
+        "object_pattern" => {
+            let mut bindings = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                match child.kind() {
+                    "shorthand_property_identifier_pattern" => {
+                        let identifier = node_text(child, source).trim();
+                        if !identifier.is_empty() {
+                            bindings.push(CommonJsRequireBinding {
+                                raw_snippet: raw.to_string(),
+                                module_specifier: module_specifier.to_string(),
+                                local_name: identifier.to_string(),
+                                imported_name: identifier.to_string(),
+                                alias: None,
+                                kind: CommonJsRequireBindingKind::Named,
+                            });
+                        }
+                    }
+                    "pair_pattern" => {
+                        let identifier = child
+                            .child_by_field_name("key")
+                            .or_else(|| first_child_of_kind(child, "property_identifier"))
+                            .map(|key| node_text(key, source).trim().to_string())
+                            .filter(|text| !text.is_empty());
+                        let alias = child
+                            .child_by_field_name("value")
+                            .and_then(|value| commonjs_pattern_local_name(value, source))
+                            .filter(|text| !text.is_empty());
+                        if let Some(identifier) = identifier {
+                            let local_name = alias.clone().unwrap_or_else(|| identifier.clone());
+                            bindings.push(CommonJsRequireBinding {
+                                raw_snippet: raw.to_string(),
+                                module_specifier: module_specifier.to_string(),
+                                local_name,
+                                imported_name: identifier,
+                                alias,
+                                kind: CommonJsRequireBindingKind::Named,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            bindings
+        }
+        _ => Vec::new(),
+    }
+}
+
+pub fn commonjs_require_module_specifier_from_declarator(
+    declarator: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    let value = declarator.child_by_field_name("value")?;
+    require_call_module_specifier(value, source)
+}
+
+pub fn require_call_module_specifier(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    if function.kind() != "identifier" || node_text(function, source).trim() != "require" {
+        return None;
+    }
+
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let first_argument = arguments.named_children(&mut cursor).next()?;
+    if !matches!(first_argument.kind(), "string" | "string_fragment") {
+        return None;
+    }
+    Some(unquote(node_text(first_argument, source)))
+}
+
+fn commonjs_pattern_local_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "type_identifier" | "shorthand_property_identifier_pattern" => {
+            let text = node_text(node, source).trim();
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        "assignment_pattern" => node
+            .child_by_field_name("left")
+            .and_then(|left| commonjs_pattern_local_name(left, source)),
+        _ => None,
+    }
+}
+
+fn first_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
+fn direct_require_expression(node: Node<'_>, source: &str) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| is_require_call(child, source))
+}
+
+fn is_require_call(node: Node<'_>, source: &str) -> bool {
+    require_call_module_specifier(node, source).is_some()
+}
+
+fn collect_named_es_imports(
+    node: Node<'_>,
+    source: &str,
+    raw: &str,
+    imports: &mut Vec<ImportInfo>,
+) {
+    let mut cursor = node.walk();
+    for spec in node.named_children(&mut cursor) {
+        if spec.kind() != "import_specifier" {
+            continue;
+        }
+        let name_node = spec.child_by_field_name("name");
+        let alias_node = spec.child_by_field_name("alias");
+        let identifier = name_node.map(|name| node_text(name, source).trim().to_string());
+        let alias = alias_node.map(|alias| node_text(alias, source).trim().to_string());
+        if identifier.as_deref().is_none_or(str::is_empty) {
+            continue;
+        }
+        // The bound name is spelled by the alias token when renamed, and by
+        // the imported name's own token otherwise.
+        let binder_span = alias_node
+            .filter(|_| alias.as_deref().is_some_and(|alias| !alias.is_empty()))
+            .or(name_node)
+            .map(brokk_bifrost_core::analyzer::common::node_span);
+        imports.push(ImportInfo {
+            raw_snippet: raw.to_string(),
+            is_wildcard: false,
+            is_global: false,
+            identifier,
+            alias,
+            path: None,
+            binder_span,
+        });
+    }
+}
+
+fn named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == kind)
+}
+
+fn first_identifier_child_node(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| matches!(child.kind(), "identifier" | "type_identifier"))
+}
+
+fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
+}
+
+fn unquote(text: &str) -> String {
+    let trimmed = text.trim();
+    let stripped = trimmed
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        });
+    stripped.unwrap_or(trimmed).to_string()
+}
+
+pub fn resolve_js_ts_import_paths(
+    source_file: &ProjectFile,
+    raw_import: &str,
+    language: Language,
+    aliases: Option<&AliasResolver>,
+) -> Vec<ProjectFile> {
+    let Some(module_path) = extract_import_module_path(raw_import) else {
+        return Vec::new();
+    };
+    resolve_js_ts_module_specifier(source_file, &module_path, language, aliases)
+}
+
+/// Resolve a module specifier to project files. Relative specifiers (`"./foo"`) resolve
+/// against the importing file's directory; non-relative specifiers are matched against
+/// the importing file's governing `tsconfig.json`/`jsconfig.json` path aliases via
+/// `aliases` (when supplied). Bare package specifiers that match no alias are still
+/// ignored — `package.json` `exports`/`main` resolution remains out of scope. Shared with
+/// the JS/TS export-usage graph so both resolvers stay in lock-step.
+pub fn resolve_js_ts_module_specifier(
+    source_file: &ProjectFile,
+    module_specifier: &str,
+    language: Language,
+    aliases: Option<&AliasResolver>,
+) -> Vec<ProjectFile> {
+    let exts = language.extensions();
+    if !module_specifier.starts_with('.') {
+        // Non-relative: try tsconfig path aliases. Each candidate base is tried in TS
+        // precedence order; the first that resolves to a real file wins.
+        let Some(aliases) = aliases else {
+            return Vec::new();
+        };
+        for base in aliases.candidate_bases(source_file, module_specifier) {
+            let mut candidates = Vec::new();
+            collect_candidate_paths(source_file.root(), &base, language, exts, &mut candidates);
+            if !candidates.is_empty() {
+                candidates.sort();
+                candidates.dedup();
+                return candidates;
+            }
+        }
+        return Vec::new();
+    }
+    let base = source_file.parent().join(module_specifier);
+    let mut candidates = Vec::new();
+    collect_candidate_paths(source_file.root(), &base, language, exts, &mut candidates);
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+/// The npm package a bare module specifier addresses, and the subpath below it.
+///
+/// `left-pad` -> (`left-pad`, none); `left-pad/dist/index` -> (`left-pad`,
+/// `dist/index`); `@scope/pkg/deep` -> (`@scope/pkg`, `deep`). A relative or
+/// absolute specifier addresses a workspace file rather than a package and
+/// yields `None`.
+///
+/// The specifier is the whole structure here: npm has no AST above it, and the
+/// scope/name/subpath split is the specifier grammar npm itself defines, not a
+/// re-parse of source text. Discovery records exactly these package and module
+/// identities (see `js_ts::external::declaration_entries`), so callers that
+/// match retained evidence must split the same way.
+pub fn npm_package_of_module_specifier(specifier: &str) -> Option<(&str, Option<&str>)> {
+    if specifier.is_empty() || specifier.starts_with('.') || specifier.starts_with('/') {
+        return None;
+    }
+    let boundary = if specifier.starts_with('@') {
+        // A scoped package is `@scope/name`: the package ends at the second slash.
+        let scope_end = specifier.find('/')?;
+        specifier[scope_end + 1..]
+            .find('/')
+            .map(|offset| scope_end + 1 + offset)
+    } else {
+        specifier.find('/')
+    };
+    match boundary {
+        Some(offset) => {
+            let subpath = specifier[offset + 1..].trim_start_matches('/');
+            Some((
+                &specifier[..offset],
+                (!subpath.is_empty()).then_some(subpath),
+            ))
+        }
+        None => Some((specifier, None)),
+    }
+}
+
+fn extract_import_module_path(raw_import: &str) -> Option<String> {
+    let trimmed = raw_import.trim().trim_end_matches(';').trim();
+    if trimmed.starts_with("import ") {
+        if let Some((_, path)) = trimmed.trim_end_matches(';').rsplit_once(" from ") {
+            return Some(path.trim().trim_matches('\'').trim_matches('"').to_string());
+        }
+        let path = trimmed.split_whitespace().nth(1)?;
+        return Some(path.trim().trim_matches('\'').trim_matches('"').to_string());
+    }
+    let require = trimmed.split_once("require(")?.1;
+    let path = require
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim_end_matches(';')
+        .trim();
+    Some(path.trim_matches('\'').trim_matches('"').to_string())
+}
+
+fn collect_candidate_paths(
+    root: &Path,
+    module_path: &Path,
+    language: Language,
+    extensions: &[&str],
+    out: &mut Vec<ProjectFile>,
+) {
+    if module_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| extensions.contains(&ext))
+    {
+        let file = ProjectFile::new(root.to_path_buf(), module_path.to_path_buf());
+        if file.exists() {
+            out.push(file);
+        }
+        return;
+    }
+    if let Some(source_extensions) =
+        ts_source_extensions_for_runtime_specifier(module_path, language)
+    {
+        for source_extension in source_extensions {
+            let source_path = module_path.with_extension(source_extension);
+            let file = ProjectFile::new(root.to_path_buf(), source_path);
+            if file.exists() {
+                out.push(file);
+            }
+        }
+        if !out.is_empty() {
+            return;
+        }
+    }
+    for extension in extensions {
+        let with_ext = PathBuf::from(format!("{}.{}", module_path.to_string_lossy(), extension));
+        let direct = ProjectFile::new(root.to_path_buf(), with_ext);
+        if direct.exists() {
+            out.push(direct);
+        }
+        let index = module_path.join(format!("index.{extension}"));
+        let index_file = ProjectFile::new(root.to_path_buf(), index);
+        if index_file.exists() {
+            out.push(index_file);
+        }
+    }
+}
+
+fn ts_source_extensions_for_runtime_specifier(
+    module_path: &Path,
+    language: Language,
+) -> Option<&'static [&'static str]> {
+    if language != Language::TypeScript {
+        return None;
+    }
+    match module_path.extension().and_then(|ext| ext.to_str()) {
+        Some("js") => Some(&["ts", "tsx"]),
+        Some("jsx") => Some(&["tsx", "ts"]),
+        Some("mjs") => Some(&["mts", "ts"]),
+        Some("cjs") => Some(&["cts", "ts"]),
+        _ => None,
+    }
+}
+
+pub fn import_info_tokens(import: &ImportInfo) -> BTreeSet<String> {
+    import
+        .local_name()
+        .map(str::to_string)
+        .into_iter()
+        .collect()
+}
+
+pub fn extract_js_ts_call_receiver(reference: &str) -> Option<String> {
+    let trimmed = reference.trim();
+    let before_args = trimmed
+        .split_once('(')
+        .map(|(head, _)| head)
+        .unwrap_or(trimmed);
+    let (receiver, method) = before_args.rsplit_once('.')?;
+    if receiver.is_empty() || method.is_empty() {
+        return None;
+    }
+    Some(receiver.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_js_ts_module_binding_candidates(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    language: Language,
+    file: &ProjectFile,
+    module: &str,
+    exported_name: &str,
+    aliases: Option<&AliasResolver>,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let files = crate::imports::resolve_js_ts_module_specifier(file, module, language, aliases);
+    if files.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates =
+        jsts_module_export_candidates(host, support, &files, exported_name, value_position);
+    if value_position {
+        candidates = jsts_value_space_candidates(host, candidates);
+    } else {
+        candidates = jsts_type_space_candidates(host, candidates);
+    }
+    if candidates.is_empty() && exported_name == "default" {
+        for file in &files {
+            candidates.extend(
+                host.declarations(file)
+                    .into_iter()
+                    .filter(|unit| unit.identifier() == "default"),
+            );
+        }
+        sort_units(&mut candidates);
+        candidates.dedup();
+        if value_position {
+            candidates = jsts_value_space_candidates(host, candidates);
+        } else {
+            candidates = jsts_type_space_candidates(host, candidates);
+        }
+    }
+    candidates
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_js_ts_direct_import_candidates(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    language: Language,
+    file: &ProjectFile,
+    imports: &JsTsImportBinder,
+    name: &str,
+    aliases: Option<&AliasResolver>,
+    value_position: bool,
+) -> Option<Vec<CodeUnit>> {
+    let mut saw_direct_import = false;
+    let mut candidates = Vec::new();
+    for binding in imports.resolvable_direct_bindings_for(name) {
+        saw_direct_import = true;
+        let exported_name = match binding.kind {
+            ImportKind::Named => binding.imported_name.as_deref().unwrap_or(name),
+            ImportKind::Default => "default",
+            _ => unreachable!("direct bindings contain only named/default imports"),
+        };
+        candidates.extend(resolve_js_ts_module_binding_candidates(
+            host,
+            support,
+            language,
+            file,
+            &binding.module_specifier,
+            exported_name,
+            aliases,
+            value_position,
+        ));
+    }
+    if !saw_direct_import {
+        return None;
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    Some(candidates)
+}
+
+fn jsts_module_export_candidates(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    files: &[ProjectFile],
+    exported_name: &str,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let Some(index) = host.usage_index(None) else {
+        return Vec::new();
+    };
+
+    let bindings = index.local_bindings_for_exported_name(files, exported_name);
+    let mut candidates = Vec::new();
+    for (file, local_name) in bindings {
+        // An export names one exact local binding. Prefer its exact FQN before
+        // the broad file-identifier index, which also returns same-terminal
+        // class members such as `Store.getPreferences` for an exported
+        // top-level `getPreferences` function.
+        let mut file_candidates: Vec<_> = support
+            .fqn(&local_name)
+            .into_iter()
+            .filter(|candidate| candidate.source() == &file)
+            .collect();
+        if file_candidates.is_empty() {
+            file_candidates = support.file_identifier_in_files(&[file], &local_name);
+        }
+        candidates.extend(file_candidates);
+    }
+
+    if value_position {
+        jsts_value_space_candidates(host, candidates)
+    } else {
+        jsts_type_space_candidates(host, candidates)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_es_import_infos_from_node;
+    use tree_sitter::Parser;
+
+    fn parse_typescript_import_infos(
+        source: &str,
+    ) -> Vec<brokk_bifrost_core::analyzer::model::ImportInfo> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let import_node = root
+            .named_children(&mut root.walk())
+            .find(|child| child.kind() == "import_statement")
+            .unwrap();
+        parse_es_import_infos_from_node(import_node, source)
+    }
+
+    #[test]
+    fn parses_typescript_type_only_named_imports() {
+        let imports = parse_typescript_import_infos("import type { BubbleState } from '../types';");
+        assert_eq!(1, imports.len());
+        assert_eq!(Some("BubbleState"), imports[0].identifier.as_deref());
+        assert_eq!(None, imports[0].alias.as_deref());
+    }
+
+    #[test]
+    fn parses_mixed_typescript_named_imports_with_inline_type_modifiers() {
+        let imports = parse_typescript_import_infos(
+            "import { type BubbleState, SummaryState } from '../types';",
+        );
+        let identifiers = imports
+            .into_iter()
+            .map(|import| import.identifier.unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(vec!["BubbleState", "SummaryState"], identifiers);
+    }
+
+    #[test]
+    fn splits_bare_specifiers_into_their_npm_package_and_subpath() {
+        use super::npm_package_of_module_specifier as split;
+
+        assert_eq!(Some(("left-pad", None)), split("left-pad"));
+        assert_eq!(Some(("left-pad", Some("dist"))), split("left-pad/dist"));
+        assert_eq!(
+            Some(("left-pad", Some("dist/index"))),
+            split("left-pad/dist/index")
+        );
+        assert_eq!(Some(("@scope/pkg", None)), split("@scope/pkg"));
+        assert_eq!(Some(("@scope/pkg", Some("deep"))), split("@scope/pkg/deep"));
+        assert_eq!(
+            Some(("@scope/pkg", Some("deep/deeper"))),
+            split("@scope/pkg/deep/deeper")
+        );
+        // A trailing slash names the package itself, not an empty subpath.
+        assert_eq!(Some(("left-pad", None)), split("left-pad/"));
+    }
+
+    #[test]
+    fn refuses_specifiers_that_do_not_address_a_package() {
+        use super::npm_package_of_module_specifier as split;
+
+        assert_eq!(None, split(""));
+        assert_eq!(None, split("./local"));
+        assert_eq!(None, split("../sibling"));
+        assert_eq!(None, split("/absolute"));
+        // A scope with no package name is not an npm coordinate.
+        assert_eq!(None, split("@scope"));
+    }
+}

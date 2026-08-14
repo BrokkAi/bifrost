@@ -1,0 +1,10 @@
+[alias]
+clippy-no-cuda = [
+    "clippy",
+    "--all-targets",
+    "--features",
+    "nlp,python",
+    "--",
+    "-D",
+    "warnings",
+]

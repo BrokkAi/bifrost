@@ -1,0 +1,15 @@
+# Reduced verbatim slice of github/codeql java/ql/lib/ext/java.sql.model.yml
+# Revision c9142680f5b6409dbe0944350321c54e8c801e61, MIT. See PROVENANCE.md.
+# SQL-injection sinks (Statement and Connection).
+extensions:
+  - addsTo:
+      pack: codeql/java-all
+      extensible: sinkModel
+    data:
+      - ["java.sql", "Connection", True, "prepareCall", "", "", "Argument[0]", "sql-injection", "manual"]
+      - ["java.sql", "Connection", True, "prepareStatement", "", "", "Argument[0]", "sql-injection", "manual"]
+      - ["java.sql", "Statement", True, "addBatch", "", "", "Argument[0]", "sql-injection", "manual"]
+      - ["java.sql", "Statement", True, "execute", "", "", "Argument[0]", "sql-injection", "manual"]
+      - ["java.sql", "Statement", True, "executeLargeUpdate", "", "", "Argument[0]", "sql-injection", "manual"]
+      - ["java.sql", "Statement", True, "executeQuery", "", "", "Argument[0]", "sql-injection", "manual"]
+      - ["java.sql", "Statement", True, "executeUpdate", "", "", "Argument[0]", "sql-injection", "manual"]

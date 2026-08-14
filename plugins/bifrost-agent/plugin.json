@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "bifrost",
+  "version": "0.9.5",
+  "description": "Bifrost by Brokk: multi-language code intelligence and MCP workflows.",
+  "author": {
+    "name": "Brokk",
+    "url": "https://brokk.ai"
+  },
+  "homepage": "https://github.com/BrokkAi/bifrost",
+  "repository": "https://github.com/BrokkAi/bifrost",
+  "license": "Apache-2.0",
+  "keywords": [
+    "bifrost",
+    "mcp",
+    "code-intelligence",
+    "tree-sitter"
+  ]
+}

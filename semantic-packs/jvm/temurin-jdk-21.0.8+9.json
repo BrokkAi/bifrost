@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.jdk",
+  "pack_version": "21.0.8",
+  "ecosystem": "jdk",
+  "kind": {
+    "artifact_kind": "jdk_source_zip",
+    "layout": "module_prefixed"
+  },
+  "artifact": {
+    "file_name": "src.zip",
+    "sha256": "5440baccc6c54b18671ab9cb9bf6ffdd7698d3a85ee74faa0b47b111312f200c",
+    "url": null,
+    "container": {
+      "file_name": "OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz",
+      "sha256": "59422c2292ae4e76b87e00d8808dbe49cffa39af731e08bb0292ddb0af4e0261",
+      "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.8%2B9/OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz",
+      "artifact_path": "jdk-21.0.8+9/Contents/Home/lib/src.zip"
+    }
+  },
+  "compatibility": {
+    "bifrost": ">=0.8.18, <0.10.0",
+    "toolchains": [
+      {
+        "name": "jdk",
+        "requirement": "=21.0.8"
+      }
+    ]
+  },
+  "activation": [
+    {
+      "toolchain": {
+        "name": "jdk",
+        "version": "=21.0.8"
+      },
+      "targets": [
+        "jvm"
+      ],
+      "configurations": []
+    }
+  ],
+  "provenance": {
+    "source": "https://github.com/adoptium/jdk21u",
+    "revision": "18dfe1e4938d"
+  },
+  "license": "GPL-2.0-only WITH Classpath-exception-2.0",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "notices": [
+    "notices/temurin-jdk-21.0.8+9.txt"
+  ],
+  "measurement_activation": {
+    "module": {
+      "name": "java.base"
+    },
+    "toolchain": {
+      "name": "jdk",
+      "version": "=21.0.8"
+    },
+    "targets": [
+      "jvm"
+    ],
+    "configurations": []
+  },
+  "measurement_queries": [
+    {
+      "kind": "type",
+      "name": "java.lang.Object"
+    },
+    {
+      "kind": "member",
+      "owner": "java.lang.Object",
+      "name": "hashCode"
+    }
+  ]
+}

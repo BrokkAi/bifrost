@@ -1,0 +1,1631 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.jdk-golden-summaries",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-golden-foundry",
+    "version": "0.9.0"
+  },
+  "language": "java",
+  "ecosystem": "jdk",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <0.10.0",
+    "toolchains": [
+      {
+        "name": "jdk",
+        "requirement": ">=17.0.0"
+      }
+    ]
+  },
+  "provenance": {
+    "source": "hand-authored golden-core JDK flow-through summaries",
+    "revision": "golden-core"
+  },
+  "license": "LGPL-3.0-or-later",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "summaries.jdk",
+      "activation": [
+        {
+          "toolchain": {
+            "name": "jdk",
+            "version": ">=17.0.0"
+          },
+          "targets": [
+            "jvm"
+          ],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "java.io.bufferedreader.readline",
+            "target": {
+              "path": "java.base/java/io/BufferedReader.java",
+              "symbol": "java.io.BufferedReader.readLine()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.io.bytearrayoutputstream.tobytearray",
+            "target": {
+              "path": "java.base/java/io/ByteArrayOutputStream.java",
+              "symbol": "java.io.ByteArrayOutputStream.toByteArray()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.io.bytearrayoutputstream.tostring",
+            "target": {
+              "path": "java.base/java/io/ByteArrayOutputStream.java",
+              "symbol": "java.io.ByteArrayOutputStream.toString()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.io.bytearrayoutputstream.tostring-java.nio.charset.charset",
+            "target": {
+              "path": "java.base/java/io/ByteArrayOutputStream.java",
+              "symbol": "java.io.ByteArrayOutputStream.toString(java.nio.charset.Charset)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.io.bytearrayoutputstream.write-byte-int-int",
+            "target": {
+              "path": "java.base/java/io/ByteArrayOutputStream.java",
+              "symbol": "java.io.ByteArrayOutputStream.write(byte[],int,int)",
+              "has_receiver": true,
+              "parameter_count": 3
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.io.stringwriter.tostring",
+            "target": {
+              "path": "java.base/java/io/StringWriter.java",
+              "symbol": "java.io.StringWriter.toString()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.io.stringwriter.write-java.lang.string",
+            "target": {
+              "path": "java.base/java/io/StringWriter.java",
+              "symbol": "java.io.StringWriter.write(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.io.writer.write-java.lang.string",
+            "target": {
+              "path": "java.base/java/io/Writer.java",
+              "symbol": "java.io.Writer.write(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.integer.intvalue",
+            "target": {
+              "path": "java.base/java/lang/Integer.java",
+              "symbol": "java.lang.Integer.intValue()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.integer.tostring-int",
+            "target": {
+              "path": "java.base/java/lang/Integer.java",
+              "symbol": "java.lang.Integer.toString(int)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.integer.valueof-int",
+            "target": {
+              "path": "java.base/java/lang/Integer.java",
+              "symbol": "java.lang.Integer.valueOf(int)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.-init-byte",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.<init>(byte[])",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.-init-byte-java.nio.charset.charset",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.<init>(byte[],java.nio.charset.Charset)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.concat-java.lang.string",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.concat(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.format-java.lang.string-java.lang.object",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.format(java.lang.String,java.lang.Object[])",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.format-java.util.locale-java.lang.string-java.lang.object",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.format(java.util.Locale,java.lang.String,java.lang.Object[])",
+              "has_receiver": false,
+              "parameter_count": 3
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 2
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.getbytes",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.getBytes()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.getbytes-java.nio.charset.charset",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.getBytes(java.nio.charset.Charset)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.join-java.lang.charsequence-java.lang.charsequence",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.join(java.lang.CharSequence,java.lang.CharSequence[])",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.join-java.lang.charsequence-java.lang.iterable",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.join(java.lang.CharSequence,java.lang.Iterable)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.replace-char-char",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.replace(char,char)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.replace-java.lang.charsequence-java.lang.charsequence",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.replace(java.lang.CharSequence,java.lang.CharSequence)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.substring-int",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.substring(int)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.substring-int-int",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.substring(int,int)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.tolowercase",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.toLowerCase()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.tolowercase-java.util.locale",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.toLowerCase(java.util.Locale)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.touppercase",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.toUpperCase()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.touppercase-java.util.locale",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.toUpperCase(java.util.Locale)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.trim",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.trim()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.valueof-char",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.valueOf(char[])",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.valueof-int",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.valueOf(int)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.string.valueof-java.lang.object",
+            "target": {
+              "path": "java.base/java/lang/String.java",
+              "symbol": "java.lang.String.valueOf(java.lang.Object)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.stringbuffer.-init-java.lang.string",
+            "target": {
+              "path": "java.base/java/lang/StringBuffer.java",
+              "symbol": "java.lang.StringBuffer.<init>(java.lang.String)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.stringbuffer.append-java.lang.string",
+            "target": {
+              "path": "java.base/java/lang/StringBuffer.java",
+              "symbol": "java.lang.StringBuffer.append(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.stringbuffer.tostring",
+            "target": {
+              "path": "java.base/java/lang/StringBuffer.java",
+              "symbol": "java.lang.StringBuffer.toString()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.stringbuilder.-init-java.lang.string",
+            "target": {
+              "path": "java.base/java/lang/StringBuilder.java",
+              "symbol": "java.lang.StringBuilder.<init>(java.lang.String)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.stringbuilder.append-char",
+            "target": {
+              "path": "java.base/java/lang/StringBuilder.java",
+              "symbol": "java.lang.StringBuilder.append(char[])",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.stringbuilder.append-java.lang.object",
+            "target": {
+              "path": "java.base/java/lang/StringBuilder.java",
+              "symbol": "java.lang.StringBuilder.append(java.lang.Object)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.stringbuilder.append-java.lang.string",
+            "target": {
+              "path": "java.base/java/lang/StringBuilder.java",
+              "symbol": "java.lang.StringBuilder.append(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.stringbuilder.insert-int-java.lang.string",
+            "target": {
+              "path": "java.base/java/lang/StringBuilder.java",
+              "symbol": "java.lang.StringBuilder.insert(int,java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.lang.stringbuilder.tostring",
+            "target": {
+              "path": "java.base/java/lang/StringBuilder.java",
+              "symbol": "java.lang.StringBuilder.toString()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.net.urldecoder.decode-java.lang.string-java.lang.string",
+            "target": {
+              "path": "java.base/java/net/URLDecoder.java",
+              "symbol": "java.net.URLDecoder.decode(java.lang.String,java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.util.arrays.aslist-java.lang.object",
+            "target": {
+              "path": "java.base/java/util/Arrays.java",
+              "symbol": "java.util.Arrays.asList(java.lang.Object[])",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.util.base64.decoder.decode-java.lang.string",
+            "target": {
+              "path": "java.base/java/util/Base64.java",
+              "symbol": "java.util.Base64.Decoder.decode(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.util.base64.encoder.encodetostring-byte",
+            "target": {
+              "path": "java.base/java/util/Base64.java",
+              "symbol": "java.util.Base64.Encoder.encodeToString(byte[])",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.util.collections.singletonlist-java.lang.object",
+            "target": {
+              "path": "java.base/java/util/Collections.java",
+              "symbol": "java.util.Collections.singletonList(java.lang.Object)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.util.iterator.next",
+            "target": {
+              "path": "java.base/java/util/Iterator.java",
+              "symbol": "java.util.Iterator.next()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.util.list.add-java.lang.object",
+            "target": {
+              "path": "java.base/java/util/List.java",
+              "symbol": "java.util.List.add(java.lang.Object)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.util.list.get-int",
+            "target": {
+              "path": "java.base/java/util/List.java",
+              "symbol": "java.util.List.get(int)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.util.map.get-java.lang.object",
+            "target": {
+              "path": "java.base/java/util/Map.java",
+              "symbol": "java.util.Map.get(java.lang.Object)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.util.map.put-java.lang.object-java.lang.object",
+            "target": {
+              "path": "java.base/java/util/Map.java",
+              "symbol": "java.util.Map.put(java.lang.Object,java.lang.Object)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              },
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.util.optional.get",
+            "target": {
+              "path": "java.base/java/util/Optional.java",
+              "symbol": "java.util.Optional.get()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.util.optional.of-java.lang.object",
+            "target": {
+              "path": "java.base/java/util/Optional.java",
+              "symbol": "java.util.Optional.of(java.lang.Object)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.util.optional.ofnullable-java.lang.object",
+            "target": {
+              "path": "java.base/java/util/Optional.java",
+              "symbol": "java.util.Optional.ofNullable(java.lang.Object)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "java.util.optional.orelse-java.lang.object",
+            "target": {
+              "path": "java.base/java/util/Optional.java",
+              "symbol": "java.util.Optional.orElse(java.lang.Object)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

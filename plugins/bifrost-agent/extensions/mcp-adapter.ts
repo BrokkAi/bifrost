@@ -1,0 +1,272 @@
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
+
+import {
+  DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_LINES,
+  formatSize,
+  keyHint,
+  truncateHead,
+  type AgentToolResult,
+  type Theme,
+  type ToolRenderResultOptions,
+  type TruncationResult,
+} from "@earendil-works/pi-coding-agent";
+import { Container, type Component, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
+import { Type, type TSchema } from "typebox";
+
+const TUI_PREVIEW_LINES = 5;
+
+export interface BifrostToolDetails {
+  truncation?: TruncationResult;
+  fullOutputPath?: string;
+}
+
+export function toolParameters(tool: Tool) {
+  return Type.Unsafe<Record<string, unknown>>(tool.inputSchema as TSchema);
+}
+
+export function toolLabel(tool: Tool): string {
+  const advertisedTitle = sanitizeTerminalLine(tool.annotations?.title?.trim() ?? "");
+  if (advertisedTitle) {
+    return advertisedTitle;
+  }
+  return sanitizeTerminalLine(
+    tool.name
+      .split("_")
+      .filter(Boolean)
+      .map((part) => part[0]!.toUpperCase() + part.slice(1))
+      .join(" "),
+  );
+}
+
+export async function mapToolResult(
+  toolName: string,
+  result: CallToolResult,
+): Promise<AgentToolResult<BifrostToolDetails>> {
+  if (result.isError) {
+    throw await createBoundedToolError(`Bifrost tool ${toolName} failed: ${errorMessage(result)}`);
+  }
+
+  const textParts: string[] = [];
+  const images: Array<{ type: "image"; data: string; mimeType: string }> = [];
+  for (const item of result.content ?? []) {
+    if (item.type === "text" && typeof item.text === "string") {
+      textParts.push(item.text);
+    } else if (item.type === "image" && typeof item.data === "string" && typeof item.mimeType === "string") {
+      images.push({ type: "image", data: item.data, mimeType: item.mimeType });
+    }
+  }
+
+  if (result.structuredContent !== undefined) {
+    textParts.push(`Structured content:\n${JSON.stringify(result.structuredContent, null, 2)}`);
+  }
+  if (textParts.length === 0 && images.length === 0) {
+    textParts.push("Bifrost returned no model-visible content.");
+  }
+
+  const visibleContent: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [];
+  let details: BifrostToolDetails = {};
+  if (textParts.length > 0) {
+    const bounded = await boundModelText(textParts.join("\n\n"));
+    visibleContent.push({ type: "text", text: bounded.text });
+    details = bounded.details;
+  }
+  visibleContent.push(...images);
+
+  return { content: visibleContent, details };
+}
+
+export async function createBoundedToolError(message: string, cause?: unknown): Promise<Error> {
+  const bounded = await boundModelText(sanitizeTerminalText(message), message);
+  return new Error(bounded.text, { cause });
+}
+
+export function renderToolCall(
+  toolName: string,
+  args: Record<string, unknown>,
+  expanded: boolean,
+  theme: Theme,
+): Component {
+  const title = theme.fg("toolTitle", theme.bold(sanitizeTerminalLine(toolName)));
+  if (Object.keys(args).length === 0) {
+    return new Text(title, 0, 0);
+  }
+  if (expanded) {
+    const formattedArgs = sanitizeTerminalText(JSON.stringify(args, null, 2));
+    return new Text(`${title}\n${theme.fg("muted", formattedArgs)}`, 0, 0);
+  }
+
+  const summary = sanitizeTerminalLine(
+    Object.entries(args)
+      .map(([name, value]) => `${name}: ${summarizeArgument(value)}`)
+      .join("  "),
+  );
+  return {
+    render: (width: number) => [truncateToWidth(`${title} ${theme.fg("muted", summary)}`, width, "...")],
+    invalidate(): void {},
+  };
+}
+
+export function renderToolResult(
+  result: AgentToolResult<BifrostToolDetails>,
+  options: ToolRenderResultOptions,
+  theme: Theme,
+): Component {
+  const container = new Container();
+  const details = result.details;
+  let output = textContent(result).trim();
+  if (details?.fullOutputPath) {
+    const notice = modelTruncationNotice(details.fullOutputPath);
+    const suffix = `\n\n${notice}`;
+    if (output.endsWith(suffix)) {
+      output = output.slice(0, -suffix.length).trimEnd();
+    } else if (output === notice) {
+      output = "";
+    }
+  }
+
+  if (output) {
+    output = sanitizeTerminalText(output);
+    const styledOutput = output
+      .split("\n")
+      .map((line) => theme.fg("toolOutput", line))
+      .join("\n");
+    if (options.expanded) {
+      container.addChild(new Text(`\n${styledOutput}`, 0, 0));
+    } else {
+      container.addChild(collapsedOutput(styledOutput, theme));
+    }
+  }
+
+  if (details?.truncation?.truncated || details?.fullOutputPath) {
+    const warnings: string[] = [];
+    if (details.fullOutputPath) {
+      warnings.push(`Full output: ${sanitizeTerminalText(details.fullOutputPath)}`);
+    }
+    const truncation = details.truncation;
+    if (truncation?.truncated) {
+      warnings.push(
+        truncation.truncatedBy === "lines"
+          ? `Truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines`
+          : `Truncated: showing ${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}`,
+      );
+    }
+    container.addChild(new Text(`\n${theme.fg("warning", `[${warnings.join(". ")}]`)}`, 0, 0));
+  }
+
+  return container;
+}
+
+async function boundModelText(
+  text: string,
+  fullText: string = text,
+): Promise<{ text: string; details: BifrostToolDetails }> {
+  const initial = truncateHead(text);
+  const fullTextTruncated = fullText === text ? initial.truncated : truncateHead(fullText).truncated;
+  if (!initial.truncated && !fullTextTruncated) {
+    return { text, details: {} };
+  }
+
+  const fullOutputPath = await saveFullOutput(fullText);
+  const notice = modelTruncationNotice(fullOutputPath);
+  const suffix = `\n\n${notice}`;
+  const truncation = truncateHead(text, {
+    maxBytes: DEFAULT_MAX_BYTES - Buffer.byteLength(suffix, "utf8"),
+    maxLines: DEFAULT_MAX_LINES - 2,
+  });
+  return {
+    text: `${truncation.content}${truncation.content ? suffix : notice}`,
+    details: { truncation, fullOutputPath },
+  };
+}
+
+async function saveFullOutput(text: string): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "pi-bifrost-"));
+  const outputPath = join(directory, "output.txt");
+  await writeFile(outputPath, text, "utf8");
+  return outputPath;
+}
+
+function modelTruncationNotice(fullOutputPath: string): string {
+  return `[Output truncated at Pi's ${DEFAULT_MAX_LINES.toLocaleString("en-US")}-line/${DEFAULT_MAX_BYTES / 1024}KB model limit. Full output: ${fullOutputPath}]`;
+}
+
+function collapsedOutput(output: string, theme: Theme): Component {
+  let cachedWidth: number | undefined;
+  let cachedLines: string[] | undefined;
+  let cachedRemaining: number | undefined;
+  return {
+    render(width: number): string[] {
+      if (cachedLines === undefined || cachedWidth !== width) {
+        const allLines = new Text(output, 0, 0).render(width);
+        cachedLines = allLines.slice(0, TUI_PREVIEW_LINES);
+        cachedRemaining = Math.max(0, allLines.length - TUI_PREVIEW_LINES);
+        cachedWidth = width;
+      }
+      if (cachedRemaining && cachedRemaining > 0) {
+        const hint = theme.fg("muted", `... (${cachedRemaining} more visual lines,`)
+          + ` ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
+        return ["", ...(cachedLines ?? []), truncateToWidth(hint, width, "...")];
+      }
+      return ["", ...(cachedLines ?? [])];
+    },
+    invalidate(): void {
+      cachedWidth = undefined;
+      cachedLines = undefined;
+      cachedRemaining = undefined;
+    },
+  };
+}
+
+export function sanitizeTerminalText(text: string): string {
+  return stripVTControlCharacters(text).replace(
+    /[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/g,
+    visibleControlCharacter,
+  );
+}
+
+export function sanitizeTerminalLine(text: string): string {
+  return sanitizeTerminalText(text).replaceAll("\n", "\\n");
+}
+
+function visibleControlCharacter(character: string): string {
+  return `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`;
+}
+
+function summarizeArgument(value: unknown): string {
+  if (typeof value === "string") {
+    return value.replace(/\s+/g, " ").trim();
+  }
+  if (Array.isArray(value) && value.every((item) => ["string", "number", "boolean"].includes(typeof item))) {
+    return value.map((item) => summarizeArgument(item)).join(", ");
+  }
+  return JSON.stringify(value) ?? String(value);
+}
+
+function textContent(result: AgentToolResult<BifrostToolDetails>): string {
+  return result.content
+    .filter((item): item is { type: "text"; text: string } => item.type === "text")
+    .map((item) => item.text)
+    .join("\n\n");
+}
+
+function errorMessage(result: CallToolResult): string {
+  const textParts: string[] = [];
+  for (const item of result.content ?? []) {
+    if (item.type === "text" && typeof item.text === "string") {
+      textParts.push(item.text);
+    }
+  }
+  const text = textParts.join("\n").trim();
+  if (text) {
+    return text;
+  }
+  if (result.structuredContent !== undefined) {
+    return JSON.stringify(result.structuredContent);
+  }
+  return "the MCP server returned an error without a message";
+}

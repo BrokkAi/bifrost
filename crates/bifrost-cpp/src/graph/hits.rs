@@ -1,0 +1,278 @@
+use crate::graph::extractor::{EnclosingContext, ScanCtx};
+use crate::graph::resolver::{
+    TargetKind, precise_parent_of, same_logical_symbol, visible_owner_from_member_name,
+};
+use brokk_bifrost_core::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
+use brokk_bifrost_core::analyzer::usages::model::{UsageHitKind, UsageHitSurface};
+use brokk_bifrost_core::analyzer::{CodeUnit, Range};
+use brokk_bifrost_core::text_utils::{find_line_index_for_offset, snippet_around_line};
+use tree_sitter::Node;
+
+pub fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    push_hit_with_options(node, ctx, false, UsageHitKind::Reference, false);
+}
+
+pub fn push_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if ctx.has_physically_visible_type_target {
+        push_hit_with_options(node, ctx, false, UsageHitKind::Reference, true);
+    } else {
+        push_unproven_hit(node, ctx);
+    }
+}
+
+pub fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    push_hit_with_options(node, ctx, false, UsageHitKind::SelfReceiver, false);
+}
+
+/// Record a recursive free-function reference for the editor surface.
+///
+/// Usage-graph consumers exclude `SelfReceiver` hits, so allowing the
+/// enclosing definition here does not create a self edge in external usage
+/// results. The structured same-symbol check below prevents unrelated
+/// enclosing units from being classified as recursive references.
+pub fn push_recursive_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if *ctx.limit_exceeded {
+        return;
+    }
+    let start = node.start_byte();
+    if is_member_field_own_declarator(node, ctx) {
+        return;
+    }
+    let line_idx = find_line_index_for_offset(ctx.line_starts, start);
+    let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
+        return;
+    };
+    if !same_logical_symbol(&enclosing, &ctx.spec.target) || is_target_declaration_name(node, ctx) {
+        return;
+    }
+    insert_hit(node, ctx, enclosing, line_idx, UsageHitKind::SelfReceiver);
+}
+
+pub fn push_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    push_hit_with_options(node, ctx, true, UsageHitKind::Definition, false);
+}
+
+pub fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    push_unproven_hit_with_kind(node, ctx, UsageHitKind::Reference);
+}
+
+pub fn push_unproven_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    push_unproven_hit_with_kind(node, ctx, UsageHitKind::Definition);
+}
+
+fn push_unproven_hit_with_kind(node: Node<'_>, ctx: &mut ScanCtx<'_>, kind: UsageHitKind) {
+    if is_inside_target_declaration(node, ctx) || is_member_field_own_declarator(node, ctx) {
+        return;
+    }
+    let start = node.start_byte();
+    let end = node.end_byte();
+    let line_idx = find_line_index_for_offset(ctx.line_starts, start);
+    let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
+        return;
+    };
+    if ctx.target_group.contains(&enclosing) {
+        return;
+    }
+    if enclosing == ctx.spec.target || same_logical_symbol(&enclosing, &ctx.spec.target) {
+        return;
+    }
+    let hit = usage_hit(
+        ctx.file,
+        line_idx,
+        start,
+        end,
+        enclosing,
+        snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
+    );
+    let hit = match kind {
+        UsageHitKind::Reference => hit,
+        UsageHitKind::Definition => hit.into_definition(),
+        UsageHitKind::Import
+        | UsageHitKind::Reexport
+        | UsageHitKind::SelfReceiver
+        | UsageHitKind::OverrideDeclaration => {
+            unreachable!("unsupported unproven C++ hit emission kind: {kind:?}")
+        }
+    };
+    ctx.unproven_hits.insert(hit.into_unproven());
+}
+
+fn push_hit_with_options(
+    node: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+    allow_logical_target_enclosing: bool,
+    kind: UsageHitKind,
+    allow_inside_target_declaration: bool,
+) {
+    if *ctx.limit_exceeded {
+        return;
+    }
+    let start = node.start_byte();
+    if is_member_field_own_declarator(node, ctx) {
+        return;
+    }
+    let inside_target_declaration =
+        !allow_inside_target_declaration && is_inside_target_declaration(node, ctx);
+    let line_idx = find_line_index_for_offset(ctx.line_starts, start);
+    let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
+        return;
+    };
+    // A reference whose enclosing declaration is the target itself is a
+    // recursive call (#1638). When the target is declared and defined in one
+    // place the site sits inside the target's own declaration range, which is
+    // why it has to be decided before that range is consulted. The declared
+    // name itself is excluded structurally, through the declarator chain, so
+    // the declaration does not become a usage of itself. `SelfReceiver` gives
+    // the same contract as [`push_recursive_reference_hit`]: editor-visible,
+    // absent from the external usage surface.
+    if matches!(kind, UsageHitKind::Reference | UsageHitKind::SelfReceiver)
+        && ctx.spec.target.is_function()
+        && enclosing == ctx.spec.target
+        && !is_target_declaration_name(node, ctx)
+    {
+        insert_hit(node, ctx, enclosing, line_idx, UsageHitKind::SelfReceiver);
+        return;
+    }
+    if inside_target_declaration {
+        return;
+    }
+    if ctx.target_group.contains(&enclosing) {
+        return;
+    }
+    if enclosing == ctx.spec.target
+        || (!allow_logical_target_enclosing && same_logical_symbol(&enclosing, &ctx.spec.target))
+    {
+        return;
+    }
+    insert_hit(node, ctx, enclosing, line_idx, kind);
+}
+
+fn insert_hit(
+    node: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+    enclosing: CodeUnit,
+    line_idx: usize,
+    kind: UsageHitKind,
+) {
+    let hit = usage_hit(
+        ctx.file,
+        line_idx,
+        node.start_byte(),
+        node.end_byte(),
+        enclosing,
+        snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
+    );
+    let hit = match kind {
+        UsageHitKind::Reference => hit,
+        UsageHitKind::SelfReceiver => hit.into_self_receiver(),
+        UsageHitKind::Definition => hit.into_definition(),
+        UsageHitKind::Import | UsageHitKind::Reexport | UsageHitKind::OverrideDeclaration => {
+            unreachable!("unsupported C++ hit emission kind: {kind:?}")
+        }
+    };
+    ctx.hits.insert(hit);
+    if kind.included_in(UsageHitSurface::ExternalUsages)
+        && ctx
+            .hits
+            .iter()
+            .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
+            .count()
+            > ctx.max_usages
+    {
+        *ctx.limit_exceeded = true;
+    }
+}
+
+pub fn enclosing_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> EnclosingContext {
+    let key = (node.start_byte(), node.end_byte());
+    if let Some(cached) = ctx.enclosing_cache.borrow().get(&key).cloned() {
+        return cached;
+    }
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: find_line_index_for_offset(ctx.line_starts, node.start_byte()),
+        end_line: find_line_index_for_offset(ctx.line_starts, node.end_byte()),
+    };
+    let enclosing = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
+    let owner = enclosing.as_ref().and_then(|enclosing| {
+        let cached = ctx.enclosing_owner_cache.borrow().get(enclosing).cloned();
+        if let Some(cached) = cached {
+            return cached;
+        }
+        let resolved = precise_parent_of(&ctx.analyzer, ctx.visibility, enclosing)
+            .or_else(|| visible_owner_from_member_name(ctx, enclosing));
+        ctx.enclosing_owner_cache
+            .borrow_mut()
+            .insert(enclosing.clone(), resolved.clone());
+        resolved
+    });
+    let context = EnclosingContext { enclosing, owner };
+    ctx.enclosing_cache
+        .borrow_mut()
+        .insert(key, context.clone());
+    context
+}
+
+/// Returns whether `node` is the target declaration's own declared name.
+///
+/// The declarator chain of a C++ declaration bottoms out at the declared name
+/// (`function_definition.declarator -> function_declarator.declarator ->
+/// identifier`), while parameters, default arguments, and the body hang off
+/// sibling fields. Containment in that terminal therefore covers a qualified
+/// out-of-line name (`void Foo::target()`) without also covering a call written
+/// in a default argument.
+fn is_target_declaration_name(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if ctx.target_declaration_ranges.iter().any(|range| {
+            candidate.start_byte() == range.start_byte && candidate.end_byte() == range.end_byte
+        }) {
+            let mut declarator = candidate;
+            while let Some(inner) = declarator.child_by_field_name("declarator") {
+                declarator = inner;
+            }
+            return node.start_byte() >= declarator.start_byte()
+                && node.end_byte() <= declarator.end_byte();
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+fn is_inside_target_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    ctx.target_declaration_ranges
+        .iter()
+        .any(|range| node.start_byte() >= range.start_byte && node.end_byte() <= range.end_byte)
+}
+
+/// Returns whether `node` is on the declared-name path of a class field.
+///
+/// A `field_declaration` also owns default member initializers and, for method
+/// declarations, parameter default values. Those subtrees contain genuine
+/// references and must not be discarded with the declaration's own name.
+pub fn is_member_field_own_declarator(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if !matches!(ctx.spec.kind, TargetKind::MemberField) {
+        return false;
+    }
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "field_declaration" {
+            let mut cursor = parent.walk();
+            return parent
+                .children_by_field_name("declarator", &mut cursor)
+                .any(|mut declarator| {
+                    while let Some(inner) = declarator.child_by_field_name("declarator") {
+                        declarator = inner;
+                    }
+                    node.start_byte() >= declarator.start_byte()
+                        && node.end_byte() <= declarator.end_byte()
+                });
+        }
+        if matches!(parent.kind(), "compound_statement" | "function_definition") {
+            return false;
+        }
+        current = parent.parent();
+    }
+    false
+}

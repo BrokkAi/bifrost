@@ -1,0 +1,29 @@
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.rayon-in-blocking-lazy-init"
+  :name "Rayon parallelism inside a blocking lazy initializer"
+  :message "Review this blocking lazy initializer: its rayon parallelism can self-deadlock when the first call arrives on a rayon worker"
+  :severity warning
+  :description "A blocking lazy-init primitive (OnceLock::get_or_init, OnceLock::get_or_try_init, Once::call_once, LazyLock::new) whose initializer closure lexically contains rayon parallelism (par_iter, into_par_iter, par_bridge, par_chunks) can self-deadlock: when the first initialization runs on a rayon worker, the initializer's parallel join steals sibling jobs, and a stolen job that re-enters the same cell parks on it forever. This is a structural review prompt, not proof of a deadlock; verify whether the cell can be reached from inside a rayon pool. Containment is lexical: a rayon call inside a nested closure defined within the initializer also matches, even when that closure only runs later. Bare rayon::join, rayon::scope, and ThreadPool::install are not matched because their unqualified names are too generic. Prefer a pool-safe memoization such as PoolSafeMemo::get_or_build_parallel, or build the value eagerly before entering the parallel region."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "concurrency" "rayon" "deadlock" "code-smell"]
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          :schema-version 1
+          (union
+            (language rust
+              (call
+                :callee (name/regex "^(get_or_init|get_or_try_init|call_once)$")
+                :args [(lambda
+                         (has (call
+                                :callee (name/regex "^(par_iter|into_par_iter|par_bridge|par_chunks)$"))))]))
+            (language rust
+              (call
+                :receiver (name "LazyLock")
+                :callee (name "new")
+                :args [(lambda
+                         (has (call
+                                :callee (name/regex "^(par_iter|into_par_iter|par_bridge|par_chunks)$"))))]))))))

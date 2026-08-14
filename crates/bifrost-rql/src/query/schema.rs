@@ -1,0 +1,2295 @@
+//! Declarative metadata for the public CodeQuery/RQL vocabulary.
+//!
+//! The registries in this module are deliberately executable metadata: parser
+//! and validator dispatch use the generated enums, while the REPL and editor
+//! use the same signatures and descriptions. Adding an entry without help or
+//! a value shape is therefore a macro error, and every handler must match the
+//! generated enum exhaustively.
+
+use brokk_bifrost_core::analyzer::structural::flow_state::{
+    ALL_FLOW_CERTAINTIES, ALL_FLOW_RELATIONS, ALL_FLOW_SUBJECT_KINDS, ALL_STATE_EVENT_CLASSES,
+    FlowCertainty, FlowRelation, FlowSubjectKind, StateEventClass,
+};
+use brokk_bifrost_core::analyzer::structural::materialization::ALL_DECLARATION_ORIGINS;
+use brokk_bifrost_core::analyzer::structural::occurrences::{
+    ALL_NAMESPACES, ALL_OCCURRENCE_CLASSES, ALL_OCCURRENCE_ROLES,
+};
+use brokk_bifrost_core::analyzer::structural::resolution::{
+    ALL_BINDING_KINDS, ALL_BOUNDARY_STATUSES, ALL_HOISTING_CLASSES, ALL_PRECEDENCE_TIERS,
+    ALL_REJECTION_REASONS,
+};
+use brokk_bifrost_core::analyzer::structural::rewrite_path::{
+    ALL_REWRITE_DOMAIN_KINDS, ALL_REWRITE_OUTCOME_KINDS, RewriteDomainKind, RewriteOutcomeKind,
+};
+use brokk_bifrost_core::analyzer::usages::model::{
+    ReferenceKind, UsageHitKind, UsageHitSurface, UsageProof,
+};
+use brokk_bifrost_core::schema_version::{
+    SchemaVersionDescriptor, SchemaVersionRegistry, SchemaVersionResolution,
+    UnsupportedSchemaVersion,
+};
+use std::sync::OnceLock;
+
+use super::ir::{
+    CandidateOutcomeLabel, MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH, SCHEMA_VERSION,
+    UNATTRIBUTED_TIER_LABEL,
+};
+
+/// The single RQL schema version. The pre-1.0 lineage (versions 2 through 13,
+/// every step auto-compatible with the next) carried no information, so it
+/// was collapsed to this one version. Mint a new version only when an
+/// existing query stops parsing or changes meaning.
+const RQL_SCHEMA_VERSION: u32 = 1;
+const RQL_SCHEMA_VERSIONS: &[SchemaVersionDescriptor] =
+    &[SchemaVersionDescriptor::new(RQL_SCHEMA_VERSION, None, true)];
+
+const _: () = assert!(RQL_SCHEMA_VERSION as u64 == SCHEMA_VERSION);
+
+static RQL_SCHEMA_VERSION_REGISTRY: OnceLock<SchemaVersionRegistry> = OnceLock::new();
+
+pub(crate) fn rql_schema_version_registry() -> &'static SchemaVersionRegistry {
+    RQL_SCHEMA_VERSION_REGISTRY.get_or_init(|| {
+        SchemaVersionRegistry::new(RQL_SCHEMA_VERSIONS)
+            .expect("the compiled-in RQL schema lineage must be valid")
+    })
+}
+
+pub fn supported_query_schema_versions() -> Vec<u64> {
+    RQL_SCHEMA_VERSIONS
+        .iter()
+        .map(|descriptor| descriptor.version as u64)
+        .collect()
+}
+
+pub fn resolve_rql_schema_version(
+    authored_version: Option<u32>,
+) -> Result<SchemaVersionResolution, UnsupportedSchemaVersion> {
+    rql_schema_version_registry().resolve(authored_version)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueShape {
+    Query,
+    QueryList,
+    QuerySteps,
+    Pattern,
+    PatternList,
+    PatternMap,
+    String,
+    ParameterName,
+    CaptureName,
+    RegexString,
+    StringList,
+    StringPredicate,
+    RegexPredicate,
+    KindList,
+    LanguageList,
+    PositiveInteger,
+    NonNegativeInteger,
+    Arity,
+    ResultDetail,
+    ExecutionMode,
+    SchemaVersion,
+    TrueBoolean,
+    ReferenceKindList,
+    UsageProof,
+    UsageSurface,
+    CallTraversalCompleteness,
+    ProtocolRef,
+    ValueFlowPlanRef,
+    TaintResultRef,
+    OccurrenceFilter,
+    OccurrenceClassList,
+    OccurrenceRoleList,
+    NamespaceList,
+    ScopeFilter,
+    BindingFilter,
+    PathFilter,
+    BindingKindList,
+    BindingNameList,
+    HoistingClassList,
+    PrecedenceTierList,
+    CandidateOutcomeList,
+    BoundaryStatusList,
+    GenerationSiteFilter,
+    ExportFilter,
+    GenerationKindList,
+    GenerationInputList,
+    ExportFormList,
+    ExportNameList,
+    DeclarationOriginList,
+    Boolean,
+    UsageKindList,
+    OwnerRelationList,
+    SiteClassList,
+    StateEventClassList,
+    FlowSubjectKindList,
+    FlowRelationList,
+    FlowCertaintyList,
+    RewriteDomainList,
+    RewriteOutcomeList,
+}
+
+impl ValueShape {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Query => "a query",
+            Self::QueryList => "two or more compatible typed queries",
+            Self::QuerySteps => "an ordered list of query steps",
+            Self::Pattern => "a pattern",
+            Self::PatternList => "a list/vector of patterns",
+            Self::PatternMap => "a map of names to patterns",
+            Self::String => "a string",
+            Self::ParameterName => "a non-empty parameter name",
+            Self::CaptureName => "a non-empty declared capture name",
+            Self::RegexString => "a regular expression string",
+            Self::StringList => "one or more strings",
+            Self::StringPredicate => "an exact string or regex predicate",
+            Self::RegexPredicate => "a regex predicate object",
+            Self::KindList => "a normalized kind or list of kinds",
+            Self::LanguageList => "one or more language labels",
+            Self::PositiveInteger => "a positive integer",
+            Self::NonNegativeInteger => "a non-negative integer",
+            Self::Arity => "an exact non-negative count, or :min/:max argument-count bounds",
+            Self::ResultDetail => "compact or full",
+            Self::ExecutionMode => "results, explain, or profile",
+            Self::SchemaVersion => "a supported schema version",
+            Self::TrueBoolean => "the boolean true",
+            Self::ReferenceKindList => "one or more structured reference kinds",
+            Self::UsageProof => "proven or unproven",
+            Self::UsageSurface => "external_usages or lsp_references",
+            Self::CallTraversalCompleteness => "exhaustive or proven_subset",
+            Self::ProtocolRef => "a bounded protocol reference in namespace:name form",
+            Self::ValueFlowPlanRef => "a bounded value-flow plan reference in namespace:name form",
+            Self::TaintResultRef => {
+                "a bounded retained taint result reference in namespace:name form"
+            }
+            Self::OccurrenceFilter => "an occurrence class/role/namespace filter object",
+            Self::OccurrenceClassList => "one or more occurrence classes",
+            Self::OccurrenceRoleList => "one or more occurrence roles",
+            Self::NamespaceList => "one or more naming namespaces",
+            Self::ScopeFilter => "a lexical scope kind filter object",
+            Self::BindingFilter => "a binding kind/name/hoisting filter object",
+            Self::PathFilter => "a qualified path min-segments filter object",
+            Self::BindingKindList => "one or more binding kinds",
+            Self::BindingNameList => "one or more exact binding names",
+            Self::HoistingClassList => "one or more hoisting classes",
+            Self::PrecedenceTierList => "one or more precedence tiers, or unattributed",
+            Self::CandidateOutcomeList => {
+                "one or more candidate outcomes or typed rejection reasons"
+            }
+            Self::BoundaryStatusList => "one or more resolution boundary statuses",
+            Self::GenerationSiteFilter => "a generation-site kind/input filter object",
+            Self::ExportFilter => "an export form/name filter object",
+            Self::GenerationKindList => "one or more generation kinds",
+            Self::GenerationInputList => "literal or dynamic",
+            Self::ExportFormList => "one or more export forms",
+            Self::ExportNameList => "one or more exact exported names",
+            Self::DeclarationOriginList => "one or more declaration origins",
+            Self::Boolean => "a boolean",
+            Self::UsageKindList => "one or more usage kinds",
+            Self::OwnerRelationList => "one or more owner relations",
+            Self::SiteClassList => "use_site or declaration_site",
+            Self::StateEventClassList => "one or more state-event classes",
+            Self::FlowSubjectKindList => "binding or property",
+            Self::FlowRelationList => "one or more flow relations",
+            Self::FlowCertaintyList => "exact or may",
+            Self::RewriteDomainList => "one or more rewrite domains",
+            Self::RewriteOutcomeList => "converged, cycle, or exceeded-budget",
+        }
+    }
+
+    pub fn string_length_bounds(self) -> Option<(usize, usize)> {
+        match self {
+            Self::ParameterName => Some((1, MAX_KWARG_NAME_LENGTH)),
+            Self::CaptureName => Some((1, MAX_CAPTURE_LENGTH)),
+            Self::ProtocolRef => Some((3, crate::refs::MAX_PROTOCOL_REF_BYTES)),
+            Self::ValueFlowPlanRef => Some((3, crate::refs::MAX_VALUE_FLOW_PLAN_REF_BYTES)),
+            Self::TaintResultRef => Some((3, crate::refs::MAX_TAINT_RESULT_REF_BYTES)),
+            _ => None,
+        }
+    }
+
+    pub fn accepts_string(self, value: &str) -> bool {
+        self.string_length_bounds()
+            .is_none_or(|(minimum, maximum)| value.len() >= minimum && value.len() <= maximum)
+    }
+}
+
+/// The guarantee an author requests from one call-graph traversal.
+///
+/// An exhaustive traversal supports a negative conclusion. A proven subset
+/// intentionally reports only resolvable proven caller edges and therefore
+/// supports positive findings but never the assertion that all callers were
+/// found.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CallTraversalCompleteness {
+    #[default]
+    Exhaustive,
+    ProvenSubset,
+}
+
+impl CallTraversalCompleteness {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Exhaustive => "exhaustive",
+            Self::ProvenSubset => "proven_subset",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RqlFormClass {
+    Wrapper,
+    Predicate,
+}
+
+/// Selects whether a CodeQuery returns ordinary results, a plan explanation,
+/// or results accompanied by an execution profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CodeQueryExecutionMode {
+    #[default]
+    Results,
+    Explain,
+    Profile,
+}
+
+pub const ALL_CODE_QUERY_EXECUTION_MODES: &[CodeQueryExecutionMode] = &[
+    CodeQueryExecutionMode::Results,
+    CodeQueryExecutionMode::Explain,
+    CodeQueryExecutionMode::Profile,
+];
+
+impl CodeQueryExecutionMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Results => "results",
+            Self::Explain => "explain",
+            Self::Profile => "profile",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        ALL_CODE_QUERY_EXECUTION_MODES
+            .iter()
+            .copied()
+            .find(|mode| mode.label() == label)
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Results => "Execute the query and return its ordinary typed results.",
+            Self::Explain => "Lower and select the query plan without executing it.",
+            Self::Profile => {
+                "Execute the query and return its typed results with operator-level measurements."
+            }
+        }
+    }
+}
+
+macro_rules! query_step_ops {
+    ($($variant:ident {
+        label: $label:literal,
+        signature: $signature:literal,
+        description: $description:literal
+        $(, semantic: [$($semantic:ident),*])?
+        $(,)?
+    })+) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum QueryStepOp {
+            $($variant,)+
+        }
+
+        pub const ALL_QUERY_STEP_OPS: &[QueryStepOp] = &[
+            $(QueryStepOp::$variant,)+
+        ];
+
+        impl QueryStepOp {
+            pub fn from_label(label: &str) -> Option<Self> {
+                match label {
+                    $($label => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+
+            pub fn label(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $label,)+
+                }
+            }
+
+            pub fn signature(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $signature,)+
+                }
+            }
+
+            pub fn description(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $description,)+
+                }
+            }
+
+            pub const fn semantic_facets(self) -> &'static [QuerySemanticFacet] {
+                match self {
+                    $(Self::$variant => &[$($(QuerySemanticFacet::$semantic),*)?],)+
+                }
+            }
+
+            pub fn allows_hierarchy_options(self) -> bool {
+                matches!(self, Self::Supertypes | Self::Subtypes)
+            }
+
+            pub fn allows_reference_options(self) -> bool {
+                matches!(self, Self::ReferencesOf | Self::UsedBy | Self::Uses)
+            }
+
+            pub fn allows_call_options(self) -> bool {
+                matches!(self, Self::Callers | Self::Callees)
+            }
+
+            pub fn allows_call_site_options(self) -> bool {
+                matches!(self, Self::CallSitesTo | Self::CallSitesFrom)
+            }
+
+            pub fn allows_receiver_options(self) -> bool {
+                matches!(
+                    self,
+                    Self::ReceiverTargets | Self::PointsTo | Self::MemberTargets
+                )
+            }
+
+            pub fn allows_typestate_options(self) -> bool {
+                matches!(self, Self::Typestate)
+            }
+
+            pub fn allows_value_flow_options(self) -> bool {
+                matches!(self, Self::ValueFlow)
+            }
+
+            pub fn allows_taint_options(self) -> bool {
+                matches!(self, Self::Taint)
+            }
+
+            pub fn allows_witness_options(self) -> bool {
+                matches!(self, Self::Witness)
+            }
+
+            pub fn allows_occurrence_options(self) -> bool {
+                matches!(self, Self::OccurrencesOf | Self::OccurrencesIn)
+            }
+
+            pub fn allows_binding_options(self) -> bool {
+                matches!(self, Self::BindingsIn)
+            }
+
+            pub fn allows_candidate_options(self) -> bool {
+                matches!(self, Self::CandidatesOf)
+            }
+
+            pub fn allows_edge_options(self) -> bool {
+                matches!(self, Self::EdgesOf | Self::EdgesFrom)
+            }
+
+            pub fn allows_state_event_options(self) -> bool {
+                matches!(self, Self::StateEventsOf)
+            }
+
+            pub fn allows_flow_relation_options(self) -> bool {
+                matches!(self, Self::FlowRelationsOf)
+            }
+
+            pub fn allows_rewrite_path_options(self) -> bool {
+                matches!(self, Self::RewritePathsOf)
+            }
+
+            pub fn allows_binding_of_options(self) -> bool {
+                matches!(self, Self::BindingOf)
+            }
+
+            pub fn allows_segment_options(self) -> bool {
+                matches!(self, Self::SegmentsOf)
+            }
+        }
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuerySemanticFacet {
+    Procedures,
+    Dispatch,
+    ProgramPoints,
+    ControlEdges,
+    Typestate,
+    ValueFlow,
+    Taint,
+}
+
+query_step_ops! {
+    EnclosingDecl { label: "enclosing_decl", signature: "structural_match -> declaration", description: "Map structural matches to their smallest real enclosing declarations." }
+    ProcedureOf { label: "procedure_of", signature: "structural_match|declaration -> procedure", description: "Resolve each source-backed input to its smallest enclosing executable procedure.", semantic: [Procedures] }
+    CfgEntry { label: "cfg_entry", signature: "procedure -> program_point", description: "Return the validated entry program point of each procedure.", semantic: [Procedures, ProgramPoints] }
+    CfgExits { label: "cfg_exits", signature: "procedure -> program_point", description: "Return the validated normal and exceptional exit program points of each procedure.", semantic: [Procedures, ProgramPoints] }
+    CfgSuccessorEdges { label: "cfg_successor_edges", signature: "program_point -> control_edge", description: "Return one-hop outgoing control edges from each program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    CfgPredecessorEdges { label: "cfg_predecessor_edges", signature: "program_point -> control_edge", description: "Return one-hop incoming control edges to each program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    CfgEdgeSource { label: "cfg_edge_source", signature: "control_edge -> program_point", description: "Project each control edge to its source program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    CfgEdgeTarget { label: "cfg_edge_target", signature: "control_edge -> program_point", description: "Project each control edge to its target program point.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    Typestate { label: "typestate", signature: "procedure -> typestate_finding", description: "Run one registered diagnostic-neutral typestate analysis for the exact procedure root.", semantic: [Procedures, Typestate] }
+    ValueFlow { label: "value_flow", signature: "procedure -> flow_endpoint", description: "Run one registered diagnostic-neutral value-flow plan for the exact procedure root.", semantic: [Procedures, ValueFlow] }
+    Taint { label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint] }
+    Witness { label: "witness", signature: "typestate_finding|flow_endpoint -> typestate_witness|flow_witness", description: "Project bounded retained evidence from each typestate finding or reached flow endpoint without rerunning analysis." }
+    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis|call_shape|call_argument_group|call_argument|callable_signature|signature_parameter|callable_applicability|overload_selection|dispatch_outcome|dispatch_target|member_family|member_family_edge|state_event -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, receiver analyses, call-shape rows, callable-signature rows, callable-applicability rows, overload-selection rows, dispatch rows, method-family rows, or state-event rows to their workspace files." }
+    ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
+    ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
+    Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
+    Subtypes { label: "subtypes", signature: "declaration -> declaration", description: "Traverse indexed subtypes from supported type declarations." }
+    Members { label: "members", signature: "declaration -> declaration", description: "Return direct indexed members of type declarations." }
+    Owner { label: "owner", signature: "declaration -> declaration", description: "Return the exact indexed declaring type of member declarations." }
+    ReferencesOf { label: "references_of", signature: "declaration -> reference_site", description: "Return resolved source reference sites for exact indexed declarations." }
+    UsedBy { label: "used_by", signature: "declaration -> declaration", description: "Return exact declarations containing references to each input declaration." }
+    Uses { label: "uses", signature: "declaration -> declaration", description: "Return exact declarations referenced by each input declaration." }
+    Callers { label: "callers", signature: "declaration -> declaration", description: "Traverse resolved incoming call edges to caller declarations, optionally to a bounded depth." }
+    Callees { label: "callees", signature: "declaration -> declaration", description: "Traverse resolved outgoing call edges to callee declarations, optionally to a bounded depth." }
+    CallSitesTo { label: "call_sites_to", signature: "declaration -> call_site", description: "Return structured call sites whose resolved callee is each input declaration." }
+    CallSitesFrom { label: "call_sites_from", signature: "declaration -> call_site", description: "Return structured call sites lexically owned by each input declaration." }
+    CallInput { label: "call_input", signature: "call_site -> expression_site", description: "Project one direct receiver or formal-parameter input from each call site." }
+    ReceiverTargets { label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site|occurrence -> receiver_analysis", description: "Analyze a bounded receiver value using adapter-provided structured facts." }
+    PointsTo { label: "points_to", signature: "structural_match|reference_site|expression_site|occurrence -> receiver_analysis", description: "Analyze bounded value provenance using adapter-provided structured facts." }
+    MemberTargets { label: "member_targets", signature: "structural_match|reference_site|occurrence -> receiver_analysis", description: "Resolve exact member declarations through bounded structured receiver facts." }
+    ReceiverOutcome { label: "receiver_outcome", signature: "receiver_analysis -> receiver_outcome", description: "Project the mandatory terminal outcome row for each receiver analysis." }
+    ReceiverEvidence { label: "receiver_evidence", signature: "receiver_analysis -> receiver_evidence", description: "Project zero or more parent-linked typed receiver evidence rows." }
+    CallShape { label: "call_shape", signature: "structural_match|call_site|occurrence -> call_shape", description: "Project the mandatory structured call-shape outcome row for each exact call site." }
+    CallArgumentGroups { label: "call_argument_groups", signature: "call_shape -> call_argument_group", description: "Project the ordered argument-list group rows of each call shape." }
+    CallArguments { label: "call_arguments", signature: "call_argument_group -> call_argument", description: "Project the ordered argument rows of each argument-list group." }
+    CallableSignature { label: "callable_signature", signature: "declaration -> callable_signature", description: "Project the mandatory callable-signature rows of each declaration from the persisted signature contract: one row per persisted signature entry, so an overload set separates into one row per overload." }
+    SignatureParameters { label: "signature_parameters", signature: "callable_signature -> signature_parameter", description: "Project the ordered declared parameter rows of each callable signature." }
+    CallableApplicability { label: "callable_applicability", signature: "occurrence -> callable_applicability", description: "Project one applicability row per candidate callable the production resolver considered for each reference occurrence: the verdict, the typed callable rejection reason when inapplicable, the precedence tier, and whether the resolver bound it. A candidate the resolver refused stays visible with its reason, so a losing overload is evidence rather than an absence." }
+    OverloadSelection { label: "overload_selection", signature: "occurrence -> overload_selection", description: "Project the mandatory overload-selection summary row for each reference occurrence: resolved_unique, ambiguous, unresolved, or unknown_shape, with the verdict counts it was computed from. Exactly one row per occurrence, and candidate order can never influence it -- zero applicable candidates stay unresolved and several equal winners stay ambiguous." }
+    MemberSelection { label: "member_selection", signature: "occurrence -> member_selection", description: "Project the mandatory member-selection summary row for each reference occurrence, from the production resolver's own candidate trace." }
+    DispatchOutcome { label: "dispatch_outcome", signature: "structural_match|call_site|reference_site|occurrence -> dispatch_outcome", description: "Project the mandatory bounded-dispatch outcome row for each input site: the semantic outcome, the candidate coverage, and the retained target count. Exactly one row per input site, so an unknown, unsupported, over-budget, or cancelled dispatch is stated rather than silently empty.", semantic: [Procedures, Dispatch] }
+    DispatchTargets { label: "dispatch_targets", signature: "structural_match|call_site|reference_site|occurrence -> dispatch_target", description: "Project zero or more bounded dispatch target rows for each input site, one per retained dispatch candidate plus one per boundary arm that names a target. Each row keeps the oracle's own proof, completeness, and candidate coverage, so a proven target in an exhaustive set stays distinguishable from an open may-dispatch arm.", semantic: [Procedures, Dispatch] }
+    MemberFamily { label: "member_family", signature: "declaration -> member_family", description: "Project the mandatory canonical method-family outcome row for each member declaration: the family id when the analyzer proves the family, the typed reason when it cannot, the per-relation edge counts, and the coverage. Exactly one row per input declaration, so an unsupported language or an unprovable overload identity is stated rather than silently empty." }
+    FamilyEdges { label: "family_edges", signature: "declaration -> member_family_edge", description: "Project the typed method-family edges of each member declaration: the forward overrides/implements edges the analyzer proves, plus the bounded inversion of those same edges as overridden_by/implemented_by. Emitted only from a proven family, so an unproven or unsupported member yields no edge row and its outcome row says why." }
+    OccurrencesOf { label: "occurrences_of", signature: "declaration -> occurrence", description: "Return the declaration-name occurrence of each declaration plus every reference-class occurrence resolving to it." }
+    OccurrencesIn { label: "occurrences_in", signature: "structural_match|file -> occurrence", description: "Return classified identifier occurrences lexically inside each structural match or file." }
+    OccurrenceTarget { label: "occurrence_target", signature: "occurrence -> declaration", description: "Project the resolved semantic targets of reference-class occurrences." }
+    ScopeOf { label: "scope_of", signature: "binding|occurrence|structural_match -> lexical_scope", description: "Return the innermost lexical scope that owns each binding, occurrence, or structural match." }
+    ScopeAncestors { label: "scope_ancestors", signature: "lexical_scope -> lexical_scope", description: "Return the enclosing lexical scopes of each scope, innermost first, excluding the scope itself." }
+    BindingsIn { label: "bindings_in", signature: "lexical_scope|structural_match -> binding", description: "Return the bindings declared in each lexical scope, or in the scopes inside each structural match." }
+    BindingOf { label: "binding_of", signature: "occurrence -> binding", description: "Return the binding of the occurrence's name that is in effect at its exact position." }
+    BindingOccurrence { label: "binding_occurrence", signature: "binding -> occurrence", description: "Return the binder-class occurrence row of each binding's declaring token." }
+    CandidatesOf { label: "candidates_of", signature: "occurrence -> resolution_candidate", description: "Return the candidates the resolver considered for each reference-class occurrence, with tier, outcome, and boundary." }
+    CandidateHierarchy { label: "candidate_hierarchy", signature: "occurrence -> candidate_hop", description: "Return the exact hierarchy hops each traced member candidate of a reference occurrence was found through. A depth-zero candidate contributes no hop, and a candidate the resolver recorded without member attribution contributes none either -- absence here is unattributed, never a claim that no hierarchy was walked; the mandatory outcome story is member_selection's." }
+    CandidateTarget { label: "candidate_target", signature: "resolution_candidate -> declaration", description: "Project the workspace declarations of unit-backed resolution candidates." }
+    EdgesOf { label: "edges_of", signature: "declaration -> reference_edge", description: "Return the canonical inverse reference edges of each declaration: every usage site the usage index enumerates, with kind, proof, usage kind, and owner relation." }
+    EdgesFrom { label: "edges_from", signature: "occurrence -> reference_edge", description: "Return the canonical forward reference edges of each occurrence: the resolver's own resolved targets for that exact token, with kind, proof, usage kind, and owner relation." }
+    EdgeTarget { label: "edge_target", signature: "reference_edge -> declaration", description: "Project each reference edge to its exact indexed target declaration." }
+    StateEventsOf { label: "state_events_of", signature: "procedure|declaration -> state_event", description: "Derive the flow-sensitive state events of each procedure from the production semantic IR: every establishment, kill, and read of a binding or of a property of a canonical binding base, anchored to a program point of that procedure's control-flow graph. Source order and containment are never evidence; an axis the lowering does not model is reported incomplete rather than approximated.", semantic: [Procedures, ProgramPoints] }
+    FlowRelationsOf { label: "flow_relations_of", signature: "state_event|procedure -> flow_relation", description: "Derive the flow relations between the state events of each procedure: reaching-definition, dominance, and same-evaluation, each with exact or may certainty. Seeded from a state event, only the relations incident to that event are returned. Budget exhaustion emits no rows and an explicit incomplete diagnostic; it is never reported as an absent relation.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    FlowSource { label: "flow_source", signature: "flow_relation -> state_event", description: "Project each flow relation to its source state event: the establishment or kill end." }
+    FlowTarget { label: "flow_target", signature: "flow_relation -> state_event", description: "Project each flow relation to its target state event: the read end." }
+    RewritePathsOf { label: "rewrite_paths_of", signature: "file -> rewrite_path", description: "Enumerate the bounded rewrite chases each file engages in a declared finite rewrite domain: the ordered steps a production analysis took, the bound the domain declared for itself, and the terminal outcome -- converged with its fixed point, cycle with the ordered repeated-state witness, or exceeded-budget with the work performed. Budget exhaustion is absence of evidence, never a proven cycle and never a clean convergence." }
+    SegmentsOf { label: "segments_of", signature: "qualified_path -> path_segment", description: "Return each path's ordered segment rows with decoded text, spelled generic arity, and (with :resolved true) each segment's own prefix resolution." }
+    SegmentTarget { label: "segment_target", signature: "path_segment -> declaration", description: "Project the workspace declarations each path segment's own position resolves to." }
+    Generates { label: "generates", signature: "generation_site -> declaration_state", description: "Return the declaration-state rows of the declarations each generation site materializes." }
+    GeneratedBy { label: "generated_by", signature: "declaration|declaration_state -> generation_site", description: "Return the generation site that materialized each generated declaration." }
+    DeclarationStateOf { label: "declaration_state_of", signature: "declaration -> declaration_state", description: "Return each declaration's state row: origin, declaration-only flag, and configuration gate." }
+    ImplementationOf { label: "implementation_of", signature: "declaration_state|declaration -> declaration", description: "Return the runnable implementation a declaration-only signature links to." }
+    StubsOf { label: "stubs_of", signature: "declaration -> declaration_state", description: "Return the declaration-only stub state rows whose implementation link resolves to each declaration; composed with except, this lists the stubs no implementation answers." }
+    ExportTarget { label: "export_target", signature: "export -> declaration", description: "Project the declaration an export row materialized, where the analyzer models one." }
+}
+
+macro_rules! rql_form_description {
+    ($description:literal) => {
+        $description
+    };
+    (($step:path)) => {
+        $step.description()
+    };
+}
+
+macro_rules! rql_form_step {
+    () => {
+        None
+    };
+    ($step:ident) => {
+        Some(QueryStepOp::$step)
+    };
+}
+
+macro_rules! rql_forms {
+    ($($variant:ident {
+        labels: [$primary:literal $(, $alias:literal)* $(,)?],
+        class: $class:ident,
+        shape: $shape:ident,
+        signature: $signature:literal,
+        description: $description:tt
+        $(, step: $step:ident)?
+        $(,)?
+    })+) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum RqlForm {
+            $($variant,)+
+        }
+
+        pub const ALL_RQL_FORMS: &[RqlForm] = &[
+            $(RqlForm::$variant,)+
+        ];
+
+        impl RqlForm {
+            pub fn from_label(label: &str) -> Option<Self> {
+                match label {
+                    $($primary $(| $alias)* => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+
+            pub fn label(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $primary,)+
+                }
+            }
+
+            pub fn labels(self) -> &'static [&'static str] {
+                match self {
+                    $(Self::$variant => &[$primary $(, $alias)*],)+
+                }
+            }
+
+            pub fn class(self) -> RqlFormClass {
+                match self {
+                    $(Self::$variant => RqlFormClass::$class,)+
+                }
+            }
+
+            pub fn value_shape(self) -> ValueShape {
+                match self {
+                    $(Self::$variant => ValueShape::$shape,)+
+                }
+            }
+
+            pub fn signature(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $signature,)+
+                }
+            }
+
+            pub fn description(self) -> &'static str {
+                match self {
+                    $(Self::$variant => rql_form_description!($description),)+
+                }
+            }
+
+            pub const fn query_step_op(self) -> Option<QueryStepOp> {
+                match self {
+                    $(Self::$variant => rql_form_step!($($step)?),)+
+                }
+            }
+
+            /// Return the pattern property lowered by a predicate form.
+            ///
+            /// Keeping this match exhaustive makes adding a form require an
+            /// explicit lowering decision rather than relying on coincidental
+            /// equality between two registry labels.
+            pub fn property(self) -> Option<RqlProperty> {
+                match self {
+                    Self::Where
+                    | Self::Language
+                    | Self::Limit
+                    | Self::ResultDetail
+                    | Self::Explain
+                    | Self::Profile
+                    | Self::Inside
+                    | Self::InsideDecl
+                    | Self::NotInside
+                    | Self::Union
+                    | Self::Intersect
+                    | Self::Except
+                    | Self::EnclosingDecl
+                    | Self::ProcedureOf
+                    | Self::CfgEntry
+                    | Self::CfgExits
+                    | Self::CfgSuccessorEdges
+                    | Self::CfgPredecessorEdges
+                    | Self::CfgEdgeSource
+                    | Self::CfgEdgeTarget
+                    | Self::Typestate
+                    | Self::ValueFlow
+                    | Self::Taint
+                    | Self::Witness
+                    | Self::FileOf
+                    | Self::ImportsOf
+                    | Self::ImportersOf
+                    | Self::Supertypes
+                    | Self::Subtypes
+                    | Self::Members
+                    | Self::Owner
+                    | Self::ReferencesOf
+                    | Self::UsedBy
+                    | Self::Uses
+                    | Self::Callers
+                    | Self::Callees
+                    | Self::CallSitesTo
+                    | Self::CallSitesFrom
+                    | Self::CallInput
+                    | Self::ReceiverTargets
+                    | Self::PointsTo
+                    | Self::MemberTargets
+                    | Self::ReceiverOutcome
+                    | Self::ReceiverEvidence
+                    | Self::CallShape
+                    | Self::CallArgumentGroups
+                    | Self::CallArguments
+                    | Self::CallableSignature
+                    | Self::SignatureParameters
+                    | Self::CallableApplicability
+                    | Self::OverloadSelection
+                    | Self::MemberSelection
+                    | Self::DispatchOutcome
+                    | Self::DispatchTargets
+                    | Self::MemberFamily
+                    | Self::FamilyEdges
+                    | Self::Occurrences
+                    | Self::OccurrencesOf
+                    | Self::OccurrencesIn
+                    | Self::OccurrenceTarget
+                    | Self::Scopes
+                    | Self::Bindings
+                    | Self::Paths
+                    | Self::SegmentsOf
+                    | Self::SegmentTarget
+                    | Self::ScopeOf
+                    | Self::ScopeAncestors
+                    | Self::BindingsIn
+                    | Self::BindingOf
+                    | Self::BindingOccurrence
+                    | Self::CandidatesOf
+                    | Self::CandidateHierarchy
+                    | Self::GenerationSites
+                    | Self::Exports
+                    | Self::Generates
+                    | Self::GeneratedBy
+                    | Self::DeclarationStateOf
+                    | Self::ImplementationOf
+                    | Self::StubsOf
+                    | Self::ExportTarget
+                    | Self::CandidateTarget
+                    | Self::EdgesOf
+                    | Self::EdgesFrom
+                    | Self::EdgeTarget
+                    | Self::StateEventsOf
+                    | Self::FlowRelationsOf
+                    | Self::FlowSource
+                    | Self::FlowTarget
+                    | Self::RewritePathsOf => None,
+                    Self::Name => Some(RqlProperty::Name),
+                    Self::NameRegex => Some(RqlProperty::NameRegex),
+                    Self::TextRegex => Some(RqlProperty::TextRegex),
+                    Self::Capture => Some(RqlProperty::Capture),
+                    Self::Has => Some(RqlProperty::Has),
+                    Self::NotHas => Some(RqlProperty::NotHas),
+                    Self::NotKind => Some(RqlProperty::NotKind),
+                    Self::Arity => Some(RqlProperty::Arity),
+                }
+            }
+        }
+    };
+}
+
+rql_forms! {
+    Where {
+        labels: ["where"],
+        class: Wrapper,
+        shape: StringList,
+        signature: "(where \"glob\" ... query)",
+        description: "Restrict the query to workspace-relative path globs.",
+    }
+    Language {
+        labels: ["language", "languages"],
+        class: Wrapper,
+        shape: LanguageList,
+        signature: "(language label ... query)",
+        description: "Restrict the query to one or more analyzer languages.",
+    }
+    Limit {
+        labels: ["limit"],
+        class: Wrapper,
+        shape: PositiveInteger,
+        signature: "(limit count query)",
+        description: "Set the maximum number of matches returned by query_code.",
+    }
+    ResultDetail {
+        labels: ["result-detail", "result_detail"],
+        class: Wrapper,
+        shape: ResultDetail,
+        signature: "(result-detail compact|full query)",
+        description: "Choose compact output or full capture and source details.",
+    }
+    Explain {
+        labels: ["explain"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(explain query)",
+        description: "Lower and select the logical and physical plans without executing the query.",
+    }
+    Profile {
+        labels: ["profile"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(profile query)",
+        description: "Execute the query and include operator timing, work, cache, waiting, and concurrency measurements.",
+    }
+    Inside {
+        labels: ["inside"],
+        class: Wrapper,
+        shape: Pattern,
+        signature: "(inside container-pattern query)",
+        description: "Require the root match to be lexically inside a matching container.",
+    }
+    InsideDecl {
+        labels: ["inside-decl", "inside_decl"],
+        class: Wrapper,
+        shape: Pattern,
+        signature: "(inside-decl container-pattern query)",
+        description: "Require the root match to be inside a matching container without crossing a callable declaration.",
+    }
+    NotInside {
+        labels: ["not-inside"],
+        class: Wrapper,
+        shape: Pattern,
+        signature: "(not-inside container-pattern query)",
+        description: "Exclude root matches lexically inside a matching container.",
+    }
+    Union {
+        labels: ["union"],
+        class: Wrapper,
+        shape: QueryList,
+        signature: "(union query query ...)",
+        description: "Return each compatible typed endpoint reached by any branch.",
+    }
+    Intersect {
+        labels: ["intersect"],
+        class: Wrapper,
+        shape: QueryList,
+        signature: "(intersect query query ...)",
+        description: "Return compatible typed endpoints reached by every branch.",
+    }
+    Except {
+        labels: ["except"],
+        class: Wrapper,
+        shape: QueryList,
+        signature: "(except query query ...)",
+        description: "Return first-branch endpoints not reached by any later branch.",
+    }
+    EnclosingDecl {
+        labels: ["enclosing-decl"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(enclosing-decl query)",
+        description: (QueryStepOp::EnclosingDecl),
+        step: EnclosingDecl,
+    }
+    ProcedureOf {
+        labels: ["procedure-of", "procedure_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(procedure-of query)",
+        description: (QueryStepOp::ProcedureOf),
+        step: ProcedureOf,
+    }
+    CfgEntry {
+        labels: ["cfg-entry", "cfg_entry"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-entry query)",
+        description: (QueryStepOp::CfgEntry),
+        step: CfgEntry,
+    }
+    CfgExits {
+        labels: ["cfg-exits", "cfg_exits"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-exits query)",
+        description: (QueryStepOp::CfgExits),
+        step: CfgExits,
+    }
+    CfgSuccessorEdges {
+        labels: ["cfg-successor-edges", "cfg_successor_edges"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-successor-edges query)",
+        description: (QueryStepOp::CfgSuccessorEdges),
+        step: CfgSuccessorEdges,
+    }
+    CfgPredecessorEdges {
+        labels: ["cfg-predecessor-edges", "cfg_predecessor_edges"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-predecessor-edges query)",
+        description: (QueryStepOp::CfgPredecessorEdges),
+        step: CfgPredecessorEdges,
+    }
+    CfgEdgeSource {
+        labels: ["cfg-edge-source", "cfg_edge_source"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-edge-source query)",
+        description: (QueryStepOp::CfgEdgeSource),
+        step: CfgEdgeSource,
+    }
+    CfgEdgeTarget {
+        labels: ["cfg-edge-target", "cfg_edge_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(cfg-edge-target query)",
+        description: (QueryStepOp::CfgEdgeTarget),
+        step: CfgEdgeTarget,
+    }
+    Typestate {
+        labels: ["typestate"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(typestate :protocol-ref namespace:name query)",
+        description: (QueryStepOp::Typestate),
+        step: Typestate,
+    }
+    ValueFlow {
+        labels: ["value-flow", "value_flow"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(value-flow :plan-ref namespace:name query)",
+        description: (QueryStepOp::ValueFlow),
+        step: ValueFlow,
+    }
+    Taint {
+        labels: ["taint"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(taint :taint-ref namespace:name query)",
+        description: (QueryStepOp::Taint),
+        step: Taint,
+    }
+    Witness {
+        labels: ["witness"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(witness [:max-steps count] [:max-bytes count] query)",
+        description: (QueryStepOp::Witness),
+        step: Witness,
+    }
+    FileOf {
+        labels: ["file-of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(file-of query)",
+        description: (QueryStepOp::FileOf),
+        step: FileOf,
+    }
+    ImportsOf {
+        labels: ["imports-of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(imports-of query)",
+        description: (QueryStepOp::ImportsOf),
+        step: ImportsOf,
+    }
+    ImportersOf {
+        labels: ["importers-of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(importers-of query)",
+        description: (QueryStepOp::ImportersOf),
+        step: ImportersOf,
+    }
+    Supertypes {
+        labels: ["supertypes"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(supertypes [:depth count | :transitive true] query)",
+        description: (QueryStepOp::Supertypes),
+        step: Supertypes,
+    }
+    Subtypes {
+        labels: ["subtypes"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(subtypes [:depth count | :transitive true] query)",
+        description: (QueryStepOp::Subtypes),
+        step: Subtypes,
+    }
+    Members {
+        labels: ["members"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(members query)",
+        description: (QueryStepOp::Members),
+        step: Members,
+    }
+    Owner {
+        labels: ["owner"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(owner query)",
+        description: (QueryStepOp::Owner),
+        step: Owner,
+    }
+    ReferencesOf {
+        labels: ["references-of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(references-of [:reference-kinds [...]] [:proof proven|unproven] [:surface external-usages|lsp-references] query)",
+        description: (QueryStepOp::ReferencesOf),
+        step: ReferencesOf,
+    }
+    UsedBy {
+        labels: ["used-by"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(used-by [:reference-kinds [...]] [:proof proven|unproven] [:surface external-usages|lsp-references] query)",
+        description: (QueryStepOp::UsedBy),
+        step: UsedBy,
+    }
+    Uses {
+        labels: ["uses"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(uses [:reference-kinds [...]] [:proof proven|unproven] [:surface external-usages|lsp-references] query)",
+        description: (QueryStepOp::Uses),
+        step: Uses,
+    }
+    Callers {
+        labels: ["callers"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(callers [:depth count] [:proof proven|unproven] query)",
+        description: (QueryStepOp::Callers),
+        step: Callers,
+    }
+    Callees {
+        labels: ["callees"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(callees [:depth count] [:proof proven|unproven] query)",
+        description: (QueryStepOp::Callees),
+        step: Callees,
+    }
+    CallSitesTo {
+        labels: ["call-sites-to", "call_sites_to"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-sites-to [:proof proven|unproven] query)",
+        description: (QueryStepOp::CallSitesTo),
+        step: CallSitesTo,
+    }
+    CallSitesFrom {
+        labels: ["call-sites-from", "call_sites_from"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-sites-from [:proof proven|unproven] query)",
+        description: (QueryStepOp::CallSitesFrom),
+        step: CallSitesFrom,
+    }
+    CallInput {
+        labels: ["call-input", "call_input"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-input (:receiver true | :parameter-index index | :parameter-name name) query)",
+        description: (QueryStepOp::CallInput),
+        step: CallInput,
+    }
+    ReceiverTargets {
+        labels: ["receiver-targets", "receiver_targets"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(receiver-targets [:capture name] query)",
+        description: (QueryStepOp::ReceiverTargets),
+        step: ReceiverTargets,
+    }
+    PointsTo {
+        labels: ["points-to", "points_to"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(points-to [:capture name] query)",
+        description: (QueryStepOp::PointsTo),
+        step: PointsTo,
+    }
+    MemberTargets {
+        labels: ["member-targets", "member_targets"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(member-targets [:capture name] query)",
+        description: (QueryStepOp::MemberTargets),
+        step: MemberTargets,
+    }
+    ReceiverOutcome {
+        labels: ["receiver-outcome", "receiver_outcome"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(receiver-outcome query)",
+        description: (QueryStepOp::ReceiverOutcome),
+        step: ReceiverOutcome,
+    }
+    ReceiverEvidence {
+        labels: ["receiver-evidence", "receiver_evidence"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(receiver-evidence query)",
+        description: (QueryStepOp::ReceiverEvidence),
+        step: ReceiverEvidence,
+    }
+    CallShape {
+        labels: ["call-shape", "call_shape"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-shape query)",
+        description: (QueryStepOp::CallShape),
+        step: CallShape,
+    }
+    CallArgumentGroups {
+        labels: ["call-argument-groups", "call_argument_groups"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-argument-groups query)",
+        description: (QueryStepOp::CallArgumentGroups),
+        step: CallArgumentGroups,
+    }
+    CallArguments {
+        labels: ["call-arguments", "call_arguments"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-arguments query)",
+        description: (QueryStepOp::CallArguments),
+        step: CallArguments,
+    }
+    CallableSignature {
+        labels: ["callable-signature", "callable_signature"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(callable-signature query)",
+        description: (QueryStepOp::CallableSignature),
+        step: CallableSignature,
+    }
+    SignatureParameters {
+        labels: ["signature-parameters", "signature_parameters"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(signature-parameters query)",
+        description: (QueryStepOp::SignatureParameters),
+        step: SignatureParameters,
+    }
+    CallableApplicability {
+        labels: ["callable-applicability", "callable_applicability"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(callable-applicability query)",
+        description: (QueryStepOp::CallableApplicability),
+        step: CallableApplicability,
+    }
+    OverloadSelection {
+        labels: ["overload-selection", "overload_selection"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(overload-selection query)",
+        description: (QueryStepOp::OverloadSelection),
+        step: OverloadSelection,
+    }
+    MemberSelection {
+        labels: ["member-selection", "member_selection"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(member-selection query)",
+        description: (QueryStepOp::MemberSelection),
+        step: MemberSelection,
+    }
+    DispatchOutcome {
+        labels: ["dispatch-outcome", "dispatch_outcome"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(dispatch-outcome query)",
+        description: (QueryStepOp::DispatchOutcome),
+        step: DispatchOutcome,
+    }
+    DispatchTargets {
+        labels: ["dispatch-targets", "dispatch_targets"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(dispatch-targets query)",
+        description: (QueryStepOp::DispatchTargets),
+        step: DispatchTargets,
+    }
+    MemberFamily {
+        labels: ["member-family", "member_family"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(member-family query)",
+        description: (QueryStepOp::MemberFamily),
+        step: MemberFamily,
+    }
+    FamilyEdges {
+        labels: ["family-edges", "family_edges"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(family-edges query)",
+        description: (QueryStepOp::FamilyEdges),
+        step: FamilyEdges,
+    }
+    Occurrences {
+        labels: ["occurrences", "occurrence"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(occurrences [:class ...] [:role ...] [:namespace ...])",
+        description: "Seed classified identifier occurrences directly from workspace facts.",
+    }
+    OccurrencesOf {
+        labels: ["occurrences-of", "occurrences_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(occurrences-of [:class ...] [:role ...] [:namespace ...] query)",
+        description: (QueryStepOp::OccurrencesOf),
+        step: OccurrencesOf,
+    }
+    OccurrencesIn {
+        labels: ["occurrences-in", "occurrences_in"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(occurrences-in [:class ...] [:role ...] [:namespace ...] query)",
+        description: (QueryStepOp::OccurrencesIn),
+        step: OccurrencesIn,
+    }
+    OccurrenceTarget {
+        labels: ["occurrence-target", "occurrence_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(occurrence-target query)",
+        description: (QueryStepOp::OccurrenceTarget),
+        step: OccurrenceTarget,
+    }
+    Scopes {
+        labels: ["scopes", "scope"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(scopes [:kind ...])",
+        description: "Seed lexical scope rows directly from workspace facts.",
+    }
+    Bindings {
+        labels: ["bindings", "binding"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(bindings [:kind ...] [:name ...] [:hoisting ...])",
+        description: "Seed lexical binding rows directly from workspace facts.",
+    }
+    Paths {
+        labels: ["paths", "path"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(paths [:min-segments N])",
+        description: "Seed qualified-path rows directly from workspace facts.",
+    }
+    SegmentsOf {
+        labels: ["segments-of", "segments_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(segments-of [:resolved true] query)",
+        description: (QueryStepOp::SegmentsOf),
+        step: SegmentsOf,
+    }
+    SegmentTarget {
+        labels: ["segment-target", "segment_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(segment-target query)",
+        description: (QueryStepOp::SegmentTarget),
+        step: SegmentTarget,
+    }
+    ScopeOf {
+        labels: ["scope-of", "scope_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(scope-of query)",
+        description: (QueryStepOp::ScopeOf),
+        step: ScopeOf,
+    }
+    ScopeAncestors {
+        labels: ["scope-ancestors", "scope_ancestors"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(scope-ancestors query)",
+        description: (QueryStepOp::ScopeAncestors),
+        step: ScopeAncestors,
+    }
+    BindingsIn {
+        labels: ["bindings-in", "bindings_in"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(bindings-in [:kind ...] [:name ...] [:hoisting ...] query)",
+        description: (QueryStepOp::BindingsIn),
+        step: BindingsIn,
+    }
+    BindingOf {
+        labels: ["binding-of", "binding_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(binding-of [:include-shadowed true] query)",
+        description: (QueryStepOp::BindingOf),
+        step: BindingOf,
+    }
+    BindingOccurrence {
+        labels: ["binding-occurrence", "binding_occurrence"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(binding-occurrence query)",
+        description: (QueryStepOp::BindingOccurrence),
+        step: BindingOccurrence,
+    }
+    CandidatesOf {
+        labels: ["candidates-of", "candidates_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(candidates-of [:tier ...] [:outcome ...] [:boundary ...] query)",
+        description: (QueryStepOp::CandidatesOf),
+        step: CandidatesOf,
+    }
+    CandidateHierarchy {
+        labels: ["candidate-hierarchy", "candidate_hierarchy"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(candidate-hierarchy query)",
+        description: (QueryStepOp::CandidateHierarchy),
+        step: CandidateHierarchy,
+    }
+    CandidateTarget {
+        labels: ["candidate-target", "candidate_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(candidate-target query)",
+        description: (QueryStepOp::CandidateTarget),
+        step: CandidateTarget,
+    }
+    GenerationSites {
+        labels: ["generation-sites", "generation_sites"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(generation-sites [:kind ...] [:input ...])",
+        description: "Seed generation-site rows directly from recorded materialization provenance.",
+    }
+    Exports {
+        labels: ["exports", "export"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(exports [:form ...] [:name ...])",
+        description: "Seed export rows directly from recorded materialization provenance.",
+    }
+    Generates {
+        labels: ["generates"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(generates query)",
+        description: (QueryStepOp::Generates),
+        step: Generates,
+    }
+    GeneratedBy {
+        labels: ["generated-by", "generated_by"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(generated-by query)",
+        description: (QueryStepOp::GeneratedBy),
+        step: GeneratedBy,
+    }
+    DeclarationStateOf {
+        labels: ["declaration-state-of", "declaration_state_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(declaration-state-of [:origin ...] [:declaration-only true] [:config-gated true] query)",
+        description: (QueryStepOp::DeclarationStateOf),
+        step: DeclarationStateOf,
+    }
+    ImplementationOf {
+        labels: ["implementation-of", "implementation_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(implementation-of query)",
+        description: (QueryStepOp::ImplementationOf),
+        step: ImplementationOf,
+    }
+    StubsOf {
+        labels: ["stubs-of", "stubs_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(stubs-of query)",
+        description: (QueryStepOp::StubsOf),
+        step: StubsOf,
+    }
+    ExportTarget {
+        labels: ["export-target", "export_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(export-target query)",
+        description: (QueryStepOp::ExportTarget),
+        step: ExportTarget,
+    }
+    EdgesOf {
+        labels: ["edges-of", "edges_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(edges-of [:reference-kinds [...]] [:proof proven|unproven] [:surface external-usages|lsp-references] [:usage [...]] [:relation [...]] [:site-class [...]] query)",
+        description: (QueryStepOp::EdgesOf),
+        step: EdgesOf,
+    }
+    EdgesFrom {
+        labels: ["edges-from", "edges_from"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(edges-from [:reference-kinds [...]] [:proof proven|unproven] [:surface external-usages|lsp-references] [:usage [...]] [:relation [...]] [:site-class [...]] query)",
+        description: (QueryStepOp::EdgesFrom),
+        step: EdgesFrom,
+    }
+    EdgeTarget {
+        labels: ["edge-target", "edge_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(edge-target query)",
+        description: (QueryStepOp::EdgeTarget),
+        step: EdgeTarget,
+    }
+    StateEventsOf {
+        labels: ["state-events-of", "state_events_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(state-events-of [:class [establish|kill|read ...]] [:subject [binding|property ...]] query)",
+        description: (QueryStepOp::StateEventsOf),
+        step: StateEventsOf,
+    }
+    FlowRelationsOf {
+        labels: ["flow-relations-of", "flow_relations_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(flow-relations-of [:relation [reaching|dominates|same-evaluation ...]] [:certainty [exact|may ...]] query)",
+        description: (QueryStepOp::FlowRelationsOf),
+        step: FlowRelationsOf,
+    }
+    FlowSource {
+        labels: ["flow-source", "flow_source"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(flow-source query)",
+        description: (QueryStepOp::FlowSource),
+        step: FlowSource,
+    }
+    FlowTarget {
+        labels: ["flow-target", "flow_target"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(flow-target query)",
+        description: (QueryStepOp::FlowTarget),
+        step: FlowTarget,
+    }
+    RewritePathsOf {
+        labels: ["rewrite-paths-of", "rewrite_paths_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(rewrite-paths-of [:domain [rust-import-alias ...]] [:outcome [converged|cycle|exceeded-budget ...]] query)",
+        description: (QueryStepOp::RewritePathsOf),
+        step: RewritePathsOf,
+    }
+    Name {
+        labels: ["name"],
+        class: Predicate,
+        shape: String,
+        signature: "(name \"exactName\")",
+        description: "Match a node's normalized name exactly.",
+    }
+    NameRegex {
+        labels: ["name/regex"],
+        class: Predicate,
+        shape: String,
+        signature: "(name/regex \"pattern\")",
+        description: "Match a node's normalized name with a regular expression.",
+    }
+    TextRegex {
+        labels: ["text/regex"],
+        class: Predicate,
+        shape: String,
+        signature: "(text/regex \"pattern\")",
+        description: "Match a node's source text with a regular expression.",
+    }
+    Capture {
+        labels: ["capture"],
+        class: Predicate,
+        shape: String,
+        signature: "(capture \"label\")",
+        description: "Capture the matching node under a result label.",
+    }
+    Has {
+        labels: ["has"],
+        class: Predicate,
+        shape: Pattern,
+        signature: "(has descendant-pattern)",
+        description: "Require a matching descendant somewhere below this pattern.",
+    }
+    NotHas {
+        labels: ["not-has", "not_has"],
+        class: Predicate,
+        shape: Pattern,
+        signature: "(not-has descendant-pattern)",
+        description: "Exclude nodes that contain a matching descendant.",
+    }
+    NotKind {
+        labels: ["not-kind", "not_kind"],
+        class: Predicate,
+        shape: KindList,
+        signature: "(not-kind kind|[kinds...])",
+        description: "Exclude one or more normalized kinds using subtype-aware matching.",
+    }
+    Arity {
+        labels: ["arity"],
+        class: Predicate,
+        shape: Arity,
+        signature: "(arity count | :min count :max count)",
+        description: "Match a call by its positional argument count: an exact count, or inclusive :min/:max bounds.",
+    }
+}
+
+macro_rules! rql_properties {
+    ($($variant:ident {
+        labels: [$primary:literal $(, $alias:literal)* $(,)?],
+        shape: $shape:ident,
+        signature: $signature:literal,
+        description: $description:literal,
+    })+) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum RqlProperty {
+            $($variant,)+
+        }
+
+        pub const ALL_RQL_PROPERTIES: &[RqlProperty] = &[
+            $(RqlProperty::$variant,)+
+        ];
+
+        impl RqlProperty {
+            pub fn from_label(label: &str) -> Option<Self> {
+                match label {
+                    $($primary $(| $alias)* => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+
+            pub fn label(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $primary,)+
+                }
+            }
+
+            pub fn labels(self) -> &'static [&'static str] {
+                match self {
+                    $(Self::$variant => &[$primary $(, $alias)*],)+
+                }
+            }
+
+            pub fn value_shape(self) -> ValueShape {
+                match self {
+                    $(Self::$variant => ValueShape::$shape,)+
+                }
+            }
+
+            pub fn signature(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $signature,)+
+                }
+            }
+
+            pub fn description(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $description,)+
+                }
+            }
+        }
+    };
+}
+
+rql_properties! {
+    Name {
+        labels: ["name"],
+        shape: String,
+        signature: ":name \"exactName\"",
+        description: "Match the normalized name exactly.",
+    }
+    NameRegex {
+        labels: ["name/regex"],
+        shape: RegexString,
+        signature: ":name/regex \"pattern\"",
+        description: "Match the normalized name with a regular expression.",
+    }
+    TextRegex {
+        labels: ["text/regex"],
+        shape: RegexString,
+        signature: ":text/regex \"pattern\"",
+        description: "Match source text with a regular expression.",
+    }
+    Capture {
+        labels: ["capture"],
+        shape: String,
+        signature: ":capture \"label\"",
+        description: "Capture the matching node under a result label.",
+    }
+    NotKind {
+        labels: ["not-kind", "not_kind"],
+        shape: KindList,
+        signature: ":not-kind kind|[kinds...]",
+        description: "Exclude one or more normalized kinds.",
+    }
+    Arity {
+        labels: ["arity"],
+        shape: Arity,
+        signature: ":arity count",
+        description: "Match a call by its exact positional argument count.",
+    }
+    Has {
+        labels: ["has"],
+        shape: Pattern,
+        signature: ":has pattern",
+        description: "Require a matching descendant.",
+    }
+    NotHas {
+        labels: ["not-has", "not_has"],
+        shape: Pattern,
+        signature: ":not-has pattern",
+        description: "Exclude nodes containing a matching descendant.",
+    }
+}
+
+macro_rules! json_fields {
+    ($name:ident, $all:ident, $($variant:ident {
+        label: $label:literal,
+        shape: $shape:ident,
+        signature: $signature:literal,
+        description: $description:literal $(,)?
+    })+) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum $name {
+            $($variant,)+
+        }
+
+        pub const $all: &[$name] = &[
+            $($name::$variant,)+
+        ];
+
+        impl $name {
+            pub fn from_label(label: &str) -> Option<Self> {
+                match label {
+                    $($label => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+
+            pub fn label(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $label,)+
+                }
+            }
+
+            pub fn value_shape(self) -> ValueShape {
+                match self {
+                    $(Self::$variant => ValueShape::$shape,)+
+                }
+            }
+
+            pub fn signature(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $signature,)+
+                }
+            }
+
+            pub fn description(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $description,)+
+                }
+            }
+        }
+    };
+}
+
+json_fields! {
+    QueryField,
+    ALL_QUERY_FIELDS,
+    Where { label: "where", shape: StringList, signature: "\"where\": [\"glob\", ...]", description: "Restrict the query to workspace-relative path globs." }
+    Languages { label: "languages", shape: LanguageList, signature: "\"languages\": [\"rust\", ...]", description: "Restrict the query to analyzer languages." }
+    Match { label: "match", shape: Pattern, signature: "\"match\": { pattern }", description: "Define the required root structural pattern." }
+    Union { label: "union", shape: QueryList, signature: "\"union\": [{ query }, { query }, ...]", description: "Combine compatible typed endpoints reached by any branch." }
+    Intersect { label: "intersect", shape: QueryList, signature: "\"intersect\": [{ query }, { query }, ...]", description: "Keep compatible typed endpoints reached by every branch." }
+    Except { label: "except", shape: QueryList, signature: "\"except\": [{ query }, { query }, ...]", description: "Keep first-branch endpoints absent from every later branch." }
+    Inside { label: "inside", shape: Pattern, signature: "\"inside\": { pattern }", description: "Require the root match to be inside a matching container." }
+    InsideDecl { label: "inside_decl", shape: Pattern, signature: "\"inside_decl\": { pattern }", description: "Require the root match to be inside a matching container without crossing a callable declaration." }
+    NotInside { label: "not_inside", shape: Pattern, signature: "\"not_inside\": { pattern }", description: "Exclude root matches inside a matching container." }
+    Steps { label: "steps", shape: QuerySteps, signature: "\"steps\": [{ \"op\": \"file_of\" }, ...]", description: "Apply ordered typed transformations to structural matches." }
+    Limit { label: "limit", shape: PositiveInteger, signature: "\"limit\": positive integer", description: "Set the maximum number of matches returned." }
+    ResultDetail { label: "result_detail", shape: ResultDetail, signature: "\"result_detail\": \"compact\" | \"full\"", description: "Choose compact output or full capture and source details." }
+    ExecutionMode { label: "execution_mode", shape: ExecutionMode, signature: "\"execution_mode\": \"results\" | \"explain\" | \"profile\"", description: "Return ordinary results, explain the selected plan without execution, or execute with an operator profile." }
+    SchemaVersion { label: "schema_version", shape: SchemaVersion, signature: "\"schema_version\": supported positive integer", description: "Pin one exact CodeQuery schema version; omission selects the compatible lineage head." }
+    Occurrences { label: "occurrences", shape: OccurrenceFilter, signature: "\"occurrences\": { \"class\": [...], \"role\": [...], \"namespace\": [...] }", description: "Seed classified identifier occurrences directly from workspace facts." }
+    Scopes { label: "scopes", shape: ScopeFilter, signature: "\"scopes\": { \"kind\": [...] }", description: "Seed lexical scope rows directly from workspace facts." }
+    Bindings { label: "bindings", shape: BindingFilter, signature: "\"bindings\": { \"kind\": [...], \"name\": [...], \"hoisting\": [...] }", description: "Seed lexical binding rows directly from workspace facts." }
+    Paths { label: "paths", shape: PathFilter, signature: "\"paths\": { \"min_segments\": N }", description: "Seed qualified-path rows directly from workspace facts." }
+    GenerationSites { label: "generation_sites", shape: GenerationSiteFilter, signature: "\"generation_sites\": { \"kind\": [...], \"input\": [...] }", description: "Seed generation-site rows directly from recorded materialization provenance." }
+    Exports { label: "exports", shape: ExportFilter, signature: "\"exports\": { \"form\": [...], \"name\": [...] }", description: "Seed export rows directly from recorded materialization provenance." }
+}
+
+json_fields! {
+    QueryStepField,
+    ALL_QUERY_STEP_FIELDS,
+    Op { label: "op", shape: String, signature: "\"op\": \"step_name\"", description: "Select the typed pipeline transformation." }
+    Depth { label: "depth", shape: PositiveInteger, signature: "\"depth\": positive integer", description: "Traverse all hierarchy edges from distance one through this depth." }
+    Transitive { label: "transitive", shape: TrueBoolean, signature: "\"transitive\": true", description: "Traverse the complete indexed hierarchy under the execution budget." }
+    ReferenceKinds { label: "reference_kinds", shape: ReferenceKindList, signature: "\"reference_kinds\": [\"field_write\", ...]", description: "Restrict traversal to structured source-reference kinds." }
+    Proof { label: "proof", shape: UsageProof, signature: "\"proof\": \"proven\" | \"unproven\"", description: "Restrict traversal to one usage-proof tier." }
+    Completeness { label: "completeness", shape: CallTraversalCompleteness, signature: "\"completeness\": \"exhaustive\" | \"proven_subset\"", description: "Require exhaustive call discovery or intentionally report only resolved proven callers." }
+    Surface { label: "surface", shape: UsageSurface, signature: "\"surface\": \"external_usages\" | \"lsp_references\"", description: "Choose the external-usage or editor-visible reference surface." }
+    Receiver { label: "receiver", shape: TrueBoolean, signature: "\"receiver\": true", description: "Select the explicit base or receiver expression of a call site." }
+    ParameterIndex { label: "parameter_index", shape: NonNegativeInteger, signature: "\"parameter_index\": non-negative integer", description: "Select a zero-based formal parameter slot, excluding receiver-bound parameters." }
+    ParameterName { label: "parameter_name", shape: ParameterName, signature: "\"parameter_name\": \"name\"", description: "Select a formal parameter slot by its declared name." }
+    Capture { label: "capture", shape: CaptureName, signature: "\"capture\": \"declared_name\"", description: "Analyze every unique range bound to a declared positive structural capture." }
+    ProtocolRef { label: "protocol_ref", shape: ProtocolRef, signature: "\"protocol_ref\": \"namespace:name\"", description: "Select one host-registered compiled protocol and binding plan." }
+    PlanRef { label: "plan_ref", shape: ValueFlowPlanRef, signature: "\"plan_ref\": \"namespace:name\"", description: "Select one host-registered immutable value-flow plan." }
+    TaintRef { label: "taint_ref", shape: TaintResultRef, signature: "\"taint_ref\": \"namespace:name\"", description: "Select one host-registered immutable retained production taint result." }
+    MaxSteps { label: "max_steps", shape: NonNegativeInteger, signature: "\"max_steps\": non-negative integer", description: "Further cap retained witness steps without rerunning analysis." }
+    MaxBytes { label: "max_bytes", shape: NonNegativeInteger, signature: "\"max_bytes\": non-negative integer", description: "Further cap retained witness bytes without rerunning analysis." }
+    OccurrenceClasses { label: "class", shape: OccurrenceClassList, signature: "\"class\": [\"declaration\", ...]", description: "Restrict occurrence rows to one or more occurrence classes." }
+    OccurrenceRoles { label: "role", shape: OccurrenceRoleList, signature: "\"role\": [\"binder\", ...]", description: "Restrict occurrence rows to one or more syntactic occurrence roles." }
+    OccurrenceNamespaces { label: "namespace", shape: NamespaceList, signature: "\"namespace\": [\"type\", ...]", description: "Restrict occurrence rows to one or more naming namespaces." }
+    BindingKinds { label: "kind", shape: BindingKindList, signature: "\"kind\": [\"local\", ...]", description: "Restrict binding rows to one or more binder kinds." }
+    BindingNames { label: "name", shape: BindingNameList, signature: "\"name\": [\"rows\", ...]", description: "Restrict binding rows to one or more exact bound names." }
+    BindingHoisting { label: "hoisting", shape: HoistingClassList, signature: "\"hoisting\": [\"scope_wide\", ...]", description: "Restrict binding rows to one or more hoisting classes." }
+    IncludeShadowed { label: "include_shadowed", shape: TrueBoolean, signature: "\"include_shadowed\": true", description: "Also return the bindings the binding-of answer shadows, instead of the winner alone." }
+    Resolved { label: "resolved", shape: TrueBoolean, signature: "\"resolved\": true", description: "Derive each path segment's own prefix resolution so rows carry a status, targets, and a resolution-decided namespace." }
+    CandidateTiers { label: "tier", shape: PrecedenceTierList, signature: "\"tier\": [\"lexical_binding\", \"unattributed\", ...]", description: "Restrict candidate rows to one or more precedence tiers, or to rows whose seam named none." }
+    CandidateOutcomes { label: "outcome", shape: CandidateOutcomeList, signature: "\"outcome\": [\"selected\", \"shadowed_by_nearer\", ...]", description: "Restrict candidate rows to one or more coarse outcomes or typed rejection reasons." }
+    CandidateBoundaries { label: "boundary", shape: BoundaryStatusList, signature: "\"boundary\": [\"workspace_local\", ...]", description: "Restrict candidate rows to one or more resolution boundary statuses." }
+    DeclarationOrigins { label: "origin", shape: DeclarationOriginList, signature: "\"origin\": [\"generated\", ...]", description: "Restrict declaration-state rows to one or more origins." }
+    DeclarationOnly { label: "declaration_only", shape: Boolean, signature: "\"declaration_only\": true | false", description: "Restrict declaration-state rows by their declaration-only flag." }
+    ConfigGated { label: "config_gated", shape: Boolean, signature: "\"config_gated\": true | false", description: "Restrict declaration-state rows by their configuration gate." }
+    EdgeUsageKinds { label: "usage", shape: UsageKindList, signature: "\"usage\": [\"reference\", \"self_receiver\", ...]", description: "Restrict edge rows to one or more usage kinds." }
+    EdgeRelations { label: "relation", shape: OwnerRelationList, signature: "\"relation\": [\"same_owner\", ...]", description: "Restrict edge rows to one or more owner relations between the site's encloser and the target." }
+    EdgeSiteClasses { label: "site_class", shape: SiteClassList, signature: "\"site_class\": [\"use_site\", ...]", description: "Restrict edge rows to use sites or declaration sites." }
+    StateEventClasses { label: "event_class", shape: StateEventClassList, signature: "\"event_class\": [\"establish\", \"read\", ...]", description: "Restrict state-event rows to one or more event classes." }
+    StateEventSubjects { label: "subject", shape: FlowSubjectKindList, signature: "\"subject\": [\"binding\", \"property\"]", description: "Restrict state-event rows to binding subjects or property subjects." }
+    FlowRelations { label: "flow_relation", shape: FlowRelationList, signature: "\"flow_relation\": [\"reaching\", ...]", description: "Restrict flow-relation rows to one or more relations." }
+    RewriteDomains { label: "domain", shape: RewriteDomainList, signature: "\"domain\": [\"rust_import_alias\"]", description: "Restrict rewrite-path rows to one or more declared rewrite domains." }
+    RewriteOutcomes { label: "rewrite_outcome", shape: RewriteOutcomeList, signature: "\"rewrite_outcome\": [\"converged\", \"cycle\", \"exceeded_budget\"]", description: "Restrict rewrite-path rows to one or more terminal outcomes." }
+    FlowCertainties { label: "certainty", shape: FlowCertaintyList, signature: "\"certainty\": [\"exact\", \"may\"]", description: "Restrict flow-relation rows to one or more certainties." }
+}
+
+// The scope filter has exactly one axis, and its JSON key is `kind` -- the same
+// spelling the binding filter uses for a different vocabulary. They therefore
+// cannot share one label registry, and the scope axis gets its own rather than
+// being renamed to something no author would guess.
+json_fields! {
+    ScopeFilterField,
+    ALL_SCOPE_FILTER_FIELDS,
+    ScopeKinds { label: "kind", shape: KindList, signature: "\"kind\": [\"block\", ...]", description: "Restrict lexical scope rows to one or more normalized anchor kinds." }
+}
+
+// The generation-site and export filters reuse the JSON spellings `kind` and
+// `name` over their own vocabularies, so, exactly like the scope axis, each
+// gets its own registry rather than a renamed label no author would guess.
+json_fields! {
+    GenerationSiteFilterField,
+    ALL_GENERATION_SITE_FILTER_FIELDS,
+    Kinds { label: "kind", shape: GenerationKindList, signature: "\"kind\": [\"accessor_macro\", ...]", description: "Restrict generation-site rows to one or more generation kinds." }
+    Inputs { label: "input", shape: GenerationInputList, signature: "\"input\": [\"literal\", \"dynamic\"]", description: "Restrict generation-site rows by their input class." }
+}
+
+json_fields! {
+    ExportFilterField,
+    ALL_EXPORT_FILTER_FIELDS,
+    Forms { label: "form", shape: ExportFormList, signature: "\"form\": [\"default_anonymous\", ...]", description: "Restrict export rows to one or more export forms." }
+    Names { label: "name", shape: ExportNameList, signature: "\"name\": [\"default\", ...]", description: "Restrict export rows to one or more exact exported names." }
+}
+
+/// One RQL option owned by a typed query-step descriptor.
+///
+/// JSON field names, accepted RQL spellings, requiredness, value shape, and
+/// help text all meet here so lowerers and editor validation cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryStepOption {
+    field: QueryStepField,
+    rql_labels: &'static [&'static str],
+    required: bool,
+}
+
+impl QueryStepOption {
+    const fn required(field: QueryStepField, rql_labels: &'static [&'static str]) -> Self {
+        Self {
+            field,
+            rql_labels,
+            required: true,
+        }
+    }
+
+    const fn optional(field: QueryStepField, rql_labels: &'static [&'static str]) -> Self {
+        Self {
+            field,
+            rql_labels,
+            required: false,
+        }
+    }
+
+    pub const fn field(self) -> QueryStepField {
+        self.field
+    }
+
+    pub const fn rql_labels(self) -> &'static [&'static str] {
+        self.rql_labels
+    }
+
+    pub const fn is_required(self) -> bool {
+        self.required
+    }
+
+    pub fn accepts_rql_label(self, label: &str) -> bool {
+        self.rql_labels.contains(&label)
+    }
+}
+
+const TYPESTATE_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
+    QueryStepField::ProtocolRef,
+    &[":protocol-ref"],
+)];
+const VALUE_FLOW_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
+    QueryStepField::PlanRef,
+    &[":plan-ref", ":plan_ref"],
+)];
+const TAINT_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
+    QueryStepField::TaintRef,
+    &[":taint-ref", ":taint_ref"],
+)];
+const WITNESS_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::MaxSteps, &[":max-steps"]),
+    QueryStepOption::optional(QueryStepField::MaxBytes, &[":max-bytes"]),
+];
+/// Shared by the two occurrence-producing steps and by the `occurrences` seed,
+/// so an author spells the same filter the same way wherever it appears.
+pub const OCCURRENCE_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::OccurrenceClasses, &[":class", ":classes"]),
+    QueryStepOption::optional(QueryStepField::OccurrenceRoles, &[":role", ":roles"]),
+    QueryStepOption::optional(
+        QueryStepField::OccurrenceNamespaces,
+        &[":namespace", ":namespaces"],
+    ),
+];
+
+pub fn occurrence_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
+    OCCURRENCE_STEP_OPTIONS
+        .iter()
+        .copied()
+        .find(|option| option.accepts_rql_label(label))
+}
+
+/// Shared by the `bindings` seed and the `bindings-in` step (#1474).
+pub const BINDING_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::BindingKinds, &[":kind", ":kinds"]),
+    QueryStepOption::optional(QueryStepField::BindingNames, &[":name", ":names"]),
+    QueryStepOption::optional(QueryStepField::BindingHoisting, &[":hoisting"]),
+];
+
+/// Options of the `candidates-of` step (#1474).
+pub const CANDIDATE_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::CandidateTiers, &[":tier", ":tiers"]),
+    QueryStepOption::optional(
+        QueryStepField::CandidateOutcomes,
+        &[":outcome", ":outcomes"],
+    ),
+    QueryStepOption::optional(
+        QueryStepField::CandidateBoundaries,
+        &[":boundary", ":boundaries"],
+    ),
+];
+
+/// Options of the `state-events-of` step (#1480).
+pub const STATE_EVENT_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::StateEventClasses, &[":class", ":classes"]),
+    QueryStepOption::optional(
+        QueryStepField::StateEventSubjects,
+        &[":subject", ":subjects"],
+    ),
+];
+
+/// Options of the `flow-relations-of` step (#1480).
+pub const FLOW_RELATION_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::FlowRelations, &[":relation", ":relations"]),
+    QueryStepOption::optional(
+        QueryStepField::FlowCertainties,
+        &[":certainty", ":certainties"],
+    ),
+];
+
+pub fn flow_state_option_for_rql_label(op: QueryStepOp, label: &str) -> Option<QueryStepOption> {
+    op.options()
+        .iter()
+        .copied()
+        .find(|option| option.accepts_rql_label(label))
+}
+
+/// Options of the `rewrite-paths-of` step (#1480).
+pub const REWRITE_PATH_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::RewriteDomains, &[":domain", ":domains"]),
+    QueryStepOption::optional(QueryStepField::RewriteOutcomes, &[":outcome", ":outcomes"]),
+];
+
+/// Options of the `binding-of` step (#1474).
+pub const BINDING_OF_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::optional(
+    QueryStepField::IncludeShadowed,
+    &[":include-shadowed", ":include_shadowed"],
+)];
+
+/// The single option of the `scopes` seed (#1474).
+pub const SCOPE_SEED_RQL_LABELS: &[&str] = &[":kind", ":kinds"];
+
+/// Options of the `declaration-state-of` step (#1476).
+pub const DECLARATION_STATE_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::DeclarationOrigins, &[":origin", ":origins"]),
+    QueryStepOption::optional(
+        QueryStepField::DeclarationOnly,
+        &[":declaration-only", ":declaration_only"],
+    ),
+    QueryStepOption::optional(
+        QueryStepField::ConfigGated,
+        &[":config-gated", ":config_gated"],
+    ),
+];
+
+pub fn declaration_state_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
+    DECLARATION_STATE_STEP_OPTIONS
+        .iter()
+        .copied()
+        .find(|option| option.accepts_rql_label(label))
+}
+
+/// The RQL option spellings of the `generation-sites` seed (#1476), mapped to
+/// their own field registry.
+pub fn generation_site_field_for_rql_label(label: &str) -> Option<GenerationSiteFilterField> {
+    match label {
+        ":kind" | ":kinds" => Some(GenerationSiteFilterField::Kinds),
+        ":input" | ":inputs" => Some(GenerationSiteFilterField::Inputs),
+        _ => None,
+    }
+}
+
+/// The RQL option spellings of the `exports` seed (#1476), mapped to their own
+/// field registry.
+pub fn export_field_for_rql_label(label: &str) -> Option<ExportFilterField> {
+    match label {
+        ":form" | ":forms" => Some(ExportFilterField::Forms),
+        ":name" | ":names" => Some(ExportFilterField::Names),
+        _ => None,
+    }
+}
+
+pub fn binding_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
+    BINDING_STEP_OPTIONS
+        .iter()
+        .copied()
+        .find(|option| option.accepts_rql_label(label))
+}
+
+pub fn candidate_option_for_rql_label(label: &str) -> Option<QueryStepOption> {
+    CANDIDATE_STEP_OPTIONS
+        .iter()
+        .copied()
+        .find(|option| option.accepts_rql_label(label))
+}
+
+impl QueryStepOp {
+    pub const fn options(self) -> &'static [QueryStepOption] {
+        match self {
+            Self::Typestate => TYPESTATE_STEP_OPTIONS,
+            Self::ValueFlow => VALUE_FLOW_STEP_OPTIONS,
+            Self::Taint => TAINT_STEP_OPTIONS,
+            Self::Witness => WITNESS_STEP_OPTIONS,
+            Self::OccurrencesOf | Self::OccurrencesIn => OCCURRENCE_STEP_OPTIONS,
+            Self::BindingsIn => BINDING_STEP_OPTIONS,
+            Self::CandidatesOf => CANDIDATE_STEP_OPTIONS,
+            Self::BindingOf => BINDING_OF_STEP_OPTIONS,
+            Self::DeclarationStateOf => DECLARATION_STATE_STEP_OPTIONS,
+            Self::StateEventsOf => STATE_EVENT_STEP_OPTIONS,
+            Self::FlowRelationsOf => FLOW_RELATION_STEP_OPTIONS,
+            Self::RewritePathsOf => REWRITE_PATH_STEP_OPTIONS,
+            _ => &[],
+        }
+    }
+
+    pub fn option_for_rql_label(self, label: &str) -> Option<QueryStepOption> {
+        self.options()
+            .iter()
+            .copied()
+            .find(|option| option.accepts_rql_label(label))
+    }
+}
+
+pub const ALL_REFERENCE_KINDS: &[ReferenceKind] = &[
+    ReferenceKind::MethodCall,
+    ReferenceKind::ConstructorCall,
+    ReferenceKind::FieldRead,
+    ReferenceKind::FieldWrite,
+    ReferenceKind::TypeReference,
+    ReferenceKind::StaticReference,
+    ReferenceKind::SuperCall,
+    ReferenceKind::Inheritance,
+];
+
+pub fn reference_kind_label(kind: ReferenceKind) -> &'static str {
+    match kind {
+        ReferenceKind::MethodCall => "method_call",
+        ReferenceKind::ConstructorCall => "constructor_call",
+        ReferenceKind::FieldRead => "field_read",
+        ReferenceKind::FieldWrite => "field_write",
+        ReferenceKind::TypeReference => "type_reference",
+        ReferenceKind::StaticReference => "static_reference",
+        ReferenceKind::SuperCall => "super_call",
+        ReferenceKind::Inheritance => "inheritance",
+    }
+}
+
+pub fn reference_kind_from_label(label: &str) -> Option<ReferenceKind> {
+    ALL_REFERENCE_KINDS
+        .iter()
+        .copied()
+        .find(|kind| reference_kind_label(*kind) == label)
+}
+
+/// The constrained-value vocabulary each occurrence filter axis accepts, in the
+/// canonical registry order, so parser, validator, hover and completion all read
+/// one table (the `ALL_REFERENCE_KINDS` shape).
+pub fn occurrence_filter_labels(field: QueryStepField) -> Vec<&'static str> {
+    match field {
+        QueryStepField::OccurrenceClasses => ALL_OCCURRENCE_CLASSES
+            .iter()
+            .map(|class| class.label())
+            .collect(),
+        QueryStepField::OccurrenceRoles => ALL_OCCURRENCE_ROLES
+            .iter()
+            .map(|role| role.label())
+            .collect(),
+        QueryStepField::OccurrenceNamespaces => ALL_NAMESPACES
+            .iter()
+            .map(|namespace| namespace.label())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The constrained-value vocabulary each lexical-environment filter axis
+/// accepts, in canonical registry order, so parser, validator, hover and
+/// completion all read one table (#1474).
+///
+/// The `:tier` axis additionally accepts [`UNATTRIBUTED_TIER_LABEL`], and the
+/// `:outcome` axis accepts the two coarse outcomes plus every typed rejection
+/// reason, because "rejected" and "rejected because shadowed" are both things an
+/// author legitimately asks for.
+pub fn environment_filter_labels(field: QueryStepField) -> Vec<&'static str> {
+    match field {
+        QueryStepField::BindingKinds => ALL_BINDING_KINDS.iter().map(|kind| kind.label()).collect(),
+        QueryStepField::BindingHoisting => ALL_HOISTING_CLASSES
+            .iter()
+            .map(|class| class.label())
+            .collect(),
+        QueryStepField::CandidateTiers => std::iter::once(UNATTRIBUTED_TIER_LABEL)
+            .chain(ALL_PRECEDENCE_TIERS.iter().map(|tier| tier.label()))
+            .collect(),
+        QueryStepField::CandidateOutcomes => [
+            CandidateOutcomeLabel::Selected.label(),
+            CandidateOutcomeLabel::Rejected.label(),
+        ]
+        .into_iter()
+        .chain(ALL_REJECTION_REASONS.iter().map(|reason| reason.label()))
+        .collect(),
+        QueryStepField::CandidateBoundaries => ALL_BOUNDARY_STATUSES
+            .iter()
+            .map(|status| status.label())
+            .collect(),
+        QueryStepField::DeclarationOrigins => ALL_DECLARATION_ORIGINS
+            .iter()
+            .map(|origin| origin.label())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The constrained-value vocabulary each flow-state filter axis accepts, in
+/// canonical registry order, so parser, validator, hover and completion all
+/// read one table (#1480, the `occurrence_filter_labels` shape).
+pub fn flow_state_filter_labels(field: QueryStepField) -> Vec<&'static str> {
+    match field {
+        QueryStepField::StateEventClasses => ALL_STATE_EVENT_CLASSES
+            .iter()
+            .map(|class| class.label())
+            .collect(),
+        QueryStepField::StateEventSubjects => ALL_FLOW_SUBJECT_KINDS
+            .iter()
+            .map(|kind| kind.label())
+            .collect(),
+        QueryStepField::FlowRelations => ALL_FLOW_RELATIONS
+            .iter()
+            .map(|relation| relation.label())
+            .collect(),
+        QueryStepField::FlowCertainties => ALL_FLOW_CERTAINTIES
+            .iter()
+            .map(|certainty| certainty.label())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The constrained-value vocabulary one *step option* axis accepts, whichever
+/// row family owns it. Parser, validator, hover and completion all read this
+/// one entry point, so a new constrained axis is spelled once (#1480).
+pub fn constrained_step_option_labels(field: QueryStepField) -> Vec<&'static str> {
+    let flow_state = flow_state_filter_labels(field);
+    if !flow_state.is_empty() {
+        return flow_state;
+    }
+    rewrite_path_filter_labels(field)
+}
+
+/// The constrained-value vocabulary each rewrite-path filter axis accepts, in
+/// canonical registry order, so parser, validator, hover and completion all
+/// read one table (#1480).
+pub fn rewrite_path_filter_labels(field: QueryStepField) -> Vec<&'static str> {
+    match field {
+        QueryStepField::RewriteDomains => ALL_REWRITE_DOMAIN_KINDS
+            .iter()
+            .map(|domain| domain.label())
+            .collect(),
+        QueryStepField::RewriteOutcomes => ALL_REWRITE_OUTCOME_KINDS
+            .iter()
+            .map(|outcome| outcome.label())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+pub fn rewrite_domain_from_label(label: &str) -> Option<RewriteDomainKind> {
+    RewriteDomainKind::from_label(label)
+}
+
+pub fn rewrite_outcome_from_label(label: &str) -> Option<RewriteOutcomeKind> {
+    RewriteOutcomeKind::from_label(label)
+}
+
+pub fn state_event_class_from_label(label: &str) -> Option<StateEventClass> {
+    StateEventClass::from_label(label)
+}
+
+pub fn flow_subject_kind_from_label(label: &str) -> Option<FlowSubjectKind> {
+    FlowSubjectKind::from_label(label)
+}
+
+pub fn flow_relation_from_label(label: &str) -> Option<FlowRelation> {
+    FlowRelation::from_label(label)
+}
+
+pub fn flow_certainty_from_label(label: &str) -> Option<FlowCertainty> {
+    FlowCertainty::from_label(label)
+}
+
+pub fn usage_proof_label(proof: UsageProof) -> &'static str {
+    match proof {
+        UsageProof::Proven => "proven",
+        UsageProof::Unproven => "unproven",
+    }
+}
+
+pub fn usage_proof_from_label(label: &str) -> Option<UsageProof> {
+    match label {
+        "proven" => Some(UsageProof::Proven),
+        "unproven" => Some(UsageProof::Unproven),
+        _ => None,
+    }
+}
+
+pub fn call_traversal_completeness_from_label(label: &str) -> Option<CallTraversalCompleteness> {
+    match label {
+        "exhaustive" => Some(CallTraversalCompleteness::Exhaustive),
+        "proven_subset" => Some(CallTraversalCompleteness::ProvenSubset),
+        _ => None,
+    }
+}
+
+pub fn usage_surface_label(surface: UsageHitSurface) -> &'static str {
+    match surface {
+        UsageHitSurface::ExternalUsages => "external_usages",
+        UsageHitSurface::LspReferences => "lsp_references",
+    }
+}
+
+pub fn usage_surface_from_label(label: &str) -> Option<UsageHitSurface> {
+    match label {
+        "external_usages" => Some(UsageHitSurface::ExternalUsages),
+        "lsp_references" => Some(UsageHitSurface::LspReferences),
+        _ => None,
+    }
+}
+
+/// Every usage kind an edge filter can name, in wire-label order. The labels
+/// are [`UsageHitKind::wire_label`]'s, so the query surface and the rendered
+/// usage surface can never disagree about a spelling.
+pub const ALL_USAGE_KINDS: &[UsageHitKind] = &[
+    UsageHitKind::Reference,
+    UsageHitKind::Import,
+    UsageHitKind::Reexport,
+    UsageHitKind::SelfReceiver,
+    UsageHitKind::Definition,
+    UsageHitKind::OverrideDeclaration,
+];
+
+pub fn usage_kind_from_label(label: &str) -> Option<UsageHitKind> {
+    ALL_USAGE_KINDS
+        .iter()
+        .copied()
+        .find(|kind| kind.wire_label() == label)
+}
+
+json_fields! {
+    StringPredicateField,
+    ALL_STRING_PREDICATE_FIELDS,
+    Regex { label: "regex", shape: String, signature: "\"regex\": \"pattern\"", description: "Match the value with a regular expression." }
+}
+
+json_fields! {
+    PatternField,
+    ALL_PATTERN_FIELDS,
+    Kind { label: "kind", shape: KindList, signature: "\"kind\": \"kind\" | [\"kinds\", ...]", description: "Match one or more normalized node kinds." }
+    NotKind { label: "not_kind", shape: KindList, signature: "\"not_kind\": \"kind\" | [\"kinds\", ...]", description: "Exclude one or more normalized node kinds." }
+    Name { label: "name", shape: StringPredicate, signature: "\"name\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match the node's normalized name." }
+    Text { label: "text", shape: RegexPredicate, signature: "\"text\": { \"regex\": \"pattern\" }", description: "Match the node's source text with a regular expression." }
+    Capture { label: "capture", shape: String, signature: "\"capture\": \"label\"", description: "Capture the matching node under a result label." }
+    Arity { label: "arity", shape: Arity, signature: "\"arity\": count | { \"min\": count, \"max\": count }", description: "Match a call by its positional argument count: an exact count, or inclusive min/max bounds." }
+    Has { label: "has", shape: Pattern, signature: "\"has\": { pattern }", description: "Require a matching descendant." }
+    NotHas { label: "not_has", shape: Pattern, signature: "\"not_has\": { pattern }", description: "Exclude nodes containing a matching descendant." }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_core::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
+    use std::collections::HashSet;
+
+    #[test]
+    fn rql_schema_lineage_defaults_to_the_head_and_accepts_exact_pins() {
+        assert_eq!(
+            resolve_rql_schema_version(None).unwrap(),
+            SchemaVersionResolution {
+                version: 1,
+                origin: SchemaVersionOrigin::ImplicitCompatible,
+            }
+        );
+        assert_eq!(
+            resolve_rql_schema_version(Some(1)).unwrap(),
+            SchemaVersionResolution {
+                version: 1,
+                origin: SchemaVersionOrigin::Explicit,
+            }
+        );
+
+        for retired in [0, 2, 5, 13, 14] {
+            let error = resolve_rql_schema_version(Some(retired)).unwrap_err();
+            assert_eq!(error.requested, retired);
+            assert_eq!(error.supported, vec![1]);
+        }
+    }
+
+    #[test]
+    fn schema_metadata_has_unique_spellings_and_help() {
+        let mut forms = HashSet::new();
+        for form in ALL_RQL_FORMS {
+            assert!(!form.signature().is_empty());
+            assert!(!form.description().is_empty());
+            for label in form.labels() {
+                assert!(forms.insert(*label), "duplicate form label {label}");
+                assert_eq!(RqlForm::from_label(label), Some(*form));
+            }
+        }
+
+        let mut step_ops = HashSet::new();
+        for op in ALL_QUERY_STEP_OPS {
+            assert!(step_ops.insert(op.label()), "duplicate query step op");
+            assert!(!op.signature().is_empty());
+            assert!(!op.description().is_empty());
+            assert_eq!(QueryStepOp::from_label(op.label()), Some(*op));
+        }
+        for form in ALL_RQL_FORMS {
+            let Some(op) = form.query_step_op() else {
+                continue;
+            };
+            assert_eq!(form.description(), op.description());
+            assert_eq!(
+                ALL_RQL_FORMS
+                    .iter()
+                    .filter(|candidate| candidate.query_step_op() == Some(op))
+                    .count(),
+                1,
+                "query step {} must have exactly one RQL wrapper",
+                op.label()
+            );
+        }
+        for op in ALL_QUERY_STEP_OPS {
+            assert!(
+                ALL_RQL_FORMS
+                    .iter()
+                    .any(|form| form.query_step_op() == Some(*op)),
+                "query step {} is missing an RQL wrapper",
+                op.label()
+            );
+        }
+
+        let mut properties = HashSet::new();
+        for property in ALL_RQL_PROPERTIES {
+            assert!(!property.signature().is_empty());
+            assert!(!property.description().is_empty());
+            for label in property.labels() {
+                assert!(
+                    properties.insert(*label),
+                    "duplicate property label {label}"
+                );
+                assert_eq!(RqlProperty::from_label(label), Some(*property));
+            }
+        }
+
+        for field in ALL_QUERY_FIELDS {
+            assert!(!field.signature().is_empty());
+            assert!(!field.description().is_empty());
+            assert_eq!(QueryField::from_label(field.label()), Some(*field));
+        }
+        for field in ALL_QUERY_STEP_FIELDS {
+            assert!(!field.signature().is_empty());
+            assert!(!field.description().is_empty());
+            assert_eq!(QueryStepField::from_label(field.label()), Some(*field));
+        }
+        for field in ALL_PATTERN_FIELDS {
+            assert!(!field.signature().is_empty());
+            assert!(!field.description().is_empty());
+            assert_eq!(PatternField::from_label(field.label()), Some(*field));
+        }
+        for field in ALL_STRING_PREDICATE_FIELDS {
+            assert!(!field.signature().is_empty());
+            assert!(!field.description().is_empty());
+            assert_eq!(
+                StringPredicateField::from_label(field.label()),
+                Some(*field)
+            );
+        }
+    }
+
+    #[test]
+    fn execution_mode_metadata_round_trips_labels_and_help() {
+        for mode in ALL_CODE_QUERY_EXECUTION_MODES {
+            assert_eq!(
+                CodeQueryExecutionMode::from_label(mode.label()),
+                Some(*mode)
+            );
+            assert!(!mode.description().is_empty());
+        }
+        assert_eq!(
+            CodeQueryExecutionMode::default(),
+            CodeQueryExecutionMode::Results
+        );
+    }
+}

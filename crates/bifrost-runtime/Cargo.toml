@@ -1,0 +1,27 @@
+[package]
+name = "brokk-bifrost-runtime"
+version.workspace = true
+edition.workspace = true
+description = "Protocol-neutral runtime and stable extension API for brokk-bifrost"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = true
+exclude = ["tests/**"]
+
+[lib]
+name = "brokk_bifrost_runtime"
+
+[dependencies]
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.9.5" }
+brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.9.5" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.8"
+
+[dev-dependencies]
+serde_json = "1.0.145"
+# Used by tests/code_intelligence_runtime.rs through its #[path] include of the
+# shared harness ../../../tests/common/inline_project.rs, which lives outside
+# this crate's directory.
+tempfile = "3.23.0"

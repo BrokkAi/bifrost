@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.scala.case-class",
+  "version": "1.0.0",
+  "producer": { "name": "bifrost", "version": "0.8.21" },
+  "language": "scala",
+  "ecosystem": "maven",
+  "compatibility": { "bifrost": ">=0.8.21, <1.0.0", "toolchains": [] },
+  "provenance": {
+    "source": "https://docs.scala-lang.org/scala3/reference/changed-features/case-classes.html",
+    "revision": "issue-1153"
+  },
+  "license": "Apache-2.0",
+  "completeness": "partial",
+  "safety": { "generated_code_only": true, "review_required": false },
+  "shards": [{
+    "id": "scala.case-class.generated-members",
+    "activation": [{}],
+    "payload": {
+      "kind": "generator_rules",
+      "rules": [
+        {
+          "id": "scala.case-class.copy",
+          "trigger": { "kind": "language_construct", "construct": "scala_case_class" },
+          "captures": [{
+            "name": "owner_id",
+            "binding": {
+              "source": { "kind": "enclosing_declaration" },
+              "projection": "stable_id"
+            },
+            "value_kind": "stable_id",
+            "cardinality": "one"
+          }],
+          "emissions": [
+            {
+              "kind": "declaration",
+              "id": {
+                "op": "concat",
+                "values": [
+                  { "op": "capture", "name": "owner_id" },
+                  { "op": "literal", "value": ".copy" }
+                ]
+              },
+              "name": { "op": "literal", "value": "copy" },
+              "anchor": { "op": "capture", "name": "owner_id" },
+              "declaration": {
+                "kind": "member",
+                "owner": { "op": "capture", "name": "owner_id" },
+                "member_kind": "method",
+                "visibility": "public"
+              }
+            },
+            {
+              "kind": "relation",
+              "id": {
+                "op": "concat",
+                "values": [
+                  { "op": "capture", "name": "owner_id" },
+                  { "op": "literal", "value": ".copy.navigation" }
+                ]
+              },
+              "relation_kind": "navigates_to",
+              "from": {
+                "op": "concat",
+                "values": [
+                  { "op": "capture", "name": "owner_id" },
+                  { "op": "literal", "value": ".copy" }
+                ]
+              },
+              "to": { "op": "capture", "name": "owner_id" }
+            }
+          ]
+        },
+        {
+          "id": "scala.case-class.parameter-accessor",
+          "trigger": { "kind": "language_construct", "construct": "scala_case_class" },
+          "captures": [
+            {
+              "name": "owner_id",
+              "binding": {
+                "source": { "kind": "enclosing_declaration" },
+                "projection": "stable_id"
+              },
+              "value_kind": "stable_id",
+              "cardinality": "one"
+            },
+            {
+              "name": "parameter_name",
+              "binding": {
+                "source": { "kind": "arguments", "from": 0 },
+                "projection": "name"
+              },
+              "value_kind": "identifier",
+              "cardinality": "many"
+            },
+            {
+              "name": "parameter_id",
+              "binding": {
+                "source": { "kind": "arguments", "from": 0 },
+                "projection": "stable_id"
+              },
+              "value_kind": "stable_id",
+              "cardinality": "many"
+            }
+          ],
+          "emissions": [
+            {
+              "kind": "declaration",
+              "id": {
+                "op": "concat",
+                "values": [
+                  { "op": "capture", "name": "parameter_id" },
+                  { "op": "literal", "value": ".accessor" }
+                ]
+              },
+              "name": { "op": "capture", "name": "parameter_name" },
+              "anchor": { "op": "capture", "name": "parameter_name" },
+              "declaration": {
+                "kind": "member",
+                "owner": { "op": "capture", "name": "owner_id" },
+                "member_kind": "property",
+                "visibility": "public"
+              }
+            },
+            {
+              "kind": "relation",
+              "id": {
+                "op": "concat",
+                "values": [
+                  { "op": "capture", "name": "parameter_id" },
+                  { "op": "literal", "value": ".accessor.navigation" }
+                ]
+              },
+              "relation_kind": "navigates_to",
+              "from": {
+                "op": "concat",
+                "values": [
+                  { "op": "capture", "name": "parameter_id" },
+                  { "op": "literal", "value": ".accessor" }
+                ]
+              },
+              "to": { "op": "capture", "name": "parameter_id" }
+            }
+          ]
+        }
+      ]
+    }
+  }]
+}

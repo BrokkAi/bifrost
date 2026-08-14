@@ -1,0 +1,634 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.encoder-sanitizers",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-sanitizer-foundry",
+    "version": "0.9.0"
+  },
+  "language": "java",
+  "ecosystem": "maven",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <0.10.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "audited k3 sanitizer content over org.owasp.encoder:encoder:1.4.0 (staged: artifact digest not pinned)",
+    "revision": "k3-sanitizers"
+  },
+  "license": "LGPL-3.0-or-later",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "sanitizers.maven",
+      "activation": [
+        {
+          "package": {
+            "name": "org.owasp.encoder:encoder"
+          },
+          "targets": [
+            "jvm"
+          ],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "org.owasp.encoder.encode.forcdata",
+            "target": {
+              "path": "org/owasp/encoder/Encode.java",
+              "symbol": "org.owasp.encoder.Encode.forCDATA",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.encoder.encode.forcssstring",
+            "target": {
+              "path": "org/owasp/encoder/Encode.java",
+              "symbol": "org.owasp.encoder.Encode.forCssString",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.encoder.encode.forcssurl",
+            "target": {
+              "path": "org/owasp/encoder/Encode.java",
+              "symbol": "org.owasp.encoder.Encode.forCssUrl",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.encoder.encode.forhtml",
+            "target": {
+              "path": "org/owasp/encoder/Encode.java",
+              "symbol": "org.owasp.encoder.Encode.forHtml",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "html",
+                  "html_attr",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.encoder.encode.forhtmlattribute",
+            "target": {
+              "path": "org/owasp/encoder/Encode.java",
+              "symbol": "org.owasp.encoder.Encode.forHtmlAttribute",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "html",
+                  "html_attr",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.encoder.encode.forhtmlcontent",
+            "target": {
+              "path": "org/owasp/encoder/Encode.java",
+              "symbol": "org.owasp.encoder.Encode.forHtmlContent",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "html",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.encoder.encode.forhtmlunquotedattribute",
+            "target": {
+              "path": "org/owasp/encoder/Encode.java",
+              "symbol": "org.owasp.encoder.Encode.forHtmlUnquotedAttribute",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "html",
+                  "html_attr",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.encoder.encode.forjavascript",
+            "target": {
+              "path": "org/owasp/encoder/Encode.java",
+              "symbol": "org.owasp.encoder.Encode.forJavaScript",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "js"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.encoder.encode.forjavascriptattribute",
+            "target": {
+              "path": "org/owasp/encoder/Encode.java",
+              "symbol": "org.owasp.encoder.Encode.forJavaScriptAttribute",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "js"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.encoder.encode.forjavascriptblock",
+            "target": {
+              "path": "org/owasp/encoder/Encode.java",
+              "symbol": "org.owasp.encoder.Encode.forJavaScriptBlock",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "js"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.encoder.encode.forjavascriptsource",
+            "target": {
+              "path": "org/owasp/encoder/Encode.java",
+              "symbol": "org.owasp.encoder.Encode.forJavaScriptSource",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "js"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.encoder.encode.foruricomponent",
+            "target": {
+              "path": "org/owasp/encoder/Encode.java",
+              "symbol": "org.owasp.encoder.Encode.forUriComponent",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css",
+                  "html",
+                  "html_attr",
+                  "js",
+                  "log",
+                  "url",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.encoder.encode.forxml",
+            "target": {
+              "path": "org/owasp/encoder/Encode.java",
+              "symbol": "org.owasp.encoder.Encode.forXml",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "html",
+                  "html_attr",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.encoder.encode.forxmlattribute",
+            "target": {
+              "path": "org/owasp/encoder/Encode.java",
+              "symbol": "org.owasp.encoder.Encode.forXmlAttribute",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "html",
+                  "html_attr",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "org.owasp.encoder.encode.forxmlcontent",
+            "target": {
+              "path": "org/owasp/encoder/Encode.java",
+              "symbol": "org.owasp.encoder.Encode.forXmlContent",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "html",
+                  "xml"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

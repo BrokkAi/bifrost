@@ -1,0 +1,682 @@
+//! The per-file half of Go's whole-workspace inverted edge pass.
+//!
+//! The driver in `brokk-bifrost-analysis` walks each file once, parses it, and
+//! hands the result here as a [`FileEdgeScanInput`]; [`scan_go_file`] resolves
+//! every reference in that file to the fully qualified callee it names and
+//! returns the file's [`PerFileEdges`]. Both are core types, so nothing on this
+//! path needs an analyzer handle.
+//!
+//! It reuses the per-symbol resolver's exact building blocks -- the same AST
+//! helpers, the same local type-inference engine, the same definition-site and
+//! self-reference exclusions -- so the resulting nodes, edges, weights, and
+//! `truncated_symbols` match the per-symbol path. Where the forward scan seeds a
+//! sentinel "this local is the target's owner type" token, the inverted scan
+//! seeds the local's *actual* type fqn, and where the forward scan matches one
+//! target it resolves the reference's callee.
+
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    FileEdgeScanInput, PerFileEdges, classify_reference_node,
+};
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
+};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
+use tree_sitter::Node;
+
+use crate::graph::ast::{
+    SELF_RECEIVER_TOKEN, for_each_var_spec, is_definition_identifier, is_identifier_node,
+    is_method_receiver_parameter, lhs_identifier_slots, parameter_names,
+    receiver_symbol_from_qualifier, rhs_expressions, selector_parts, type_ref_from_node,
+    var_spec_names,
+};
+use crate::graph::resolver::{GoEdgeIndex, TypeRef, constructor_call_type_fqns, node_text};
+use crate::packages::GO_MODULE_SCOPE_SEGMENT;
+
+/// Walk one Go file and return its edge contributions. Pure logic over the
+/// driver-supplied [`FileEdgeScanInput`], the file's package facts, and the
+/// tree-free [`GoEdgeIndex`] — no analyzer handle and no driver state.
+pub fn scan_go_file(
+    index: &GoEdgeIndex,
+    file_pkg: String,
+    alias_packages: HashMap<String, Vec<String>>,
+    dot_packages: Vec<String>,
+    import_binding_names: HashSet<String>,
+    input: &FileEdgeScanInput<'_>,
+) -> PerFileEdges {
+    let mut ctx = FileScan {
+        source: input.source,
+        file_pkg,
+        alias_packages,
+        dot_packages,
+        import_binding_names,
+        index,
+        member_callee_cache: HashMap::default(),
+        input,
+        edges: PerFileEdges::default(),
+    };
+    let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    scan_node(input.root(), &mut ctx, &mut locals);
+    ctx.edges
+}
+
+struct FileScan<'a> {
+    source: &'a str,
+    file_pkg: String,
+    alias_packages: HashMap<String, Vec<String>>,
+    dot_packages: Vec<String>,
+    import_binding_names: HashSet<String>,
+    index: &'a GoEdgeIndex,
+    member_callee_cache: HashMap<(String, String), Vec<String>>,
+    input: &'a FileEdgeScanInput<'a>,
+    edges: PerFileEdges,
+}
+
+impl FileScan<'_> {
+    /// Candidate node fqns for a type reference used as a value's type: the type's
+    /// class fqn, resolved through the file's package (bare) or imports (qualified).
+    fn type_tokens(&self, ty: &TypeRef) -> Vec<String> {
+        let Some(name) = ty.name.as_deref() else {
+            return Vec::new();
+        };
+        match ty.qualifier.as_deref() {
+            None => vec![format!("{}.{}", self.file_pkg, name)],
+            Some(qualifier) => self
+                .alias_packages
+                .get(qualifier)
+                .map(|packages| {
+                    packages
+                        .iter()
+                        .map(|package| format!("{package}.{name}"))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The class fqn(s) a value expression constructs, if any — mirrors the
+    /// forward scan's `expression_matches_owner_type` recursion, but returns the
+    /// concrete type instead of a yes/no against one target.
+    fn expression_type_tokens(&self, node: Node<'_>) -> Vec<String> {
+        if let Some(ty) = type_ref_from_node(node, self.source) {
+            let tokens = self.type_tokens(&ty);
+            if !tokens.is_empty() {
+                return tokens;
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            let tokens = self.expression_type_tokens(child);
+            if !tokens.is_empty() {
+                return tokens;
+            }
+        }
+        Vec::new()
+    }
+
+    fn member_callees(&mut self, owner_fqn: &str, member: &str) -> Vec<String> {
+        let key = (owner_fqn.to_string(), member.to_string());
+        if let Some(callees) = self.member_callee_cache.get(&key) {
+            return callees.clone();
+        }
+        let callees: Vec<String> = self
+            .index
+            .unique_member_fqn(owner_fqn, member)
+            .into_iter()
+            .collect();
+        self.member_callee_cache.insert(key, callees.clone());
+        callees
+    }
+
+    /// Hand a resolved reference to this file's edge accumulator, which applies the
+    /// enclosing-caller attribution, cap counting, and edge dedup.
+    fn record(&mut self, callee: String, node: Node<'_>) {
+        self.edges.record_kind(
+            self.input,
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
+    }
+
+    fn record_unproven(&mut self, name: &str, node: Node<'_>) {
+        self.edges
+            .record_unproven_name(self.input, name, node.start_byte(), node.end_byte());
+    }
+
+    /// Record a resolved callee as unproven inbound (rather than a proven edge):
+    /// used for same-owner receiver calls (#1138).
+    fn record_unproven_callee(&mut self, callee: String, node: Node<'_>) {
+        self.edges
+            .record_unproven(self.input, callee, node.start_byte(), node.end_byte());
+    }
+
+    fn has_node(&self, node: &String) -> bool {
+        self.input.is_node(node)
+    }
+
+    fn record_with_caller(&mut self, caller: String, callee: String, node: Node<'_>) {
+        self.edges.record_with_caller_kind(
+            self.input,
+            caller,
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
+    }
+}
+
+fn scan_node(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &mut LocalInferenceEngine<String>) {
+    match node.kind() {
+        "import_declaration" => return,
+        "func_literal" | "function_declaration" | "method_declaration" => {
+            locals.enter_scope();
+            scan_callable_header(node, ctx, locals);
+            seed_parameters(node, ctx, locals);
+            if let Some(body) = node.child_by_field_name("body") {
+                scan_node(body, ctx, locals);
+            }
+            locals.exit_scope();
+            return;
+        }
+        "block" | "block_statement" => {
+            locals.enter_scope();
+            scan_children(node, ctx, locals);
+            locals.exit_scope();
+            return;
+        }
+        "parameter_declaration" => {
+            if let Some(type_node) = node.child_by_field_name("type") {
+                scan_node(type_node, ctx, locals);
+            }
+            seed_parameter_declaration(node, ctx, locals, is_method_receiver_parameter(node));
+            return;
+        }
+        "const_declaration" if is_top_level_declaration(node) => {
+            scan_top_level_value_initializers(node, ctx);
+        }
+        "var_declaration" | "short_var_declaration" => {
+            if node.kind() == "var_declaration" && is_top_level_declaration(node) {
+                scan_top_level_value_initializers(node, ctx);
+            } else if node.kind() == "short_var_declaration" {
+                for value in rhs_expressions(node) {
+                    scan_node(value, ctx, locals);
+                }
+                seed_assignment_like(node, ctx, locals, true);
+                return;
+            } else {
+                for_each_var_spec(node, &mut |spec| {
+                    scan_var_spec_before_binding(spec, ctx, locals);
+                    seed_var_spec(spec, ctx, locals);
+                });
+                return;
+            }
+        }
+        "assignment_statement" => {
+            seed_local_bindings(node, ctx, locals);
+        }
+        "selector_expression" | "qualified_type" => scan_selector(node, ctx, locals),
+        "identifier" | "type_identifier" | "package_identifier" => scan_direct(node, ctx, locals),
+        _ => {}
+    }
+    scan_children(node, ctx, locals);
+}
+
+fn scan_var_spec_before_binding(
+    node: Node<'_>,
+    ctx: &mut FileScan<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    if let Some(type_node) = node.child_by_field_name("type") {
+        scan_node(type_node, ctx, locals);
+    }
+    for value in rhs_expressions(node) {
+        scan_node(value, ctx, locals);
+    }
+}
+
+fn scan_callable_header(
+    node: Node<'_>,
+    ctx: &mut FileScan<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if node.child_by_field_name("body") == Some(child) {
+            continue;
+        }
+        if child.kind() == "parameter_list" {
+            let mut params = child.walk();
+            for parameter in child.named_children(&mut params) {
+                if matches!(
+                    parameter.kind(),
+                    "parameter_declaration" | "variadic_parameter_declaration"
+                ) && let Some(type_node) = parameter.child_by_field_name("type")
+                {
+                    scan_node(type_node, ctx, locals);
+                }
+            }
+        } else {
+            scan_node(child, ctx, locals);
+        }
+    }
+}
+
+fn is_top_level_declaration(node: Node<'_>) -> bool {
+    node.parent()
+        .is_some_and(|parent| parent.kind() == "source_file")
+}
+
+fn scan_top_level_value_initializers(node: Node<'_>, ctx: &mut FileScan<'_>) {
+    for_each_value_spec(node, &mut |spec| {
+        let names = var_spec_names(spec, ctx.source);
+        let values = rhs_expressions(spec);
+        if names.is_empty() || values.is_empty() {
+            return;
+        }
+        for (name, value) in names.into_iter().zip(values) {
+            let caller = format!("{}.{}.{name}", ctx.file_pkg, GO_MODULE_SCOPE_SEGMENT);
+            scan_top_level_initializer_value(value, caller.as_str(), ctx);
+        }
+    });
+}
+
+fn for_each_value_spec(node: Node<'_>, f: &mut impl FnMut(Node<'_>)) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "var_spec" | "const_spec" => f(child),
+            "var_spec_list" | "const_spec_list" => for_each_value_spec(child, f),
+            _ => {}
+        }
+    }
+}
+
+fn scan_top_level_initializer_value(node: Node<'_>, caller: &str, ctx: &mut FileScan<'_>) {
+    match node.kind() {
+        "func_literal" | "function_declaration" | "method_declaration" => return,
+        "selector_expression" | "qualified_type" => {
+            scan_top_level_initializer_selector(node, caller, ctx);
+            return;
+        }
+        "identifier" | "type_identifier" => {
+            scan_top_level_initializer_direct(node, caller, ctx);
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        scan_top_level_initializer_value(child, caller, ctx);
+    }
+}
+
+fn scan_top_level_initializer_selector(node: Node<'_>, caller: &str, ctx: &mut FileScan<'_>) {
+    let Some((qualifier, qualifier_node, field_node)) = selector_parts(node, ctx.source) else {
+        return;
+    };
+    if is_definition_identifier(qualifier_node, ctx.source) {
+        return;
+    }
+    let field = node_text(field_node, ctx.source).to_string();
+    if let Some(packages) = ctx.alias_packages.get(&qualifier) {
+        let callees: Vec<String> = packages
+            .iter()
+            .map(|package| format!("{package}.{field}"))
+            .collect();
+        for callee in callees {
+            ctx.record_with_caller(caller.to_string(), callee, field_node);
+        }
+    }
+}
+
+fn scan_top_level_initializer_direct(node: Node<'_>, caller: &str, ctx: &mut FileScan<'_>) {
+    if is_definition_identifier(node, ctx.source) {
+        return;
+    }
+    let text = node_text(node, ctx.source).to_string();
+    ctx.record_with_caller(
+        caller.to_string(),
+        format!("{}.{}", ctx.file_pkg, text),
+        node,
+    );
+    let dot_callees: Vec<String> = ctx
+        .dot_packages
+        .iter()
+        .map(|package| format!("{package}.{text}"))
+        .collect();
+    for callee in dot_callees {
+        ctx.record_with_caller(caller.to_string(), callee, node);
+    }
+}
+
+fn scan_children(
+    node: Node<'_>,
+    ctx: &mut FileScan<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        scan_node(child, ctx, locals);
+    }
+}
+
+fn scan_selector(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &LocalInferenceEngine<String>) {
+    let Some((qualifier, qualifier_node, field_node)) = selector_parts(node, ctx.source) else {
+        return;
+    };
+    let field = node_text(field_node, ctx.source).to_string();
+
+    // Member call: the qualifier is a local whose type we inferred.
+    let receiver = receiver_symbol_from_qualifier(&qualifier);
+    let receiver_resolution = locals.resolve_symbol(receiver);
+    if let Some(types) = receiver_resolution.as_precise() {
+        // A call through the enclosing method's own receiver variable is a
+        // same-owner site (#1138): route its resolved callees to unproven inbound
+        // rather than proven edges. A call through another owner-typed value stays
+        // external.
+        let same_owner = types.iter().any(|type_fqn| type_fqn == SELF_RECEIVER_TOKEN);
+        let callees: Vec<String> = types
+            .iter()
+            .flat_map(|type_fqn| ctx.member_callees(type_fqn, &field))
+            .collect();
+        if callees.is_empty() {
+            if same_owner || types.iter().all(|type_fqn| !ctx.has_node(type_fqn)) {
+                ctx.record_unproven(&field, field_node);
+            }
+            return;
+        }
+        for callee in callees {
+            if same_owner {
+                ctx.record_unproven_callee(callee, field_node);
+            } else {
+                ctx.record(callee, field_node);
+            }
+        }
+        return;
+    }
+
+    // Namespace call: the qualifier is an import binding (and not shadowed by a
+    // local of the same name, nor itself a definition site).
+    if locals.is_shadowed(&qualifier) || is_definition_identifier(qualifier_node, ctx.source) {
+        return;
+    }
+    if let Some(packages) = ctx.alias_packages.get(&qualifier) {
+        let callees: Vec<String> = packages
+            .iter()
+            .map(|package| format!("{package}.{field}"))
+            .collect();
+        for callee in callees {
+            ctx.record(callee, field_node);
+        }
+    } else if receiver_resolution.is_ambiguous() || locals.is_shadowed(receiver) {
+        ctx.record_unproven(&field, field_node);
+    }
+}
+
+fn scan_direct(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &LocalInferenceEngine<String>) {
+    if is_definition_identifier(node, ctx.source) {
+        return;
+    }
+    let text = node_text(node, ctx.source).to_string();
+    if ctx.import_binding_names.contains(&text) {
+        return;
+    }
+    if locals.is_shadowed(&text) {
+        return;
+    }
+    // A bare name resolves to a same-package symbol, or a dot-imported one.
+    ctx.record(format!("{}.{}", ctx.file_pkg, text), node);
+    let dot_callees: Vec<String> = ctx
+        .dot_packages
+        .iter()
+        .map(|package| format!("{package}.{text}"))
+        .collect();
+    for callee in dot_callees {
+        ctx.record(callee, node);
+    }
+}
+
+fn seed_parameters(node: Node<'_>, ctx: &FileScan<'_>, locals: &mut LocalInferenceEngine<String>) {
+    // Mark the method's own receiver variable as the same-owner receiver (Go has
+    // no `self`/`this`; `func (s *T) f() { s.g() }` calls siblings through `s`).
+    // Ported from the forward scan (extractor.rs) so `s.g()` routes to unproven
+    // inbound (#1138) while `other.g()` — another `*T` value — stays external.
+    if node.kind() == "method_declaration"
+        && let Some(receiver) = node.child_by_field_name("receiver")
+    {
+        seed_parameter_list(receiver, ctx, locals, true);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "parameter_list" && node.child_by_field_name("receiver") != Some(child) {
+            seed_parameter_list(child, ctx, locals, false);
+        }
+    }
+}
+
+fn seed_parameter_list(
+    node: Node<'_>,
+    ctx: &FileScan<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+    is_method_receiver: bool,
+) {
+    let mut params = node.walk();
+    for param in node.named_children(&mut params) {
+        if matches!(
+            param.kind(),
+            "parameter_declaration" | "variadic_parameter_declaration"
+        ) {
+            seed_parameter_declaration(param, ctx, locals, is_method_receiver);
+        }
+    }
+}
+
+fn seed_parameter_declaration(
+    node: Node<'_>,
+    ctx: &FileScan<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+    is_method_receiver: bool,
+) {
+    let names = parameter_names(node, ctx.source);
+    let mut tokens = node
+        .child_by_field_name("type")
+        .and_then(|type_node| type_ref_from_node(type_node, ctx.source))
+        .map(|ty| ctx.type_tokens(&ty))
+        .unwrap_or_default();
+    // Tag the receiver variable so `recv.member` is recognized as same-owner in
+    // `scan_selector`. Only when the receiver type resolved to a workspace type
+    // (otherwise the name is a shadow with no callable siblings to route).
+    if is_method_receiver
+        && !tokens.is_empty()
+        && !tokens.iter().any(|token| token == SELF_RECEIVER_TOKEN)
+    {
+        tokens.push(SELF_RECEIVER_TOKEN.to_string());
+    }
+    seed_or_shadow(names, tokens, locals);
+}
+
+fn seed_local_bindings(
+    node: Node<'_>,
+    ctx: &FileScan<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    match node.kind() {
+        "var_declaration" => {
+            for_each_var_spec(node, &mut |var_spec| seed_var_spec(var_spec, ctx, locals))
+        }
+        "var_spec" => seed_var_spec(node, ctx, locals),
+        "short_var_declaration" => seed_assignment_like(node, ctx, locals, true),
+        "assignment_statement" => seed_assignment_like(node, ctx, locals, false),
+        _ => {}
+    }
+}
+
+fn seed_var_spec(node: Node<'_>, ctx: &FileScan<'_>, locals: &mut LocalInferenceEngine<String>) {
+    let names = var_spec_names(node, ctx.source);
+    if names.is_empty() {
+        return;
+    }
+    let typed = node
+        .child_by_field_name("type")
+        .and_then(|type_node| type_ref_from_node(type_node, ctx.source))
+        .map(|ty| ctx.type_tokens(&ty))
+        .unwrap_or_default();
+    if !typed.is_empty() {
+        seed_or_shadow(names, typed, locals);
+        return;
+    }
+    let bindings = infer_names_from_values(
+        var_spec_name_slots(node, ctx.source),
+        rhs_expressions(node),
+        ctx,
+        locals,
+    );
+    for name in names {
+        locals.declare_shadow(name);
+    }
+    apply_inferred_bindings(bindings, locals);
+}
+
+fn seed_assignment_like(
+    node: Node<'_>,
+    ctx: &FileScan<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+    declare_lhs: bool,
+) {
+    let slots = lhs_identifier_slots(node, ctx.source);
+    let mut bindings = infer_names_from_values(slots.clone(), rhs_expressions(node), ctx, locals);
+    if declare_lhs {
+        for name in slots.into_iter().flatten() {
+            locals.declare_shadow(name);
+        }
+    } else {
+        // Ordinary `=` updates an existing lexical binding; it must not turn an
+        // otherwise unbound package name into a local shadow.
+        bindings.retain(|(name, _)| locals.is_shadowed(name));
+    }
+    apply_inferred_bindings(bindings, locals);
+}
+
+enum InferredBinding {
+    Types(Vec<String>),
+    Alias(String),
+}
+
+fn infer_names_from_values(
+    names: Vec<Option<String>>,
+    values: Vec<Node<'_>>,
+    ctx: &FileScan<'_>,
+    locals: &LocalInferenceEngine<String>,
+) -> Vec<(String, InferredBinding)> {
+    if names.is_empty() || values.is_empty() {
+        return Vec::new();
+    }
+
+    names
+        .iter()
+        .zip(values.iter())
+        .filter_map(|(name, value)| {
+            let name = name.as_ref()?;
+            let mut tokens = constructor_call_type_fqns(
+                *value,
+                ctx.source,
+                &ctx.file_pkg,
+                &ctx.alias_packages,
+                &ctx.dot_packages,
+                ctx.index,
+                Some(locals),
+            );
+            if tokens.is_empty() {
+                tokens = field_selector_type_tokens(*value, ctx, locals);
+            }
+            if tokens.is_empty() {
+                tokens = ctx.expression_type_tokens(*value);
+            }
+            if !tokens.is_empty() {
+                Some((name.clone(), InferredBinding::Types(tokens)))
+            } else if is_identifier_node(*value) {
+                Some((
+                    name.clone(),
+                    InferredBinding::Alias(node_text(*value, ctx.source).to_string()),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The type fqn(s) a `base.field` initializer denotes: `base` is a local whose
+/// type was precisely inferred and `field` is an indexed struct field with a
+/// workspace type. Mirrors the forward scan's field-derived local receiver
+/// seeding (#1611) with the actual type fqn instead of the owner sentinel.
+fn field_selector_type_tokens(
+    value: Node<'_>,
+    ctx: &FileScan<'_>,
+    locals: &LocalInferenceEngine<String>,
+) -> Vec<String> {
+    if value.kind() != "selector_expression" {
+        return Vec::new();
+    }
+    let Some((qualifier, _qualifier_node, field_node)) = selector_parts(value, ctx.source) else {
+        return Vec::new();
+    };
+    let receiver = receiver_symbol_from_qualifier(&qualifier);
+    let resolution = locals.resolve_symbol(receiver);
+    let Some(types) = resolution.as_precise() else {
+        return Vec::new();
+    };
+    let field = node_text(field_node, ctx.source);
+    let mut tokens: Vec<String> = types
+        .iter()
+        .filter(|type_fqn| type_fqn.as_str() != SELF_RECEIVER_TOKEN)
+        .filter_map(|type_fqn| ctx.index.unique_field_type_fqn(type_fqn, field))
+        .collect();
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn apply_inferred_bindings(
+    bindings: Vec<(String, InferredBinding)>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    for (name, binding) in bindings {
+        match binding {
+            InferredBinding::Types(tokens) => locals.seed_symbol_many(name, tokens),
+            InferredBinding::Alias(source) => locals.alias_symbol(name, &source),
+        }
+    }
+}
+
+fn var_spec_name_slots(node: Node<'_>, source: &str) -> Vec<Option<String>> {
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for name_node in node.children_by_field_name("name", &mut cursor) {
+        let name = node_text(name_node, source);
+        out.push((name != "_").then(|| name.to_string()));
+    }
+    out
+}
+
+/// Seed `names` with the inferred type tokens, or — when no workspace type was
+/// resolved — record them as shadowing locals so they are not mistaken for import
+/// bindings. Mirrors the forward scan, which shadows any typed local that is not
+/// the target's owner.
+fn seed_or_shadow(
+    names: Vec<String>,
+    tokens: Vec<String>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    if tokens.is_empty() {
+        for name in names {
+            locals.declare_shadow(name);
+        }
+    } else {
+        for name in names {
+            locals.seed_symbol_many(name, tokens.clone());
+        }
+    }
+}

@@ -1,0 +1,32 @@
+---
+title: Agent Instructions
+description: Append Bifrost guidance to AGENTS.md or retrieve it through MCP resources.
+---
+
+import agentsGuidance from '../../../../crates/bifrost-mcp/resources/agent-guidance/bifrost-agents.md?raw';
+
+Bifrost includes a host-neutral `AGENTS.md` section that tells coding agents to
+use structured code-intelligence tools before broad refactors or risky changes.
+Append it to an existing project `AGENTS.md` when you want agents to gather
+Bifrost context before planning.
+
+## Can My Agent Run RQL?
+
+This template is instruction text only. Installing or appending it does not start Bifrost MCP and does not expose `query_code` or any other tool. Configure a query-capable MCP server such as `--mcp "symbol|extended"`, start a fresh agent session, and confirm that `query_code` is advertised before asking the agent to run a query.
+
+MCP accepts canonical JSON inline and saved workspace `.rql` through `query_file`; it does not accept raw inline RQL. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for setup and validation, then use [Agent Result Safety](/agent-result-safety/) for completeness claims.
+
+MCP-capable clients can retrieve the same guidance from the Bifrost server with
+`resources/list` and `resources/read` using this URI:
+
+```text
+bifrost://agent-guidance/agents.md
+```
+
+## Template
+
+Keep project-specific, agent-specific, or user-specific guidance in the existing
+project `AGENTS.md`. The template below contains only the reusable Bifrost
+code-intelligence guidance.
+
+<pre><code>{agentsGuidance.replace(/\n\nKeep project-specific instructions[\s\S]*$/, '').trim()}</code></pre>

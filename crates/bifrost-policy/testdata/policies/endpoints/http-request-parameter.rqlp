@@ -1,0 +1,21 @@
+; Minimal source-owned fixture for public endpoint unit contracts.
+(endpoint
+  :id "bifrost.sources.http-request-parameter"
+  :name "HTTP request parameter"
+  :display-name "User-controlled I/O"
+  :description "A value supplied by an external HTTP request."
+  :role source
+  :categories [input.user-controlled io.external]
+  :selector
+    (rql
+      (language python
+        (call :callee (name "request_parameter"))))
+  :binding return-value
+  :taint
+    (source-semantics
+      :labels [attacker-controlled]
+      :evidence
+        (evidence
+          :trust-boundary external
+          :system-entry vulnerable-system-network-stack))
+  :supersedes [])

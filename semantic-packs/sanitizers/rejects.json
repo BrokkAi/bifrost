@@ -1,0 +1,123 @@
+{
+  "format": "bifrost_sanitizer_pack_audit/v1",
+  "candidates_total": 64,
+  "gate_rejected": 0,
+  "shipped_summaries": 56,
+  "folded_overloads": 8,
+  "adversarial_probes": 768,
+  "gate_rejects": [],
+  "folded": [
+    {
+      "artifact": "jdk",
+      "target_path": "java.base/java/lang/Integer.java",
+      "target_symbol": "java.lang.Integer.parseInt",
+      "kept_parameter_count": 2,
+      "folded_parameter_count": 2
+    },
+    {
+      "artifact": "jdk",
+      "target_path": "java.base/java/lang/Long.java",
+      "target_symbol": "java.lang.Long.parseLong",
+      "kept_parameter_count": 2,
+      "folded_parameter_count": 2
+    },
+    {
+      "artifact": "jdk",
+      "target_path": "java.base/java/net/URLEncoder.java",
+      "target_symbol": "java.net.URLEncoder.encode",
+      "kept_parameter_count": 2,
+      "folded_parameter_count": 2
+    },
+    {
+      "artifact": "org.owasp.esapi:esapi:2.7.0.0",
+      "target_path": "org/owasp/esapi/Encoder.java",
+      "target_symbol": "org.owasp.esapi.Encoder.encodeForLDAP",
+      "kept_parameter_count": 2,
+      "folded_parameter_count": 2
+    },
+    {
+      "artifact": "org.springframework:spring-web:7.0.8",
+      "target_path": "org/springframework/web/util/UriUtils.java",
+      "target_symbol": "org.springframework.web.util.UriUtils.encode",
+      "kept_parameter_count": 2,
+      "folded_parameter_count": 2
+    },
+    {
+      "artifact": "org.springframework:spring-web:7.0.8",
+      "target_path": "org/springframework/web/util/UriUtils.java",
+      "target_symbol": "org.springframework.web.util.UriUtils.encodePath",
+      "kept_parameter_count": 2,
+      "folded_parameter_count": 2
+    },
+    {
+      "artifact": "org.springframework:spring-web:7.0.8",
+      "target_path": "org/springframework/web/util/UriUtils.java",
+      "target_symbol": "org.springframework.web.util.UriUtils.encodePathSegment",
+      "kept_parameter_count": 2,
+      "folded_parameter_count": 2
+    },
+    {
+      "artifact": "org.springframework:spring-web:7.0.8",
+      "target_path": "org/springframework/web/util/UriUtils.java",
+      "target_symbol": "org.springframework.web.util.UriUtils.encodeQueryParam",
+      "kept_parameter_count": 2,
+      "folded_parameter_count": 2
+    }
+  ],
+  "packs": [
+    {
+      "pack_id": "bifrost.commons-text-sanitizers",
+      "artifact": "org.apache.commons:commons-text:1.15.0",
+      "pinned": false,
+      "ecosystem": "maven",
+      "completeness": "partial",
+      "shipped_summaries": 7,
+      "adversarial_probes": 84
+    },
+    {
+      "pack_id": "bifrost.encoder-sanitizers",
+      "artifact": "org.owasp.encoder:encoder:1.4.0",
+      "pinned": false,
+      "ecosystem": "maven",
+      "completeness": "complete",
+      "shipped_summaries": 15,
+      "adversarial_probes": 180
+    },
+    {
+      "pack_id": "bifrost.esapi-sanitizers",
+      "artifact": "org.owasp.esapi:esapi:2.7.0.0",
+      "pinned": false,
+      "ecosystem": "maven",
+      "completeness": "complete",
+      "shipped_summaries": 13,
+      "adversarial_probes": 168
+    },
+    {
+      "pack_id": "bifrost.guava-sanitizers",
+      "artifact": "com.google.guava:guava:33.6.0-jre",
+      "pinned": false,
+      "ecosystem": "maven",
+      "completeness": "partial",
+      "shipped_summaries": 5,
+      "adversarial_probes": 60
+    },
+    {
+      "pack_id": "bifrost.java-sanitizers",
+      "artifact": "jdk",
+      "pinned": true,
+      "ecosystem": "jdk",
+      "completeness": "complete",
+      "shipped_summaries": 11,
+      "adversarial_probes": 168
+    },
+    {
+      "pack_id": "bifrost.spring-web-sanitizers",
+      "artifact": "org.springframework:spring-web:7.0.8",
+      "pinned": false,
+      "ecosystem": "maven",
+      "completeness": "complete",
+      "shipped_summaries": 5,
+      "adversarial_probes": 108
+    }
+  ]
+}

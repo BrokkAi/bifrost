@@ -1,0 +1,42 @@
+//! Analyzer-store entry points into the shared cache GC driver.
+//!
+//! The driver itself is [`brokk_bifrost_core::cache_gc`]; it needs only the
+//! unified DB path, so all that stays here is the pair of wrappers that read
+//! that path off an [`AnalyzerStore`].
+
+pub use brokk_bifrost_core::cache_gc::{
+    GC_AUTO_BLOB_THRESHOLD, GC_MIN_INTERVAL_SECS, GcOutcome, VERSION_STORE_GRACE_SECS,
+    force_gc as force_gc_for_semantic, maybe_gc as maybe_gc_for_semantic,
+    sweep_disused_version_stores,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use brokk_bifrost_core::cache_gc::{
+    GcTuningGuard, set_accounting_for_test, set_tuning_for_test, total_blob_count_for_test,
+};
+
+use brokk_bifrost_core::cache_gc::{force_gc, maybe_gc};
+use git2::Repository;
+
+use crate::analyzer::store::AnalyzerStore;
+
+pub fn maybe_gc_for_analyzer(
+    store: &AnalyzerStore,
+    repo: &Repository,
+    workspace_root: &std::path::Path,
+) -> Result<GcOutcome, String> {
+    let Some(db_path) = store.db_path() else {
+        return Ok(GcOutcome::skipped(0));
+    };
+    maybe_gc(db_path, repo, workspace_root)
+}
+
+pub fn force_gc_for_analyzer(
+    store: &AnalyzerStore,
+    repo: &Repository,
+    workspace_root: &std::path::Path,
+) -> Result<GcOutcome, String> {
+    let Some(db_path) = store.db_path() else {
+        return Ok(GcOutcome::skipped(0));
+    };
+    force_gc(db_path, repo, workspace_root)
+}

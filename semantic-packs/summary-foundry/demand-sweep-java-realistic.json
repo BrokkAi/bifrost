@@ -1,0 +1,231 @@
+{
+  "format": "bifrost_summary_foundry_demand_sweep/v1",
+  "slice": {
+    "selection_rule": "The first 12 corpus directories, in sorted-name order, that carry a root-level Maven or Gradle build file (pom.xml, build.gradle, or build.gradle.kts), hold between one and 400 .java files, and import at least one endpoint library (java.sql, javax.servlet.http). The import scan is a slice-selection heuristic over `import` declarations; the taint analysis itself is fully structural. `java.lang` endpoints (Runtime, ProcessBuilder, System) are imported implicitly and so cannot gate selection, but they still fire in a selected repo that uses them. A repo's git HEAD is recorded when the clone is a git checkout.",
+    "repos": [
+      {
+        "name": "Appendium__flatpack",
+        "java_files": 102,
+        "commit": "d1f643abb6689eb35cae10b93cc6b7d49afcc8fb"
+      },
+      {
+        "name": "Athou__commafeed",
+        "java_files": 196,
+        "commit": "98a261d4571d24446a68ce95976f41303ba027bd"
+      },
+      {
+        "name": "Cisurm__Portal-Drug-System",
+        "java_files": 190,
+        "commit": "4c2e9ab5cba5a0c8956e931af135baa08a9947dc"
+      },
+      {
+        "name": "Djaytan__mc-jobs-reborn-patch-place-break",
+        "java_files": 153,
+        "commit": "36f0497d741e8b64eb1107effc55d8fba72e1784"
+      },
+      {
+        "name": "EsotericSoftware__kryo",
+        "java_files": 141,
+        "commit": "0e681fe4e5675308558df56bfa17f5fe458ba1c3"
+      },
+      {
+        "name": "FIWARE__mintaka",
+        "java_files": 75,
+        "commit": "971790debe91f15e58ef03b9a6372a17e1175c78"
+      },
+      {
+        "name": "Hakky54__ayza",
+        "java_files": 176,
+        "commit": "e23f7724afdbcb0a70d8c8de506c4a41995c02ec"
+      },
+      {
+        "name": "JeffLi1993__springboot-learning-example",
+        "java_files": 201,
+        "commit": "07732958304327b5f64e97eff0f3f6a63d4e7bd7"
+      },
+      {
+        "name": "Lob2018__SudokuFX",
+        "java_files": 232,
+        "commit": "3e5b7b2bc0fdbf4e337ee0e20331d705bbb8a0b2"
+      },
+      {
+        "name": "MariaDB4j__MariaDB4j",
+        "java_files": 38,
+        "commit": "2ff7cf75b1ad6449237a3eccb930a3b7a23adbee"
+      },
+      {
+        "name": "Meituan-Dianping__Leaf",
+        "java_files": 33,
+        "commit": "86a6441d263497b9f9ee321de13422b9c63f0c06"
+      },
+      {
+        "name": "Netflix__archaius",
+        "java_files": 172,
+        "commit": "f40de16d1c74ffd0efbd12b14342e78969a3d5bf"
+      }
+    ]
+  },
+  "repo_count": 12,
+  "evaluated_runs": 12,
+  "clean_conclusion_runs": 4,
+  "clean_conclusion_permille": 333,
+  "outcomes": {
+    "complete": 4,
+    "proven_by_summary": 0,
+    "proven_subset": 0,
+    "inconclusive": 8,
+    "unsupported": 0,
+    "failed": 0,
+    "workspace_build_failed": 0,
+    "evaluation_failed": 0,
+    "timed_out": 0
+  },
+  "verdict_split": {
+    "blocked_verdicts": 0,
+    "verdicts_all_summary_closable": 0,
+    "verdicts_with_engine_blocker": 0,
+    "engine_blocked_verdict_permille": 0
+  },
+  "blocker_bucket_totals": {
+    "summary_closable": 0,
+    "engine_blocked": 0
+  },
+  "inconclusive_reason_verdicts": {
+    "capability_incomplete": 8
+  },
+  "ranked_blockers": [],
+  "repo_outcomes": [
+    {
+      "repo": "Appendium__flatpack",
+      "java_files": 102,
+      "outcome": {
+        "status": "ran",
+        "completion": "inconclusive",
+        "findings": 0
+      },
+      "inconclusive_reasons": [
+        "capability_incomplete"
+      ]
+    },
+    {
+      "repo": "Athou__commafeed",
+      "java_files": 196,
+      "outcome": {
+        "status": "ran",
+        "completion": "inconclusive",
+        "findings": 0
+      },
+      "inconclusive_reasons": [
+        "capability_incomplete"
+      ]
+    },
+    {
+      "repo": "Cisurm__Portal-Drug-System",
+      "java_files": 190,
+      "outcome": {
+        "status": "ran",
+        "completion": "inconclusive",
+        "findings": 0
+      },
+      "inconclusive_reasons": [
+        "capability_incomplete"
+      ]
+    },
+    {
+      "repo": "Djaytan__mc-jobs-reborn-patch-place-break",
+      "java_files": 153,
+      "outcome": {
+        "status": "ran",
+        "completion": "inconclusive",
+        "findings": 0
+      },
+      "inconclusive_reasons": [
+        "capability_incomplete"
+      ]
+    },
+    {
+      "repo": "EsotericSoftware__kryo",
+      "java_files": 141,
+      "outcome": {
+        "status": "ran",
+        "completion": "complete",
+        "findings": 0
+      }
+    },
+    {
+      "repo": "FIWARE__mintaka",
+      "java_files": 75,
+      "outcome": {
+        "status": "ran",
+        "completion": "complete",
+        "findings": 0
+      }
+    },
+    {
+      "repo": "Hakky54__ayza",
+      "java_files": 176,
+      "outcome": {
+        "status": "ran",
+        "completion": "complete",
+        "findings": 0
+      }
+    },
+    {
+      "repo": "JeffLi1993__springboot-learning-example",
+      "java_files": 201,
+      "outcome": {
+        "status": "ran",
+        "completion": "inconclusive",
+        "findings": 0
+      },
+      "inconclusive_reasons": [
+        "capability_incomplete"
+      ]
+    },
+    {
+      "repo": "Lob2018__SudokuFX",
+      "java_files": 232,
+      "outcome": {
+        "status": "ran",
+        "completion": "inconclusive",
+        "findings": 0
+      },
+      "inconclusive_reasons": [
+        "capability_incomplete"
+      ]
+    },
+    {
+      "repo": "MariaDB4j__MariaDB4j",
+      "java_files": 38,
+      "outcome": {
+        "status": "ran",
+        "completion": "inconclusive",
+        "findings": 0
+      },
+      "inconclusive_reasons": [
+        "capability_incomplete"
+      ]
+    },
+    {
+      "repo": "Meituan-Dianping__Leaf",
+      "java_files": 33,
+      "outcome": {
+        "status": "ran",
+        "completion": "complete",
+        "findings": 0
+      }
+    },
+    {
+      "repo": "Netflix__archaius",
+      "java_files": 172,
+      "outcome": {
+        "status": "ran",
+        "completion": "inconclusive",
+        "findings": 0
+      },
+      "inconclusive_reasons": [
+        "capability_incomplete"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  BIFROST_CAPABILITY_IDS,
+  DEFAULT_BIFROST_CAPABILITIES,
+  capabilityForTool,
+  normalizeCapabilities,
+  piToolName,
+  serverToolsetExpression,
+  toolBelongsToSelection,
+} from "../extensions/bifrost-capabilities.ts";
+
+test("normalizes capability order and builds existing Bifrost toolsets", () => {
+  assert.deepEqual(
+    normalizeCapabilities(["text", "policies", "symbols", "quality", "symbols", "unknown"]),
+    ["symbols", "policies", "quality", "text"],
+  );
+  assert.equal(serverToolsetExpression(["symbols"]), "symbol|slopcop");
+  assert.equal(
+    serverToolsetExpression(DEFAULT_BIFROST_CAPABILITIES),
+    "symbol|extended|slopcop",
+  );
+  assert.equal(
+    serverToolsetExpression(["symbols", "query", "files", "quality"]),
+    "symbol|extended|slopcop",
+  );
+  assert.equal(serverToolsetExpression([]), "");
+});
+
+test("classifies broad extended tools and excludes removed Git wrappers", () => {
+  assert.equal(capabilityForTool("analyze_diff"), "symbols");
+  assert.equal(toolBelongsToSelection("analyze_diff", ["symbols"]), true);
+  assert.equal(toolBelongsToSelection("compute_cyclomatic_complexity", ["symbols"]), false);
+  assert.equal(capabilityForTool("query_code"), "query");
+  assert.equal(capabilityForTool("most_relevant_files"), "files");
+  assert.equal(capabilityForTool("list_policies"), "policies");
+  assert.equal(capabilityForTool("run_policy"), "policies");
+  assert.equal(capabilityForTool("get_git_log"), undefined);
+  assert.equal(capabilityForTool("jq"), undefined);
+  assert.equal(toolBelongsToSelection("query_code", ["query"]), true);
+  assert.equal(toolBelongsToSelection("run_policy", ["policies"]), true);
+});
+
+test("uses one stable namespace for every Pi-visible tool", () => {
+  assert.equal(piToolName("query_code"), "bifrost_query_code");
+  assert.equal(piToolName("jq"), "bifrost_jq");
+});
+
+test("does not advertise Semantic Search as a Pi capability", () => {
+  assert.equal(BIFROST_CAPABILITY_IDS.includes("semantic"), false);
+  assert.equal(capabilityForTool("semantic_search"), undefined);
+  assert.equal(toolBelongsToSelection("semantic_search", BIFROST_CAPABILITY_IDS), false);
+});

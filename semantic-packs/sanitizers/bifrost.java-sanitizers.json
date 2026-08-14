@@ -1,0 +1,578 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.java-sanitizers",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-sanitizer-foundry",
+    "version": "0.9.0"
+  },
+  "language": "java",
+  "ecosystem": "jdk",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <0.10.0",
+    "toolchains": [
+      {
+        "name": "jdk",
+        "requirement": ">=17.0.0"
+      }
+    ]
+  },
+  "provenance": {
+    "source": "audited k3 sanitizer content over the JDK standard library",
+    "revision": "k3-sanitizers"
+  },
+  "license": "LGPL-3.0-or-later",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "sanitizers.jdk",
+      "activation": [
+        {
+          "toolchain": {
+            "name": "jdk",
+            "version": ">=17.0.0"
+          },
+          "targets": [
+            "jvm"
+          ],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "java.lang.boolean.parseboolean",
+            "target": {
+              "path": "java.base/java/lang/Boolean.java",
+              "symbol": "java.lang.Boolean.parseBoolean",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css",
+                  "html",
+                  "html_attr",
+                  "js",
+                  "ldap",
+                  "log",
+                  "path",
+                  "shell",
+                  "sql",
+                  "url",
+                  "xml",
+                  "xpath"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "java.lang.byte.parsebyte",
+            "target": {
+              "path": "java.base/java/lang/Byte.java",
+              "symbol": "java.lang.Byte.parseByte",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css",
+                  "html",
+                  "html_attr",
+                  "js",
+                  "ldap",
+                  "log",
+                  "path",
+                  "shell",
+                  "sql",
+                  "url",
+                  "xml",
+                  "xpath"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "java.lang.double.parsedouble",
+            "target": {
+              "path": "java.base/java/lang/Double.java",
+              "symbol": "java.lang.Double.parseDouble",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css",
+                  "html",
+                  "html_attr",
+                  "js",
+                  "ldap",
+                  "log",
+                  "path",
+                  "shell",
+                  "sql",
+                  "url",
+                  "xml",
+                  "xpath"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "java.lang.float.parsefloat",
+            "target": {
+              "path": "java.base/java/lang/Float.java",
+              "symbol": "java.lang.Float.parseFloat",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css",
+                  "html",
+                  "html_attr",
+                  "js",
+                  "ldap",
+                  "log",
+                  "path",
+                  "shell",
+                  "sql",
+                  "url",
+                  "xml",
+                  "xpath"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "java.lang.integer.parseint",
+            "target": {
+              "path": "java.base/java/lang/Integer.java",
+              "symbol": "java.lang.Integer.parseInt",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css",
+                  "html",
+                  "html_attr",
+                  "js",
+                  "ldap",
+                  "log",
+                  "path",
+                  "shell",
+                  "sql",
+                  "url",
+                  "xml",
+                  "xpath"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "java.lang.long.parselong",
+            "target": {
+              "path": "java.base/java/lang/Long.java",
+              "symbol": "java.lang.Long.parseLong",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css",
+                  "html",
+                  "html_attr",
+                  "js",
+                  "ldap",
+                  "log",
+                  "path",
+                  "shell",
+                  "sql",
+                  "url",
+                  "xml",
+                  "xpath"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "java.lang.short.parseshort",
+            "target": {
+              "path": "java.base/java/lang/Short.java",
+              "symbol": "java.lang.Short.parseShort",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css",
+                  "html",
+                  "html_attr",
+                  "js",
+                  "ldap",
+                  "log",
+                  "path",
+                  "shell",
+                  "sql",
+                  "url",
+                  "xml",
+                  "xpath"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "java.net.urlencoder.encode",
+            "target": {
+              "path": "java.base/java/net/URLEncoder.java",
+              "symbol": "java.net.URLEncoder.encode",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css",
+                  "html",
+                  "html_attr",
+                  "js",
+                  "log",
+                  "url",
+                  "xml"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "java.util.base64.encoder.encode",
+            "target": {
+              "path": "java.base/java/util/Base64.java",
+              "symbol": "java.util.Base64.Encoder.encode",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css",
+                  "html",
+                  "html_attr",
+                  "js",
+                  "ldap",
+                  "sql",
+                  "xml",
+                  "xpath"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "java.util.base64.encoder.encodetostring",
+            "target": {
+              "path": "java.base/java/util/Base64.java",
+              "symbol": "java.util.Base64.Encoder.encodeToString",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css",
+                  "html",
+                  "html_attr",
+                  "js",
+                  "ldap",
+                  "sql",
+                  "xml",
+                  "xpath"
+                ]
+              }
+            ]
+          },
+          {
+            "id": "java.util.uuid.fromstring",
+            "target": {
+              "path": "java.base/java/util/UUID.java",
+              "symbol": "java.util.UUID.fromString",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "sanitize",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "output": {
+                  "kind": "normal_return"
+                },
+                "removes": [
+                  "css",
+                  "html",
+                  "html_attr",
+                  "js",
+                  "ldap",
+                  "log",
+                  "path",
+                  "shell",
+                  "sql",
+                  "url",
+                  "xml",
+                  "xpath"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

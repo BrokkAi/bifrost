@@ -1,0 +1,920 @@
+//! Whole-workspace inverted edge builder for C#.
+//!
+//! Walks each file once and resolves every reference to the callee fqn it names,
+//! via the shared [`build_edges`] driver. Like Java, C# references resolve
+//! through type-name resolution ([`CSharpAnalyzer::resolve_visible_type`], which
+//! honors `using` directives and the file's namespace) plus a
+//! [`LocalInferenceEngine`] seeded with every local/parameter's declared type so
+//! a member access's receiver can be typed:
+//!
+//! - a type reference (`Foo x`, `new Foo()`, `List<Foo>`) resolves to the type;
+//! - `recv.Member(..)` resolves `recv`'s type to `Owner`, giving `Owner.Member`;
+//! - `Type.Member(..)` (static) resolves the type directly;
+//! - a bare `Member(..)` attributes to the enclosing class.
+//!
+//! The enclosing class is taken from a per-file class-range index (the analyzer's
+//! own fqns), so unqualified calls attribute to the right class without
+//! re-deriving the namespace. Receivers needing return-type inference (method
+//! chains) are an unhandled recall gap, not a wrong edge.
+
+use crate::graph::CSharpGraphSource;
+use crate::graph::extractor::{
+    is_declaration_name, is_unqualified_method_group_value, member_access_name,
+    member_access_receiver,
+};
+use crate::graph::resolver::{
+    UnqualifiedMethodGroupResolution, argument_count, class_unit_for_fq_name,
+    extension_visibility_site_key, first_type_child, invocation_member_candidates_for_owner,
+    is_member_variable_declaration, is_type_reference_node, nearest_member_candidates_for_owner,
+    node_text, object_initializer_for_label, object_initializer_owner_type_node,
+    reference_type_text, resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner,
+    same_node, unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
+    usage_direct_base, usage_member_declared_type_fq_name,
+    usage_method_return_type_fq_name_for_arity, usage_relational_generic_call_has_type_argument,
+    usage_unqualified_value_member_shadows_type, usage_visible_extension_method_candidates,
+};
+use crate::graph_support::CSharpSource;
+use crate::hierarchy;
+use crate::syntax::{
+    CSharpMemberName, CSharpNamedArgumentLabel, csharp_attribute_type_names,
+    csharp_conditional_member_access, csharp_constant_pattern_type_candidate,
+    csharp_member_access_type_receiver, csharp_member_name, csharp_named_argument_label,
+    csharp_nameof_type_candidates, csharp_relational_generic_call,
+    csharp_relational_generic_call_for_argument, csharp_type_leftmost_identifier,
+    csharp_type_reference_root, csharp_unqualified_invocation_for_name,
+};
+use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node, first_precise,
+};
+use brokk_bifrost_core::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine,
+};
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::HashMap;
+use tree_sitter::Node;
+
+/// One file's `caller -> callee` edges, for the whole-workspace inverted pass.
+///
+/// The pass's fan-out -- `build_edge_output` plus `parse_and_collect`, the
+/// shared cross-language driver -- stays in `brokk-bifrost-analysis` and calls
+/// this per file, so the C# half is a pure function of a parsed file and the
+/// two sources.
+pub fn scan_file(
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpSource,
+    file: &ProjectFile,
+    input: &FileEdgeScanInput<'_>,
+) -> PerFileEdges {
+    let mut ctx = CsScan {
+        graph,
+        csharp,
+        file,
+        source: input.source,
+        class_ranges: ClassRangeIndex::build(graph.index, file),
+        method_group_cache: HashMap::default(),
+        member_cache: HashMap::default(),
+        extension_cache: HashMap::default(),
+        input,
+        edges: PerFileEdges::default(),
+    };
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    walk(input.root(), &mut ctx, &mut bindings);
+    ctx.edges
+}
+
+struct CsScan<'a> {
+    graph: &'a CSharpGraphSource<'a>,
+    csharp: &'a dyn CSharpSource,
+    file: &'a ProjectFile,
+    source: &'a str,
+    class_ranges: ClassRangeIndex,
+    method_group_cache: HashMap<(String, String), UnqualifiedMethodGroupResolution>,
+    member_cache: HashMap<MemberCacheKey, Vec<String>>,
+    extension_cache: HashMap<ExtensionCacheKey, Vec<String>>,
+    input: &'a FileEdgeScanInput<'a>,
+    edges: PerFileEdges,
+}
+
+type ExtensionCacheKey = (String, String, usize, Option<usize>, usize, usize);
+type MemberCacheKey = (String, String, Option<usize>, Option<usize>);
+
+impl CsScan<'_> {
+    /// Resolve a type reference's text to its fqn via lexical scope, then visible types.
+    fn resolve_type_fqn_at(&self, text: &str, node: Node<'_>) -> Option<String> {
+        resolve_type_fq_name_at(
+            self.csharp,
+            self.file,
+            &self.class_ranges,
+            text,
+            node,
+            self.source,
+        )
+    }
+
+    /// The fqn of the smallest class declaration containing `byte`.
+    fn enclosing_class(&self, byte: usize) -> Option<&str> {
+        self.class_ranges.enclosing(byte)
+    }
+
+    fn record(&mut self, callee: String, node: Node<'_>) {
+        self.edges.record_kind(
+            self.input,
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
+    }
+
+    fn record_unproven(&mut self, name: &str, node: Node<'_>) {
+        self.edges
+            .record_unproven_name(self.input, name, node.start_byte(), node.end_byte());
+    }
+
+    fn record_unproven_callee(&mut self, callee: String, node: Node<'_>) {
+        self.edges
+            .record_unproven(self.input, callee, node.start_byte(), node.end_byte());
+    }
+
+    fn record_nearest_member(
+        &mut self,
+        owner_fqn: &str,
+        name: &str,
+        node: Node<'_>,
+        call_arity: Option<usize>,
+        explicit_generic_arity: Option<usize>,
+        same_owner: bool,
+    ) {
+        let key = (
+            owner_fqn.to_string(),
+            name.to_string(),
+            explicit_generic_arity,
+            call_arity,
+        );
+        if !self.member_cache.contains_key(&key) {
+            let candidates = class_unit_for_fq_name(self.csharp, owner_fqn)
+                .map(|owner| {
+                    call_arity.map_or_else(
+                        || {
+                            nearest_member_candidates_for_owner(
+                                self.graph,
+                                self.csharp,
+                                &owner,
+                                name,
+                                explicit_generic_arity,
+                            )
+                        },
+                        |arity| {
+                            invocation_member_candidates_for_owner(
+                                self.graph,
+                                self.csharp,
+                                &owner,
+                                name,
+                                explicit_generic_arity,
+                                arity,
+                            )
+                        },
+                    )
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .map(|candidate| candidate.fq_name())
+                .collect();
+            self.member_cache.insert(key.clone(), candidates);
+        }
+        let candidates = self
+            .member_cache
+            .get(&key)
+            .expect("member cache entry was inserted");
+        let callees = candidates.clone();
+        if !callees.is_empty() {
+            for callee in callees {
+                // Same-owner (`this.`, bare implicit-this, own-type static) calls
+                // are unproven inbound rather than proven edges (#1138): a member
+                // reachable only through same-owner calls reads INCONCLUSIVE,
+                // never confidently dead.
+                if same_owner {
+                    self.record_unproven_callee(callee, node);
+                } else {
+                    self.record(callee, node);
+                }
+            }
+            return;
+        }
+
+        let extension_callees = call_arity
+            .map(|call_arity| {
+                let (scope_start, scope_end) = extension_visibility_site_key(node);
+                let extension_key = (
+                    owner_fqn.to_string(),
+                    name.to_string(),
+                    call_arity,
+                    explicit_generic_arity,
+                    scope_start,
+                    scope_end,
+                );
+                if !self.extension_cache.contains_key(&extension_key) {
+                    let receiver_types = [owner_fqn.to_string()];
+                    let mut extensions = usage_visible_extension_method_candidates(
+                        self.csharp,
+                        self.graph,
+                        self.source,
+                        node,
+                        &receiver_types,
+                        name,
+                        Some(call_arity),
+                        explicit_generic_arity,
+                        false,
+                    )
+                    .into_iter()
+                    .map(|extension| extension.fq_name())
+                    .collect::<Vec<_>>();
+                    extensions.sort();
+                    extensions.dedup();
+                    self.extension_cache
+                        .insert(extension_key.clone(), extensions);
+                }
+                self.extension_cache
+                    .get(&extension_key)
+                    .expect("extension cache entry was inserted")
+                    .clone()
+            })
+            .unwrap_or_default();
+        if !extension_callees.is_empty() {
+            for callee in extension_callees {
+                if same_owner {
+                    self.record_unproven_callee(callee, node);
+                } else {
+                    self.record(callee, node);
+                }
+            }
+            return;
+        }
+
+        if candidates.is_empty() {
+            if explicit_generic_arity.is_some() || same_owner {
+                self.record_unproven(name, node);
+            } else {
+                self.record(format!("{owner_fqn}.{name}"), node);
+            }
+        }
+    }
+}
+
+const SCOPE_NODES: &[&str] = &[
+    "method_declaration",
+    "constructor_declaration",
+    "destructor_declaration",
+    "operator_declaration",
+    "accessor_declaration",
+    "local_function_statement",
+    "lambda_expression",
+    "block",
+    "for_statement",
+    "for_each_statement",
+    "using_statement",
+    "catch_clause",
+];
+
+fn walk(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &mut LocalInferenceEngine<String>) {
+    let enters_scope = SCOPE_NODES.contains(&node.kind());
+    if enters_scope {
+        bindings.enter_scope();
+    }
+    seed_declaration(node, ctx, bindings);
+    record_reference(node, ctx, bindings);
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk(child, ctx, bindings);
+    }
+
+    if enters_scope {
+        bindings.exit_scope();
+    }
+}
+
+fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInferenceEngine<String>) {
+    let recovered_method_group =
+        csharp_relational_generic_call_for_argument(node).is_some_and(|call| {
+            usage_relational_generic_call_has_type_argument(
+                call,
+                ctx.graph,
+                ctx.csharp,
+                ctx.file,
+                &ctx.class_ranges,
+                ctx.source,
+                bindings,
+            )
+        });
+    if let Some(candidate) = csharp_constant_pattern_type_candidate(node) {
+        record_structured_type_candidate(candidate, true, ctx, bindings);
+    }
+    if let Some(receiver) = csharp_member_access_type_receiver(node) {
+        record_structured_type_candidate(receiver, true, ctx, bindings);
+    }
+    if let Some((operand, qualified_owner)) = csharp_nameof_type_candidates(node, ctx.source)
+        && !record_structured_type_candidate(operand, true, ctx, bindings)
+        && let Some(owner) = qualified_owner
+    {
+        record_structured_type_candidate(owner, true, ctx, bindings);
+    }
+    if !recovered_method_group
+        && let Some(root) = csharp_type_reference_root(node)
+        && same_node(root, node)
+    {
+        record_structured_type_candidate(root, false, ctx, bindings);
+        return;
+    }
+    match node.kind() {
+        "attribute" => {
+            let Some(name) = node.child_by_field_name("name") else {
+                return;
+            };
+            let names = csharp_attribute_type_names(name, ctx.source);
+            for candidate in
+                hierarchy::usage_unambiguous_attribute_type_candidates(ctx.csharp, ctx.file, &names)
+            {
+                ctx.record(candidate.fq_name(), name);
+            }
+        }
+        // A type reference (`Foo x`, `new Foo()`, generics) resolves to the type
+        // node. `new Foo()`'s type child is itself a type reference, so it is
+        // covered here without a separate object-creation case.
+        "identifier" | "type" => {
+            if node.kind() == "identifier"
+                && let Some(shape) = csharp_named_argument_label(node)
+            {
+                // `[Svc(Lifetime = ..)]` writes a member of the attribute type,
+                // so the label is a usage of that member (#1796). A plain
+                // `name:` label names a parameter, which is not a declaration.
+                if let CSharpNamedArgumentLabel::AttributeMember { attribute_name } = shape {
+                    let name = node_text(node, ctx.source);
+                    let names = csharp_attribute_type_names(attribute_name, ctx.source);
+                    let owners = hierarchy::usage_unambiguous_attribute_type_candidates(
+                        ctx.csharp, ctx.file, &names,
+                    );
+                    if owners.is_empty() {
+                        ctx.record_unproven(name, node);
+                    } else {
+                        for owner in owners {
+                            ctx.record_nearest_member(
+                                &owner.fq_name(),
+                                name,
+                                node,
+                                None,
+                                None,
+                                false,
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+            if node.kind() == "identifier"
+                && let Some(initializer) = object_initializer_for_label(node)
+            {
+                let name = node_text(node, ctx.source);
+                if let Some(type_node) = object_initializer_owner_type_node(initializer)
+                    && let Some(owner) = ctx
+                        .resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
+                {
+                    ctx.record_nearest_member(&owner, name, node, None, None, false);
+                } else {
+                    ctx.record_unproven(name, node);
+                }
+                return;
+            }
+            if node.kind() == "identifier"
+                && let Some((invocation, explicit_generic_arity)) =
+                    csharp_unqualified_invocation_for_name(node)
+            {
+                let name = node_text(node, ctx.source);
+                if unqualified_member_has_local_binding(node, ctx.source, bindings)
+                    || unqualified_member_has_structured_shadow(node, ctx.source)
+                {
+                    return;
+                }
+                if let Some(owner) = ctx.enclosing_class(node.start_byte()).map(str::to_string) {
+                    let arity = argument_count(invocation, ctx.source);
+                    // A bare `Member(..)` is an implicit-this call on the current
+                    // instance — a same-owner reference (#1138), now routed to
+                    // unproven inbound. This is the inverted routing that unlocks
+                    // the scan-side bare-implicit-this widening (#1014 deferral).
+                    ctx.record_nearest_member(
+                        &owner,
+                        name,
+                        node,
+                        Some(arity),
+                        explicit_generic_arity,
+                        true,
+                    );
+                }
+                return;
+            }
+            if recovered_method_group || is_declaration_name(node) || !is_type_reference_node(node)
+            {
+                // Unqualified calls and method-group values attribute to the enclosing class.
+                if recovered_method_group || is_unqualified_method_group_value(node, ctx.source) {
+                    let Some(owner_fqn) = ctx
+                        .class_ranges
+                        .enclosing(node.start_byte())
+                        .map(str::to_string)
+                    else {
+                        return;
+                    };
+                    let name = node_text(node, ctx.source).to_string();
+                    if unqualified_member_has_local_binding(node, ctx.source, bindings) {
+                        return;
+                    }
+                    let key = (owner_fqn.clone(), name.clone());
+                    let resolution = if let Some(cached) = ctx.method_group_cache.get(&key) {
+                        cached.clone()
+                    } else {
+                        let Some(owner) = class_unit_for_fq_name(ctx.csharp, &owner_fqn) else {
+                            return;
+                        };
+                        let resolution = resolve_unqualified_method_group_for_owner(
+                            ctx.graph, ctx.csharp, &owner, &name,
+                        );
+                        ctx.method_group_cache.insert(key, resolution.clone());
+                        resolution
+                    };
+                    if matches!(&resolution, UnqualifiedMethodGroupResolution::NoMember)
+                        || unqualified_member_has_structured_shadow(node, ctx.source)
+                    {
+                        return;
+                    }
+                    match resolution {
+                        UnqualifiedMethodGroupResolution::Unique(candidate) => {
+                            ctx.record(candidate.fq_name(), node);
+                        }
+                        UnqualifiedMethodGroupResolution::Ambiguous(candidates) => {
+                            let mut callees = candidates
+                                .into_iter()
+                                .map(|candidate| candidate.fq_name())
+                                .collect::<Vec<_>>();
+                            callees.sort();
+                            callees.dedup();
+                            for callee in callees {
+                                ctx.record_unproven_callee(callee, node);
+                            }
+                        }
+                        UnqualifiedMethodGroupResolution::NoMember => {}
+                    }
+                }
+                return;
+            }
+            let reference = reference_type_text(node, ctx.source);
+            if let Some(fqn) = ctx.resolve_type_fqn_at(&reference, node) {
+                ctx.record(fqn, node);
+            }
+        }
+        "member_access_expression" | "conditional_access_expression" => {
+            let access = match node.kind() {
+                "member_access_expression" => {
+                    member_access_receiver(node).zip(member_access_name(node))
+                }
+                _ => csharp_conditional_member_access(node)
+                    .map(|access| (access.receiver, access.name)),
+            };
+            let Some((receiver, name_node)) = access else {
+                return;
+            };
+            let Some(name_shape) = csharp_member_name(name_node) else {
+                return;
+            };
+            let name = node_text(name_shape.identifier, ctx.source);
+            if name.is_empty() {
+                return;
+            }
+            if let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) {
+                let recovered_call = csharp_relational_generic_call(node).filter(|call| {
+                    usage_relational_generic_call_has_type_argument(
+                        *call,
+                        ctx.graph,
+                        ctx.csharp,
+                        ctx.file,
+                        &ctx.class_ranges,
+                        ctx.source,
+                        bindings,
+                    )
+                });
+                let call_arity = node
+                    .parent()
+                    .and_then(|parent| {
+                        (parent.kind() == "invocation_expression"
+                            && parent.child_by_field_name("function") == Some(node))
+                        .then(|| argument_count(parent, ctx.source))
+                    })
+                    .or_else(|| recovered_call.map(|call| call.call_arity));
+                let explicit_generic_arity = name_shape
+                    .explicit_generic_arity
+                    .or_else(|| recovered_call.map(|call| call.explicit_generic_arity));
+                // `this.Member` / own-type-static `Owner.Member` (from within
+                // `Owner`) is a same-owner reference (#1138) → unproven inbound.
+                // `base.Member` and a call through another same-type variable stay
+                // external.
+                let same_owner = csharp_receiver_is_same_owner(receiver, ctx, bindings);
+                ctx.record_nearest_member(
+                    &owner,
+                    name,
+                    name_shape.identifier,
+                    call_arity,
+                    explicit_generic_arity,
+                    same_owner,
+                );
+            } else {
+                ctx.record_unproven(name, name_shape.identifier);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn record_structured_type_candidate(
+    candidate: Node<'_>,
+    reject_value_receiver: bool,
+    ctx: &mut CsScan<'_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> bool {
+    if reject_value_receiver {
+        let Some(leftmost) = csharp_type_leftmost_identifier(candidate) else {
+            return false;
+        };
+        if unqualified_value_shadows_type(leftmost, ctx, bindings) {
+            return false;
+        }
+    }
+    let reference = reference_type_text(candidate, ctx.source);
+    if let Some(fqn) = ctx.resolve_type_fqn_at(&reference, candidate) {
+        ctx.record(fqn, candidate);
+        true
+    } else {
+        false
+    }
+}
+
+fn unqualified_value_shadows_type(
+    node: Node<'_>,
+    ctx: &CsScan<'_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> bool {
+    let name = node_text(node, ctx.source);
+    !bindings.resolve_symbol(name).is_unknown()
+        || unqualified_member_has_structured_shadow(node, ctx.source)
+        || usage_unqualified_value_member_shadows_type(
+            node, name, ctx.graph, ctx.csharp, ctx.file, ctx.source,
+        )
+}
+
+/// Whether a member-access receiver is a same-owner receiver: an explicit `this`
+/// receiver, or the owner type itself for an own-type static call
+/// (`Owner.StaticMember` from within `Owner`). A `base` receiver, or a call
+/// through a differently-named local/parameter — even one of the same type —
+/// stays external (#1138). Mirrors Java's `method_invocation_receiver_is_same_owner`.
+fn csharp_receiver_is_same_owner(
+    receiver: Node<'_>,
+    ctx: &CsScan<'_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> bool {
+    let Some(enclosing_owner) = ctx.enclosing_class(receiver.start_byte()) else {
+        return false;
+    };
+    match receiver.kind() {
+        "this" => true,
+        "base" => false,
+        "identifier" | "qualified_name" | "generic_name" => {
+            let name = node_text(receiver, ctx.source);
+            if name.is_empty() {
+                return false;
+            }
+            // A typed or shadowed local/parameter is a value of some type, not the
+            // own type used as a static receiver — a different instance.
+            if first_precise(bindings, name).is_some() || bindings.is_shadowed(name) {
+                return false;
+            }
+            ctx.resolve_type_fqn_at(&reference_type_text(receiver, ctx.source), receiver)
+                .is_some_and(|receiver_fqn| receiver_fqn == enclosing_owner)
+        }
+        _ => false,
+    }
+}
+
+/// The fqn of a receiver expression's type, for the shapes that resolve without
+/// return-type inference.
+fn receiver_type_fqn(
+    receiver: Node<'_>,
+    ctx: &CsScan<'_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    match receiver.kind() {
+        "identifier" => {
+            let name = node_text(receiver, ctx.source);
+            // A typed local resolves to its type; otherwise the name may be a
+            // class field/property or a static type, unless it is shadowed.
+            first_precise(bindings, name).or_else(|| {
+                if bindings.is_shadowed(name) {
+                    return None;
+                }
+                enclosing_member_type_fqn(receiver, name, ctx)
+                    .or_else(|| ctx.resolve_type_fqn_at(name, receiver))
+            })
+        }
+        "this" => ctx
+            .enclosing_class(receiver.start_byte())
+            .map(str::to_string),
+        "base" => ctx
+            .enclosing_class(receiver.start_byte())
+            .and_then(|owner| class_unit_for_fq_name(ctx.csharp, owner))
+            .and_then(|owner| usage_direct_base(ctx.graph, ctx.csharp, &owner))
+            .map(|owner| owner.fq_name()),
+        "invocation_expression" => invocation_return_type_fqn(receiver, ctx, bindings),
+        "parenthesized_expression" | "checked_expression" => receiver
+            .named_child(0)
+            .and_then(|inner| receiver_type_fqn(inner, ctx, bindings)),
+        "cast_expression" | "as_expression" => receiver
+            .child_by_field_name(if receiver.kind() == "cast_expression" {
+                "type"
+            } else {
+                "right"
+            })
+            .and_then(|type_node| {
+                ctx.resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
+            }),
+        "member_access_expression" | "conditional_access_expression" => {
+            expression_type_fqn(receiver, ctx, bindings)
+        }
+        "qualified_name" | "generic_name" => {
+            ctx.resolve_type_fqn_at(&reference_type_text(receiver, ctx.source), receiver)
+        }
+        _ => None,
+    }
+}
+
+fn seed_declaration(node: Node<'_>, ctx: &CsScan<'_>, bindings: &mut LocalInferenceEngine<String>) {
+    match node.kind() {
+        "parameter" => {
+            let (Some(name), Some(type_node)) = (
+                node.child_by_field_name("name"),
+                node.child_by_field_name("type"),
+            ) else {
+                return;
+            };
+            seed_typed(
+                name,
+                ctx.resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node),
+                ctx,
+                bindings,
+            );
+        }
+        "variable_declaration" => seed_variable_declaration(node, ctx, bindings),
+        _ => {}
+    }
+}
+
+fn seed_variable_declaration(
+    node: Node<'_>,
+    ctx: &CsScan<'_>,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
+    if is_member_variable_declaration(node) {
+        return;
+    }
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return;
+    };
+    let type_text = reference_type_text(type_node, ctx.source);
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "variable_declarator" {
+            continue;
+        }
+        let Some(name) = child.child_by_field_name("name") else {
+            continue;
+        };
+        // `var x = new Foo()` infers from the initializer; other `var` is unknown.
+        let resolved = if type_text == "var" {
+            object_created_type(child)
+                .and_then(|type_node| {
+                    ctx.resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
+                })
+                .or_else(|| var_initializer_type(child, ctx, bindings))
+        } else {
+            ctx.resolve_type_fqn_at(&type_text, type_node)
+        };
+        seed_typed(name, resolved, ctx, bindings);
+    }
+}
+
+fn seed_typed(
+    name: Node<'_>,
+    resolved: Option<String>,
+    ctx: &CsScan<'_>,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
+    let binding_name = node_text(name, ctx.source);
+    if binding_name.is_empty() {
+        return;
+    }
+    match resolved {
+        Some(fqn) => bindings.seed_symbol(binding_name.to_string(), fqn),
+        None => bindings.declare_shadow(binding_name.to_string()),
+    }
+}
+
+/// The type node of a `new Foo()` initializer reachable from a declarator.
+fn object_created_type(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() == "object_creation_expression" {
+        return node
+            .child_by_field_name("type")
+            .or_else(|| first_type_child(node));
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(object_created_type)
+}
+
+fn var_initializer_type(
+    declarator: Node<'_>,
+    ctx: &CsScan<'_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    let initializer = variable_declarator_initializer(declarator)?;
+    expression_type_fqn(initializer, ctx, bindings)
+}
+
+fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
+    declarator
+        .child_by_field_name("value")
+        .or_else(|| declarator.child_by_field_name("initializer"))
+        .or_else(|| {
+            let mut cursor = declarator.walk();
+            declarator
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "equals_value_clause")
+                .and_then(|clause| {
+                    clause
+                        .child_by_field_name("value")
+                        .or_else(|| clause.named_child(0))
+                })
+        })
+        .or_else(|| {
+            let name = declarator.child_by_field_name("name")?;
+            let mut cursor = declarator.walk();
+            declarator
+                .named_children(&mut cursor)
+                .find(|child| child.start_byte() > name.end_byte())
+        })
+}
+
+fn expression_type_fqn(
+    expression: Node<'_>,
+    ctx: &CsScan<'_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    match expression.kind() {
+        "object_creation_expression" => object_created_type(expression).and_then(|type_node| {
+            ctx.resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
+        }),
+        "invocation_expression" => invocation_return_type_fqn(expression, ctx, bindings),
+        "parenthesized_expression" | "checked_expression" => expression
+            .named_child(0)
+            .and_then(|inner| expression_type_fqn(inner, ctx, bindings)),
+        "cast_expression" | "as_expression" => expression
+            .child_by_field_name(if expression.kind() == "cast_expression" {
+                "type"
+            } else {
+                "right"
+            })
+            .and_then(|type_node| {
+                ctx.resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
+            }),
+        "member_access_expression" | "conditional_access_expression" => {
+            let (receiver, name_node) = match expression.kind() {
+                "member_access_expression" => (
+                    member_access_receiver(expression)?,
+                    member_access_name(expression)?,
+                ),
+                _ => {
+                    let access = csharp_conditional_member_access(expression)?;
+                    (access.receiver, access.name)
+                }
+            };
+            let owner_fqn = receiver_type_fqn(receiver, ctx, bindings)?;
+            let owner = class_unit_for_fq_name(ctx.csharp, &owner_fqn)?;
+            let name = csharp_member_name(name_node)?;
+            usage_member_declared_type_fq_name(
+                ctx.csharp,
+                &owner,
+                node_text(name.identifier, ctx.source),
+            )
+        }
+        "identifier" => {
+            let name = node_text(expression, ctx.source);
+            first_precise(bindings, name).or_else(|| {
+                (!bindings.is_shadowed(name))
+                    .then(|| enclosing_member_type_fqn(expression, name, ctx))
+                    .flatten()
+            })
+        }
+        _ => None,
+    }
+}
+
+fn enclosing_member_type_fqn(node: Node<'_>, name: &str, ctx: &CsScan<'_>) -> Option<String> {
+    let owner_fqn = ctx.enclosing_class(node.start_byte())?;
+    let owner = class_unit_for_fq_name(ctx.csharp, owner_fqn)?;
+    usage_member_declared_type_fq_name(ctx.csharp, &owner, name)
+}
+
+fn invocation_return_type_fqn(
+    invocation: Node<'_>,
+    ctx: &CsScan<'_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    let function = invocation.child_by_field_name("function")?;
+    match function.kind() {
+        "identifier" => {
+            let name = node_text(function, ctx.source);
+            let owner_fqn = ctx.enclosing_class(invocation.start_byte())?;
+            let owner = class_unit_for_fq_name(ctx.csharp, owner_fqn)?;
+            method_return_type_for_call(
+                ctx,
+                &owner,
+                name,
+                argument_count(invocation, ctx.source),
+                None,
+                None,
+            )
+        }
+        "generic_name" => {
+            let name = csharp_member_name(function)?;
+            let type_arguments = resolved_type_arguments(name, ctx);
+            let owner_fqn = ctx.enclosing_class(invocation.start_byte())?;
+            let owner = class_unit_for_fq_name(ctx.csharp, owner_fqn)?;
+            method_return_type_for_call(
+                ctx,
+                &owner,
+                node_text(name.identifier, ctx.source),
+                argument_count(invocation, ctx.source),
+                name.explicit_generic_arity,
+                type_arguments.as_deref(),
+            )
+        }
+        "member_access_expression" | "conditional_access_expression" => {
+            let (receiver, name_node) = match function.kind() {
+                "member_access_expression" => (
+                    member_access_receiver(function)?,
+                    member_access_name(function)?,
+                ),
+                _ => {
+                    let access = csharp_conditional_member_access(function)?;
+                    (access.receiver, access.name)
+                }
+            };
+            let name = csharp_member_name(name_node)?;
+            let type_arguments = resolved_type_arguments(name, ctx);
+            let owner_fqn = receiver_type_fqn(receiver, ctx, bindings)?;
+            let owner = class_unit_for_fq_name(ctx.csharp, &owner_fqn)?;
+            method_return_type_for_call(
+                ctx,
+                &owner,
+                node_text(name.identifier, ctx.source),
+                argument_count(invocation, ctx.source),
+                name.explicit_generic_arity,
+                type_arguments.as_deref(),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn method_return_type_for_call(
+    ctx: &CsScan<'_>,
+    owner: &CodeUnit,
+    method_name: &str,
+    arity: usize,
+    explicit_generic_arity: Option<usize>,
+    explicit_type_arguments: Option<&[String]>,
+) -> Option<String> {
+    usage_method_return_type_fq_name_for_arity(
+        ctx.csharp,
+        owner,
+        method_name,
+        Some(arity),
+        explicit_generic_arity,
+        explicit_type_arguments,
+    )
+}
+
+fn resolved_type_arguments(name: CSharpMemberName<'_>, ctx: &CsScan<'_>) -> Option<Vec<String>> {
+    let arguments = name.type_arguments?;
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .map(|argument| {
+            ctx.resolve_type_fqn_at(&reference_type_text(argument, ctx.source), argument)
+        })
+        .collect()
+}

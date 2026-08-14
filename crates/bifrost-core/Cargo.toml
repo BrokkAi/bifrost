@@ -1,0 +1,49 @@
+[package]
+name = "brokk-bifrost-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Foundation model, project, and workspace utilities shared by every brokk-bifrost crate"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+publish = true
+
+[lib]
+name = "brokk_bifrost_core"
+
+[dependencies]
+bincode = "1.3.3"
+git2 = { version = "0.20.2", default-features = false }
+growable-bloom-filter = "2.1"
+ignore = "0.4.24"
+moka = { version = "0.12.11", features = ["sync"] }
+once_cell = "1.21.3"
+rayon = "1.10.0"
+# `backup` carries a cache store forward across schema versions: it copies a
+# live source through SQLite rather than the filesystem, so committed pages
+# sitting in the source's `-wal` sidecar come along (issue #1589).
+rusqlite = { version = "0.32.1", features = ["bundled", "backup"] }
+rustc-hash = "2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+# `canonical_hash` is the workspace's single content-addressing primitive; the
+# same 0.10.8 already reached the dependency graph through analysis, mcp, nlp
+# and policy, so this adds a manifest line rather than a new third party.
+sha2 = "0.10.8"
+smallvec = "1"
+tempfile = "3.23.0"
+tree-sitter = "0.25.10"
+walkdir = "2.5.0"
+
+[features]
+default = []
+# CI-only mode that exposes accidental dependence on hash iteration order.
+randomized-hash = []
+# Mirrors `brokk-bifrost-analysis`'s feature of the same name: the analysis
+# crate's `test-support` turns this on so the cancellation hooks stay a single
+# implementation rather than a copy on each side of the seam.
+test-support = []

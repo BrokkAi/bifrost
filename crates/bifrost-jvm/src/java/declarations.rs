@@ -1,0 +1,1464 @@
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::model::{CallableArity, SignatureMetadata};
+use brokk_bifrost_core::analyzer::model::{DeclarationInfo, DeclarationKind};
+use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
+use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::HashSet;
+use tree_sitter::{Node, Parser, Tree};
+
+use crate::java::imports::parse_import_info;
+
+/// Intern one qualified-name segment in the process-global interner.
+fn java_segment(text: &str, kind: SegmentKind) -> SegmentId {
+    segment_interner().intern(text, kind)
+}
+
+/// Build the structured package-path prefix for a Java declaration.
+///
+/// `package_name` (from `determine_package_name`) is already the `.`-joined
+/// dotted package (`com.example.pkg`, empty for the unnamed package). Java
+/// identifiers can never contain a literal `.`, so splitting on `.` is
+/// lossless; each component becomes one [`SegmentKind::Package`] segment —
+/// mirroring python's `python_module_fq` (`Package`-`Package` renders `.` by
+/// default, which is exactly this convention; unlike go's `/`-joined import
+/// path, java's package has no `Path` component).
+fn java_package_fq(package_name: &str) -> FqName {
+    let mut fq = FqName::new();
+    for component in package_name.split('.').filter(|c| !c.is_empty()) {
+        fq.push(java_segment(component, SegmentKind::Package));
+    }
+    fq
+}
+
+pub fn determine_package_name(root: Node<'_>, source: &str) -> String {
+    for index in 0..root.named_child_count() {
+        let Some(child) = root.named_child(index) else {
+            continue;
+        };
+
+        if child.kind() == "package_declaration" {
+            return node_text(child, source)
+                .trim()
+                .strip_prefix("package ")
+                .unwrap_or("")
+                .strip_suffix(';')
+                .unwrap_or("")
+                .trim()
+                .to_string();
+        }
+
+        if is_class_like_declaration_kind(child.kind()) {
+            break;
+        }
+    }
+
+    String::new()
+}
+
+fn strip_generic_type_arguments(input: &str) -> String {
+    let mut depth = 0usize;
+    let mut out = String::with_capacity(input.len());
+
+    for ch in input.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+
+    out
+}
+
+pub fn normalize_java_full_name(fq_name: &str) -> String {
+    let mut normalized = strip_generic_type_arguments(fq_name);
+
+    if normalized.contains("$anon$") {
+        let mut out = String::with_capacity(normalized.len());
+        let mut chars = normalized.char_indices();
+
+        while let Some((index, ch)) = chars.next() {
+            if normalized[index..].starts_with("$anon$") {
+                out.push_str("$anon$");
+                for _ in 0.."anon$".len() {
+                    chars.next();
+                }
+                continue;
+            }
+
+            out.push(if ch == '$' { '.' } else { ch });
+        }
+
+        return out;
+    }
+
+    normalized = strip_trailing_numeric_suffix(&normalized);
+    normalized = strip_location_suffix(&normalized);
+    normalized.replace('$', ".")
+}
+
+fn strip_trailing_numeric_suffix(input: &str) -> String {
+    let colon_split = input.rsplit_once(':');
+    let candidate = colon_split.map(|(head, _)| head).unwrap_or(input);
+    // fqname-M4: parses a JVM bytecode-derived synthetic name (anonymous `$<digits>` suffix),
+    // not a CodeUnit's structured short_name — the `$anon`/binary-name subsystem, not fq inference.
+    let Some((prefix, suffix)) = candidate.rsplit_once('$') else {
+        return input.to_string();
+    };
+
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return input.to_string();
+    }
+
+    if let Some((_, location)) = colon_split {
+        format!("{prefix}:{location}")
+    } else {
+        prefix.to_string()
+    }
+}
+
+fn strip_location_suffix(input: &str) -> String {
+    let Some((head, tail)) = input.rsplit_once(':') else {
+        return input.to_string();
+    };
+    if !tail.bytes().all(|byte| byte.is_ascii_digit()) {
+        return input.to_string();
+    }
+
+    if let Some((grand_head, middle)) = head.rsplit_once(':')
+        && middle.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return grand_head.to_string();
+    }
+
+    head.to_string()
+}
+
+pub fn extract_java_call_receiver(reference: &str) -> Option<String> {
+    let trimmed = reference.trim();
+    if trimmed.is_empty() || !trimmed.is_ascii() {
+        return None;
+    }
+
+    let before_args = trimmed
+        .split_once('(')
+        .map(|(head, _)| head)
+        .unwrap_or(trimmed)
+        .trim();
+    let (receiver, method_name) = before_args.rsplit_once('.')?;
+    if receiver.is_empty() || method_name.is_empty() || receiver.contains('$') {
+        return None;
+    }
+
+    if !looks_like_java_method_name(method_name) {
+        return None;
+    }
+
+    let segments: Vec<_> = receiver.split('.').collect();
+    let last = *segments.last()?;
+    if !looks_like_pascal_identifier(last) {
+        return None;
+    }
+
+    for segment in &segments {
+        if segment.is_empty()
+            || !segment
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return None;
+        }
+
+        let first = segment.as_bytes()[0] as char;
+        if !first.is_ascii_lowercase() && !first.is_ascii_uppercase() {
+            return None;
+        }
+    }
+
+    Some(receiver.to_string())
+}
+
+fn looks_like_java_method_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    first.is_ascii_lowercase() && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn looks_like_pascal_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    first.is_ascii_uppercase() && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+pub fn is_java_anonymous_structure(fq_name: &str) -> bool {
+    fq_name.contains("$anon$")
+        || fq_name
+            // fqname-M4: classifies a JVM bytecode-derived anonymous-structure name, not a CodeUnit fq
+            .rsplit_once('$')
+            .map(|(_, suffix)| suffix.chars().all(|ch| ch.is_ascii_digit()))
+            .unwrap_or(false)
+}
+
+pub fn collect_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut HashSet<String>) {
+    walk_named_tree_preorder(node, true, |node| {
+        match node.kind() {
+            "type_identifier" | "scoped_type_identifier" => {
+                let text = node_text(node, source).trim();
+                if !text.is_empty() {
+                    identifiers.insert(text.to_string());
+                }
+            }
+            _ => {}
+        }
+        WalkControl::Continue
+    });
+}
+
+pub fn visit_class_like(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    package_name: &str,
+    parent: Option<&CodeUnit>,
+    top_level_owner: Option<&CodeUnit>,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+) -> Option<CodeUnit> {
+    let mut first = None;
+    let mut stack = vec![(node, parent.cloned(), top_level_owner.cloned())];
+    while let Some((node, parent, top_level_owner)) = stack.pop() {
+        let Some(name_node) = node.child_by_field_name("name") else {
+            continue;
+        };
+
+        let simple_name = node_text(name_node, source).trim().to_string();
+        if simple_name.is_empty() {
+            continue;
+        }
+
+        let short_name = parent
+            .as_ref()
+            .map(|parent| format!("{}.{}", parent.short_name(), simple_name))
+            .unwrap_or(simple_name.clone());
+        // A nested class joins its parent with an ordinary `.` in Java's legacy
+        // convention (unlike python/php/ruby's `$`-joined nesting), so it is a
+        // plain `Type` segment hanging off the parent's own `Type` chain; a
+        // top-level class hangs off the package-path `Package` chain instead.
+        let fq = match &parent {
+            Some(parent) => parent
+                .fq()
+                .clone()
+                .with_pushed(java_segment(&simple_name, SegmentKind::Type)),
+            None => java_package_fq(package_name)
+                .with_pushed(java_segment(&simple_name, SegmentKind::Type)),
+        };
+
+        let code_unit = CodeUnit::new_fq(
+            file.clone(),
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Class,
+            package_name.to_string(),
+            short_name,
+            fq,
+        );
+        if first.is_none() {
+            first = Some(code_unit.clone());
+        }
+        let raw_supertypes = extract_raw_supertypes(node, source);
+        let signature = class_signature(node, source);
+        let class_is_static = java_class_like_is_static(node, parent.as_ref());
+
+        let top_level = top_level_owner.unwrap_or_else(|| code_unit.clone());
+        parsed.add_code_unit(
+            code_unit.clone(),
+            node,
+            source,
+            parent.clone(),
+            Some(top_level.clone()),
+        );
+        parsed.set_raw_supertypes(code_unit.clone(), raw_supertypes);
+        // The declaration node's own kind is what separates an interface from a
+        // class; recording it here is what lets a family edge state `implements`
+        // rather than `overrides` without re-reading the owner's source. A Java
+        // annotation type is an interface -- `@interface Marker` declares
+        // `interface Marker extends java.lang.annotation.Annotation` -- so a
+        // class that names one in its `implements` clause implements it.
+        parsed.add_signature_with_metadata(
+            code_unit.clone(),
+            SignatureMetadata::new(signature, Vec::new())
+                .with_class_like_interface(matches!(
+                    node.kind(),
+                    "interface_declaration" | "annotation_type_declaration"
+                ))
+                .with_class_like_static(class_is_static),
+        );
+
+        if node.kind() == "record_declaration" {
+            visit_record_components(
+                file,
+                source,
+                node,
+                package_name,
+                &code_unit,
+                &top_level,
+                parsed,
+            );
+        }
+
+        if let Some(body) = node.child_by_field_name("body") {
+            for child in class_like_body_children_rev(body) {
+                match child.kind() {
+                    kind if is_class_like_declaration_kind(kind) => {
+                        stack.push((child, Some(code_unit.clone()), Some(top_level.clone())));
+                    }
+                    "method_declaration" | "constructor_declaration" => {
+                        visit_callable(
+                            file,
+                            source,
+                            child,
+                            package_name,
+                            &code_unit,
+                            &top_level,
+                            parsed,
+                        );
+                    }
+                    "compact_constructor_declaration" if node.kind() == "record_declaration" => {
+                        visit_compact_constructor(
+                            file,
+                            source,
+                            child,
+                            node,
+                            package_name,
+                            &code_unit,
+                            &top_level,
+                            parsed,
+                        );
+                    }
+                    "field_declaration" | "constant_declaration" => {
+                        visit_field_declaration(
+                            file,
+                            source,
+                            child,
+                            package_name,
+                            &code_unit,
+                            &top_level,
+                            parsed,
+                        );
+                    }
+                    "enum_constant" => {
+                        visit_enum_constant(
+                            file,
+                            source,
+                            child,
+                            package_name,
+                            &code_unit,
+                            &top_level,
+                            parsed,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    first
+}
+
+fn visit_callable(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    package_name: &str,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+
+    let name = node_text(name_node, source).trim();
+    if name.is_empty() {
+        return;
+    }
+
+    let signature = node
+        .child_by_field_name("parameters")
+        .map(|parameters| canonical_parameters_signature(parameters, source));
+    let short_name = format!("{}.{}", parent.short_name(), name);
+    let callable_sig = callable_signature(node, source);
+    let parameter_labels = node
+        .child_by_field_name("parameters")
+        .map(|parameters| parameter_labels(parameters, source))
+        .unwrap_or_default();
+    let fq = parent
+        .fq()
+        .clone()
+        .with_pushed(java_segment(name, SegmentKind::Member));
+    let code_unit = CodeUnit::with_signature_and_fq(
+        file.clone(),
+        brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+        package_name.to_string(),
+        short_name,
+        signature.clone(),
+        false,
+        fq,
+    );
+
+    parsed.add_code_unit(
+        code_unit.clone(),
+        node,
+        source,
+        Some(parent.clone()),
+        Some(top_level.clone()),
+    );
+    let modifiers = java_callable_modifiers(node);
+    parsed.add_signature_with_metadata(
+        code_unit.clone(),
+        SignatureMetadata::with_parameter_labels(callable_sig, parameter_labels)
+            .with_callable_arity(
+                node.child_by_field_name("parameters")
+                    .map(callable_arity_for_parameters)
+                    .unwrap_or_else(|| CallableArity::exact(0)),
+            )
+            .with_callable_modifiers(
+                modifiers.is_static,
+                node.kind() == "constructor_declaration",
+                modifiers.visibility,
+            )
+            .with_callable_parameter_types(
+                node.child_by_field_name("parameters")
+                    .map(|parameters| canonical_parameter_type_texts(parameters, source))
+                    .unwrap_or_default(),
+            )
+            .with_callable_native(modifiers.is_native),
+    );
+
+    if let Some(body) = node.child_by_field_name("body") {
+        collect_lambda_expressions(
+            file,
+            source,
+            body,
+            package_name,
+            &code_unit,
+            top_level,
+            parsed,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_compact_constructor(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    record: Node<'_>,
+    package_name: &str,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    let Some(parameters) = record.child_by_field_name("parameters") else {
+        return;
+    };
+    let name = node_text(name_node, source).trim();
+    if name.is_empty() {
+        return;
+    }
+
+    let signature = canonical_parameters_signature(parameters, source);
+    let short_name = format!("{}.{}", parent.short_name(), name);
+    let declaration_header = callable_signature(node, source);
+    let callable_sig = format!("{declaration_header}{signature}");
+    let fq = parent
+        .fq()
+        .clone()
+        .with_pushed(java_segment(name, SegmentKind::Member));
+    let code_unit = CodeUnit::with_signature_and_fq(
+        file.clone(),
+        brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+        package_name.to_string(),
+        short_name,
+        Some(signature),
+        false,
+        fq,
+    );
+    parsed.add_code_unit(
+        code_unit.clone(),
+        node,
+        source,
+        Some(parent.clone()),
+        Some(top_level.clone()),
+    );
+    parsed.add_signature_with_metadata(
+        code_unit.clone(),
+        SignatureMetadata::with_parameter_labels(
+            callable_sig,
+            parameter_labels(parameters, source),
+        )
+        .with_callable_arity(callable_arity_for_parameters(parameters))
+        .with_callable_modifiers(false, true, java_callable_modifiers(node).visibility)
+        .with_callable_parameter_types(canonical_parameter_type_texts(parameters, source)),
+    );
+
+    if let Some(body) = node.child_by_field_name("body") {
+        collect_lambda_expressions(
+            file,
+            source,
+            body,
+            package_name,
+            &code_unit,
+            top_level,
+            parsed,
+        );
+    }
+}
+
+fn visit_field_declaration(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    package_name: &str,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "variable_declarator" {
+            continue;
+        }
+
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+
+        let name = node_text(name_node, source).trim();
+        if name.is_empty() {
+            continue;
+        }
+
+        let fq = parent
+            .fq()
+            .clone()
+            .with_pushed(java_segment(name, SegmentKind::Member));
+        let code_unit = CodeUnit::new_fq(
+            file.clone(),
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
+            package_name.to_string(),
+            format!("{}.{}", parent.short_name(), name),
+            fq,
+        );
+        parsed.add_code_unit(
+            code_unit.clone(),
+            node,
+            source,
+            Some(parent.clone()),
+            Some(top_level.clone()),
+        );
+        let signature = field_signature(node, child, source);
+        let field_type = node
+            .child_by_field_name("type")
+            .map(|type_node| normalize_whitespace(node_text(type_node, source)));
+        let (is_static, is_final) = java_field_modifiers(node);
+        let has_initializer = child.child_by_field_name("value").is_some();
+        parsed.add_signature_with_metadata(
+            code_unit,
+            SignatureMetadata::new(signature, Vec::new())
+                .with_return_type_text(field_type)
+                .with_field_modifiers(is_static, is_final)
+                .with_field_initializer(has_initializer),
+        );
+
+        if let Some(value) = child.child_by_field_name("value") {
+            collect_lambda_expressions(
+                file,
+                source,
+                value,
+                package_name,
+                parent,
+                top_level,
+                parsed,
+            );
+        }
+    }
+}
+
+fn java_field_modifiers(field: Node<'_>) -> (bool, bool) {
+    let modifiers = (0..field.named_child_count())
+        .filter_map(|index| field.named_child(index))
+        .find(|child| child.kind() == "modifiers");
+    let mut is_static = false;
+    let mut is_final = false;
+    if let Some(modifiers) = modifiers {
+        for index in 0..modifiers.child_count() {
+            let Some(modifier) = modifiers.child(index) else {
+                continue;
+            };
+            match modifier.kind() {
+                "static" => is_static = true,
+                "final" => is_final = true,
+                _ => {}
+            }
+        }
+    }
+
+    let mut ancestor = field.parent();
+    let mut implicit_static_final = false;
+    while let Some(current) = ancestor {
+        if is_class_like_declaration_kind(current.kind()) {
+            implicit_static_final = matches!(
+                current.kind(),
+                "interface_declaration" | "annotation_type_declaration"
+            );
+            break;
+        }
+        ancestor = current.parent();
+    }
+    is_static |= implicit_static_final;
+    is_final |= implicit_static_final;
+    (is_static, is_final)
+}
+
+fn visit_record_components(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    package_name: &str,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+) {
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return;
+    };
+
+    let mut cursor = parameters.walk();
+    for child in parameters.named_children(&mut cursor) {
+        if child.kind() != "formal_parameter" {
+            continue;
+        }
+
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+
+        let name = node_text(name_node, source).trim();
+        if name.is_empty() {
+            continue;
+        }
+
+        let fq = parent
+            .fq()
+            .clone()
+            .with_pushed(java_segment(name, SegmentKind::Member));
+        let code_unit = CodeUnit::new_fq(
+            file.clone(),
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
+            package_name.to_string(),
+            format!("{}.{}", parent.short_name(), name),
+            fq,
+        );
+        parsed.add_code_unit(
+            code_unit.clone(),
+            child,
+            source,
+            Some(parent.clone()),
+            Some(top_level.clone()),
+        );
+        parsed.add_signature(code_unit, normalize_whitespace(node_text(child, source)));
+    }
+}
+
+fn visit_enum_constant(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    package_name: &str,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+
+    let name = node_text(name_node, source).trim();
+    if name.is_empty() {
+        return;
+    }
+
+    let fq = parent
+        .fq()
+        .clone()
+        .with_pushed(java_segment(name, SegmentKind::Member));
+    let code_unit = CodeUnit::new_fq(
+        file.clone(),
+        brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
+        package_name.to_string(),
+        format!("{}.{}", parent.short_name(), name),
+        fq,
+    );
+    parsed.add_code_unit(
+        code_unit.clone(),
+        node,
+        source,
+        Some(parent.clone()),
+        Some(top_level.clone()),
+    );
+    parsed.add_signature_with_metadata(
+        code_unit,
+        SignatureMetadata::new(enum_constant_signature(node, source), Vec::new())
+            .with_field_modifiers(true, true),
+    );
+}
+
+fn collect_lambda_expressions(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    package_name: &str,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+) {
+    let mut stack = vec![(node, parent.clone())];
+    while let Some((node, parent)) = stack.pop() {
+        let next_parent = if node.kind() == "lambda_expression" {
+            let lambda = lambda_code_unit(file, package_name, &parent, node);
+            parsed.add_code_unit(
+                lambda.clone(),
+                node,
+                source,
+                Some(parent),
+                Some(top_level.clone()),
+            );
+            lambda
+        } else {
+            parent
+        };
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(
+            children
+                .into_iter()
+                .rev()
+                .map(|child| (child, next_parent.clone())),
+        );
+    }
+}
+
+fn lambda_code_unit(
+    file: &ProjectFile,
+    package_name: &str,
+    parent: &CodeUnit,
+    node: Node<'_>,
+) -> CodeUnit {
+    let line = node.start_position().row;
+    let column = node.start_position().column;
+    let short_name = if parent.is_function() {
+        format!("{}$anon${line}:{column}", parent.short_name())
+    } else {
+        format!(
+            "{}.{}$anon${line}:{column}",
+            parent.short_name(),
+            parent.identifier()
+        )
+    };
+    // The synthetic anonymous-lambda marker is a single `$anon$line:column`
+    // segment whose OWN text embeds a literal `$` between "anon" and the
+    // coordinate (`SegmentKind::Nested` renders one more `$` before it,
+    // regardless of the preceding segment's kind, and segment text is
+    // free-form, so the embedded `$` round-trips untouched). A lambda nested
+    // directly in a method (`parent.is_function()`) hangs the marker off the
+    // method's own `fq`; a lambda in a field/class-level initializer repeats
+    // the owning class's own last segment first (mirroring `parent.identifier()`
+    // in `short_name` above) before the marker.
+    let anon = java_segment(&format!("anon${line}:{column}"), SegmentKind::Nested);
+    let fq = if parent.fq().is_empty() {
+        FqName::new()
+    } else if parent.is_function() {
+        parent.fq().clone().with_pushed(anon)
+    } else {
+        let mut fq = parent.fq().clone();
+        if let Some(last) = parent.fq().last() {
+            fq.push(last);
+        }
+        fq.with_pushed(anon)
+    };
+    CodeUnit::with_signature_and_fq(
+        file.clone(),
+        brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+        package_name.to_string(),
+        short_name,
+        None,
+        true,
+        fq,
+    )
+}
+
+pub fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    brokk_bifrost_core::analyzer::common::node_source_text(node, source)
+}
+
+pub fn normalize_whitespace(text: &str) -> String {
+    brokk_bifrost_core::analyzer::common::collapse_whitespace(text)
+}
+
+pub fn parse_tree(source: &str) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .expect("failed to load java parser");
+    parser.parse(source, None)
+}
+
+pub fn is_comment_node(node: Node<'_>) -> bool {
+    matches!(node.kind(), "line_comment" | "block_comment")
+}
+
+pub fn is_declaration_parent(kind: &str) -> bool {
+    matches!(
+        kind,
+        "method_declaration"
+            | "field_declaration"
+            | "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "variable_declarator"
+            | "formal_parameter"
+            | "catch_formal_parameter"
+            | "enhanced_for_statement"
+            | "resource"
+    )
+}
+
+pub fn is_class_like_declaration_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+    )
+}
+
+pub fn class_like_body_children_rev<'tree>(body: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut children = Vec::new();
+    for index in (0..body.named_child_count()).rev() {
+        let Some(child) = body.named_child(index) else {
+            continue;
+        };
+        children.push(child);
+    }
+    children
+}
+
+pub fn find_nearest_declaration_from_node(
+    start_node: Node<'_>,
+    identifier: &str,
+    source: &str,
+) -> Option<DeclarationInfo> {
+    let mut current = Some(start_node);
+
+    while let Some(node) = current {
+        match node.kind() {
+            "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration" => {
+                if let Some(found) = check_formal_parameters(node, identifier, source) {
+                    return Some(found);
+                }
+            }
+            "enhanced_for_statement" => {
+                if let Some(found) = match_named_field(
+                    node,
+                    "name",
+                    identifier,
+                    source,
+                    DeclarationKind::EnhancedForVariable,
+                ) {
+                    return Some(found);
+                }
+            }
+            "catch_clause" => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if child.kind() == "catch_formal_parameter"
+                        && let Some(found) = match_named_field(
+                            child,
+                            "name",
+                            identifier,
+                            source,
+                            DeclarationKind::CatchParameter,
+                        )
+                    {
+                        return Some(found);
+                    }
+                }
+            }
+            "try_with_resources_statement" => {
+                if let Some(resources) = node.child_by_field_name("resources") {
+                    let mut cursor = resources.walk();
+                    for child in resources.named_children(&mut cursor) {
+                        if child.kind() == "resource"
+                            && let Some(found) = match_named_field(
+                                child,
+                                "name",
+                                identifier,
+                                source,
+                                DeclarationKind::ResourceVariable,
+                            )
+                        {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            "lambda_expression" => {
+                if let Some(parameters) = node.child_by_field_name("parameters") {
+                    if parameters.kind() == "identifier" {
+                        if node_text(parameters, source).trim() == identifier {
+                            return Some(declaration_info(
+                                identifier,
+                                DeclarationKind::LambdaParameter,
+                                parameters,
+                            ));
+                        }
+                    } else {
+                        let mut cursor = parameters.walk();
+                        for child in parameters.named_children(&mut cursor) {
+                            if child.kind() == "identifier"
+                                && node_text(child, source).trim() == identifier
+                            {
+                                return Some(declaration_info(
+                                    identifier,
+                                    DeclarationKind::LambdaParameter,
+                                    child,
+                                ));
+                            }
+                            if child.kind() == "formal_parameter"
+                                && let Some(found) = match_named_field(
+                                    child,
+                                    "name",
+                                    identifier,
+                                    source,
+                                    DeclarationKind::LambdaParameter,
+                                )
+                            {
+                                return Some(found);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(found) = check_preceding_local_variables(node, identifier, source) {
+            return Some(found);
+        }
+
+        current = node.parent();
+    }
+
+    None
+}
+
+fn check_formal_parameters(
+    node: Node<'_>,
+    identifier: &str,
+    source: &str,
+) -> Option<DeclarationInfo> {
+    let params = node.child_by_field_name("parameters")?;
+    let mut cursor = params.walk();
+    for child in params.named_children(&mut cursor) {
+        if child.kind() == "formal_parameter"
+            && let Some(found) = match_named_field(
+                child,
+                "name",
+                identifier,
+                source,
+                DeclarationKind::Parameter,
+            )
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn check_preceding_local_variables(
+    current: Node<'_>,
+    identifier: &str,
+    source: &str,
+) -> Option<DeclarationInfo> {
+    let parent = current.parent()?;
+    let mut cursor = parent.walk();
+    for sibling in parent.named_children(&mut cursor) {
+        if sibling.end_byte() > current.start_byte() {
+            break;
+        }
+        if sibling.kind() != "local_variable_declaration" {
+            continue;
+        }
+        let mut local_cursor = sibling.walk();
+        for child in sibling.named_children(&mut local_cursor) {
+            if child.kind() == "variable_declarator"
+                && let Some(found) = match_named_field(
+                    child,
+                    "name",
+                    identifier,
+                    source,
+                    DeclarationKind::LocalVariable,
+                )
+            {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn match_named_field(
+    node: Node<'_>,
+    field_name: &str,
+    identifier: &str,
+    source: &str,
+    kind: DeclarationKind,
+) -> Option<DeclarationInfo> {
+    let name_node = node.child_by_field_name(field_name)?;
+    if node_text(name_node, source).trim() == identifier {
+        Some(declaration_info(identifier, kind, name_node))
+    } else {
+        None
+    }
+}
+
+fn declaration_info(identifier: &str, kind: DeclarationKind, node: Node<'_>) -> DeclarationInfo {
+    DeclarationInfo {
+        identifier: identifier.to_string(),
+        kind,
+        range: brokk_bifrost_core::analyzer::Range {
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            start_line: node.start_position().row + 1,
+            end_line: node.end_position().row + 1,
+        },
+    }
+}
+
+fn class_signature(node: Node<'_>, source: &str) -> String {
+    let body_start = node
+        .child_by_field_name("body")
+        .map(|body| body.start_byte())
+        .unwrap_or(node.end_byte());
+    let header = source
+        .get(node.start_byte()..body_start)
+        .unwrap_or("")
+        .trim_end();
+    format!("{} {{", normalize_whitespace(header))
+}
+
+fn java_class_like_is_static(node: Node<'_>, parent: Option<&CodeUnit>) -> bool {
+    if parent.is_none() {
+        return false;
+    }
+    if matches!(
+        node.kind(),
+        "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+    ) || java_callable_modifiers(node).is_static
+    {
+        return true;
+    }
+
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if is_class_like_declaration_kind(current.kind()) {
+            return matches!(
+                current.kind(),
+                "interface_declaration" | "annotation_type_declaration"
+            );
+        }
+        ancestor = current.parent();
+    }
+    false
+}
+
+fn callable_signature(node: Node<'_>, source: &str) -> String {
+    let end = node
+        .child_by_field_name("body")
+        .map(|body| body.start_byte())
+        .unwrap_or(node.end_byte());
+    normalize_whitespace(source.get(node.start_byte()..end).unwrap_or("").trim_end())
+}
+
+fn canonical_parameters_signature(parameters: Node<'_>, source: &str) -> String {
+    format!(
+        "({})",
+        canonical_parameter_type_texts(parameters, source).join(", ")
+    )
+}
+
+/// The declared type of each parameter, in order, read from the parameter's own
+/// `type` node (plus its array dimensions or varargs marker).
+///
+/// This is the strongest per-parameter fact the Java declaration walk holds: a
+/// source spelling, not a resolved or erased type. It is recorded so that
+/// consumers can discriminate overloads structurally instead of splitting a
+/// rendered signature string.
+fn canonical_parameter_type_texts(parameters: Node<'_>, source: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cursor = parameters.walk();
+    for child in parameters.named_children(&mut cursor) {
+        match child.kind() {
+            "formal_parameter" => {
+                if let Some(type_node) = child.child_by_field_name("type") {
+                    let mut ty = normalize_whitespace(node_text(type_node, source));
+                    if let Some(dimensions) = child.child_by_field_name("dimensions") {
+                        ty.push_str(node_text(dimensions, source).trim());
+                    }
+                    parts.push(ty);
+                }
+            }
+            "spread_parameter" => {
+                if let Some(type_node) = spread_parameter_type_node(child) {
+                    parts.push(format!(
+                        "{}[]",
+                        normalize_whitespace(node_text(type_node, source))
+                    ));
+                }
+            }
+            "ERROR" => {
+                if let Some(type_node) = malformed_spread_parameter_type_node(child) {
+                    parts.push(format!(
+                        "{}[]",
+                        normalize_whitespace(node_text(type_node, source))
+                    ));
+                }
+            }
+            "receiver_parameter" => {
+                if let Some(type_node) = child.child_by_field_name("type") {
+                    parts.push(normalize_whitespace(node_text(type_node, source)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    parts
+}
+
+/// The modifier facts a Java callable declares, read from its `modifiers`
+/// node rather than from its rendered header text.
+struct JavaCallableModifiers {
+    is_static: bool,
+    /// The declaration is implemented outside every source the workspace can
+    /// read. A consumer that must not guess past a body-less callee needs this
+    /// to tell `native` from `abstract`.
+    is_native: bool,
+    visibility: DeclaredVisibility,
+}
+
+fn java_callable_modifiers(node: Node<'_>) -> JavaCallableModifiers {
+    // Java's default when no access modifier is written is package-private.
+    // Interface members are implicitly public, but that is an inheritance rule
+    // the consumer applies from the owner's kind; the declaration itself still
+    // states nothing here, and inventing `Public` would be a claim the source
+    // never made.
+    let mut modifiers = JavaCallableModifiers {
+        is_static: false,
+        is_native: false,
+        visibility: DeclaredVisibility::PackagePrivate,
+    };
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "modifiers" {
+            continue;
+        }
+        let mut inner = child.walk();
+        for modifier in child.children(&mut inner) {
+            match modifier.kind() {
+                "static" => modifiers.is_static = true,
+                "native" => modifiers.is_native = true,
+                "public" => modifiers.visibility = DeclaredVisibility::Public,
+                "protected" => modifiers.visibility = DeclaredVisibility::Protected,
+                "private" => modifiers.visibility = DeclaredVisibility::Private,
+                _ => {}
+            }
+        }
+    }
+    modifiers
+}
+
+fn parameter_labels(parameters: Node<'_>, source: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    let mut cursor = parameters.walk();
+    for child in parameters.named_children(&mut cursor) {
+        let name = match child.kind() {
+            "formal_parameter" => child.child_by_field_name("name"),
+            "spread_parameter" => spread_parameter_name(child),
+            "ERROR" => malformed_spread_parameter_name(child),
+            _ => None,
+        };
+        if let Some(name) = name {
+            let label = node_text(name, source).trim();
+            if !label.is_empty() {
+                labels.push(label.to_string());
+            }
+        }
+    }
+    labels
+}
+
+fn callable_arity_for_parameters(parameters: Node<'_>) -> CallableArity {
+    let mut total = 0usize;
+    let mut repeated = false;
+    let mut cursor = parameters.walk();
+    for child in parameters.named_children(&mut cursor) {
+        match child.kind() {
+            "formal_parameter" => total += 1,
+            "spread_parameter" => {
+                total += 1;
+                repeated = true;
+            }
+            "ERROR" if malformed_spread_parameter_name(child).is_some() => {
+                total += 1;
+                repeated = true;
+            }
+            _ => {}
+        }
+    }
+    let required = total.saturating_sub(usize::from(repeated));
+    CallableArity::new(required, total, repeated)
+}
+
+fn spread_parameter_type_node(parameter: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = parameter.walk();
+    parameter.named_children(&mut cursor).find(|child| {
+        !matches!(
+            child.kind(),
+            "variable_declarator" | "modifiers" | "annotation" | "marker_annotation"
+        )
+    })
+}
+
+fn spread_parameter_name(parameter: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = parameter.walk();
+    for child in parameter.named_children(&mut cursor) {
+        if child.kind() == "variable_declarator" {
+            return child.child_by_field_name("name");
+        }
+    }
+    None
+}
+
+fn malformed_spread_parameter_type_node(parameter: Node<'_>) -> Option<Node<'_>> {
+    if parameter.kind() != "ERROR" {
+        return None;
+    }
+    let mut cursor = parameter.walk();
+    parameter
+        .named_children(&mut cursor)
+        .find(|child| is_malformed_spread_parameter_type_node(child.kind()))
+}
+
+fn malformed_spread_parameter_name(parameter: Node<'_>) -> Option<Node<'_>> {
+    let type_end = malformed_spread_parameter_type_node(parameter)?.end_byte();
+    let mut stack = vec![parameter];
+    let mut last = None;
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" && node.start_byte() > type_end {
+            last = Some(node);
+        }
+        let mut cursor = node.walk();
+        let mut children: Vec<_> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
+    last
+}
+
+fn is_malformed_spread_parameter_type_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "type_identifier"
+            | "scoped_identifier"
+            | "scoped_type_identifier"
+            | "generic_type"
+            | "annotated_type"
+            | "array_type"
+    )
+}
+
+fn field_signature(field_node: Node<'_>, declarator: Node<'_>, source: &str) -> String {
+    let Some(type_node) = field_node.child_by_field_name("type") else {
+        return normalize_whitespace(node_text(field_node, source));
+    };
+    let Some(name_node) = declarator.child_by_field_name("name") else {
+        return normalize_whitespace(node_text(field_node, source));
+    };
+
+    let prefix = normalize_whitespace(
+        source
+            .get(field_node.start_byte()..type_node.start_byte())
+            .unwrap_or(""),
+    );
+    let type_text = normalize_whitespace(node_text(type_node, source));
+    let name_text = node_text(name_node, source).trim();
+
+    let mut signature = String::new();
+    for part in [prefix.as_str(), type_text.as_str(), name_text] {
+        if part.is_empty() {
+            continue;
+        }
+        if !signature.is_empty() {
+            signature.push(' ');
+        }
+        signature.push_str(part);
+    }
+
+    let suffix = declarator
+        .child_by_field_name("value")
+        .and_then(|value| literal_field_initializer(value, source))
+        .map(|value| format!(" = {value};"))
+        .unwrap_or_else(|| ";".to_string());
+    signature.push_str(&suffix);
+    signature
+}
+
+fn literal_field_initializer<'a>(value: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let kind = value.kind();
+    if kind.ends_with("_literal") || matches!(kind, "true" | "false" | "null_literal" | "null") {
+        Some(node_text(value, source).trim())
+    } else {
+        None
+    }
+}
+
+fn enum_constant_signature(node: Node<'_>, source: &str) -> String {
+    let mut text = node_text(node, source).trim().to_string();
+    if node.next_named_sibling().is_some() {
+        text.push(',');
+    }
+    text
+}
+
+pub fn module_code_unit(file: &ProjectFile, package_name: &str) -> CodeUnit {
+    let fq = java_package_fq(package_name);
+    match package_name.rsplit_once('.') {
+        Some((parent, leaf)) => CodeUnit::new_fq(
+            file.clone(),
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Module,
+            parent.to_string(),
+            leaf.to_string(),
+            fq,
+        ),
+        None => CodeUnit::new_fq(
+            file.clone(),
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Module,
+            String::new(),
+            package_name.to_string(),
+            fq,
+        ),
+    }
+}
+
+pub fn extract_raw_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut raw = Vec::new();
+
+    if let Some(superclass) = node.child_by_field_name("superclass") {
+        collect_supertype_nodes(superclass, source, &mut raw);
+    }
+    if let Some(interfaces) = node.child_by_field_name("interfaces") {
+        collect_supertype_nodes(interfaces, source, &mut raw);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "extends_interfaces" {
+            collect_supertype_nodes(child, source, &mut raw);
+        }
+    }
+
+    raw
+}
+
+fn collect_supertype_nodes(node: Node<'_>, source: &str, raw: &mut Vec<String>) {
+    walk_named_tree_preorder(node, true, |node| {
+        match node.kind() {
+            "type_identifier" | "scoped_type_identifier" => {
+                let text = node_text(node, source).trim();
+                if !text.is_empty() {
+                    raw.push(text.to_string());
+                }
+            }
+            _ => {}
+        }
+        WalkControl::Continue
+    });
+}
+
+/// The whole-file declaration walk behind `JavaAdapter::parse_file`: the
+/// package module unit, the import facts, and every top-level class-like
+/// declaration with its members.
+pub fn parse_java_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
+    let root = tree.root_node();
+    let package_name = determine_package_name(root, source);
+    let mut parsed = ParsedFile::new(package_name.clone());
+    collect_type_identifiers(root, source, &mut parsed.type_identifiers);
+    let package_module_code_unit =
+        (!package_name.is_empty()).then(|| module_code_unit(file, &package_name));
+
+    for index in 0..root.named_child_count() {
+        let Some(child) = root.named_child(index) else {
+            continue;
+        };
+
+        match child.kind() {
+            "package_declaration" => {
+                if let Some(module) = &package_module_code_unit {
+                    parsed.add_code_unit(module.clone(), child, source, None, Some(module.clone()));
+                    parsed.add_signature(module.clone(), format!("package {};", package_name));
+                }
+            }
+            "import_declaration" => {
+                let raw = node_text(child, source).trim().to_string();
+                parsed.imports.push(parse_import_info(child, source, raw));
+            }
+            "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration" => {
+                let class_code_unit =
+                    visit_class_like(file, source, child, &package_name, None, None, &mut parsed);
+                if let (Some(module), Some(class_code_unit)) =
+                    (&package_module_code_unit, class_code_unit)
+                {
+                    parsed.add_child(module.clone(), class_code_unit);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    parsed
+}

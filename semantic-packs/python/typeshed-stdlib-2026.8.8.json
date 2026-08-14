@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.python-stdlib",
+  "pack_version": "2026.8.8",
+  "ecosystem": "python",
+  "kind": {
+    "artifact_kind": "python_stub",
+    "stubs": [
+      "_collections_abc.pyi",
+      "builtins.pyi",
+      "collections/__init__.pyi",
+      "collections/abc.pyi",
+      "json/__init__.pyi",
+      "json/decoder.pyi",
+      "json/encoder.pyi",
+      "json/scanner.pyi",
+      "json/tool.pyi",
+      "ntpath.pyi",
+      "os/__init__.pyi",
+      "os/path.pyi",
+      "posixpath.pyi",
+      "re.pyi",
+      "typing.pyi"
+    ]
+  },
+  "artifact": {
+    "file_name": "typeshed-stdlib-1620e2254765",
+    "sha256": "b0bdd0b288feb36c0b501f07a5d45450c13478e1aef26e0ff58abdef1d5a0036",
+    "url": "https://github.com/python/typeshed/archive/1620e225476597f34177351ef913dc8390dade30.tar.gz",
+    "container": null
+  },
+  "compatibility": {
+    "bifrost": ">=0.8.24, <0.10.0",
+    "toolchains": [
+      {
+        "name": "cpython",
+        "requirement": ">=3.10.0, <3.15.0"
+      }
+    ]
+  },
+  "activation": [
+    {
+      "toolchain": {
+        "name": "cpython",
+        "version": ">=3.10.0, <3.15.0"
+      },
+      "targets": [],
+      "configurations": []
+    }
+  ],
+  "provenance": {
+    "source": "https://github.com/python/typeshed",
+    "revision": "1620e225476597f34177351ef913dc8390dade30"
+  },
+  "license": "Apache-2.0",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "notices": [
+    "notices/typeshed-stdlib-2026.8.8.txt"
+  ],
+  "measurement_activation": {
+    "toolchain": {
+      "name": "cpython",
+      "version": "=3.13.5"
+    },
+    "targets": [],
+    "configurations": []
+  },
+  "measurement_queries": [
+    {
+      "kind": "type",
+      "name": "builtins.str"
+    },
+    {
+      "kind": "member",
+      "owner": "os",
+      "name": "getcwd"
+    }
+  ]
+}

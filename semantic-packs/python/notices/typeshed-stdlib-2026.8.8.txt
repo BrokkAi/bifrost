@@ -1,0 +1,12 @@
+Python typeshed standard-library stubs
+
+Copyright the typeshed project contributors.
+
+The generated declaration data is derived from a bounded subset of the
+`stdlib` stub tree of the typeshed project and is distributed under the
+Apache License, Version 2.0.
+
+Project: https://github.com/python/typeshed
+License: https://www.apache.org/licenses/LICENSE-2.0
+Pinned revision: 1620e225476597f34177351ef913dc8390dade30
+Pinned artifact: https://github.com/python/typeshed/archive/1620e225476597f34177351ef913dc8390dade30.tar.gz

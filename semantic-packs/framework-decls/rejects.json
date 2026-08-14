@@ -1,0 +1,26 @@
+{
+  "format": "bifrost_framework_pack_audit/v1",
+  "types_total": 9,
+  "members_total": 46,
+  "packs": [
+    {
+      "pack_id": "bifrost.javax.servlet-api-framework-decls",
+      "artifact": "javax.servlet:javax.servlet-api:4.0.1",
+      "pinned": false,
+      "ecosystem": "maven",
+      "completeness": "partial",
+      "types": 3,
+      "members": 17,
+      "staged_reason": "byte-level artifact_sha256 for javax.servlet:javax.servlet-api:4.0.1 needs the jar, which this generation step cannot fetch; the coordinate and version are pinned, the digest is not"
+    },
+    {
+      "pack_id": "bifrost.jdk-framework-decls",
+      "artifact": "jdk",
+      "pinned": true,
+      "ecosystem": "jdk",
+      "completeness": "partial",
+      "types": 6,
+      "members": 29
+    }
+  ]
+}

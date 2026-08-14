@@ -1,0 +1,2548 @@
+use brokk_bifrost_core::analyzer::common::{IdentifierSigil, node_ident_text};
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::model::StructuredTypeIdentityBuilder;
+use brokk_bifrost_core::analyzer::model::{
+    CodeUnitType, DispatchExtensibility, PackageAnchor, ParameterMetadata, SignatureMetadata,
+    StructuredTypeIdentity, StructuredTypeName,
+};
+use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportBinding, ImportKind};
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
+use std::collections::BTreeSet;
+use std::path::Path;
+use tree_sitter::{Node, Parser, Tree};
+
+/// The synthetic module-scope segment Rust uses in `short_name` for
+/// package-level `const`/`static`/`type` items (`_module_.NAME`), mirroring
+/// Go's `_module_` scope. Emitted as a [`SegmentKind::Package`] segment so the
+/// structured name round-trips to the legacy string.
+const RUST_MODULE_SCOPE_SEGMENT: &str = "_module_";
+
+/// Intern one qualified-name segment in the process-global interner.
+fn rust_segment(text: &str, kind: SegmentKind) -> SegmentId {
+    segment_interner().intern(text, kind)
+}
+
+pub fn rust_file_package_fq(file: &ProjectFile) -> FqName {
+    let mut fq = FqName::new();
+    for component in rust_package_components(file) {
+        fq.push(rust_segment(&component, SegmentKind::Package));
+    }
+    fq
+}
+
+pub fn rust_semantic_package_fq(package_name: &str) -> FqName {
+    let mut fq = FqName::new();
+    for component in package_name
+        .split('.')
+        .filter(|component| !component.is_empty())
+    {
+        fq.push(rust_segment(component, SegmentKind::Package));
+    }
+    fq
+}
+
+/// The [`FqName`] a child declaration extends: its lexical parent's structured
+/// name when nested, otherwise the file's package prefix.
+fn rust_child_fq_base(parent: Option<&CodeUnit>, file: &ProjectFile) -> FqName {
+    match parent {
+        Some(parent) => parent.fq().clone(),
+        None => rust_file_package_fq(file),
+    }
+}
+
+use crate::imports::{RustModuleAnchor, rust_imports_from_use_declaration};
+
+/// A member's structured name is built on its parent's, so it is anchored
+/// wherever the parent is. This matters for the synthesized owner of an
+/// `impl crate::Type` / `impl super::Type` block: without inheritance its
+/// members would persist the extracting mount's path-derived package text.
+fn rust_inherit_package_anchor(code_unit: CodeUnit, parent: Option<&CodeUnit>) -> CodeUnit {
+    match parent.and_then(CodeUnit::package_anchor) {
+        Some(anchor) => code_unit.with_package_anchor(anchor),
+        None => code_unit,
+    }
+}
+
+/// Whether `kind` is one of tree-sitter-rust's identifier leaf node kinds.
+/// `identifier`, `field_identifier`, `type_identifier`, and
+/// `shorthand_field_identifier` are all grammar aliases of the exact same
+/// lexical rule (`/(r#)?[_\p{XID_Start}][_\p{XID_Continue}]*/`), so any of
+/// them can carry the `r#` raw-identifier escape prefix verbatim in their
+/// token text. Compound path nodes (`scoped_identifier`,
+/// `scoped_type_identifier`) are deliberately excluded: callers read those by
+/// walking to their constituent identifier-kind children (the `path`/`name`
+/// fields), never by string-splitting the whole node text, so each segment's
+/// text is normalized individually when it is itself read as one of the leaf
+/// kinds above.
+pub fn rust_identifier_like_node_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier" | "field_identifier" | "type_identifier" | "shorthand_field_identifier"
+    )
+}
+
+/// tree-sitter-rust raw-identifier normalization (`r#type` -> `type`), gated to
+/// the identifier leaf kinds (see [`rust_identifier_like_node_kind`]).
+pub const RUST_IDENTIFIER_SIGIL: IdentifierSigil = IdentifierSigil {
+    is_identifier_kind: rust_identifier_like_node_kind,
+    prefix: "r#",
+};
+
+/// Text of `node` verbatim from source, EXCEPT that when `node` is one of
+/// tree-sitter-rust's identifier leaf kinds (see
+/// [`rust_identifier_like_node_kind`]) a leading
+/// `r#` raw-identifier escape is stripped so identity text (short_name,
+/// fq_name) and reference/member-name text agree on the canonical spelling
+/// (issue #1128). Compound nodes (whole signatures, headers, macro token
+/// spans, scoped paths) are returned unmodified — those are only ever
+/// normalized by first walking down to their own identifier-kind children.
+pub fn rust_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    node_ident_text(node, source, false, &RUST_IDENTIFIER_SIGIL)
+}
+
+/// Whether `item` is directly preceded by a test-evidence attribute
+/// (`#[test]`, `#[cfg(test)]`, `#[tokio::test]`, `#[sqlx::test]`, ...).
+///
+/// In tree-sitter-rust, outer attributes attach to an item as *preceding
+/// siblings*, not children, so we walk backward across the contiguous run of
+/// attribute/comment siblings and stop at the first real item. This is the
+/// per-item half of the test-region taint: combined with the taint inherited
+/// from enclosing items, it decides whether a declaration lies in a test
+/// region. It operates on whatever tree/source the caller passes, so it also
+/// covers the region reparse of item-position macros (#1015).
+fn rust_item_carries_test_attribute(item: Node<'_>, source: &str) -> bool {
+    let mut prev = item.prev_sibling();
+    while let Some(node) = prev {
+        match node.kind() {
+            "attribute_item" => {
+                if crate::test_detection::rust_attribute_is_test_evidence(node, source) {
+                    return true;
+                }
+            }
+            "inner_attribute_item" | "line_comment" | "block_comment" => {}
+            _ => break,
+        }
+        prev = node.prev_sibling();
+    }
+    false
+}
+
+pub fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
+    let mut parsed = ParsedFile::new(rust_package_name(file));
+    let root = tree.root_node();
+    collect_rust_type_identifiers(root, source, &mut parsed.type_identifiers);
+    let item_macro_definitions = rust_rules_item_macro_definitions(root, source);
+    let mut impl_import_binder = ImportBinder::empty();
+
+    for index in 0..root.named_child_count() {
+        let Some(child) = root.named_child(index) else {
+            continue;
+        };
+        if child.kind() == "use_declaration" {
+            let imports = rust_imports_from_use_declaration(child, source);
+            for import in &imports {
+                crate::lexical_scope::insert_rust_import_binding(&mut impl_import_binder, import);
+            }
+            parsed.imports.extend(imports);
+        }
+    }
+    for index in 0..root.named_child_count() {
+        let Some(child) = root.named_child(index) else {
+            continue;
+        };
+        match child.kind() {
+            "use_declaration" => {}
+            "struct_item" | "enum_item" | "trait_item" => {
+                visit_rust_class_like(
+                    file,
+                    source,
+                    child,
+                    None,
+                    &parsed.package_name.clone(),
+                    false,
+                    &mut parsed,
+                );
+            }
+            "mod_item" => {
+                visit_rust_module(
+                    file,
+                    source,
+                    child,
+                    None,
+                    &parsed.package_name.clone(),
+                    &item_macro_definitions,
+                    false,
+                    &mut parsed,
+                );
+            }
+            "function_item" => {
+                visit_rust_function(
+                    file,
+                    source,
+                    child,
+                    None,
+                    &parsed.package_name.clone(),
+                    false,
+                    &mut parsed,
+                );
+            }
+            "const_item" | "static_item" => {
+                visit_rust_field(
+                    file,
+                    source,
+                    child,
+                    None,
+                    &parsed.package_name.clone(),
+                    false,
+                    &mut parsed,
+                );
+            }
+            "macro_definition" => {
+                visit_rust_macro(
+                    file,
+                    source,
+                    child,
+                    None,
+                    &parsed.package_name.clone(),
+                    false,
+                    &mut parsed,
+                );
+            }
+            "macro_invocation" => {
+                visit_rust_macro_invocation_definitions(
+                    file,
+                    source,
+                    child,
+                    None,
+                    &parsed.package_name.clone(),
+                    &item_macro_definitions,
+                    false,
+                    &mut parsed,
+                );
+            }
+            "type_item" => {
+                visit_rust_alias(
+                    file,
+                    source,
+                    child,
+                    None,
+                    &parsed.package_name.clone(),
+                    false,
+                    &mut parsed,
+                );
+            }
+            "impl_item" => {
+                visit_rust_impl(
+                    file,
+                    source,
+                    child,
+                    None,
+                    &parsed.package_name.clone(),
+                    &impl_import_binder,
+                    false,
+                    &mut parsed,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // The per-file usage facts persisted to the `rust_*` fact tables. Extracted
+    // here, from the tree this pass already holds, so nothing re-parses later
+    // to answer a usage query (ExecPlan `.agents/plans/rust-usage-index-v2.md`).
+    parsed.rust_usage_facts =
+        crate::facts::extract_rust_usage_facts(root, source, &item_macro_definitions);
+
+    parsed
+}
+
+pub fn rust_package_name(file: &ProjectFile) -> String {
+    rust_package_components(file).join(".")
+}
+
+/// Crate-anchored package components when a `Cargo.toml` governs `file`,
+/// otherwise the legacy path-derived scheme.
+fn rust_package_components(file: &ProjectFile) -> Vec<String> {
+    if let Some(paths) = crate::crate_naming::rust_crate_paths(file) {
+        return paths.package;
+    }
+    rust_path_derived_package_components(file)
+}
+
+/// Directory-derived naming, kept verbatim for manifest-less trees.
+fn rust_path_derived_package_components(file: &ProjectFile) -> Vec<String> {
+    let rel = file.rel_path();
+    let mut components: Vec<_> = rel
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect();
+
+    let source_root = components.iter().rposition(|component| component == "src");
+    if source_root == Some(0) {
+        components.remove(0);
+    }
+    if components.is_empty() {
+        return Vec::new();
+    }
+
+    let file_name = components.pop().unwrap_or_default();
+    let stem = Path::new(&file_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+
+    if stem == "lib" || stem == "main" || stem == "mod" {
+        components
+    } else if source_root.is_some() {
+        components
+            .into_iter()
+            .chain(std::iter::once(stem.to_string()))
+            .filter(|component| !component.is_empty())
+            .collect()
+    } else {
+        components
+    }
+}
+
+fn visit_rust_class_like(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    parent: Option<&CodeUnit>,
+    package_name: &str,
+    parent_in_test_region: bool,
+    parsed: &mut ParsedFile,
+) -> Option<CodeUnit> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = rust_node_text(name_node, source).trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
+    let short_name = parent
+        .map(|parent| format!("{}.{}", parent.short_name(), name))
+        .unwrap_or_else(|| name.to_string());
+    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Type));
+    let code_unit = CodeUnit::new_fq(
+        file.clone(),
+        CodeUnitType::Class,
+        package_name.to_string(),
+        short_name,
+        fq,
+    );
+    let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
+    parsed.add_code_unit(
+        code_unit.clone(),
+        node,
+        source,
+        parent.cloned(),
+        Some(top_level.clone()),
+    );
+    if in_test_region {
+        parsed.mark_test_region(&code_unit);
+    }
+    parsed.add_signature(
+        code_unit.clone(),
+        rust_type_signature(node, source, package_name.is_empty()),
+    );
+
+    if let Some(body) = node.child_by_field_name("body") {
+        for index in 0..body.named_child_count() {
+            let Some(child) = body.named_child(index) else {
+                continue;
+            };
+            match child.kind() {
+                "field_declaration" | "enum_variant" | "const_item" => {
+                    visit_rust_field(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        in_test_region,
+                        parsed,
+                    );
+                }
+                "function_item" | "function_signature_item" => {
+                    visit_rust_function(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        in_test_region,
+                        parsed,
+                    );
+                }
+                "associated_type" | "type_item" => {
+                    visit_rust_alias(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        in_test_region,
+                        parsed,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Some(code_unit)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_rust_module(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    parent: Option<&CodeUnit>,
+    package_name: &str,
+    item_macro_definitions: &[RustRulesItemMacroDefinition],
+    parent_in_test_region: bool,
+    parsed: &mut ParsedFile,
+) -> Option<CodeUnit> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = rust_node_text(name_node, source).trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
+    let short_name = parent
+        .map(|parent| format!("{}.{}", parent.short_name(), name))
+        .unwrap_or_else(|| name.to_string());
+    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Package));
+    let code_unit = CodeUnit::new_fq(
+        file.clone(),
+        CodeUnitType::Module,
+        package_name.to_string(),
+        short_name,
+        fq,
+    );
+    let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
+    parsed.add_code_unit(
+        code_unit.clone(),
+        node,
+        source,
+        parent.cloned(),
+        Some(top_level.clone()),
+    );
+    if in_test_region {
+        parsed.mark_test_region(&code_unit);
+    }
+    parsed.add_signature(code_unit.clone(), format!("mod {name} {{"));
+
+    if let Some(body) = node.child_by_field_name("body") {
+        let mut impl_import_binder = ImportBinder::empty();
+        for index in 0..body.named_child_count() {
+            let Some(child) = body.named_child(index) else {
+                continue;
+            };
+            if child.kind() == "use_declaration" {
+                for import in rust_imports_from_use_declaration(child, source) {
+                    crate::lexical_scope::insert_rust_import_binding(
+                        &mut impl_import_binder,
+                        &import,
+                    );
+                }
+            }
+        }
+
+        for index in 0..body.named_child_count() {
+            let Some(child) = body.named_child(index) else {
+                continue;
+            };
+            match child.kind() {
+                "function_item" => {
+                    visit_rust_function(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        in_test_region,
+                        parsed,
+                    );
+                }
+                "struct_item" | "enum_item" | "trait_item" => {
+                    visit_rust_class_like(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        in_test_region,
+                        parsed,
+                    );
+                }
+                "const_item" | "static_item" => {
+                    visit_rust_field(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        in_test_region,
+                        parsed,
+                    );
+                }
+                "type_item" => {
+                    visit_rust_alias(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        in_test_region,
+                        parsed,
+                    );
+                }
+                "mod_item" => {
+                    visit_rust_module(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        item_macro_definitions,
+                        in_test_region,
+                        parsed,
+                    );
+                }
+                "impl_item" => {
+                    visit_rust_impl(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        &impl_import_binder,
+                        in_test_region,
+                        parsed,
+                    );
+                }
+                "macro_definition" => {
+                    visit_rust_macro(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        in_test_region,
+                        parsed,
+                    );
+                }
+                "macro_invocation" => {
+                    visit_rust_macro_invocation_definitions(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        item_macro_definitions,
+                        in_test_region,
+                        parsed,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Some(code_unit)
+}
+
+fn visit_rust_function(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    parent: Option<&CodeUnit>,
+    package_name: &str,
+    parent_in_test_region: bool,
+    parsed: &mut ParsedFile,
+) -> Option<CodeUnit> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = rust_node_text(name_node, source).trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
+    let signature = rust_impl_member_identity_signature(node, source).or_else(|| {
+        node.child_by_field_name("parameters")
+            .map(|parameters| rust_node_text(parameters, source).trim().to_string())
+    });
+    let short_name = parent
+        .map(|parent| format!("{}.{}", parent.short_name(), name))
+        .unwrap_or_else(|| name.to_string());
+    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Member));
+    let code_unit = rust_inherit_package_anchor(
+        CodeUnit::with_signature_and_fq(
+            file.clone(),
+            CodeUnitType::Function,
+            package_name.to_string(),
+            short_name,
+            signature,
+            false,
+            fq,
+        ),
+        parent,
+    );
+    let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
+    parsed.add_code_unit(
+        code_unit.clone(),
+        node,
+        source,
+        parent.cloned(),
+        Some(top_level),
+    );
+    if in_test_region {
+        parsed.mark_test_region(&code_unit);
+    }
+    let signature = rust_function_signature(node, source);
+    parsed.add_signature_with_metadata(
+        code_unit.clone(),
+        rust_signature_metadata(signature, node, source),
+    );
+    Some(code_unit)
+}
+
+fn visit_rust_macro(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    parent: Option<&CodeUnit>,
+    package_name: &str,
+    parent_in_test_region: bool,
+    parsed: &mut ParsedFile,
+) -> Option<CodeUnit> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = rust_node_text(name_node, source).trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
+    register_rust_macro(
+        file,
+        name,
+        package_name,
+        parent,
+        rust_range_from_node(node),
+        rust_macro_signature(node, source),
+        in_test_region,
+        parsed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_rust_macro(
+    file: &ProjectFile,
+    name: &str,
+    package_name: &str,
+    parent: Option<&CodeUnit>,
+    range: Range,
+    signature: String,
+    in_test_region: bool,
+    parsed: &mut ParsedFile,
+) -> Option<CodeUnit> {
+    let short_name = parent
+        .map(|parent| format!("{}.{}", parent.short_name(), name))
+        .unwrap_or_else(|| name.to_string());
+    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Member));
+    let code_unit = CodeUnit::new_fq(
+        file.clone(),
+        CodeUnitType::Macro,
+        package_name.to_string(),
+        short_name,
+        fq,
+    );
+    let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
+    parsed.add_code_unit_with_range(code_unit.clone(), range, parent.cloned(), Some(top_level));
+    if in_test_region {
+        parsed.mark_test_region(&code_unit);
+    }
+    parsed.add_signature(code_unit.clone(), signature);
+    Some(code_unit)
+}
+
+/// Index the items written inside an item-position macro invocation
+/// (`cfg_rt! { pub mod coop; }`, `cfg_coop! { pub struct RestoreOnPending(...); ... }`)
+/// exactly as if the macro braces were absent.
+///
+/// tokio and similar crates wrap whole modules and free items in
+/// conditional-compilation macros defined in *another* file, so the invoked
+/// macro's `macro_rules!` definition is not visible here. Rather than relying
+/// on a name allowlist, we reparse the token-tree interior as Rust items and,
+/// when it genuinely parses as well-formed items (the robustness gate in
+/// `rust_reparsed_items_are_indexable`), run the ordinary declaration
+/// visitation over the result. Expression-position macros (`println!(...)`,
+/// `matches!(...)`) never reach here because they live inside function bodies,
+/// not at item position, and their token soup fails the parse gate anyway.
+///
+/// Range fidelity: the interior is reparsed in place, confined to its region via
+/// tree-sitter included ranges, so every node's byte offset and line number
+/// matches the original file exactly. This lets the existing visitors (which
+/// derive ranges from node positions via `node_range`) run unchanged and still
+/// slice the correct source text.
+#[allow(clippy::too_many_arguments)]
+fn visit_rust_macro_invocation_definitions(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    parent: Option<&CodeUnit>,
+    package_name: &str,
+    item_macro_definitions: &[RustRulesItemMacroDefinition],
+    parent_in_test_region: bool,
+    parsed: &mut ParsedFile,
+) {
+    let Some(invoked_macro) = rust_unqualified_macro_invocation_name(node, source) else {
+        return;
+    };
+    if rust_builtin_macro_does_not_replay_item_arguments(invoked_macro) {
+        return;
+    }
+    // Use the structured macro-rules knowledge we have. If this file defines the
+    // invoked macro and proves it does NOT replay its item input faithfully, the
+    // braces do not expand to the items inside, so indexing them would be a lie
+    // (`Some(false)` -> suppress). Otherwise -- proven faithful (`Some(true)`) or
+    // the definition lives in another file and is unknown here (`None`) -- admit
+    // ordinary items and let the parse gate below be the arbiter. Macro
+    // definitions require positive passthrough evidence because an unknown
+    // external macro can accept a syntactically valid `macro_rules!` token tree
+    // without emitting that declaration. Known inert built-ins were suppressed
+    // above before reaching this fallback.
+    let locally_proven_passthrough = match rust_latest_visible_rules_item_macro(
+        item_macro_definitions,
+        invoked_macro,
+        node.start_byte(),
+    ) {
+        Some(false) => return,
+        Some(true) => true,
+        None => false,
+    };
+
+    // Taint carried into the reparsed items: the enclosing test region plus any
+    // test attribute directly on the macro invocation (`#[cfg(test)] mac! {...}`).
+    // A `#[cfg(test)]` written *inside* the token tree, guarding an individual
+    // reparsed item, is additionally caught by `visit_rust_macro_item`'s own
+    // preceding-attribute check over the region reparse tree.
+    let invocation_in_test_region =
+        parent_in_test_region || rust_item_carries_test_attribute(node, source);
+
+    let Some(arguments) = rust_macro_invocation_arguments(node) else {
+        return;
+    };
+    let Some((interior_start, interior_end)) = rust_macro_token_tree_interior(arguments) else {
+        return;
+    };
+    let Some(tree) = rust_reparse_macro_items(source, interior_start, interior_end) else {
+        return;
+    };
+    let root = tree.root_node();
+    if !rust_reparsed_items_are_indexable(root) {
+        return;
+    }
+
+    // First pass: bind imports declared inside the block so impls can resolve
+    // their owners, and expose re-exports (`pub use`) to import resolution --
+    // exactly as the top-level file walk does.
+    let mut interior_binder = ImportBinder::empty();
+    for index in 0..root.named_child_count() {
+        let Some(child) = root.named_child(index) else {
+            continue;
+        };
+        if child.kind() == "use_declaration" {
+            let imports = rust_imports_from_use_declaration(child, source);
+            for import in &imports {
+                crate::lexical_scope::insert_rust_import_binding(&mut interior_binder, import);
+            }
+            parsed.imports.extend(imports);
+        }
+    }
+
+    // Second pass: index every item as if the macro braces were absent. Nested
+    // item-position macros (tokio nests `cfg_rt!` inside `cfg_coop!`) recurse
+    // through the `macro_invocation` arm of `visit_rust_macro_item`.
+    for index in 0..root.named_child_count() {
+        let Some(child) = root.named_child(index) else {
+            continue;
+        };
+        visit_rust_macro_item(
+            file,
+            source,
+            child,
+            parent,
+            package_name,
+            item_macro_definitions,
+            &interior_binder,
+            locally_proven_passthrough,
+            invocation_in_test_region,
+            parsed,
+        );
+    }
+}
+
+/// Byte range `[start, end)` of a `token_tree`'s interior, excluding its
+/// delimiters. Returns `None` if the node is not a delimited token tree.
+fn rust_macro_token_tree_interior(token_tree: Node<'_>) -> Option<(usize, usize)> {
+    let open = token_tree.child(0)?;
+    let close = token_tree.child(token_tree.child_count().checked_sub(1)?)?;
+    if !matches!(open.kind(), "(" | "[" | "{") || !matches!(close.kind(), ")" | "]" | "}") {
+        return None;
+    }
+    let start = open.end_byte();
+    let end = close.start_byte();
+    (start <= end).then_some((start, end))
+}
+
+/// Reparse the token-tree interior `[start, end)` as Rust items, confined to
+/// the region via included ranges so that every node position in the reparse --
+/// byte offset and line number -- is identical to the original file.
+fn rust_reparse_macro_items(
+    source: &str,
+    interior_start: usize,
+    interior_end: usize,
+) -> Option<Tree> {
+    crate::lexical_scope::parse_rust_region_tree(source, interior_start, interior_end)
+}
+
+/// Robustness gate: the reparsed interior is only indexed when it consists
+/// entirely of well-formed Rust items (plus benign comments/attributes) with no
+/// ERROR or MISSING nodes anywhere. This rejects expression-macro arguments
+/// (`vec![1, 2, 3]`, `matches!(x, Some(_))`, `println!("struct Foo")`) whose
+/// interiors are not item streams, while admitting real item blocks -- including
+/// `thread_local! { static FOO: ...; }`, which correctly yields a static.
+fn rust_reparsed_items_are_indexable(root: Node<'_>) -> bool {
+    if root.has_error() {
+        return false;
+    }
+    let mut cursor = root.walk();
+    let mut saw_item = false;
+    for child in root.named_children(&mut cursor) {
+        match child.kind() {
+            "line_comment" | "block_comment" | "attribute_item" | "inner_attribute_item" => {}
+            kind if rust_is_indexable_item_kind(kind) => saw_item = true,
+            _ => return false,
+        }
+    }
+    saw_item
+}
+
+fn rust_is_indexable_item_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function_item"
+            | "struct_item"
+            | "enum_item"
+            | "union_item"
+            | "trait_item"
+            | "mod_item"
+            | "use_declaration"
+            | "const_item"
+            | "static_item"
+            | "type_item"
+            | "impl_item"
+            | "macro_definition"
+            | "macro_invocation"
+            | "extern_crate_declaration"
+    )
+}
+
+/// Dispatch a single reparsed item to the same visitor the top-level and module
+/// walks use. `use_declaration`s are bound by the caller's first pass; nested
+/// `macro_invocation`s recurse so arbitrarily nested item-position macros index.
+#[allow(clippy::too_many_arguments)]
+fn visit_rust_macro_item(
+    file: &ProjectFile,
+    source: &str,
+    child: Node<'_>,
+    parent: Option<&CodeUnit>,
+    package_name: &str,
+    item_macro_definitions: &[RustRulesItemMacroDefinition],
+    impl_binder: &ImportBinder,
+    replay_macro_definitions: bool,
+    in_test_region: bool,
+    parsed: &mut ParsedFile,
+) {
+    match child.kind() {
+        "use_declaration" => {}
+        "struct_item" | "enum_item" | "trait_item" => {
+            visit_rust_class_like(
+                file,
+                source,
+                child,
+                parent,
+                package_name,
+                in_test_region,
+                parsed,
+            );
+        }
+        "mod_item" => {
+            visit_rust_module(
+                file,
+                source,
+                child,
+                parent,
+                package_name,
+                item_macro_definitions,
+                in_test_region,
+                parsed,
+            );
+        }
+        "function_item" => {
+            visit_rust_function(
+                file,
+                source,
+                child,
+                parent,
+                package_name,
+                in_test_region,
+                parsed,
+            );
+        }
+        "const_item" | "static_item" => {
+            visit_rust_field(
+                file,
+                source,
+                child,
+                parent,
+                package_name,
+                in_test_region,
+                parsed,
+            );
+        }
+        "type_item" => {
+            visit_rust_alias(
+                file,
+                source,
+                child,
+                parent,
+                package_name,
+                in_test_region,
+                parsed,
+            );
+        }
+        "macro_definition" if replay_macro_definitions => {
+            visit_rust_macro(
+                file,
+                source,
+                child,
+                parent,
+                package_name,
+                in_test_region,
+                parsed,
+            );
+        }
+        "impl_item" => {
+            visit_rust_impl(
+                file,
+                source,
+                child,
+                parent,
+                package_name,
+                impl_binder,
+                in_test_region,
+                parsed,
+            );
+        }
+        "macro_invocation" => {
+            visit_rust_macro_invocation_definitions(
+                file,
+                source,
+                child,
+                parent,
+                package_name,
+                item_macro_definitions,
+                in_test_region,
+                parsed,
+            );
+        }
+        _ => {}
+    }
+}
+
+pub fn rust_unqualified_macro_invocation_name<'a>(
+    node: Node<'_>,
+    source: &'a str,
+) -> Option<&'a str> {
+    let macro_node = node.child_by_field_name("macro")?;
+    if !rust_is_identifier_like(macro_node) {
+        return None;
+    }
+    let name = rust_node_text(macro_node, source).trim();
+    (!name.is_empty()).then_some(name)
+}
+
+pub fn rust_macro_invocation_arguments(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("arguments").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| child.kind() == "token_tree")
+    })
+}
+
+fn rust_is_identifier_like(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "identifier" | "reserved_identifier" | "_reserved_identifier"
+    )
+}
+
+/// Re-exported from core, where the persisted Rust module-route facts that
+/// carry it live.
+pub use brokk_bifrost_core::analyzer::rust_facts::RustRulesItemMacroDefinition;
+
+pub fn rust_rules_item_macro_definitions(
+    root: Node<'_>,
+    source: &str,
+) -> Vec<RustRulesItemMacroDefinition> {
+    let mut definitions = Vec::new();
+    let mut pending_scopes = vec![root];
+    while let Some(scope) = pending_scopes.pop() {
+        let mut cursor = scope.walk();
+        let mut children = scope.named_children(&mut cursor).collect::<Vec<_>>();
+        children.reverse();
+        for child in children {
+            if child.kind() == "macro_definition" {
+                if let Some(name) = rust_macro_definition_name(child, source) {
+                    definitions.push((
+                        RustRulesItemMacroDefinition {
+                            name: name.to_string(),
+                            visible_after: child.end_byte(),
+                            scope_start: scope.start_byte(),
+                            scope_end: scope.end_byte(),
+                            passthrough: rust_macro_definition_all_rules_replay_item_parameters(
+                                child, source,
+                            ),
+                        },
+                        rust_macro_definition_item_delegate(child, source),
+                    ));
+                }
+                continue;
+            }
+            if child.kind() == "mod_item"
+                && let Some(body) = child.child_by_field_name("body")
+            {
+                pending_scopes.push(body);
+            }
+        }
+    }
+    definitions.sort_by_key(|(definition, _)| definition.visible_after);
+    loop {
+        let mut changed = false;
+        for index in 0..definitions.len() {
+            if definitions[index].0.passthrough {
+                continue;
+            }
+            let Some(delegate) = definitions[index].1.as_deref() else {
+                continue;
+            };
+            let wrapper = &definitions[index].0;
+            let delegated = definitions[..index]
+                .iter()
+                .filter(|(definition, _)| {
+                    definition.name == delegate
+                        && definition.visible_after <= wrapper.visible_after
+                        && definition.scope_start <= wrapper.visible_after
+                        && wrapper.visible_after < definition.scope_end
+                })
+                .max_by_key(|(definition, _)| (definition.scope_start, definition.visible_after))
+                .is_some_and(|(definition, _)| definition.passthrough);
+            if delegated {
+                definitions[index].0.passthrough = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    definitions
+        .into_iter()
+        .map(|(definition, _)| definition)
+        .collect()
+}
+
+fn rust_macro_definition_item_delegate(node: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    let rules: Vec<_> = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "macro_rule")
+        .collect();
+    let mut delegate = None;
+    for rule in rules {
+        let candidate = rust_macro_rule_item_delegate(rule, source)?;
+        if delegate.as_ref().is_some_and(|known| known != &candidate) {
+            return None;
+        }
+        delegate = Some(candidate);
+    }
+    delegate
+}
+
+fn rust_macro_rule_item_delegate(rule: Node<'_>, source: &str) -> Option<String> {
+    let pattern = rule.child_by_field_name("left")?;
+    let expansion = rule.child_by_field_name("right")?;
+    let item_parameters = rust_macro_rule_item_parameters(pattern, source);
+    if item_parameters.is_empty()
+        || !rust_macro_rule_matcher_is_item_stream(pattern, source, &item_parameters)
+    {
+        return None;
+    }
+
+    let mut cursor = expansion.walk();
+    let children = expansion.children(&mut cursor).collect::<Vec<_>>();
+    let mut index = 1;
+    let end = children.len().checked_sub(1)?;
+    while index + 1 < end
+        && children[index].kind() == "#"
+        && rust_is_conditional_attribute_token_tree(children[index + 1], source)
+    {
+        index += 2;
+    }
+    let name = *children.get(index)?;
+    let bang = *children.get(index + 1)?;
+    let arguments = *children.get(index + 2)?;
+    if index + 3 != end
+        || !rust_is_identifier_like(name)
+        || bang.kind() != "!"
+        || arguments.kind() != "token_tree"
+        || !rust_macro_delegate_arguments_replay_items(arguments, source, &item_parameters)
+    {
+        return None;
+    }
+    Some(rust_node_text(name, source).trim().to_string())
+}
+
+fn rust_is_conditional_attribute_token_tree(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "token_tree"
+        && node.child(0).is_some_and(|child| child.kind() == "[")
+        && node
+            .child(node.child_count().saturating_sub(1))
+            .is_some_and(|child| child.kind() == "]")
+        && node
+            .named_child(0)
+            .filter(|child| rust_is_identifier_like(*child))
+            .map(|child| rust_node_text(child, source).trim())
+            .is_some_and(|name| matches!(name, "cfg" | "cfg_attr"))
+}
+
+fn rust_macro_delegate_arguments_replay_items(
+    arguments: Node<'_>,
+    source: &str,
+    item_parameters: &HashMap<String, usize>,
+) -> bool {
+    let mut cursor = arguments.walk();
+    let children = arguments.children(&mut cursor).collect::<Vec<_>>();
+    let Some(inner) = children.get(1..children.len().saturating_sub(1)) else {
+        return false;
+    };
+    if inner.is_empty()
+        || inner.iter().any(|child| {
+            child.kind() != "token_repetition"
+                || !rust_item_repetition_replays_parameters(*child, source, item_parameters)
+        })
+    {
+        return false;
+    }
+    let mut seen = HashMap::default();
+    for child in inner {
+        let mut pending = vec![*child];
+        while let Some(node) = pending.pop() {
+            if node.kind() == "metavariable" {
+                *seen
+                    .entry(rust_node_text(node, source).trim().to_string())
+                    .or_insert(0usize) += 1;
+                continue;
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
+        }
+    }
+    item_parameters
+        .keys()
+        .all(|parameter| seen.get(parameter) == Some(&1))
+        && seen.len() == item_parameters.len()
+}
+
+fn rust_item_repetition_replays_parameters(
+    repetition: Node<'_>,
+    source: &str,
+    item_parameters: &HashMap<String, usize>,
+) -> bool {
+    let mut cursor = repetition.walk();
+    repetition
+        .children(&mut cursor)
+        .all(|child| match child.kind() {
+            "$" | "(" | ")" | "*" | "+" | "?" => true,
+            "metavariable" => item_parameters.contains_key(rust_node_text(child, source).trim()),
+            _ => false,
+        })
+}
+
+fn rust_builtin_macro_does_not_replay_item_arguments(name: &str) -> bool {
+    matches!(
+        name,
+        "cfg"
+            | "column"
+            | "compile_error"
+            | "concat"
+            | "env"
+            | "file"
+            | "include"
+            | "include_bytes"
+            | "include_str"
+            | "line"
+            | "module_path"
+            | "option_env"
+            | "stringify"
+    )
+}
+
+fn rust_latest_visible_rules_item_macro(
+    definitions: &[RustRulesItemMacroDefinition],
+    name: &str,
+    invocation_start: usize,
+) -> Option<bool> {
+    definitions
+        .iter()
+        .filter(|definition| {
+            definition.name == name
+                && definition.visible_after <= invocation_start
+                && definition.scope_start <= invocation_start
+                && invocation_start < definition.scope_end
+        })
+        .max_by_key(|definition| (definition.scope_start, definition.visible_after))
+        .map(|definition| definition.passthrough)
+}
+
+fn rust_macro_definition_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = rust_node_text(name_node, source).trim();
+    (!name.is_empty()).then_some(name)
+}
+
+fn rust_macro_definition_all_rules_replay_item_parameters(node: Node<'_>, source: &str) -> bool {
+    let mut cursor = node.walk();
+    let rules: Vec<_> = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "macro_rule")
+        .collect();
+    !rules.is_empty()
+        && rules
+            .into_iter()
+            .all(|rule| rust_macro_rule_replays_item_parameters(rule, source))
+}
+
+fn rust_macro_rule_replays_item_parameters(rule: Node<'_>, source: &str) -> bool {
+    let Some(pattern) = rule.child_by_field_name("left") else {
+        return false;
+    };
+    let Some(expansion) = rule.child_by_field_name("right") else {
+        return false;
+    };
+
+    let item_parameters = rust_macro_rule_item_parameters(pattern, source);
+    if item_parameters.is_empty()
+        || !rust_macro_rule_matcher_is_item_stream(pattern, source, &item_parameters)
+    {
+        return false;
+    }
+
+    let mut occurrences: HashMap<String, usize> = HashMap::default();
+    let mut stack = vec![expansion];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "metavariable" {
+            let name = rust_node_text(node, source).trim();
+            let Some(pattern_depth) = item_parameters.get(name) else {
+                continue;
+            };
+            let mut repetition_depth = 0;
+            let mut ancestor = node;
+            loop {
+                let Some(parent) = ancestor.parent() else {
+                    return false;
+                };
+                if parent == expansion {
+                    break;
+                }
+                if parent.kind() != "token_repetition" {
+                    return false;
+                }
+                repetition_depth += 1;
+                ancestor = parent;
+            }
+            if repetition_depth != *pattern_depth {
+                return false;
+            }
+            *occurrences.entry(name.to_string()).or_default() += 1;
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    item_parameters
+        .keys()
+        .all(|parameter| occurrences.get(parameter) == Some(&1))
+}
+
+fn rust_macro_rule_item_parameters(pattern: Node<'_>, source: &str) -> HashMap<String, usize> {
+    let mut parameters = HashMap::default();
+    let mut stack = vec![(pattern, 0)];
+    while let Some((node, repetition_depth)) = stack.pop() {
+        if node.kind() == "token_binding_pattern"
+            && rust_macro_binding_fragment(node, source) == Some("item")
+            && let Some(metavariable) = node.child_by_field_name("name")
+        {
+            let name = rust_node_text(metavariable, source).trim();
+            if !name.is_empty() {
+                parameters.insert(name.to_string(), repetition_depth);
+            }
+        }
+
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor).map(|child| {
+            (
+                child,
+                repetition_depth + usize::from(child.kind() == "token_repetition_pattern"),
+            )
+        }));
+    }
+    parameters
+}
+
+fn rust_macro_binding_fragment<'a>(binding: Node<'_>, source: &'a str) -> Option<&'a str> {
+    binding
+        .child_by_field_name("type")
+        .map(|fragment| rust_node_text(fragment, source).trim())
+}
+
+fn rust_macro_rule_matcher_is_item_stream(
+    pattern: Node<'_>,
+    source: &str,
+    item_parameters: &HashMap<String, usize>,
+) -> bool {
+    let mut cursor = pattern.walk();
+    let children = pattern.children(&mut cursor).collect::<Vec<_>>();
+    let mut index = 1;
+    let end = children.len().saturating_sub(1);
+    while index < end {
+        let child = children[index];
+        match child.kind() {
+            "token_binding_pattern" => {
+                if rust_macro_binding_fragment(child, source) != Some("item") {
+                    return false;
+                }
+                index += 1;
+            }
+            "token_repetition_pattern" => {
+                if !rust_item_repetition_pattern_is_safe(child, source, item_parameters) {
+                    return false;
+                }
+                index += 1;
+            }
+            "#" => {
+                index += 1;
+                if index < end && children[index].kind() == "!" {
+                    index += 1;
+                }
+                if index >= end
+                    || children[index].kind() != "token_tree_pattern"
+                    || !rust_attribute_meta_pattern_is_safe(children[index], source)
+                {
+                    return false;
+                }
+                index += 1;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn rust_item_repetition_pattern_is_safe(
+    repetition: Node<'_>,
+    source: &str,
+    item_parameters: &HashMap<String, usize>,
+) -> bool {
+    let mut saw_item = false;
+    let mut cursor = repetition.walk();
+    for child in repetition.children(&mut cursor) {
+        match child.kind() {
+            "$" | "(" | ")" | "*" | "+" | "?" => {}
+            "token_binding_pattern" => {
+                let Some(name) = child.child_by_field_name("name") else {
+                    return false;
+                };
+                let name = rust_node_text(name, source).trim();
+                if rust_macro_binding_fragment(child, source) != Some("item")
+                    || !item_parameters.contains_key(name)
+                {
+                    return false;
+                }
+                saw_item = true;
+            }
+            _ => return false,
+        }
+    }
+    saw_item
+}
+
+fn rust_attribute_meta_pattern_is_safe(attribute: Node<'_>, source: &str) -> bool {
+    let mut saw_meta = false;
+    let mut pending = vec![attribute];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "token_binding_pattern" {
+            if rust_macro_binding_fragment(node, source) != Some("meta") {
+                return false;
+            }
+            saw_meta = true;
+            continue;
+        }
+        if node != attribute && node.kind() == "token_tree_pattern" {
+            return false;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    saw_meta
+}
+
+fn rust_range_from_node(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row + 1,
+        end_line: node.end_position().row + 1,
+    }
+}
+
+fn visit_rust_field(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    parent: Option<&CodeUnit>,
+    package_name: &str,
+    parent_in_test_region: bool,
+    parsed: &mut ParsedFile,
+) -> Option<CodeUnit> {
+    let name_node = node.child_by_field_name("name").unwrap_or(node);
+    let name = rust_node_text(name_node, source)
+        .trim()
+        .trim_end_matches(',')
+        .to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
+    let short_name = parent
+        .map(|parent| format!("{}.{}", parent.short_name(), name))
+        .unwrap_or_else(|| format!("{RUST_MODULE_SCOPE_SEGMENT}.{name}"));
+    // A package-level `const`/`static` sits under the synthetic `_module_`
+    // scope; a member sits directly under its owner.
+    let fq = match parent {
+        Some(parent) => parent.fq().clone(),
+        None => rust_file_package_fq(file).with_pushed(rust_segment(
+            RUST_MODULE_SCOPE_SEGMENT,
+            SegmentKind::Package,
+        )),
+    }
+    .with_pushed(rust_segment(&name, SegmentKind::Member));
+    let code_unit = rust_inherit_package_anchor(
+        CodeUnit::with_signature_and_fq(
+            file.clone(),
+            CodeUnitType::Field,
+            package_name.to_string(),
+            short_name,
+            rust_impl_member_identity_signature(node, source),
+            false,
+            fq,
+        ),
+        parent,
+    );
+    let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
+    parsed.add_code_unit(
+        code_unit.clone(),
+        node,
+        source,
+        parent.cloned(),
+        Some(top_level),
+    );
+    if in_test_region {
+        parsed.mark_test_region(&code_unit);
+    }
+    parsed.add_signature_with_metadata(
+        code_unit.clone(),
+        SignatureMetadata::new(
+            rust_node_text(node, source)
+                .trim()
+                .trim_end_matches(',')
+                .to_string(),
+            Vec::new(),
+        )
+        .with_return_type_text(
+            node.child_by_field_name("type")
+                .map(|r#type| rust_node_text(r#type, source).trim().to_owned()),
+        )
+        .with_return_type_identity(rust_enum_variant_owner_identity(node, source))
+        .with_dispatch_extensibility(DispatchExtensibility::Closed),
+    );
+
+    // A struct-like enum variant owns its named fields just as a struct owns
+    // its fields. Keep the variant's existing value-namespace identity and
+    // publish the named children beneath it (`Enum.Variant.field`). Tuple
+    // variants have positional fields and deliberately remain fieldless here.
+    if node.kind() == "enum_variant"
+        && let Some(body) = node.child_by_field_name("body")
+        && body.kind() == "field_declaration_list"
+    {
+        for index in 0..body.named_child_count() {
+            let Some(field) = body.named_child(index) else {
+                continue;
+            };
+            if field.kind() == "field_declaration" {
+                visit_rust_field(
+                    file,
+                    source,
+                    field,
+                    Some(&code_unit),
+                    package_name,
+                    in_test_region,
+                    parsed,
+                );
+            }
+        }
+    }
+    Some(code_unit)
+}
+
+fn rust_enum_variant_owner_identity(
+    variant: Node<'_>,
+    source: &str,
+) -> Option<StructuredTypeIdentity> {
+    if variant.kind() != "enum_variant" {
+        return None;
+    }
+    let mut current = variant.parent()?;
+    while current.kind() != "enum_item" {
+        current = current.parent()?;
+    }
+    let enum_name = current.child_by_field_name("name")?;
+    let enum_name = rust_node_text(enum_name, source).trim();
+    if enum_name.is_empty() {
+        return None;
+    }
+
+    let mut lexical_scope = Vec::new();
+    let mut ancestor = current.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "mod_item" {
+            let name = node.child_by_field_name("name")?;
+            let name = rust_node_text(name, source).trim();
+            if name.is_empty() {
+                return None;
+            }
+            lexical_scope.push(name.to_string());
+        }
+        ancestor = node.parent();
+    }
+    lexical_scope.reverse();
+
+    let mut builder = StructuredTypeIdentityBuilder::default();
+    let root = builder.named(StructuredTypeName::new(
+        vec![enum_name.to_string()],
+        lexical_scope,
+        false,
+    )?)?;
+    builder.finish(root)
+}
+
+fn visit_rust_alias(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    parent: Option<&CodeUnit>,
+    package_name: &str,
+    parent_in_test_region: bool,
+    parsed: &mut ParsedFile,
+) -> Option<CodeUnit> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = rust_node_text(name_node, source).trim();
+    if name.is_empty() {
+        return None;
+    }
+    let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
+    let short_name = parent
+        .map(|parent| format!("{}.{}", parent.short_name(), name))
+        .unwrap_or_else(|| name.to_string());
+    let fq = rust_child_fq_base(parent, file).with_pushed(rust_segment(name, SegmentKind::Member));
+    let code_unit = rust_inherit_package_anchor(
+        CodeUnit::with_signature_and_fq(
+            file.clone(),
+            CodeUnitType::Field,
+            package_name.to_string(),
+            short_name,
+            rust_impl_member_identity_signature(node, source),
+            false,
+            fq,
+        ),
+        parent,
+    );
+    let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
+    parsed.add_code_unit(
+        code_unit.clone(),
+        node,
+        source,
+        parent.cloned(),
+        Some(top_level),
+    );
+    if in_test_region {
+        parsed.mark_test_region(&code_unit);
+    }
+    parsed.add_signature(
+        code_unit.clone(),
+        rust_node_text(node, source).trim().to_string(),
+    );
+    parsed.mark_type_alias(code_unit.clone());
+    Some(code_unit)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_rust_impl(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    lexical_parent: Option<&CodeUnit>,
+    package_name: &str,
+    import_binder: &ImportBinder,
+    parent_in_test_region: bool,
+    parsed: &mut ParsedFile,
+) {
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return;
+    };
+    let Some(parent) = rust_impl_owner(
+        file,
+        source,
+        type_node,
+        lexical_parent,
+        package_name,
+        import_binder,
+        parsed,
+    ) else {
+        return;
+    };
+
+    // A `#[cfg(test)]`-gated `impl` (or one nested in a test region) taints its
+    // members, but never the impl owner type itself — that type may be defined
+    // in production and only extended by a test impl.
+    let in_test_region = parent_in_test_region || rust_item_carries_test_attribute(node, source);
+
+    let Some(body) = node.child_by_field_name("body") else {
+        return;
+    };
+    for index in 0..body.named_child_count() {
+        let Some(child) = body.named_child(index) else {
+            continue;
+        };
+        match child.kind() {
+            "function_item" => {
+                visit_rust_function(
+                    file,
+                    source,
+                    child,
+                    Some(&parent),
+                    parent.package_name(),
+                    in_test_region,
+                    parsed,
+                );
+            }
+            "const_item" => {
+                visit_rust_field(
+                    file,
+                    source,
+                    child,
+                    Some(&parent),
+                    parent.package_name(),
+                    in_test_region,
+                    parsed,
+                );
+            }
+            "type_item" => {
+                visit_rust_alias(
+                    file,
+                    source,
+                    child,
+                    Some(&parent),
+                    parent.package_name(),
+                    in_test_region,
+                    parsed,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RustImplOwnerIdentity {
+    package_name: String,
+    short_name: String,
+    /// How `package_name` was resolved, so a persisted member of this owner can
+    /// be re-anchored against a live path instead of storing the path-derived
+    /// package text of the mount it was extracted from.
+    anchor: RustModuleAnchor,
+}
+
+fn rust_package_anchor(anchor: RustModuleAnchor) -> Option<PackageAnchor> {
+    match anchor {
+        RustModuleAnchor::Crate => Some(PackageAnchor::CrateRoot),
+        RustModuleAnchor::OwnModule { pop } => Some(PackageAnchor::OwnModule { pop }),
+        // A package rooted in another crate cannot be placed from this file's
+        // path; encoding falls back to persisting the complete name.
+        RustModuleAnchor::External => None,
+    }
+}
+
+fn rust_impl_owner(
+    file: &ProjectFile,
+    source: &str,
+    type_node: Node<'_>,
+    lexical_parent: Option<&CodeUnit>,
+    package_name: &str,
+    import_binder: &ImportBinder,
+    parsed: &ParsedFile,
+) -> Option<CodeUnit> {
+    let target_path = rust_nominal_type_path(type_node, source)?;
+    let lexical_package = match lexical_parent {
+        Some(parent) if package_name.is_empty() => parent.short_name().to_string(),
+        Some(parent) => format!("{package_name}.{}", parent.short_name()),
+        None => package_name.to_string(),
+    };
+    let local_identity = RustImplOwnerIdentity {
+        package_name: lexical_package.clone(),
+        short_name: target_path.join("."),
+        anchor: crate::imports::rust_anchor_for_resolved_package(
+            &lexical_package,
+            package_name,
+            false,
+        ),
+    };
+    if let Some(owner) = rust_declared_impl_owner(parsed, &local_identity) {
+        return Some(owner);
+    }
+
+    let identity = if target_path.len() == 1 {
+        let target_name = &target_path[0];
+        if let Some(binding) = import_binder.bindings.get(target_name)
+            && binding.kind == ImportKind::Named
+        {
+            let imported_name = binding.imported_name.as_ref()?;
+            let resolved_package = crate::imports::resolve_rust_module_path_with_crate(
+                &lexical_package,
+                &crate::imports::rust_crate_root_package(file),
+                &binding.module_specifier,
+            )?;
+            let anchor = crate::imports::rust_anchor_for_resolved_package(
+                &resolved_package,
+                package_name,
+                crate::imports::rust_module_specifier_is_crate_rooted(&binding.module_specifier),
+            );
+            RustImplOwnerIdentity {
+                package_name: resolved_package,
+                short_name: imported_name.clone(),
+                anchor,
+            }
+        } else {
+            // Generic parameters and `Self` deliberately remain member namespaces only.
+            // Ordinary unresolved bare names do too: only a source declaration can publish
+            // a nominal workspace type.
+            local_identity
+        }
+    } else {
+        rust_impl_owner_identity_from_path(
+            file,
+            &lexical_package,
+            package_name,
+            &target_path,
+            import_binder,
+        )?
+    };
+
+    rust_declared_impl_owner(parsed, &identity).or_else(|| {
+        let expected_fqn = if identity.package_name.is_empty() {
+            identity.short_name.clone()
+        } else {
+            format!("{}.{}", identity.package_name, identity.short_name)
+        };
+        let local_short_name = if package_name.is_empty() {
+            Some(expected_fqn)
+        } else if identity.package_name == package_name {
+            Some(identity.short_name.clone())
+        } else {
+            identity
+                .package_name
+                .strip_prefix(package_name)
+                .and_then(|suffix| suffix.strip_prefix('.'))
+                .map(|suffix| format!("{suffix}.{}", identity.short_name))
+        };
+        // Re-expressing the owner relative to this file's package also moves its
+        // anchor: the structured name is then built on the file's own package,
+        // whatever route the specifier took to name it.
+        let identity_anchor = identity.anchor;
+        let (owner_package, owner_short_name, owner_anchor) = local_short_name
+            .map(|short_name| {
+                (
+                    package_name.to_string(),
+                    short_name,
+                    RustModuleAnchor::OwnModule { pop: 0 },
+                )
+            })
+            .unwrap_or((identity.package_name, identity.short_name, identity_anchor));
+        // This synthesized owner is not itself indexed, but its `fq` seeds the
+        // structured names of the impl members that extend it. A resolved
+        // owner path names modules before its terminal nominal type. Treating
+        // every component as a type creates an equal-rendering orphan when an
+        // `impl` precedes the corresponding module-scoped declaration.
+        let mut fq = if owner_package == package_name {
+            rust_file_package_fq(file)
+        } else {
+            rust_semantic_package_fq(&owner_package)
+        };
+        let owner_components = owner_short_name
+            .split('.')
+            .filter(|component| !component.is_empty())
+            .collect::<Vec<_>>();
+        for (index, component) in owner_components.iter().enumerate() {
+            let kind = if index + 1 == owner_components.len() {
+                SegmentKind::Type
+            } else {
+                SegmentKind::Package
+            };
+            fq.push(rust_segment(component, kind));
+        }
+        let owner = CodeUnit::new_fq(
+            file.clone(),
+            CodeUnitType::Class,
+            owner_package,
+            owner_short_name,
+            fq,
+        );
+        Some(match rust_package_anchor(owner_anchor) {
+            Some(anchor) => owner.with_package_anchor(anchor),
+            None => owner,
+        })
+    })
+}
+
+fn rust_declared_impl_owner(
+    parsed: &ParsedFile,
+    identity: &RustImplOwnerIdentity,
+) -> Option<CodeUnit> {
+    let expected_fqn = if identity.package_name.is_empty() {
+        identity.short_name.clone()
+    } else {
+        format!("{}.{}", identity.package_name, identity.short_name)
+    };
+    parsed
+        .declarations()
+        .iter()
+        .find(|unit| {
+            (unit.kind() == CodeUnitType::Class || parsed.type_aliases.contains(*unit))
+                && ((unit.package_name() == identity.package_name
+                    && unit.short_name() == identity.short_name)
+                    || unit.fq_name() == expected_fqn)
+        })
+        .cloned()
+}
+
+/// The module path that a `use` binding's local name stands for when that name
+/// roots a qualified `impl` owner path such as `impl Trait for m::Writer`.
+///
+/// A namespace binding already names its module. A renamed import keeps the
+/// imported terminal name apart from the module it came from, so `m` in
+/// `use crate::model as m;` stands for `crate::model` - the two joined. A glob
+/// binding names no path root at all.
+fn rust_import_binding_module_route(binding: &ImportBinding) -> Option<String> {
+    match binding.kind {
+        ImportKind::Namespace => Some(binding.module_specifier.clone()),
+        ImportKind::Named => {
+            let imported_name = binding.imported_name.as_deref()?;
+            Some(if binding.module_specifier.is_empty() {
+                imported_name.to_string()
+            } else {
+                format!("{}::{imported_name}", binding.module_specifier)
+            })
+        }
+        _ => None,
+    }
+}
+
+fn rust_impl_owner_identity_from_path(
+    file: &ProjectFile,
+    lexical_package: &str,
+    file_package: &str,
+    path: &[String],
+    import_binder: &ImportBinder,
+) -> Option<RustImplOwnerIdentity> {
+    let (name, module_path) = path.split_last()?;
+    let crate_package = crate::imports::rust_crate_root_package(file);
+    let (package_name, module_specifier) = if let Some((root, remainder)) =
+        module_path.split_first()
+        && let Some(binding) = import_binder.bindings.get(root)
+        && let Some(root_specifier) = rust_import_binding_module_route(binding)
+    {
+        let mut resolved = crate::imports::resolve_rust_module_path_with_crate(
+            lexical_package,
+            &crate_package,
+            &root_specifier,
+        )?;
+        for component in remainder {
+            if !resolved.is_empty() {
+                resolved.push('.');
+            }
+            resolved.push_str(component);
+        }
+        (resolved, root_specifier)
+    } else {
+        let module_specifier = module_path.join("::");
+        let resolved = crate::imports::resolve_rust_module_path_with_crate(
+            lexical_package,
+            &crate_package,
+            &module_specifier,
+        )?;
+        (resolved, module_specifier)
+    };
+    let anchor = crate::imports::rust_anchor_for_resolved_package(
+        &package_name,
+        file_package,
+        crate::imports::rust_module_specifier_is_crate_rooted(&module_specifier),
+    );
+
+    Some(RustImplOwnerIdentity {
+        package_name,
+        short_name: name.clone(),
+        anchor,
+    })
+}
+
+fn rust_nominal_type_path(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    let mut pending = vec![node];
+    while let Some(candidate) = pending.pop() {
+        match candidate.kind() {
+            "type_identifier" | "identifier" => {
+                let name = rust_node_text(candidate, source).trim();
+                if !name.is_empty() {
+                    return Some(vec![name.to_string()]);
+                }
+            }
+            "scoped_type_identifier" => {
+                let path = rust_path_components(candidate, source);
+                if !path.is_empty() {
+                    return Some(path);
+                }
+            }
+            "generic_type" | "reference_type" | "pointer_type" | "array_type" | "slice_type" => {
+                if let Some(inner) = candidate.child_by_field_name("type") {
+                    pending.push(inner);
+                } else {
+                    for index in (0..candidate.named_child_count()).rev() {
+                        if let Some(child) = candidate.named_child(index)
+                            && child.kind() != "type_arguments"
+                        {
+                            pending.push(child);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn rust_path_components(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut components = Vec::new();
+    let mut pending = vec![node];
+    while let Some(candidate) = pending.pop() {
+        match candidate.kind() {
+            "crate" | "self" | "super" | "identifier" | "type_identifier" => {
+                let text = rust_node_text(candidate, source).trim();
+                if !text.is_empty() {
+                    components.push(text.to_string());
+                }
+            }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                if let Some(name) = candidate.child_by_field_name("name") {
+                    pending.push(name);
+                }
+                if let Some(path) = candidate.child_by_field_name("path") {
+                    pending.push(path);
+                }
+            }
+            _ => {}
+        }
+    }
+    components
+}
+
+fn rust_type_signature(node: Node<'_>, source: &str, _top_level: bool) -> String {
+    let header = rust_node_text(node, source)
+        .split('{')
+        .next()
+        .unwrap_or_else(|| rust_node_text(node, source))
+        .split(';')
+        .next()
+        .unwrap_or_else(|| rust_node_text(node, source))
+        .trim();
+    format!("{header} {{")
+}
+
+fn rust_function_signature(node: Node<'_>, source: &str) -> String {
+    let header = rust_node_text(node, source)
+        .split('{')
+        .next()
+        .unwrap_or_else(|| rust_node_text(node, source))
+        .trim()
+        .trim_end_matches(';')
+        .to_string();
+    if node.kind() == "function_signature_item" {
+        header
+    } else {
+        format!("{header} {{ ... }}")
+    }
+}
+
+fn rust_impl_member_identity_signature(node: Node<'_>, source: &str) -> Option<String> {
+    let impl_item = enclosing_rust_impl_item(node)?;
+    let type_text = impl_item
+        .child_by_field_name("type")
+        .map(|node| rust_node_text(node, source).trim())?;
+    let item_signature = match node.kind() {
+        "function_item" | "function_signature_item" => rust_function_signature(node, source),
+        "const_item" | "type_item" | "associated_type" => {
+            rust_node_text(node, source).trim().to_string()
+        }
+        _ => return None,
+    };
+    if let Some(trait_node) = impl_item.child_by_field_name("trait") {
+        let trait_text = rust_node_text(trait_node, source).trim();
+        Some(format!(
+            "impl {trait_text} for {type_text}::{item_signature}"
+        ))
+    } else {
+        Some(format!("impl {type_text}::{item_signature}"))
+    }
+}
+
+fn enclosing_rust_impl_item(node: Node<'_>) -> Option<Node<'_>> {
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        if candidate.kind() == "impl_item" {
+            return Some(candidate);
+        }
+        parent = candidate.parent();
+    }
+    None
+}
+
+fn rust_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
+    let dispatch = rust_callable_dispatch_extensibility(node);
+    let Some(parameters_node) = node.child_by_field_name("parameters") else {
+        return SignatureMetadata::new(signature, Vec::new()).with_dispatch_extensibility(dispatch);
+    };
+    let parameter_text = rust_node_text(parameters_node, source).trim();
+    let Some(parameters_start) = signature.find(parameter_text) else {
+        return SignatureMetadata::new(signature, Vec::new()).with_dispatch_extensibility(dispatch);
+    };
+    let parameters_end = parameters_start + parameter_text.len();
+    let mut search_start = parameters_start;
+    let parameters = rust_parameter_label_nodes(parameters_node)
+        .into_iter()
+        .filter_map(|label_node| {
+            let label = rust_node_text(label_node, source).trim();
+            if label.is_empty() || search_start > parameters_end {
+                return None;
+            }
+            let haystack = signature.get(search_start..parameters_end)?;
+            let relative_start = haystack.find(label)?;
+            let start_byte = search_start + relative_start;
+            let end_byte = start_byte + label.len();
+            search_start = end_byte;
+            Some(ParameterMetadata::new(label, start_byte, end_byte))
+        })
+        .collect();
+    let metadata =
+        SignatureMetadata::new(signature, parameters).with_dispatch_extensibility(dispatch);
+    match rust_callable_parameter_type_spellings(parameters_node, source) {
+        Some(parameter_types) => metadata.with_callable_parameter_types(parameter_types),
+        None => metadata,
+    }
+}
+
+fn rust_callable_parameter_type_spellings(
+    parameters: Node<'_>,
+    source: &str,
+) -> Option<Vec<String>> {
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter(|parameter| parameter.kind() != "attribute_item")
+        .map(|parameter| {
+            if parameter.kind() != "parameter" {
+                return None;
+            }
+            let type_node = parameter.child_by_field_name("type")?;
+            let spelling = rust_node_text(type_node, source).trim();
+            (!spelling.is_empty()).then(|| spelling.to_string())
+        })
+        .collect()
+}
+
+fn rust_callable_dispatch_extensibility(node: Node<'_>) -> DispatchExtensibility {
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        match candidate.kind() {
+            "trait_item" => return DispatchExtensibility::Open,
+            "impl_item" => {
+                return if candidate.child_by_field_name("trait").is_some() {
+                    DispatchExtensibility::Open
+                } else {
+                    DispatchExtensibility::Closed
+                };
+            }
+            "function_item" | "closure_expression" | "source_file" => break,
+            _ => parent = candidate.parent(),
+        }
+    }
+    DispatchExtensibility::Closed
+}
+
+#[cfg(test)]
+mod structured_package_tests {
+    use super::*;
+
+    #[test]
+    fn hidden_directory_is_one_structured_rust_package_segment() {
+        let source = "pub struct Pattern;\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust parser language");
+        let tree = parser.parse(source, None).expect("parse Rust fixture");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = ProjectFile::new(
+            temp.path().canonicalize().expect("canonical root"),
+            ".github/workflows/generate-release-yml.rs",
+        );
+
+        let parsed = parse_rust_file(&file, source, &tree);
+        let pattern = parsed
+            .top_level_declarations
+            .iter()
+            .find(|unit| unit.identifier() == "Pattern")
+            .expect("Pattern declaration");
+
+        assert_eq!(pattern.package_name(), ".github.workflows");
+        assert_eq!(pattern.fq_name(), ".github.workflows.Pattern");
+        assert_eq!(pattern.package_segment_count(), 2);
+        assert_eq!(
+            pattern.fq_segments_debug(),
+            vec![
+                ("Package", ".github".to_string()),
+                ("Package", "workflows".to_string()),
+                ("Type", "Pattern".to_string()),
+            ]
+        );
+    }
+}
+
+fn rust_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
+    let mut labels = Vec::new();
+    let mut cursor = parameters_node.walk();
+    for child in parameters_node.named_children(&mut cursor) {
+        match child.kind() {
+            "parameter" => {
+                if let Some(pattern) = child.child_by_field_name("pattern") {
+                    labels.push(rust_parameter_pattern_label_node(pattern).unwrap_or(pattern));
+                }
+            }
+            "self_parameter" => labels.push(child),
+            _ => {}
+        }
+    }
+    labels
+}
+
+fn rust_parameter_pattern_label_node(pattern: Node<'_>) -> Option<Node<'_>> {
+    match pattern.kind() {
+        "identifier" => Some(pattern),
+        "mut_pattern" | "ref_pattern" => {
+            let mut cursor = pattern.walk();
+            pattern
+                .named_children(&mut cursor)
+                .find_map(rust_parameter_pattern_label_node)
+        }
+        _ => None,
+    }
+}
+
+fn rust_macro_signature(node: Node<'_>, source: &str) -> String {
+    rust_node_text(node, source)
+        .lines()
+        .find(|line| line.contains("macro_rules!"))
+        .map(str::trim)
+        .unwrap_or("macro_rules!")
+        .to_string()
+}
+
+/// Every type identifier named anywhere in `source`, parsed standalone rather
+/// than read off an indexed file: callers pass ad hoc snippets that the
+/// analyzer has never seen.
+pub fn rust_type_identifiers(source: &str) -> BTreeSet<String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .expect("failed to load rust parser");
+    let Some(tree) = parser.parse(source, None) else {
+        return BTreeSet::new();
+    };
+    let mut identifiers = HashSet::default();
+    collect_rust_type_identifiers(tree.root_node(), source, &mut identifiers);
+    identifiers.into_iter().collect()
+}
+
+pub fn collect_rust_type_identifiers(
+    node: Node<'_>,
+    source: &str,
+    identifiers: &mut HashSet<String>,
+) {
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        match node.kind() {
+            "identifier" | "type_identifier" | "field_identifier" => {
+                let text = rust_node_text(node, source).trim();
+                if !text.is_empty() {
+                    identifiers.insert(text.to_string());
+                }
+            }
+            _ => {}
+        }
+
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                pending.push(child);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod passthrough_macro_tests {
+    use super::*;
+
+    #[test]
+    fn item_passthrough_classifier_requires_a_safe_matcher_and_faithful_replay() {
+        let source = r#"
+macro_rules! replay { ($($item:item)*) => { $( #[cfg(any())] $item )* }; }
+macro_rules! feature { (#![$meta:meta] $($item:item)*) => { $( #[$meta] $item )* }; }
+macro_rules! base { ($($item:item)*) => { $( #[cfg(any())] $item )* }; }
+macro_rules! delegated { ($($item:item)*) => { #[cfg(unix)] base! { $($item)* } }; }
+macro_rules! attributed_nested { ($($item:item)*) => { #[allow(dead_code)] base! { $($item)* } }; }
+macro_rules! dropped { ($($left:item)* $($right:item)*) => { $($left)* }; }
+macro_rules! stringified { ($($item:item)*) => { stringify!($($item)*) }; }
+macro_rules! nested { ($($item:item)*) => { wrapper! { $($item)* } }; }
+macro_rules! mixed { ($name:ident, $item:item) => { $item }; }
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust parser language");
+        let tree = parser.parse(source, None).expect("parse Rust fixture");
+        let definitions = rust_rules_item_macro_definitions(tree.root_node(), source)
+            .into_iter()
+            .map(|definition| (definition.name, definition.passthrough))
+            .collect::<HashMap<_, _>>();
+
+        for name in ["replay", "feature", "base", "delegated"] {
+            assert_eq!(definitions.get(name), Some(&true), "{name}");
+        }
+        for name in [
+            "attributed_nested",
+            "dropped",
+            "stringified",
+            "nested",
+            "mixed",
+        ] {
+            assert_eq!(definitions.get(name), Some(&false), "{name}");
+        }
+    }
+
+    #[test]
+    fn built_in_token_macros_are_not_item_passthroughs() {
+        for name in [
+            "cfg",
+            "column",
+            "compile_error",
+            "concat",
+            "env",
+            "file",
+            "include",
+            "include_bytes",
+            "include_str",
+            "line",
+            "module_path",
+            "option_env",
+            "stringify",
+        ] {
+            assert!(
+                rust_builtin_macro_does_not_replay_item_arguments(name),
+                "{name}"
+            );
+        }
+        assert!(!rust_builtin_macro_does_not_replay_item_arguments(
+            "external_cfg_items"
+        ));
+    }
+
+    #[test]
+    fn declaration_expansion_uses_the_latest_visible_same_name_macro() {
+        let source = r#"
+macro_rules! wrapper { ($($item:item)*) => { $($item)* }; }
+wrapper! { macro_rules! Before { () => {} } }
+macro_rules! wrapper { (drop $name:ident) => {}; }
+wrapper! { macro_rules! Phantom { () => {} } }
+mod inline_scope {
+    macro_rules! wrapper { ($($item:item)*) => { $($item)* }; }
+    wrapper! { macro_rules! InlineGenerated { () => {} } }
+}
+wrapper! { macro_rules! OutsidePhantom { () => {} } }
+other::wrapper! { macro_rules! QualifiedPhantom { () => {} } }
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust parser language");
+        let tree = parser.parse(source, None).expect("parse Rust fixture");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = ProjectFile::new(
+            temp.path().canonicalize().expect("canonical root"),
+            "src/lib.rs",
+        );
+        let parsed = parse_rust_file(&file, source, &tree);
+        let macros = parsed
+            .top_level_declarations
+            .iter()
+            .chain(parsed.children.values().flatten())
+            .filter(|unit| unit.is_macro())
+            .map(|unit| unit.identifier())
+            .collect::<HashSet<_>>();
+
+        for expected in ["Before", "InlineGenerated"] {
+            assert!(macros.contains(expected), "missing {expected}: {macros:?}");
+        }
+        for phantom in ["Phantom", "OutsidePhantom", "QualifiedPhantom"] {
+            assert!(
+                !macros.contains(phantom),
+                "unexpected {phantom}: {macros:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_region_taint_tests {
+    use super::*;
+
+    /// Parse `source` as `src/lib.rs` and return the set of short names for the
+    /// declarations recorded in the per-declaration test-region taint side-map.
+    fn tainted_short_names(source: &str) -> HashSet<String> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust parser language");
+        let tree = parser.parse(source, None).expect("parse Rust fixture");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = ProjectFile::new(
+            temp.path().canonicalize().expect("canonical root"),
+            "src/lib.rs",
+        );
+        let parsed = parse_rust_file(&file, source, &tree);
+        parsed
+            .test_region_units
+            .iter()
+            .map(|unit| unit.short_name().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn inline_cfg_test_module_taints_only_the_test_symbols() {
+        // The issue's exact shape: a production fn plus an inline
+        // `#[cfg(test)] mod tests`. Production API must stay untainted.
+        let tainted = tainted_short_names(
+            r#"
+pub fn make_widget() {}
+
+#[cfg(test)]
+mod tests {
+    fn it_works() {}
+}
+
+pub fn after_tests() {}
+"#,
+        );
+        assert!(tainted.contains("tests"), "{tainted:?}");
+        assert!(tainted.contains("tests.it_works"), "{tainted:?}");
+        assert!(!tainted.contains("make_widget"), "{tainted:?}");
+        assert!(!tainted.contains("after_tests"), "{tainted:?}");
+    }
+
+    #[test]
+    fn test_attributed_free_functions_are_tainted() {
+        let tainted = tainted_short_names(
+            r#"
+#[test]
+fn top_level_test() {}
+
+#[tokio::test]
+async fn tokio_test() {}
+
+#[my_framework::test]
+fn custom_last_segment_test() {}
+
+pub fn production() {}
+"#,
+        );
+        assert!(tainted.contains("top_level_test"), "{tainted:?}");
+        assert!(tainted.contains("tokio_test"), "{tainted:?}");
+        assert!(tainted.contains("custom_last_segment_test"), "{tainted:?}");
+        assert!(!tainted.contains("production"), "{tainted:?}");
+    }
+
+    #[test]
+    fn nested_modules_inside_cfg_test_inherit_the_taint() {
+        let tainted = tainted_short_names(
+            r#"
+#[cfg(test)]
+mod outer {
+    mod inner {
+        fn helper() {}
+        struct Fixture {}
+    }
+}
+"#,
+        );
+        for name in [
+            "outer",
+            "outer.inner",
+            "outer.inner.helper",
+            "outer.inner.Fixture",
+        ] {
+            assert!(tainted.contains(name), "missing {name}: {tainted:?}");
+        }
+    }
+
+    #[test]
+    fn cfg_all_test_feature_is_tainted_but_cfg_not_test_is_not() {
+        let positive = tainted_short_names(
+            r#"
+#[cfg(all(test, feature = "x"))]
+mod gated {
+    fn used() {}
+}
+"#,
+        );
+        assert!(positive.contains("gated"), "{positive:?}");
+        assert!(positive.contains("gated.used"), "{positive:?}");
+
+        let negative = tainted_short_names(
+            r#"
+#[cfg(not(test))]
+mod prod_only {
+    fn used() {}
+}
+"#,
+        );
+        assert!(
+            negative.is_empty(),
+            "cfg(not(test)) must not taint: {negative:?}"
+        );
+    }
+
+    #[test]
+    fn production_symbol_after_a_test_module_is_untainted() {
+        let tainted = tainted_short_names(
+            r#"
+#[cfg(test)]
+mod tests {
+    fn t() {}
+}
+
+pub struct Widget {}
+"#,
+        );
+        assert!(tainted.contains("tests"), "{tainted:?}");
+        assert!(!tainted.contains("Widget"), "{tainted:?}");
+    }
+
+    #[test]
+    fn cfg_test_gated_macro_region_taints_reparsed_items() {
+        // A `#[cfg(test)]`-gated item-position macro invocation taints the items
+        // recovered through the #1015 reparse path, both when the attribute sits
+        // on the invocation and when it guards an item *inside* the token tree.
+        let tainted = tainted_short_names(
+            r#"
+macro_rules! passthrough { ($($item:item)*) => { $($item)* }; }
+
+#[cfg(test)]
+passthrough! {
+    fn generated_under_test() {}
+    pub struct GeneratedFixture {}
+}
+
+passthrough! {
+    #[cfg(test)]
+    fn inner_gated_test() {}
+
+    pub fn inner_production() {}
+}
+"#,
+        );
+        assert!(tainted.contains("generated_under_test"), "{tainted:?}");
+        assert!(tainted.contains("GeneratedFixture"), "{tainted:?}");
+        assert!(tainted.contains("inner_gated_test"), "{tainted:?}");
+        assert!(!tainted.contains("inner_production"), "{tainted:?}");
+    }
+
+    #[test]
+    fn test_impl_taints_members_not_the_owner_type() {
+        let tainted = tainted_short_names(
+            r#"
+pub struct Widget {}
+
+#[cfg(test)]
+impl Widget {
+    fn test_only_helper() {}
+}
+"#,
+        );
+        assert!(
+            !tainted.contains("Widget"),
+            "owner type must stay untainted: {tainted:?}"
+        );
+        assert!(
+            tainted
+                .iter()
+                .any(|name| name.ends_with("test_only_helper")),
+            "impl member should be tainted: {tainted:?}"
+        );
+    }
+}

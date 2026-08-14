@@ -1,0 +1,175 @@
+//! Shared stack-based (non-recursive) tree-sitter traversal helpers.
+//!
+//! These exist because recursive AST walks are disallowed for analyzer code that may
+//! touch deeply nested trees (see CLAUDE.md's stack-safety rule) — every helper here
+//! is an explicit-stack replacement for what would otherwise be a recursive walk.
+//! Consolidated from ~25 independent per-language/per-module copies (cross-language
+//! duplication survey, Concern 5, Tier 1): visibility (`pub(super)`) was the only
+//! reason most of them existed as separate copies rather than calling a shared
+//! helper.
+//!
+//! The preorder family -- `WalkControl`, `walk_tree_preorder`,
+//! `walk_named_tree_preorder` and its fallible counterpart -- plus
+//! `collect_parse_errors` and `expanded_comment_start` live in
+//! [`brokk_bifrost_core::analyzer::tree_walk`] and are re-exported by
+//! [`crate::analyzer::tree_sitter_analyzer`], where their callers already reach
+//! them. The enter/exit iterative walker joined them there when the Ruby scans
+//! moved into `brokk-bifrost-ruby`; java and js_ts reach it at this path. The
+//! three direct-child readers -- `named_children`, `first_named_child_of_kind`
+//! and `has_token_child` -- followed when Kotlin's declaration walk moved into
+//! `brokk-bifrost-jvm`, since a language crate reads its own grammar's child
+//! slots with them; the first two are re-exported here for the callers already
+//! at this path, and `has_token_child` has no analysis-side caller left.
+
+use tree_sitter::Node;
+
+pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{
+    TreeWalkAction, first_named_child_of_kind, named_children, node_for_exact_range,
+    subtree_contains, walk_tree_iterative,
+};
+
+/// All descendants of `node` (not including `node` itself) whose `kind()` equals
+/// `kind`, in pre-order (a node before its own descendants), iterative (explicit
+/// stack) depth-first search.
+///
+/// Its only current callers are test-only traversal helpers (this module's own
+/// unit tests, and `ruby::semantic`'s test-only `descendants_by_kind`). The one
+/// production candidate identified by the cross-language duplication survey
+/// (`rust::graph_support::named_descendants_of_kind`) performs a *post*-order
+/// walk that also matches the root node, which is an observably different
+/// contract, so it was deliberately left as its own copy rather than forced
+/// through this preorder/exclude-self helper.
+#[allow(dead_code)]
+pub(crate) fn descendants_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'tree>> {
+    let mut out = Vec::new();
+    let mut stack: Vec<Node<'tree>> = named_children(node).into_iter().rev().collect();
+    while let Some(candidate) = stack.pop() {
+        if candidate.kind() == kind {
+            out.push(candidate);
+        }
+        for child in named_children(candidate).into_iter().rev() {
+            stack.push(child);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(source: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("set rust language");
+        parser.parse(source, None).expect("parse")
+    }
+
+    #[test]
+    fn walk_tree_iterative_visits_enter_and_exit_in_nested_order() {
+        let tree = parse("fn outer() { fn inner() { let x = 1; } }");
+        let root = tree.root_node();
+        let mut order: Vec<String> = Vec::new();
+        walk_tree_iterative(
+            root,
+            &mut order,
+            |node, order| {
+                order.push(format!("enter:{}", node.kind()));
+                TreeWalkAction::DescendWithExit
+            },
+            |order| {
+                order.push("exit".to_string());
+            },
+        );
+        // Every enter has a matching exit, and exits are LIFO (nested) relative to
+        // their enter.
+        assert_eq!(
+            order.iter().filter(|entry| **entry == "exit").count(),
+            order
+                .iter()
+                .filter(|entry| entry.starts_with("enter:"))
+                .count()
+        );
+        assert_eq!(order.first().map(String::as_str), Some("enter:source_file"));
+        assert_eq!(order.last().map(String::as_str), Some("exit"));
+    }
+
+    #[test]
+    fn walk_tree_iterative_skip_prunes_descendants() {
+        let tree = parse("fn outer() { let x = 1; }");
+        let root = tree.root_node();
+        let mut visited: Vec<String> = Vec::new();
+        walk_tree_iterative(
+            root,
+            &mut visited,
+            |node, visited| {
+                visited.push(node.kind().to_string());
+                if node.kind() == "block" {
+                    // Prune: the block's children (the let-statement and its
+                    // descendants) must never be visited.
+                    return TreeWalkAction::Skip;
+                }
+                TreeWalkAction::Descend
+            },
+            |_| {},
+        );
+        assert!(visited.iter().any(|k| k == "block"));
+        assert!(!visited.iter().any(|k| k == "let_declaration"));
+    }
+
+    #[test]
+    fn issue_1228_walk_tree_iterative_can_stop_cooperatively() {
+        let source = "fn first() {} fn stop() {} fn never() {}";
+        let tree = parse(source);
+        let root = tree.root_node();
+        let mut visited: Vec<String> = Vec::new();
+        walk_tree_iterative(
+            root,
+            &mut visited,
+            |node, visited| {
+                let text = node.utf8_text(source.as_bytes()).unwrap_or_default();
+                visited.push(text.to_string());
+                if text.starts_with("fn stop") {
+                    TreeWalkAction::Stop
+                } else {
+                    TreeWalkAction::Descend
+                }
+            },
+            |_| {},
+        );
+        assert!(visited.iter().any(|text| text.starts_with("fn stop")));
+        assert!(!visited.iter().any(|text| text.starts_with("fn never")));
+    }
+
+    #[test]
+    fn subtree_contains_finds_nested_match() {
+        let tree = parse("fn outer() { fn inner() {} }");
+        let root = tree.root_node();
+        assert!(subtree_contains(root, |node| node.kind() == "function_item"));
+        assert!(!subtree_contains(root, |node| node.kind() == "struct_item"));
+    }
+
+    #[test]
+    fn descendants_of_kind_collects_all_matches_excluding_self() {
+        let tree = parse("fn outer() { fn inner() { fn innermost() {} } }");
+        let root = tree.root_node();
+        let functions = descendants_of_kind(root, "function_item");
+        assert_eq!(functions.len(), 3);
+
+        // Querying from a function_item root excludes that node itself.
+        let outer = functions[0];
+        let nested = descendants_of_kind(outer, "function_item");
+        assert_eq!(nested.len(), 2);
+    }
+
+    #[test]
+    fn named_children_returns_direct_children_in_source_order() {
+        let tree = parse("fn outer() {}");
+        let root = tree.root_node();
+        let children = named_children(root);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].kind(), "function_item");
+    }
+}

@@ -1,0 +1,112 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Bifrost RQL Policy",
+  "scopeName": "source.bifrost-rql-policy",
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#inline-rql"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "name": "entity.name.function.record.bifrost-rql-policy",
+      "match": "(?<=\\()[a-z][a-z0-9-]*(?=$|[\\s)])"
+    },
+    {
+      "name": "variable.parameter.keyword.bifrost-rql-policy",
+      "match": ":[a-z][a-z0-9-]*(?=$|[\\s()\\[\\]])"
+    },
+    {
+      "name": "constant.numeric.integer.decimal.bifrost-rql-policy",
+      "match": "(?<![A-Za-z0-9_.-])-?[0-9]+(?=$|[\\s()\\[\\]])"
+    },
+    {
+      "name": "constant.language.bifrost-rql-policy",
+      "match": "\\b(?:true|false|null)\\b"
+    },
+    {
+      "name": "punctuation.section.brackets.bifrost-rql-policy",
+      "match": "[()\\[\\]]"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "name": "comment.line.semicolon.bifrost-rql-policy",
+      "match": ";.*$"
+    },
+    "strings": {
+      "name": "string.quoted.double.bifrost-rql-policy",
+      "begin": "\"",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.begin.bifrost-rql-policy"
+        }
+      },
+      "end": "\"",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.end.bifrost-rql-policy"
+        }
+      },
+      "patterns": [
+        {
+          "name": "constant.character.escape.bifrost-rql-policy",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "inline-rql": {
+      "name": "meta.embedded.inline.rql.bifrost-rql-policy",
+      "contentName": "source.bifrost-rql",
+      "begin": "(\\()\\s*(rql)(?=$|[\\s)])",
+      "beginCaptures": {
+        "1": {
+          "name": "punctuation.section.parens.begin.bifrost-rql-policy"
+        },
+        "2": {
+          "name": "support.function.embedded.rql.bifrost-rql-policy"
+        }
+      },
+      "end": "(\\))",
+      "endCaptures": {
+        "1": {
+          "name": "punctuation.section.parens.end.bifrost-rql-policy"
+        }
+      },
+      "patterns": [
+        {
+          "include": "#inline-rql-parens"
+        },
+        {
+          "include": "source.bifrost-rql"
+        }
+      ]
+    },
+    "inline-rql-parens": {
+      "begin": "\\(",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.section.brackets.bifrost-rql"
+        }
+      },
+      "end": "\\)",
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.section.brackets.bifrost-rql"
+        }
+      },
+      "patterns": [
+        {
+          "include": "#inline-rql-parens"
+        },
+        {
+          "include": "source.bifrost-rql"
+        }
+      ]
+    }
+  }
+}

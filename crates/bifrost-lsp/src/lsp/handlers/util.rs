@@ -1,0 +1,853 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use crate::analyzer::common::{language_for_file, source_identifier_for_target};
+use crate::analyzer::declaration_range::{
+    DeclarationNameRangeContext, code_unit_declaration_name_range,
+};
+use crate::analyzer::usages::get_definition::NavigationTarget;
+use crate::analyzer::{
+    CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range as ByteRange,
+    semantic_model::{SemanticModelOverlay, SemanticModelSymbol},
+};
+use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string, uri_to_path};
+#[cfg(test)]
+use crate::text_utils::identifier_at_offset;
+use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+pub(crate) use crate::text_utils::{
+    find_word, identifier_prefix_before_offset, identifier_span_at_offset,
+};
+use lsp_types::{Location, Range as LspRange, Uri};
+use tree_sitter::{Node, Parser};
+
+const MAX_DOC_COMMENT_SOURCE_BYTES: u64 = 1_000_000;
+
+/// Resolve an external Python model symbol through the document's parser-derived
+/// import bindings. This deliberately does not perform a terminal-name lookup:
+/// an imported `parse` only selects the fully-qualified API named by its import.
+pub(crate) fn python_model_symbol_at_offset<'a>(
+    overlay: &'a SemanticModelOverlay,
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Option<&'a SemanticModelSymbol> {
+    python_model_symbols_at_offset(overlay, file, source, offset)
+        .into_iter()
+        .next()
+}
+
+pub(crate) fn python_model_symbols_at_offset<'a>(
+    overlay: &'a SemanticModelOverlay,
+    file: &ProjectFile,
+    source: &str,
+    offset: usize,
+) -> Vec<&'a SemanticModelSymbol> {
+    if language_for_file(file) != Language::Python {
+        return Vec::new();
+    }
+    let Some(expression) = python_expression_path_at_offset(source, offset) else {
+        return Vec::new();
+    };
+    let Some(qualified_name) = python_bound_qualified_name(source, &expression, offset) else {
+        return Vec::new();
+    };
+    let matched = overlay.symbols_named(&qualified_name);
+    if matched
+        .records
+        .iter()
+        .all(|symbol| symbol.qualified_name == qualified_name)
+    {
+        matched.records
+    } else {
+        Vec::new()
+    }
+}
+
+pub(crate) fn python_model_reference_ranges(source: &str, qualified_name: &str) -> Vec<ByteRange> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .expect("failed to load Python parser");
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let mut pending = vec![tree.root_node()];
+    let mut ranges = Vec::new();
+    while let Some(node) = pending.pop() {
+        let parent_is_attribute = node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "attribute");
+        if matches!(node.kind(), "identifier" | "attribute")
+            && !parent_is_attribute
+            && !python_import_declaration(node)
+            && let Some(segments) = python_expression_segments(node, source)
+            && python_bound_qualified_name(source, &segments, node.start_byte()).as_deref()
+                == Some(qualified_name)
+        {
+            let highlighted = if node.kind() == "attribute" {
+                node.child_by_field_name("attribute").unwrap_or(node)
+            } else {
+                node
+            };
+            ranges.push(ByteRange {
+                start_byte: highlighted.start_byte(),
+                end_byte: highlighted.end_byte(),
+                start_line: 0,
+                end_line: 0,
+            });
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
+    ranges.dedup_by_key(|range| (range.start_byte, range.end_byte));
+    ranges
+}
+
+fn python_import_declaration(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if matches!(parent.kind(), "import_statement" | "import_from_statement") {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn python_bound_qualified_name(
+    source: &str,
+    expression: &[String],
+    reference_byte: usize,
+) -> Option<String> {
+    let root = expression.first()?;
+    let imported = crate::analyzer::parse_python_import_bindings(source)
+        .into_iter()
+        .rfind(|binding| {
+            binding.start_byte <= reference_byte
+                && (binding.scope_start_byte..=binding.scope_end_byte).contains(&reference_byte)
+                && binding.local_name == *root
+        })?
+        .qualified_name;
+    Some(
+        expression
+            .iter()
+            .skip(1)
+            .fold(imported, |mut name, segment| {
+                name.push('.');
+                name.push_str(segment);
+                name
+            }),
+    )
+}
+
+fn python_expression_path_at_offset(source: &str, offset: usize) -> Option<Vec<String>> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .expect("failed to load Python parser");
+    let tree = parser.parse(source, None)?;
+    let mut node = tree.root_node().descendant_for_byte_range(offset, offset)?;
+    while node.kind() != "identifier" {
+        node = node.named_child(0)?;
+    }
+    let mut expression = node;
+    while expression
+        .parent()
+        .is_some_and(|parent| parent.kind() == "attribute")
+    {
+        expression = expression.parent()?;
+    }
+    python_expression_segments(expression, source)
+}
+
+fn python_expression_segments(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    match node.kind() {
+        "identifier" => Some(vec![node.utf8_text(source.as_bytes()).ok()?.to_owned()]),
+        "attribute" => {
+            let mut segments =
+                python_expression_segments(node.child_by_field_name("object")?, source)?;
+            segments.push(
+                node.child_by_field_name("attribute")?
+                    .utf8_text(source.as_bytes())
+                    .ok()?
+                    .to_owned(),
+            );
+            Some(segments)
+        }
+        _ => None,
+    }
+}
+
+/// Resolve an LSP `Uri` to a [`ProjectFile`], read its contents (consulting
+/// `project.read_source` so unsaved overlays win over disk), and compute the
+/// line-start index — the prologue used by every per-file handler. Returns
+/// `None` if the URI doesn't map into the project, or the file cannot be read.
+pub fn read_document_for_uri(
+    project: &dyn Project,
+    uri: &Uri,
+) -> Option<(ProjectFile, String, Vec<usize>)> {
+    let project_file = project_file_for_uri(project, uri)?;
+    let content = project.read_source(&project_file).ok()?;
+    let line_starts = compute_line_starts(&content);
+    Some((project_file, content, line_starts))
+}
+
+#[derive(Default)]
+pub(super) struct FileContentCache {
+    files: HashMap<PathBuf, FileContent>,
+}
+
+pub(super) struct FileContent {
+    pub(super) body: String,
+    pub(super) line_starts: Vec<usize>,
+}
+
+impl FileContentCache {
+    pub(super) fn read_project<'a>(
+        &'a mut self,
+        project: &dyn Project,
+        file: &ProjectFile,
+    ) -> Option<&'a FileContent> {
+        self.read_with(file.abs_path(), || project.read_source(file).ok())
+    }
+
+    pub(super) fn read_disk_or_empty<'a>(&'a mut self, path: &Path) -> &'a FileContent {
+        let key = path.to_path_buf();
+        if !self.files.contains_key(&key) {
+            let body = std::fs::read_to_string(path).unwrap_or_default();
+            let line_starts = compute_line_starts(&body);
+            self.files
+                .insert(key.clone(), FileContent { body, line_starts });
+        }
+        self.files.get(&key).expect("cache entry inserted")
+    }
+
+    fn read_with(
+        &mut self,
+        key: PathBuf,
+        read: impl FnOnce() -> Option<String>,
+    ) -> Option<&FileContent> {
+        if !self.files.contains_key(&key) {
+            let body = read()?;
+            let line_starts = compute_line_starts(&body);
+            self.files
+                .insert(key.clone(), FileContent { body, line_starts });
+        }
+        self.files.get(&key)
+    }
+}
+
+pub(super) fn code_unit_location(
+    analyzer: &dyn IAnalyzer,
+    project: &dyn Project,
+    code_unit: &CodeUnit,
+) -> Option<Location> {
+    let body = project.read_source(code_unit.source()).ok()?;
+    let line_starts = compute_line_starts(&body);
+    code_unit_location_from_content(analyzer, code_unit.source(), &body, &line_starts, code_unit)
+}
+
+pub(super) fn navigation_target_location(
+    analyzer: &dyn IAnalyzer,
+    project: &dyn Project,
+    cache: &mut NavigationLocationCache,
+    target: &NavigationTarget,
+) -> Option<Location> {
+    let file = target.code_unit.source();
+    let cached = cache.file(project, file)?;
+    let body = cached.context.content();
+    let declaration_range = target.declaration_range.unwrap_or_else(|| {
+        analyzer
+            .ranges(&target.code_unit)
+            .iter()
+            .min()
+            .copied()
+            .unwrap_or(ByteRange {
+                start_byte: 0,
+                end_byte: body.len(),
+                start_line: 0,
+                end_line: 0,
+            })
+    });
+    let exact_name_range = if target.declaration_range.is_some() {
+        cached
+            .context
+            .name_range_for_declaration(&target.code_unit, declaration_range)
+    } else {
+        cached.context.name_range(analyzer, &target.code_unit)
+    };
+    let lsp_range = exact_name_range
+        .map(|range| byte_range_to_lsp_range(body, cached.context.line_starts(), &range))
+        .or_else(|| {
+            identifier_selection_range(
+                &target.code_unit,
+                body,
+                cached.context.line_starts(),
+                &declaration_range,
+            )
+        })
+        .unwrap_or_else(|| {
+            byte_range_to_lsp_range(body, cached.context.line_starts(), &declaration_range)
+        });
+    let uri: Uri = path_to_uri_string(&file.abs_path()).parse().ok()?;
+    Some(Location {
+        uri,
+        range: lsp_range,
+    })
+}
+
+#[derive(Default)]
+pub(super) struct NavigationLocationCache {
+    files: HashMap<PathBuf, NavigationLocationFile>,
+}
+
+struct NavigationLocationFile {
+    context: DeclarationNameRangeContext,
+}
+
+impl NavigationLocationCache {
+    fn file<'a>(
+        &'a mut self,
+        project: &dyn Project,
+        file: &ProjectFile,
+    ) -> Option<&'a NavigationLocationFile> {
+        let key = file.abs_path();
+        if !self.files.contains_key(&key) {
+            let body = project.read_source(file).ok()?;
+            self.files.insert(
+                key.clone(),
+                NavigationLocationFile {
+                    context: DeclarationNameRangeContext::new(file, body),
+                },
+            );
+        }
+        self.files.get(&key)
+    }
+}
+
+pub(super) fn code_unit_location_from_content(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    body: &str,
+    line_starts: &[usize],
+    code_unit: &CodeUnit,
+) -> Option<Location> {
+    let range = analyzer
+        .ranges(code_unit)
+        .iter()
+        .min()
+        .copied()
+        .unwrap_or(ByteRange {
+            start_byte: 0,
+            end_byte: body.len(),
+            start_line: 0,
+            end_line: 0,
+        });
+    let lsp_range = code_unit_declaration_name_range(analyzer, file, body, code_unit)
+        .map(|name_range| byte_range_to_lsp_range(body, line_starts, &name_range))
+        .or_else(|| identifier_selection_range(code_unit, body, line_starts, &range))
+        .unwrap_or_else(|| byte_range_to_lsp_range(body, line_starts, &range));
+    let uri: Uri = path_to_uri_string(&file.abs_path()).parse().ok()?;
+    Some(Location {
+        uri,
+        range: lsp_range,
+    })
+}
+
+/// Resolve an LSP `Uri` to a [`ProjectFile`] that belongs to `project`.
+/// Returns `None` for non-`file:` URIs or paths outside the project, logging
+/// a single-line stderr warning so users debugging "why is my LSP request
+/// returning empty" can see the cause.
+pub fn project_file_for_uri(project: &dyn Project, uri: &Uri) -> Option<ProjectFile> {
+    let abs_path = path_for_file_uri(uri)?;
+    if let Some(file) = project_file_for_abs_path(project, &abs_path) {
+        return Some(file);
+    }
+    eprintln!(
+        "[bifrost-lsp] ignoring path outside project: {} (root: {})",
+        abs_path.display(),
+        project.root().display()
+    );
+    None
+}
+
+pub(crate) fn project_file_for_abs_path(
+    project: &dyn Project,
+    abs_path: &std::path::Path,
+) -> Option<ProjectFile> {
+    // Canonicalize so Windows extended-length paths (`\\?\C:\…` produced by
+    // FilesystemProject's canonicalize) line up with the URI-decoded path
+    // (`C:/…`). Fall back to the as-is path when canonicalize fails — for
+    // example, didChangeWatchedFiles DELETED events reference paths that no
+    // longer exist on disk.
+    let canonical = abs_path
+        .canonicalize()
+        .unwrap_or_else(|_| abs_path.to_path_buf());
+    if let Some(file) = project.file_by_abs_path(&canonical) {
+        return Some(file);
+    }
+    if let Some(file) = project.file_by_abs_path(abs_path) {
+        return Some(file);
+    }
+    None
+}
+
+/// Resolve a URI to a project path even when the file no longer exists on disk.
+/// This is reserved for watched-file delete events: normal document handlers
+/// should use [`project_file_for_uri`] so they only read files that currently
+/// belong to the project.
+pub(crate) fn project_file_for_uri_allow_missing(
+    project: &dyn Project,
+    uri: &Uri,
+) -> Option<ProjectFile> {
+    let abs_path = path_for_file_uri(uri)?;
+    if let Some(file) = project.file_by_abs_path_allow_missing(&abs_path) {
+        return Some(file);
+    }
+    if let Some(canonical) = canonicalize_existing_prefix(&abs_path)
+        && canonical != abs_path
+        && let Some(file) = project.file_by_abs_path_allow_missing(&canonical)
+    {
+        return Some(file);
+    }
+    eprintln!(
+        "[bifrost-lsp] ignoring path outside project: {} (root: {})",
+        abs_path.display(),
+        project.root().display()
+    );
+    None
+}
+
+fn path_for_file_uri(uri: &Uri) -> Option<std::path::PathBuf> {
+    match uri_to_path(uri) {
+        Some(path) => Some(path),
+        None => {
+            eprintln!(
+                "[bifrost-lsp] ignoring non-file URI: {} (only file:// is supported)",
+                uri.as_str()
+            );
+            None
+        }
+    }
+}
+
+fn canonicalize_existing_prefix(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut current = path;
+    let mut suffix = std::path::PathBuf::new();
+
+    loop {
+        if let Ok(canonical) = current.canonicalize() {
+            return Some(canonical.join(suffix));
+        }
+
+        let name = current.file_name()?;
+        let mut new_suffix = std::path::PathBuf::from(name);
+        new_suffix.push(suffix);
+        suffix = new_suffix;
+        current = current.parent()?;
+    }
+}
+
+/// Locate the identifier of `code_unit` inside `fallback`'s byte span and
+/// return its position as an `LspRange`. Returns `None` when the identifier
+/// cannot be found word-bounded inside the span — callers fall back to the
+/// full span in that case. Word-boundary matching matters here: a raw `find`
+/// returns the wrong span for short identifiers (e.g. method `s` matches the
+/// `s` in `class`) or identifiers that are a prefix of a longer word in the
+/// body (e.g. method `foo` matches the first three bytes of `foofoo`).
+pub(super) fn identifier_selection_range(
+    code_unit: &CodeUnit,
+    content: &str,
+    line_starts: &[usize],
+    fallback: &ByteRange,
+) -> Option<LspRange> {
+    let slice = content.get(fallback.start_byte..fallback.end_byte)?;
+    let name = source_identifier_for_target(code_unit);
+    if name.is_empty() {
+        return None;
+    }
+    let offset = find_word(slice, name)?;
+    let abs_start = fallback.start_byte + offset;
+    let abs_end = abs_start + name.len();
+    let range = ByteRange {
+        start_byte: abs_start,
+        end_byte: abs_end,
+        start_line: 0,
+        end_line: 0,
+    };
+    Some(byte_range_to_lsp_range(content, line_starts, &range))
+}
+
+/// Lift the contiguous block of comment-like lines that ends immediately
+/// before the line containing `decl_start_byte`. The returned string has
+/// comment markers stripped so it can be embedded directly inside hover
+/// markdown. Returns `None` when there is no leading comment block, or the
+/// block is whitespace-only after stripping.
+///
+/// "Comment-like" covers the leading-comment shapes the issue called out:
+/// `///` and `//!` (Rust), `//` (C-family), `/** … */` (Javadoc/JSDoc/PHPDoc
+/// /Scaladoc), `/* … */`, and `#` (Python). Rust attributes (`#[…]`) are
+/// intentionally NOT consumed — they aren't doc comments, and including them
+/// would corrupt the markdown.
+#[cfg(test)]
+fn extract_leading_doc_comment(content: &str, decl_start_byte: usize) -> Option<String> {
+    extract_leading_doc_comment_impl(content, decl_start_byte, false)
+}
+
+fn extract_leading_doc_comment_impl(
+    content: &str,
+    decl_start_byte: usize,
+    allow_bare_double_slash: bool,
+) -> Option<String> {
+    let line_starts = compute_line_starts(content);
+    let line_index = find_line_index_for_offset(&line_starts, decl_start_byte);
+    if line_index == 0 {
+        return None;
+    }
+
+    let mut comment_lines: Vec<&str> = Vec::new();
+    for li in (0..line_index).rev() {
+        let line_start = line_starts[li];
+        let line_end = line_starts.get(li + 1).copied().unwrap_or(content.len());
+        let raw = &content[line_start..line_end];
+        let trimmed = raw.trim_end_matches(['\n', '\r']);
+        let stripped = trimmed.trim_start();
+
+        if stripped.is_empty() {
+            break;
+        }
+        if is_doc_comment_line(stripped, allow_bare_double_slash) {
+            comment_lines.push(trimmed);
+            continue;
+        }
+        // A Rust outer attribute (`#[…]`) sits between the doc comment and
+        // the declaration — skip it so docs above attributes still get
+        // surfaced, but never lift the attribute itself into hover markdown.
+        if is_rust_outer_attribute_line(stripped) {
+            continue;
+        }
+        break;
+    }
+
+    if comment_lines.is_empty() {
+        return None;
+    }
+    comment_lines.reverse();
+
+    let cleaned: Vec<String> = comment_lines
+        .iter()
+        .map(|line| clean_comment_line(line))
+        .collect();
+    let joined = cleaned.join("\n").trim().to_string();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
+/// Read the candidate's source file and lift any contiguous block of
+/// comment-like lines that immediately precedes the declaration. Returns
+/// `None` if the file can't be read, the candidate has no recorded range, the
+/// source file is too large for an interactive LSP request, or no doc comment
+/// is present.
+pub fn leading_doc_comment_for_code_unit(
+    analyzer: &dyn IAnalyzer,
+    candidate: &CodeUnit,
+) -> Option<String> {
+    let decl_range = analyzer.ranges(candidate).iter().min().copied()?;
+    let path = candidate.source().abs_path();
+    if std::fs::metadata(&path).ok()?.len() > MAX_DOC_COMMENT_SOURCE_BYTES {
+        return None;
+    }
+    let source = std::fs::read_to_string(path).ok()?;
+    let allow_bare_double_slash = language_for_file(candidate.source()) == Language::Go;
+    extract_leading_doc_comment_impl(&source, decl_range.start_byte, allow_bare_double_slash)
+}
+
+/// True for a single-line Rust outer attribute (e.g. `#[derive(Debug)]`,
+/// `#[cfg(test)]`). Multi-line attributes split across lines are intentionally
+/// not handled — they're rare in practice and would require bracket-depth
+/// tracking to consume safely.
+fn is_rust_outer_attribute_line(stripped: &str) -> bool {
+    stripped.starts_with("#[") && stripped.trim_end().ends_with(']')
+}
+
+fn is_doc_comment_line(stripped: &str, allow_bare_double_slash: bool) -> bool {
+    // Bare `//` is too noisy (license headers, TODOs, commented-out code), so
+    // require the explicit doc-comment prefixes `///` and `//!`.
+    stripped.starts_with("///")
+        || stripped.starts_with("//!")
+        || (allow_bare_double_slash
+            && stripped.starts_with("//")
+            && !stripped.starts_with("///")
+            && !stripped.starts_with("//!"))
+        || stripped.starts_with("/**")
+        || stripped.starts_with("/*!")
+        || stripped.starts_with("/*")
+        // Javadoc continuations: bare `*`, `* ...`, or the closing `*/`.
+        // Anything else starting with `*` (e.g. `*ptr;`, `*= 2;`) is code.
+        || stripped == "*"
+        || stripped == "*/"
+        || stripped.starts_with("* ")
+        // Python `#` comments. Skip `#[` (Rust outer attribute) and `#!`
+        // (Rust inner attribute `#![...]` and Unix shebangs).
+        || (stripped.starts_with('#')
+            && !stripped.starts_with("#[")
+            && !stripped.starts_with("#!"))
+}
+
+fn clean_comment_line(line: &str) -> String {
+    let trimmed = line.trim_start();
+    let body = if let Some(rest) = trimmed.strip_prefix("///") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("//!") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("//") {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix("/**") {
+        rest.strip_suffix("*/").unwrap_or(rest)
+    } else if let Some(rest) = trimmed.strip_prefix("/*!") {
+        rest.strip_suffix("*/").unwrap_or(rest)
+    } else if let Some(rest) = trimmed.strip_prefix("/*") {
+        rest.strip_suffix("*/").unwrap_or(rest)
+    } else if trimmed == "*/" {
+        ""
+    } else if let Some(rest) = trimmed.strip_prefix("* ") {
+        rest
+    } else if trimmed == "*" {
+        ""
+    } else if let Some(rest) = trimmed.strip_prefix('#') {
+        rest
+    } else {
+        trimmed
+    };
+    body.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn python_model_references_follow_structured_aliases_without_name_matching() {
+        let source = "from codec import parse as decode\n\
+decode('first')\n\
+from another import parse\n\
+parse('second')\n";
+
+        let ranges = python_model_reference_ranges(source, "codec.parse");
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&source[ranges[0].start_byte..ranges[0].end_byte], "decode");
+    }
+
+    #[test]
+    fn python_model_references_use_the_last_visible_import_binding() {
+        let source = "from first import parse\n\
+parse('first')\n\
+from second import parse\n\
+parse('second')\n";
+
+        let ranges = python_model_reference_ranges(source, "first.parse");
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&source[ranges[0].start_byte..ranges[0].end_byte], "parse");
+        assert!(ranges[0].start_byte < source.find("second").unwrap());
+    }
+
+    #[test]
+    fn python_model_references_do_not_leak_function_local_imports() {
+        let source = r#"from outer import parse
+def nested():
+    from inner import parse
+    return parse('inner')
+parse('outer')
+"#;
+
+        let ranges = python_model_reference_ranges(source, "outer.parse");
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start_byte, source.find("parse('outer')").unwrap());
+    }
+
+    #[test]
+    fn python_model_references_preserve_namespace_module_paths() {
+        let source = "import api.client as client\nclient.fetch()\n";
+
+        let ranges = python_model_reference_ranges(source, "api.client.fetch");
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&source[ranges[0].start_byte..ranges[0].end_byte], "fetch");
+    }
+
+    #[test]
+    fn identifier_at_offset_finds_word_under_cursor() {
+        let content = "let foo_bar = baz123;";
+        assert_eq!(identifier_at_offset(content, 5), Some("foo_bar"));
+        assert_eq!(identifier_at_offset(content, 11), Some("foo_bar"));
+        assert_eq!(identifier_at_offset(content, 16), Some("baz123"));
+    }
+
+    #[test]
+    fn identifier_at_offset_handles_empty_or_no_word() {
+        assert_eq!(identifier_at_offset("", 0), None);
+        assert_eq!(identifier_at_offset("   ", 1), None);
+    }
+
+    #[test]
+    fn identifier_prefix_before_offset_walks_backward_only() {
+        let content = "let foo_bar = baz123;";
+        // Cursor after "foo" (inside `foo_bar`): prefix is "foo", NOT "foo_bar".
+        // Completion must not consume the suffix the user is overwriting.
+        assert_eq!(identifier_prefix_before_offset(content, 7), Some("foo"));
+        // Cursor at end of "foo_bar".
+        assert_eq!(
+            identifier_prefix_before_offset(content, 11),
+            Some("foo_bar")
+        );
+        // Cursor sits on whitespace following an identifier.
+        assert_eq!(identifier_prefix_before_offset(content, 12), None);
+        // Cursor at file start.
+        assert_eq!(identifier_prefix_before_offset(content, 0), None);
+        // Empty content.
+        assert_eq!(identifier_prefix_before_offset("", 0), None);
+        // Offset past EOF is rejected — callers must clamp first.
+        assert_eq!(identifier_prefix_before_offset("abc", 99), None);
+    }
+
+    #[test]
+    fn extract_doc_comment_handles_rust_triple_slash() {
+        let content = "/// Returns the answer.\n/// Always 42.\nfn answer() -> i32 { 42 }\n";
+        let decl_start = content.find("fn answer").expect("decl");
+        let doc = extract_leading_doc_comment(content, decl_start).expect("doc");
+        assert_eq!(doc, "Returns the answer.\nAlways 42.");
+    }
+
+    #[test]
+    fn extract_doc_comment_handles_javadoc_block() {
+        let content =
+            "    /**\n     * The class A.\n     * Important.\n     */\n    public class A {}\n";
+        let decl_start = content.find("public class A").expect("decl");
+        let doc = extract_leading_doc_comment(content, decl_start).expect("doc");
+        assert_eq!(doc, "The class A.\nImportant.");
+    }
+
+    #[test]
+    fn extract_doc_comment_handles_python_hash() {
+        let content = "# Helper module.\n# Used by tests.\ndef foo():\n    pass\n";
+        let decl_start = content.find("def foo").expect("decl");
+        let doc = extract_leading_doc_comment(content, decl_start).expect("doc");
+        assert_eq!(doc, "Helper module.\nUsed by tests.");
+    }
+
+    #[test]
+    fn extract_doc_comment_rejects_bare_double_slash_by_default() {
+        let content = "// Helper function.\nvoid foo() {}\n";
+        let decl_start = content.find("void foo").expect("decl");
+        assert_eq!(extract_leading_doc_comment(content, decl_start), None);
+    }
+
+    #[test]
+    fn extract_doc_comment_allows_bare_double_slash_when_requested() {
+        let content = "// Helper function.\n// Used by Go docs.\nfunc foo() {}\n";
+        let decl_start = content.find("func foo").expect("decl");
+        let doc = extract_leading_doc_comment_impl(content, decl_start, true).expect("doc");
+        assert_eq!(doc, "Helper function.\nUsed by Go docs.");
+    }
+
+    #[test]
+    fn extract_doc_comment_returns_none_when_no_comment() {
+        let content = "fn foo() {}\n";
+        assert!(extract_leading_doc_comment(content, 0).is_none());
+        let content2 = "let x = 1;\nfn bar() {}\n";
+        let decl = content2.find("fn bar").unwrap();
+        assert!(extract_leading_doc_comment(content2, decl).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_rust_attributes() {
+        // `#[derive(...)]` is an attribute, not a doc comment — must be ignored.
+        let content = "#[derive(Debug)]\nstruct S {}\n";
+        let decl_start = content.find("struct S").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_attribute_between_doc_and_decl() {
+        // Regression: `/// docs` followed by `#[derive(Debug)]` followed by
+        // `struct S` must surface "docs". Previously the scan stopped at the
+        // attribute line and dropped the doc comment entirely.
+        let content = "/// First line.\n/// Second line.\n#[derive(Debug, Clone)]\nstruct S {}\n";
+        let decl_start = content.find("struct S").expect("decl");
+        let doc = extract_leading_doc_comment(content, decl_start).expect("doc");
+        assert_eq!(doc, "First line.\nSecond line.");
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_multiple_attribute_lines() {
+        let content = "/// docs\n#[derive(Debug)]\n#[allow(unused)]\nstruct S {}\n";
+        let decl_start = content.find("struct S").expect("decl");
+        let doc = extract_leading_doc_comment(content, decl_start).expect("doc");
+        assert_eq!(doc, "docs");
+    }
+
+    #[test]
+    fn extract_doc_comment_attribute_without_doc_returns_none() {
+        // Attributes alone (no preceding doc comment) must not produce hover
+        // text — the attribute itself is never lifted into markdown.
+        let content = "#[derive(Debug)]\n#[allow(unused)]\nstruct S {}\n";
+        let decl_start = content.find("struct S").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_rust_inner_attributes() {
+        // `#![allow(...)]` is an inner attribute, not a doc comment.
+        let content = "#![allow(dead_code)]\nstruct S {}\n";
+        let decl_start = content.find("struct S").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_python_shebang() {
+        let content = "#!/usr/bin/env python\ndef foo():\n    pass\n";
+        let decl_start = content.find("def foo").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_bare_double_slash() {
+        // Plain `//` lines (license headers, TODOs, commented-out code) must
+        // not be lifted into hover — only `///` and `//!` are doc comments.
+        let content =
+            "// SPDX-License-Identifier: MIT\n// Copyright 2026.\npub fn first_function() {}\n";
+        let decl_start = content.find("pub fn first_function").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_skips_pointer_deref() {
+        // A C-style `*ptr;` line must not be treated as a Javadoc continuation.
+        let content = "*ptr_value;\nint bar() { return 0; }\n";
+        let decl_start = content.find("int bar").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_stops_at_blank_line() {
+        // A blank gap between the comment block and the declaration breaks
+        // the association — the comment is documenting something else.
+        let content = "/// Old comment.\n\nfn current() {}\n";
+        let decl_start = content.find("fn current").expect("decl");
+        assert!(extract_leading_doc_comment(content, decl_start).is_none());
+    }
+
+    #[test]
+    fn extract_doc_comment_handles_single_line_block() {
+        let content = "/** Single-line block doc. */\npublic void foo() {}\n";
+        let decl_start = content.find("public void foo").expect("decl");
+        let doc = extract_leading_doc_comment(content, decl_start).expect("doc");
+        assert_eq!(doc, "Single-line block doc.");
+    }
+}

@@ -1,0 +1,219 @@
+[workspace]
+members = [
+    "crates/bifrost-analysis",
+    "crates/bifrost-core",
+    "crates/bifrost-cpp",
+    "crates/bifrost-csharp",
+    "crates/bifrost-go",
+    "crates/bifrost-js-ts",
+    "crates/bifrost-jvm",
+    "crates/bifrost-lsp",
+    "crates/bifrost-mcp",
+    "crates/bifrost-nlp",
+    "crates/bifrost-php",
+    "crates/bifrost-policy",
+    "crates/bifrost-rql",
+    "crates/bifrost-python",
+    "crates/bifrost-ruby",
+    "crates/bifrost-runtime",
+    "crates/bifrost-rust",
+    "crates/bifrost-semantic-packs",
+]
+default-members = ["."]
+# Nested agent worktrees (.claude/worktrees/*) check out arbitrary commits --
+# including pre-workspace-split ones whose root Cargo.toml declares no
+# [workspace] and would otherwise be claimed by THIS workspace and rejected as
+# a non-member. Excluding them keeps cargo working inside every worktree.
+exclude = [".claude/worktrees/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.9.5"
+edition = "2024"
+# The floor is what CI actually pins and tests (rust-toolchain.toml); raise
+# both together.
+rust-version = "1.96"
+license = "Apache-2.0"
+repository = "https://github.com/BrokkAi/bifrost"
+homepage = "https://github.com/BrokkAi/bifrost"
+# Shared discovery metadata for the implementation crates; the facade keeps
+# its own richer lists below.
+keywords = ["analyzer", "tree-sitter", "code-analysis"]
+categories = ["development-tools", "parser-implementations"]
+
+[package]
+name = "brokk-bifrost"
+# The workspace version is the single source of truth for this facade, all
+# implementation packages, and the Python wheel. Maturin inherits it through
+# `dynamic = ["version"]` in pyproject.toml.
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Tree-sitter-backed multi-language code analyzer with bundled LSP and MCP search-tool servers. Powers Brokk's `bifrost` binary."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["analyzer", "tree-sitter", "lsp", "mcp", "code-analysis"]
+categories = ["development-tools", "parser-implementations", "command-line-utilities"]
+# Order matters: gitignore semantics, last match wins. A "!" negation only
+# re-includes a file if it appears AFTER the broad pattern it carves out
+# of. Do not sort this list. scripts/check-crate-package.sh guards both
+# directions (excluded content staying out, negated files staying in).
+exclude = [
+    ".agents/**",
+    # Repository/process metadata that Cargo includes by default but crate
+    # consumers never need.
+    ".cargo/config.toml",
+    ".claude-plugin/**",
+    ".cursor-plugin/**",
+    ".gitattributes",
+    ".github/**",
+    ".gitignore",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    # Repository tests, implementation crates, analyzer caches, and fixtures
+    # run from source checkouts and CI, not from the published facade package.
+    # The facade resolves implementation crates from crates.io.
+    "**/.bifrost/**",
+    "crates/**",
+    "tests/**",
+    "/python_tests/**",
+    # The documentation site is published separately; none of it is a crate
+    # build or runtime input.
+    "docs/**",
+    # Benchmark baselines and runner tooling are development-only.
+    "benchmark/**",
+    # Editor extension sources ship through the VS Code marketplace.
+    "editors/**",
+    # Development tooling. The voyage sidecar script is a runtime input for
+    # the nlp feature and stays. The mcp property fuzzer's repo-rank helper
+    # (scripts/mcp-fuzzer-repo-rank.py) is deliberately dropped: the fuzzer
+    # binary is a development tool that already needs a source checkout.
+    "scripts/**",
+    "!scripts/embedding_sidecar.py",
+    "!scripts/voyage_sidecar.py",
+    "examples/**",
+]
+
+[lib]
+name = "brokk_bifrost"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+brokk-bifrost-analysis = { path = "crates/bifrost-analysis", version = "=0.9.5" }
+brokk-bifrost-lsp = { path = "crates/bifrost-lsp", version = "=0.9.5" }
+brokk-bifrost-mcp = { path = "crates/bifrost-mcp", version = "=0.9.5" }
+brokk-bifrost-nlp = { path = "crates/bifrost-nlp", version = "=0.9.5", optional = true }
+brokk-bifrost-policy = { path = "crates/bifrost-policy", version = "=0.9.5" }
+brokk-bifrost-rql = { path = "crates/bifrost-rql", version = "=0.9.5" }
+brokk-bifrost-runtime = { path = "crates/bifrost-runtime", version = "=0.9.5" }
+brokk-bifrost-semantic-packs = { path = "crates/bifrost-semantic-packs", version = "=0.9.5" }
+bincode = "1.3.3"
+# The NLP / semantic_search stack (hf-hub, tokenizers, fastrq, and the embedder
+# itself) lives in brokk-bifrost-nlp; see that crate's manifest. The PyTorch SDPA
+# sidecar script it drives is `scripts/voyage_sidecar.py`, which this package
+# still ships because the binary resolves it relative to the facade.
+chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
+csv = "1.3.1"
+git2 = { version = "0.20.2", default-features = false }
+glob = "0.3.3"
+lsp-types = "0.97"
+nu-ansi-term = "0.50"
+pyo3 = { version = "0.23.5", features = ["abi3-py312"], optional = true }
+rayon = "1.10.0"
+reedline = "0.49"
+regex = "1.12.2"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+rustdoc-types = { version = "=0.60.0", default-features = false }
+semver = "1.0.28"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.8"
+toml = "0.8.23"
+tempfile = "3.23.0"
+url = { version = "2.5.8", default-features = false, features = ["std"] }
+
+# Tree-sitter policy:
+# - keep one shared runtime version
+# - pin each grammar crate to a known-compatible upstream release
+# - grammar crate versions are intentionally not forced to match numerically,
+#   because the upstream language crates are released independently
+tree-sitter = "0.25.10"
+
+# Grammars already on the current 0.25 line.
+tree-sitter-python = "0.25.0"
+
+# Grammars that still need older published releases for this port.
+tree-sitter-cpp = "0.23.4"
+walkdir = "2.5.0"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+
+[features]
+default = []
+# CI-only mode that changes internal hash tables to randomly seeded tables.
+randomized-hash = ["brokk-bifrost-analysis/randomized-hash"]
+# Semantic search: brokkai/Muninn embeddings via the PyTorch SDPA sidecar.
+# Opt in with `--features nlp`. Acceleration (CUDA/Metal) is selected inside the sidecar
+# at runtime — no compile-time backend features needed.
+# Enabling this pulls in the brokk-bifrost-nlp crate. It deliberately does NOT
+# touch brokk-bifrost-analysis, so toggling semantic search never invalidates
+# the analysis crate's fingerprint.
+# `brokk-bifrost-nlp/tokenizers` supplies the re-export that `embed_seq_probe` needs.
+nlp = ["dep:brokk-bifrost-nlp", "brokk-bifrost-nlp/tokenizers", "brokk-bifrost-mcp/nlp"]
+# Enables the pyo3-backed Python extension module (`bifrost_searchtools._native`).
+# Maturin turns this on automatically via pyproject.toml; the `bifrost` CLI
+# binary builds without it on every platform.
+python = ["dep:pyo3"]
+# Benchmark and release artifact tooling. Keep it out of normal runtime builds.
+release-tooling = ["brokk-bifrost-semantic-packs/release-tooling"]
+# Suppresses libpython linkage, which a Python extension needs (the host
+# interpreter supplies `Py*` at load time) and an executable cannot tolerate
+# (the symbols stay undefined and the link fails). Kept out of `python` so
+# `cargo test --features python` can link its test binaries; maturin turns it
+# on for the cdylib via pyproject.toml. Building the cdylib without maturin
+# still fails to link, exactly as before -- maturin supplies the
+# `-undefined dynamic_lookup` that a bare `cargo build` does not.
+extension-module = ["pyo3/extension-module"]
+# Root-level re-exports of the implementation crates' test-only hooks, for a
+# downstream consumer that wants them in its own tests. Off in every shipped
+# build. This package's own `tests/` cannot turn it on -- that would need a
+# dev-dependency on itself, which scripts/check-workspace-dependencies.mjs
+# rejects -- so they reach the same hooks through the `analyzer` and `cache_gc`
+# module re-exports, which the dev-dependency below already gates open.
+test-support = ["brokk-bifrost-analysis/test-support"]
+
+[dev-dependencies]
+# Cargo unifies this with the plain `[dependencies]` entry above for test targets, turning
+# on bifrost-analysis's test-only hooks (e.g. scan_usages::disable_time_budget_for_test,
+# usages::get_definition::scala_active_path_node_visits_for_test) for the integration tests
+# under `tests/` without affecting non-test builds of this package. See #1337.
+brokk-bifrost-analysis = { path = "crates/bifrost-analysis", version = "=0.9.5", features = ["test-support"] }
+filetime = "0.2"
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+jsonschema = { version = "0.48.0", default-features = false }
+pretty_assertions = "1.4.1"
+# The language reach-in gate parses bifrost-analysis's own sources; span-locations is what
+# lets it report the offending file and line rather than just a filename.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+syn = { version = "2", features = ["extra-traits", "full", "visit"] }
+tar = { version = "0.4.44", default-features = false }
+# Unix: process-group kill for the embedding sidecar (and the peak-RSS bench).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Full debuginfo made every dev test binary ~600 MB, so target/ grew by
+# terabytes; line tables keep file/line backtraces at a fraction of the size.
+# Bump back to `debug = true` locally when a real debugger session is needed.
+[profile.dev]
+debug = "line-tables-only"
+
+# The workspace split ended same-crate inlining for the small leaf helpers the
+# language crates call per AST node (there is no #[inline] in the fleet).
+# Thin LTO restores cross-crate inlining in release builds.
+[profile.release]
+lto = "thin"

@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.kotlin-stdlib",
+  "pack_version": "2.2.20",
+  "ecosystem": "maven",
+  "kind": {
+    "artifact_kind": "kotlin_source_jar"
+  },
+  "artifact": {
+    "file_name": "kotlin-stdlib-2.2.20-sources.jar",
+    "sha256": "27b9b8672ef33ae9c345b3e57d39b705560e7eca9ca2bf6485f323f612276c26",
+    "url": "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/2.2.20/kotlin-stdlib-2.2.20-sources.jar",
+    "container": null
+  },
+  "compatibility": {
+    "bifrost": ">=0.8.19, <0.10.0",
+    "toolchains": [
+      {
+        "name": "kotlin",
+        "requirement": "=2.2.20"
+      }
+    ]
+  },
+  "activation": [
+    {
+      "package": {
+        "name": "org.jetbrains.kotlin:kotlin-stdlib",
+        "version": "=2.2.20"
+      },
+      "toolchain": {
+        "name": "kotlin",
+        "version": "=2.2.20"
+      },
+      "targets": [
+        "jvm"
+      ],
+      "configurations": []
+    }
+  ],
+  "provenance": {
+    "source": "https://github.com/JetBrains/kotlin",
+    "revision": "v2.2.20"
+  },
+  "license": "Apache-2.0",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "notices": [
+    "notices/kotlin-stdlib-2.2.20.txt"
+  ],
+  "measurement_activation": {
+    "package": {
+      "name": "org.jetbrains.kotlin:kotlin-stdlib",
+      "version": "=2.2.20"
+    },
+    "toolchain": {
+      "name": "kotlin",
+      "version": "=2.2.20"
+    },
+    "targets": [
+      "jvm"
+    ],
+    "configurations": []
+  },
+  "measurement_queries": [
+    {
+      "kind": "type",
+      "name": "kotlin.collections.List"
+    },
+    {
+      "kind": "member",
+      "owner": "kotlin.collections",
+      "name": "map"
+    }
+  ]
+}

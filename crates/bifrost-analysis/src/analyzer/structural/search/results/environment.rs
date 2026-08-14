@@ -1,0 +1,574 @@
+use super::*;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryFile {
+    pub path: String,
+    pub language: &'static str,
+    /// The package or module this file belongs to, when the workspace can name
+    /// one (#1474). The package clause is one row per file, so it is exposed as
+    /// fields on the file row rather than as a fourth row kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_fq: Option<String>,
+    /// `Some(true)` when the language spells the package in the source (Java's
+    /// `package a.b;`), `Some(false)` when it is derived from the file's path,
+    /// and `None` when no package could be named at all -- which is not the
+    /// same as "the file is in the root package".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_syntactic: Option<bool>,
+}
+
+/// One lexical scope of a file (#1474).
+///
+/// `ast_id` is absent for exactly one scope per file: the synthesized whole-file
+/// scope, which no grammar gives an arena node. Every other scope is a fact, so
+/// its `ast_id` joins with a structural capture over the same node.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryLexicalScope {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    /// Dense per-file scope index; 0 is always the file scope.
+    pub index: u32,
+    /// The normalized kind of the anchoring fact, or `null` for the file scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_index: Option<u32>,
+}
+
+/// One construct that materializes declarations (#1476).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryGenerationSite {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub kind: &'static str,
+    /// `literal` when the generated set below is exact; `dynamic` when the
+    /// site generates declarations the analyzer cannot name, so the set is
+    /// explicitly not the whole answer.
+    pub input: &'static str,
+    pub generated_count: usize,
+    pub generated: Vec<CodeQueryGeneratedDeclaration>,
+}
+
+/// One declaration a generation site materialized, with the literal naming
+/// argument that produced it — the multi-location half of generation
+/// evidence (#1476).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryGeneratedDeclaration {
+    pub fq_name: String,
+    pub argument_start_byte: usize,
+    pub argument_end_byte: usize,
+    pub argument_range: CodeQueryRange,
+}
+
+/// One export declaration (#1476).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryExport {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub form: &'static str,
+    pub exported_name: String,
+    /// The declaration the export materialized, when the analyzer models one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_fq_name: Option<String>,
+}
+
+/// The state of one declaration: where it came from and what it must not be
+/// mistaken for (#1476).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryDeclarationState {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub fq_name: String,
+    pub unit_kind: &'static str,
+    pub origin: &'static str,
+    pub declaration_only: bool,
+    pub config_gated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<CodeQueryRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_byte: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_byte: Option<usize>,
+}
+
+/// One name a scope introduces (#1474).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryBinding {
+    pub id: String,
+    /// Absent when the binder's local name is not spelled by a classified
+    /// token, which is how a wildcard import and an adapter without a
+    /// structured import path surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub name: String,
+    pub kind: &'static str,
+    pub hoisting: &'static str,
+    pub namespace: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    /// Byte interval over which the binding is in effect.
+    pub activation_start_byte: usize,
+    pub activation_end_byte: usize,
+    /// Dense index of the declaring scope, which `scope-of` projects to a row.
+    pub declaring_scope_index: u32,
+    pub source_order: u32,
+    pub visibility: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import: Option<CodeQueryImportBinder>,
+    /// `true` when this row was emitted as a binding the binding-of answer
+    /// shadows rather than as the winner. Only `binding-of
+    /// :include-shadowed` produces such rows.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub shadowed: bool,
+    /// The AST identity of the occurrence this row is the binding-of answer
+    /// *of*, present exactly on rows the `binding-of` step produced.
+    ///
+    /// Without it the step's answer is unjoinable: a correlated consumer that
+    /// captured one token cannot tell which of several returned bindings
+    /// belongs to it. A binding reached from two different occurrences is two
+    /// rows, because it is two answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reached_from_ast_id: Option<String>,
+}
+
+/// What an import binder contributes, as far as the adapter can state it.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryImportBinder {
+    pub local_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    /// Empty when the adapter records no parser-derived import path. That is a
+    /// stated gap, not a claim that the import has no target.
+    pub target_segments: Vec<String>,
+    pub wildcard: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wildcard_ambiguous: Option<bool>,
+    pub boundary: &'static str,
+}
+
+/// One candidate the resolver considered for one reference (#1474).
+///
+/// `tier` is optional by construction: the shared outcome constructors receive
+/// a bare candidate list and cannot name the tier that produced it, so an
+/// absent tier means *unattributed*, never "the weakest tier".
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryResolutionCandidate {
+    pub id: String,
+    /// The AST identity of the *reference* the candidate was considered for,
+    /// which is what a capture over that token joins on.
+    pub ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    /// The reference occurrence's source range, so a candidate row points at
+    /// the position whose resolution it explains.
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    /// Ordinal of this candidate within its reference's trace, so two
+    /// otherwise identical rows stay separately addressable.
+    pub ordinal: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<&'static str>,
+    pub outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<&'static str>,
+    pub boundary: &'static str,
+    pub visibility: &'static str,
+    /// How much of the candidate story the language's resolver reports.
+    /// `selection_only` means an absent rejection row says nothing.
+    pub trace_completeness: &'static str,
+    pub candidate: CodeQueryCandidateRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_target: Option<String>,
+    /// The #1475 canonical identity digest of a unit-backed candidate:
+    /// domain-separated over the identity's kind-tagged segments, namespace,
+    /// language, and recorded generic arity -- never over a rendered FQN
+    /// string. `None` for candidates without a workspace declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_member_id: Option<String>,
+    /// The exact hierarchy type the resolver found this member candidate on
+    /// (#1477). Absent when the recording seam is not a member lookup; absence
+    /// is unattributed, never "the receiver's own type".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<CodeQueryDeclaration>,
+    /// Hierarchy hops between the receiver's declared owner and `owner`. Zero
+    /// is a direct member; absent is unattributed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hierarchy_depth: Option<usize>,
+    /// The language-neutral dispatch bucket the find belongs to (#1477).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_tier: Option<&'static str>,
+    /// Whether the candidate accepts the call shape as far as the member seam
+    /// checked. `unknown` means no shape was checked, never "applicable".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applicability: Option<&'static str>,
+}
+
+/// One exact hierarchy hop on one member candidate's route (#1477).
+///
+/// One row is one edge the production resolver's own member walk took, so a
+/// candidate found at depth `n` contributes exactly `n` rows, numbered `0`
+/// through `n - 1`, contiguous, starting at the receiver's declared owner and
+/// terminating at the candidate's owner. A depth-zero (direct) candidate
+/// contributes no row, and a candidate the resolver recorded without member
+/// attribution contributes none either. Zero rows is therefore never a claim
+/// that no hierarchy was walked; the mandatory per-occurrence outcome is the
+/// `member_selection` summary's job, not this domain's.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryCandidateHop {
+    pub id: String,
+    /// The exact `id` of the `resolution_candidate` row this hop belongs to.
+    /// Both ids are derived by the same function, so string equality is the
+    /// join between the two domains.
+    pub candidate_id: String,
+    /// The AST identity of the *reference* occurrence the owning candidate was
+    /// considered for, which is what a capture over that token joins on.
+    pub ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    /// The reference occurrence's source range: a hop explains part of the
+    /// resolution of that position.
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    /// Zero-based position of this hop on its candidate's route.
+    pub hop: usize,
+    /// The kind of hierarchy edge, as the provider that recorded it stated it.
+    pub relation: &'static str,
+    /// The type the hop left. `None` when the workspace can no longer locate
+    /// the recorded unit, which is a stated rendering gap, not an absent hop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<CodeQueryDeclaration>,
+    /// The type the hop reached, under the same rule as `from`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<CodeQueryDeclaration>,
+}
+
+/// One canonical reference edge (#1479).
+///
+/// The same row shape whichever producer derived it: `provenance` says which
+/// one did, and every classification the parity comparison depends on (kind,
+/// proof, usage kind, site class, owner relation) is an explicit field, never
+/// inferred from counts. `ast_id` is the site token's content-scoped AST
+/// identity when the producer can address it as a facts-arena node; string
+/// equality with a capture's or occurrence's `ast_id` is the correlation join.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryReferenceEdge {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub target: CodeQueryDeclaration,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enclosing_declaration: Option<CodeQueryDeclaration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_kind: Option<&'static str>,
+    pub proof: &'static str,
+    pub usage_kind: &'static str,
+    pub site_class: &'static str,
+    pub owner_relation: &'static str,
+    /// Which producer derived the row. Serialized as `edge_provenance`
+    /// because the result item that flattens this row already owns the
+    /// `provenance` key for its pipeline trace, and a colliding key would let
+    /// the trace silently shadow the producer label under full detail.
+    #[serde(rename = "edge_provenance")]
+    pub provenance: &'static str,
+    /// The workspace generation the edge was derived in. A parity comparison
+    /// refuses to relate rows from two generations.
+    pub generation: u64,
+}
+
+/// One flow-sensitive state event (#1480): an establishment, kill, or read of
+/// a binding or of a property of a canonical binding base, anchored to a
+/// program point of the production control-flow graph.
+///
+/// `completeness` and `uncovered_axes` travel on every row rather than on the
+/// response alone, so a row that survives a filter still states whether its
+/// derivation answered the axis it belongs to. Source order and containment are
+/// never evidence for anything on this row.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryStateEvent {
+    pub id: String,
+    /// The content-scoped AST identity of the event's own token; absent when
+    /// the lowering's provenance lands on no facts-arena node, in which case
+    /// `path` plus the byte range address it exactly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    /// The wire identity of the procedure whose control-flow graph the event
+    /// is anchored in; equal to a `procedure` row's `id`.
+    pub procedure_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    /// `establish`, `kill`, or `read`.
+    pub event_class: &'static str,
+    /// `binding` or `property`.
+    pub subject: &'static str,
+    /// The member a property subject names; absent for a binding subject.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
+    /// The lowered value the subject is identified by: the binding itself, or
+    /// the canonical base a property hangs off. Two events of one subject
+    /// carry the same number inside one procedure.
+    pub subject_value: usize,
+    /// The dense program point of the procedure's control-flow graph.
+    pub program_point: usize,
+    /// The value the event moves: the assigned value for a write, the produced
+    /// value for a read.
+    pub value: usize,
+    /// `complete` or `partial`, from the derivation's own account.
+    pub completeness: &'static str,
+    /// The axes the derivation does not answer for. Empty exactly when
+    /// `completeness` is `complete`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub uncovered_axes: Vec<&'static str>,
+    pub generation: u64,
+}
+
+/// One end of a flow relation, rendered inline so the relation is readable
+/// without a second query (#1480).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryStateEventRef {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub range: CodeQueryRange,
+    pub event_class: &'static str,
+    pub subject: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
+    pub program_point: usize,
+}
+
+/// One flow relation between two state events of one procedure (#1480).
+///
+/// `source` is always the establishment or kill end and `target` the read end.
+/// The row carries no subject of its own: a `same_evaluation` row legitimately
+/// relates two different subjects (a property write to a binding read).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryFlowRelation {
+    pub id: String,
+    pub procedure_id: String,
+    pub path: String,
+    pub language: &'static str,
+    /// The relation's own display anchor: its target read.
+    pub range: CodeQueryRange,
+    /// `reaching`, `dominates`, or `same_evaluation`.
+    pub relation: &'static str,
+    /// `exact` when the relation holds on every path, `may` otherwise.
+    pub certainty: &'static str,
+    pub source: CodeQueryStateEventRef,
+    pub target: CodeQueryStateEventRef,
+    pub completeness: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub uncovered_axes: Vec<&'static str>,
+    pub generation: u64,
+}
+
+/// One step of a bounded rewrite chase (#1480).
+///
+/// `state_key` is the *semantic* state the cycle check keys on, which is not
+/// the rewritten object: the object usually grows every hop and can never
+/// repeat, so keying on it would never detect a cycle.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryRewriteStep {
+    pub state_key: String,
+    pub input: String,
+    pub output: String,
+    /// The human-stable label of the rule that fired, so a step sequence reads
+    /// as a derivation rather than as a list of strings.
+    pub rule: &'static str,
+}
+
+/// One bounded chase through one declared finite rewrite domain (#1480).
+///
+/// The row states its own bound and its own work, so a reader can check the
+/// claim: `declared_bound` is the size of the finite state space the domain
+/// walks (not an arbitrary cap), and `steps` is the ordered derivation that
+/// bound governs.
+///
+/// The three outcomes mean different things. `converged` carries the
+/// `fixed_point` the chase stopped on. `cycle` carries the ordered `witness`
+/// whose last state repeats its first and closes the loop -- a concrete
+/// counterexample. `exceeded_budget` carries only `explored`: it is absence of
+/// evidence, never a proven cycle and never a clean convergence.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryRewritePath {
+    pub id: String,
+    pub path: String,
+    pub language: &'static str,
+    /// The origin site: the token that spells the object the chase started
+    /// from.
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    /// The declared rewrite domain, e.g. `rust_import_alias`.
+    pub domain: &'static str,
+    /// The object the chase started from, exactly as the source spells it.
+    pub origin_specifier: String,
+    pub declared_bound: usize,
+    pub step_count: usize,
+    pub steps: Vec<CodeQueryRewriteStep>,
+    /// `converged`, `cycle`, or `exceeded_budget`.
+    pub outcome: &'static str,
+    /// The fixed point of a converged chase; absent for the other outcomes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixed_point: Option<String>,
+    /// The ordered repeated-state witness of a cycle; empty for the other
+    /// outcomes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub witness: Vec<String>,
+    /// The steps a budget-exhausted chase performed; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explored: Option<usize>,
+    /// `complete` or `partial`, from the derivation's own account.
+    pub completeness: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub uncovered_domains: Vec<&'static str>,
+    pub generation: u64,
+}
+
+/// One qualified-path chain (#1475): a linear sequence of segments the
+/// grammar records, anchored at its terminal segment token.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryQualifiedPath {
+    pub id: String,
+    /// The terminal segment token's AST identity — the equijoin key with
+    /// captures and occurrence rows over the same token.
+    pub ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub segment_count: u32,
+}
+
+/// One segment of one qualified path (#1475).
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryPathSegment {
+    pub id: String,
+    /// The segment token's AST identity; absent for a segment the kind table
+    /// does not admit as a fact (Rust's `crate`/`self`/`super` path
+    /// keywords), whose position in the path is real but whose structural
+    /// identity is genuinely absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    /// The owning path's terminal AST identity — the group key back to its
+    /// qualified-path row.
+    pub path_ast_id: String,
+    /// 0-based position within the path, counting every spelled segment.
+    pub ordinal: u32,
+    /// Decoded identifier text: a quoted or punctuation-bearing identifier is
+    /// one segment and is never re-split.
+    pub text: String,
+    /// Stated by the adapter's classification or decided by resolution;
+    /// absent means "not stated", never a guessed value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<&'static str>,
+    /// The generic argument count the source spells at this segment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generic_arity: Option<u32>,
+    /// Present exactly when segment resolution was derived; `null` means
+    /// "not derived", never "nothing considered".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_count: Option<usize>,
+}
+
+/// What a candidate row points at. Two of the five shapes carry no workspace
+/// declaration, which is why `candidate-target` is partial by construction.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "candidate_kind", rename_all = "snake_case")]
+pub enum CodeQueryCandidateRef {
+    Unit {
+        unit: Box<CodeQueryDeclaration>,
+    },
+    Lexical {
+        name: String,
+        kind: &'static str,
+        range: CodeQueryRange,
+    },
+    Binding {
+        name: String,
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ast_id: Option<String>,
+    },
+    ImportBinder {
+        name: String,
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ast_id: Option<String>,
+        /// The parser-derived path the route pointed at. Empty when the
+        /// adapter or seam recorded no structured target. That is a stated
+        /// gap, not a claim that the import has no target.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        target_segments: Vec<String>,
+    },
+    ExternalRoute {
+        name: String,
+    },
+}
+
+impl CodeQueryCandidateRef {
+    /// The stable label of the shape, used in rendering and in the detailed
+    /// terminal key.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Unit { .. } => "unit",
+            Self::Lexical { .. } => "lexical",
+            Self::Binding { .. } => "binding",
+            Self::ImportBinder { .. } => "import_binder",
+            Self::ExternalRoute { .. } => "external_route",
+        }
+    }
+
+    /// The candidate's name, for rendering.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Unit { unit } => &unit.fq_name,
+            Self::Lexical { name, .. }
+            | Self::Binding { name, .. }
+            | Self::ImportBinder { name, .. }
+            | Self::ExternalRoute { name } => name,
+        }
+    }
+}

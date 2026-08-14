@@ -1,0 +1,26 @@
+(policy
+  :schema-version 1
+  :id "bifrost.performance.regex-compile-in-loop"
+  :name "Regular-expression compilation inside a loop"
+  :message "Review whether this lexically nested regex compilation repeats per iteration"
+  :severity warning
+  :description "Regex compilation lexically nested under a loop may rebuild parser and matcher state. This structural prompt also includes deferred nested bodies; verify execution and invariance before hoisting it."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["performance" "regex" "loop" "code-smell"]
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          :schema-version 1
+          (union
+            (language python
+              (inside-decl (loop) (call :receiver (name "re") :callee (name "compile"))))
+            (language java
+              (inside-decl (loop) (call :receiver (name "Pattern") :callee (name "compile"))))
+            (language javascript
+              (inside-decl (loop) (call :callee (name "RegExp"))))
+            (language typescript
+              (inside-decl (loop) (call :callee (name "RegExp"))))
+            (language rust
+              (inside-decl (loop) (call :receiver (name "Regex") :callee (name "new"))))))))

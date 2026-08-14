@@ -1,0 +1,1395 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.jdk-framework-decls",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-framework-foundry",
+    "version": "0.9.0"
+  },
+  "language": "java",
+  "ecosystem": "jdk",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <0.10.0",
+    "toolchains": [
+      {
+        "name": "jdk",
+        "requirement": ">=17.0.0"
+      }
+    ]
+  },
+  "provenance": {
+    "source": "hand-authored JDK framework declarations (java.lang, java.sql)",
+    "revision": "framework-decls"
+  },
+  "license": "LGPL-3.0-or-later",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "declarations.jdk",
+      "activation": [
+        {
+          "toolchain": {
+            "name": "jdk",
+            "version": ">=17.0.0"
+          },
+          "targets": [
+            "jvm"
+          ],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "jdk.java-lang-processbuilder",
+            "name": "java.lang.ProcessBuilder",
+            "type_kind": "class",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [
+              {
+                "hierarchy_kind": "extends",
+                "target": {
+                  "kind": "named",
+                  "name": "java.lang.Object",
+                  "arguments": [],
+                  "nullable": false
+                }
+              }
+            ],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/ProcessBuilder.java",
+              "symbol": "java.lang.ProcessBuilder"
+            }
+          },
+          {
+            "id": "jdk.java-lang-runtime",
+            "name": "java.lang.Runtime",
+            "type_kind": "class",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [
+              {
+                "hierarchy_kind": "extends",
+                "target": {
+                  "kind": "named",
+                  "name": "java.lang.Object",
+                  "arguments": [],
+                  "nullable": false
+                }
+              }
+            ],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/Runtime.java",
+              "symbol": "java.lang.Runtime"
+            }
+          },
+          {
+            "id": "jdk.java-lang-system",
+            "name": "java.lang.System",
+            "type_kind": "class",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [
+              {
+                "hierarchy_kind": "extends",
+                "target": {
+                  "kind": "named",
+                  "name": "java.lang.Object",
+                  "arguments": [],
+                  "nullable": false
+                }
+              }
+            ],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/System.java",
+              "symbol": "java.lang.System"
+            }
+          },
+          {
+            "id": "jdk.java-sql-connection",
+            "name": "java.sql.Connection",
+            "type_kind": "interface",
+            "visibility": "public",
+            "is_abstract": true,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [
+              {
+                "hierarchy_kind": "extends",
+                "target": {
+                  "kind": "named",
+                  "name": "java.sql.Wrapper",
+                  "arguments": [],
+                  "nullable": false
+                }
+              },
+              {
+                "hierarchy_kind": "extends",
+                "target": {
+                  "kind": "named",
+                  "name": "java.lang.AutoCloseable",
+                  "arguments": [],
+                  "nullable": false
+                }
+              }
+            ],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.sql/java/sql/Connection.java",
+              "symbol": "java.sql.Connection"
+            }
+          },
+          {
+            "id": "jdk.java-sql-preparedstatement",
+            "name": "java.sql.PreparedStatement",
+            "type_kind": "interface",
+            "visibility": "public",
+            "is_abstract": true,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [
+              {
+                "hierarchy_kind": "extends",
+                "target": {
+                  "kind": "named",
+                  "name": "java.sql.Statement",
+                  "arguments": [],
+                  "nullable": false
+                }
+              }
+            ],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.sql/java/sql/PreparedStatement.java",
+              "symbol": "java.sql.PreparedStatement"
+            }
+          },
+          {
+            "id": "jdk.java-sql-statement",
+            "name": "java.sql.Statement",
+            "type_kind": "interface",
+            "visibility": "public",
+            "is_abstract": true,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [
+              {
+                "hierarchy_kind": "extends",
+                "target": {
+                  "kind": "named",
+                  "name": "java.sql.Wrapper",
+                  "arguments": [],
+                  "nullable": false
+                }
+              },
+              {
+                "hierarchy_kind": "extends",
+                "target": {
+                  "kind": "named",
+                  "name": "java.lang.AutoCloseable",
+                  "arguments": [],
+                  "nullable": false
+                }
+              }
+            ],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.sql/java/sql/Statement.java",
+              "symbol": "java.sql.Statement"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.connection.createstatement",
+            "owner": "jdk.java-sql-connection",
+            "name": "createStatement",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.sql.Statement",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.sql/java/sql/Connection.java",
+              "symbol": "createStatement()"
+            }
+          },
+          {
+            "id": "member.connection.preparecall",
+            "owner": "jdk.java-sql-connection",
+            "name": "prepareCall",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "sql",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.sql.CallableStatement",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.sql/java/sql/Connection.java",
+              "symbol": "prepareCall(java.lang.String)"
+            }
+          },
+          {
+            "id": "member.connection.preparestatement-string",
+            "owner": "jdk.java-sql-connection",
+            "name": "prepareStatement",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "sql",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.sql.PreparedStatement",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.sql/java/sql/Connection.java",
+              "symbol": "prepareStatement(java.lang.String)"
+            }
+          },
+          {
+            "id": "member.connection.preparestatement-string-int",
+            "owner": "jdk.java-sql-connection",
+            "name": "prepareStatement",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "sql",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "autoGeneratedKeys",
+                  "type": {
+                    "kind": "named",
+                    "name": "int",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.sql.PreparedStatement",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.sql/java/sql/Connection.java",
+              "symbol": "prepareStatement(java.lang.String,int)"
+            }
+          },
+          {
+            "id": "member.preparedstatement.execute",
+            "owner": "jdk.java-sql-preparedstatement",
+            "name": "execute",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "boolean",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.sql/java/sql/PreparedStatement.java",
+              "symbol": "execute()"
+            }
+          },
+          {
+            "id": "member.preparedstatement.executequery",
+            "owner": "jdk.java-sql-preparedstatement",
+            "name": "executeQuery",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.sql.ResultSet",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.sql/java/sql/PreparedStatement.java",
+              "symbol": "executeQuery()"
+            }
+          },
+          {
+            "id": "member.preparedstatement.executeupdate",
+            "owner": "jdk.java-sql-preparedstatement",
+            "name": "executeUpdate",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "int",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.sql/java/sql/PreparedStatement.java",
+              "symbol": "executeUpdate()"
+            }
+          },
+          {
+            "id": "member.preparedstatement.setstring",
+            "owner": "jdk.java-sql-preparedstatement",
+            "name": "setString",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "parameterIndex",
+                  "type": {
+                    "kind": "named",
+                    "name": "int",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "x",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.sql/java/sql/PreparedStatement.java",
+              "symbol": "setString(int,java.lang.String)"
+            }
+          },
+          {
+            "id": "member.processbuilder.command",
+            "owner": "jdk.java-lang-processbuilder",
+            "name": "command",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.util.List",
+                "arguments": [
+                  {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                ],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/ProcessBuilder.java",
+              "symbol": "command()"
+            }
+          },
+          {
+            "id": "member.processbuilder.command-list",
+            "owner": "jdk.java-lang-processbuilder",
+            "name": "command",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "command",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.util.List",
+                    "arguments": [
+                      {
+                        "kind": "named",
+                        "name": "java.lang.String",
+                        "arguments": [],
+                        "nullable": false
+                      }
+                    ],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.ProcessBuilder",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/ProcessBuilder.java",
+              "symbol": "command(java.util.List)"
+            }
+          },
+          {
+            "id": "member.processbuilder.command-string-array",
+            "owner": "jdk.java-lang-processbuilder",
+            "name": "command",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "command",
+                  "type": {
+                    "kind": "array",
+                    "element": {
+                      "kind": "named",
+                      "name": "java.lang.String",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.ProcessBuilder",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/ProcessBuilder.java",
+              "symbol": "command(java.lang.String[])"
+            }
+          },
+          {
+            "id": "member.processbuilder.ctor-list",
+            "owner": "jdk.java-lang-processbuilder",
+            "name": "ProcessBuilder",
+            "member_kind": "constructor",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "command",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.util.List",
+                    "arguments": [
+                      {
+                        "kind": "named",
+                        "name": "java.lang.String",
+                        "arguments": [],
+                        "nullable": false
+                      }
+                    ],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/ProcessBuilder.java",
+              "symbol": "ProcessBuilder(java.util.List)"
+            }
+          },
+          {
+            "id": "member.processbuilder.ctor-string-array",
+            "owner": "jdk.java-lang-processbuilder",
+            "name": "ProcessBuilder",
+            "member_kind": "constructor",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "command",
+                  "type": {
+                    "kind": "array",
+                    "element": {
+                      "kind": "named",
+                      "name": "java.lang.String",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/ProcessBuilder.java",
+              "symbol": "ProcessBuilder(java.lang.String[])"
+            }
+          },
+          {
+            "id": "member.processbuilder.start",
+            "owner": "jdk.java-lang-processbuilder",
+            "name": "start",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.Process",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/ProcessBuilder.java",
+              "symbol": "start()"
+            }
+          },
+          {
+            "id": "member.runtime.exec-string",
+            "owner": "jdk.java-lang-runtime",
+            "name": "exec",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "command",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.Process",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/Runtime.java",
+              "symbol": "exec(java.lang.String)"
+            }
+          },
+          {
+            "id": "member.runtime.exec-string-array",
+            "owner": "jdk.java-lang-runtime",
+            "name": "exec",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "cmdarray",
+                  "type": {
+                    "kind": "array",
+                    "element": {
+                      "kind": "named",
+                      "name": "java.lang.String",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.Process",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/Runtime.java",
+              "symbol": "exec(java.lang.String[])"
+            }
+          },
+          {
+            "id": "member.runtime.exec-string-array-string-array",
+            "owner": "jdk.java-lang-runtime",
+            "name": "exec",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "cmdarray",
+                  "type": {
+                    "kind": "array",
+                    "element": {
+                      "kind": "named",
+                      "name": "java.lang.String",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "envp",
+                  "type": {
+                    "kind": "array",
+                    "element": {
+                      "kind": "named",
+                      "name": "java.lang.String",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.Process",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/Runtime.java",
+              "symbol": "exec(java.lang.String[],java.lang.String[])"
+            }
+          },
+          {
+            "id": "member.runtime.exec-string-array-string-array-file",
+            "owner": "jdk.java-lang-runtime",
+            "name": "exec",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "cmdarray",
+                  "type": {
+                    "kind": "array",
+                    "element": {
+                      "kind": "named",
+                      "name": "java.lang.String",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "envp",
+                  "type": {
+                    "kind": "array",
+                    "element": {
+                      "kind": "named",
+                      "name": "java.lang.String",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "dir",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.io.File",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.Process",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/Runtime.java",
+              "symbol": "exec(java.lang.String[],java.lang.String[],java.io.File)"
+            }
+          },
+          {
+            "id": "member.runtime.exec-string-string-array",
+            "owner": "jdk.java-lang-runtime",
+            "name": "exec",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "command",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "envp",
+                  "type": {
+                    "kind": "array",
+                    "element": {
+                      "kind": "named",
+                      "name": "java.lang.String",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.Process",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/Runtime.java",
+              "symbol": "exec(java.lang.String,java.lang.String[])"
+            }
+          },
+          {
+            "id": "member.runtime.exec-string-string-array-file",
+            "owner": "jdk.java-lang-runtime",
+            "name": "exec",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "command",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "envp",
+                  "type": {
+                    "kind": "array",
+                    "element": {
+                      "kind": "named",
+                      "name": "java.lang.String",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "dir",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.io.File",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.Process",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/Runtime.java",
+              "symbol": "exec(java.lang.String,java.lang.String[],java.io.File)"
+            }
+          },
+          {
+            "id": "member.runtime.getruntime",
+            "owner": "jdk.java-lang-runtime",
+            "name": "getRuntime",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.Runtime",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/Runtime.java",
+              "symbol": "getRuntime()"
+            }
+          },
+          {
+            "id": "member.statement.addbatch",
+            "owner": "jdk.java-sql-statement",
+            "name": "addBatch",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "sql",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.sql/java/sql/Statement.java",
+              "symbol": "addBatch(java.lang.String)"
+            }
+          },
+          {
+            "id": "member.statement.execute",
+            "owner": "jdk.java-sql-statement",
+            "name": "execute",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "sql",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "boolean",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.sql/java/sql/Statement.java",
+              "symbol": "execute(java.lang.String)"
+            }
+          },
+          {
+            "id": "member.statement.executequery",
+            "owner": "jdk.java-sql-statement",
+            "name": "executeQuery",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "sql",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.sql.ResultSet",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.sql/java/sql/Statement.java",
+              "symbol": "executeQuery(java.lang.String)"
+            }
+          },
+          {
+            "id": "member.statement.executeupdate",
+            "owner": "jdk.java-sql-statement",
+            "name": "executeUpdate",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "sql",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "int",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.sql/java/sql/Statement.java",
+              "symbol": "executeUpdate(java.lang.String)"
+            }
+          },
+          {
+            "id": "member.system.getenv",
+            "owner": "jdk.java-lang-system",
+            "name": "getenv",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "java.util.Map",
+                "arguments": [
+                  {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                ],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/System.java",
+              "symbol": "getenv()"
+            }
+          },
+          {
+            "id": "member.system.getenv-string",
+            "owner": "jdk.java-lang-system",
+            "name": "getenv",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "name",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.String",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/System.java",
+              "symbol": "getenv(java.lang.String)"
+            }
+          },
+          {
+            "id": "member.system.getproperty-string",
+            "owner": "jdk.java-lang-system",
+            "name": "getProperty",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "key",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.String",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/System.java",
+              "symbol": "getProperty(java.lang.String)"
+            }
+          },
+          {
+            "id": "member.system.getproperty-string-string",
+            "owner": "jdk.java-lang-system",
+            "name": "getProperty",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "key",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "def",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.lang.String",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/lang/System.java",
+              "symbol": "getProperty(java.lang.String,java.lang.String)"
+            }
+          }
+        ],
+        "relations": []
+      }
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+(policy
+  :schema-version 1
+  :id "bifrost.correctness.dynamic-evaluation"
+  :name "Dynamic code evaluation"
+  :message "Replace dynamic evaluation with explicit parsing or dispatch"
+  :severity warning
+  :description "Calls that evaluate source text as code are difficult to validate and can execute unintended behavior. Prefer a data-only representation and explicit operations."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["correctness" "security" "code-smell"]
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql
+          :schema-version 1
+          (union
+            (language python (call :callee (name "eval")))
+            (language python (call :callee (name "exec")))
+            (language javascript (call :callee (name "eval")))
+            (language javascript (call :callee (name "Function")))
+            (language typescript (call :callee (name "eval")))
+            (language typescript (call :callee (name "Function")))))))

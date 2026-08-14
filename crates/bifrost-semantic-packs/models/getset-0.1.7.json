@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.rust.getset",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.8.21"
+  },
+  "language": "rust",
+  "ecosystem": "cargo",
+  "compatibility": {
+    "bifrost": ">=0.8.21, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://docs.rs/getset/0.1.7/getset/",
+    "revision": "0.1.7"
+  },
+  "license": "MIT",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": true,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "rust.getset.generated-getter",
+      "activation": [
+        {
+          "package": {
+            "name": "getset",
+            "version": "=0.1.7"
+          }
+        }
+      ],
+      "payload": {
+        "kind": "generator_rules",
+        "rules": [
+          {
+            "id": "rust.getset.getter",
+            "trigger": {
+              "kind": "annotated_field",
+              "annotation": "get",
+              "value": "\"pub\"",
+              "excluded_annotations": ["getset"],
+              "owner_annotation_path": ["getset", "Getters"]
+            },
+            "captures": [
+              {
+                "name": "owner_id",
+                "binding": {
+                  "source": { "kind": "owning_type" },
+                  "projection": "stable_id"
+                },
+                "value_kind": "stable_id",
+                "cardinality": "one"
+              },
+              {
+                "name": "field_name",
+                "binding": {
+                  "source": { "kind": "matched_node" },
+                  "projection": "name"
+                },
+                "value_kind": "identifier",
+                "cardinality": "one"
+              },
+              {
+                "name": "field_id",
+                "binding": {
+                  "source": { "kind": "matched_node" },
+                  "projection": "stable_id"
+                },
+                "value_kind": "stable_id",
+                "cardinality": "one"
+              },
+              {
+                "name": "field_type",
+                "binding": {
+                  "source": { "kind": "matched_node" },
+                  "projection": "type"
+                },
+                "value_kind": "type",
+                "cardinality": "one"
+              }
+            ],
+            "emissions": [
+              {
+                "kind": "declaration",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "field_id" },
+                    { "op": "literal", "value": ".getset-getter" }
+                  ]
+                },
+                "name": { "op": "capture", "name": "field_name" },
+                "anchor": { "op": "capture", "name": "field_name" },
+                "declaration": {
+                  "kind": "member",
+                  "owner": { "op": "capture", "name": "owner_id" },
+                  "member_kind": "method",
+                  "visibility": "public",
+                  "signature": {
+                    "type_parameters": [],
+                    "parameters": [],
+                    "returns": {
+                      "kind": "by_ref",
+                      "element": { "kind": "capture", "name": "field_type" }
+                    }
+                  }
+                }
+              },
+              {
+                "kind": "relation",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "field_id" },
+                    { "op": "literal", "value": ".getset-getter-navigation" }
+                  ]
+                },
+                "relation_kind": "navigates_to",
+                "from": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "field_id" },
+                    { "op": "literal", "value": ".getset-getter" }
+                  ]
+                },
+                "to": { "op": "capture", "name": "field_id" }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

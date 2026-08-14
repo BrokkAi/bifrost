@@ -1,0 +1,385 @@
+{
+  "name": "bifrost-vscode",
+  "displayName": "Bifrost: Multi-Language LSP & MCP Server",
+  "description": "Tree-sitter-backed code intelligence for definitions, references, symbols, hierarchy, rename, diagnostics, and MCP workflows.",
+  "version": "0.9.5",
+  "bifrost": {
+    "binaryVersion": "0.9.5",
+    "minimumBinaryVersion": "0.9.0",
+    "allowPrerelease": false,
+    "archiveSha256": {
+      "aarch64-pc-windows-msvc": "35d03fd4a041366f95b9b0f5f6b72ddf73e1ef671c6c932fb75fd49dda1113bb",
+      "aarch64-unknown-linux-gnu": "5578286a4c82a4f757f24d478bbea135bb68c8c17d2a423885ac5df7c9250ad2",
+      "universal-apple-darwin": "e5a2fdd5c11dd3d4fce6b06f580cadca56439178345402bf565fb3551d86ee85",
+      "x86_64-pc-windows-msvc": "96b7b7769207ff8f5307298fc66d68f0f11b1e672f9cb20e737ef14595926b07",
+      "x86_64-unknown-linux-gnu": "6d1c09bc9c8a40cfce5c347c61ec23e362a5d705fb309eeb45fa1c809a568025"
+    }
+  },
+  "publisher": "brokk",
+  "homepage": "https://brokk.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BrokkAi/bifrost"
+  },
+  "license": "Apache-2.0",
+  "icon": "icon.png",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:java",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onLanguage:rust",
+    "onLanguage:go",
+    "onLanguage:python",
+    "onLanguage:c",
+    "onLanguage:cpp",
+    "onLanguage:csharp",
+    "onLanguage:php",
+    "onLanguage:scala",
+    "onLanguage:kotlin",
+    "onLanguage:bifrost-rql",
+    "onLanguage:bifrost-rql-policy",
+    "onLanguage:bifrost-rune-ir"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "bifrost-rql",
+        "aliases": [
+          "Bifrost RQL",
+          "bifrost-rql"
+        ],
+        "extensions": [
+          ".rql"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/bifrost-rql-light.svg",
+          "dark": "./icons/bifrost-rql-dark.svg"
+        }
+      },
+      {
+        "id": "bifrost-rql-policy",
+        "aliases": [
+          "Bifrost RQL Policy",
+          "bifrost-rql-policy"
+        ],
+        "extensions": [
+          ".rqlp"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/bifrost-rql-policy-light.svg",
+          "dark": "./icons/bifrost-rql-policy-dark.svg"
+        }
+      },
+      {
+        "id": "bifrost-rune-ir",
+        "aliases": [
+          "Bifrost Rune IR",
+          "bifrost-rune-ir"
+        ],
+        "extensions": [
+          ".rune"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/bifrost-rune-ir-light.svg",
+          "dark": "./icons/bifrost-rune-ir-dark.svg"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "bifrost-rql",
+        "scopeName": "source.bifrost-rql",
+        "path": "./syntaxes/bifrost-rql.tmLanguage.json"
+      },
+      {
+        "language": "bifrost-rql-policy",
+        "scopeName": "source.bifrost-rql-policy",
+        "path": "./syntaxes/bifrost-rql-policy.tmLanguage.json"
+      },
+      {
+        "language": "bifrost-rune-ir",
+        "scopeName": "source.bifrost-rune-ir",
+        "path": "./syntaxes/bifrost-rune-ir.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Bifrost",
+      "properties": {
+        "bifrost.launchMode": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "bundled",
+            "path"
+          ],
+          "enumDescriptions": [
+            "Auto-detect a configured path, bundled binary, local development binary, or PATH binary.",
+            "Use the Bifrost binary bundled with the extension.",
+            "Use bifrost.serverPath, or the bifrost command on PATH when no path is configured."
+          ],
+          "description": "How to start the Bifrost language server."
+        },
+        "bifrost.serverPath": {
+          "type": "string",
+          "default": "bifrost",
+          "description": "Path to the bifrost binary, or the command name to resolve on PATH."
+        },
+        "bifrost.debug": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable verbose Bifrost LSP request and notification tracing."
+        },
+        "bifrost.slowRequestMs": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 0,
+          "description": "Log Bifrost LSP requests and notifications that take at least this many milliseconds."
+        },
+        "bifrost.extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional command-line arguments appended when launching the Bifrost LSP server."
+        },
+        "bifrost.roots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Workspace-relative or absolute directories to index instead of the full VS Code workspace. Empty means use VS Code workspace folders."
+        },
+        "bifrost.exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Workspace-relative or absolute files or directories to exclude from Bifrost indexing and LSP lookups."
+        },
+        "bifrost.formatterCommands": {
+          "type": "array",
+          "default": [],
+          "description": "Ordered formatter command rules passed to Bifrost from user settings only. Rules run without a shell, receive document text on stdin, and must write the formatted document to stdout.",
+          "items": {
+            "type": "object",
+            "required": [
+              "command"
+            ],
+            "properties": {
+              "include": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Workspace-relative glob patterns this formatter rule applies to."
+              },
+              "exclude": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Workspace-relative glob patterns this formatter rule must not apply to."
+              },
+              "language": {
+                "type": "string",
+                "description": "Optional Bifrost language filter, such as rust, go, typescript, java, csharp, php, or ruby."
+              },
+              "command": {
+                "type": "string",
+                "description": "Executable name or path. This is executed directly and is not shell-parsed."
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Command arguments. Supports {file}, {relativeFile}, {workspaceRoot}, and {language} placeholders."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory for the formatter. Relative paths are resolved against the workspace root and support placeholders."
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "bifrost.unrecognizedSymbolDiagnostics": {
+          "type": "boolean",
+          "default": false,
+          "description": "Publish Bifrost unrecognized-symbol diagnostics. This experimental lint is disabled by default because it can report false positives."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "bifrost.startServer",
+        "title": "Bifrost: Start Language Server"
+      },
+      {
+        "command": "bifrost.stopServer",
+        "title": "Bifrost: Stop Language Server"
+      },
+      {
+        "command": "bifrost.restartServer",
+        "title": "Bifrost: Restart Language Server"
+      },
+      {
+        "command": "bifrost.copyMcpConfig",
+        "title": "Bifrost: Copy MCP Config"
+      },
+      {
+        "command": "bifrost.openMcpSetup",
+        "title": "Bifrost: Open MCP Setup"
+      },
+      {
+        "command": "bifrost.showOutput",
+        "title": "Bifrost: Show Output"
+      },
+      {
+        "command": "bifrost.runRqlQuery",
+        "title": "Bifrost: Run RQL Query",
+        "icon": "$(play)"
+      },
+      {
+        "command": "bifrost.runRqlPolicy",
+        "title": "Bifrost: Run RQL Policy",
+        "icon": "$(play)"
+      },
+      {
+        "command": "bifrost.openRqlQueryResult",
+        "title": "Bifrost: Open RQL Query Result"
+      },
+      {
+        "command": "bifrost.openRqlPolicyFinding",
+        "title": "Bifrost: Open RQL Policy Finding"
+      },
+      {
+        "command": "bifrost.openRqlPolicyDisplayStep",
+        "title": "Bifrost: Open RQL Policy Display Step"
+      },
+      {
+        "command": "bifrost.showRuneIr",
+        "title": "Bifrost: Show Rune IR"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "bifrost.queryResults",
+          "name": "Bifrost Query Results"
+        },
+        {
+          "id": "bifrost.policyResults",
+          "name": "Bifrost Policy Results"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "bifrost.queryResults",
+        "contents": "Run an RQL query from a `.rql` editor to see its results here."
+      },
+      {
+        "view": "bifrost.policyResults",
+        "contents": "Run an RQL policy from a `.rqlp` editor to see completion state and findings here."
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "bifrost.runRqlQuery",
+          "when": "false"
+        },
+        {
+          "command": "bifrost.openRqlQueryResult",
+          "when": "false"
+        },
+        {
+          "command": "bifrost.runRqlPolicy",
+          "when": "resourceLangId == bifrost-rql-policy"
+        },
+        {
+          "command": "bifrost.openRqlPolicyFinding",
+          "when": "false"
+        },
+        {
+          "command": "bifrost.openRqlPolicyDisplayStep",
+          "when": "false"
+        },
+        {
+          "command": "bifrost.showRuneIr",
+          "when": "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == kotlin || resourceLangId == ruby"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "bifrost.runRqlQuery",
+          "when": "resourceLangId == bifrost-rql",
+          "group": "navigation@1"
+        },
+        {
+          "command": "bifrost.runRqlPolicy",
+          "when": "resourceLangId == bifrost-rql-policy",
+          "group": "navigation@1"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "bifrost.showRuneIr",
+          "when": "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == kotlin || resourceLangId == ruby",
+          "group": "navigation@10"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "node esbuild.mjs",
+    "license:prepare": "node ../../scripts/prepare-vscode-license-artifacts.mjs",
+    "compile:test": "tsc -p tsconfig.test.json",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"*.{json,mjs,md}\" \"syntaxes/*.json\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"*.{json,mjs,md}\" \"syntaxes/*.json\"",
+    "lint": "eslint src test esbuild.mjs eslint.config.mjs",
+    "lint:fix": "npm run lint -- --fix",
+    "typecheck": "tsc -p tsconfig.test.json --noEmit && tsc -p tsconfig.tools.json",
+    "watch": "node esbuild.mjs --watch",
+    "test": "npm run format:check && npm run typecheck && npm run lint && npm run compile && npm run license:prepare && npm run test:unit",
+    "test:unit": "npm run compile:test && node --test out-test/test/*.test.js",
+    "vscode:prepublish": "npm run compile && npm run license:prepare"
+  },
+  "dependencies": {
+    "extract-zip": "^2.0.1",
+    "tar": "^7.5.19",
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^20.0.0",
+    "@types/vscode": "1.90.0",
+    "@vscode/vsce": "3.9.2",
+    "esbuild": "^0.28.1",
+    "eslint": "^10.7.0",
+    "globals": "^17.7.0",
+    "ovsx": "1.0.2",
+    "prettier": "^3.9.5",
+    "typescript": "^5.4.0",
+    "typescript-eslint": "^8.64.0",
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.3.2"
+  }
+}
