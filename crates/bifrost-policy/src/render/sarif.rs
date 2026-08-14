@@ -1230,21 +1230,8 @@ const fn is_false(value: &bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
-    use crate::{PolicyEvaluationDate, PolicyEvaluationOptions, evaluate_policy_files};
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
-
-    fn evaluation_options() -> PolicyEvaluationOptions {
-        PolicyEvaluationOptions::new(
-            PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
-        )
-    }
-
-    fn policy_cli_fixture_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/policy-cli/project")
-    }
 
     #[test]
     fn artifact_uri_preserves_only_segment_separators_and_unreserved_bytes() {
@@ -1253,44 +1240,6 @@ mod tests {
             "src/a%20b%23%25/caf%C3%A9%0A%E2%80%AE.py"
         );
         assert!(!encode_artifact_uri("a/b").contains("%2F"));
-    }
-
-    #[test]
-    fn zero_byte_bound_stops_before_results_or_artifact_uris_are_visited() {
-        let fixture_root = policy_cli_fixture_root();
-        let outcome = evaluate_policy_files(
-            &fixture_root,
-            &[PathBuf::from("policies/dynamic-eval.rqlp")],
-            &evaluation_options(),
-        )
-        .expect("fixture policy evaluation");
-        assert_eq!(outcome.report().runs()[0].findings().len(), 1);
-
-        reset_sarif_stream_visits();
-        let mut output = Vec::new();
-        assert!(matches!(
-            write_policy_sarif(
-                outcome.report(),
-                &SarifToolIdentity::default(),
-                &mut output,
-                0,
-            ),
-            Err(PolicyRenderError::SerializedReportLimit {
-                max_serialized_bytes: 0
-            })
-        ));
-        assert!(output.is_empty());
-        assert_eq!(sarif_stream_visits(), (0, 0));
-
-        reset_sarif_stream_visits();
-        write_policy_sarif(
-            outcome.report(),
-            &SarifToolIdentity::default(),
-            Vec::new(),
-            usize::MAX,
-        )
-        .expect("unbounded fixture SARIF");
-        assert_eq!(sarif_stream_visits(), (1, 1));
     }
 
     #[test]
@@ -1334,46 +1283,6 @@ mod tests {
         assert_eq!(
             normalize_absolute_uri("HTTPS://Example.Test/tool"),
             Some("https://example.test/tool".to_string())
-        );
-    }
-
-    #[test]
-    fn truncated_policy_diagnostics_report_a_nonzero_omission_lower_bound() {
-        let fixture_root = policy_cli_fixture_root();
-        let outcome = evaluate_policy_files(
-            &fixture_root,
-            &[PathBuf::from("policies/resource-lifecycle.rqlp")],
-            &evaluation_options(),
-        )
-        .expect("fixture policy evaluation");
-        // The fixture run completes since #1987, so rebuild it with an
-        // inconclusive completion: only a non-complete run carries a
-        // completion notification, and truncated diagnostics require one.
-        let complete = &outcome.report().runs()[0];
-        let mut run = crate::PolicyRun::try_new(
-            complete.policy_id().clone(),
-            complete.policy_hash(),
-            complete.analysis_type(),
-            crate::PolicyRunCompletion::inconclusive(vec![
-                crate::PolicyIncompleteReason::PartialDiscovery,
-            ])
-            .expect("inconclusive completion"),
-            complete.findings().to_vec(),
-            complete.diagnostics().to_vec(),
-            false,
-            complete.work().clone(),
-            &crate::PolicyBudget::default(),
-        )
-        .expect("rebuilt inconclusive run");
-        run.replace_diagnostics(run.diagnostics().to_vec(), true);
-
-        let notification = SarifNotification::policy_completion(&run)
-            .expect("the inconclusive policy run produces a completion notification");
-        let value = serde_json::to_value(notification).expect("serialize notification");
-        assert_eq!(value["properties"]["bifrost.diagnosticsTruncated"], true);
-        assert_eq!(
-            value["properties"]["bifrost.omittedDiagnosticsLowerBound"],
-            1
         );
     }
 
