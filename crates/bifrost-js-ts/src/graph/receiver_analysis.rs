@@ -8,12 +8,13 @@
 use crate::imports::require_call_module_specifier;
 use crate::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
+    resolve_js_ts_module_specifier,
 };
 use crate::providers::JsTsSource;
 use crate::syntax::compute_import_binder as compute_jsts_import_binder;
 use crate::syntax::parse_js_ts_tree;
 use crate::syntax::{JsTsImportBinder, slice};
-use crate::ts_owners::ts_resolve_type_text_to_property_owners;
+use crate::ts_owners::{jsts_identifier_candidates, ts_resolve_type_text_to_property_owners};
 use crate::tsconfig::AliasResolver;
 use crate::type_text::ts_type_annotation_text;
 use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
@@ -42,6 +43,12 @@ use tree_sitter::Node;
 
 const MAX_JSTS_RECEIVER_RECURSION: usize = 8;
 
+/// How many module or default-export steps a JSX component binding may take
+/// before its props count as unproven. `lazy(() => import("./panel"))` costs
+/// one step, and a module that re-exports another component's default costs the
+/// next (#2041).
+const MAX_JSX_COMPONENT_HOPS: usize = 3;
+
 pub struct JsTsReceiverFactProvider<'tree, 'a> {
     host: &'a dyn JsTsSource,
     support: &'a dyn BoundedDefinitionLookup,
@@ -55,6 +62,8 @@ pub struct JsTsReceiverFactProvider<'tree, 'a> {
     member_target_cache:
         RefCell<HashMap<ReceiverAnalysisCacheKey, ReceiverAnalysisOutcome<CodeUnit>>>,
     jsx_props_owner_cache: RefCell<HashMap<(ProjectFile, String), Vec<CodeUnit>>>,
+    /// Props owners by (enclosing scope, component name) in this file.
+    jsx_component_owner_cache: RefCell<HashMap<(usize, String), Vec<CodeUnit>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +161,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             syntax_index,
             member_target_cache: RefCell::new(HashMap::default()),
             jsx_props_owner_cache: RefCell::new(HashMap::default()),
+            jsx_component_owner_cache: RefCell::new(HashMap::default()),
         }
     }
 
@@ -296,6 +306,33 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         })
     }
 
+    /// The declarations that own `member` on ONE ELEMENT of `iterable`.
+    ///
+    /// `const [{ texture: frameTexture }] = frames` reads `texture` at the
+    /// element type of `frames`, not at `frames` itself, so the element step
+    /// happens before the member lookup that
+    /// [`Self::resolve_member_targets`] performs for a whole value (#2039).
+    pub fn resolve_iterable_element_member_targets(
+        &self,
+        iterable: Node<'tree>,
+        member: &str,
+        budget: ReceiverAnalysisBudget,
+    ) -> Vec<CodeUnit> {
+        let ReceiverAnalysisOutcome::Precise(values) =
+            self.resolve_iterable_element(iterable, budget)
+        else {
+            return Vec::new();
+        };
+        let mut targets = values
+            .iter()
+            .flat_map(|value| self.member_targets_for_value(value, member))
+            .collect::<Vec<_>>();
+        sort_units(&mut targets);
+        targets.dedup();
+        targets.truncate(budget.max_targets.saturating_add(1));
+        targets
+    }
+
     pub fn resolve_contextual_object_literal_key_targets(
         &self,
         key: Node<'tree>,
@@ -335,22 +372,268 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             return Some(Vec::new());
         }
         let attribute = slice(attribute_name, self.source);
+        // A lower-case tag names an intrinsic element: the host environment
+        // declares `div`'s attributes, not this workspace.
         let Some(component) = simple_identifier_text(element_name, self.source)
             .filter(|name| name.starts_with(|ch: char| ch.is_ascii_uppercase()))
         else {
             return Some(Vec::new());
         };
 
-        let components = self.jsx_component_candidates(component);
-        let mut targets = components
+        let mut targets = self
+            .jsx_component_props_owners(element_name, component)
             .iter()
-            .flat_map(|component| self.jsx_component_prop_owners(component))
-            .flat_map(|owner| self.member_targets(&owner, attribute))
+            .flat_map(|owner| self.member_targets(owner, attribute))
             .collect::<Vec<_>>();
         sort_units(&mut targets);
         targets.dedup();
         targets.truncate(budget.max_targets.saturating_add(1));
         Some(targets)
+    }
+
+    /// The props owners of the component `name` names at `site`.
+    ///
+    /// A binding visible from the site *is* the component, so an import
+    /// spelled the same way is shadowed by it and must not answer. Two visible
+    /// bindings mean the name identifies no single declaration, and the site
+    /// stays unresolved rather than merging both props types (#2041).
+    ///
+    /// The answer depends only on the name and the scope that asks, so it is
+    /// memoized on that pair: one element usually carries several attributes,
+    /// and each of them would otherwise repeat the scope walk and the module
+    /// reads behind it.
+    fn jsx_component_props_owners(&self, site: Node<'tree>, name: &str) -> Vec<CodeUnit> {
+        let scope = enclosing_scope_id(site);
+        if let Some(cached) = self
+            .jsx_component_owner_cache
+            .borrow()
+            .get(&(scope, name.to_string()))
+        {
+            return cached.clone();
+        }
+        let owners = self.resolve_jsx_component_props_owners(site, name);
+        self.jsx_component_owner_cache
+            .borrow_mut()
+            .insert((scope, name.to_string()), owners.clone());
+        owners
+    }
+
+    fn resolve_jsx_component_props_owners(&self, site: Node<'tree>, name: &str) -> Vec<CodeUnit> {
+        let bindings = visible_component_bindings(site, name, self.source);
+        if bindings.len() > 1 {
+            return Vec::new();
+        }
+        if let Some(binding) = bindings.first() {
+            return jsx_binding_props_source(*binding, self.source)
+                .map(|props| {
+                    self.jsx_props_source_owners(
+                        props,
+                        self.file,
+                        self.source,
+                        &self.imports,
+                        &self.aliases,
+                        MAX_JSX_COMPONENT_HOPS,
+                    )
+                })
+                .unwrap_or_default();
+        }
+        // Nothing in this file binds the name, so it is imported. Two direct
+        // imports of one name leave the component unproven.
+        if self.imports.has_competing_direct_imports(name) {
+            return Vec::new();
+        }
+        let mut owners = self
+            .jsx_component_candidates(name)
+            .iter()
+            .flat_map(|component| self.jsx_component_prop_owners(component))
+            .collect::<Vec<_>>();
+        sort_units(&mut owners);
+        owners.dedup();
+        owners
+    }
+
+    /// Resolves one binding's props evidence to the declarations that own the
+    /// element's attributes. `hops` bounds the module and default-export steps
+    /// the walk may still take, so the mutual recursion with
+    /// [`Self::module_default_component_props_owners`] is depth-bounded.
+    fn jsx_props_source_owners(
+        &self,
+        props: JsxPropsSource<'_>,
+        file: &ProjectFile,
+        source: &str,
+        imports: &JsTsImportBinder,
+        aliases: &AliasResolver,
+        hops: usize,
+    ) -> Vec<CodeUnit> {
+        match props {
+            JsxPropsSource::Type(type_node) => {
+                self.type_node_property_owners(type_node, file, source, imports, aliases)
+            }
+            JsxPropsSource::ComponentTypeName(name) => {
+                self.component_type_props_owners(&name, file, source, imports, aliases)
+            }
+            JsxPropsSource::Module(specifier) => {
+                if hops == 0 {
+                    return Vec::new();
+                }
+                resolve_js_ts_module_specifier(
+                    file,
+                    &specifier,
+                    Language::TypeScript,
+                    Some(aliases),
+                )
+                .iter()
+                .flat_map(|module| {
+                    self.module_default_component_props_owners(module, aliases, hops - 1)
+                })
+                .collect()
+            }
+            JsxPropsSource::TypeMember {
+                owner_type,
+                members,
+            } => self.type_member_component_props_owners(
+                owner_type, &members, file, source, imports, aliases,
+            ),
+        }
+    }
+
+    fn type_node_property_owners(
+        &self,
+        type_node: Node<'_>,
+        file: &ProjectFile,
+        source: &str,
+        imports: &JsTsImportBinder,
+        aliases: &AliasResolver,
+    ) -> Vec<CodeUnit> {
+        ts_resolve_type_text_to_property_owners(
+            self.host,
+            self.support,
+            file,
+            source,
+            imports,
+            aliases,
+            ts_type_annotation_text(type_node, source).as_str(),
+            0,
+        )
+    }
+
+    /// The props a component *type* declares: `type DevtoolsComponentType =
+    /// Component<QueryDevtoolsProps> & {...}` makes `QueryDevtoolsProps` the
+    /// props of every variable annotated with it.
+    fn component_type_props_owners(
+        &self,
+        name: &str,
+        file: &ProjectFile,
+        source: &str,
+        imports: &JsTsImportBinder,
+        aliases: &AliasResolver,
+    ) -> Vec<CodeUnit> {
+        let mut owners = Vec::new();
+        for unit in jsts_identifier_candidates(
+            self.host,
+            self.support,
+            Language::TypeScript,
+            file,
+            source,
+            imports,
+            aliases,
+            name,
+            false,
+        ) {
+            let Ok(unit_source) = unit.source().read_to_string() else {
+                continue;
+            };
+            let Some(tree) = parse_js_ts_tree(unit.source(), &unit_source, Language::TypeScript)
+            else {
+                continue;
+            };
+            let unit_imports = compute_jsts_import_binder(&unit_source, &tree);
+            for node in nodes_for_code_unit(self.host, &unit, tree.root_node()) {
+                let Some(argument) = node
+                    .child_by_field_name("value")
+                    .and_then(|value| function_component_wrapper_argument(value, &unit_source))
+                else {
+                    continue;
+                };
+                owners.extend(self.type_node_property_owners(
+                    argument,
+                    unit.source(),
+                    &unit_source,
+                    &unit_imports,
+                    aliases,
+                ));
+            }
+        }
+        owners
+    }
+
+    /// The props of the component a module default-exports, which is what a
+    /// `lazy(() => import("./panel"))` binding renders.
+    fn module_default_component_props_owners(
+        &self,
+        file: &ProjectFile,
+        aliases: &AliasResolver,
+        hops: usize,
+    ) -> Vec<CodeUnit> {
+        let Ok(source) = file.read_to_string() else {
+            return Vec::new();
+        };
+        let Some(tree) = parse_js_ts_tree(file, &source, Language::TypeScript) else {
+            return Vec::new();
+        };
+        let imports = compute_jsts_import_binder(&source, &tree);
+        let Some(binding) = default_export_component_binding(tree.root_node(), &source) else {
+            return Vec::new();
+        };
+        jsx_binding_props_source(binding, &source)
+            .map(|props| {
+                self.jsx_props_source_owners(props, file, &source, &imports, aliases, hops)
+            })
+            .unwrap_or_default()
+    }
+
+    /// The props of a component read out of a typed value: `const { Box } =
+    /// components` renders the component the enclosing type declares at
+    /// `components.Box`.
+    ///
+    /// `members` names the properties to follow, outermost first. The chain is
+    /// read inside the declaring type's own syntax, so a member whose type is
+    /// declared in a third file ends the walk instead of guessing.
+    #[allow(clippy::too_many_arguments)]
+    fn type_member_component_props_owners(
+        &self,
+        owner_type: Node<'_>,
+        members: &[String],
+        file: &ProjectFile,
+        source: &str,
+        imports: &JsTsImportBinder,
+        aliases: &AliasResolver,
+    ) -> Vec<CodeUnit> {
+        let mut owners = Vec::new();
+        for root in self.type_node_property_owners(owner_type, file, source, imports, aliases) {
+            let Ok(root_source) = root.source().read_to_string() else {
+                continue;
+            };
+            let Some(tree) = parse_js_ts_tree(root.source(), &root_source, Language::TypeScript)
+            else {
+                continue;
+            };
+            let root_imports = compute_jsts_import_binder(&root_source, &tree);
+            for node in nodes_for_code_unit(self.host, &root, tree.root_node()) {
+                let Some(argument) = type_member_component_argument(node, members, &root_source)
+                else {
+                    continue;
+                };
+                owners.extend(self.type_node_property_owners(
+                    argument,
+                    root.source(),
+                    &root_source,
+                    &root_imports,
+                    aliases,
+                ));
+            }
+        }
+        owners
     }
 
     fn jsx_component_candidates(&self, name: &str) -> Vec<CodeUnit> {
@@ -389,19 +672,21 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             return Vec::new();
         };
         let imports = compute_jsts_import_binder(&source, &tree);
+        let aliases = self.host.alias_resolver();
         let mut owners = nodes_for_code_unit(self.host, component, tree.root_node())
             .into_iter()
-            .filter_map(|node| jsx_component_props_type(node, component.identifier(), &source))
-            .flat_map(|type_node| {
-                ts_resolve_type_text_to_property_owners(
-                    self.host,
-                    self.support,
+            .filter_map(|node| {
+                enclosing_component_declaration(node, component.identifier(), &source)
+            })
+            .filter_map(|declaration| jsx_binding_props_source(declaration, &source))
+            .flat_map(|props| {
+                self.jsx_props_source_owners(
+                    props,
                     component.source(),
                     &source,
                     &imports,
-                    self.host.alias_resolver(),
-                    ts_type_annotation_text(type_node, &source).as_str(),
-                    0,
+                    aliases,
+                    MAX_JSX_COMPONENT_HOPS,
                 )
             })
             .collect::<Vec<_>>();
@@ -1248,30 +1533,410 @@ fn jsx_attribute_site(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     Some((attribute_name, element.child_by_field_name("name")?))
 }
 
-fn jsx_component_props_type<'tree>(
-    node: Node<'tree>,
-    component_name: &str,
+/// What a component binding proves about the props type its JSX attributes
+/// name.
+///
+/// Every variant is evidence read off the binding's own syntax: a type
+/// annotation, a dynamic import specifier, the name of a component type, or a
+/// destructuring chain into a typed value. A binding that carries none of them
+/// proves no owner, and its attributes stay unresolved (#2041).
+enum JsxPropsSource<'tree> {
+    /// The props type itself: a parameter's annotation, or the argument a
+    /// component generic applies.
+    Type(Node<'tree>),
+    /// A component type name, whose own declaration applies the component
+    /// generic (`let Devtools: DevtoolsComponentType`).
+    ComponentTypeName(String),
+    /// A dynamic `import(specifier)` inside a wrapper call
+    /// (`lazy(() => import("./panel"))`): the module's default export is the
+    /// component.
+    Module(String),
+    /// A component held in a property of a typed value (`const { Box } =
+    /// components`). `members` names the properties to follow, outermost
+    /// first.
+    TypeMember {
+        owner_type: Node<'tree>,
+        members: Vec<String>,
+    },
+}
+
+fn jsx_binding_props_source<'tree>(
+    binding: Node<'tree>,
     source: &str,
-) -> Option<Node<'tree>> {
-    let declaration = enclosing_component_declaration(node, component_name, source)?;
-    match declaration.kind() {
-        "function_declaration" | "function_expression" | "arrow_function" => {
-            function_first_parameter_type(declaration)
-        }
-        "variable_declarator" => declaration
-            .child_by_field_name("value")
-            .filter(|value| matches!(value.kind(), "function_expression" | "arrow_function"))
-            .and_then(function_first_parameter_type)
-            .or_else(|| {
-                declaration
-                    .child_by_field_name("type")
-                    .and_then(|node| function_component_wrapper_argument(node, source))
-            }),
+) -> Option<JsxPropsSource<'tree>> {
+    match binding.kind() {
+        "function_declaration"
+        | "generator_function_declaration"
+        | "function_expression"
+        | "arrow_function" => function_first_parameter_type(binding).map(JsxPropsSource::Type),
         "class_declaration" | "abstract_class_declaration" => {
-            class_component_props_argument(declaration, source)
+            class_component_props_argument(binding, source).map(JsxPropsSource::Type)
+        }
+        "variable_declarator" => variable_binding_props_source(binding, source),
+        "required_parameter" | "optional_parameter" => binding
+            .child_by_field_name("type")
+            .and_then(|annotation| component_type_props_source(annotation, source)),
+        "shorthand_property_identifier_pattern" | "pair_pattern" => {
+            destructured_binding_props_source(binding, source)
         }
         _ => None,
     }
+}
+
+fn variable_binding_props_source<'tree>(
+    declarator: Node<'tree>,
+    source: &str,
+) -> Option<JsxPropsSource<'tree>> {
+    let value = declarator.child_by_field_name("value");
+    // `const Chip = ({ label }: ChipProps) => ...`: the value is the component.
+    if let Some(props) = value
+        .filter(|value| matches!(value.kind(), "function_expression" | "arrow_function"))
+        .and_then(function_first_parameter_type)
+    {
+        return Some(JsxPropsSource::Type(props));
+    }
+    // `const Box: React.FC<IBox>`, `const Row: Component<RowProps>`.
+    if let Some(props) = declarator
+        .child_by_field_name("type")
+        .and_then(|annotation| component_type_props_source(annotation, source))
+    {
+        return Some(props);
+    }
+    value
+        .and_then(|value| wrapped_dynamic_import_specifier(value, source))
+        .map(JsxPropsSource::Module)
+}
+
+/// The props evidence a *component-typed* annotation carries: either the
+/// generic argument a component type applies, or the name of a type that
+/// applies one itself.
+fn component_type_props_source<'tree>(
+    annotation: Node<'tree>,
+    source: &str,
+) -> Option<JsxPropsSource<'tree>> {
+    if let Some(argument) = function_component_wrapper_argument(annotation, source) {
+        return Some(JsxPropsSource::Type(argument));
+    }
+    let named = annotation
+        .child_by_field_name("type")
+        .or_else(|| annotation.named_child(0))
+        .filter(|node| node.kind() == "type_identifier")?;
+    Some(JsxPropsSource::ComponentTypeName(
+        slice(named, source).to_string(),
+    ))
+}
+
+/// The module a wrapper call defers to, as in `lazy(() => import("./panel"))`.
+///
+/// The wrapper itself is opaque -- `lazy`, `dynamic` and their re-exports are
+/// all library functions this analyzer does not model -- but the dynamic
+/// `import` inside its arguments names the module structurally.
+fn wrapped_dynamic_import_specifier(value: Node<'_>, source: &str) -> Option<String> {
+    if value.kind() != "call_expression" {
+        return None;
+    }
+    let mut stack = vec![value.child_by_field_name("arguments")?];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "call_expression"
+            && node
+                .child_by_field_name("function")
+                .is_some_and(|function| function.kind() == "import")
+        {
+            return node
+                .child_by_field_name("arguments")
+                .and_then(|arguments| arguments.named_child(0))
+                .filter(|argument| argument.kind() == "string")
+                .and_then(|argument| argument.named_child(0))
+                .map(|fragment| slice(fragment, source).to_string());
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    None
+}
+
+/// How deep a destructuring chain may be followed before the binding counts as
+/// unproven.
+const MAX_JSX_DESTRUCTURING_DEPTH: usize = 4;
+
+/// The typed value a destructured component binding reads, and the property
+/// chain that reaches the component inside it.
+fn destructured_binding_props_source<'tree>(
+    binding: Node<'tree>,
+    source: &str,
+) -> Option<JsxPropsSource<'tree>> {
+    let mut members = Vec::new();
+    let mut current = binding;
+    for _ in 0..MAX_JSX_DESTRUCTURING_DEPTH {
+        members.push(destructured_member_name(current, source)?);
+        let pattern = current
+            .parent()
+            .filter(|parent| parent.kind() == "object_pattern")?;
+        let owner = pattern.parent()?;
+        match owner.kind() {
+            // A nested pattern: the enclosing entry names the next property.
+            "pair_pattern" => current = owner,
+            "required_parameter" | "optional_parameter" => {
+                let annotation = owner.child_by_field_name("type")?;
+                members.reverse();
+                return Some(JsxPropsSource::TypeMember {
+                    owner_type: annotation,
+                    members,
+                });
+            }
+            "variable_declarator" => {
+                if let Some(annotation) = owner.child_by_field_name("type") {
+                    members.reverse();
+                    return Some(JsxPropsSource::TypeMember {
+                        owner_type: annotation,
+                        members,
+                    });
+                }
+                // `const { Box } = components`: continue at whatever binds
+                // `components`, which carries the type this reads through.
+                let value = owner.child_by_field_name("value")?;
+                let name = simple_identifier_text(value, source)?;
+                let bindings = visible_component_bindings(owner, name, source);
+                let [next] = bindings.as_slice() else {
+                    return None;
+                };
+                match next.kind() {
+                    "shorthand_property_identifier_pattern" | "pair_pattern" => current = *next,
+                    "variable_declarator" | "required_parameter" | "optional_parameter" => {
+                        let annotation = next.child_by_field_name("type")?;
+                        members.reverse();
+                        return Some(JsxPropsSource::TypeMember {
+                            owner_type: annotation,
+                            members,
+                        });
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn destructured_member_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "shorthand_property_identifier_pattern" => Some(slice(node, source).to_string()),
+        "pair_pattern" => node
+            .child_by_field_name("key")
+            .map(|key| slice(key, source).to_string()),
+        _ => None,
+    }
+}
+
+/// The component generic a member chain reaches inside `declaration`.
+///
+/// The chain is followed through the declaration's own property signatures and
+/// the inline object types nested in them; a member typed by a name declared
+/// elsewhere ends the walk.
+fn type_member_component_argument<'tree>(
+    declaration: Node<'tree>,
+    members: &[String],
+    source: &str,
+) -> Option<Node<'tree>> {
+    let mut container = type_member_container(declaration)?;
+    let mut remaining = members;
+    while let Some((member, rest)) = remaining.split_first() {
+        let annotation = property_signature_type(container, member, source)?;
+        if rest.is_empty() {
+            return function_component_wrapper_argument(annotation, source);
+        }
+        container = annotation
+            .named_child(0)
+            .filter(|node| node.kind() == "object_type")?;
+        remaining = rest;
+    }
+    None
+}
+
+fn type_member_container<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
+    match node.kind() {
+        "interface_declaration" => node.child_by_field_name("body"),
+        "type_alias_declaration" => node
+            .child_by_field_name("value")
+            .filter(|value| value.kind() == "object_type"),
+        "object_type" | "interface_body" => Some(node),
+        _ => None,
+    }
+}
+
+fn property_signature_type<'tree>(
+    container: Node<'tree>,
+    member: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let mut cursor = container.walk();
+    container
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "property_signature")
+        .find(|child| {
+            child
+                .child_by_field_name("name")
+                .is_some_and(|name| node_text_matches(name, source, member))
+        })
+        .and_then(|property| property.child_by_field_name("type"))
+}
+
+/// The binding a module's `export default` renders.
+///
+/// `export default function Panel(props: P)` declares the component inline;
+/// `export default Panel` names one the module binds elsewhere.
+fn default_export_component_binding<'tree>(root: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let mut cursor = root.walk();
+    let export = root
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "export_statement")
+        .find(|child| {
+            (0..child.child_count())
+                .filter_map(|index| child.child(index))
+                .any(|child| child.kind() == "default")
+        })?;
+    if let Some(declaration) = export.child_by_field_name("declaration") {
+        return Some(declaration);
+    }
+    let value = export.child_by_field_name("value")?;
+    if matches!(value.kind(), "function_expression" | "arrow_function") {
+        return Some(value);
+    }
+    let name = simple_identifier_text(value, source)?;
+    let bindings = visible_component_bindings(export, name, source);
+    let [binding] = bindings.as_slice() else {
+        return None;
+    };
+    Some(*binding)
+}
+
+/// The scope a site resolves names in, which is the program when nothing
+/// narrower encloses it.
+fn enclosing_scope_id(site: Node<'_>) -> usize {
+    let mut current = site;
+    loop {
+        if is_scope_boundary(current.kind()) {
+            return current.id();
+        }
+        let Some(parent) = current.parent() else {
+            return current.id();
+        };
+        current = parent;
+    }
+}
+
+/// Every binding of `name` the site can see, from the nearest scope that binds
+/// it at all.
+///
+/// Declaration order does not matter: a component declared below the JSX that
+/// renders it is the same binding, so the scan reads the whole scope instead of
+/// only the text before the site.
+fn visible_component_bindings<'tree>(
+    site: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Vec<Node<'tree>> {
+    let mut scope = Some(site);
+    while let Some(current) = scope {
+        if is_scope_boundary(current.kind()) {
+            let bindings = component_bindings_in_scope(current, name, source);
+            if !bindings.is_empty() {
+                return bindings;
+            }
+        }
+        scope = current.parent();
+    }
+    Vec::new()
+}
+
+fn component_bindings_in_scope<'tree>(
+    scope: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Vec<Node<'tree>> {
+    let mut bindings = Vec::new();
+    let mut stack = vec![scope];
+    while let Some(node) = stack.pop() {
+        if node.id() != scope.id() && is_scope_boundary(node.kind()) {
+            continue;
+        }
+        if let Some(binding) = binding_node_for_name(node, name, source) {
+            bindings.push(binding);
+            continue;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    bindings
+}
+
+/// The node that binds `name` at `node`, which is the declaration itself for a
+/// plain binder and the pattern entry for a destructured one.
+fn binding_node_for_name<'tree>(
+    node: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    match node.kind() {
+        "function_declaration"
+        | "generator_function_declaration"
+        | "class_declaration"
+        | "abstract_class_declaration" => node
+            .child_by_field_name("name")
+            .filter(|declared| node_text_matches(*declared, source, name))
+            .map(|_| node),
+        "variable_declarator" | "required_parameter" | "optional_parameter" => {
+            let pattern = node
+                .child_by_field_name("name")
+                .or_else(|| node.child_by_field_name("pattern"))?;
+            match pattern.kind() {
+                "identifier" | "type_identifier" => {
+                    node_text_matches(pattern, source, name).then_some(node)
+                }
+                "object_pattern" | "array_pattern" => {
+                    destructured_pattern_entry(pattern, name, source)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn destructured_pattern_entry<'tree>(
+    pattern: Node<'tree>,
+    name: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let mut stack = vec![pattern];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "shorthand_property_identifier_pattern" if node_text_matches(node, source, name) => {
+                return Some(node);
+            }
+            "pair_pattern"
+                if node
+                    .child_by_field_name("value")
+                    .is_some_and(|value| node_text_matches(value, source, name)) =>
+            {
+                return Some(node);
+            }
+            _ => {}
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    None
 }
 
 fn enclosing_component_declaration<'tree>(
@@ -1335,7 +2000,18 @@ fn function_component_wrapper_argument<'tree>(
             else {
                 continue;
             };
-            if matches!(terminal, "FC" | "FunctionComponent" | "ComponentType") {
+            // React spells the props type as the argument of `FC`,
+            // `FunctionComponent` or `ComponentType`; Solid spells the same
+            // contract as `Component` and its arity variants.
+            if matches!(
+                terminal,
+                "FC" | "FunctionComponent"
+                    | "ComponentType"
+                    | "Component"
+                    | "ParentComponent"
+                    | "VoidComponent"
+                    | "FlowComponent"
+            ) {
                 return node
                     .child_by_field_name("type_arguments")
                     .and_then(|arguments| arguments.named_child(0));

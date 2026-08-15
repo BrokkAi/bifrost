@@ -6,6 +6,7 @@ use crate::declarations::cpp_displaced_preprocessor_terminator;
 use crate::declarations::{
     cpp_displaced_preprocessor_boundary, cpp_export_macro_token, cpp_field_declaration_linkage,
     cpp_template_term, node_text, normalize_cpp_whitespace, recovered_exported_class_has_body,
+    recovered_fragmented_plain_class_has_body,
 };
 use crate::graph::CppGraphSource;
 use crate::graph::extractor::ScanCtx;
@@ -4624,6 +4625,34 @@ impl<'a> VisibilityIndex<'a> {
             {
                 continue;
             }
+            if let Some(existing) = canonical.iter_mut().find(|existing| {
+                self.compatible_primary_template_redeclarations(existing, &resolved)
+            }) {
+                // A forward declaration and its full primary-template
+                // definition are one C++ type even when they live in
+                // different headers and alpha-rename their parameters. The
+                // target-preserving path already reconciles this family; do
+                // the same for ordinary canonical lookup so an out-of-line
+                // member's lexical owner is not made ambiguous by its own
+                // forward declaration. Retain the strongest physical
+                // declaration for later owner/range queries.
+                if matches!(
+                    (
+                        cpp_class_declaration_strength(analyzer, existing),
+                        cpp_class_declaration_strength(analyzer, &resolved),
+                    ),
+                    (
+                        CppClassDeclarationStrength::Forward | CppClassDeclarationStrength::Unknown,
+                        CppClassDeclarationStrength::Full,
+                    ) | (
+                        CppClassDeclarationStrength::Unknown,
+                        CppClassDeclarationStrength::Forward,
+                    )
+                ) {
+                    *existing = resolved;
+                }
+                continue;
+            }
             canonical.push(resolved);
             if canonical.len() > 1 {
                 return Err(TypeCandidateFailure::Ambiguous);
@@ -6400,16 +6429,22 @@ fn resolve_field_method_call_return_binding(
     }
     let receiver_resolver = receiver_resolver?;
     let field = function.child_by_field_name("field")?;
-    let member_name = node_text(field, source);
+    let member_name = node_text(function_terminal_node(field), source);
     let receiver = function
         .child_by_field_name("argument")
         .or_else(|| function.named_child(0))?;
     let owners = receiver_resolver(receiver, source);
     let mut candidates = Vec::new();
     for owner in owners {
+        let declaring_owner =
+            match resolve_declaring_member_owner(analyzer, visibility, file, &owner, member_name) {
+                EnclosingMemberOwnerResolution::Owner(owner) => owner,
+                EnclosingMemberOwnerResolution::Missing => continue,
+                EnclosingMemberOwnerResolution::Ambiguous => return None,
+            };
         candidates.extend(
             visibility
-                .visible_members_for_owner_name(file, &owner, member_name)
+                .visible_members_for_owner_name(file, &declaring_owner, member_name)
                 .into_iter()
                 .filter(|unit| {
                     unit.is_function() && cpp_callable_arity(analyzer, unit).accepts(arity)
@@ -8257,7 +8292,10 @@ fn unique_type_candidate_preserving_alias(
         return candidates
             .iter()
             .all(|candidate| {
-                declared_type_alias(analyzer, candidate) && same_logical_symbol(first, candidate)
+                declared_type_alias(analyzer, candidate)
+                    && candidate.kind() == first.kind()
+                    && candidate.fq_name() == first.fq_name()
+                    && candidate.source() == first.source()
             })
             .then(|| first.clone());
     }
@@ -9016,10 +9054,11 @@ pub enum RecoveredDeclaratorTypeContext {
 ///
 /// Tree-sitter parses `API Result *make(Arg);` as if `API` were the declared
 /// type and `Result` were the scope of a qualified declarator with a missing
-/// `::`. The same recovery occurs for macro-prefixed definitions, extern
-/// variables, and macro-decorated parameters (`f(MACRO T* p)`, where the
-/// parameter's own `type` field takes the macro). Keep this intentionally
-/// structural: the recovered scope must
+/// `::`. A template return such as `API Result<T> make()` uses a
+/// `template_type` for the same recovered scope. The same recovery occurs for
+/// macro-prefixed definitions, extern variables, and macro-decorated
+/// parameters (`f(MACRO T* p)`, where the parameter's own `type` field takes
+/// the macro). Keep this intentionally structural: the recovered scope must
 /// have the grammar's missing separator, the qualified node must occupy the
 /// declaration's declarator chain, a separate nonempty type must occupy the
 /// normal type field, and the recovered name must unwrap to a real declarator
@@ -9037,7 +9076,7 @@ pub fn recovered_macro_decorated_declarator_type(
 pub fn recovered_macro_decorated_type_node(
     node: Node<'_>,
 ) -> Option<(Node<'_>, RecoveredDeclaratorTypeContext)> {
-    if node.kind() != "namespace_identifier" || node.is_missing() {
+    if !matches!(node.kind(), "namespace_identifier" | "template_type") || node.is_missing() {
         return None;
     }
     let qualified = node.parent()?;
@@ -9126,7 +9165,9 @@ fn concrete_recovered_declarator_name(mut node: Node<'_>) -> bool {
             return false;
         }
         match node.kind() {
-            "identifier" | "field_identifier" | "type_identifier" => return true,
+            "identifier" | "field_identifier" | "type_identifier" | "operator_name" => {
+                return true;
+            }
             "array_declarator"
             | "function_declarator"
             | "parenthesized_declarator"
@@ -10536,6 +10577,7 @@ pub fn function_terminal_node(mut node: Node<'_>) -> Node<'_> {
         let next = match node.kind() {
             "qualified_identifier"
             | "scoped_identifier"
+            | "template_method"
             | "template_function"
             | "template_type" => node.child_by_field_name("name"),
             "field_expression" => node.child_by_field_name("field"),
@@ -11477,7 +11519,17 @@ fn cpp_class_declaration_strength_in_tree(
     for range in ranges {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            if node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
+            if node.start_byte() == range.start_byte
+                && recovered_fragmented_plain_class_has_body(
+                    node,
+                    source,
+                    candidate.identifier(),
+                    &range,
+                )
+            {
+                return CppClassDeclarationStrength::Full;
+            }
+            if node.start_byte() > range.start_byte || node.end_byte() < range.start_byte {
                 continue;
             }
             if node.start_byte() == range.start_byte && node.end_byte() == range.end_byte {

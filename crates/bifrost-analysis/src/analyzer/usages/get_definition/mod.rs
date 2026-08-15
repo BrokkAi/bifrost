@@ -137,6 +137,7 @@ pub(crate) use call_sites::{
     CallSiteSyntax, CallSyntaxKind, ExactCallReference, ExactCallReferenceGap,
     call_reference_ranges_in_tree, call_reference_requires_point_lookup,
     call_site_syntax_for_reference, exact_call_reference_for_call, is_call_reference_range_in_tree,
+    range_is_call_keyword_label,
 };
 pub(crate) use cpp::{cpp_type_lookup_resolution_in_session, resolve_cpp_bounded};
 pub(crate) use csharp::{
@@ -154,6 +155,7 @@ pub(crate) use kotlin::{
 pub(crate) use php::{
     PhpDefinitionProvider, php_type_lookup_resolution_bounded, resolve_php_bounded,
 };
+pub use python::python_visible_same_file_candidates;
 pub(crate) use python::{
     PythonDefinitionProvider, python_type_lookup_resolution_bounded, resolve_python_bounded,
 };

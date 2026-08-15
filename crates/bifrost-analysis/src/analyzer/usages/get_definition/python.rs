@@ -1886,7 +1886,16 @@ fn python_conditional_paths_are_compatible(
     })
 }
 
-fn python_visible_same_file_candidates(
+/// Which same-file declarations a bare Python name written at `node` can bind
+/// to: a binding of the class body the name is written in, otherwise a
+/// module-level declaration. A method or an attribute of some other class is
+/// absent, because Python has no implicit receiver -- `list(values)` inside a
+/// class that declares `def list(self, ...)` is the builtin, never `self.list`.
+///
+/// The forward resolver answers same-file lookups with this, and the reference
+/// census grades against the same notion of scope (#2054): a same-file
+/// declaration this rejects is not evidence that forward lookup missed a target.
+pub fn python_visible_same_file_candidates(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     node: Node<'_>,

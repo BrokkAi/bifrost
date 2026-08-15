@@ -155,6 +155,33 @@ pub(crate) fn call_reference_requires_point_lookup(
     reference_candidate_requires_point_lookup(tree.root_node(), language, range)
 }
 
+/// Whether an exact reference range is a call's keyword-argument label.
+///
+/// A named argument's label names a parameter of the callee, so an analyzer
+/// that resolves the label reports a reference to the callable. The label is
+/// still not a call site: the call's own name span is elsewhere. Call-relation
+/// projection reads that distinction from the structural facts instead of
+/// treating the label as a call whose syntax could not be read.
+pub(crate) fn range_is_call_keyword_label(
+    facts: &FileFacts,
+    start_byte: usize,
+    end_byte: usize,
+) -> bool {
+    facts
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.kind == NormalizedKind::Call)
+        .any(|(call_id, _)| {
+            facts.roles(call_id as u32).iter().any(|target| {
+                target.role == Role::Kwarg
+                    && target.keyword.is_some_and(|keyword| {
+                        keyword.start_byte <= start_byte && end_byte <= keyword.end_byte
+                    })
+            })
+        })
+}
+
 pub(crate) fn call_site_syntax_for_reference(
     facts: &FileFacts,
     start_byte: usize,

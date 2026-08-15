@@ -28,6 +28,14 @@ use std::borrow::Cow;
 use std::sync::OnceLock;
 use tree_sitter::Language as TsLanguage;
 
+// v11 is the last salt this struct will ever cost. Signature metadata now
+// lives in the typed columns that migration 0023 created, so a new signature
+// fact is an `ALTER TABLE ... ADD COLUMN ... DEFAULT ...` in a new migration
+// and never a field on a serialized struct. Add the column; do not bump this
+// salt. A migration re-keys the store file by schema version and invalidates
+// nothing, while a salt bump throws away every analyzer row for every language
+// in every cache on every machine.
+//
 // v11: merge of two v10 bumps made independently on both sides of a branch.
 // One added `SignatureMetadata::field_has_initializer`; the other added the
 // declaration-backed structured underlying type identity for Go named
@@ -221,11 +229,23 @@ macro_rules! lang_epoch {
 // Salt bumped again (#1905): Java class-like signature metadata now records
 // explicit and implicit static nested declarations. Warm rows without this
 // fact would admit illegal outer-instance member resolution.
+// Salt bumped again (#2045): the Java declaration walk now emits two kinds of
+// owner it used to drop. A class declared local to a method body and an
+// anonymous `new Base() { ... }` body each become a class scope with their own
+// members, and an enum's `enum_body_declarations` members are no longer
+// skipped. A warm workspace holds rows without any of those declarations, and
+// a forward field lookup against them reports `no_indexed_definition` for a
+// field the source plainly declares.
+// Salt bumped again (#2161): two persisted Java facts change. A scope written
+// in an anonymous body's field initializer no longer repeats that body's own
+// `$anon$line:column` marker, so every name under a nested anonymous owner
+// changes, and a type argument is no longer recorded as a raw supertype, so a
+// warm workspace holds hierarchy edges from a class to its own element type.
 lang_epoch!(
     Java,
     "java",
     "treesitter/java/",
-    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07;callable-arity-metadata-2026-07;annotated-spread-parameter-metadata-2026-07;compact-record-constructors-2026-07;fq-interned-segments-2026-07;field-modifier-metadata-2026-08;static-import-path-kind-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;class-like-static-metadata-2026-08;native-callable-modifier-metadata-2026-08"
+    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07;callable-arity-metadata-2026-07;annotated-spread-parameter-metadata-2026-07;compact-record-constructors-2026-07;fq-interned-segments-2026-07;field-modifier-metadata-2026-08;static-import-path-kind-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;class-like-static-metadata-2026-08;native-callable-modifier-metadata-2026-08;local-anonymous-and-enum-body-owners-2026-08;nested-anonymous-owner-identity-2026-08"
 );
 // Salt bumped: Go `package_name` is now the canonical import path, changing
 // every persisted Go `fq_name`. Forces stale rows to be re-analyzed.
@@ -300,12 +320,51 @@ lang_epoch!(
 // value parameter per [dcl.fct]/5. Both change persisted signatures, and rows
 // written under the old rules would keep a declaration and its out-of-line
 // definition apart.
+// Salt bumped again (#2177): a plain class fragmented by an unknown attribute
+// macro now reparses through its displaced close and persists the real members
+// after that inline body. This removes a phantom call-shaped member signature
+// and restores the typed, cv-qualified identity of the following declaration.
+// Salt bumped again (#914): that plain-class fragment can make tree-sitter use
+// the class close as a namespace close and eject later namespace declarations.
+// The structured displaced boundary now restores the missing class members and
+// namespace ownership, changing persisted identities and navigation ranges.
+// Salt bumped again (#1961): templated plain-class fragments now retain their
+// parser-visible prefix declarations and re-own lifted member siblings through
+// the displaced namespace boundary. This restores class-owned alias identities.
+// Salt bumped again (#2197): when a declaration macro displaces a scalar return
+// type into the function declarator, the structured recovery now persists the
+// real callable name and return type instead of a callable named for the return
+// type. This adds the missing overload identity and changes signature metadata.
 lang_epoch!(
     Cpp,
     "cpp",
     "treesitter/cpp/",
-    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;conditional-alias-physical-ranges-2026-08;macro-argument-typedef-declarator-2026-08;enum-enumerator-child-ownership-2026-08;sentinel-error-envelope-sibling-recovery-2026-08;cpp-query-assets-in-brokk-bifrost-cpp-2026-08;structural-declarator-qualifier-suffix-and-top-level-parameter-cv-2026-08"
+    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;conditional-alias-physical-ranges-2026-08;macro-argument-typedef-declarator-2026-08;enum-enumerator-child-ownership-2026-08;sentinel-error-envelope-sibling-recovery-2026-08;cpp-query-assets-in-brokk-bifrost-cpp-2026-08;structural-declarator-qualifier-suffix-and-top-level-parameter-cv-2026-08;macro-fragmented-plain-class-member-signatures-2026-08;namespaced-plain-fragment-boundary-2026-08;templated-plain-fragment-prefix-and-sibling-ownership-2026-08;macro-displaced-scalar-return-callable-name-2026-08"
 );
+
+#[cfg(test)]
+pub(super) fn cpp_epoch_before_macro_displaced_callable_name() -> String {
+    cpp_epoch_before_salt_marker("macro-displaced-scalar-return-callable-name-2026-08")
+}
+
+#[cfg(test)]
+pub(super) fn cpp_epoch_before_templated_plain_fragment_ownership() -> String {
+    cpp_epoch_before_salt_marker("templated-plain-fragment-prefix-and-sibling-ownership-2026-08")
+}
+
+#[cfg(test)]
+pub(super) fn cpp_epoch_before_namespaced_plain_fragment_boundary() -> String {
+    cpp_epoch_before_salt_marker("namespaced-plain-fragment-boundary-2026-08")
+}
+
+#[cfg(test)]
+fn cpp_epoch_before_salt_marker(marker: &str) -> String {
+    let marker = format!(";{marker}");
+    let (prior, _) = Cpp::SALT
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("the current C++ salt carries the {marker} bump"));
+    compute_epoch::<Cpp>(&tree_sitter_cpp::LANGUAGE.into(), prior)
+}
 
 #[cfg(test)]
 pub(super) fn cpp_epoch_before_sentinel_class_before_member_callable() -> String {
@@ -551,11 +610,19 @@ pub(super) fn php_epoch_before_conditional_free_function_declarations() -> Strin
 // the salted content now comes from a different crate's `include_str!`. The
 // bytes are unchanged, which is exactly why the salt has to carry the
 // relocation.
+// Salt bumped again (#2082): a `package object p` body is now a package scope,
+// so the package prefixes in scope at a byte include `<clause>.p`. Two
+// persisted facts follow that value: an import declared inside a package
+// object records those prefixes in `import_lexical_prefixes`, and an anonymous
+// instance declared there records them in its supertype lookup path. A warm
+// workspace holds both without the package object's own package, so a
+// relative import and a supertype written inside a package object resolve
+// against the wrong scope.
 lang_epoch!(
     Scala,
     "scala",
     "treesitter/scala/",
-    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;tree-sitter-scala-0.26.2-2026-08;scala-anonymous-template-code-units-2026-08"
+    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;tree-sitter-scala-0.26.2-2026-08;scala-anonymous-template-code-units-2026-08;package-object-package-scope-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the C# `.scm` query assets moved from this
 // crate's `resources/treesitter/c_sharp/` into `brokk-bifrost-csharp`, so the
@@ -569,11 +636,22 @@ lang_epoch!(
 // before this change say "nobody read the modifiers", and a consumer that
 // distinguishes a static callable from an instance one would read every warm
 // C# callable as undecided.
+// Salt bumped again (#2061): `csharp_type_reference_root` no longer reads the
+// `pointer_type` half of a multiplication the grammar mis-parsed as an
+// out-argument declaration expression. Rows persisted before this change hold a
+// type reference for the left operand of every `Math.Abs(Width * Height)`, and
+// nothing at query time can tell that bogus reference from a real one.
+// Salt bumped again (#2064): the verbatim-identifier `@` escape is now
+// normalized off declaration names and off every type-name segment, so a
+// `class @Wrapper` is indexed as `Wrapper` and its references match it. Rows
+// persisted before this change hold `@`-prefixed short names, fq segments, and
+// type identifiers, which no query-time normalization can reconcile with the
+// canonical spellings written afterwards.
 lang_epoch!(
     CSharp,
     "csharp",
     "treesitter/c_sharp/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08;interop-optional-callable-arity-2026-08;callable-modifier-metadata-2026-08;preprocessor-directive-aware-parsing-2026-08"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08;interop-optional-callable-arity-2026-08;callable-modifier-metadata-2026-08;preprocessor-directive-aware-parsing-2026-08;multiplication-not-pointer-type-reference-2026-08;verbatim-identifier-canonical-declaration-names-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the Ruby `.scm` query assets moved from
 // this crate's `resources/treesitter/ruby/` into `brokk-bifrost-ruby`, so the

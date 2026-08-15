@@ -419,7 +419,7 @@ pub fn java_lexical_type_from_node(
     java_lexical_type_from_declaration(java, &declaration, &components)
 }
 
-fn java_lexical_type_from_declaration(
+pub fn java_lexical_type_from_declaration(
     java: &dyn JavaSource,
     declaration: &CodeUnit,
     components: &[String],

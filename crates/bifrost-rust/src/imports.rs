@@ -871,6 +871,25 @@ pub fn rust_target_kind_root_package(file: &ProjectFile) -> Option<String> {
     crate::crate_naming::rust_target_kind_root(file).map(|root| root.join("."))
 }
 
+/// Re-spell a package resolved under a Cargo target's private `crate::` root
+/// under the kind root shared by its sibling targets.
+///
+/// `package` is an analyzer package produced by the structured Rust module
+/// resolver, not source text. A direct target such as `tests/left.rs` resolves
+/// `crate::common` first as `C.tests.left.common`; this returns
+/// `C.tests.common`, where Cargo's physically shared `tests/common/mod.rs`
+/// lives. Callers still decide whether that alternative has an indexed,
+/// reachable backing file and must keep the private-root answer first.
+pub fn rust_target_kind_root_alternative(file: &ProjectFile, package: &str) -> Option<String> {
+    let kind_root = rust_target_kind_root_package(file)?;
+    let own_root = rust_crate_root_package(file);
+    let suffix = package.strip_prefix(&own_root)?;
+    if !suffix.is_empty() && !suffix.starts_with('.') {
+        return None;
+    }
+    Some(format!("{kind_root}{suffix}"))
+}
+
 /// Package that `crate::` resolves to from `file`: crate-anchored when a
 /// `Cargo.toml` governs the file, otherwise the legacy path-derived root.
 pub fn rust_crate_root_package(file: &ProjectFile) -> String {

@@ -366,6 +366,10 @@ test("generated release metadata is exported without writing public source", () 
     /--plugin-release plugins\/bifrost-agent\/bifrost-release\.json/u,
   );
   assert.match(metadataExport, /scripts\/export-release-metadata\.mjs/u);
+  assert.match(
+    metadataExport,
+    /name: Remove downloaded release artifacts before source-diff validation[\s\S]*?run: rm -rf -- dist/u,
+  );
   assert.match(metadataExport, /--public-commit "\$PUBLIC_RELEASE_COMMIT"/u);
   assert.match(
     metadataExport,

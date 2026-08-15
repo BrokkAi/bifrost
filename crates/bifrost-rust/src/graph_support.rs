@@ -8,7 +8,7 @@ use brokk_bifrost_core::analyzer::structural::rewrite_path::{
 };
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::usages::model::{
-    ExportEntry, ExportIndex, ImportBinder, ImportKind, ReexportStar,
+    ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, ReexportStar,
 };
 use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::analyzer::{CodeUnitIndex, default_parent_fq_name};
@@ -22,10 +22,11 @@ use tree_sitter::Node;
 
 use crate::cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
 use crate::crate_naming;
-use crate::declarations::rust_package_name;
+use crate::declarations::{rust_node_text, rust_package_name};
 use crate::imports::{
     RustVisibility, resolve_rust_module_path_with_crate, rust_crate_root_package,
     rust_imports_with_visibility_from_use_declaration, rust_item_visibility,
+    rust_target_kind_root_alternative,
 };
 use crate::lexical_scope::{parse_rust_tree, visible_import_binder_at};
 use crate::usage::exported_targets_from_files;
@@ -328,7 +329,20 @@ impl<'a> RustReferenceContext<'a> {
         if let Some((module_path, item_name)) = path.rsplit_once("::")
             && let Some(package) = self.resolve_scoped_owner(module_path)
         {
-            return Some(join_rust_fqn(&package, item_name));
+            let resolved = join_rust_fqn(&package, item_name);
+            // Direct Cargo test/bench/example targets own a private `crate::`
+            // root, while `mod common;` can be physically shared at the target
+            // kind root. Apply that fallback only to a rooted module prefix
+            // with no private backing. Item paths continue through the normal
+            // recursive owner/reexport tiers instead of being mistaken for a
+            // complete module package.
+            if is_rooted_rust_module_path(path)
+                && let Some(shared) =
+                    resolve_target_kind_root_module(self.rust, &self.file, &resolved)
+            {
+                return Some(shared);
+            }
+            return Some(resolved);
         }
         if let Some(package) = self.namespace_binding(path) {
             return Some(package);
@@ -1323,12 +1337,12 @@ pub fn rust_member_reexport_targets(
         .collect()
 }
 
-/// Rewrite a leading `use <crate> as <alias>` module-alias segment in
-/// `module_specifier` to the aliased crate/module. `use forc_pkg::{self as
-/// pkg}` makes `pkg` (and `pkg::Item`) mean `forc_pkg` (`forc_pkg::Item`),
-/// so every module resolver must first substitute the alias before routing —
-/// otherwise the alias root is unknown and draws a false "not indexed"
-/// boundary even though the crate is in the workspace (issue #1089).
+/// Rewrite a leading aliased `use` segment in `module_specifier` to the
+/// imported path. `use forc_pkg::{self as pkg}` makes `pkg` (and `pkg::Item`)
+/// mean `forc_pkg` (`forc_pkg::Item`), while `use a::b as c` makes `c` mean
+/// `a::b`. Every module resolver must first substitute the alias before
+/// routing; otherwise the alias root is unknown and draws a false "not
+/// indexed" boundary even though the path is in the workspace (issue #1089).
 pub fn rust_apply_import_alias(
     rust: &dyn RustSource,
     importing_file: &ProjectFile,
@@ -1342,20 +1356,33 @@ pub fn rust_apply_import_alias(
     }
     let binder = rust.import_binder_of(importing_file);
     let binding = binder.bindings.get(root)?;
-    if binding.kind != ImportKind::Namespace || binding.imported_name.is_some() {
-        return None;
-    }
+    rewrite_import_alias_binding(root, rest, binding)
+}
+
+fn rewrite_import_alias_binding(
+    root: &str,
+    rest: Option<&str>,
+    binding: &ImportBinding,
+) -> Option<String> {
+    let imported_name = match binding.kind {
+        ImportKind::Namespace if binding.imported_name.is_none() => None,
+        ImportKind::Named => Some(binding.imported_name.as_deref()?),
+        _ => return None,
+    };
     let target = binding.module_specifier.as_str();
     // Only a genuine rename (`use path as alias`) where the alias spelling
     // differs from the imported module's own last segment; an ordinary
-    // `use a::b` namespace binding names its own last segment and must not
-    // be rewritten (that would loop or mis-route).
-    if target.is_empty() || target == root || target.rsplit("::").next() == Some(root) {
+    // `use a::b` binding names its own last segment and must not be rewritten
+    // (that would loop or mis-route).
+    let target_last_segment = imported_name.or_else(|| target.rsplit("::").next());
+    if target.is_empty() || target == root || target_last_segment == Some(root) {
         return None;
     }
-    Some(match rest {
-        Some(rest) => format!("{target}::{rest}"),
-        None => target.to_string(),
+    Some(match (imported_name, rest) {
+        (Some(imported_name), Some(rest)) => format!("{target}::{imported_name}::{rest}"),
+        (Some(imported_name), None) => format!("{target}::{imported_name}"),
+        (None, Some(rest)) => format!("{target}::{rest}"),
+        (None, None) => target.to_string(),
     })
 }
 
@@ -1432,6 +1459,42 @@ pub fn resolve_module_files(
         return if shared.is_empty() { unknown } else { shared };
     }
     files
+}
+
+/// Re-spell one rooted module prefix under a Cargo target's shared kind root.
+/// The private target spelling wins whenever it has a physical file or an
+/// inline declaration in the importing file. The shared spelling must be
+/// backed by a file Cargo classifies as shared; unknown and disjoint roots are
+/// never admitted here.
+fn resolve_target_kind_root_module(
+    rust: &dyn RustSource,
+    importing_file: &ProjectFile,
+    resolved: &str,
+) -> Option<String> {
+    let files = rust.package_file_index();
+    let routes = rust.cargo_routes();
+    if files.files_in_package(resolved).next().is_some()
+        || rust.definitions(resolved).any(|unit| {
+            unit.is_module()
+                && !is_external_module_declaration(rust, &unit)
+                && unit.source() == importing_file
+        })
+    {
+        return None;
+    }
+    let declares_external_module = rust.definitions(resolved).any(|unit| {
+        unit.is_module()
+            && is_external_module_declaration(rust, &unit)
+            && unit.source() == importing_file
+    });
+    if !declares_external_module {
+        return None;
+    }
+    let alternative = rust_target_kind_root_alternative(importing_file, resolved)?;
+    let has_shared_file = files.files_in_package(&alternative).any(|candidate| {
+        routes.target_relation(importing_file, candidate) == RustCargoTargetRelation::Shared
+    });
+    has_shared_file.then_some(alternative)
 }
 
 pub fn exact_member(
@@ -1861,12 +1924,53 @@ pub fn rust_named_declaration_node<'tree>(
 ) -> Option<Node<'tree>> {
     let mut node = rust_declaration_node(index, code_unit, root)?;
     loop {
-        if node.child_by_field_name("name").is_some_and(|name| {
-            source.get(name.start_byte()..name.end_byte()) == Some(code_unit.identifier())
-        }) {
+        if node
+            .child_by_field_name("name")
+            .is_some_and(|name| rust_declaration_name_matches(name, source, code_unit.identifier()))
+        {
             return Some(node);
         }
         node = node.parent()?;
+    }
+}
+
+fn rust_declaration_name_matches(name: Node<'_>, source: &str, identifier: &str) -> bool {
+    rust_node_text(name, source).trim() == identifier
+}
+
+#[cfg(test)]
+mod declaration_name_tests {
+    use super::*;
+
+    #[test]
+    fn public_raw_field_name_matches_its_canonical_identifier() {
+        let source = r#"pub struct DbColumn {
+    pub r#type: String,
+    pub type_name: String,
+}
+"#;
+        let tree = parse_rust_tree(source).expect("parse Rust fixture");
+        let fields = named_descendants_of_kind(tree.root_node(), "field_declaration");
+        let raw_field = fields
+            .iter()
+            .copied()
+            .find(|field| {
+                field
+                    .child_by_field_name("name")
+                    .and_then(|name| source.get(name.byte_range()))
+                    == Some("r#type")
+            })
+            .expect("raw field declaration");
+        let name = raw_field
+            .child_by_field_name("name")
+            .expect("raw field name");
+
+        assert!(rust_declaration_name_matches(name, source, "type"));
+        assert_eq!(rust_visibility_text(raw_field, source), Some("pub"));
+        assert!(
+            !rust_declaration_name_matches(name, source, "type_name"),
+            "normalization must not widen a raw identifier to a prefix near miss"
+        );
     }
 }
 

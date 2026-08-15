@@ -8,10 +8,12 @@
 //! handed across without the store's key material crossing with it.
 
 use brokk_bifrost_core::analyzer::CodeUnitIndex;
-use brokk_bifrost_core::analyzer::capabilities::{DescendantIndexScope, DirectDescendantIndex};
+use brokk_bifrost_core::analyzer::capabilities::{
+    DescendantIndexScope, DirectDescendantIndex, TypeHierarchyProvider,
+};
 use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ImportInfo, Language, Range};
-use brokk_bifrost_core::hash::HashMap;
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 use crate::java::graph_support::{
     JavaSource, resolve_java_forward_type_name, resolve_java_lexical_type_name,
@@ -65,6 +67,48 @@ pub fn java_preferred_declaring_owners(
     } else {
         class_owners
     }
+}
+
+/// The owners on the *nearest* supertype level of `owner` that declare the
+/// member `declares` tests for, reduced by [`java_preferred_declaring_owners`].
+///
+/// Java binds an inherited member to the declaration the receiver's static type
+/// provides, searching one level at a time and stopping at the first level that
+/// declares the name. A level that declares it answers outright, so a deeper
+/// declaration of the same name is the one that level's declaration overrides,
+/// never a competing candidate.
+///
+/// `None` means no ancestor level declares the member at all -- either the
+/// hierarchy is exhausted or the declaring supertype is outside the workspace.
+/// A returned vector holding more than one owner is honest ambiguity: two
+/// unrelated interfaces at the same distance both declare the name, and no
+/// caller may choose between them.
+pub fn java_nearest_declaring_ancestors(
+    source: &dyn CodeUnitIndex,
+    provider: &dyn TypeHierarchyProvider,
+    owner: &CodeUnit,
+    mut declares: impl FnMut(&CodeUnit) -> bool,
+) -> Option<Vec<CodeUnit>> {
+    let mut seen = HashSet::from_iter([owner.clone()]);
+    let mut level = provider.get_direct_ancestors(owner);
+    while !level.is_empty() {
+        let mut declaring_owners = Vec::new();
+        let mut next_level = Vec::new();
+        for ancestor in level {
+            if !seen.insert(ancestor.clone()) {
+                continue;
+            }
+            if declares(&ancestor) {
+                declaring_owners.push(ancestor.clone());
+            }
+            next_level.extend(provider.get_direct_ancestors(&ancestor));
+        }
+        if !declaring_owners.is_empty() {
+            return Some(java_preferred_declaring_owners(source, &declaring_owners));
+        }
+        level = next_level;
+    }
+    None
 }
 
 /// The uncached half of the analyzer's `get_direct_ancestors`.

@@ -381,6 +381,33 @@ struct SeedMatch {
 struct DeclarationValue {
     unit: CodeUnit,
     range: Range,
+    // `CodeUnitType` deliberately coarsens every callable to `Function`.
+    // An exact structural projection retains the normalized leaf kind so the
+    // public declaration and its stable id do not erase method/constructor
+    // distinctions already proved by the seed facts.
+    structural_kind: Option<NormalizedKind>,
+}
+
+impl DeclarationValue {
+    fn new(unit: CodeUnit, range: Range) -> Self {
+        Self {
+            unit,
+            range,
+            structural_kind: None,
+        }
+    }
+
+    fn with_structural_kind(mut self, kind: NormalizedKind) -> Self {
+        debug_assert!(kind.satisfies(NormalizedKind::Declaration));
+        self.structural_kind = Some(kind);
+        self
+    }
+
+    fn kind_label(&self) -> &'static str {
+        self.structural_kind
+            .map(NormalizedKind::label)
+            .unwrap_or_else(|| self.unit.kind().display_lowercase())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -474,10 +501,7 @@ impl IndexedDeclarations {
                     .ranges_of(unit)
                     .into_iter()
                     .min_by_key(primary_range_key)
-                    .map(|range| DeclarationValue {
-                        unit: unit.clone(),
-                        range,
-                    })
+                    .map(|range| DeclarationValue::new(unit.clone(), range))
             })?
         };
         self.by_unit.insert(unit.clone(), value.clone());
@@ -2809,7 +2833,7 @@ fn detailed_evidence_for_pipeline_value(
         PipelineValue::Declaration(declaration) => {
             let file = declaration.unit.source().clone();
             let path = rel_path_string(&file);
-            let kind = declaration.unit.kind().display_lowercase();
+            let kind = declaration.kind_label();
             let fq_name = declaration.unit.fq_name();
             let byte_span = range_byte_span(declaration.range);
             DetailedCodeQueryEvidence {
@@ -2857,7 +2881,7 @@ fn detailed_evidence_for_pipeline_value(
         },
         PipelineValue::ReferenceSite(site) => {
             let target_path = rel_path_string(site.target.unit.source());
-            let target_kind = site.target.unit.kind().display_lowercase();
+            let target_kind = site.target.kind_label();
             let target_fq_name = site.target.unit.fq_name();
             let byte_span = range_byte_span(site.range);
             DetailedCodeQueryEvidence {
@@ -4387,7 +4411,7 @@ fn detailed_declaration_provenance_ref(
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     let file = declaration.unit.source().clone();
     let path = rel_path_string(&file);
-    let kind = declaration.unit.kind().display_lowercase();
+    let kind = declaration.kind_label();
     let fq_name = declaration.unit.fq_name();
     let byte_span = range_byte_span(declaration.range);
     DetailedCodeQueryProvenanceRefEvidence {
@@ -4412,7 +4436,7 @@ fn detailed_reference_provenance_ref(
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     let target_path = rel_path_string(site.target.unit.source());
-    let target_kind = site.target.unit.kind().display_lowercase();
+    let target_kind = site.target.kind_label();
     let target_fq_name = site.target.unit.fq_name();
     let byte_span = range_byte_span(site.range);
     DetailedCodeQueryProvenanceRefEvidence {

@@ -1,5 +1,6 @@
 use super::selectors::*;
 use super::*;
+use crate::analyzer::symbol_lookup::resolve_codeunit_fuzzy_bounded_with;
 use crate::cancellation::CancellationToken;
 use std::time::Duration;
 
@@ -2178,19 +2179,43 @@ fn scan_usages_backend_on_pool(
             DefinitionSelector::Name(name) => (None, name),
             DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
         };
-        // Resolution is inside the scan's budget, not beside it. It is the
-        // phase that reads the identifier index and then one `definitions`
-        // page per matched declaration, so on a large workspace a common name
-        // spends the whole budget several hundred times over here, before the
-        // scan proper starts (#1839).
+        // Resolution is inside the scan's budget, not beside it. A file anchor
+        // is part of resolution itself: filter candidates to that file before
+        // the resolver decides whether the spelling is ambiguous. Otherwise a
+        // global namesake can reject the path#symbol recovery before the later
+        // anchor narrowing ever runs.
+        //
+        // An anchored miss still runs the global lookup once for the existing
+        // "defined elsewhere" diagnostic. Normalize its ambiguous candidates
+        // into one candidate list; the anchor branch below will find that none
+        // live in the requested file and report the scoped miss rather than a
+        // global ambiguity.
         let keep_scanning = || !context.cancellation.is_cancelled();
+        let resolution_budget =
+            FuzzyResolveBudget::new(&keep_scanning, SCAN_USAGES_MAX_RESOLUTION_CANDIDATES);
         let resolution = {
             let _scope = profiling::scope("searchtools::scan_usages_symbol_resolution");
-            resolve_codeunit_fuzzy_bounded(
-                analyzer,
-                lookup,
-                FuzzyResolveBudget::new(&keep_scanning, SCAN_USAGES_MAX_RESOLUTION_CANDIDATES),
-            )
+            match anchor.as_deref() {
+                Some(anchor) => match resolve_codeunit_fuzzy_bounded_with(
+                    analyzer,
+                    lookup,
+                    |unit| rel_path_string(unit.source()) == anchor,
+                    resolution_budget,
+                ) {
+                    Ok(CodeUnitResolution::NotFound) => {
+                        resolve_codeunit_fuzzy_bounded(analyzer, lookup, resolution_budget).map(
+                            |global| match global {
+                                CodeUnitResolution::Ambiguous(candidates) => {
+                                    CodeUnitResolution::Resolved(candidates)
+                                }
+                                other => other,
+                            },
+                        )
+                    }
+                    scoped => scoped,
+                },
+                None => resolve_codeunit_fuzzy_bounded(analyzer, lookup, resolution_budget),
+            }
         };
         let resolution = match resolution {
             Ok(resolution) => resolution,

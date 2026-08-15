@@ -549,6 +549,10 @@ impl CodeUnitIndex for PythonAnalyzer {
         self.inner.project()
     }
 
+    fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        self.inner.structural_parent_of(code_unit)
+    }
+
     fn get_all_declarations(&self) -> Vec<CodeUnit> {
         self.inner.get_all_declarations()
     }
@@ -597,7 +601,7 @@ impl CodeUnitIndex for PythonAnalyzer {
             self.inner.ranges(code_unit).to_vec()
         };
 
-        let Ok(source) = self.inner.project().read_source(code_unit.source()) else {
+        let Some(source) = self.inner.file_source(code_unit.source()) else {
             return BTreeSet::new();
         };
 

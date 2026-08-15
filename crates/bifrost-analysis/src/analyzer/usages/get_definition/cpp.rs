@@ -413,6 +413,14 @@ pub(super) fn resolve_cpp<'a>(
             if text.is_empty() {
                 return no_definition("no_reference_text", "C++ identifier is blank");
             }
+            if cpp_active_template_parameter_reference(identifier, ctx.source) {
+                return no_definition(
+                    "unresolved_template_parameter",
+                    format!(
+                        "`{text}` is an active C++ template parameter without an indexed definition"
+                    ),
+                );
+            }
             let bindings = cpp_local_bindings_before(ctx, identifier, identifier.start_byte());
             if bindings.is_shadowed(text) {
                 return no_definition(
@@ -2608,6 +2616,27 @@ fn resolve_cpp_type(
         }
     }
     if let Some(qualifier) = cpp_focused_type_qualifier(node, source) {
+        // A lexical template parameter shadows every same-named workspace type.
+        // Prefer its indexed stand-in when one exists; otherwise report the
+        // same adjudicated local boundary as an unqualified parameter use.
+        if cpp_active_template_parameter_reference(node, source) {
+            if let Some(parameter) = resolve_in_enclosing_scopes(
+                analyzer,
+                file,
+                &qualifier.reference,
+                node.start_byte(),
+                |unit| unit.source() == file && unit.is_field(),
+            ) {
+                return candidates_outcome(vec![parameter]);
+            }
+            return no_definition(
+                "unresolved_template_parameter",
+                format!(
+                    "`{}` is an active C++ template parameter without an indexed definition",
+                    qualifier.reference
+                ),
+            );
+        }
         let namespace = cpp_lexical_namespace(node, source);
         let mut root = node;
         while let Some(parent) = root.parent() {
@@ -2655,22 +2684,31 @@ fn resolve_cpp_type(
                 .collect();
             return candidates_outcome(candidates);
         }
-        // A template type parameter names no indexed type but is lexically
-        // visible inside its own template (cutlass's `OperandLayout::packed`
-        // inside OperandSharedStorage): the enclosing-scope walk finds the
-        // parameter's declaration when it is indexed; without it the
-        // qualifier drew a dishonest include-boundary claim (tier-4
-        // DeepSpeed). The stand-in is restricted to parameter-like hits
-        // (fields, not real types) so a class scope missing the member
-        // stays an ordinary no-definition.
-        if let Some(parameter) = resolve_in_enclosing_scopes(
+        // Namespace declarations are not indexed as CodeUnits, so a focused
+        // qualifier such as `Common` in `Common::Status` cannot resolve on its
+        // own. Resolve the complete structured type path before considering a
+        // dependent template-parameter stand-in for the qualifier.
+        if let Some(unit) = cpp_resolve_qualified_via_enclosing_namespaces(
             analyzer,
             file,
-            &qualifier.reference,
+            &qualifier.qualified_reference,
             node.start_byte(),
-            |unit| unit.source() == file && unit.is_field(),
+            |unit| {
+                cpp_unit_matches_kind(
+                    analyzer,
+                    context.bounded_support(),
+                    unit,
+                    CppTargetKind::Type,
+                ) && visibility.external_type_candidate_visible_at(file, unit, node.start_byte())
+            },
         ) {
-            return candidates_outcome(vec![parameter]);
+            return candidates_outcome(cpp_selected_type_definition_candidates(
+                analyzer,
+                visibility,
+                file,
+                context.bounded_support(),
+                unit,
+            ));
         }
         if cpp_unresolved_include_boundary(analyzer, file, &qualifier.reference) {
             // gated upstream: the enclosing-scope parameter probe above returned
@@ -3000,13 +3038,15 @@ fn resolve_cpp_type_without_focused_qualifier(
             // enclosing-scope walk finds the parameter's declaration when
             // it is indexed; without it the qualifier fell through to a
             // dishonest include-boundary claim (tier-4 DeepSpeed).
-            if let Some(parameter) = resolve_in_enclosing_scopes(
-                analyzer,
-                file,
-                &owner_reference,
-                node.start_byte(),
-                |unit| unit.source() == file,
-            ) {
+            if cpp_active_template_parameter_reference(node, source)
+                && let Some(parameter) = resolve_in_enclosing_scopes(
+                    analyzer,
+                    file,
+                    &owner_reference,
+                    node.start_byte(),
+                    |unit| unit.source() == file,
+                )
+            {
                 let candidates = cpp_direct_member_candidates(
                     analyzer,
                     support,
@@ -3345,6 +3385,87 @@ fn cpp_active_template_parameter_reference(node: Node<'_>, source: &str) -> bool
         }
         current = parent.parent();
     }
+    cpp_fragmented_function_template_parameter_reference(node, source, name)
+}
+
+/// Recover the lexical template binder when preprocessing inside an out-of-line
+/// parameter list makes tree-sitter close the enclosing namespace at the
+/// function body's `}`. In that recovery shape, the function-template head and
+/// its body statements are siblings in the namespace declaration list, while
+/// the namespace's real close is an `ERROR` sibling after the namespace node.
+/// Those three CST facts bound the recovery without interpreting source text.
+fn cpp_fragmented_function_template_parameter_reference(
+    node: Node<'_>,
+    source: &str,
+    name: &str,
+) -> bool {
+    let mut item = node;
+    let declaration_list = loop {
+        let Some(parent) = item.parent() else {
+            return false;
+        };
+        if parent.kind() == "declaration_list" {
+            break parent;
+        }
+        item = parent;
+    };
+    let Some(namespace) = declaration_list.parent() else {
+        return false;
+    };
+    if namespace.kind() != "namespace_definition"
+        || namespace.child_by_field_name("body") != Some(declaration_list)
+    {
+        return false;
+    }
+
+    let mut following = namespace.next_named_sibling();
+    let displaced_namespace_close = loop {
+        let Some(candidate) = following else {
+            break false;
+        };
+        if candidate.kind() == "ERROR"
+            && candidate.child_count() == 1
+            && candidate.child(0).is_some_and(|child| child.kind() == "}")
+        {
+            break true;
+        }
+        following = candidate.next_named_sibling();
+    };
+    if !displaced_namespace_close {
+        return false;
+    }
+
+    let mut preceding = item.prev_named_sibling();
+    while let Some(candidate) = preceding {
+        if candidate.kind() == "template_declaration" {
+            if !candidate.has_error() {
+                return false;
+            }
+            let parameter_matches =
+                candidate
+                    .child_by_field_name("parameters")
+                    .is_some_and(|parameters| {
+                        parameters
+                            .named_children(&mut parameters.walk())
+                            .filter_map(|parameter| cpp_template_parameter_name(parameter, source))
+                            .any(|parameter| parameter == name)
+                    });
+            if !parameter_matches {
+                return false;
+            }
+
+            let mut pending = vec![candidate];
+            while let Some(current) = pending.pop() {
+                if current.kind() == "function_declarator" {
+                    return true;
+                }
+                let mut cursor = current.walk();
+                pending.extend(current.named_children(&mut cursor));
+            }
+            return false;
+        }
+        preceding = candidate.prev_named_sibling();
+    }
     false
 }
 
@@ -3609,6 +3730,7 @@ fn cpp_direct_type_member_candidates(
 
 struct CppFocusedQualifier {
     reference: String,
+    qualified_reference: String,
     identifier: String,
     components: Vec<String>,
     globally_qualified: bool,
@@ -3652,8 +3774,10 @@ fn cpp_focused_type_qualifier(node: Node<'_>, source: &str) -> Option<CppFocused
     scopes.reverse();
     scopes.push(focused);
     let components = scopes.iter().map(|scope| (*scope).to_string()).collect();
+    let qualified_reference = cpp_type_name_components(nested_access, source)?.join("::");
     Some(CppFocusedQualifier {
         reference: scopes.join("::"),
+        qualified_reference,
         identifier: focused.to_string(),
         components,
         globally_qualified,
@@ -6039,6 +6163,26 @@ fn cpp_inherited_member_candidates(
         let mut bases = Vec::new();
         for owner in &level {
             for base in cpp_direct_base_types(ctx.analyzer, owner) {
+                // A hierarchy edge can retain the first visible declaration
+                // spelling of a base. If that spelling is a forward
+                // declaration, it has no members even when a complete class
+                // spelling is physically visible from the reference file.
+                // Select the longest visible spelling of the same canonical
+                // type before asking it for members (#837).
+                let mut spellings = ctx
+                    .support
+                    .fqn(&base.fq_name())
+                    .into_iter()
+                    .filter(CodeUnit::is_class)
+                    .filter(|candidate| {
+                        candidate == &base
+                            || ctx.visibility.is_physically_visible(ctx.file, candidate)
+                    })
+                    .collect::<Vec<_>>();
+                if !spellings.contains(&base) {
+                    spellings.push(base.clone());
+                }
+                let base = cpp_choose_canonical_type(ctx.analyzer, spellings).unwrap_or(base);
                 if seen.insert(base.fq_name()) {
                     if let Some(state) = member_trace.as_deref_mut() {
                         state

@@ -176,5 +176,17 @@ for the additional terms that apply to official binaries and semantic packs.
 
 ## Contributing
 
+<p><strong>Project contributors</strong>&nbsp;&nbsp;
+  <a href="https://github.com/jbellis"><img src="https://github.com/jbellis.png?size=96" width="40" height="40" alt="@jbellis" title="@jbellis"></a>
+  <a href="https://github.com/DavidBakerEffendi"><img src="https://github.com/DavidBakerEffendi.png?size=96" width="40" height="40" alt="@DavidBakerEffendi" title="@DavidBakerEffendi"></a>
+  <a href="https://github.com/foundev"><img src="https://github.com/foundev.png?size=96" width="40" height="40" alt="@foundev" title="@foundev"></a>
+  <a href="https://github.com/sontek"><img src="https://github.com/sontek.png?size=96" width="40" height="40" alt="@sontek" title="@sontek"></a>
+  <a href="https://github.com/alexswearingen"><img src="https://github.com/alexswearingen.png?size=96" width="40" height="40" alt="@alexswearingen" title="@alexswearingen"></a>
+  <a href="https://github.com/joshuadavidthomas"><img src="https://github.com/joshuadavidthomas.png?size=96" width="40" height="40" alt="@joshuadavidthomas" title="@joshuadavidthomas"></a>
+</p>
+
+<sub>The public repository is projected from Bifrost's open-core source, so its
+GitHub contributor graph does not reflect everyone who helped build the project.</sub>
+
 For local development, test commands, repository-local Python workflow, and
 release tagging, see [CONTRIBUTING.md](CONTRIBUTING.md).

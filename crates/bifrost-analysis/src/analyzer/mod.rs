@@ -91,11 +91,14 @@ pub use config::{
     RustPackageApiArtifact, RustSelectedTarget,
 };
 pub use cpp::CppAnalyzer;
-pub use cpp::cpp_is_constructor_or_destructor_declarator_name;
 pub(crate) use cpp::{
     CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole,
     cpp_callable_definitions_share_identity_evidence, cpp_header_body_files_are_related,
     node_text as cpp_node_text,
+};
+pub use cpp::{
+    cpp_is_constructor_or_destructor_declarator_name, cpp_is_conversion_operator_target_type,
+    cpp_is_recovered_macro_character_token_type,
 };
 pub use csharp::CSharpAnalyzer;
 pub use csharp::external::{

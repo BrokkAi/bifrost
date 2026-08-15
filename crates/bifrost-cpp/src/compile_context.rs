@@ -11,6 +11,14 @@ use brokk_bifrost_core::path_normalization::NormalizePath;
 use serde::Deserialize;
 use std::path::{Component, Path, PathBuf};
 
+const COMPILATION_DATABASE_PATH: &str = "compile_commands.json";
+
+/// Whether `file` is the workspace compilation database consumed by
+/// [`CppCompileContexts::load`].
+pub fn is_cpp_compile_context_input(file: &ProjectFile) -> bool {
+    file.rel_path() == Path::new(COMPILATION_DATABASE_PATH)
+}
+
 /// The compiler configuration Bifrost can safely use for one source file.
 ///
 /// This is deliberately narrower than a compiler invocation. It records only
@@ -62,7 +70,7 @@ pub struct CppCompileContexts {
 
 impl CppCompileContexts {
     pub fn load(project: &dyn Project) -> Self {
-        let database_path = project.root().join("compile_commands.json");
+        let database_path = project.root().join(COMPILATION_DATABASE_PATH);
         let Ok(database) = std::fs::read_to_string(database_path) else {
             return Self::default();
         };

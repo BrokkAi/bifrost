@@ -52,10 +52,11 @@ use super::syntax::{
     named_argument_invocation_owner, node_text, parenthesized_arity,
     qualified_stable_type_reference, resolve_stable_object_expression,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
-    scala_callable_shape_matches, scala_import_is_visible_at_byte, scala_pattern_binder_names,
-    scala_source_facts, scala_union_type_alternative_paths, stable_identifier_prefix_reference,
-    stable_identifier_reference, stable_type_prefix_reference, template_direct_term_member_named,
-    template_self_types, terminal_invocation_owner_name,
+    scala_callable_shape_matches, scala_definition_binder_names, scala_import_is_visible_at_byte,
+    scala_pattern_binder_names, scala_source_facts, scala_union_type_alternative_paths,
+    stable_identifier_prefix_reference, stable_identifier_reference, stable_path_segments,
+    stable_type_prefix_reference, template_direct_term_member_named, template_self_types,
+    terminal_invocation_owner_name,
 };
 use crate::scala::declarations::scala_class_parameter_field_keyword;
 use crate::scala::graph_support::{
@@ -1850,6 +1851,28 @@ impl ProjectTypes {
             || member.is_class() && self.type_is_stable_owner(scala, member)
     }
 
+    /// Whether `member` blocks resolving `call` to a same-named callable of the
+    /// owner that declares it.
+    ///
+    /// A `val` and a `def` can share one name in one Scala template only when
+    /// the `def` takes parameters. An unapplied reference is therefore the
+    /// `val`, and letting it reach the `def` would attribute a plain read to a
+    /// method. An application carries argument lists the `val` does not
+    /// declare, so the shape filter below selects the `def` and the `val` does
+    /// not block it. A nested stable object blocks either way: `Nested(...)` is
+    /// that object's `apply`, not an ordinary method of the enclosing owner.
+    fn member_blocks_callable_lookup_for_call(
+        &self,
+        scala: &dyn ScalaSource,
+        member: &CodeUnit,
+        call: ScalaCallMatch<'_>,
+    ) -> bool {
+        if member.is_class() && self.type_is_stable_owner(scala, member) {
+            return true;
+        }
+        call.is_unapplied() && self.has_term_field_declaration(member)
+    }
+
     pub fn callable_parameter_function_shape(
         &self,
         scala: &dyn ScalaSource,
@@ -1991,7 +2014,7 @@ impl ProjectTypes {
             let members = self.members_for_exact_owner_unit(scala, owner, member);
             if members
                 .iter()
-                .any(|member| self.member_blocks_callable_lookup(scala, member))
+                .any(|member| self.member_blocks_callable_lookup_for_call(scala, member, call))
             {
                 return BareMemberResolution::Unresolved;
             }
@@ -2016,10 +2039,9 @@ impl ProjectTypes {
                         return true;
                     }
                     let replica_members = self.members_for_exact_owner_unit(scala, replica, member);
-                    if replica_members
-                        .iter()
-                        .any(|member| self.member_blocks_callable_lookup(scala, member))
-                    {
+                    if replica_members.iter().any(|member| {
+                        self.member_blocks_callable_lookup_for_call(scala, member, call)
+                    }) {
                         return true;
                     }
                     match call {
@@ -2054,6 +2076,44 @@ impl ProjectTypes {
             BareMemberResolution::NoMatch,
             BareMemberResolution::Resolved,
         )
+    }
+
+    /// The declaration `super.m` names inside `owner`. An up-call is answered by
+    /// the parent linearization, so `owner`'s own declaration is skipped: in
+    /// `class C extends B { override def m() = super.m() }` the call names
+    /// `B.m`, not `C.m`. The first parent tier that declares the member wins,
+    /// exactly as ordinary member lookup treats the tiers below it.
+    fn super_method_declarations(
+        &self,
+        scala: &dyn ScalaSource,
+        owner: &CodeUnit,
+        member: &str,
+        call: ScalaCallMatch<'_>,
+    ) -> BareMemberResolution {
+        if !self.owner_supports_ordinary_member_lookup(scala, owner) {
+            return BareMemberResolution::NoMatch;
+        }
+        for tier in self.linearized_owners(scala, owner).into_iter().skip(1) {
+            let members = self.members_for_exact_owner_unit(scala, &tier, member);
+            if members
+                .iter()
+                .any(|member| self.member_blocks_callable_lookup_for_call(scala, member, call))
+            {
+                return BareMemberResolution::Unresolved;
+            }
+            let methods = match call {
+                ScalaCallMatch::Arities(call_arities) => {
+                    self.method_declarations_for_members(scala, &members, call_arities)
+                }
+                ScalaCallMatch::Shape(shape) => {
+                    self.method_declarations_for_members_with_shape(scala, &members, shape)
+                }
+            };
+            if !methods.is_empty() {
+                return BareMemberResolution::Resolved(methods);
+            }
+        }
+        BareMemberResolution::NoMatch
     }
 
     fn owner_supports_ordinary_member_lookup(
@@ -3657,6 +3717,48 @@ impl ProjectTypes {
         values
     }
 
+    /// The nested declarations a wildcard import of `owner` binds, paired with
+    /// the simple name each one binds.
+    ///
+    /// Scala makes an inherited nested declaration a member of the importing
+    /// singleton, so the search runs over the owner's linearization and not
+    /// over its own children alone. specs2 writes `trait EditDistance:` with
+    /// `case class Add[T](t: T)` inside it and `object EditDistance extends
+    /// EditDistance` beside it; `import EditDistance.*` then binds `Add`, which
+    /// a lookup that reads only the object's own children never sees. The first
+    /// template in the linearization that declares a name is the one that name
+    /// binds, so a nearer declaration shadows an inherited one.
+    fn linearized_nested_declarations(
+        &self,
+        scala: &dyn ScalaSource,
+        owner: &CodeUnit,
+        accepts: impl Fn(&CodeUnit) -> bool,
+    ) -> Vec<(String, CodeUnit)> {
+        let mut bound = HashSet::default();
+        let mut declarations = Vec::new();
+        for template in self.linearized_owners(scala, owner) {
+            let mut declared: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+            for unit in self
+                .index
+                .fqn_direct_children(&template.fq_name())
+                .into_iter()
+                .filter(&accepts)
+            {
+                declared
+                    .entry(scala_simple_type_name(&unit))
+                    .or_default()
+                    .push(unit);
+            }
+            for (simple, units) in declared {
+                if !bound.insert(simple.clone()) {
+                    continue;
+                }
+                declarations.extend(units.into_iter().map(|unit| (simple.clone(), unit)));
+            }
+        }
+        declarations
+    }
+
     fn nested_types_in(
         &self,
         scala: &dyn ScalaSource,
@@ -3678,16 +3780,10 @@ impl ProjectTypes {
             .iter()
             .filter(|unit| unit.is_class() && self.type_is_stable_owner(scala, unit))
         {
-            for unit in self
-                .index
-                .fqn_direct_children(&owner.fq_name())
-                .into_iter()
-                .filter(|unit| self.is_type_namespace_declaration(unit))
-            {
-                grouped
-                    .entry(scala_simple_type_name(&unit))
-                    .or_default()
-                    .push(unit);
+            for (simple, unit) in self.linearized_nested_declarations(scala, owner, |unit| {
+                self.is_type_namespace_declaration(unit)
+            }) {
+                grouped.entry(simple).or_default().push(unit);
             }
         }
         let mut values = Vec::new();
@@ -3731,20 +3827,34 @@ impl ProjectTypes {
         {
             return types;
         }
-        let mut values = Vec::new();
+        let mut grouped: HashMap<String, Vec<CodeUnit>> = HashMap::default();
         for owner in self
             .index
             .by_normalized_fqn(normalized_owner)
             .iter()
             .filter(|unit| unit.is_class() && self.type_is_stable_owner(scala, unit))
         {
-            for unit in self
-                .index
-                .fqn_direct_children(&owner.fq_name())
-                .into_iter()
-                .filter(|unit| unit.is_class() && self.type_accepts_object_roles(scala, unit))
-            {
-                values.push((scala_simple_type_name(&unit), unit));
+            for (simple, unit) in self.linearized_nested_declarations(scala, owner, |unit| {
+                unit.is_class() && self.type_accepts_object_roles(scala, unit)
+            }) {
+                grouped.entry(simple).or_default().push(unit);
+            }
+        }
+        // A declared companion object is the object this name binds. A case
+        // class beside it accepts object roles through its implicit companion,
+        // and counting both would make `object O { case class G(..); object G
+        // { .. } }` an ambiguous binding for `G` -- the same rule
+        // `package_objects_in` applies at package level.
+        let mut values = Vec::new();
+        for (simple, units) in grouped {
+            let declared = units
+                .iter()
+                .filter(|unit| unit.short_name().ends_with('$'))
+                .cloned()
+                .collect::<Vec<_>>();
+            let selected = if declared.is_empty() { units } else { declared };
+            for unit in selected {
+                values.push((simple.clone(), unit));
             }
         }
         let values = Arc::new(values);
@@ -4450,18 +4560,85 @@ impl ProjectTypes {
             .collect()
     }
 
+    /// The case class whose synthetic `apply` an explicit `Owner.apply(...)`
+    /// selection names, given the receiver's declaration: a companion object, or
+    /// the case class itself when the companion is implicit and the index
+    /// therefore carries no `Owner$` unit. `None` when the companion declares an
+    /// `apply` of its own, because that declaration is then the callee.
+    pub fn synthetic_apply_case_class(
+        &self,
+        scala: &dyn ScalaSource,
+        receiver: &CodeUnit,
+    ) -> Option<CodeUnit> {
+        let class = if receiver.short_name().ends_with('$') {
+            let mut companions = self.exact_companion_classes(scala, receiver).into_iter();
+            let class = companions.next()?;
+            if companions.next().is_some() {
+                return None;
+            }
+            class
+        } else {
+            receiver.clone()
+        };
+        if !self.is_case_class(scala, &class) {
+            return None;
+        }
+        let declares_apply = self
+            .exact_companion_objects(scala, &class)
+            .iter()
+            .any(|companion| {
+                self.members_for_exact_owner_unit(scala, companion, "apply")
+                    .iter()
+                    .any(|unit| unit.is_function())
+            });
+        (!declares_apply).then_some(class)
+    }
+
+    /// Whether `owner` declares an extractor entry point of its own -- an
+    /// `unapply` or `unapplySeq` a pattern can name through `owner`.
+    pub fn declares_extractor_entry_point(
+        &self,
+        scala: &dyn ScalaSource,
+        owner: &CodeUnit,
+    ) -> bool {
+        ["unapply", "unapplySeq"].into_iter().any(|member| {
+            self.members_for_exact_owner_unit(scala, owner, member)
+                .iter()
+                .any(|unit| unit.is_function())
+        })
+    }
+
+    /// The extractor entry points `owner` declares.
+    ///
+    /// An extractor pattern says nothing about the parameter list of the
+    /// `unapply` behind it -- `case Foo(a, b)` writes the *result* the
+    /// extractor yields -- so ordinary call-shape matching cannot choose among
+    /// the entry points one owner declares. When the owner declares overloads,
+    /// the scrutinee type selects one, and that type is not modeled here, so
+    /// the site names the whole family (#2078).
+    pub fn extractor_entry_points(
+        &self,
+        scala: &dyn ScalaSource,
+        owner: &CodeUnit,
+    ) -> Vec<CodeUnit> {
+        let mut entry_points = Vec::new();
+        for member in ["unapply", "unapplySeq"] {
+            entry_points.extend(
+                self.members_for_exact_owner_unit(scala, owner, member)
+                    .into_iter()
+                    .filter(|unit| unit.is_function())
+                    .cloned(),
+            );
+        }
+        entry_points
+    }
+
     pub fn class_accepts_extractor_role(&self, scala: &dyn ScalaSource, target: &CodeUnit) -> bool {
         self.is_case_class(scala, target)
             || self
                 .exact_companion_objects(scala, target)
                 .iter()
-                .any(|companion| {
-                    ["unapply", "unapplySeq"].iter().any(|member| {
-                        self.members_for_exact_owner_unit(scala, companion, member)
-                            .iter()
-                            .any(|unit| unit.is_function())
-                    })
-                })
+                .any(|companion| self.declares_extractor_entry_point(scala, companion))
     }
 
     fn class_application_matches_with_shape(
@@ -4567,15 +4744,7 @@ impl ProjectTypes {
             };
             let unapply_targets = extractor_owners
                 .iter()
-                .flat_map(|companion| {
-                    ["unapply", "unapplySeq"]
-                        .into_iter()
-                        .flat_map(move |member| {
-                            let members =
-                                self.members_for_exact_owner_unit(scala, companion, member);
-                            self.method_declarations_for_members(scala, &members, None)
-                        })
-                })
+                .flat_map(|companion| self.extractor_entry_points(scala, companion))
                 .collect::<Vec<_>>();
             let mut callable_targets = match self.physical_callable_targets(scala, unapply_targets)
             {
@@ -4699,8 +4868,22 @@ impl ProjectTypes {
                 value_result: None,
             };
         }
+        // A case class's `apply` is synthesized in its own companion, so it is an
+        // own member of that object and outranks any `apply` the companion merely
+        // inherits from a supertype. `object P extends SpanContainerCompanion`
+        // next to `case class P(...)` is exactly that shape: the inherited
+        // overloads would otherwise consume `P(spans)` and leave the site with no
+        // edge at all, while `get_definition` names the constructor.
+        let synthetic_companion_apply = type_target.as_ref().is_some_and(|target| {
+            self.is_case_class(scala, target)
+                && apply_owners.first().is_some_and(|companion| {
+                    self.members_for_exact_owner_unit(scala, companion, "apply")
+                        .is_empty()
+                })
+        });
         let apply_resolution = apply_owners
             .first()
+            .filter(|_| !synthetic_companion_apply)
             .map(|owner| self.inherited_apply_value_resolution(scala, owner, call_shape))
             .unwrap_or(ScalaApplyValueResolution::NoDeclaration);
         let apply_resolution = match apply_resolution {
@@ -6256,6 +6439,13 @@ impl NameResolver {
             }
         }
 
+        // Names an earlier explicit import binds in this file, so a later import
+        // may be written through one: `import p.Implicits` makes `Implicits` a
+        // visible root, and `import Implicits.request2Session` then names
+        // `p.Implicits.request2Session`. Neither the package scopes nor the
+        // lexical prefixes spell that owner, so the path resolves against this
+        // map after both.
+        let mut import_roots: HashMap<String, String> = HashMap::default();
         for import in imports {
             let Some(path) = scala_import_path(import) else {
                 continue;
@@ -6263,9 +6453,29 @@ impl NameResolver {
             if import.is_wildcard {
                 continue;
             }
-            let Some(tier) = types.explicit_import_tier(&path, active_package_prefixes) else {
+            let Some(tier) = types
+                .explicit_import_tier(&path, active_package_prefixes)
+                .or_else(|| {
+                    let segments = import.path.as_ref().map(|path| path.segments.as_slice())?;
+                    let [root, rest @ ..] = segments else {
+                        return None;
+                    };
+                    if rest.is_empty() {
+                        return None;
+                    }
+                    let bound = import_roots.get(root)?;
+                    let candidate = std::iter::once(bound.as_str())
+                        .chain(rest.iter().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    types.explicit_import_tier(&candidate, &[])
+                })
+            else {
                 continue;
             };
+            if let Some(local) = import.local_name() {
+                import_roots.insert(local.to_string(), tier.candidate.clone());
+            }
             // `ImportInfo::local_name` is the shared `alias ?? identifier ??
             // tail-of-structured-path` desugar; scala's `identifier` is already
             // alias-resolved at construction, so this agrees with the old
@@ -6849,6 +7059,7 @@ pub fn scan_edge_file(
         class_ranges,
         sink: &mut sink,
         cancellation: None,
+        invocation_callables: HashMap::default(),
     };
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     walk(input.root(), &mut ctx, &mut bindings);
@@ -6915,6 +7126,7 @@ pub fn scan_scala_query_file(
         class_ranges,
         sink,
         cancellation,
+        invocation_callables: HashMap::default(),
     };
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     #[cfg(any(test, feature = "test-support"))]
@@ -6941,6 +7153,13 @@ struct ScalaScan<'a, 'b> {
     class_ranges: ClassRangeIndex,
     sink: &'a mut dyn ScalaReferenceSink,
     cancellation: Option<&'b brokk_bifrost_core::cancellation::CancellationToken>,
+    /// Callables this scan proved for each invocation, keyed by the id of the
+    /// invocation's terminal callee-name node. The walk enters an invocation
+    /// before its `arguments`, so a named-argument label reads the callee that
+    /// the ordinary call resolution already selected instead of resolving the
+    /// owner a second time through a narrower path. An invocation whose callee
+    /// stayed unproven has no entry, which keeps labels fail-closed.
+    invocation_callables: HashMap<usize, Vec<CodeUnit>>,
 }
 
 impl ScalaScan<'_, '_> {
@@ -7389,6 +7608,17 @@ impl ScalaScan<'_, '_> {
         })
     }
 
+    /// The template an owner-qualified `X.this` names (#2082).
+    ///
+    /// Scala admits the qualifier only when it spells a template enclosing the
+    /// site, so the reference is that declaration and nothing else can supply
+    /// it. A spelling that names no enclosing template stays unrecorded.
+    fn enclosing_template_named(&self, byte: usize, name: &str) -> Option<CodeUnit> {
+        self.class_ranges.find_in_enclosing_units(byte, |owner| {
+            (scala_simple_type_name(owner) == name).then(|| owner.clone())
+        })
+    }
+
     fn record_with_caller(&mut self, caller: String, callee: CodeUnit, node: Node<'_>) {
         self.sink.record_with_caller(
             caller,
@@ -7401,8 +7631,19 @@ impl ScalaScan<'_, '_> {
         );
     }
 
+    /// Remember `callee` as a proven target of the invocation whose terminal
+    /// callee-name node is `node`. Named-argument labels inside that
+    /// invocation's arguments resolve their parameter owner from this record.
+    fn register_invocation_callable(&mut self, callee: &CodeUnit, node: Node<'_>) {
+        self.invocation_callables
+            .entry(node.id())
+            .or_default()
+            .push(callee.clone());
+    }
+
     fn record_exact(&mut self, callee: CodeUnit, role: ScalaReferenceRole, node: Node<'_>) {
         let hit_kind = if role == ScalaReferenceRole::Callable {
+            self.register_invocation_callable(&callee, node);
             self.callable_reference_hit_kind(node, &callee)
         } else {
             UsageHitKind::Reference
@@ -7466,7 +7707,19 @@ impl ScalaScan<'_, '_> {
                 | ScalaReferenceRole::CompanionExtractor
                 | ScalaReferenceRole::CompanionValue
         ));
-        let Some(call_shape) = call_site_shape_for_reference(node) else {
+        self.register_invocation_callable(&callee, node);
+        // An extractor pattern is a reference to the extractor owner, not a
+        // call of the entry point that implements it: `case Foo(a, b)` writes
+        // the *result* `unapply` yields, while `unapply` itself takes the one
+        // scrutinee. Carrying the pattern's argument list as an ordinary call
+        // shape would let it be matched against the entry point's parameter
+        // list, which no explicit `unapply` can satisfy. The recorded identity
+        // is the entry point; the shape belongs to the owner, so the site is
+        // recorded without one (#2078).
+        let call_shape = (role != ScalaReferenceRole::CompanionExtractor)
+            .then(|| call_site_shape_for_reference(node))
+            .flatten();
+        let Some(call_shape) = call_shape else {
             self.record_exact(callee, role, node);
             return;
         };
@@ -7487,6 +7740,7 @@ impl ScalaScan<'_, '_> {
         node: Node<'_>,
         call_shape: &ScalaCallSiteShape,
     ) {
+        self.register_invocation_callable(&callee, node);
         let hit_kind = if call_shape.method_value_arity.is_some()
             && !call_shape
                 .method_value_parameter_types
@@ -7671,19 +7925,7 @@ fn seed_parent_scope_declaration(
     ctx: &ScalaScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
-    if node.kind() != "function_definition"
-        || !node.parent().is_some_and(|mut parent| {
-            loop {
-                if parent.kind() == "function_definition" {
-                    break true;
-                }
-                let Some(next) = parent.parent() else {
-                    break false;
-                };
-                parent = next;
-            }
-        })
-    {
+    if node.kind() != "function_definition" || !scala_function_definition_is_local(node) {
         return;
     }
     if let Some(name) = node.child_by_field_name("name") {
@@ -7692,6 +7934,45 @@ fn seed_parent_scope_declaration(
             bindings.declare_shadow(name.to_string());
         }
     }
+}
+
+/// Whether `definition` is a *local* `def` -- one a method body declares -- as
+/// opposed to a member some template declares.
+///
+/// The distinction is the nearest enclosing owner, not the presence of a
+/// `function_definition` anywhere above (#2079). A `def` inside an anonymous
+/// template that a method body constructs (`def m = new T { def helper = .. }`)
+/// is a member of that template: extraction mints it as
+/// `Owner.m$anon$L:C.helper`, and every bare `helper(..)` inside the template
+/// names that member. Reading it as a local `def` of `m` instead declared the
+/// name as an opaque shadow across the whole method, which made the inverse
+/// scan drop every such call before any owner lookup ran while forward
+/// resolution still answered with the minted identity.
+///
+/// A genuinely nested `def` -- one whose nearest owner really is a method body,
+/// including through a block, a lambda, or a `case` clause -- still shadows.
+///
+/// A `def` inside a template-level `val` initializer reaches a template body
+/// first and is therefore not a shadow. That is the answer this rule gave
+/// before as well, since no `function_definition` encloses it either.
+fn scala_function_definition_is_local(definition: Node<'_>) -> bool {
+    let mut current = definition.parent();
+    while let Some(ancestor) = current {
+        match ancestor.kind() {
+            "function_definition" => return true,
+            "template_body"
+            | "enum_body"
+            | "class_definition"
+            | "object_definition"
+            | "trait_definition"
+            | "enum_definition"
+            | "instance_expression"
+            | "extension_definition" => return false,
+            _ => {}
+        }
+        current = ancestor.parent();
+    }
+    false
 }
 
 fn record_import_declaration(node: Node<'_>, ctx: &mut ScalaScan<'_, '_>) {
@@ -8234,6 +8515,23 @@ fn record_reference(
                     if name.is_empty() {
                         return;
                     }
+                    // `super.m(..)` is an up-call: the parent linearization
+                    // answers it, and no other receiver rule may reinterpret
+                    // the selection when it does not.
+                    if node_text(receiver, ctx.source).trim() == "super" {
+                        record_super_member(field, name, ctx);
+                        return;
+                    }
+                    // `C.apply(..)` on a case class selects the synthetic apply
+                    // its companion carries, which is the primary constructor.
+                    // Ordinary member lookup cannot reach it: the companion
+                    // declares no `apply` of its own, and an `apply` it inherits
+                    // is not the callee.
+                    if name == "apply"
+                        && record_explicit_case_class_apply(receiver, field, ctx, bindings)
+                    {
+                        return;
+                    }
                     // A parser-proven stable application such as
                     // `Uri.UserInfo(...)` names a type/companion application,
                     // even when `Uri` is also a resolvable stable receiver.
@@ -8499,7 +8797,7 @@ fn record_reference(
             }
         }
         "infix_expression" => {
-            let (Some(receiver), Some(operator)) = (
+            let (Some(left), Some(operator)) = (
                 node.child_by_field_name("left"),
                 node.child_by_field_name("operator"),
             ) else {
@@ -8509,6 +8807,18 @@ fn record_reference(
             if member.is_empty() {
                 return;
             }
+            // Scala makes an operator right-associative exactly when its last
+            // character is `:`, and then the *right* operand is the receiver:
+            // `h :: acc` is `acc.::(h)`. Reading the left operand as the
+            // receiver leaves every `::`, `+:` and `<:::` call unresolved.
+            let receiver = if member.ends_with(':') {
+                let Some(right) = node.child_by_field_name("right") else {
+                    return;
+                };
+                right
+            } else {
+                left
+            };
             let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) else {
                 return;
             };
@@ -8584,8 +8894,7 @@ fn record_reference(
                 named_argument_invocation_owner(node).and_then(terminal_invocation_owner_name)
             {
                 let owner_name = node_text(owner_node, ctx.source).trim();
-                let declaring_callables =
-                    named_argument_callable_targets(owner_node, owner_name, name, ctx, bindings);
+                let declaring_callables = named_argument_callable_targets(owner_node, name, ctx);
                 if let Some(ScalaResolvedReference::Exact(owner)) =
                     ctx.visible_type_reference(owner_node, owner_name)
                 {
@@ -8596,15 +8905,21 @@ fn record_reference(
                         .types
                         .exact_member_declarations(ctx.scala, &owner, name)
                         .is_empty();
-                    if !declaring_callables.is_empty()
-                        && (!callable_matches_owner || !owner_declares_member)
+                    // A parameter of the owner's own constructor and a member
+                    // the owner declares under the same name are one source
+                    // entity: a case-class parameter is both. The label names
+                    // that entity, so record both identities. A callable owned
+                    // by something else -- a companion `apply` next to an
+                    // unrelated member of the same name (#1861) -- is not the
+                    // owner's member, and only the callable is recorded.
+                    if declaring_callables.is_empty()
+                        || (callable_matches_owner && owner_declares_member)
                     {
-                        for callable in declaring_callables {
-                            ctx.record_exact_callable(callable, node);
-                        }
-                        return;
+                        ctx.record_exact_owner_member(owner, name, ScalaReferenceRole::Field, node);
                     }
-                    ctx.record_exact_owner_member(owner, name, ScalaReferenceRole::Field, node);
+                    for callable in declaring_callables {
+                        ctx.record_exact_callable(callable, node);
+                    }
                 } else {
                     for callable in declaring_callables {
                         ctx.record_exact_callable(callable, node);
@@ -8613,6 +8928,12 @@ fn record_reference(
                 return;
             }
             if is_declaration_name(node) {
+                return;
+            }
+            // A parameterless `super.m`, the selection form of the up-call the
+            // `call_expression` arm resolves.
+            if is_super_selection(node, ctx.source) {
+                record_super_member(node, name, ctx);
                 return;
             }
             if record_qualified_root_owner_reference(node, name, ctx, bindings) {
@@ -8630,7 +8951,7 @@ fn record_reference(
             {
                 return;
             }
-            if is_scala_case_pattern_binder(node) {
+            if is_scala_case_pattern_binder(node, ctx.source) {
                 return;
             }
             // The enclosing `call_expression` owns callable-shape resolution.
@@ -8664,6 +8985,23 @@ fn record_reference(
             {
                 return;
             }
+            // `X.this` names the enclosing template `X`, whatever its kind,
+            // and so does the qualifier of `private[X]`. A trait is neither a
+            // stable owner nor an object, so the rules below cannot reach it
+            // (#2082). An access qualifier that names an enclosing package
+            // instead resolves to no template and stays unrecorded.
+            if let Some(qualifier) = node
+                .parent()
+                .filter(|parent| {
+                    parent.kind() == "access_qualifier"
+                        || (is_owner_qualified_this(*parent, ctx.source)
+                            && parent.child_by_field_name("value") == Some(node))
+                })
+                .and_then(|_| ctx.enclosing_template_named(node.start_byte(), name))
+            {
+                ctx.record_exact(qualifier, ScalaReferenceRole::Type, node);
+                return;
+            }
             // A stable selection's root is an independently meaningful term
             // reference. Resolve it before class/type handling consumes the same
             // spelling, so `Flag` in `Flag.values` is attributed to the exact
@@ -8687,14 +9025,9 @@ fn record_reference(
             }
             let bare_companion_method_value = is_bare_companion_method_value_reference(node);
             if (is_extractor_reference(node) || is_infix_pattern_operator(node))
-                && let Some(fqn) = (bindings.resolve_symbol(name).is_unknown()
-                    && !bindings.is_shadowed(name))
-                .then(|| ctx.visible_type(node, name))
-                .flatten()
-                && let Some(target) = ctx
-                    .types
-                    .type_by_normalized_fqn(&scala_normalized_fq_name(&fqn))
-                && ctx.types.class_accepts_extractor_role(ctx.scala, target)
+                && bindings.resolve_symbol(name).is_unknown()
+                && !bindings.is_shadowed(name)
+                && names_extractor_owner(node, name, ctx)
             {
                 record_unqualified_type_application(node, name, ctx, bindings);
                 return;
@@ -9527,6 +9860,28 @@ fn scala_postfix_receiver_node<'tree>(
         .find(|child| child.end_byte() <= operator.start_byte())
 }
 
+/// Whether `name` at this pattern site denotes an extractor owner: a type whose
+/// companion (or the case class itself) supplies the extractor, or an object
+/// that declares `unapply`/`unapplySeq` of its own.
+///
+/// An extractor lives in Scala's term namespace, so an object with no companion
+/// class -- `object Split { def unapply(..) }`, the shape the infix pattern
+/// `case left Split right` writes -- owns the pattern even though the type
+/// namespace knows nothing by that name (#2078).
+fn names_extractor_owner(node: Node<'_>, name: &str, ctx: &ScalaScan<'_, '_>) -> bool {
+    if let Some(fqn) = ctx.visible_type(node, name)
+        && let Some(target) = ctx
+            .types
+            .type_by_normalized_fqn(&scala_normalized_fq_name(&fqn))
+        && ctx.types.class_accepts_extractor_role(ctx.scala, target)
+    {
+        return true;
+    }
+    ctx.lexically_visible_object_unit(node.start_byte(), name)
+        .or_else(|| ctx.resolver.resolve_object_unit(name))
+        .is_some_and(|object| ctx.types.declares_extractor_entry_point(ctx.scala, &object))
+}
+
 fn record_unqualified_type_application(
     function: Node<'_>,
     name: &str,
@@ -9621,28 +9976,116 @@ fn resolve_unqualified_type_application(
     Some((resolution, call_shape))
 }
 
+/// Whether `field` is the member of a `super.member` selection.
+fn is_super_selection(field: Node<'_>, source: &str) -> bool {
+    field
+        .parent()
+        .filter(|parent| {
+            parent.kind() == "field_expression"
+                && parent.child_by_field_name("field") == Some(field)
+        })
+        .and_then(|parent| parent.child_by_field_name("value"))
+        .is_some_and(|value| node_text(value, source).trim() == "super")
+}
+
+/// Record what `super.member` names inside the enclosing template. The up-call
+/// is answered by the template's parent linearization, never by its own
+/// override, and an unresolved one records nothing rather than falling through
+/// to a receiver rule that would read `super` as an ordinary value.
+fn record_super_member(node: Node<'_>, name: &str, ctx: &mut ScalaScan<'_, '_>) {
+    let Some(owner) = ctx.enclosing_class_unit(node.start_byte()).cloned() else {
+        return;
+    };
+    let call_shape = call_site_shape_for_reference(node);
+    let call = match call_shape.as_ref() {
+        Some(shape) => ScalaCallMatch::Shape(shape),
+        None => ScalaCallMatch::Arities(None),
+    };
+    if let BareMemberResolution::Resolved(methods) = ctx
+        .types
+        .super_method_declarations(ctx.scala, &owner, name, call)
+    {
+        for method in methods {
+            match call_shape.as_ref() {
+                Some(shape) => ctx.record_exact_callable_with_shape(method, node, shape),
+                None => ctx.record_exact(method, ScalaReferenceRole::Callable, node),
+            }
+        }
+    }
+}
+
+/// `C.apply(args)` on a case class. Bifrost identifies a case class's synthetic
+/// companion `apply` with the class's primary constructor, and `get_definition`
+/// answers the selection with that constructor, so the inverse records it too.
+/// Ordinary member lookup cannot: the companion declares no `apply` unit, and an
+/// `apply` the companion inherits from a supertype is not the callee.
+fn record_explicit_case_class_apply(
+    receiver: Node<'_>,
+    field: Node<'_>,
+    ctx: &mut ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
+) -> bool {
+    let Some(owner) = receiver_type_declaration(receiver, ctx, bindings).or_else(|| {
+        let name = node_text(receiver, ctx.source).trim();
+        if receiver.kind() != "identifier"
+            || !bindings.resolve_symbol(name).is_unknown()
+            || bindings.is_shadowed(name)
+        {
+            return None;
+        }
+        match ctx.visible_type_reference(receiver, name) {
+            Some(ScalaResolvedReference::Exact(unit)) => Some(unit),
+            Some(ScalaResolvedReference::Logical(_)) | None => None,
+        }
+    }) else {
+        return false;
+    };
+    let Some(class) = ctx.types.synthetic_apply_case_class(ctx.scala, &owner) else {
+        return false;
+    };
+    let resolution = ctx.types.resolve_type_application(
+        ctx.scala,
+        &ctx.resolver,
+        Some(&class.fq_name()),
+        None,
+        &scala_short_name_terminal_segment(class.short_name()),
+        call_site_shape_for_reference(field).as_ref(),
+        TypeApplicationRole::BareApplication,
+        Some(ctx.source_file),
+    );
+    if resolution.callable_targets.is_empty() {
+        return false;
+    }
+    for callable in resolution.callable_targets {
+        ctx.record_exact_companion_callable(
+            callable,
+            ScalaReferenceRole::CompanionApplication,
+            field,
+        );
+    }
+    true
+}
+
+/// The callables a named argument's label can name, given the invocation's
+/// terminal callee-name node.
+///
+/// Ordinary call resolution runs first for every supported invocation shape --
+/// a receiver method call, an unqualified method call, a companion
+/// application, and an explicit constructor -- and registers what it proved.
+/// The label narrows that proven set to the callables that declare a parameter
+/// with this label, so an overload family that arity or literal filtering has
+/// already reduced stays reduced. An invocation whose callee never resolved has
+/// no registered callable and therefore contributes no label reference.
 fn named_argument_callable_targets(
     function: Node<'_>,
-    owner_name: &str,
     label: &str,
     ctx: &ScalaScan<'_, '_>,
-    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> Vec<CodeUnit> {
-    if function.kind() != "identifier" {
-        return Vec::new();
-    }
-    let Some((resolution, _)) = resolve_unqualified_type_application(
-        function,
-        owner_name,
-        TypeApplicationRole::BareApplication,
-        ctx,
-        bindings,
-    ) else {
+    let Some(callables) = ctx.invocation_callables.get(&function.id()) else {
         return Vec::new();
     };
-    let mut targets = resolution
-        .callable_targets
-        .into_iter()
+    let mut targets = callables
+        .iter()
         .filter(|callable| {
             ctx.types
                 .signature_metadata_for(ctx.scala, callable)
@@ -9650,6 +10093,7 @@ fn named_argument_callable_targets(
                 .flat_map(|metadata| metadata.parameters())
                 .any(|parameter| parameter.label() == label)
         })
+        .cloned()
         .collect::<Vec<_>>();
     targets.sort();
     targets.dedup();
@@ -9965,10 +10409,31 @@ fn record_intermediate_stable_object_reference(
             &ctx.resolver,
             &reference.segments,
             true,
-            lexical_roots,
+            lexical_roots.clone(),
         )
     {
         ctx.record_exact(target, ScalaReferenceRole::StableObject, node);
+        return true;
+    }
+    // A case class carries an implicit companion, which the index models as
+    // the class declaration itself: `Owner.Failed.apply` selects through
+    // `Failed` without any `Failed$` unit existing (#2082). Resolve the same
+    // path in the type namespace and keep only a declaration that genuinely
+    // accepts object roles, so an ordinary nested class stays unrecorded.
+    if let Some(target) = ctx
+        .types
+        .resolve_qualified_stable_type_unit_at_with_lexical_roots(
+            ctx.scala,
+            &ctx.resolver,
+            &reference.segments,
+            false,
+            lexical_roots,
+        )
+        .filter(|target| ctx.types.type_accepts_object_roles(ctx.scala, target))
+    {
+        // The index carries no companion unit for that class, so `Type` is
+        // the role its identity answers to.
+        ctx.record_exact(target, ScalaReferenceRole::Type, node);
         return true;
     }
     // This parser shape also covers ordinary field chains such as
@@ -10153,10 +10618,11 @@ enum LexicalFieldReferenceResolution {
 ///
 /// Local and parameter bindings are authoritative. Otherwise each physical
 /// enclosing template is examined nearest-first, including that template's
-/// inherited field tier. A field declaration, field ambiguity, or callable at
-/// the nearest matching tier stops the walk, so neither a same-named outer
-/// field nor a package-level member can leak through it. Callable recording is
-/// left to the existing shape-aware path after this helper reports
+/// inherited field tier and the members its self type contributes. A field
+/// declaration, field ambiguity, or callable at the nearest matching tier stops
+/// the walk, so neither a same-named outer field nor a package-level member can
+/// leak through it. Callable recording is left to the existing shape-aware path
+/// after this helper reports
 /// [`LexicalFieldReferenceResolution::CallableBound`].
 fn record_lexically_visible_field_reference(
     node: Node<'_>,
@@ -10168,6 +10634,24 @@ fn record_lexically_visible_field_reference(
     if bindings.is_shadowed(name) && bound_field_owner.is_none() {
         return LexicalFieldReferenceResolution::Consumed;
     }
+    let enclosing_templates = enclosing_template_declarations(node)
+        .into_iter()
+        .filter_map(|declaration| {
+            let owner = ctx
+                .class_ranges
+                .unit_for_exact_span(declaration.start_byte(), declaration.end_byte())?
+                .clone();
+            Some((owner, declaration))
+        })
+        .collect::<Vec<_>>();
+    // Scala lets one name carry a `val` and a `def` in one template, and an
+    // application selects between them by shape: `images` is the `val` and
+    // `images(registry)` is the `def`. The node carries that shape, so a tier
+    // that declares a callable the application can reach yields to the
+    // shape-aware callable path instead of answering with its field.
+    let applied_call_shape = is_call_function_reference(node)
+        .then(|| call_site_shape_for_reference(node))
+        .flatten();
     let mut owner = ctx.enclosing_class_unit(node.start_byte()).cloned();
     let mut seen = HashSet::default();
     while let Some(current) = owner {
@@ -10177,6 +10661,11 @@ fn record_lexically_visible_field_reference(
         owner = ctx.types.exact_structural_parent(ctx.scala, &current);
         if !current.is_class() {
             continue;
+        }
+        if applied_call_shape.is_some()
+            && callable_name_is_bound_for_exact_owner(&current, name, ctx)
+        {
+            return LexicalFieldReferenceResolution::CallableBound;
         }
         match ctx.types.field_for_owner_unit(ctx.scala, &current, name) {
             FieldResolution::Resolved(field) => {
@@ -10193,12 +10682,65 @@ fn record_lexically_visible_field_reference(
         if callable_name_is_bound_for_exact_owner(&current, name, ctx) {
             return LexicalFieldReferenceResolution::CallableBound;
         }
+        let Some((_, declaration)) = enclosing_templates
+            .iter()
+            .find(|(template, _)| *template == current)
+        else {
+            continue;
+        };
+        match self_type_field_resolution(*declaration, name, ctx) {
+            FieldResolution::Resolved(field) => {
+                ctx.record_exact(field.declaration, ScalaReferenceRole::Field, node);
+                return LexicalFieldReferenceResolution::Consumed;
+            }
+            FieldResolution::Unresolved => return LexicalFieldReferenceResolution::Consumed,
+            FieldResolution::NoMatch => {}
+        }
     }
     if bound_field_owner.is_some() {
         LexicalFieldReferenceResolution::Consumed
     } else {
         LexicalFieldReferenceResolution::NoMatch
     }
+}
+
+/// The field a bare name selects through `declaration`'s self type.
+///
+/// `trait T { self: A with B => ... }` puts every member of `A` and `B` into
+/// scope for `T`'s body, and the corpus uses that cake-pattern shape as the
+/// ordinary way to reach a collaborator's `val`. The callable paths already
+/// consult `template_self_types`; the field path did not, so a bare read of a
+/// self-type `val` produced no edge at all while forward resolution named the
+/// declaration.
+///
+/// Two self types that declare one name leave the reference ambiguous, and an
+/// ambiguous owner inside one self type's hierarchy fails closed, exactly as
+/// the template's own field tier does. A self type Bifrost does not index
+/// contributes nothing rather than blocking the ones it does index.
+fn self_type_field_resolution(
+    declaration: Node<'_>,
+    name: &str,
+    ctx: &ScalaScan<'_, '_>,
+) -> FieldResolution {
+    let mut matches = Vec::new();
+    for self_type in template_self_types(declaration) {
+        let Some(owner) = resolve_receiver_type_declaration_node(self_type, ctx) else {
+            continue;
+        };
+        match ctx.types.field_for_owner_unit(ctx.scala, &owner, name) {
+            FieldResolution::Resolved(field) => matches.push(field),
+            FieldResolution::Unresolved => return FieldResolution::Unresolved,
+            FieldResolution::NoMatch => {}
+        }
+    }
+    matches.sort_by(|left, right| left.declaration.cmp(&right.declaration));
+    matches.dedup_by(|left, right| left.declaration == right.declaration);
+    if matches.len() > 1 {
+        return FieldResolution::Unresolved;
+    }
+    matches
+        .pop()
+        .map_or(FieldResolution::NoMatch, FieldResolution::Resolved)
 }
 
 fn companion_method_value_context(
@@ -10437,11 +10979,24 @@ fn record_ordinary_class_methods(
 }
 
 fn record_exact_callable_reference(method: CodeUnit, node: Node<'_>, ctx: &mut ScalaScan<'_, '_>) {
-    if is_explicit_eta_reference(node, ctx.source) {
+    if is_explicit_eta_reference(node, ctx.source) || is_unapplied_type_application(node) {
         ctx.record_exact(method, ScalaReferenceRole::Callable, node);
     } else {
         ctx.record_exact_callable(method, node);
     }
+}
+
+/// `m[T]` with no argument list. Scala reads it as a parameterless call when
+/// `m` declares no parameters and as an eta-expanded method value when it does,
+/// so the reference carries no call shape: claiming the empty argument list the
+/// call-site shape invents for a type application would reject every method
+/// that takes parameters, which is what `_.map(fromEncodeable[T])` writes.
+fn is_unapplied_type_application(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "generic_function"
+            && parent.child_by_field_name("function") == Some(node)
+            && !is_call_function_reference(node)
+    })
 }
 
 fn is_explicit_eta_reference(mut node: Node<'_>, source: &str) -> bool {
@@ -10824,7 +11379,9 @@ fn receiver_type_declaration(
         "field_expression" => {
             let value = receiver.child_by_field_name("value")?;
             let member = receiver.child_by_field_name("field")?;
-            let owner = receiver_type_declaration(value, ctx, bindings)?;
+            let Some(owner) = receiver_type_declaration(value, ctx, bindings) else {
+                return stable_object_path_declaration(receiver, ctx, bindings);
+            };
             let member = node_text(member, ctx.source).trim();
             match ctx.types.field_for_owner_unit(ctx.scala, &owner, member) {
                 FieldResolution::Resolved(field) => {
@@ -10980,6 +11537,38 @@ fn stable_object_expression_fqn(
                 .flatten()
         },
         |owner, member| ctx.types.exact_nested_object(ctx.scala, owner, member),
+    )
+    .or_else(|| stable_object_path_declaration(node, ctx, bindings).map(|object| object.fq_name()))
+}
+
+/// The object a dotted receiver path names when its root is a package rather
+/// than a term the object-name resolver already binds.
+///
+/// `stable_object_expression_fqn` starts from an imported or lexically visible
+/// object and then selects nested objects. A path rooted at a package --
+/// `com.example.transport.Method` written out, or `transport.Method` after
+/// `import com.example.transport` -- has no such root, so the receiver stayed
+/// untyped and every selection off it went unrecorded. The qualified stable
+/// resolver already understands package roots, `_root_`, imported packages and
+/// nested objects, so read the path through it. A local binding of the root
+/// spelling shadows the package and keeps the path out of this rule.
+fn stable_object_path_declaration(
+    receiver: Node<'_>,
+    ctx: &ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
+) -> Option<CodeUnit> {
+    let segments = stable_path_segments(receiver, ctx.source)?;
+    let root = segments.first().expect("a stable path has a root segment");
+    if !bindings.resolve_symbol(root).is_unknown() || bindings.is_shadowed(root) {
+        return None;
+    }
+    let lexical_root = ctx.lexically_visible_object_unit(receiver.start_byte(), root);
+    ctx.types.resolve_qualified_stable_type_unit_at(
+        ctx.scala,
+        &ctx.resolver,
+        &segments,
+        true,
+        lexical_root,
     )
 }
 
@@ -11316,7 +11905,7 @@ fn seed_value_definition_with_owner(
     let Some(pattern) = node.child_by_field_name("pattern") else {
         return;
     };
-    for name in scala_pattern_binder_names(pattern, ctx.source) {
+    for name in scala_definition_binder_names(pattern, ctx.source) {
         if let Some(receiver_declaration) = receiver_declaration.clone() {
             seed_scala_binding_with_receiver_declaration(
                 name,

@@ -1340,6 +1340,9 @@ jobs:
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
 
+      - name: Remove downloaded release artifacts before source-diff validation
+        run: rm -rf -- dist
+
       - name: Validate synchronized release projections
         run: node scripts/release-version.mjs check
 
