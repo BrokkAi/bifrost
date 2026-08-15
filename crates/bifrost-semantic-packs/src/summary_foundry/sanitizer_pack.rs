@@ -70,7 +70,7 @@ const PRODUCER_NAME: &str = "bifrost-sanitizer-foundry";
 const PACK_CONTENT_VERSION: &str = "0.1.0";
 
 /// The Bifrost compatibility requirement every generated pack declares.
-const BIFROST_REQUIREMENT: &str = ">=0.8.0, <0.10.0";
+const BIFROST_REQUIREMENT: &str = ">=0.8.0, <0.11.0";
 
 /// The authored sanitizer content is Bifrost's own claim, licensed like the
 /// workspace. It is not a slice of the described library.

@@ -64,7 +64,7 @@ const PRODUCER_NAME: &str = "bifrost-golden-foundry";
 const PACK_CONTENT_VERSION: &str = "0.1.0";
 
 /// The Bifrost compatibility requirement the generated pack declares.
-const BIFROST_REQUIREMENT: &str = ">=0.8.0, <0.10.0";
+const BIFROST_REQUIREMENT: &str = ">=0.8.0, <0.11.0";
 
 /// The authored golden content is Bifrost's own claim, licensed like the
 /// workspace. It is not a slice of the JDK.

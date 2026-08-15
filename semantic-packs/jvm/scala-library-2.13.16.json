@@ -13,7 +13,7 @@
     "container": null
   },
   "compatibility": {
-    "bifrost": ">=0.8.18, <0.10.0",
+    "bifrost": ">=0.8.18, <0.11.0",
     "toolchains": [
       {
         "name": "scala",

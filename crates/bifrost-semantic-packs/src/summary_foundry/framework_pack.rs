@@ -78,7 +78,7 @@ const PRODUCER_NAME: &str = "bifrost-framework-foundry";
 const PACK_CONTENT_VERSION: &str = "0.1.0";
 
 /// The Bifrost compatibility requirement every generated pack declares.
-const BIFROST_REQUIREMENT: &str = ">=0.8.0, <0.10.0";
+const BIFROST_REQUIREMENT: &str = ">=0.8.0, <0.11.0";
 
 /// The authored framework declarations are Bifrost's own recorded surface,
 /// licensed like the workspace. They are not a slice of the described library.

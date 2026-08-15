@@ -1123,8 +1123,10 @@ test("server startup logs preferred and selected versions for a compatible fallb
   const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
   const binary = path.join(temp, "bifrost");
   const release = await readReleaseMetadata(path.join(packageDir, "bifrost-release.json"));
-  const [major, minor] = release.binaryVersion.split(".");
-  const selected = `${major}.${minor}.0`;
+  const [major, minor, preferredPatch] = release.binaryVersion.split(".").map(Number);
+  const minimumPatch = Number(release.minimumBinaryVersion.split(".")[2]);
+  const selectedPatch = minimumPatch < preferredPatch ? minimumPatch : preferredPatch + 1;
+  const selected = `${major}.${minor}.${selectedPatch}`;
   await writeExecutableFixture(binary, `#!/bin/sh
 if [ "$1" = "--version" ]; then
   echo "bifrost ${selected}"

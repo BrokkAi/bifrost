@@ -6,6 +6,10 @@ const release = readFileSync(
   new URL("../.github/workflows/release.yml", import.meta.url),
   "utf8",
 );
+const docs = readFileSync(
+  new URL("../.github/workflows/docs.yml", import.meta.url),
+  "utf8",
+);
 const releaseContext = readFileSync(
   new URL("../.github/workflows/release-context.yml", import.meta.url),
   "utf8",
@@ -78,6 +82,14 @@ test("release triggers stay independent from source projection", () => {
     assert.doesNotMatch(publisher, /^  push:/mu);
     assert.doesNotMatch(publisher, /^  workflow_dispatch:/mu);
   }
+});
+
+test("tag-driven docs publication is restricted to the public repository", () => {
+  assert.match(docs, /^  push:\n    tags:/mu);
+  assert.match(
+    jobBlock(docs, "build"),
+    /^    if: \$\{\{ github\.repository == 'BrokkAi\/bifrost' && github\.event\.repository\.private == false \}\}$/mu,
+  );
 });
 
 test("uv CLI package exposes bifrost through its package name", () => {

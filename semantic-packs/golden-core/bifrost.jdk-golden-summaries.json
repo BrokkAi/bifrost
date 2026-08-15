@@ -9,7 +9,7 @@
   "language": "java",
   "ecosystem": "jdk",
   "compatibility": {
-    "bifrost": ">=0.8.0, <0.10.0",
+    "bifrost": ">=0.8.0, <0.11.0",
     "toolchains": [
       {
         "name": "jdk",

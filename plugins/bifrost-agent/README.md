@@ -146,7 +146,7 @@ pi install "$(pwd)"
 After `@brokk/bifrost-agent` is published to npm, install a pinned release with:
 
 ```bash
-pi install npm:@brokk/bifrost-agent@0.9.5
+pi install npm:@brokk/bifrost-agent@0.10.0
 ```
 
 Run `/bifrost` in Pi's interactive TUI to configure Bifrost for the current
