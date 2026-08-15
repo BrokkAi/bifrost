@@ -1,0 +1,156 @@
+{
+  "policyRootUri": "file:///workspace",
+  "reportRootUri": "file:///workspace",
+  "report": {
+    "schema_version": 4,
+    "evaluation": {
+      "evaluation_date": "2026-08-14",
+      "suppression_path": ".bifrost/suppressions.json",
+      "suppression_document_state": "not_found",
+      "scope_path": ".bifrost/policy-scope.json",
+      "scope_document_state": "not_found"
+    },
+    "execution": {
+      "total_elapsed_ms": 1,
+      "stage_timings": [],
+      "termination": null,
+      "terminal_stage": null,
+      "active_policy_id": null,
+      "completed_policy_ids": ["demo.taint.user-input-to-eval"],
+      "pending_policy_ids": []
+    },
+    "rules": [
+      {
+        "policy_id": "demo.taint.user-input-to-eval",
+        "name": "User input reaches eval",
+        "analysis_type": "taint",
+        "message": { "type": "static", "text": "Attacker-controlled input reaches eval" },
+        "severity": { "type": "fixed", "level": "warning" }
+      }
+    ],
+    "runs": [
+      {
+        "policy_id": "demo.taint.user-input-to-eval",
+        "analysis_type": "taint",
+        "completion": { "type": "complete" },
+        "findings": [
+          {
+            "id": "425b4f5b4f05e18d456fe4ed70575ac1b65457489baa93cb2828dfd4b4c463c5",
+            "policy_id": "demo.taint.user-input-to-eval",
+            "severity": "warning",
+            "message": "Attacker-controlled input reaches eval",
+            "primary": {
+              "path": "Foo.java",
+              "region": {
+                "start_line": 14,
+                "start_column": 9,
+                "end_line": 14,
+                "end_column": 33
+              }
+            },
+            "display_path": {
+              "schema_version": 1,
+              "representative_witness_id": "bifrost:7647f52a5809d73d64b413513e962f0521bc3f3015f5adad812d2d79d06df74a",
+              "witness_ids": [
+                "bifrost:7647f52a5809d73d64b413513e962f0521bc3f3015f5adad812d2d79d06df74a",
+                "bifrost:b7bea1bc211511fcbe79be1b8346b2bc9e43b8c446d650e909ed4e6d142b0719",
+                "bifrost:c6244cb88c222af639ccb01f6fe1d41cc38a6b063cd010a79fdfe3101d2ab39d"
+              ],
+              "steps": [
+                {
+                  "kind": "source",
+                  "location": {
+                    "path": "Foo.java",
+                    "byte_span": { "start": 250, "end": 261 },
+                    "region": {
+                      "start_line": 14,
+                      "start_column": 20,
+                      "end_line": 14,
+                      "end_column": 31
+                    }
+                  },
+                  "label": "userInput()"
+                },
+                {
+                  "kind": "call",
+                  "location": {
+                    "path": "Foo.java",
+                    "byte_span": { "start": 244, "end": 262 },
+                    "region": {
+                      "start_line": 14,
+                      "start_column": 14,
+                      "end_line": 14,
+                      "end_column": 32
+                    }
+                  },
+                  "label": "relay(userInput())"
+                },
+                {
+                  "kind": "propagation",
+                  "location": {
+                    "path": "Foo.java",
+                    "byte_span": { "start": 145, "end": 158 },
+                    "region": {
+                      "start_line": 8,
+                      "start_column": 9,
+                      "end_line": 8,
+                      "end_column": 22
+                    }
+                  },
+                  "label": "return value;"
+                },
+                {
+                  "kind": "return",
+                  "location": {
+                    "path": "Foo.java",
+                    "byte_span": { "start": 244, "end": 262 },
+                    "region": {
+                      "start_line": 14,
+                      "start_column": 14,
+                      "end_line": 14,
+                      "end_column": 32
+                    }
+                  },
+                  "label": "return from relay(userInput())"
+                },
+                {
+                  "kind": "sink",
+                  "location": {
+                    "path": "Foo.java",
+                    "byte_span": { "start": 239, "end": 263 },
+                    "region": {
+                      "start_line": 14,
+                      "start_column": 9,
+                      "end_line": 14,
+                      "end_column": 33
+                    }
+                  },
+                  "label": "eval(relay(userInput()))"
+                }
+              ],
+              "canonical_incomplete": false,
+              "omitted_meaningful_steps": 0,
+              "alternatives_truncated": false,
+              "omitted_alternative_paths_lower_bound": 0,
+              "omitted_witnesses_lower_bound": 0
+            },
+            "witnesses": [
+              { "id": "bifrost:7647f52a5809d73d64b413513e962f0521bc3f3015f5adad812d2d79d06df74a" },
+              { "id": "bifrost:b7bea1bc211511fcbe79be1b8346b2bc9e43b8c446d650e909ed4e6d142b0719" },
+              { "id": "bifrost:c6244cb88c222af639ccb01f6fe1d41cc38a6b063cd010a79fdfe3101d2ab39d" }
+            ],
+            "suppression": null
+          }
+        ],
+        "diagnostics": [],
+        "diagnostics_truncated": false
+      }
+    ],
+    "suppressions": [],
+    "scope": [],
+    "diagnostics": [],
+    "diagnostics_truncated": false,
+    "omitted_diagnostics_lower_bound": 0,
+    "worst_omitted_diagnostic_severity": null
+  }
+}

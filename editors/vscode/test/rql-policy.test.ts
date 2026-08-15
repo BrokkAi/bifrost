@@ -85,7 +85,7 @@ function runner(overrides: Partial<RqlPolicyRunner> = {}): RqlPolicyRunner {
 void test("accepts the canonical Rust schema-4 one-finding contract artifact", () => {
   const fixture = JSON.parse(
     readFileSync(
-      resolve(__dirname, "../../../../tests/fixtures/policy-report/v4-one-finding.json"),
+      resolve(__dirname, "../../test/fixtures/policy-report/v4-one-finding.json"),
       "utf8"
     )
   ) as unknown;
@@ -102,7 +102,7 @@ void test("accepts the canonical Rust schema-4 one-finding contract artifact", (
 void test("keeps the Java relay display rows in server order for the policy tree", () => {
   const fixture = JSON.parse(
     readFileSync(
-      resolve(__dirname, "../../../../tests/fixtures/policy-report/v4-java-display-path.json"),
+      resolve(__dirname, "../../test/fixtures/policy-report/v4-java-display-path.json"),
       "utf8"
     )
   ) as unknown;

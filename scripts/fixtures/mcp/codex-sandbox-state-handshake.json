@@ -1,0 +1,56 @@
+{
+  "description": "Recorded Codex MCP handshake shape used to replay active-task workspace binding without inventing roots support.",
+  "source": "Codex CLI 0.145.0-alpha.30 during the issue #1067 investigation on 2026-07-22",
+  "placeholders": {
+    "__BIFROST_SANDBOX_CWD__": "Canonical file URI for the active task workspace",
+    "__BIFROST_THREAD_ID__": "Current Codex task identifier",
+    "__BIFROST_SYMBOL_PATTERN__": "Search pattern used by the smoke or integration test"
+  },
+  "initialize": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+      "protocolVersion": "2025-06-18",
+      "capabilities": {
+        "elicitation": {}
+      },
+      "clientInfo": {
+        "name": "codex-mcp-client",
+        "title": "Codex",
+        "version": "0.145.0-alpha.30"
+      }
+    }
+  },
+  "initialized": {
+    "jsonrpc": "2.0",
+    "method": "notifications/initialized"
+  },
+  "toolCall": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/call",
+    "params": {
+      "name": "search_symbols",
+      "arguments": {
+        "patterns": [
+          "__BIFROST_SYMBOL_PATTERN__"
+        ]
+      },
+      "_meta": {
+        "threadId": "__BIFROST_THREAD_ID__",
+        "codex/sandbox-state-meta": {
+          "permissionProfile": {
+            "type": "workspace-write",
+            "writableRoots": [
+              "__BIFROST_SANDBOX_CWD__"
+            ]
+          },
+          "codexLinuxSandboxExe": null,
+          "sandboxCwd": "__BIFROST_SANDBOX_CWD__",
+          "useLegacyLandlock": false
+        }
+      }
+    }
+  }
+}

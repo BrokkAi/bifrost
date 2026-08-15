@@ -14,7 +14,7 @@ import { toolInventoryFromMarkdown, unavailableSkillTools } from "./skill-tool-c
 const execFileAsync = promisify(execFile);
 const codexHandshake = JSON.parse(
   await fs.readFile(
-    new URL("../tests/fixtures/mcp/codex-sandbox-state-handshake.json", import.meta.url),
+    new URL("./fixtures/mcp/codex-sandbox-state-handshake.json", import.meta.url),
     "utf8"
   )
 );
