@@ -1362,7 +1362,10 @@ jobs:
             {
               git diff --name-only
               git diff --cached --name-only
-              git ls-files --others --exclude-standard
+              # Release artifacts are downloaded into this otherwise-untracked
+              # directory; keep the source-tree guard applied to tracked files
+              # and every other untracked path.
+              git ls-files --others --exclude-standard -- ':!dist/**'
             } | LC_ALL=C sort -u
           )
 

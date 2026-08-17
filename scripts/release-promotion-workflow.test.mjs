@@ -359,7 +359,10 @@ test("generated release metadata is exported without writing public source", () 
     metadataExport,
     /name: bifrost-release-metadata-\$\{\{ needs\.release-context\.outputs\.tag \}\}/u,
   );
-  assert.match(metadataExport, /git ls-files --others --exclude-standard/u);
+  assert.match(
+    metadataExport,
+    /git ls-files --others --exclude-standard -- ':!dist\/\*\*'/u,
+  );
   for (const forbidden of [
     /contents: write/u,
     /\bgit add\b/u,
