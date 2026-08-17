@@ -32,7 +32,7 @@ use tree_sitter::Node;
 
 use crate::syntax::{
     expression_name_node, python_deferred_annotation_identifier_ranges,
-    python_keyword_argument_label, python_node_is_in_annotation,
+    python_node_is_in_annotation,
 };
 
 #[derive(Debug, Default)]
@@ -156,7 +156,7 @@ fn python_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
             OccurrenceRole::Binder
         }
         "for_statement" | "for_in_clause" if field == Some("left") => OccurrenceRole::Binder,
-        "keyword_argument" if python_keyword_argument_label(node) => OccurrenceRole::LabelOrKey,
+        "keyword_argument" if field == Some("name") => OccurrenceRole::LabelOrKey,
         "attribute" => match field {
             Some("attribute") => OccurrenceRole::MemberPosition,
             Some("object") => OccurrenceRole::ReceiverPosition,

@@ -30,8 +30,6 @@ use brokk_bifrost_rust::graph_support::{
 use brokk_bifrost_rust::lexical_scope;
 use std::cell::RefCell;
 
-use super::{DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND, LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND};
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RustResolutionSemantics {
     Full,
@@ -239,25 +237,22 @@ pub(super) fn resolve_rust(
     if !support.observe_cancellation() {
         return outcome;
     }
-    let cargo_scope = resolve_analyzer::<RustAnalyzer>(analyzer).and_then(|rust| {
-        rust_cargo_reference_scope(rust, file, source, tree, site).map(|scope| (rust, scope))
-    });
-    let outcome = match cargo_scope {
-        Some((rust, scope)) => {
-            let direct_crate_reference =
-                tree.and_then(|tree| rust_direct_crate_root_reference(source, tree, site));
-            rust_scope_forward_candidates_to_cargo_target(
-                rust,
-                support,
-                file,
-                scope,
-                direct_crate_reference,
-                outcome,
-            )
-        }
-        None => outcome,
+    let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
+        return outcome;
     };
-    rust_filter_associated_call_outcome(analyzer, support, source, tree, site, outcome)
+    let Some(scope) = rust_cargo_reference_scope(rust, file, source, tree, site) else {
+        return outcome;
+    };
+    let direct_crate_reference =
+        tree.and_then(|tree| rust_direct_crate_root_reference(source, tree, site));
+    rust_scope_forward_candidates_to_cargo_target(
+        rust,
+        support,
+        file,
+        scope,
+        direct_crate_reference,
+        outcome,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -345,7 +340,7 @@ fn resolve_rust_bounded_in_session(
 
     if node.kind() == "self" && focused_rust_field_receiver(node, site.focus_start_byte) {
         return no_definition(
-            LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+            "local_receiver",
             "the focused Rust receiver is a local expression, which is not indexed",
         );
     }
@@ -651,33 +646,40 @@ fn rust_scope_forward_candidates_to_cargo_target(
         return outcome;
     }
     // `Self` resolution already carries the exact enclosing impl identity in
-    // the CodeUnit signature. Expanding that result by FQN can introduce
-    // unrelated associated items from other impls whose analyzer identity is
-    // necessarily the same (for example several `Alias<S>::Output` items).
-    // Keep the lexical result exact and only use Cargo membership to validate
-    // that result below.
-    let preserve_exact_lexical_self = matches!(&scope, RustCargoReferenceScope::LexicalSelf);
+    // the CodeUnit signature. Same-file declarations can nevertheless share
+    // its analyzer FQN (for example impls for `T` and `&[T]`). Preserve every
+    // exact outcome from those files while still admitting other-file replicas
+    // for the Cargo target router to select between independent roots.
+    let exact_lexical_self_files = if matches!(&scope, RustCargoReferenceScope::LexicalSelf) {
+        outcome
+            .definitions
+            .iter()
+            .map(|definition| definition.source().clone())
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::default()
+    };
     let mut expanded = outcome.definitions.clone();
-    if !preserve_exact_lexical_self {
-        for definition in &outcome.definitions {
-            expanded.extend(
-                support
-                    .fqn(&definition.fq_name())
-                    .into_iter()
-                    .filter(|candidate| {
-                        rust_same_declaration_namespace(rust, definition, candidate)
-                    }),
-            );
-            expanded.extend(
-                support
-                    .file_identifier(file, definition.identifier())
-                    .into_iter()
-                    .filter(|candidate| {
-                        candidate.fq_name() == definition.fq_name()
-                            && rust_same_declaration_namespace(rust, definition, candidate)
-                    }),
-            );
-        }
+    for definition in &outcome.definitions {
+        expanded.extend(
+            support
+                .fqn(&definition.fq_name())
+                .into_iter()
+                .filter(|candidate| {
+                    !exact_lexical_self_files.contains(candidate.source())
+                        && rust_same_declaration_namespace(rust, definition, candidate)
+                }),
+        );
+        expanded.extend(
+            support
+                .file_identifier(file, definition.identifier())
+                .into_iter()
+                .filter(|candidate| {
+                    !exact_lexical_self_files.contains(candidate.source())
+                        && candidate.fq_name() == definition.fq_name()
+                        && rust_same_declaration_namespace(rust, definition, candidate)
+                }),
+        );
     }
     sort_units(&mut expanded);
     expanded.dedup();
@@ -806,30 +808,6 @@ fn resolve_rust_unscoped(
     }
     if let Some(tree) = tree
         && let Some(outcome) =
-            rust_imported_pattern_variant_outcome(rust, support, file, source, tree, site)
-    {
-        return outcome;
-    }
-    // An impl associated type is both a declaration site and a navigation
-    // source: declaration jumps to the trait contract, while definition stays
-    // on the concrete impl item. Handle that exact structured shape before the
-    // generic declaration-name guard rejects it as a non-reference.
-    if let Some(operation) = operation
-        && let Some(tree) = tree
-        && let Some(outcome) = rust_impl_associated_type_declaration_outcome(
-            rust,
-            support,
-            file,
-            source,
-            tree,
-            site,
-            Some(operation),
-        )
-    {
-        return outcome;
-    }
-    if let Some(tree) = tree
-        && let Some(outcome) =
             rust_exact_reference_role_outcome(analyzer, support, file, source, tree, site)
     {
         return outcome;
@@ -852,30 +830,30 @@ fn resolve_rust_unscoped(
             site.focus_end_byte,
         )
         && matches!(node.kind(), "identifier" | "shorthand_field_identifier")
+        && (lexical_scope::is_pattern_binding_identifier(node)
+            || lexical_scope::name_shadowed_in_tree(
+                tree.root_node(),
+                source,
+                reference,
+                site.focus_start_byte,
+            ))
     {
-        let shadowed = lexical_scope::name_shadowed_in_tree(
-            tree.root_node(),
-            source,
-            reference,
-            site.focus_start_byte,
+        return no_definition(
+            "local_binding",
+            format!("`{reference}` is a local Rust binding, which is not indexed"),
         );
-        if lexical_scope::is_pattern_binding_identifier(node) && !shadowed {
-            return no_definition(
-                "local_binding",
-                format!("`{reference}` is a local Rust binding, which is not indexed"),
-            );
-        }
-        if shadowed {
-            return no_definition(
-                LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
-                format!("`{reference}` is a local Rust binding, which is not indexed"),
-            );
-        }
     }
     if let Some(tree) = tree
         && let Some(operation) = operation
         && let Some(outcome) = rust_qualified_associated_type_navigation_outcome(
             rust, analyzer, support, file, source, tree, site, operation,
+        )
+    {
+        return outcome;
+    }
+    if let Some(tree) = tree
+        && let Some(outcome) = rust_impl_associated_type_declaration_outcome(
+            rust, support, file, source, tree, site, operation,
         )
     {
         return outcome;
@@ -889,7 +867,7 @@ fn resolve_rust_unscoped(
     }
     if let Some(tree) = tree
         && let Some(candidates) =
-            rust_self_scoped_associated_type_candidates(rust, analyzer, file, source, tree, site)
+            rust_self_scoped_associated_type_candidates(analyzer, file, source, tree, site)
         && !candidates.is_empty()
     {
         return candidates_outcome(candidates);
@@ -1086,7 +1064,7 @@ fn resolve_rust_unscoped(
                 )
             {
                 return no_definition(
-                    LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+                    "local_binding",
                     format!("`{reference}` is a local Rust item, which is not indexed"),
                 );
             }
@@ -1216,49 +1194,44 @@ fn resolve_rust_unscoped(
                     ));
                 }
                 RustVisibleImportResolution::Unbound => {
-                    // A bare name is first resolved in its physical module. The
-                    // enclosing CodeUnit can have a different logical owner -- for
-                    // example, a child-file `impl From<Local> for parent::Local`
-                    // is stored beneath the parent type -- and must not make that
-                    // owner shadow the child module's own declaration (#2129).
-                    let module = rust_current_module_candidates(
-                        analyzer,
-                        rust,
-                        support,
-                        file,
-                        tree.root_node(),
-                        site.focus_start_byte,
-                        site.focus_end_byte,
-                        reference,
-                        role,
-                    );
-                    if !module.is_empty() {
-                        trace_selected_units(&module, PrecedenceTier::PackageOrModule);
-                        module
-                    } else {
-                        // Only an unbound name may fall back to a lexically
-                        // enclosing declaration. An explicit import is
-                        // authoritative even when a same-named type exists in
-                        // the surrounding file/module.
-                        let lexical = (role == RustBareReferenceRole::Type)
-                            .then(|| {
-                                resolve_in_enclosing_scopes(
-                                    analyzer,
-                                    file,
-                                    reference,
-                                    site.focus_start_byte,
-                                    CodeUnit::is_class,
-                                )
-                            })
-                            .flatten();
-                        lexical.map_or_else(Vec::new, |unit| {
+                    // Only an unbound name may fall back to a lexically enclosing
+                    // declaration. An explicit import is authoritative even when a
+                    // same-named type exists in the surrounding file/module.
+                    let lexical = (role == RustBareReferenceRole::Type)
+                        .then(|| {
+                            resolve_in_enclosing_scopes(
+                                analyzer,
+                                file,
+                                reference,
+                                site.focus_start_byte,
+                                CodeUnit::is_class,
+                            )
+                        })
+                        .flatten();
+                    lexical.map_or_else(
+                        || {
+                            let module = rust_current_module_candidates(
+                                analyzer,
+                                rust,
+                                support,
+                                file,
+                                tree.root_node(),
+                                site.focus_start_byte,
+                                site.focus_end_byte,
+                                reference,
+                                role,
+                            );
+                            trace_selected_units(&module, PrecedenceTier::PackageOrModule);
+                            module
+                        },
+                        |unit| {
                             trace_selected_units(
                                 std::slice::from_ref(&unit),
                                 PrecedenceTier::OwnMember,
                             );
                             vec![unit]
-                        })
-                    }
+                        },
+                    )
                 }
             }
         } else {
@@ -1330,7 +1303,7 @@ fn rust_struct_field_name_outcome(
                 && name.end_byte() == site.focus_end_byte =>
         {
             Some(no_definition(
-                DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND,
+                "declaration_site",
                 "Rust field declaration names do not reference another definition",
             ))
         }
@@ -1345,7 +1318,7 @@ fn rust_struct_field_name_outcome(
                 field.kind() == "field_pattern" && field.child_by_field_name("pattern").is_none()
             }) {
                 return Some(no_definition(
-                    LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+                    "local_binding",
                     "Rust shorthand struct-pattern fields introduce local bindings",
                 ));
             }
@@ -1431,12 +1404,6 @@ fn rust_exact_reference_role_outcome(
 ) -> Option<DefinitionLookupOutcome> {
     let focused =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
-    if brokk_bifrost_rust::graph::ast::is_rust_declaration_name(focused) {
-        return Some(no_definition(
-            DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND,
-            "Rust declaration names do not reference another definition",
-        ));
-    }
     if crate::analyzer::usages::rust_graph::rust_bare_token_tree_non_reference_role(focused, source)
     {
         let focused_name = rust_node_text(focused, source).trim();
@@ -1449,13 +1416,13 @@ fn rust_exact_reference_role_outcome(
     }
     if rust_enclosing_lifetime(focused).is_some() {
         return Some(no_definition(
-            LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+            "local_lifetime",
             "Rust lifetime parameters are lexical bindings and are not indexed definitions",
         ));
     }
     if focused.kind() == "self" && focused_rust_field_receiver(focused, site.focus_start_byte) {
         return Some(no_definition(
-            LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+            "local_receiver",
             "the focused Rust receiver is a local expression, which is not indexed",
         ));
     }
@@ -1465,7 +1432,7 @@ fn rust_exact_reference_role_outcome(
         && rust_type_parameter_visible_from(focused, source, focused_name)
     {
         return Some(no_definition(
-            LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+            "local_type_parameter",
             format!("`{focused_name}` is a lexical Rust type parameter, which is not indexed"),
         ));
     }
@@ -1493,79 +1460,22 @@ fn rust_exact_reference_role_outcome(
         );
     }
 
-    if matches!(focused.kind(), "identifier" | "shorthand_field_identifier") {
-        let shadowed = lexical_scope::name_shadowed_in_tree(
-            tree.root_node(),
-            source,
-            focused_name,
-            site.focus_start_byte,
-        );
-        if lexical_scope::is_pattern_binding_identifier(focused) && !shadowed {
-            return Some(no_definition(
-                "local_binding",
-                format!("`{focused_name}` is a local Rust binding, which is not indexed"),
-            ));
-        }
-        if shadowed
-            && (rust_identifier_is_explicit_receiver(focused) || !site.text.contains(['.', ':']))
-        {
-            return Some(no_definition(
-                LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
-                format!("`{focused_name}` is a local Rust binding, which is not indexed"),
-            ));
-        }
+    if matches!(focused.kind(), "identifier" | "shorthand_field_identifier")
+        && (lexical_scope::is_pattern_binding_identifier(focused)
+            || (lexical_scope::name_shadowed_in_tree(
+                tree.root_node(),
+                source,
+                focused_name,
+                site.focus_start_byte,
+            ) && (rust_identifier_is_explicit_receiver(focused)
+                || !site.text.contains(['.', ':']))))
+    {
+        return Some(no_definition(
+            "local_binding",
+            format!("`{focused_name}` is a local Rust binding, which is not indexed"),
+        ));
     }
     None
-}
-
-fn rust_imported_pattern_variant_outcome(
-    rust: &RustAnalyzer,
-    support: &dyn RustDefinitionProvider,
-    file: &ProjectFile,
-    source: &str,
-    tree: &Tree,
-    site: &ResolvedReferenceSite,
-) -> Option<DefinitionLookupOutcome> {
-    let focused =
-        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
-    let possible_unit_variant = lexical_scope::is_pattern_binding_identifier(focused);
-    let possible_constructor_variant =
-        std::iter::successors(focused.parent(), |node| node.parent())
-            .take_while(|node| !matches!(node.kind(), "match_arm" | "block" | "function_item"))
-            .any(|node| {
-                matches!(node.kind(), "tuple_struct_pattern" | "struct_pattern")
-                    && node
-                        .child_by_field_name("type")
-                        .is_some_and(|r#type| node_within(r#type, focused))
-            });
-    if !possible_unit_variant && !possible_constructor_variant {
-        return None;
-    }
-
-    let name = rust_node_text(focused, source).trim();
-    if name.is_empty() {
-        return None;
-    }
-    let candidates = match rust_visible_import_resolution(
-        rust,
-        support,
-        file,
-        source,
-        site.focus_start_byte,
-        name,
-        RustBareReferenceRole::Value,
-    ) {
-        RustVisibleImportResolution::Resolved(candidates)
-        | RustVisibleImportResolution::GlobResolved(candidates) => candidates,
-        RustVisibleImportResolution::BoundButUnindexed
-        | RustVisibleImportResolution::GlobBoundButUnindexed
-        | RustVisibleImportResolution::Unbound => return None,
-    };
-    let variants: Vec<_> = candidates
-        .into_iter()
-        .filter(|candidate| rust_declaration_is_enum_variant(rust, candidate))
-        .collect();
-    (!variants.is_empty()).then(|| candidates_outcome(variants))
 }
 
 fn rust_enclosing_lifetime(mut node: Node<'_>) -> Option<Node<'_>> {
@@ -1932,7 +1842,7 @@ fn rust_visible_import_resolution(
                 role,
             );
             routed_glob_candidates =
-                rust_glob_forward_export_candidates(rust, support, file, &binder, reference, role);
+                rust_glob_forward_export_candidates(rust, file, &binder, reference, role);
             if scoped_glob_resolution.is_some() {
                 targets.clear();
             }
@@ -2077,14 +1987,12 @@ fn rust_visible_import_resolution(
 
 fn rust_glob_forward_export_candidates(
     rust: &RustAnalyzer,
-    support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     binder: &ImportBinder,
     reference: &str,
     role: RustBareReferenceRole,
 ) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
-    let refs = support.forward_reference_context(rust, file);
     for binding in binder
         .bindings
         .values()
@@ -2098,25 +2006,15 @@ fn rust_glob_forward_export_candidates(
             continue;
         }
         let module_files = resolve_module_files(rust, file, &binding.module_specifier);
-        if let Some(fqn) = forward_export_fqn_from_files(rust, &module_files, reference) {
-            candidates.extend(
-                rust.get_definitions(&fqn)
-                    .into_iter()
-                    .filter(|candidate| rust_role_accepts_imported(rust, role, candidate)),
-            );
-        }
-        if let Some(owner) = refs
-            .as_ref()
-            .and_then(|refs| resolve_rust_path_fqn(rust, refs, file, &binding.module_specifier))
-        {
-            candidates.extend(
-                support
-                    .fqn(&format!("{owner}.{reference}"))
-                    .into_iter()
-                    .filter(|candidate| rust_role_accepts_imported(rust, role, candidate))
-                    .filter(|candidate| rust_declaration_is_enum_variant(rust, candidate)),
-            );
-        }
+        let Some(fqn) = forward_export_fqn_from_files(rust, &module_files, reference) else {
+            continue;
+        };
+        let definitions = rust.get_definitions(&fqn);
+        candidates.extend(
+            definitions
+                .into_iter()
+                .filter(|candidate| rust_role_accepts_imported(rust, role, candidate)),
+        );
     }
     sort_units(&mut candidates);
     candidates.dedup();
@@ -2192,7 +2090,6 @@ fn rust_scoped_glob_forward_import_candidates(
     let mut candidates = Vec::new();
     let mut saw_scoped_glob = false;
     let mut crossed_unindexed_explicit_binding = false;
-    let refs = support.forward_reference_context(rust, file);
     for binding in binder.bindings.values() {
         let segments = crate::analyzer::symbol_lookup::parse_symbol_path(
             Language::Rust,
@@ -2204,18 +2101,6 @@ fn rust_scoped_glob_forward_import_candidates(
             continue;
         }
         saw_scoped_glob = true;
-        if let Some(owner) = refs
-            .as_ref()
-            .and_then(|refs| resolve_rust_path_fqn(rust, refs, file, &binding.module_specifier))
-        {
-            candidates.extend(
-                support
-                    .fqn(&format!("{owner}.{reference}"))
-                    .into_iter()
-                    .filter(|candidate| rust_role_accepts_imported(rust, role, candidate))
-                    .filter(|candidate| rust_declaration_is_enum_variant(rust, candidate)),
-            );
-        }
         let Some(package) = resolve_rust_import_package_scoped(
             rust,
             file,
@@ -2453,6 +2338,7 @@ fn rust_current_module_candidates(
         enclosing.push(unit.clone());
         current = analyzer.parent_of(&unit);
     }
+    let reference_module = enclosing.iter().find(|unit| unit.is_module());
     let reference_syntax_module = lexical_scope::enclosing_mod_item_range_at(root, reference_start);
     let mut physical = analyzer
         .declarations(file)
@@ -2469,10 +2355,27 @@ fn rust_current_module_candidates(
         .into_iter()
         .filter(|candidate| rust_role_accepts_current_module(rust, role, candidate))
         .filter(|candidate| {
-            analyzer.ranges(candidate).iter().any(|range| {
-                rust_declaration_syntax_module_range(root, range, candidate.is_module())
-                    == reference_syntax_module
-            })
+            let mut parent = analyzer.parent_of(candidate);
+            let mut candidate_module = None;
+            while let Some(unit) = parent {
+                if unit.is_module() {
+                    candidate_module = Some(unit);
+                    break;
+                }
+                parent = analyzer.parent_of(&unit);
+            }
+            if reference_module.is_some() {
+                candidate_module.as_ref() == reference_module
+            } else {
+                analyzer
+                    .ranges(candidate)
+                    .first()
+                    .map(|range| {
+                        rust_declaration_syntax_module_range(root, range, candidate.is_module())
+                            == reference_syntax_module
+                    })
+                    .unwrap_or(reference_syntax_module.is_none())
+            }
         })
         .filter(|candidate| {
             analyzer.parent_of(candidate).is_none_or(|parent| {
@@ -2917,7 +2820,6 @@ fn rust_enclosing_named_associated_type(
 }
 
 fn rust_self_scoped_associated_type_candidates(
-    rust: &RustAnalyzer,
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
@@ -2939,35 +2841,6 @@ fn rust_self_scoped_associated_type_candidates(
     }
     let name = scoped.child_by_field_name("name")?;
     let name = rust_node_text(name, source).trim();
-    let Some(impl_item) = rust_enclosing_ancestor(scoped, "impl_item") else {
-        return resolve_in_enclosing_scopes(
-            analyzer,
-            file,
-            name,
-            site.focus_start_byte,
-            CodeUnit::is_field,
-        )
-        .map(|candidate| vec![candidate]);
-    };
-    if let Some(body) = impl_item.child_by_field_name("body") {
-        let mut cursor = body.walk();
-        for item in body.named_children(&mut cursor) {
-            if !matches!(item.kind(), "associated_type" | "type_item") {
-                continue;
-            }
-            let Some(item_name) = item.child_by_field_name("name") else {
-                continue;
-            };
-            if rust_node_text(item_name, source).trim() != name {
-                continue;
-            }
-            if let Some(candidate) =
-                rust_associated_type_declaration_for_exact_node(rust, file, item, name)
-            {
-                return Some(vec![candidate]);
-            }
-        }
-    }
     let candidate = resolve_in_enclosing_scopes(
         analyzer,
         file,
@@ -2975,6 +2848,9 @@ fn rust_self_scoped_associated_type_candidates(
         site.focus_start_byte,
         CodeUnit::is_field,
     );
+    let Some(impl_item) = rust_enclosing_ancestor(scoped, "impl_item") else {
+        return candidate.map(|candidate| vec![candidate]);
+    };
     let candidate_is_in_impl = candidate.as_ref().is_some_and(|candidate| {
         candidate.source() == file
             && analyzer.ranges(candidate).iter().any(|range| {
@@ -3597,7 +3473,7 @@ fn rust_focused_terminal_scoped_declaration_outcome(
         )
     {
         return Some(no_definition(
-            LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+            "local_binding",
             format!("`{owner}` is a local Rust item, which is not indexed"),
         ));
     }
@@ -3716,230 +3592,6 @@ fn rust_focused_terminal_scoped_declaration_outcome(
     sort_units(&mut candidates);
     candidates.dedup();
     (!candidates.is_empty()).then(|| candidates_outcome(candidates))
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum RustCallTypeMatch {
-    Coercion,
-    Exact,
-}
-
-fn rust_filter_associated_call_outcome(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn RustDefinitionProvider,
-    source: &str,
-    tree: Option<&Tree>,
-    site: &ResolvedReferenceSite,
-    outcome: DefinitionLookupOutcome,
-) -> DefinitionLookupOutcome {
-    if outcome.definitions.len() < 2 {
-        return outcome;
-    }
-    let Some(tree) = tree else {
-        return outcome;
-    };
-    let Some(focused) =
-        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)
-    else {
-        return outcome;
-    };
-    let Some(scoped) =
-        rust_enclosing_scoped_terminal_name(focused, site.focus_start_byte, site.focus_end_byte)
-    else {
-        return outcome;
-    };
-    let original_len = outcome.definitions.len();
-    let filtered = rust_associated_call_applicable_candidates(
-        analyzer,
-        support,
-        source,
-        tree.root_node(),
-        scoped,
-        outcome.definitions.clone(),
-    )
-    .filter(|filtered| !filtered.is_empty());
-    if let Some(filtered) = filtered.filter(|filtered| filtered.len() < original_len) {
-        candidates_outcome(filtered)
-    } else {
-        outcome
-    }
-}
-
-/// The positively applicable declarations for a one-argument scoped call.
-/// `None` means the node is not such a call; an empty vector means it is a call
-/// whose argument type provides no positive narrowing evidence.
-pub(crate) fn rust_associated_call_applicable_candidates(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn RustDefinitionProvider,
-    source: &str,
-    root: Node<'_>,
-    scoped: Node<'_>,
-    candidates: Vec<CodeUnit>,
-) -> Option<Vec<CodeUnit>> {
-    let argument = rust_single_scoped_call_argument(support, scoped)?;
-    let Some(actual) = rust_call_argument_type_spellings(support, root, source, argument) else {
-        return Some(Vec::new());
-    };
-    let scored = candidates
-        .iter()
-        .filter_map(|candidate| {
-            let candidate_signature = candidate.signature()?;
-            let expected = support
-                .signature_metadata(analyzer, candidate)
-                .into_iter()
-                .find_map(|metadata| {
-                    if !candidate_signature.ends_with(metadata.label()) {
-                        return None;
-                    }
-                    match metadata.callable_parameter_types()? {
-                        [expected] => Some(expected.to_owned()),
-                        _ => None,
-                    }
-                })?;
-            actual
-                .iter()
-                .find_map(|(spelling, rank)| (spelling == &expected).then_some(*rank))
-                .map(|rank| (candidate.clone(), rank))
-        })
-        .collect::<Vec<_>>();
-    let Some(best) = scored.iter().map(|(_, rank)| *rank).max() else {
-        return Some(Vec::new());
-    };
-    Some(
-        scored
-            .into_iter()
-            .filter_map(|(candidate, rank)| (rank == best).then_some(candidate))
-            .collect(),
-    )
-}
-
-fn rust_single_scoped_call_argument<'tree>(
-    support: &dyn RustDefinitionProvider,
-    scoped: Node<'tree>,
-) -> Option<Node<'tree>> {
-    let mut function = scoped;
-    while let Some(parent) = function.parent()
-        && parent.kind() == "generic_function"
-        && parent.child_by_field_name("function") == Some(function)
-    {
-        if !support.scope_step() {
-            return None;
-        }
-        function = parent;
-    }
-    let call = function.parent()?;
-    if call.kind() != "call_expression"
-        || call.child_by_field_name("function") != Some(function)
-        || !support.scope_step()
-    {
-        return None;
-    }
-    let arguments = call.child_by_field_name("arguments")?;
-    let mut cursor = arguments.walk();
-    let mut values = arguments
-        .named_children(&mut cursor)
-        .filter(|child| child.kind() != "attribute_item");
-    let argument = values.next()?;
-    values.next().is_none().then_some(argument)
-}
-
-fn rust_call_argument_type_spellings(
-    support: &dyn RustDefinitionProvider,
-    root: Node<'_>,
-    source: &str,
-    argument: Node<'_>,
-) -> Option<Vec<(String, RustCallTypeMatch)>> {
-    let type_node = match argument.kind() {
-        "identifier" => {
-            let name = rust_node_text(argument, source).trim();
-            if name.is_empty() {
-                return None;
-            }
-            rust_binding_type_node_at(support, root, source, name, argument.start_byte())?
-        }
-        "cast_expression" => argument.child_by_field_name("type")?,
-        _ => return None,
-    };
-    let exact = rust_node_text(type_node, source).trim();
-    if exact.is_empty()
-        || (matches!(type_node.kind(), "identifier" | "type_identifier")
-            && rust_type_parameter_visible_from(type_node, source, exact))
-    {
-        return None;
-    }
-    let mut spellings = vec![(exact.to_string(), RustCallTypeMatch::Exact)];
-    if type_node.kind() == "reference_type" {
-        let inner = type_node.child_by_field_name("type")?;
-        let mutable = (0..type_node.named_child_count()).any(|index| {
-            type_node
-                .named_child(index)
-                .is_some_and(|child| child.kind() == "mutable_specifier")
-        });
-        let inner_text = rust_node_text(inner, source).trim();
-        if mutable && !inner_text.is_empty() {
-            spellings.push((format!("&{inner_text}"), RustCallTypeMatch::Coercion));
-        }
-        if inner.kind() == "array_type"
-            && inner.child_by_field_name("length").is_some()
-            && let Some(element) = inner.child_by_field_name("element")
-        {
-            let element = rust_node_text(element, source).trim();
-            if !element.is_empty() {
-                spellings.push((format!("&[{element}]"), RustCallTypeMatch::Coercion));
-            }
-        }
-    }
-    Some(spellings)
-}
-
-fn rust_binding_type_node_at<'tree>(
-    support: &dyn RustDefinitionProvider,
-    root: Node<'tree>,
-    source: &str,
-    name: &str,
-    before_byte: usize,
-) -> Option<Node<'tree>> {
-    let mut found = None;
-    let mut pending = vec![root];
-    while let Some(node) = pending.pop() {
-        if !support.scope_step() {
-            return None;
-        }
-        if node.start_byte() >= before_byte {
-            continue;
-        }
-        match node.kind() {
-            "parameter" => {
-                if let Some((binding, type_node)) = rust_typed_binding(support, node, source)
-                    && binding == name
-                {
-                    found = Some(type_node);
-                }
-            }
-            "let_declaration" if node.end_byte() <= before_byte => {
-                if node
-                    .child_by_field_name("pattern")
-                    .and_then(|pattern| rust_simple_identifier_text(pattern, source))
-                    .is_some_and(|binding| binding == name)
-                    && let Some(type_node) = node.child_by_field_name("type")
-                {
-                    found = Some(type_node);
-                }
-            }
-            _ => {}
-        }
-        for index in (0..node.named_child_count()).rev() {
-            let Some(child) = node.named_child(index) else {
-                continue;
-            };
-            if child.start_byte() < before_byte
-                && !rust_scope_boundary_excludes_reference(child, before_byte)
-            {
-                pending.push(child);
-            }
-        }
-    }
-    found
 }
 
 fn rust_scoped_owner_and_member(
@@ -4802,7 +4454,7 @@ fn resolve_rust_field(
         {
             return (receiver.kind() == "self").then(|| {
                 no_definition(
-                    LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+                    "local_receiver",
                     "the focused Rust receiver is a local expression, which is not indexed",
                 )
             });

@@ -247,15 +247,22 @@ pub fn csharp_source_name_segment(segment: &str) -> &str {
 }
 
 pub fn csharp_type_node_identity(node: Node<'_>, source: &str) -> String {
-    csharp_type_node_identity_with_terminal_suffix(node, source, "")
+    csharp_type_node_identity_with_terminal_suffix(node, source, "", false)
 }
 
 fn csharp_type_node_identity_with_terminal_suffix(
     node: Node<'_>,
     source: &str,
     terminal_suffix: &str,
+    strip_terminal_verbatim_prefix: bool,
 ) -> String {
-    csharp_type_node_segments_with_terminal_suffix(node, source, terminal_suffix).join(".")
+    csharp_type_node_segments_with_terminal_suffix(
+        node,
+        source,
+        terminal_suffix,
+        strip_terminal_verbatim_prefix,
+    )
+    .join(".")
 }
 
 /// The dotted parts of a C# type or namespace name, in order.
@@ -265,28 +272,14 @@ fn csharp_type_node_identity_with_terminal_suffix(
 /// the parts themselves and must not recover them by splitting the join, which
 /// an extern-alias qualifier or a generic arity marker would defeat.
 pub fn csharp_type_node_segments(node: Node<'_>, source: &str) -> Vec<String> {
-    csharp_type_node_segments_with_terminal_suffix(node, source, "")
-}
-
-/// A type-name segment with the verbatim-identifier `@` escape normalized off.
-///
-/// The escape is spelling, not identity: `@Wrapper` and `Wrapper` name the same
-/// declaration, and the declaration side records the canonical spelling, so a
-/// name segment built here has to agree (#2064). The shared sigil gates the
-/// strip on the `identifier` leaf kind, so a `predefined_type` is untouched.
-fn csharp_type_segment_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_ident_text(
-        node,
-        source,
-        true,
-        &crate::declarations::CSHARP_IDENTIFIER_SIGIL,
-    )
+    csharp_type_node_segments_with_terminal_suffix(node, source, "", false)
 }
 
 fn csharp_type_node_segments_with_terminal_suffix(
     node: Node<'_>,
     source: &str,
     terminal_suffix: &str,
+    strip_terminal_verbatim_prefix: bool,
 ) -> Vec<String> {
     let mut segments = Vec::new();
     let mut stack = vec![node];
@@ -318,7 +311,10 @@ fn csharp_type_node_segments_with_terminal_suffix(
                     .filter_map(|index| current.named_child(index))
                     .find(|child| child.kind() == "type_argument_list");
                 if let Some(name) = name {
-                    let source_name = csharp_type_segment_text(name, source);
+                    let source_name = source
+                        .get(name.start_byte()..name.end_byte())
+                        .unwrap_or("")
+                        .trim();
                     let arity = type_arguments.map_or(0, |arguments| arguments.named_child_count());
                     if !source_name.is_empty() {
                         segments.push(if arity == 0 {
@@ -351,7 +347,10 @@ fn csharp_type_node_segments_with_terminal_suffix(
                 }
             }
             "identifier" | "predefined_type" => {
-                let segment = csharp_type_segment_text(current, source);
+                let segment = source
+                    .get(current.start_byte()..current.end_byte())
+                    .unwrap_or("")
+                    .trim();
                 if !segment.is_empty() {
                     segments.push(segment.to_string());
                 }
@@ -368,6 +367,9 @@ fn csharp_type_node_segments_with_terminal_suffix(
         }
     }
     if let Some(terminal) = segments.last_mut() {
+        if strip_terminal_verbatim_prefix && terminal.starts_with('@') {
+            terminal.remove(0);
+        }
         terminal.push_str(terminal_suffix);
     }
     // An extern-alias qualifier binds tighter than the dots that follow it, so
@@ -383,9 +385,6 @@ fn csharp_type_node_segments_with_terminal_suffix(
 pub fn csharp_type_reference_root(mut node: Node<'_>) -> Option<Node<'_>> {
     loop {
         let parent = node.parent()?;
-        if csharp_declaration_expression_is_multiplication(parent) {
-            return None;
-        }
         if let Some(wrapper) = csharp_pattern_type_wrapper(parent, node) {
             node = wrapper;
             continue;
@@ -442,38 +441,6 @@ pub fn csharp_type_reference_root(mut node: Node<'_>) -> Option<Node<'_>> {
         }
         return None;
     }
-}
-
-/// Whether `node` is a `declaration_expression` the grammar produced for a
-/// multiplication rather than for a declaration.
-///
-/// C# admits a declaration expression only as an `out`, `ref`, or `in`
-/// argument, and the keyword is a child token of the enclosing `argument`. When
-/// the keyword is absent the parse is `Math.Abs(Width * Height)`, which the
-/// grammar splits into a `pointer_type` (`Width *`) plus a name (`Height`)
-/// because a pointer type and a multiplication share a spelling. Both operands
-/// are then values, so the `pointer_type` must not be read as a type reference
-/// role at all (#2061).
-fn csharp_declaration_expression_is_multiplication(node: Node<'_>) -> bool {
-    if node.kind() != "declaration_expression" {
-        return false;
-    }
-    if node
-        .child_by_field_name("type")
-        .is_none_or(|declared| declared.kind() != "pointer_type")
-    {
-        return false;
-    }
-    let Some(argument) = node.parent() else {
-        return false;
-    };
-    if argument.kind() != "argument" {
-        return false;
-    }
-    let mut cursor = argument.walk();
-    !argument
-        .children(&mut cursor)
-        .any(|child| matches!(child.kind(), "out" | "ref" | "in"))
 }
 
 fn csharp_pattern_type_wrapper<'tree>(
@@ -681,103 +648,6 @@ fn same_csharp_node(left: Node<'_>, right: Node<'_>) -> bool {
     left.start_byte() == right.start_byte() && left.end_byte() == right.end_byte()
 }
 
-/// Whether `node` is a bare occurrence of `value`, the parameter C# introduces
-/// implicitly inside a `set`, `init`, `add` or `remove` accessor.
-///
-/// `value` is a contextual keyword: the grammar tokenizes it as an ordinary
-/// `identifier`, so the accessor it sits in is the only structure that says what
-/// it names. C# gives every write accessor one implicit parameter of that
-/// spelling, and the language forbids declaring anything else called `value`
-/// inside the accessor's scope (CS0136), so a bare `value` under a write
-/// accessor always names that parameter and never a declaration of the enclosing
-/// type. No declaration index publishes an implicit parameter, so no forward
-/// lookup can reach one.
-///
-/// A qualified `x.value`, a named-argument label `f(value: 1)` and a declaration
-/// spelled `value` are excluded: each names something other than the implicit
-/// parameter, and each has its own structured answer.
-pub fn csharp_implicit_accessor_value(node: Node<'_>, source: &str) -> bool {
-    if node.kind() != "identifier"
-        || source.get(node.start_byte()..node.end_byte()) != Some("value")
-    {
-        return false;
-    }
-    if csharp_named_argument_label(node).is_some() {
-        return false;
-    }
-    if node.parent().is_some_and(|parent| {
-        matches!(
-            parent.kind(),
-            "member_access_expression"
-                | "member_binding_expression"
-                | "qualified_name"
-                | "alias_qualified_name"
-        ) && parent
-            .child_by_field_name("name")
-            .is_some_and(|name| same_csharp_node(name, node))
-    }) {
-        return false;
-    }
-    if csharp_local_binder_name(node) {
-        return false;
-    }
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        if parent.kind() == "accessor_declaration" {
-            return parent
-                .child_by_field_name("name")
-                .is_some_and(|name| matches!(name.kind(), "set" | "init" | "add" | "remove"));
-        }
-        current = parent;
-    }
-    false
-}
-
-/// Whether `node` names a binding at the point the C# grammar introduces it,
-/// for a binding kind C# analysis publishes no CodeUnit for: a pattern binder,
-/// a `foreach` variable, a `catch` binder, an `out var` declaration, a
-/// deconstruction designation, a tuple element name, a type parameter, a
-/// parameter, or a LINQ range variable.
-///
-/// [`crate::graph::extractor::is_declaration_name`] answers for the declaration
-/// names the analyzer DOES index; these are the rest. Every one of them is the
-/// grammar's own `name` field (or `foreach`'s `left`), so the role is read off
-/// the node rather than guessed from the spelling.
-pub fn csharp_local_binder_name(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    if parent.kind() == "foreach_statement" {
-        return parent
-            .child_by_field_name("left")
-            .is_some_and(|left| same_csharp_node(left, node));
-    }
-    matches!(
-        parent.kind(),
-        "tuple_element"
-            | "declaration_pattern"
-            | "recursive_pattern"
-            | "declaration_expression"
-            | "parenthesized_variable_designation"
-            | "catch_declaration"
-            | "type_parameter"
-            | "parameter"
-            | "from_clause"
-    ) && parent
-        .child_by_field_name("name")
-        .is_some_and(|name| same_csharp_node(name, node))
-}
-
-/// Whether `node` occupies a C# TYPE position: a structured type role, or an
-/// attribute's name, which the grammar spells outside the type roles even though
-/// it denotes an attribute type.
-///
-/// C# sorts a simple name into a type namespace or a value namespace from syntax
-/// alone, and only a type declaration can be the target of a type position.
-pub fn csharp_is_type_position(node: Node<'_>) -> bool {
-    csharp_type_reference_root(node).is_some() || csharp_attribute_name_node(node).is_some()
-}
-
 /// Return the structured name node when `node` is inside a C# attribute's name.
 /// Identifiers in an attribute argument deliberately do not count.
 pub fn csharp_attribute_name_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -848,7 +718,7 @@ fn csharp_attribute_of_argument(argument: Node<'_>) -> Option<Node<'_>> {
 /// with `Attribute` appended to its terminal AST segment. A verbatim identifier
 /// suppresses the suffix form.
 pub fn csharp_attribute_type_names(name: Node<'_>, source: &str) -> Vec<String> {
-    let exact = csharp_type_node_identity(name, source);
+    let exact = csharp_type_node_identity_with_terminal_suffix(name, source, "", true);
     if exact.is_empty() {
         return Vec::new();
     }
@@ -859,7 +729,7 @@ pub fn csharp_attribute_type_names(name: Node<'_>, source: &str) -> Vec<String> 
         return vec![exact];
     }
 
-    let suffixed = csharp_type_node_identity_with_terminal_suffix(name, source, "Attribute");
+    let suffixed = csharp_type_node_identity_with_terminal_suffix(name, source, "Attribute", false);
     if suffixed == exact {
         vec![exact]
     } else {

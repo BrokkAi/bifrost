@@ -2244,22 +2244,6 @@ fn visible_extension_method_candidates_inner(
             named_candidates.push(unit);
         }
     }
-    // Extension lookup normally stops at the nearest enclosing scope that offers
-    // an applicable declaration, which is what C# does: a `using`-imported
-    // extension loses to one declared in an enclosing namespace. Applicability
-    // is decided by the receiver type, so that ordering is only meaningful when
-    // the scan knows it. A usage-mode site whose receiver never typed --
-    // an external or open-generic receiver, or a capture the local binder cannot
-    // see -- has no receiver to decide with, and stopping at the nearest scope
-    // there names one same-spelled declaration and silently disclaims every
-    // other one. In ILSpy that made `typeHint.GetStackType()` answer
-    // `IL.ILTypeExtensions.GetStackType(this PrimitiveType)` from the enclosing
-    // namespace and report the actual `TypeSystem.TypeUtils.GetStackType(this
-    // IType)` target as verified-absent (#1261). Untyped, every visible scope's
-    // candidates are equally possible, so they are all returned and the caller
-    // records the site as unproven rather than proving or disclaiming one.
-    let receiver_is_untyped = usage && compatible_receiver_types.is_empty();
-    let mut untyped_receiver_candidates = Vec::new();
     for scope in scopes {
         if !resolution_scope_step(session) {
             return Vec::new();
@@ -2353,10 +2337,6 @@ fn visible_extension_method_candidates_inner(
         let candidates = filtered;
         let Some(call_arity) = call_arity else {
             if !candidates.is_empty() {
-                if receiver_is_untyped {
-                    untyped_receiver_candidates.extend(candidates);
-                    continue;
-                }
                 return candidates;
             }
             continue;
@@ -2376,23 +2356,13 @@ fn visible_extension_method_candidates_inner(
             .cloned()
             .collect::<Vec<_>>();
         if !applicable.is_empty() {
-            if receiver_is_untyped {
-                untyped_receiver_candidates.extend(applicable);
-                continue;
-            }
             return applicable;
         }
         if fallback_when_inapplicable && !candidates.is_empty() {
-            if receiver_is_untyped {
-                untyped_receiver_candidates.extend(candidates);
-                continue;
-            }
             return candidates;
         }
     }
-    untyped_receiver_candidates.sort();
-    untyped_receiver_candidates.dedup();
-    untyped_receiver_candidates
+    Vec::new()
 }
 
 fn extension_visibility_scopes(

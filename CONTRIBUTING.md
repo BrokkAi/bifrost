@@ -1,9 +1,5 @@
 # Contributing
 
-## Contribution Policy
-
-Bifrost no longer accepts pull requests. We accept open source contributions only through [GitHub Issues](https://github.com/BrokkAi/bifrost/issues) and [GitHub Discussions](https://github.com/BrokkAi/bifrost/discussions). Please use those channels to report bugs, propose improvements, share use cases, or discuss potential changes.
-
 ## Development Setup
 
 Rust build:

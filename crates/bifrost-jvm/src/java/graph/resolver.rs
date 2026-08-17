@@ -4,15 +4,11 @@ use super::hits::enclosing_context;
 use super::return_type::{
     FileReturnCache, JavaReturnTypeContext, LexicalTypeResolution, METHOD_RECEIVER_CHAIN_LIMIT,
     MethodAnonymousReturnCache, MethodReturnCache, is_java_nominal_type_node,
-    java_lexical_type_from_declaration, java_lexical_type_from_node, java_type_name_from_node,
-    merge_receiver_type_outcomes, method_anonymous_return_type_for_owner_fqn,
-    method_return_type_for_owner_fqns,
+    java_lexical_type_from_node, java_type_name_from_node, merge_receiver_type_outcomes,
+    method_anonymous_return_type_for_owner_fqn, method_return_type_for_owner_fqns,
 };
-use crate::java::graph_support::{
-    JavaSource, normalize_java_type_text, resolve_java_usage_type_name,
-    resolve_java_usage_type_name_in,
-};
-use crate::java::hierarchy::java_nearest_declaring_ancestors;
+use crate::java::graph_support::{JavaSource, resolve_java_usage_type_name};
+use crate::java::hierarchy::java_preferred_declaring_owners;
 use brokk_bifrost_core::analyzer::model::{CallableArity, CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 pub use brokk_bifrost_core::analyzer::usages::common::node_text;
@@ -254,13 +250,6 @@ pub fn receiver_matches_target(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) -> Rec
             let name = node_text(receiver, ctx.source);
             match ctx.bindings.resolve_symbol(name).as_precise() {
                 Some(targets) => receiver_fq_names_match_target(targets.iter(), ctx),
-                // A simple name that declares no value here can still name a
-                // type: `InstanceMode.MANAGER` written inside `InstanceMode`
-                // reads a nested type the file scope alone cannot name, so the
-                // lexical chain has to answer it.
-                None if !ctx.bindings.is_shadowed(name) => resolve_type_from_node(receiver, ctx)
-                    .map(|resolved| receiver_type_matches_target(&resolved, ctx))
-                    .unwrap_or(ReceiverTargetMatch::Unresolved),
                 None => ReceiverTargetMatch::Unresolved,
             }
         }
@@ -293,100 +282,8 @@ pub fn receiver_matches_target(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) -> Rec
                 ReceiverTargetMatch::Unresolved
             }
         }
-        "field_access" => field_access_receiver_type(receiver, ctx)
-            .map(|resolved| receiver_type_matches_target(&resolved, ctx))
-            .unwrap_or(ReceiverTargetMatch::Unresolved),
         _ => ReceiverTargetMatch::Unresolved,
     }
-}
-
-/// The class a Java `field_access` receiver names.
-///
-/// The same syntax spells two different things. `Settings.Basic` is a nested
-/// *type* path, which [`resolve_field_access_type`] answers from declarations.
-/// `config.mode` is a *value*: it reads a field, and its static type is that
-/// field's declared type. The receiver matcher could only do the first, so a
-/// switch selector written as a field read left every case label under it
-/// unclaimed even though the forward side binds them (#2162).
-fn field_access_receiver_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
-    resolve_field_access_type(
-        node,
-        ctx.source,
-        |base| {
-            let name = node_text(base, ctx.source);
-            if ctx.bindings.is_shadowed(name) {
-                Err(())
-            } else {
-                Ok(resolve_type_from_node(base, ctx))
-            }
-        },
-        |qualified| ctx.resolve_realm_type_name(qualified),
-        |owner, name| nested_type_for_owner(owner, name, ctx),
-    )
-    .or_else(|| field_access_value_type(node, ctx, 0))
-}
-
-/// The class a `field_access` denotes when it is read as a value: the declared
-/// type of the field its receiver's type declares.
-fn field_access_value_type(node: Node<'_>, ctx: &ScanCtx<'_>, depth: usize) -> Option<CodeUnit> {
-    if depth > METHOD_RECEIVER_CHAIN_LIMIT {
-        return None;
-    }
-    let field_node = node.child_by_field_name("field")?;
-    let field = node_text(field_node, ctx.source);
-    if field.is_empty() {
-        return None;
-    }
-    let object = node.child_by_field_name("object")?;
-    let owner = receiver_type_from_node_at_depth(object, ctx, depth + 1)?;
-    java_field_declared_type(&owner, field, ctx)
-}
-
-/// The class named by the declared type of `owner`'s field `field`.
-///
-/// A field's declared type is written in the field's own compilation unit, so
-/// its simple name must resolve through that file's nesting, imports and
-/// package -- never through the imports of whatever file reads the field. The
-/// forward resolver learned this in #2043 for the same selector shape; this is
-/// the same rule on the inverse side.
-fn java_field_declared_type(owner: &CodeUnit, field: &str, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
-    let mut scopes = vec![owner.clone()];
-    if let Some(provider) = ctx.graph.hierarchy {
-        scopes.extend(provider.get_ancestors(owner));
-    }
-    for scope in scopes {
-        let candidates =
-            ctx.java
-                .usage_definitions()
-                .fqn(&format!("{}.{}", scope.fq_name(), field));
-        if let Some(unit) = candidates.iter().find(|unit| unit.is_field()) {
-            let declared = ctx
-                .java
-                .signature_metadata(unit)
-                .into_iter()
-                .find_map(|metadata| metadata.return_type_text().map(str::to_owned))?;
-            let spelled = normalize_java_type_text(&declared);
-            // The declaration's own lexical chain binds a simple name first --
-            // a sibling nested type such as `MultiMap.MultiMapEntry` is written
-            // unqualified inside `MultiMap` and names no file-scope type -- and
-            // only then the declaring file's imports and package.
-            return match java_lexical_type_from_declaration(
-                ctx.java,
-                unit,
-                &parse_symbol_path(Language::Java, spelled),
-            ) {
-                LexicalTypeResolution::Resolved(resolved) => Some(resolved),
-                LexicalTypeResolution::Blocked => None,
-                LexicalTypeResolution::NotFound => ctx.graph.with_definitions(|definitions| {
-                    resolve_java_usage_type_name_in(ctx.java, definitions, unit.source(), spelled)
-                }),
-            };
-        }
-        if let Some(nested) = candidates.into_iter().find(CodeUnit::is_class) {
-            return Some(nested);
-        }
-    }
-    None
 }
 
 fn receiver_fq_names_match_target<'a>(
@@ -470,23 +367,7 @@ fn receiver_type_matches_target_uncached(
         }
         if nearest_declaring_ancestor_matches_target(ctx, receiver_type, |ancestor| {
             java_owner_declares_matching_method(ctx.java, ancestor, &ctx.spec.target)
-        })
-        .unwrap_or(false)
-        {
-            return ReceiverTargetMatch::Matched;
-        }
-    }
-    if ctx.spec.kind == TargetKind::Field {
-        // A field is inherited, not overridden: `derived.shared` reads the
-        // `shared` its nearest declaring supertype declares. A field the
-        // receiver's own type declares hides that one (JLS 8.3), so it is a
-        // different field with the same spelling.
-        if !owner_declares_target_field(receiver_type, ctx)
-            && nearest_declaring_ancestor_matches_target(ctx, receiver_type, |ancestor| {
-                owner_declares_target_field(ancestor, ctx)
-            })
-            .unwrap_or(false)
-        {
+        }) {
             return ReceiverTargetMatch::Matched;
         }
     }
@@ -656,76 +537,63 @@ pub fn bare_method_context_matches_target(node: Node<'_>, ctx: &mut ScanCtx<'_>)
     nearest_declaring_ancestor_matches_target(ctx, owner, |ancestor| {
         java_owner_declares_matching_method(ctx.java, ancestor, &ctx.spec.target)
     })
-    .unwrap_or(false)
 }
 
-/// Whether a bare (simple-name) field read at `node` binds to the target field.
-///
-/// JLS 6.5.6.1 searches the innermost enclosing class's member scope first --
-/// what it declares, then what it inherits -- and only if nothing there
-/// declares the name does the search move out to the class that lexically
-/// encloses it. The first scope that declares the name answers outright, so an
-/// inner class with its own `type` hides an outer `type` and never reads the
-/// target.
-///
-/// The scan used to stop at the innermost owner and its ancestors, so a nested
-/// class reading an outer class's constant produced no hit at all. That is 148
-/// of the 277 keys #2042 records, and flatbuffers' `FlexBuffers.Reference`
-/// reading `FBT_BOOL` is the dense witness. #2046 gave the forward resolver
-/// this same chain for a bare call.
 pub fn bare_field_context_matches_target(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
     let context = enclosing_context(node, ctx);
-    let mut scope = context.owner.clone();
-    let mut visited = HashSet::default();
-    while let Some(owner) = scope {
-        if !visited.insert(owner.fq_name()) {
-            return false;
-        }
-        scope = ctx.java.parent_of(&owner);
-        // An anonymous or local class is indexed under the method that writes
-        // it (#2045), so a callable step is part of the chain, not the end of
-        // it. Only a package ends the walk.
-        if !owner.is_class() {
-            continue;
-        }
-        if owner.fq_name() == ctx.spec.owner.fq_name() {
-            return true;
-        }
-        if owner_declares_target_field(&owner, ctx) {
-            return false;
-        }
-        if let Some(matched) = nearest_declaring_ancestor_matches_target(ctx, &owner, |ancestor| {
-            owner_declares_target_field(ancestor, ctx)
-        }) {
-            return matched;
-        }
+    let Some(owner) = context.owner.as_ref() else {
+        return false;
+    };
+    if owner.fq_name() == ctx.spec.owner.fq_name() {
+        return true;
     }
-    false
-}
-
-fn owner_declares_target_field(owner: &CodeUnit, ctx: &ScanCtx<'_>) -> bool {
-    ctx.java
+    if ctx
+        .java
         .usage_definitions()
         .fqn(&format!("{}.{}", owner.fq_name(), ctx.spec.member_name))
         .iter()
         .any(CodeUnit::is_field)
+    {
+        return false;
+    }
+    nearest_declaring_ancestor_matches_target(ctx, owner, |ancestor| {
+        ctx.java
+            .usage_definitions()
+            .fqn(&format!("{}.{}", ancestor.fq_name(), ctx.spec.member_name))
+            .iter()
+            .any(CodeUnit::is_field)
+    })
 }
 
-/// What `owner`'s inheritance says about the target member: `Some(true)` when
-/// the nearest level that declares the name declares exactly the target,
-/// `Some(false)` when that level declares something else, and `None` when no
-/// ancestor declares the name at all. The caller distinguishes the last case
-/// because a lexical search continues outward only when the whole member scope
-/// -- inherited members included -- says nothing.
 fn nearest_declaring_ancestor_matches_target(
     ctx: &ScanCtx<'_>,
     owner: &CodeUnit,
-    declares_target_member: impl FnMut(&CodeUnit) -> bool,
-) -> Option<bool> {
-    let provider = ctx.graph.hierarchy?;
-    let preferred =
-        java_nearest_declaring_ancestors(ctx.java, provider, owner, declares_target_member)?;
-    Some(preferred.len() == 1 && preferred[0].fq_name() == ctx.spec.owner.fq_name())
+    mut declares_target_member: impl FnMut(&CodeUnit) -> bool,
+) -> bool {
+    let Some(provider) = ctx.graph.hierarchy else {
+        return false;
+    };
+    let mut seen = HashSet::from_iter([owner.clone()]);
+    let mut level = provider.get_direct_ancestors(owner);
+    while !level.is_empty() {
+        let mut declaring_owners = Vec::new();
+        let mut next_level = Vec::new();
+        for ancestor in level {
+            if !seen.insert(ancestor.clone()) {
+                continue;
+            }
+            if declares_target_member(&ancestor) {
+                declaring_owners.push(ancestor.clone());
+            }
+            next_level.extend(provider.get_direct_ancestors(&ancestor));
+        }
+        if !declaring_owners.is_empty() {
+            let preferred = java_preferred_declaring_owners(ctx.java, &declaring_owners);
+            return preferred.len() == 1 && preferred[0].fq_name() == ctx.spec.owner.fq_name();
+        }
+        level = next_level;
+    }
+    false
 }
 
 pub fn same_owner_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
@@ -1144,7 +1012,6 @@ fn receiver_type_from_node_at_depth(
             .and_then(|type_node| resolve_type_from_node(type_node, ctx)),
         "method_invocation" => method_invocation_return_type_at_depth(node, ctx, depth),
         "this" | "super" => enclosing_owner(node, ctx),
-        "field_access" => field_access_value_type(node, ctx, depth),
         _ => None,
     }
 }

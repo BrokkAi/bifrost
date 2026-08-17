@@ -757,7 +757,7 @@ impl PolicyBaselineEntryReview {
 /// Top-level audit of one baseline-aware evaluation.
 ///
 /// Present only when a baseline document loaded, so a run without one keeps
-/// its exact schema-version-4 shape. Every count is exact over the complete
+/// its exact schema-version-3 shape. Every count is exact over the complete
 /// document; the `entries` list is bounded and retains only entries that need
 /// attention (anything other than applied-with-matching-hash), so a 100k-entry
 /// onboarding audit stays within the retained-report budget.

@@ -1074,14 +1074,7 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
 pub struct OverlayProject {
     delegate: Arc<dyn Project>,
     overlays: Arc<RwLock<HashMap<PathBuf, Arc<OverlayEntry>>>>,
-    /// Process-local allocator shared by every snapshot descended from this
-    /// view. Entry revisions must remain unique even when the live view and an
-    /// older request snapshot are both mutated.
-    revision_allocator: Arc<AtomicU64>,
-    /// Generation published by mutations to this view's map. Unlike the
-    /// allocator, a snapshot owns this value so later live edits cannot make
-    /// its frozen source look stale midway through a request.
-    published_generation: AtomicU64,
+    next_overlay_revision: Arc<AtomicU64>,
     max_overlay_bytes: usize,
     /// Last instant we emitted a rejection log for a given path. Kept on a
     /// separate throttle helper so the per-keystroke read path doesn't
@@ -1106,8 +1099,7 @@ impl OverlayProject {
         Self {
             delegate,
             overlays: Arc::new(RwLock::new(HashMap::new())),
-            revision_allocator: Arc::new(AtomicU64::new(0)),
-            published_generation: AtomicU64::new(0),
+            next_overlay_revision: Arc::new(AtomicU64::new(0)),
             max_overlay_bytes,
             last_rejection_log: ThrottledLog::new(
                 OVERLAY_REJECTION_LOG_THROTTLE,
@@ -1118,7 +1110,7 @@ impl OverlayProject {
 
     fn next_revision(&self) -> OverlayRevision {
         let previous = self
-            .revision_allocator
+            .next_overlay_revision
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
@@ -1135,14 +1127,11 @@ impl OverlayProject {
     /// Subsequent editor changes mutate the live project's map without changing this
     /// snapshot, allowing background requests to use one coherent source generation.
     pub fn snapshot(&self) -> Self {
-        let overlays = self.overlays.read().expect("overlay lock poisoned");
-        let frozen_overlays = overlays.clone();
-        let frozen_generation = self.published_generation.load(Ordering::Acquire);
+        let overlays = self.overlays.read().expect("overlay lock poisoned").clone();
         Self {
             delegate: Arc::clone(&self.delegate),
-            overlays: Arc::new(RwLock::new(frozen_overlays)),
-            revision_allocator: Arc::clone(&self.revision_allocator),
-            published_generation: AtomicU64::new(frozen_generation),
+            overlays: Arc::new(RwLock::new(overlays)),
+            next_overlay_revision: Arc::clone(&self.next_overlay_revision),
             max_overlay_bytes: self.max_overlay_bytes,
             last_rejection_log: ThrottledLog::new(
                 OVERLAY_REJECTION_LOG_THROTTLE,
@@ -1174,8 +1163,6 @@ impl OverlayProject {
                 revision,
             }),
         );
-        self.published_generation
-            .store(revision.get(), Ordering::Release);
         true
     }
 
@@ -1199,9 +1186,7 @@ impl OverlayProject {
             // generation or the new map and new generation, never the removed
             // overlay under the old generation.
             before_revision();
-            let revision = self.next_revision();
-            self.published_generation
-                .store(revision.get(), Ordering::Release);
+            self.next_revision();
         }
         removed
     }
@@ -1212,9 +1197,7 @@ impl OverlayProject {
         let mut overlays = self.overlays.write().expect("overlay lock poisoned");
         if !overlays.is_empty() {
             overlays.clear();
-            let revision = self.next_revision();
-            self.published_generation
-                .store(revision.get(), Ordering::Release);
+            self.next_revision();
         }
     }
 
@@ -1354,7 +1337,7 @@ impl Project for OverlayProject {
     }
 
     fn analysis_generation(&self) -> u64 {
-        self.published_generation.load(Ordering::Acquire)
+        self.next_overlay_revision.load(Ordering::Acquire)
     }
 }
 
@@ -1773,7 +1756,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_project_snapshot_freezes_content_and_analysis_generation() {
+    fn overlay_project_snapshot_isolated_from_later_edits() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let file = write_file(&root, "lib.rs", "fn disk() {}\n");
@@ -1782,8 +1765,6 @@ mod tests {
         assert!(overlay.set(file.abs_path(), "fn first() {}\n".to_string()));
 
         let snapshot = overlay.snapshot();
-        let frozen_generation = snapshot.analysis_generation();
-        assert_eq!(frozen_generation, overlay.analysis_generation());
         {
             let live = overlay.overlays.read().expect("overlay lock poisoned");
             let frozen = snapshot.overlays.read().expect("overlay lock poisoned");
@@ -1801,68 +1782,9 @@ mod tests {
         assert_eq!(snapshot.read_source(&file).unwrap(), "fn first() {}\n");
         assert_eq!(overlay.read_source(&file).unwrap(), "fn second() {}\n");
         assert_eq!(
-            snapshot.analysis_generation(),
-            frozen_generation,
-            "a later live edit must not invalidate a frozen request view"
-        );
-        assert!(overlay.analysis_generation() > frozen_generation);
-        assert_eq!(
             snapshot.read_source_snapshot(&file).unwrap().origin(),
             ProjectSourceOrigin::Overlay(frozen_revision)
         );
-    }
-
-    #[test]
-    fn live_and_snapshot_mutations_publish_independent_globally_unique_revisions() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let file = write_file(&root, "lib.rs", "fn disk() {}\n");
-        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
-        let live = OverlayProject::new(delegate);
-        assert!(live.set(file.abs_path(), "fn first() {}\n".to_string()));
-        let first_generation = live.analysis_generation();
-
-        let snapshot = live.snapshot();
-        assert_eq!(snapshot.analysis_generation(), first_generation);
-        assert!(snapshot.set(file.abs_path(), "fn snapshot() {}\n".to_string()));
-        let snapshot_generation = snapshot.analysis_generation();
-        assert!(snapshot_generation > first_generation);
-        assert_eq!(
-            live.analysis_generation(),
-            first_generation,
-            "mutating the snapshot must not invalidate the live view"
-        );
-        let ProjectSourceOrigin::Overlay(snapshot_revision) =
-            snapshot.read_source_snapshot(&file).unwrap().origin()
-        else {
-            panic!("the snapshot mutation must publish an overlay revision")
-        };
-        assert_eq!(snapshot_revision.get(), snapshot_generation);
-
-        assert!(live.set(file.abs_path(), "fn live() {}\n".to_string()));
-        let live_generation = live.analysis_generation();
-        assert!(live_generation > snapshot_generation);
-        assert_eq!(
-            snapshot.analysis_generation(),
-            snapshot_generation,
-            "mutating the live view must not invalidate the snapshot"
-        );
-        let ProjectSourceOrigin::Overlay(live_revision) =
-            live.read_source_snapshot(&file).unwrap().origin()
-        else {
-            panic!("the live mutation must publish an overlay revision")
-        };
-        assert_eq!(live_revision.get(), live_generation);
-        assert_ne!(live_revision, snapshot_revision);
-        assert_eq!(snapshot.read_source(&file).unwrap(), "fn snapshot() {}\n");
-        assert_eq!(live.read_source(&file).unwrap(), "fn live() {}\n");
-
-        assert!(snapshot.clear(&file.abs_path()));
-        let snapshot_clear_generation = snapshot.analysis_generation();
-        assert!(snapshot_clear_generation > live_generation);
-        assert_eq!(live.analysis_generation(), live_generation);
-        assert_eq!(snapshot.read_source(&file).unwrap(), "fn disk() {}\n");
-        assert_eq!(live.read_source(&file).unwrap(), "fn live() {}\n");
     }
 
     #[test]

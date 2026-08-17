@@ -956,18 +956,6 @@ impl LanguageSupport for JavaSupport {
         Language::Java
     }
 
-    /// Java keeps method names and variable names in separate namespaces (JLS
-    /// 6.5.7): a local `int value = 7` does not shadow `value(item)`, and only
-    /// the method-invocation path can say which overload the call reaches. A
-    /// lexical binding answered for the callee name before the resolver ever
-    /// ran, so a same-named local won the call site (#2046).
-    fn focus_resolves_lexically(&self, focus: tree_sitter::Node<'_>) -> bool {
-        !focus.parent().is_some_and(|parent| {
-            parent.kind() == "method_invocation"
-                && parent.child_by_field_name("name") == Some(focus)
-        })
-    }
-
     fn declaration_ranges_limited(
         &self,
         analyzer: &dyn IAnalyzer,

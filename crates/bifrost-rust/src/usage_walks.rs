@@ -43,7 +43,7 @@ use crate::graph_support::{
 };
 use crate::imports::{
     resolve_rust_module_path_with_crate, resolve_rust_module_segments_with_crate,
-    rust_crate_root_package, rust_target_kind_root_alternative,
+    rust_crate_root_package, rust_target_kind_root_package,
 };
 use crate::lexical_scope::RustCfgCondition;
 use crate::usage::{
@@ -657,7 +657,10 @@ impl<'a> RustUsageWalks<'a> {
     /// `common::x` in `benches/b.rs` first mean this bench's own `common`, and
     /// only then the `benches/common/mod.rs` every bench shares.
     fn kind_root_alternative(&self, importing_file: &ProjectFile, package: &str) -> Option<String> {
-        let alternative = rust_target_kind_root_alternative(importing_file, package)?;
+        let kind_root = rust_target_kind_root_package(importing_file)?;
+        let own_root = rust_crate_root_package(importing_file);
+        let suffix = package.strip_prefix(&own_root)?;
+        let alternative = format!("{kind_root}{suffix}");
         (!self.files_in_module_package(&alternative).is_empty()).then_some(alternative)
     }
 
@@ -1552,7 +1555,6 @@ impl<'a> RustUsageWalks<'a> {
                         importer_module: edge.importer_module.clone(),
                         extent: edge.extent.clone(),
                         path,
-                        is_glob_import: matches!(edge.kind, RustImportEdgeKind::Glob),
                         namespace: target.namespace,
                         origin: binding.origin,
                         domain: effective,

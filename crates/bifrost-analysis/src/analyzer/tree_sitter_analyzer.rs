@@ -285,8 +285,6 @@ fn projection_value_for_unit<'a, T>(
 static PREPARED_FAILURE_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 #[cfg(test)]
 static PREPARATION_FAILURE_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
-#[cfg(test)]
-static FORCED_PARSE_TIMEOUT_PATHS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BulkFileStateSource {
@@ -707,11 +705,6 @@ pub struct FileState {
     /// falls back to a fresh parse in that case until the next `update`
     /// re-populates the field.
     pub(crate) parse_errors: Option<Vec<crate::analyzer::ParseError>>,
-    /// Whether tree-sitter completed the whole source before this state was
-    /// assembled. A timed-out parse still carries a conservative file-scope
-    /// marker for in-memory reads, but the store must never publish that
-    /// marker as a complete parsed blob.
-    pub(crate) parse_complete: bool,
 }
 
 impl FileState {
@@ -2294,12 +2287,6 @@ impl<A> TreeSitterAnalyzer<A> {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut snapshot = self.clone();
         snapshot.project = project;
-        // A request overlay may publish a transient source OID while it parses
-        // an unsaved revision. Keep that projection local to the request just
-        // as update/update_all keep their next-generation projections local;
-        // sharing it would make a later sibling or cleared overlay resolve the
-        // old transient OID instead of its own project source.
-        snapshot.store_context.live_paths = Arc::new(self.store_context.live_paths.fork());
         snapshot.structural_index_cache = Arc::new(
             crate::analyzer::structural::provider::StructuralSearchSnapshotCache::new(
                 self.config.structural_index_cache_budget_bytes(),
@@ -2742,28 +2729,7 @@ where
         file: &ProjectFile,
         source: String,
     ) -> Option<FileState> {
-        Self::analyze_source_with_budget(
-            parser,
-            adapter,
-            file,
-            source,
-            Self::complete_file_parse_budget(file),
-        )
-    }
-
-    fn complete_file_parse_budget(file: &ProjectFile) -> Duration {
-        #[cfg(test)]
-        if FORCED_PARSE_TIMEOUT_PATHS
-            .lock()
-            .expect("forced parse timeout paths mutex poisoned")
-            .iter()
-            .any(|path| path.as_path() == file.abs_path().as_path())
-        {
-            return Duration::ZERO;
-        }
-        #[cfg(not(test))]
-        let _ = file;
-        COMPLETE_FILE_PARSE_BUDGET
+        Self::analyze_source_with_budget(parser, adapter, file, source, COMPLETE_FILE_PARSE_BUDGET)
     }
 
     fn analyze_source_with_budget(
@@ -2789,7 +2755,6 @@ where
                     parsed,
                     false,
                     Some(Vec::new()),
-                    false,
                 ));
             }
             BoundedParse::Cancelled => unreachable!("no cancellation token supplied"),
@@ -2806,7 +2771,6 @@ where
             parsed,
             contains_tests,
             Some(parse_errors),
-            true,
         ))
     }
 
@@ -2820,7 +2784,6 @@ where
         mut parsed: ParsedFile,
         contains_tests: bool,
         parse_errors: Option<Vec<crate::analyzer::ParseError>>,
-        parse_complete: bool,
     ) -> FileState {
         let declarations = parsed.take_declarations();
 
@@ -2849,7 +2812,6 @@ where
             test_region_units: parsed.test_region_units,
             materialization_records: parsed.materialization_records,
             parse_errors,
-            parse_complete,
         }
     }
 
@@ -4244,14 +4206,6 @@ where
             }
             (Arc::clone(&dirty.state), dirty.generation)
         };
-
-        // A bounded parse timeout intentionally retains a conservative state
-        // for this analyzer snapshot. Retrying that same incomplete state can
-        // never make it publishable; a later update or reopen must re-run the
-        // parser against the unchanged source instead.
-        if !state.parse_complete {
-            return Some(state);
-        }
 
         match self.store_context.store.write_parsed_blob_at_generation(
             key.oid,
@@ -10829,8 +10783,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let db = root.join("analyzer.db");
-        let store =
-            Arc::new(AnalyzerStore::open_persistent(&db).expect("initialize persistent store"));
+        drop(AnalyzerStore::open_persistent(&db).expect("initialize persistent store"));
         let conn = crate::cache_db::open_unified_connection(&db).expect("open test connection");
         conn.execute_batch(
             "CREATE TRIGGER fail_epoch_publication
@@ -10844,7 +10797,7 @@ mod tests {
 
         let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Java));
         let store_context = AnalyzerStoreContext {
-            store,
+            store: Arc::new(AnalyzerStore::open_persistent(&db).expect("reopen persistent store")),
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             live_paths: Arc::new(LivePathMap::default()),
@@ -11129,7 +11082,6 @@ mod tests {
             test_region_units: HashSet::default(),
             materialization_records: Vec::new(),
             parse_errors: None,
-            parse_complete: true,
         }
     }
 
@@ -11181,196 +11133,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_timeout_stays_transient_and_same_content_recovers_on_retry_and_reopen() {
+    fn parse_timeout_persists_a_file_scope_marker() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let retry = ProjectFile::new(root.clone(), "src/Retry.java");
-        let reopen = ProjectFile::new(root.clone(), "src/Reopen.java");
-        let healthy = ProjectFile::new(root.clone(), "src/Healthy.java");
-        let retry_source = format!(
-            "package demo; class Retry {{\n{}\n}}\n",
+        let file = ProjectFile::new(root, "Generated.java");
+        let source = format!(
+            "class Generated {{\n{}\n}}\n",
             "int generatedField;\n".repeat(10_000)
         );
-        let reopen_source = format!(
-            "package demo; class Reopen {{\n{}\n}}\n",
-            "int generatedField;\n".repeat(10_000)
+        let mut parser = TreeSitterAnalyzer::<JavaAdapter>::build_parser(
+            JavaAdapter.parser_language_for_file(&file),
         );
-        let healthy_source = "package demo; class Healthy {}\n";
-        retry.write(&retry_source).expect("retry fixture");
-        reopen.write(&reopen_source).expect("reopen fixture");
-        healthy.write(healthy_source).expect("healthy fixture");
 
-        *FORCED_PARSE_TIMEOUT_PATHS
-            .lock()
-            .expect("forced parse timeout paths mutex poisoned") =
-            vec![retry.abs_path(), reopen.abs_path()];
-
-        let db = root.join("analyzer.db");
-        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Java));
-        let store = Arc::new(AnalyzerStore::open_persistent(&db).expect("persistent store"));
-        let store_context = AnalyzerStoreContext {
-            store: Arc::clone(&store),
-            gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
-            liveness: None,
-            live_paths: Arc::new(LivePathMap::default()),
-            generations: Arc::new(HashMap::default()),
-            startup_cache_validation: StartupCacheValidation::FullIntegrity,
-        };
-        let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
-            Arc::clone(&project),
-            JavaAdapter,
-            AnalyzerConfig {
-                parallelism: Some(1),
-                ..AnalyzerConfig::default()
-            },
-            store_context,
-            None,
-        )
-        .expect("initial timed-out reconciliation");
-        FORCED_PARSE_TIMEOUT_PATHS
-            .lock()
-            .expect("forced parse timeout paths mutex poisoned")
-            .clear();
-
-        assert_eq!(
-            analyzer.state.dirty_snapshot().len(),
-            2,
-            "both timed-out states must remain transient and retryable"
-        );
-        for (file, source, missing_name) in [
-            (&retry, retry_source.as_str(), "Retry"),
-            (&reopen, reopen_source.as_str(), "Reopen"),
-        ] {
-            let state = analyzer
-                .fetch_file_state(file)
-                .expect("timed-out state remains available in memory");
-            assert_eq!(state.source, source, "fixture bytes must participate");
-            assert!(!state.parse_complete);
-            assert_eq!(state.declarations.len(), 1);
-            assert!(state.declarations.iter().all(CodeUnit::is_file_scope));
-            assert!(
-                !analyzer
-                    .get_declarations(file)
-                    .iter()
-                    .any(|declaration| declaration.short_name() == missing_name)
-            );
-            let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
-            assert!(
-                !store.contains_parsed_blob(oid, "java").unwrap(),
-                "a timeout marker must not be published as a complete blob"
-            );
-        }
-
-        let healthy_state = analyzer
-            .fetch_file_state(&healthy)
-            .expect("healthy peer state");
-        assert_eq!(healthy_state.source, healthy_source);
-        assert!(healthy_state.parse_complete);
-        assert!(
-            analyzer
-                .get_declarations(&healthy)
-                .iter()
-                .any(|declaration| declaration.short_name() == "Healthy")
-        );
-        let healthy_oid = Oid::hash_object(ObjectType::Blob, healthy_source.as_bytes()).unwrap();
-        assert!(store.contains_parsed_blob(healthy_oid, "java").unwrap());
-
-        let retry_oid = Oid::hash_object(ObjectType::Blob, retry_source.as_bytes()).unwrap();
-        let retry_generation = analyzer.store_context.generations["java"];
-        let partial_retry_state = analyzer
-            .fetch_file_state(&retry)
-            .expect("partial retry state");
-        let preparation_error = AnalyzerStore::prepare_parsed_blob(
-            retry_oid,
-            "java",
-            retry_generation,
+        let state = TreeSitterAnalyzer::<JavaAdapter>::analyze_source_with_budget(
+            &mut parser,
             &JavaAdapter,
-            Arc::clone(&partial_retry_state),
+            &file,
+            source.clone(),
+            Duration::ZERO,
         )
-        .expect_err("prepared persistence must reject an incomplete parser result");
-        assert!(
-            preparation_error
-                .to_string()
-                .contains("timed-out file analysis")
-        );
-        let direct_error = store
-            .write_parsed_blob_at_generation(
-                retry_oid,
-                "java",
-                retry_generation,
-                &JavaAdapter,
-                partial_retry_state.as_ref(),
-            )
-            .expect_err("the direct write path must enforce the same completeness invariant");
-        assert!(direct_error.to_string().contains("timed-out file analysis"));
-        assert!(!store.contains_parsed_blob(retry_oid, "java").unwrap());
+        .expect("a timed-out source keeps a persistent file marker");
 
-        let retried = analyzer.update(&BTreeSet::from([retry.clone()]));
-        let retried_state = retried.fetch_file_state(&retry).expect("retried state");
-        assert!(retried_state.parse_complete);
-        let retried_declarations = retried.get_declarations(&retry);
-        assert!(
-            retried_declarations
-                .iter()
-                .any(|declaration| declaration.short_name() == "Retry")
-        );
-        assert!(store.contains_parsed_blob(retry_oid, "java").unwrap());
-
-        drop(retried);
-        drop(analyzer);
-        drop(store);
-
-        let reopened_store =
-            Arc::new(AnalyzerStore::open_persistent(&db).expect("reopen persistent store"));
-        let reopened_context = AnalyzerStoreContext {
-            store: Arc::clone(&reopened_store),
-            gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
-            liveness: None,
-            live_paths: Arc::new(LivePathMap::default()),
-            generations: Arc::new(HashMap::default()),
-            startup_cache_validation: StartupCacheValidation::FullIntegrity,
-        };
-        let reopened = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
-            project,
-            JavaAdapter,
-            AnalyzerConfig {
-                parallelism: Some(1),
-                ..AnalyzerConfig::default()
-            },
-            reopened_context,
-            None,
-        )
-        .expect("reopen reparses the still-missing same-content blob");
-
-        let reopened_state = reopened
-            .fetch_file_state(&reopen)
-            .expect("reopened complete state");
-        assert_eq!(reopened_state.source, reopen_source);
-        assert!(reopened_state.parse_complete);
-        assert!(
-            reopened
-                .get_declarations(&reopen)
-                .iter()
-                .any(|declaration| declaration.short_name() == "Reopen")
-        );
-        for (file, source) in [(&retry, retry_source.as_str()), (&healthy, healthy_source)] {
-            let state = reopened
-                .fetch_file_state(file)
-                .expect("reopened complete peer state");
-            assert_eq!(state.source, source);
-            assert!(state.parse_complete);
-        }
-        assert_eq!(
-            reopened.get_declarations(&retry),
-            retried_declarations,
-            "same-content update and persisted reopen must converge"
-        );
-        let reopen_oid = Oid::hash_object(ObjectType::Blob, reopen_source.as_bytes()).unwrap();
-        assert!(
-            reopened_store
-                .contains_parsed_blob(reopen_oid, "java")
-                .unwrap()
-        );
+        assert_eq!(state.declarations.len(), 1);
+        assert!(state.declarations.iter().all(CodeUnit::is_file_scope));
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "java", &JavaAdapter, &state)
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "java").unwrap());
     }
 
     #[test]
@@ -13847,45 +13638,6 @@ mod tests {
             1,
             "snapshot should read its own overlay"
         );
-    }
-
-    #[test]
-    fn clone_with_project_isolates_transient_live_paths_from_disk_and_siblings() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().canonicalize().expect("canonical temp dir");
-        let file = temp_file(&root, "src/main.rs");
-        std::fs::create_dir_all(file.abs_path().parent().expect("source parent"))
-            .expect("source directory");
-        let disk_source = "fn disk() {}\n";
-        let overlay_source = "fn unsaved() { disk(); }\n";
-        file.write(disk_source).expect("disk source");
-        let base: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let disk = TreeSitterAnalyzer::new(Arc::clone(&base), RustAdapter);
-        let sibling = disk.clone_with_project(Arc::clone(&base));
-        let disk_oid = Oid::hash_object(ObjectType::Blob, disk_source.as_bytes()).unwrap();
-        let overlay_oid = Oid::hash_object(ObjectType::Blob, overlay_source.as_bytes()).unwrap();
-
-        let live_overlay = Arc::new(OverlayProject::new(Arc::clone(&base)));
-        assert!(live_overlay.set(file.abs_path(), overlay_source.to_owned()));
-        let frozen_overlay: Arc<dyn Project> = Arc::new(live_overlay.snapshot());
-        let request = disk.clone_with_project(frozen_overlay);
-        let state = request
-            .fetch_file_state(&file)
-            .expect("parse the transient overlay revision");
-        assert_eq!(state.source, overlay_source);
-        assert_eq!(request.resolve_live_oid_for_file(&file), Some(overlay_oid));
-
-        assert_eq!(disk.resolve_live_oid_for_file(&file), Some(disk_oid));
-        assert_eq!(sibling.resolve_live_oid_for_file(&file), Some(disk_oid));
-        assert_eq!(disk.file_source(&file).as_deref(), Some(disk_source));
-        assert_eq!(sibling.file_source(&file).as_deref(), Some(disk_source));
-
-        assert!(live_overlay.clear(&file.abs_path()));
-        let cleared_project: Arc<dyn Project> = Arc::new(live_overlay.snapshot());
-        let cleared = disk.clone_with_project(cleared_project);
-        assert_eq!(cleared.resolve_live_oid_for_file(&file), Some(disk_oid));
-        assert_eq!(cleared.file_source(&file).as_deref(), Some(disk_source));
-        assert_eq!(request.file_source(&file).as_deref(), Some(overlay_source));
     }
 
     #[test]

@@ -231,7 +231,7 @@ impl<'a> CSharpVisitor<'a> {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
-        let name = cs_ident_text(name_node, self.source);
+        let name = cs_node_text(name_node, self.source).trim();
         if name.is_empty() {
             return;
         }
@@ -318,7 +318,7 @@ impl<'a> CSharpVisitor<'a> {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
-        let name = cs_ident_text(name_node, self.source);
+        let name = cs_node_text(name_node, self.source).trim();
         if name.is_empty() {
             return;
         }
@@ -427,7 +427,7 @@ impl<'a> CSharpVisitor<'a> {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
-        let name = cs_ident_text(name_node, self.source);
+        let name = cs_node_text(name_node, self.source).trim();
         // C# requires a constructor to be named after the type that declares it,
         // so a mismatch never occurs in source the compiler accepts. It is still
         // reachable through parse recovery: an `#if !DEBUG` region between a
@@ -479,7 +479,7 @@ impl<'a> CSharpVisitor<'a> {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
-        let name = cs_ident_text(name_node, self.source);
+        let name = cs_node_text(name_node, self.source).trim();
         if name.is_empty() {
             return;
         }
@@ -538,7 +538,7 @@ impl<'a> CSharpVisitor<'a> {
             let Some(name_node) = child.child_by_field_name("name") else {
                 continue;
             };
-            let name = cs_ident_text(name_node, self.source);
+            let name = cs_node_text(name_node, self.source).trim();
             if name.is_empty() {
                 continue;
             }
@@ -580,7 +580,7 @@ impl<'a> CSharpVisitor<'a> {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
-        let name = cs_ident_text(name_node, self.source);
+        let name = cs_node_text(name_node, self.source).trim();
         if name.is_empty() {
             return;
         }
@@ -653,25 +653,6 @@ fn collect_csharp_type_identifiers(
 
 fn cs_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     brokk_bifrost_core::analyzer::common::node_source_text(node, source)
-}
-
-/// A declaration's own name, with the verbatim-identifier `@` escape normalized
-/// off (`class @Wrapper` -> `Wrapper`).
-///
-/// C# lets any identifier be written with a leading `@`; the escape only stops
-/// the lexer from reading a keyword, so `@Wrapper` and `Wrapper` denote the same
-/// declaration. Every reference surface already canonicalizes the escape away
-/// (`graph::resolver::node_text`, `csharp_type_node_segments`), so an identity
-/// built from the raw spelling could never be matched by a reference (#2064).
-/// Use this for anything that becomes a short name, an fq segment, or a
-/// type-parameter identity; rendered signature text keeps the source spelling.
-fn cs_ident_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    brokk_bifrost_core::analyzer::common::node_ident_text(
-        node,
-        source,
-        true,
-        &CSHARP_IDENTIFIER_SIGIL,
-    )
 }
 
 fn normalize_cs_whitespace(value: &str) -> String {
@@ -938,7 +919,7 @@ fn csharp_method_type_parameters(node: Node<'_>, source: &str) -> Vec<String> {
                 .child_by_field_name("name")
                 .or_else(|| parameter.named_child(0))
                 .unwrap_or(parameter);
-            let text = cs_ident_text(name, source);
+            let text = cs_node_text(name, source).trim();
             (!text.is_empty()).then(|| text.to_string())
         })
         .collect()
@@ -955,7 +936,7 @@ fn csharp_method_type_parameter_has_constraints(
         .any(|clause| {
             let mut clause_cursor = clause.walk();
             clause.named_children(&mut clause_cursor).any(|child| {
-                child.kind() == "identifier" && cs_ident_text(child, source) == parameter_name
+                child.kind() == "identifier" && cs_node_text(child, source).trim() == parameter_name
             })
         })
 }
@@ -1138,7 +1119,8 @@ fn csharp_type_wrapper_child(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn csharp_identifier_text(node: Node<'_>, source: &str) -> Option<String> {
-    let text = cs_ident_text(node, source);
+    let text = cs_node_text(node, source).trim();
+    let text = text.strip_prefix('@').unwrap_or(text);
     (!text.is_empty()).then(|| text.to_string())
 }
 

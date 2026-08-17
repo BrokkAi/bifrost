@@ -360,64 +360,6 @@ html[data-has-hero] .sl-markdown-content > .capability-deck {
   background: var(--bifrost-line-strong);
 }
 
-.project-contributors {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: 0.7rem 1rem;
-  align-items: center;
-  margin-top: 2rem;
-  padding: 1rem 1.2rem;
-  border: 1px solid var(--bifrost-line-strong);
-  background: rgb(15 14 13 / 0.82);
-  clip-path: var(--bifrost-octagon-lg);
-}
-
-.project-contributors > strong {
-  color: #cbc4b7;
-  font-family: var(--sl-font-mono);
-  font-size: 0.72rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.project-contributors__avatars {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.35rem;
-}
-
-.project-contributors__avatars a {
-  display: block;
-  width: 2.7rem;
-  height: 2.7rem;
-  border: 2px solid rgb(255 255 255 / 0.16);
-  border-radius: 50%;
-  background: #171513;
-  transition: border-color 140ms ease, transform 140ms ease;
-}
-
-.project-contributors__avatars a:hover,
-.project-contributors__avatars a:focus-visible {
-  border-color: #eb3f33;
-  transform: translateY(-2px);
-}
-
-.project-contributors__avatars img {
-  display: block;
-  width: 100%;
-  height: 100%;
-  margin: 0;
-  border-radius: 50%;
-}
-
-.project-contributors > small {
-  grid-column: 2;
-  max-width: 58rem;
-  color: #948b7e;
-  font-size: 0.78rem;
-  line-height: 1.45;
-}
-
 /* The cards are a grid with a fixed min-height, so shorter cards left their
    content stranded at the top. align-content centres the block in the cell;
    align-items puts the arrow on the text's centre line rather than its first
@@ -506,14 +448,6 @@ html[data-has-hero] .sl-markdown-content > .capability-deck {
 
   .sl-markdown-content h1 {
     font-size: clamp(2.7rem, 14vw, 4rem);
-  }
-
-  .project-contributors {
-    grid-template-columns: 1fr;
-  }
-
-  .project-contributors > small {
-    grid-column: 1;
   }
 }
 

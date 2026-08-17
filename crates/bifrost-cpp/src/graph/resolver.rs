@@ -1,12 +1,9 @@
 use crate::call_match::{
     CppArgType, cpp_signature_param_types, cpp_split_top_level_commas, normalize_cpp_type_name,
 };
-#[cfg(test)]
-use crate::declarations::cpp_displaced_preprocessor_terminator;
 use crate::declarations::{
-    cpp_displaced_preprocessor_boundary, cpp_export_macro_token, cpp_field_declaration_linkage,
+    cpp_displaced_preprocessor_terminator, cpp_export_macro_token, cpp_field_declaration_linkage,
     cpp_template_term, node_text, normalize_cpp_whitespace, recovered_exported_class_has_body,
-    recovered_fragmented_plain_class_has_body,
 };
 use crate::graph::CppGraphSource;
 use crate::graph::extractor::ScanCtx;
@@ -810,127 +807,16 @@ pub struct VisibilityIndex<'a> {
 pub enum PreprocessorGuard {
     Defined(String),
     Undefined(String),
-    Boolean(BooleanGuardExpression),
     Expression(String),
     NegatedExpression(String),
     Constant(bool),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum BooleanGuardExpression {
-    Defined(String),
-    Undefined(String),
-    Truthy(String),
-    Falsy(String),
-    Opaque(String),
-    NegatedOpaque(String),
-    All(Vec<BooleanGuardExpression>),
-    Any(Vec<BooleanGuardExpression>),
-    Constant(bool),
-}
-
-impl BooleanGuardExpression {
-    fn negated(&self) -> Self {
-        match self {
-            Self::Defined(name) => Self::Undefined(name.clone()),
-            Self::Undefined(name) => Self::Defined(name.clone()),
-            Self::Truthy(name) => Self::Falsy(name.clone()),
-            Self::Falsy(name) => Self::Truthy(name.clone()),
-            Self::Opaque(expression) => Self::NegatedOpaque(expression.clone()),
-            Self::NegatedOpaque(expression) => Self::Opaque(expression.clone()),
-            Self::All(expressions) => Self::any(expressions.iter().map(Self::negated)),
-            Self::Any(expressions) => Self::all(expressions.iter().map(Self::negated)),
-            Self::Constant(value) => Self::Constant(!value),
-        }
-    }
-
-    fn all(expressions: impl IntoIterator<Item = Self>) -> Self {
-        Self::normalized(expressions, true)
-    }
-
-    fn any(expressions: impl IntoIterator<Item = Self>) -> Self {
-        Self::normalized(expressions, false)
-    }
-
-    fn normalized(expressions: impl IntoIterator<Item = Self>, conjunction: bool) -> Self {
-        let mut normalized = Vec::new();
-        for expression in expressions {
-            match expression {
-                Self::All(nested) if conjunction => normalized.extend(nested),
-                Self::Any(nested) if !conjunction => normalized.extend(nested),
-                Self::Constant(value) if value == conjunction => {}
-                Self::Constant(value) => return Self::Constant(value),
-                expression => normalized.push(expression),
-            }
-        }
-        normalized.sort_unstable();
-        normalized.dedup();
-        match normalized.len() {
-            0 => Self::Constant(conjunction),
-            1 => normalized.pop().expect("one Boolean guard expression"),
-            _ if conjunction => Self::All(normalized),
-            _ => Self::Any(normalized),
-        }
-    }
-
-    fn implies(&self, required: &Self) -> bool {
-        if self == required
-            || matches!(self, Self::Constant(false))
-            || matches!(required, Self::Constant(true))
-        {
-            return true;
-        }
-        match self {
-            Self::Any(active) => active.iter().all(|expression| expression.implies(required)),
-            Self::All(active) => match required {
-                Self::All(required) => required.iter().all(|expression| self.implies(expression)),
-                _ => active.iter().any(|expression| expression.implies(required)),
-            },
-            _ => match required {
-                Self::Any(required) => required.iter().any(|expression| self.implies(expression)),
-                Self::All(required) => required.iter().all(|expression| self.implies(expression)),
-                _ => false,
-            },
-        }
-    }
-
-    pub fn heap_size(&self) -> usize {
-        match self {
-            Self::Defined(value)
-            | Self::Undefined(value)
-            | Self::Truthy(value)
-            | Self::Falsy(value)
-            | Self::Opaque(value)
-            | Self::NegatedOpaque(value) => value.len(),
-            Self::All(expressions) | Self::Any(expressions) => {
-                expressions
-                    .iter()
-                    .fold(std::mem::size_of::<Vec<Self>>(), |size, expression| {
-                        size.saturating_add(std::mem::size_of::<Self>())
-                            .saturating_add(expression.heap_size())
-                    })
-            }
-            Self::Constant(_) => 0,
-        }
-    }
-}
-
 impl PreprocessorGuard {
-    fn as_boolean_expression(&self) -> Option<BooleanGuardExpression> {
-        match self {
-            Self::Defined(name) => Some(BooleanGuardExpression::Defined(name.clone())),
-            Self::Undefined(name) => Some(BooleanGuardExpression::Undefined(name.clone())),
-            Self::Boolean(expression) => Some(expression.clone()),
-            Self::Constant(value) => Some(BooleanGuardExpression::Constant(*value)),
-            Self::Expression(_) | Self::NegatedExpression(_) => None,
-        }
-    }
-
     fn negated(&self) -> Self {
         match self {
             Self::Defined(name) => Self::Undefined(name.clone()),
             Self::Undefined(name) => Self::Defined(name.clone()),
-            Self::Boolean(expression) => Self::Boolean(expression.negated()),
             Self::Expression(expression) => Self::NegatedExpression(expression.clone()),
             Self::NegatedExpression(expression) => Self::Expression(expression.clone()),
             Self::Constant(value) => Self::Constant(!value),
@@ -944,7 +830,7 @@ impl PreprocessorGuard {
             // tree-sitter, but its full preprocessor semantics are outside the
             // analyzer's guard model. Any macro mutation can therefore change
             // its truth value.
-            Self::Boolean(_) | Self::Expression(_) | Self::NegatedExpression(_) => true,
+            Self::Expression(_) | Self::NegatedExpression(_) => true,
             Self::Constant(_) => false,
         }
     }
@@ -1402,18 +1288,16 @@ impl<'a> VisibilityIndex<'a> {
         else {
             return CallArityEvidence::Exact(0);
         };
-        let recovered_c_keyword_arguments =
-            recovered_c_keyword_argument_count(file, call, arguments, source);
         let arguments = argument_children(arguments).collect::<Vec<_>>();
         if arguments
             .iter()
             .all(|argument| !argument_shape_may_change_arity(*argument))
         {
-            return CallArityEvidence::Exact(arguments.len() + recovered_c_keyword_arguments);
+            return CallArityEvidence::Exact(arguments.len());
         }
         let environment = self.macro_environment(file, call.start_byte());
         let mut stack = Vec::new();
-        let mut total = recovered_c_keyword_arguments;
+        let mut total = 0usize;
         for argument in arguments {
             if !macro_expansion_shape_is_safe(argument, source, &[], &environment) {
                 return CallArityEvidence::Unknown;
@@ -2940,18 +2824,8 @@ impl<'a> VisibilityIndex<'a> {
         {
             return false;
         }
-        declaration_guard_requirements(analyzer, self.cpp, declaration)
-            .into_iter()
-            .any(|(_, declaration_guards)| {
-                self.foreign_declaration_reachable_at_reference(
-                    file,
-                    prepared.as_ref(),
-                    declaration.source(),
-                    &declaration_guards,
-                    reference.guards(),
-                    reference_byte,
-                )
-            })
+        self.include_activation_for_source(self.cpp, file, prepared.as_ref(), declaration.source())
+            .is_some_and(|activation| activation < reference_byte)
     }
 
     pub fn external_type_candidate_visible_at(
@@ -3035,7 +2909,7 @@ impl<'a> VisibilityIndex<'a> {
                     )
                     && self.preprocessor_guards_stable_between(
                         file,
-                        projection.activation_byte,
+                        0,
                         reference_byte,
                         &projection.required_guards,
                     )
@@ -4623,34 +4497,6 @@ impl<'a> VisibilityIndex<'a> {
                 .iter()
                 .any(|existing| same_visible_symbol(existing, &resolved))
             {
-                continue;
-            }
-            if let Some(existing) = canonical.iter_mut().find(|existing| {
-                self.compatible_primary_template_redeclarations(existing, &resolved)
-            }) {
-                // A forward declaration and its full primary-template
-                // definition are one C++ type even when they live in
-                // different headers and alpha-rename their parameters. The
-                // target-preserving path already reconciles this family; do
-                // the same for ordinary canonical lookup so an out-of-line
-                // member's lexical owner is not made ambiguous by its own
-                // forward declaration. Retain the strongest physical
-                // declaration for later owner/range queries.
-                if matches!(
-                    (
-                        cpp_class_declaration_strength(analyzer, existing),
-                        cpp_class_declaration_strength(analyzer, &resolved),
-                    ),
-                    (
-                        CppClassDeclarationStrength::Forward | CppClassDeclarationStrength::Unknown,
-                        CppClassDeclarationStrength::Full,
-                    ) | (
-                        CppClassDeclarationStrength::Unknown,
-                        CppClassDeclarationStrength::Forward,
-                    )
-                ) {
-                    *existing = resolved;
-                }
                 continue;
             }
             canonical.push(resolved);
@@ -6429,22 +6275,16 @@ fn resolve_field_method_call_return_binding(
     }
     let receiver_resolver = receiver_resolver?;
     let field = function.child_by_field_name("field")?;
-    let member_name = node_text(function_terminal_node(field), source);
+    let member_name = node_text(field, source);
     let receiver = function
         .child_by_field_name("argument")
         .or_else(|| function.named_child(0))?;
     let owners = receiver_resolver(receiver, source);
     let mut candidates = Vec::new();
     for owner in owners {
-        let declaring_owner =
-            match resolve_declaring_member_owner(analyzer, visibility, file, &owner, member_name) {
-                EnclosingMemberOwnerResolution::Owner(owner) => owner,
-                EnclosingMemberOwnerResolution::Missing => continue,
-                EnclosingMemberOwnerResolution::Ambiguous => return None,
-            };
         candidates.extend(
             visibility
-                .visible_members_for_owner_name(file, &declaring_owner, member_name)
+                .visible_members_for_owner_name(file, &owner, member_name)
                 .into_iter()
                 .filter(|unit| {
                     unit.is_function() && cpp_callable_arity(analyzer, unit).accepts(arity)
@@ -7010,28 +6850,7 @@ fn guard_requirements_hold_at_reference(
     required: &HashSet<PreprocessorGuard>,
     reference: Option<&HashSet<PreprocessorGuard>>,
 ) -> bool {
-    reference.is_some_and(|active| {
-        required
-            .iter()
-            .all(|guard| preprocessor_guard_holds_at_reference(guard, active))
-    })
-}
-
-fn preprocessor_guard_holds_at_reference(
-    required: &PreprocessorGuard,
-    active: &HashSet<PreprocessorGuard>,
-) -> bool {
-    if active.contains(required) {
-        return true;
-    }
-    let active_expression = BooleanGuardExpression::all(
-        active
-            .iter()
-            .filter_map(PreprocessorGuard::as_boolean_expression),
-    );
-    required
-        .as_boolean_expression()
-        .is_some_and(|required| active_expression.implies(&required))
+    reference.is_some_and(|active| required.is_subset(active))
 }
 
 /// Cross-file guard rule: two guard sets are compatible when neither one
@@ -7146,80 +6965,7 @@ pub fn preprocessor_guard_environment(
         }
         ancestor = conditional.parent();
     }
-    if let Some(guard) = fragmented_statement_preprocessor_guard(node, source) {
-        match guard {
-            PreprocessorGuard::Constant(true) => {}
-            PreprocessorGuard::Constant(false) => return None,
-            _ => {
-                if guards.contains(&guard.negated()) {
-                    return None;
-                }
-                guards.insert(guard);
-            }
-        }
-    }
     Some(guards)
-}
-
-fn fragmented_statement_preprocessor_guard(
-    descendant: Node<'_>,
-    source: &str,
-) -> Option<PreprocessorGuard> {
-    // A conditional that starts before `} else if (...) {` crosses the
-    // enclosing statement's grammar boundary. tree-sitter leaves its opener
-    // as a `preproc_if` with a missing terminator in the consequence and
-    // reparses the real `#endif` as a `preproc_call` in the alternative. Pair
-    // those structured nodes before restoring the guard to intervening uses.
-    let mut ancestor = descendant.parent();
-    while let Some(statement) = ancestor {
-        if statement.kind() == "if_statement"
-            && let (Some(consequence), Some(alternative)) = (
-                statement.child_by_field_name("consequence"),
-                statement.child_by_field_name("alternative"),
-            )
-            && alternative.start_byte() <= descendant.start_byte()
-            && descendant.end_byte() <= alternative.end_byte()
-        {
-            let mut cursor = consequence.walk();
-            let openers = consequence
-                .named_children(&mut cursor)
-                .filter(|child| {
-                    matches!(child.kind(), "preproc_if" | "preproc_ifdef")
-                        && child
-                            .child(child.child_count().saturating_sub(1))
-                            .is_some_and(|last| last.kind() == "#endif" && last.is_missing())
-                })
-                .collect::<Vec<_>>();
-            if openers.len() != 1 {
-                ancestor = statement.parent();
-                continue;
-            }
-
-            let mut terminators = Vec::new();
-            let mut stack = vec![alternative];
-            while let Some(node) = stack.pop() {
-                if node.kind() == "preproc_call"
-                    && node.start_byte() >= descendant.end_byte()
-                    && node
-                        .child_by_field_name("directive")
-                        .is_some_and(|directive| node_text(directive, source).trim() == "#endif")
-                {
-                    terminators.push(node);
-                    continue;
-                }
-                for index in (0..node.named_child_count()).rev() {
-                    if let Some(child) = node.named_child(index) {
-                        stack.push(child);
-                    }
-                }
-            }
-            if terminators.len() == 1 {
-                return simple_preprocessor_guard(openers[0], source);
-            }
-        }
-        ancestor = statement.parent();
-    }
-    None
 }
 
 fn preprocessor_guard_for_descendant(
@@ -7251,8 +6997,8 @@ fn preprocessor_conditional_contains_descendant(
     conditional: Node<'_>,
     descendant: Node<'_>,
 ) -> bool {
-    cpp_displaced_preprocessor_boundary(conditional)
-        .is_none_or(|boundary| descendant.end_byte() <= boundary.end_byte)
+    cpp_displaced_preprocessor_terminator(conditional)
+        .is_none_or(|terminator| descendant.start_byte() < terminator.end_byte())
 }
 
 pub fn merge_preprocessor_guards(
@@ -7320,104 +7066,7 @@ fn simple_preprocessor_expression_guard(
             .filter_map(|index| expression.named_child(index))
             .next()
             .and_then(|child| simple_preprocessor_expression_guard(child, source)),
-        "binary_expression" => Some(PreprocessorGuard::Boolean(boolean_preprocessor_expression(
-            expression, source,
-        ))),
         _ => None,
-    }
-}
-
-fn boolean_preprocessor_expression(expression: Node<'_>, source: &str) -> BooleanGuardExpression {
-    match expression.kind() {
-        "number_literal" => match node_text(expression, source).trim() {
-            "0" => BooleanGuardExpression::Constant(false),
-            "1" => BooleanGuardExpression::Constant(true),
-            _ => BooleanGuardExpression::Opaque(normalize_cpp_whitespace(node_text(
-                expression, source,
-            ))),
-        },
-        "identifier" => BooleanGuardExpression::Truthy(node_text(expression, source).to_string()),
-        "preproc_defined" => {
-            let identifier = (0..expression.named_child_count())
-                .filter_map(|index| expression.named_child(index))
-                .find(|child| child.kind() == "identifier");
-            identifier.map_or_else(
-                || {
-                    BooleanGuardExpression::Opaque(normalize_cpp_whitespace(node_text(
-                        expression, source,
-                    )))
-                },
-                |identifier| {
-                    BooleanGuardExpression::Defined(node_text(identifier, source).to_string())
-                },
-            )
-        }
-        "unary_expression"
-            if expression
-                .child_by_field_name("operator")
-                .is_some_and(|operator| operator.kind() == "!") =>
-        {
-            expression.child_by_field_name("argument").map_or_else(
-                || {
-                    BooleanGuardExpression::Opaque(normalize_cpp_whitespace(node_text(
-                        expression, source,
-                    )))
-                },
-                |argument| boolean_preprocessor_expression(argument, source).negated(),
-            )
-        }
-        "parenthesized_expression" => (0..expression.named_child_count())
-            .filter_map(|index| expression.named_child(index))
-            .next()
-            .map_or_else(
-                || {
-                    BooleanGuardExpression::Opaque(normalize_cpp_whitespace(node_text(
-                        expression, source,
-                    )))
-                },
-                |child| boolean_preprocessor_expression(child, source),
-            ),
-        "binary_expression" => {
-            let operands = || {
-                Some((
-                    boolean_preprocessor_expression(
-                        expression.child_by_field_name("left")?,
-                        source,
-                    ),
-                    boolean_preprocessor_expression(
-                        expression.child_by_field_name("right")?,
-                        source,
-                    ),
-                ))
-            };
-            match expression
-                .child_by_field_name("operator")
-                .map(|operator| operator.kind())
-            {
-                Some("&&") => operands().map_or_else(
-                    || {
-                        BooleanGuardExpression::Opaque(normalize_cpp_whitespace(node_text(
-                            expression, source,
-                        )))
-                    },
-                    |(left, right)| BooleanGuardExpression::all([left, right]),
-                ),
-                Some("||") => operands().map_or_else(
-                    || {
-                        BooleanGuardExpression::Opaque(normalize_cpp_whitespace(node_text(
-                            expression, source,
-                        )))
-                    },
-                    |(left, right)| BooleanGuardExpression::any([left, right]),
-                ),
-                _ => BooleanGuardExpression::Opaque(normalize_cpp_whitespace(node_text(
-                    expression, source,
-                ))),
-            }
-        }
-        _ => {
-            BooleanGuardExpression::Opaque(normalize_cpp_whitespace(node_text(expression, source)))
-        }
     }
 }
 
@@ -7593,13 +7242,14 @@ fn callable_preprocessor_context_is_visible_for_reference(
                 }
                 // The declaration stands under a guard whose value this
                 // analyzer cannot decide. It is still co-active with a
-                // reference whose active guards imply it. Collecting one guard
-                // per ancestor makes the whole walk a conjunction of the
-                // declaration requirements.
+                // reference that stands under the same guard, so accept the
+                // guard when the reference already requires it. Collecting one
+                // guard per ancestor makes the whole walk a subset test of the
+                // declaration guards against the reference guards.
                 guard => {
                     if !reference
                         .guards()
-                        .is_some_and(|active| preprocessor_guard_holds_at_reference(&guard, active))
+                        .is_some_and(|active| active.contains(&guard))
                     {
                         return false;
                     }
@@ -7942,11 +7592,11 @@ fn is_split_cpp_language_linkage_wrapper(
     descendant: Node<'_>,
     source: &str,
 ) -> bool {
-    if conditional.child_by_field_name("alternative").is_some()
-        || !matches!(
-            simple_preprocessor_guard(conditional, source),
-            Some(PreprocessorGuard::Defined(name)) if name == "__cplusplus"
-        )
+    if conditional.kind() != "preproc_ifdef"
+        || conditional.child_by_field_name("alternative").is_some()
+        || conditional
+            .child_by_field_name("name")
+            .is_none_or(|name| node_text(name, source) != "__cplusplus")
     {
         return false;
     }
@@ -7985,14 +7635,15 @@ fn is_split_cpp_language_linkage_wrapper(
         .filter_map(|index| body.named_child(index))
         .skip_while(|child| child.start_byte() < descendant.end_byte())
         .any(|child| {
-            matches!(
-                simple_preprocessor_guard(child, source),
-                Some(PreprocessorGuard::Defined(name)) if name == "__cplusplus"
-            ) && (0..child.child_count()).any(|index| {
-                child
-                    .child(index)
-                    .is_some_and(|token| token.kind() == "#endif" && token.is_missing())
-            })
+            child.kind() == "preproc_ifdef"
+                && child
+                    .child_by_field_name("name")
+                    .is_some_and(|name| node_text(name, source) == "__cplusplus")
+                && (0..child.child_count()).any(|index| {
+                    child
+                        .child(index)
+                        .is_some_and(|token| token.kind() == "#endif" && token.is_missing())
+                })
         });
     closes_opening_branch && reopens_for_closing_brace
 }
@@ -8022,82 +7673,6 @@ pub fn argument_children<'tree>(node: Node<'tree>) -> impl Iterator<Item = Node<
             }
         })
         .flatten()
-}
-
-fn recovered_c_keyword_argument_count(
-    file: &ProjectFile,
-    call: Node<'_>,
-    arguments: Node<'_>,
-    source: &str,
-) -> usize {
-    // A C identifier that is a C++ keyword can be displaced twice by the C++
-    // grammar: first into a direct parameter-list `ERROR(keyword)`, then into
-    // a direct argument-list `ERROR(',', keyword)`. Match those CST tokens in
-    // the enclosing C function before restoring the otherwise dropped slot.
-    if !is_c_source_file(file) || arguments.kind() != "argument_list" {
-        return 0;
-    }
-    let mut ancestor = Some(call);
-    let function = loop {
-        let Some(current) = ancestor else {
-            return 0;
-        };
-        if current.kind() == "function_definition" {
-            break current;
-        }
-        ancestor = current.parent();
-    };
-    let Some(parameters) = function
-        .child_by_field_name("declarator")
-        .and_then(|declarator| declarator.child_by_field_name("parameters"))
-    else {
-        return 0;
-    };
-    let displaced_parameter_keywords = (0..parameters.child_count())
-        .filter_map(|index| parameters.child(index))
-        .filter(|error| error.kind() == "ERROR")
-        .filter_map(|error| {
-            let parameter = error.prev_named_sibling()?;
-            if parameter.kind() != "parameter_declaration"
-                || parameter.end_byte() != error.start_byte()
-                || extract_variable_name(parameter, source).is_some()
-            {
-                return None;
-            }
-            let mut children = (0..error.child_count())
-                .filter_map(|index| error.child(index))
-                .filter(|child| !child.is_extra() && !child.is_missing());
-            let keyword = children.next()?;
-            (children.next().is_none() && !keyword.is_named() && keyword.child_count() == 0)
-                .then_some(keyword)
-        })
-        .collect::<Vec<_>>();
-    if displaced_parameter_keywords.is_empty() {
-        return 0;
-    }
-
-    (0..arguments.child_count())
-        .filter_map(|index| arguments.child(index))
-        .filter(|error| error.kind() == "ERROR" && error.is_extra())
-        .filter(|error| {
-            let mut children = (0..error.child_count())
-                .filter_map(|index| error.child(index))
-                .filter(|child| !child.is_extra() && !child.is_missing());
-            let Some(comma) = children.next() else {
-                return false;
-            };
-            let Some(keyword) = children.next() else {
-                return false;
-            };
-            children.next().is_none()
-                && comma.kind() == ","
-                && !keyword.is_named()
-                && keyword.child_count() == 0
-                && displaced_parameter_keywords
-                    .iter()
-                    .any(|parameter| parameter.kind_id() == keyword.kind_id())
-        })
-        .count()
 }
 
 fn recovered_block_literal_arguments<'tree>(
@@ -8292,10 +7867,7 @@ fn unique_type_candidate_preserving_alias(
         return candidates
             .iter()
             .all(|candidate| {
-                declared_type_alias(analyzer, candidate)
-                    && candidate.kind() == first.kind()
-                    && candidate.fq_name() == first.fq_name()
-                    && candidate.source() == first.source()
+                declared_type_alias(analyzer, candidate) && same_logical_symbol(first, candidate)
             })
             .then(|| first.clone());
     }
@@ -9054,11 +8626,10 @@ pub enum RecoveredDeclaratorTypeContext {
 ///
 /// Tree-sitter parses `API Result *make(Arg);` as if `API` were the declared
 /// type and `Result` were the scope of a qualified declarator with a missing
-/// `::`. A template return such as `API Result<T> make()` uses a
-/// `template_type` for the same recovered scope. The same recovery occurs for
-/// macro-prefixed definitions, extern variables, and macro-decorated
-/// parameters (`f(MACRO T* p)`, where the parameter's own `type` field takes
-/// the macro). Keep this intentionally structural: the recovered scope must
+/// `::`. The same recovery occurs for macro-prefixed definitions, extern
+/// variables, and macro-decorated parameters (`f(MACRO T* p)`, where the
+/// parameter's own `type` field takes the macro). Keep this intentionally
+/// structural: the recovered scope must
 /// have the grammar's missing separator, the qualified node must occupy the
 /// declaration's declarator chain, a separate nonempty type must occupy the
 /// normal type field, and the recovered name must unwrap to a real declarator
@@ -9076,7 +8647,7 @@ pub fn recovered_macro_decorated_declarator_type(
 pub fn recovered_macro_decorated_type_node(
     node: Node<'_>,
 ) -> Option<(Node<'_>, RecoveredDeclaratorTypeContext)> {
-    if !matches!(node.kind(), "namespace_identifier" | "template_type") || node.is_missing() {
+    if node.kind() != "namespace_identifier" || node.is_missing() {
         return None;
     }
     let qualified = node.parent()?;
@@ -9165,9 +8736,7 @@ fn concrete_recovered_declarator_name(mut node: Node<'_>) -> bool {
             return false;
         }
         match node.kind() {
-            "identifier" | "field_identifier" | "type_identifier" | "operator_name" => {
-                return true;
-            }
+            "identifier" | "field_identifier" | "type_identifier" => return true,
             "array_declarator"
             | "function_declarator"
             | "parenthesized_declarator"
@@ -9516,9 +9085,6 @@ fn recovered_c_reference_node(
     if !name.is_empty() && visibility.macro_name_may_be_bound_at(file, name, node.start_byte()) {
         return true;
     }
-    if recovered_c_explicit_assignment_callee(visibility, file, node, name) {
-        return true;
-    }
     if is_declaration_name(node) {
         return false;
     }
@@ -9526,38 +9092,6 @@ fn recovered_c_reference_node(
         return true;
     }
     recovered_c_reference_anchor(node)
-}
-
-fn recovered_c_explicit_assignment_callee(
-    visibility: &VisibilityIndex<'_>,
-    file: &ProjectFile,
-    node: Node<'_>,
-    name: &str,
-) -> bool {
-    let mut current = node;
-    let error = loop {
-        let Some(parent) = current.parent() else {
-            return false;
-        };
-        if parent.is_error() {
-            break parent;
-        }
-        current = parent;
-    };
-    let mut cursor = error.walk();
-    let explicit_recovery_precedes_callee = error
-        .named_children(&mut cursor)
-        .take_while(|child| child.start_byte() < node.start_byte())
-        .any(|child| child.kind() == "explicit_function_specifier");
-    if !explicit_recovery_precedes_callee {
-        return false;
-    }
-    visibility
-        .cpp
-        .declarations(file)
-        .iter()
-        .chain(visibility.visible_by_file.get(file).into_iter().flatten())
-        .any(|candidate| candidate.identifier() == name && candidate.is_function())
 }
 
 fn recovered_c_macro_binding_role(mut node: Node<'_>) -> bool {
@@ -10577,7 +10111,6 @@ pub fn function_terminal_node(mut node: Node<'_>) -> Node<'_> {
         let next = match node.kind() {
             "qualified_identifier"
             | "scoped_identifier"
-            | "template_method"
             | "template_function"
             | "template_type" => node.child_by_field_name("name"),
             "field_expression" => node.child_by_field_name("field"),
@@ -11519,17 +11052,7 @@ fn cpp_class_declaration_strength_in_tree(
     for range in ranges {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            if node.start_byte() == range.start_byte
-                && recovered_fragmented_plain_class_has_body(
-                    node,
-                    source,
-                    candidate.identifier(),
-                    &range,
-                )
-            {
-                return CppClassDeclarationStrength::Full;
-            }
-            if node.start_byte() > range.start_byte || node.end_byte() < range.start_byte {
+            if node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
                 continue;
             }
             if node.start_byte() == range.start_byte && node.end_byte() == range.end_byte {
@@ -11954,115 +11477,6 @@ mod tests {
                 .is_some_and(|child| child.kind() == "#endif" && !child.is_missing())
         );
         assert!(cpp_displaced_preprocessor_terminator(conditional).is_none());
-
-        let split_declaration = "struct Node;\n\ntypedef\n  #ifdef FEATURE_X\n    struct Node *\n  #else\n    UInt32\n  #endif\n  NodeRef;\n\nstatic int target(void) { return 1; }\n#ifdef LATER\nint later;\n#endif\n";
-        let tree = parse(split_declaration);
-        let root = tree.root_node();
-        let conditional = root
-            .named_children(&mut root.walk())
-            .find(|node| node.kind() == "preproc_ifdef" && node.start_position().row == 3)
-            .expect("split declaration conditional");
-        let target = split_declaration
-            .find("static int target")
-            .expect("target byte");
-        let boundary =
-            cpp_displaced_preprocessor_boundary(conditional).expect("split declaration boundary");
-        assert!(boundary.end_byte <= target, "{boundary:?}");
-        assert_eq!(boundary.end_line, 9, "{boundary:?}");
-        let target_node = root
-            .descendant_for_byte_range(target, target + "static".len())
-            .expect("target node");
-        assert!(!preprocessor_conditional_contains_descendant(
-            conditional,
-            target_node
-        ));
-    }
-
-    #[test]
-    fn fragmented_reference_guard_is_recovered() {
-        let source = "#if HAVE_ONE && HAVE_TWO\nstatic int helper(int value) { return value; }\n#endif\n\nint fragmented(int value) {\n    if (value == 0) {\n        return 0;\n#if HAVE_ONE && HAVE_TWO\n    } else if (value == 1) {\n        return helper(value);\n#endif\n    }\n    return 0;\n}\n";
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .expect("C++ grammar");
-        let tree = parser.parse(source, None).expect("fixture tree");
-        let start = source.rfind("helper").expect("reference byte");
-        let node = tree
-            .root_node()
-            .descendant_for_byte_range(start, start + "helper".len())
-            .expect("reference node");
-        let mut expected = HashSet::default();
-        expected.insert(PreprocessorGuard::Boolean(BooleanGuardExpression::All(
-            vec![
-                BooleanGuardExpression::Truthy("HAVE_ONE".to_string()),
-                BooleanGuardExpression::Truthy("HAVE_TWO".to_string()),
-            ],
-        )));
-        assert_eq!(preprocessor_guard_environment(node, source), Some(expected));
-    }
-
-    #[test]
-    fn boolean_guard_normalization_proves_equivalence_and_implication() {
-        let windows = BooleanGuardExpression::Defined("WIN32".to_string());
-        let cygwin = BooleanGuardExpression::Defined("CYGWIN".to_string());
-        let negated_windows_branch =
-            BooleanGuardExpression::all([windows.clone(), cygwin.negated()]).negated();
-        let portable = BooleanGuardExpression::any([windows.negated(), cygwin]);
-        assert_eq!(negated_windows_branch, portable);
-
-        let missing_a = BooleanGuardExpression::Undefined("A".to_string());
-        let missing_b = BooleanGuardExpression::Undefined("B".to_string());
-        let missing_c = BooleanGuardExpression::Undefined("C".to_string());
-        let fallback_branch = BooleanGuardExpression::any([missing_a.clone(), missing_b.clone()]);
-        let fallback_declaration = BooleanGuardExpression::any([missing_a, missing_b, missing_c]);
-        assert!(fallback_branch.implies(&fallback_declaration));
-        assert!(!fallback_declaration.implies(&fallback_branch));
-    }
-
-    #[test]
-    fn c_keyword_argument_recovery_requires_an_enclosing_displaced_parameter() {
-        let source = "static int helper(const char *left, wchar_t *right) { return 0; }\nint caller(wchar_t *template) {\n    return helper(NULL, template); /* bound */\n}\nint unbound(void) {\n    return helper(NULL, template); /* unbound */\n}\n";
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_cpp::LANGUAGE.into())
-            .expect("C++ grammar");
-        let tree = parser.parse(source, None).expect("fixture tree");
-        let root = tree.root_node();
-        let call = |marker: &str| {
-            let start = source.find(marker).expect("call marker");
-            let mut node = root
-                .descendant_for_byte_range(start, start + "helper".len())
-                .expect("call name node");
-            loop {
-                if node.kind() == "call_expression" {
-                    break node;
-                }
-                node = node.parent().expect("call expression ancestor");
-            }
-        };
-        let c_file = ProjectFile::new(std::env::temp_dir(), "keyword-argument.c");
-        let cpp_file = ProjectFile::new(std::env::temp_dir(), "keyword-argument.cpp");
-        let keyword_call = call("helper(NULL, template); /* bound */");
-        let keyword_arguments = keyword_call
-            .child_by_field_name("arguments")
-            .expect("keyword argument list");
-        assert_eq!(
-            recovered_c_keyword_argument_count(&c_file, keyword_call, keyword_arguments, source),
-            1
-        );
-        assert_eq!(
-            recovered_c_keyword_argument_count(&cpp_file, keyword_call, keyword_arguments, source),
-            0
-        );
-
-        let unbound_call = call("helper(NULL, template); /* unbound */");
-        let unbound_arguments = unbound_call
-            .child_by_field_name("arguments")
-            .expect("unbound argument list");
-        assert_eq!(
-            recovered_c_keyword_argument_count(&c_file, unbound_call, unbound_arguments, source),
-            0
-        );
     }
 
     fn first_enum_flattened_namespace(source: &str) -> Option<Vec<String>> {

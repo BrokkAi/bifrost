@@ -1955,18 +1955,6 @@ int recovered_member(struct State *state) {
     DISCARD(const int = state->timestamp);
     return 0;
 }
-
-int recovered_call_target(int value) { return value; }
-int recovered_explicit_assignment(void) {
-    int explicit = 0;
-    if (explicit == 0) {
-        explicit = recovered_call_target(1);
-    }
-    if (explicit == 0) {
-        explicit = unindexed_recovery_name(2);
-    }
-    return explicit;
-}
 "#;
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp root");
@@ -1976,14 +1964,6 @@ int recovered_explicit_assignment(void) {
             &root,
             crate::analyzer::Language::Cpp,
         ));
-        assert!(
-            analyzer
-                .get_all_declarations()
-                .iter()
-                .any(|unit| unit.is_function() && unit.identifier() == "recovered_call_target"),
-            "fixture declarations: {:#?}",
-            analyzer.get_all_declarations()
-        );
         let roots = HashSet::from_iter([file.clone()]);
         let batch = CppAuthoritativeUsageBatch::new(&analyzer, &roots).expect("C batch");
         let ranges = batch
@@ -1996,12 +1976,6 @@ int recovered_explicit_assignment(void) {
 
         let recovered_type = source.rfind("Widget").expect("recovered Widget");
         let recovered_member = source.rfind("timestamp").expect("recovered timestamp");
-        let recovered_callee = source
-            .find("recovered_call_target(1)")
-            .expect("recovered call target");
-        let unindexed_recovery = source
-            .find("unindexed_recovery_name(2)")
-            .expect("unindexed recovery name");
         assert!(
             ranges.contains(&(recovered_type, recovered_type + "Widget".len())),
             "the macro-shaped type remains a structured reference: {ranges:?}"
@@ -2009,20 +1983,6 @@ int recovered_explicit_assignment(void) {
         assert!(
             ranges.contains(&(recovered_member, recovered_member + "timestamp".len())),
             "the recovered selected member remains a structured reference: {ranges:?}"
-        );
-        assert!(
-            ranges.contains(&(
-                recovered_callee,
-                recovered_callee + "recovered_call_target".len()
-            )),
-            "a visible callable after a C identifier misparsed as `explicit` remains a structured reference: {ranges:?}"
-        );
-        assert!(
-            !ranges.contains(&(
-                unindexed_recovery,
-                unindexed_recovery + "unindexed_recovery_name".len()
-            )),
-            "an arbitrary direct recovery identifier is not admitted: {ranges:?}"
         );
 
         let macro_definition =

@@ -41,8 +41,8 @@ use brokk_bifrost_jvm::scala::graph::syntax::{
     is_scala_case_pattern_binder, is_scala_class_reference, is_scala_named_argument_assignment,
     named_argument_invocation_owner, qualified_stable_type_reference,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
-    scala_callable_alternative_mismatch, scala_definition_binder_names, scala_pattern_binder_names,
-    scala_source_facts, template_self_types,
+    scala_callable_alternative_mismatch, scala_pattern_binder_names, scala_source_facts,
+    template_self_types,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -3654,7 +3654,7 @@ fn resolve_scala_with_context(
             format!("`{}` is not a Scala reference site", site.text),
         );
     }
-    if is_scala_case_pattern_binder(node, source) {
+    if is_scala_case_pattern_binder(node) {
         return no_definition(
             "local_variable_reference",
             format!("`{}` is a local Scala pattern binding", site.text),
@@ -10365,7 +10365,7 @@ fn scala_node_declares_name_before(
             }
             node.child_by_field_name("pattern").is_some_and(|pattern| {
                 lower_bound <= pattern.start_byte()
-                    && scala_definition_binder_names(pattern, source).contains(&name)
+                    && scala_pattern_binder_names(pattern, source).contains(&name)
             })
         }
         "enumerator" => {
@@ -10437,7 +10437,7 @@ fn scala_node_declares_name_before_bounded(
             if lower_bound > pattern.start_byte() {
                 return Some(false);
             }
-            scala_definition_declares_name_bounded(session, pattern, source, name)
+            scala_pattern_declares_name_bounded(session, pattern, source, name)
         }
         "enumerator" => {
             let Some(pattern) =
@@ -10517,18 +10517,6 @@ fn scala_pattern_declares_name_bounded(
         return None;
     }
     Some(scala_pattern_binder_names(pattern, source).contains(&name))
-}
-
-fn scala_definition_declares_name_bounded(
-    session: &ResolutionSession,
-    pattern: Node<'_>,
-    source: &str,
-    name: &str,
-) -> Option<bool> {
-    if !scala_charge_named_descendants(session, pattern) {
-        return None;
-    }
-    Some(scala_definition_binder_names(pattern, source).contains(&name))
 }
 
 fn scala_charge_named_descendants(session: &ResolutionSession, root: Node<'_>) -> bool {
@@ -11847,7 +11835,7 @@ fn scala_seed_value_definition(
                 .cloned()
         })
         .flatten();
-    for name in scala_definition_binder_names(pattern, ctx.source) {
+    for name in scala_pattern_binder_names(pattern, ctx.source) {
         if let Some(owner) = exact_stable_owner.clone() {
             seed_scala_binding_with_receiver_declaration(
                 name,

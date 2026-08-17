@@ -3,8 +3,8 @@ use crate::call_match::{
     cpp_type_text_pointer_depth, normalize_cpp_type_name,
 };
 use crate::declarations::{
-    CppSentinelRecoveredClass, cpp_active_template_type_parameter, cpp_export_macro_token,
-    cpp_sentinel_recovered_scope_for_node, node_text, recovered_macro_return_type_node,
+    CppSentinelRecoveredClass, cpp_export_macro_token, cpp_sentinel_recovered_scope_for_node,
+    node_text, recovered_macro_return_type_node,
 };
 use crate::graph::CppGraphSource;
 use crate::graph::callable_definitions_share_identity_evidence as cpp_callable_definitions_share_identity_evidence;
@@ -16,7 +16,6 @@ use crate::graph::hits::{
 use crate::graph::resolver::*;
 use crate::graph::syntax::qualified_callable_value;
 use crate::graph_support::CppSource;
-use brokk_bifrost_core::analyzer::fq_name::segment_interner;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
@@ -966,18 +965,6 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         return;
     }
-    if !recovered_type
-        && matches!(node.kind(), "qualified_identifier" | "scoped_identifier")
-        && is_declaration_name(node)
-        && let Some(owner) = indexed_out_of_line_template_owner_hit(node, ctx)
-    {
-        *ctx.raw_match_count += 1;
-        push_type_hit(owner, ctx);
-        if let Some(destructor) = out_of_line_destructor_type_reference(node) {
-            push_type_hit(destructor, ctx);
-        }
-        return;
-    }
     // A qualified template-id is represented as a qualified_identifier whose
     // name child is the template_type. Resolve the complete qualified
     // reference from that inner template node below; handling the outer node
@@ -997,11 +984,6 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if !recovered_type && is_nested_type_node(node) {
-        if let Some(hit) = out_of_line_dependent_return_template_owner(node, ctx) {
-            *ctx.raw_match_count += 1;
-            push_type_hit(hit, ctx);
-            return;
-        }
         if let Some(hit) = target_guided_nested_type_terminal_hit(node, ctx) {
             *ctx.raw_match_count += 1;
             push_type_hit(hit, ctx);
@@ -1238,11 +1220,6 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             ctx.recovered_sentinel_scope(hit_node).as_deref(),
         )
     };
-    let type_resolution = if matches!(type_resolution, LexicalTypeResolution::Missing) {
-        orphaned_namespace_alias_type_resolution(hit_node, ctx).unwrap_or(type_resolution)
-    } else {
-        type_resolution
-    };
     match type_resolution {
         LexicalTypeResolution::Resolved {
             unit, candidates, ..
@@ -1253,12 +1230,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     push_type_hit(scope, ctx);
                 }
             } else {
-                let hit_node = if recovered_type && hit_node.kind() == "template_type" {
-                    hit_node
-                        .child_by_field_name("name")
-                        .filter(|name| name.kind() == "type_identifier")
-                        .unwrap_or(hit_node)
-                } else if ctx.visibility.is_template_specialization(&ctx.spec.target) {
+                let hit_node = if ctx.visibility.is_template_specialization(&ctx.spec.target) {
                     hit_node
                         .child_by_field_name("name")
                         .filter(|name| name.kind() == "type_identifier")
@@ -1284,23 +1256,11 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     )
                 {
                     hit_node.child_by_field_name("name").unwrap_or(hit_node)
-                } else if cpp_template_reference_arguments(hit_node, ctx.source).is_some()
-                    && ctx.analyzer.type_alias_provider().is_some_and(|provider| {
-                        candidates
-                            .iter()
-                            .any(|candidate| provider.is_type_alias(candidate))
-                    })
-                {
-                    template_reference_name_node(hit_node)
-                        .map(function_terminal_node)
-                        .unwrap_or(hit_node)
                 } else if qualified_type_scope_contains_template(hit_node) {
                     function_terminal_node(hit_node)
                 } else {
                     hit_node
                 };
-                let hit_node = target_guided_missing_orphaned_namespace_type_leaf(hit_node, ctx)
-                    .unwrap_or(hit_node);
                 push_type_hit(
                     type_reference_hit_node(hit_node, ctx.file, ctx.source, &ctx.bindings),
                     ctx,
@@ -1353,11 +1313,6 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             return;
         }
         LexicalTypeResolution::Missing => {
-            if let Some(leaf) = target_guided_compatible_foreign_import_type_leaf(node, ctx) {
-                *ctx.raw_match_count += 1;
-                push_unproven_hit(leaf, ctx);
-                return;
-            }
             if let Some(leaf) = target_guided_dependent_class_alias_leaf(node, ctx) {
                 *ctx.raw_match_count += 1;
                 push_unproven_hit(leaf, ctx);
@@ -1445,46 +1400,6 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn target_guided_compatible_foreign_import_type_leaf<'tree>(
-    node: Node<'tree>,
-    ctx: &ScanCtx<'_>,
-) -> Option<Node<'tree>> {
-    let (components, global) = type_reference_components(node, ctx.source)?;
-    let lexical_scope = ctx.recovered_sentinel_scope(node).or_else(|| {
-        match cached_enclosing_lexical_scope_components_with_unresolved_owner(
-            node,
-            &ctx.analyzer,
-            ctx.visibility,
-            ctx.file,
-            ctx.source,
-            false,
-            false,
-            Some(&ctx.lexical_scope_cache),
-        ) {
-            LexicalScopeResolution::Resolved(scope) => Some(scope),
-            LexicalScopeResolution::Ambiguous | LexicalScopeResolution::Missing => None,
-        }
-    })?;
-    let OrdinaryTypeImportResolution::Resolved { target, .. } =
-        compatible_foreign_type_import_resolution(
-            node,
-            &components,
-            global,
-            &ctx.analyzer,
-            ctx.visibility,
-            &ctx.ordinary_type_imports,
-            ctx.file,
-            ctx.source,
-            &lexical_scope,
-            &ctx.spec.target,
-        )
-    else {
-        return None;
-    };
-    same_visible_symbol(&target, &ctx.spec.target)
-        .then(|| type_reference_hit_node(node, ctx.file, ctx.source, &ctx.bindings))
-}
-
 /// Resolve the terminal of `Owner::Nested` when the owner name reaches a base
 /// class through C++ inherited-type lookup. The complete type lookup cannot
 /// express that injected owner as its first qualified component, but the owner
@@ -1555,124 +1470,6 @@ fn target_guided_nested_type_terminal_hit<'tree>(
         .into_iter()
         .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target))
         .then_some(complete)
-}
-
-/// Recover the class-template qualifier in a dependent leading return type of
-/// an out-of-line member definition.
-///
-/// `typename Owner<T>::Alias Owner<T>::method()` contains two references to
-/// `Owner`: one in the return type and one in the callable declarator. The
-/// latter already has authoritative indexed owner resolution. Reuse that
-/// structured owner evidence for the former when both template names agree;
-/// resolving `Owner<T>::Alias` as one type would instead select terminal
-/// `Alias` and discard the qualifier.
-fn out_of_line_dependent_return_template_owner<'tree>(
-    node: Node<'tree>,
-    ctx: &ScanCtx<'_>,
-) -> Option<Node<'tree>> {
-    if node.kind() != "template_type" {
-        return None;
-    }
-    let template_name = template_reference_name_node(node)?;
-    let mut scope = node;
-    while let Some(parent) = scope.parent().filter(|parent| {
-        matches!(
-            parent.kind(),
-            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
-        ) && parent.child_by_field_name("name") == Some(scope)
-    }) {
-        scope = parent;
-    }
-    let qualified = scope.parent().filter(|parent| {
-        matches!(
-            parent.kind(),
-            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
-        ) && parent.child_by_field_name("scope") == Some(scope)
-    })?;
-    let mut function = qualified.parent();
-    let function = loop {
-        let candidate = function?;
-        if candidate.kind() == "function_definition" {
-            break candidate;
-        }
-        function = candidate.parent();
-    };
-    let return_type = function.child_by_field_name("type")?;
-    if return_type.start_byte() > node.start_byte() || node.end_byte() > return_type.end_byte() {
-        return None;
-    }
-    let declarator_name = function
-        .child_by_field_name("declarator")
-        .and_then(declarator_name_node)?;
-    if node_text(template_name, ctx.source) != ctx.spec.target.identifier() {
-        return None;
-    }
-    let resolved_owner_matches = out_of_line_member_definition_owner(
-        &ctx.analyzer,
-        ctx.visibility,
-        ctx.file,
-        ctx.source,
-        declarator_name,
-    )
-    .is_some_and(|owners| {
-        owners
-            .owners
-            .iter()
-            .any(|(_, owner)| same_logical_symbol(owner, &ctx.spec.target))
-    });
-    let indexed_owner_matches =
-        indexed_out_of_line_template_owner_hit(declarator_name, ctx).is_some();
-    let target_guided_owner_matches =
-        target_guided_qualifier_type_scopes(declarator_name, ctx).is_some();
-    (resolved_owner_matches || indexed_owner_matches || target_guided_owner_matches)
-        .then_some(template_name)
-}
-
-/// Use the indexed callable identity when a malformed namespace sentinel
-/// prevents lexical lookup of an out-of-line template owner.
-fn indexed_out_of_line_template_owner_hit<'tree>(
-    node: Node<'tree>,
-    ctx: &ScanCtx<'_>,
-) -> Option<Node<'tree>> {
-    if !matches!(node.kind(), "qualified_identifier" | "scoped_identifier")
-        || !is_declaration_name(node)
-    {
-        return None;
-    }
-    let mut function = node.parent();
-    let function = loop {
-        let candidate = function?;
-        if candidate.kind() == "function_definition" {
-            break candidate;
-        }
-        function = candidate.parent();
-    };
-    if function
-        .child_by_field_name("declarator")
-        .and_then(declarator_name_node)
-        != Some(node)
-    {
-        return None;
-    }
-    let target = physically_visible_type_target(ctx)?;
-    if indexed_enclosing_lexical_scope(&ctx.analyzer, ctx.file, node)?
-        != canonical_cpp_scope_components(target)
-    {
-        return None;
-    }
-    let qualified = qualified_owner_components(node, ctx.source)?;
-    if qualified.names.last().map(String::as_str) != Some(target.identifier()) {
-        return None;
-    }
-    let owner = qualified.nodes.last().copied()?;
-    let template = if owner.kind() == "template_type" {
-        owner
-    } else {
-        owner
-            .parent()
-            .filter(|parent| parent.kind() == "template_type")?
-    };
-    template_reference_name_node(template)
 }
 
 fn push_guarded_owner_hit(
@@ -2710,15 +2507,19 @@ pub fn resolve_bare_call_target(
     let transitive_bindings = bindings
         .iter()
         .filter(|binding| {
-            effective_using_binding_guards_active(
-                binding,
-                function.start_byte(),
-                function_guards.as_ref(),
-                visibility,
-                file,
-            ) && (binding.namespace_scope.is_some()
-                || (binding.scope_start <= function.start_byte()
-                    && function.end_byte() <= binding.scope_end))
+            binding.declaration_byte <= function.start_byte()
+                && function_guards
+                    .as_ref()
+                    .is_some_and(|active| binding.required_guards.is_subset(active))
+                && visibility.preprocessor_guards_stable_between(
+                    file,
+                    0,
+                    function.start_byte(),
+                    &binding.required_guards,
+                )
+                && (binding.namespace_scope.is_some()
+                    || (binding.scope_start <= function.start_byte()
+                        && function.end_byte() <= binding.scope_end))
         })
         .collect::<Vec<_>>();
     let mut concrete_depths = active_bindings
@@ -3325,18 +3126,16 @@ fn target_guided_unproven_alias_type_reference<'tree>(
     candidates: &[CodeUnit],
     ctx: &ScanCtx<'_>,
 ) -> Option<Node<'tree>> {
-    let template_arguments = cpp_template_reference_arguments(node, ctx.source);
+    if cpp_template_reference_arguments(node, ctx.source).is_some() {
+        return None;
+    }
     let target = physically_visible_type_target(ctx)?;
     if !target.is_class() {
         return None;
     }
     let alias_provider = ctx.analyzer.type_alias_provider()?;
     let (components, _) = type_reference_components(node, ctx.source)?;
-    let hit = template_arguments
-        .as_ref()
-        .and_then(|_| template_reference_name_node(node))
-        .map(function_terminal_node)
-        .unwrap_or_else(|| function_terminal_node(node));
+    let hit = function_terminal_node(node);
     candidates
         .iter()
         .filter(|candidate| {
@@ -3345,26 +3144,13 @@ fn target_guided_unproven_alias_type_reference<'tree>(
                 && canonical_cpp_scope_components(candidate) == components
         })
         .find(|candidate| {
-            template_arguments.as_ref().map_or_else(
-                || {
-                    same_visible_symbol(&canonical_alias_target(candidate, ctx), target)
-                        || ctx.visibility.structured_alias_primary_preserves_target(
-                            &ctx.analyzer,
-                            ctx.file,
-                            candidate,
-                            target,
-                        )
-                },
-                |arguments| {
-                    ctx.visibility.template_alias_arguments_preserve_target(
-                        &ctx.analyzer,
-                        ctx.file,
-                        candidate,
-                        arguments,
-                        target,
-                    )
-                },
-            )
+            same_visible_symbol(&canonical_alias_target(candidate, ctx), target)
+                || ctx.visibility.structured_alias_primary_preserves_target(
+                    &ctx.analyzer,
+                    ctx.file,
+                    candidate,
+                    target,
+                )
         })
         .map(|_| hit)
 }
@@ -3706,9 +3492,6 @@ fn template_alias_owner_matches_reference(
     let Some(target_owner) = ctx.analyzer.parent_of(target) else {
         return true;
     };
-    if !target_owner.is_class() {
-        return true;
-    }
     let Some(reference_owner) = structured_enclosing_owner(node, ctx) else {
         return true;
     };
@@ -4177,8 +3960,7 @@ fn target_guided_missing_orphaned_namespace_type_leaf<'tree>(
     ctx: &ScanCtx<'_>,
 ) -> Option<Node<'tree>> {
     let target = &ctx.spec.target;
-    let leaf = template_reference_name_node(node).unwrap_or(node);
-    let name = node_text(leaf, ctx.source);
+    let name = node_text(node, ctx.source);
     let (components, global) = type_reference_components(node, ctx.source)?;
     if global || components.len() != 1 || components[0] != name {
         return None;
@@ -4188,16 +3970,16 @@ fn target_guided_missing_orphaned_namespace_type_leaf<'tree>(
             .analyzer
             .type_alias_provider()
             .is_some_and(|provider| provider.is_type_alias(target))
-        || is_declaration_name(leaf)
+        || is_declaration_name(node)
         || name != target.identifier()
         || ctx.local_shadows.is_shadowed(name)
-        || local_type_name_shadows(leaf, ctx)
+        || local_type_name_shadows(node, ctx)
         || !ctx.visibility.is_physically_visible(ctx.file, target)
         || !ctx.visibility.external_type_candidate_visible_in_context(
             &ctx.analyzer,
             ctx.file,
             target,
-            leaf,
+            node,
         )
     {
         return None;
@@ -4206,14 +3988,14 @@ fn target_guided_missing_orphaned_namespace_type_leaf<'tree>(
     let target_components = canonical_cpp_scope_components(target);
     let target_package_len = target_components.len().checked_sub(1)?;
     let target_package = &target_components[..target_package_len];
-    let surviving_namespace = enclosing_namespace_components(leaf, ctx.source);
+    let surviving_namespace = enclosing_namespace_components(node, ctx.source);
     if !target_package.starts_with(&surviving_namespace) {
         return None;
     }
     let envelope = ctx
         .orphaned_namespaces
         .iter()
-        .filter(|envelope| envelope.error_marked && envelope.body_end < leaf.start_byte())
+        .filter(|envelope| envelope.error_marked && envelope.body_end < node.start_byte())
         .max_by_key(|envelope| envelope.body_end)?;
     if envelope.components.as_slice() != target_package {
         return None;
@@ -4235,68 +4017,7 @@ fn target_guided_missing_orphaned_namespace_type_leaf<'tree>(
     {
         return None;
     }
-    Some(leaf)
-}
-
-/// Retry a bare alias after tree-sitter has prematurely closed a malformed
-/// namespace. The error-marked namespace envelope supplies only the missing
-/// lexical scope; the ordinary structured resolver must still select an
-/// indexed alias and prove that its canonical type is the inverse target.
-fn orphaned_namespace_alias_type_resolution(
-    node: Node<'_>,
-    ctx: &ScanCtx<'_>,
-) -> Option<LexicalTypeResolution> {
-    let (reference_components, global) = type_reference_components(node, ctx.source)?;
-    if global
-        || reference_components.len() != 1
-        || is_declaration_name(node)
-        || local_type_name_shadows(node, ctx)
-    {
-        return None;
-    }
-
-    let surviving_namespace = enclosing_namespace_components(node, ctx.source);
-    let envelope = ctx
-        .orphaned_namespaces
-        .iter()
-        .filter(|envelope| {
-            envelope.error_marked
-                && envelope.body_end < node.start_byte()
-                && envelope.components.starts_with(&surviving_namespace)
-        })
-        .max_by_key(|envelope| envelope.body_end)?;
-    let resolution = resolve_type_node_lexically_for_target(
-        node,
-        &ctx.analyzer,
-        ctx.visibility,
-        &ctx.ordinary_type_imports,
-        ctx.file,
-        ctx.source,
-        &ctx.spec.target,
-        Some(&ctx.lexical_scope_cache),
-        Some(&envelope.components),
-    );
-    let LexicalTypeResolution::Resolved {
-        ref unit,
-        ref components,
-        ref candidates,
-    } = resolution
-    else {
-        return None;
-    };
-    let alias_provider = ctx.analyzer.type_alias_provider()?;
-    if components.len() != envelope.components.len() + 1
-        || !components.starts_with(&envelope.components)
-        || candidates.is_empty()
-        || candidates.iter().any(|candidate| {
-            !alias_provider.is_type_alias(candidate)
-                || canonical_cpp_scope_components(candidate) != *components
-        })
-        || !type_resolution_matches_target(node, unit, candidates, ctx)
-    {
-        return None;
-    }
-    Some(resolution)
+    Some(node)
 }
 
 /// Recover a nested type-alias reference when parser recovery leaves an
@@ -4663,9 +4384,6 @@ fn nearer_type_name_shadows_structured_reference(node: Node<'_>, ctx: &ScanCtx<'
 }
 
 fn local_type_name_shadows(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    if cpp_active_template_type_parameter(node, ctx.spec.target.identifier(), ctx.source) {
-        return true;
-    }
     let Some(callable) = nearest_callable_scope(node) else {
         return false;
     };
@@ -5149,13 +4867,6 @@ fn qualified_scope_text(scope: Node<'_>, source: &str) -> String {
 }
 
 fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if node.kind() == "using_declaration" {
-        maybe_record_using_callable_hit(node, ctx);
-        return;
-    }
-    if has_ancestor_kind(node, "using_declaration") {
-        return;
-    }
     if node.kind() == "function_definition" {
         return;
     }
@@ -5578,7 +5289,7 @@ fn maybe_record_free_function_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'
 
 fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() == "using_declaration" {
-        maybe_record_using_callable_hit(node, ctx);
+        maybe_record_using_member_hit(node, ctx);
         return;
     }
     if has_ancestor_kind(node, "using_declaration") {
@@ -5779,7 +5490,7 @@ fn recovered_direct_initializer_qualified_callable(node: Node<'_>) -> Option<Nod
     node.child_by_field_name("name")
 }
 
-fn maybe_record_using_callable_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn maybe_record_using_member_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(imported) = ordinary_using_declaration_type_node(node) else {
         return;
     };
@@ -6208,30 +5919,19 @@ fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// equality is insufficient: classify each ancestor by structured subtree
 /// containment instead.
 fn is_selected_field_expression_member_descendant(mut node: Node<'_>) -> bool {
-    let candidate = node;
     while let Some(parent) = node.parent() {
         if parent.kind() == "field_expression" {
-            if let Some(field) = parent.child_by_field_name("field")
-                && node_is_within(field, candidate)
+            if parent
+                .child_by_field_name("field")
+                .is_some_and(|field| node_is_within(field, node))
             {
-                let selected_name = match field.kind() {
-                    "template_method" => field.child_by_field_name("name").unwrap_or(field),
-                    _ => field,
-                };
-                if node_is_within(selected_name, candidate) {
-                    return true;
-                }
-                // A template argument is structurally inside the field subtree,
-                // but it is an independent reference rather than the selected
-                // member name.
-                node = parent;
-                continue;
+                return true;
             }
             let receiver = parent
                 .child_by_field_name("argument")
                 .or_else(|| parent.child_by_field_name("object"))
                 .or_else(|| parent.named_child(0));
-            if !receiver.is_some_and(|receiver| node_is_within(receiver, candidate)) {
+            if !receiver.is_some_and(|receiver| node_is_within(receiver, node)) {
                 // Unknown grammar shape inside a field expression: fail closed
                 // rather than treating it as a receiver reference.
                 return true;
@@ -6586,13 +6286,6 @@ fn is_nested_in_qualified_identifier(node: Node<'_>) -> bool {
         if parent.kind() == "ERROR" {
             return false;
         }
-        // A qualified template owns only its scope/name path. References in
-        // `Owner::Template<argument>` are independent expressions or types,
-        // not nested components of `Owner::Template`; let their own target
-        // scanners resolve them instead of suppressing them as duplicates.
-        if parent.kind() == "template_argument_list" {
-            return false;
-        }
         if parent.kind() == "qualified_identifier" {
             return true;
         }
@@ -6745,22 +6438,9 @@ fn receiver_type_units_with_budget(
     while let Some(member_name) = member_chain.pop() {
         let mut next_units = Vec::new();
         for owner in &base_units {
-            let declaring_owner = match resolve_declaring_member_owner(
-                &ctx.analyzer,
-                ctx.visibility,
-                ctx.file,
-                owner,
-                member_name,
-            ) {
-                EnclosingMemberOwnerResolution::Owner(owner) => owner,
-                EnclosingMemberOwnerResolution::Missing => continue,
-                EnclosingMemberOwnerResolution::Ambiguous => return Vec::new(),
-            };
-            let fields = ctx.visibility.visible_members_for_owner_name(
-                ctx.file,
-                &declaring_owner,
-                member_name,
-            );
+            let fields =
+                ctx.visibility
+                    .visible_members_for_owner_name(ctx.file, owner, member_name);
             for field in fields.into_iter().filter(|unit| unit.is_field()) {
                 let Some(unit) =
                     field_declared_binding(&ctx.analyzer, ctx.visibility, ctx.file, field)
@@ -7527,41 +7207,17 @@ fn qualified_owner_resolution(node: Node<'_>, ctx: &ScanCtx<'_>) -> QualifiedOwn
         false,
         Some(&ctx.lexical_scope_cache),
     ) {
-        LexicalTypeResolution::Resolved { unit: owner, .. } => {
-            if receiver_owner_matches_target(&owner, target_owner, node.start_byte(), ctx) {
-                return QualifiedOwnerResolution::Target;
-            }
-            match cached_declaring_member_owner(&owner, ctx) {
-                EnclosingMemberOwnerResolution::Owner(declaring_owner)
-                    if receiver_owner_matches_target(
-                        &declaring_owner,
-                        target_owner,
-                        node.start_byte(),
-                        ctx,
-                    ) =>
-                {
-                    QualifiedOwnerResolution::Target
-                }
-                EnclosingMemberOwnerResolution::Owner(declaring_owner)
-                    if receiver_owner_is_known_non_target(
-                        &declaring_owner,
-                        target_owner,
-                        node.start_byte(),
-                        ctx,
-                    ) =>
-                {
-                    QualifiedOwnerResolution::NonTarget
-                }
-                EnclosingMemberOwnerResolution::Owner(_)
-                | EnclosingMemberOwnerResolution::Ambiguous => QualifiedOwnerResolution::Unresolved,
-                EnclosingMemberOwnerResolution::Missing
-                    if same_visible_symbol(&owner, target_owner) =>
-                {
-                    QualifiedOwnerResolution::Unresolved
-                }
-                EnclosingMemberOwnerResolution::Missing => QualifiedOwnerResolution::NonTarget,
-            }
+        LexicalTypeResolution::Resolved { unit: owner, .. }
+            if receiver_owner_matches_target(&owner, target_owner, node.start_byte(), ctx) =>
+        {
+            QualifiedOwnerResolution::Target
         }
+        LexicalTypeResolution::Resolved { unit: owner, .. }
+            if same_visible_symbol(&owner, target_owner) =>
+        {
+            QualifiedOwnerResolution::Unresolved
+        }
+        LexicalTypeResolution::Resolved { .. } => QualifiedOwnerResolution::NonTarget,
         LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {
             QualifiedOwnerResolution::Unresolved
         }
@@ -7794,16 +7450,14 @@ fn enclosing_lexical_scope_components_with_unresolved_owner(
         .or_else(|| {
             // A nested class declaration can likewise lose one of its outer
             // class ancestors from the CST.  Prefer the exact indexed
-            // structural class scope. Its same-file declaration range and
-            // exact template-id match already prove the owner, including a
-            // specialization whose parser component retains only the primary
-            // name. Keep the suffix guard for graph-only recovery, which lacks
-            // that direct syntax-range proof.
-            indexed_structural_class_scope(visibility, file, node, source).or_else(|| {
-                indexed_enclosing_owner_scope(analyzer, visibility, file, node).filter(|indexed| {
+            // structural class scope when the surviving parser names are a
+            // suffix of that scope (for example `const_iterator` inside
+            // `AnySpan<T>`).
+            indexed_structural_class_scope(visibility, file, node, source)
+                .or_else(|| indexed_enclosing_owner_scope(analyzer, visibility, file, node))
+                .filter(|indexed| {
                     qualified_owner_scope_is_recoverable(indexed, &namespace, &classes, None)
                 })
-            })
         })
         .or_else(|| {
             // Retain the existing indexed lexical-scope recovery for
@@ -9294,54 +8948,17 @@ fn effective_using_binding_active(
     visibility: &VisibilityIndex<'_>,
     file: &ProjectFile,
 ) -> bool {
-    effective_using_binding_guards_active(
-        binding,
-        node.start_byte(),
-        reference_guards,
-        visibility,
-        file,
-    ) && binding.namespace_scope.as_ref().map_or_else(
-        || binding.scope_start <= node.start_byte() && node.end_byte() <= binding.scope_end,
-        |namespace| lexical_scope.starts_with(namespace),
-    )
-}
-
-fn effective_using_binding_guards_active(
-    binding: &OrdinaryTypeImport,
-    reference_byte: usize,
-    reference_guards: Option<&HashSet<PreprocessorGuard>>,
-    visibility: &VisibilityIndex<'_>,
-    file: &ProjectFile,
-) -> bool {
-    binding.declaration_byte <= reference_byte
+    binding.declaration_byte <= node.start_byte()
         && reference_guards.is_some_and(|active| binding.required_guards.is_subset(active))
         && visibility.preprocessor_guards_stable_between(
             file,
             0,
-            reference_byte,
+            node.start_byte(),
             &binding.required_guards,
         )
-}
-
-fn effective_using_binding_guards_compatible(
-    binding: &OrdinaryTypeImport,
-    reference_byte: usize,
-    reference_guards: Option<&HashSet<PreprocessorGuard>>,
-    visibility: &VisibilityIndex<'_>,
-    file: &ProjectFile,
-) -> bool {
-    binding.source != *file
-        && !binding.required_guards.is_empty()
-        && binding.declaration_byte <= reference_byte
-        && reference_guards.is_some_and(|active| {
-            !binding.required_guards.is_subset(active)
-                && merge_preprocessor_guards(&binding.required_guards, active).is_some()
-        })
-        && visibility.preprocessor_guards_stable_between(
-            file,
-            0,
-            reference_byte,
-            &binding.required_guards,
+        && binding.namespace_scope.as_ref().map_or_else(
+            || binding.scope_start <= node.start_byte() && node.end_byte() <= binding.scope_end,
+            |namespace| lexical_scope.starts_with(namespace),
         )
 }
 
@@ -9560,106 +9177,21 @@ fn ordinary_type_import_resolution(
     let transitive = bindings
         .iter()
         .filter(|binding| {
-            effective_using_binding_guards_active(
-                binding,
-                node.start_byte(),
-                reference_guards.as_ref(),
-                visibility,
-                file,
-            ) && (binding.namespace_scope.is_some()
-                || (binding.scope_start <= node.start_byte()
-                    && node.end_byte() <= binding.scope_end))
+            binding.declaration_byte <= node.start_byte()
+                && reference_guards
+                    .as_ref()
+                    .is_some_and(|active| binding.required_guards.is_subset(active))
+                && visibility.preprocessor_guards_stable_between(
+                    file,
+                    0,
+                    node.start_byte(),
+                    &binding.required_guards,
+                )
+                && (binding.namespace_scope.is_some()
+                    || (binding.scope_start <= node.start_byte()
+                        && node.end_byte() <= binding.scope_end))
         })
         .collect::<Vec<_>>();
-    ordinary_type_import_resolution_for_bindings(
-        node,
-        name,
-        analyzer,
-        visibility,
-        file,
-        lexical_scope,
-        direct_target,
-        &active,
-        &transitive,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compatible_foreign_type_import_resolution(
-    node: Node<'_>,
-    components: &[String],
-    global: bool,
-    analyzer: &CppGraphSource<'_>,
-    visibility: &VisibilityIndex<'_>,
-    imports: &OrdinaryTypeImportCell,
-    file: &ProjectFile,
-    source: &str,
-    lexical_scope: &[String],
-    direct_target: &CodeUnit,
-) -> OrdinaryTypeImportResolution {
-    if global || components.len() != 1 {
-        return OrdinaryTypeImportResolution::Missing;
-    }
-    let name = &components[0];
-    let bindings = effective_using_bindings_for_name(visibility, imports, file, node, source, name);
-    if bindings.is_empty() {
-        return OrdinaryTypeImportResolution::Missing;
-    }
-    let reference_guards = preprocessor_guard_environment(node, source);
-    let compatible = bindings
-        .iter()
-        .filter(|binding| {
-            effective_using_binding_guards_compatible(
-                binding,
-                node.start_byte(),
-                reference_guards.as_ref(),
-                visibility,
-                file,
-            ) && binding.namespace_scope.as_ref().map_or_else(
-                || binding.scope_start <= node.start_byte() && node.end_byte() <= binding.scope_end,
-                |namespace| lexical_scope.starts_with(namespace),
-            )
-        })
-        .collect::<Vec<_>>();
-    let transitive = bindings
-        .iter()
-        .filter(|binding| {
-            effective_using_binding_guards_compatible(
-                binding,
-                node.start_byte(),
-                reference_guards.as_ref(),
-                visibility,
-                file,
-            ) && (binding.namespace_scope.is_some()
-                || (binding.scope_start <= node.start_byte()
-                    && node.end_byte() <= binding.scope_end))
-        })
-        .collect::<Vec<_>>();
-    ordinary_type_import_resolution_for_bindings(
-        node,
-        name,
-        analyzer,
-        visibility,
-        file,
-        lexical_scope,
-        Some(direct_target),
-        &compatible,
-        &transitive,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ordinary_type_import_resolution_for_bindings(
-    node: Node<'_>,
-    name: &str,
-    analyzer: &CppGraphSource<'_>,
-    visibility: &VisibilityIndex<'_>,
-    file: &ProjectFile,
-    lexical_scope: &[String],
-    direct_target: Option<&CodeUnit>,
-    active: &[&OrdinaryTypeImport],
-    transitive: &[&OrdinaryTypeImport],
-) -> OrdinaryTypeImportResolution {
     let mut concrete_depths = active
         .iter()
         .filter(|binding| binding.namespace_scope.is_none())
@@ -9678,7 +9210,7 @@ fn ordinary_type_import_resolution_for_bindings(
             .flat_map(|binding| {
                 binding_type_candidates(
                     binding,
-                    transitive,
+                    &transitive,
                     visibility,
                     file,
                     name,
@@ -9703,7 +9235,7 @@ fn ordinary_type_import_resolution_for_bindings(
             .flat_map(|binding| {
                 binding_type_candidates(
                     binding,
-                    transitive,
+                    &transitive,
                     visibility,
                     file,
                     name,
@@ -9736,7 +9268,7 @@ fn ordinary_type_import_resolution_for_bindings(
             .flat_map(|binding| {
                 binding_type_candidates(
                     binding,
-                    transitive,
+                    &transitive,
                     visibility,
                     file,
                     name,
@@ -9761,7 +9293,7 @@ fn ordinary_type_import_resolution_for_bindings(
             .flat_map(|binding| {
                 binding_type_candidates(
                     binding,
-                    transitive,
+                    &transitive,
                     visibility,
                     file,
                     name,
@@ -10002,26 +9534,6 @@ fn resolve_type_components_lexically_at_scoped(
     {
         return LexicalTypeResolution::Missing;
     }
-    // A recovered macro-prefixed return type can share its global spelling
-    // with aliases from mutually exclusive included headers. C++ lookup uses
-    // the declaration physically present earlier in this file; the visibility
-    // index deliberately retains every configuration alternative. Restore
-    // that precedence only for the exact recovered scope and lexical tier.
-    if !global
-        && components.len() == 1
-        && recovered_macro_decorated_type_node(node).is_some()
-        && let Some(resolution) = recovered_same_file_type_alias_resolution(
-            node,
-            components,
-            analyzer,
-            visibility,
-            file,
-            direct_target,
-            &lexical_scope,
-        )
-    {
-        return resolution;
-    }
     if !global
         && components.len() == 1
         // The two constant-time conditions run before the ancestor climb: each
@@ -10157,63 +9669,6 @@ fn resolve_type_components_lexically_at_scoped(
     }
 }
 
-fn recovered_same_file_type_alias_resolution(
-    node: Node<'_>,
-    components: &[String],
-    analyzer: &CppGraphSource<'_>,
-    visibility: &VisibilityIndex<'_>,
-    file: &ProjectFile,
-    direct_target: Option<&CodeUnit>,
-    lexical_scope: &[String],
-) -> Option<LexicalTypeResolution> {
-    debug_assert_eq!(components.len(), 1);
-    debug_assert!(recovered_macro_decorated_type_node(node).is_some());
-    let alias_provider = analyzer.type_alias_provider()?;
-    for qualified in lexical_component_tiers(components, false, lexical_scope) {
-        let candidates = visibility
-            .visible_identifier_candidates(file, &components[0])
-            .filter(|candidate| {
-                candidate.source() == file
-                    && canonical_cpp_scope_components(candidate) == qualified
-                    && visibility
-                        .external_type_candidate_visible_in_context(analyzer, file, candidate, node)
-            })
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            continue;
-        }
-        if candidates
-            .iter()
-            .any(|candidate| !alias_provider.is_type_alias(candidate))
-        {
-            return None;
-        }
-        let unit = if let Some(target) = direct_target {
-            visibility.unique_type_candidate_preserving_target(
-                analyzer,
-                file,
-                &candidates,
-                target,
-            )?
-        } else {
-            let first = candidates[0];
-            if candidates
-                .iter()
-                .any(|candidate| !same_visible_symbol(candidate, first))
-            {
-                return None;
-            }
-            first.clone()
-        };
-        return Some(LexicalTypeResolution::Resolved {
-            unit,
-            components: qualified,
-            candidates: candidates.into_iter().cloned().collect(),
-        });
-    }
-    None
-}
-
 fn same_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     matches!(
         structured_owner_context_resolution(node, ctx),
@@ -10326,96 +9781,10 @@ fn cached_declaring_member_owner(
         receiver_owner,
         &ctx.spec.member_name,
     );
-    let resolved = if matches!(resolved, EnclosingMemberOwnerResolution::Missing) {
-        indexed_declaring_owner_for_recovered_member(receiver_owner, ctx)
-    } else {
-        resolved
-    };
     ctx.member_owner_cache
         .borrow_mut()
         .insert(receiver_owner.clone(), resolved.clone());
     resolved
-}
-
-/// Recover a member's declaring owner when parser recovery omitted its
-/// in-class declaration but retained an out-of-line definition. Ordinary
-/// visible-member lookup runs first. The structured definition index then
-/// supplies the missing member fact at each hierarchy level, so an indexed
-/// derived override still hides the queried base member and distinct base
-/// paths still fail closed.
-fn indexed_declaring_owner_for_recovered_member(
-    receiver_owner: &CodeUnit,
-    ctx: &ScanCtx<'_>,
-) -> EnclosingMemberOwnerResolution {
-    let Some(spec_owner) = ctx.spec.owner.as_ref() else {
-        return EnclosingMemberOwnerResolution::Missing;
-    };
-    if ctx.spec.kind != TargetKind::Method || ctx.spec.target.source() == spec_owner.source() {
-        return EnclosingMemberOwnerResolution::Missing;
-    }
-    let Some(hierarchy) = ctx.analyzer.type_hierarchy_provider() else {
-        return EnclosingMemberOwnerResolution::Missing;
-    };
-    let Some(receiver_owner) =
-        ctx.visibility
-            .canonical_visible_full_type_unit(&ctx.analyzer, ctx.file, receiver_owner)
-    else {
-        return EnclosingMemberOwnerResolution::Ambiguous;
-    };
-    let Some(target_owner) = ctx.spec.owner.as_ref().and_then(|owner| {
-        ctx.visibility
-            .canonical_visible_full_type_unit(&ctx.analyzer, ctx.file, owner)
-    }) else {
-        return EnclosingMemberOwnerResolution::Missing;
-    };
-
-    let owner_declares_member = |owner: &CodeUnit| {
-        if same_visible_symbol(owner, &target_owner) {
-            return true;
-        }
-        let mut member_fq = owner.fq().clone();
-        member_fq.push(
-            ctx.spec
-                .target
-                .fq()
-                .last()
-                .expect("a method target has a terminal member segment"),
-        );
-        ctx.analyzer
-            .definitions(&member_fq.display(segment_interner()))
-            .any(|child| child.is_function())
-    };
-    if owner_declares_member(&receiver_owner) {
-        return EnclosingMemberOwnerResolution::Owner(receiver_owner);
-    }
-
-    let mut stack = hierarchy.get_direct_ancestors(&receiver_owner);
-    let mut propagated_counts: HashMap<CodeUnit, u8> = HashMap::default();
-    let mut declaring_owner = None;
-    while let Some(raw_owner) = stack.pop() {
-        let Some(owner) =
-            ctx.visibility
-                .canonical_visible_full_type_unit(&ctx.analyzer, ctx.file, &raw_owner)
-        else {
-            return EnclosingMemberOwnerResolution::Ambiguous;
-        };
-        let propagated = propagated_counts.entry(owner.clone()).or_default();
-        if *propagated == 2 {
-            continue;
-        }
-        *propagated += 1;
-        if owner_declares_member(&owner) {
-            if declaring_owner.is_some() {
-                return EnclosingMemberOwnerResolution::Ambiguous;
-            }
-            declaring_owner = Some(owner);
-            continue;
-        }
-        stack.extend(hierarchy.get_direct_ancestors(&owner));
-    }
-    declaring_owner
-        .map(EnclosingMemberOwnerResolution::Owner)
-        .unwrap_or(EnclosingMemberOwnerResolution::Missing)
 }
 
 fn structured_enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {

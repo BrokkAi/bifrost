@@ -91,14 +91,11 @@ pub use config::{
     RustPackageApiArtifact, RustSelectedTarget,
 };
 pub use cpp::CppAnalyzer;
+pub use cpp::cpp_is_constructor_or_destructor_declarator_name;
 pub(crate) use cpp::{
     CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole,
     cpp_callable_definitions_share_identity_evidence, cpp_header_body_files_are_related,
     node_text as cpp_node_text,
-};
-pub use cpp::{
-    cpp_is_constructor_or_destructor_declarator_name, cpp_is_conversion_operator_target_type,
-    cpp_is_recovered_macro_character_token_type,
 };
 pub use csharp::CSharpAnalyzer;
 pub use csharp::external::{
@@ -203,10 +200,8 @@ pub use ruby::{
 pub(crate) use rust::is_rust_public_like_declaration;
 pub use rust::rust_is_field_declaration_name;
 pub use rust::{
-    RustAnalyzer, RustDependencyPackAdapter, RustReferenceContext, RustReferenceNamespace,
-    RustdocJsonPackProducer, resolve_rust_semantic_pack_dependencies,
-    rust_declaration_is_enum_variant, rust_declaration_matches_reference_namespace,
-    rust_reference_namespace,
+    RustAnalyzer, RustDependencyPackAdapter, RustReferenceContext, RustdocJsonPackProducer,
+    resolve_rust_semantic_pack_dependencies,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use rust::{

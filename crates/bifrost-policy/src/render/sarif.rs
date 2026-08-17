@@ -10,17 +10,16 @@ use super::{
     BoundedWriter, CanonicalJsonFormatter, PolicyRenderError, ensure_supported_schema,
     map_io_error, map_json_error,
 };
-use crate::display_path::{TaintDisplayPath, TaintDisplayStep, TaintDisplayStepKind};
 use crate::{
-    FindingCertainty, FindingCompleteness, FindingDiffDisposition, FindingIdentityStability,
-    FindingSeverity, OrganizationalRiskAssessment, PolicyAnalysisType, PolicyBaselineReview,
-    PolicyDiagnostic, PolicyDiagnosticSeverity, PolicyDiffReview, PolicyDisplayRegion,
-    PolicyEvaluationDate, PolicyFinding, PolicyFindingBaseline, PolicyFindingEvidence,
-    PolicyFindingSuppression, PolicyLevel, PolicyPackActivationReview, PolicyReportDiagnostic,
-    PolicyReportDocument, PolicyReportEvaluationContext, PolicyRuleDescriptor, PolicyRun,
-    PolicyRunCompletion, PolicySemanticHash, PolicySeveritySpec, PolicySourceLocation,
-    PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicyWorkReport, ProofMetadata,
-    RelatedPolicyLocation,
+    BoundedWitness, FindingCertainty, FindingCompleteness, FindingDiffDisposition,
+    FindingIdentityStability, FindingSeverity, OrganizationalRiskAssessment, PolicyAnalysisType,
+    PolicyBaselineReview, PolicyDiagnostic, PolicyDiagnosticSeverity, PolicyDiffReview,
+    PolicyDisplayRegion, PolicyEvaluationDate, PolicyFinding, PolicyFindingBaseline,
+    PolicyFindingEvidence, PolicyFindingSuppression, PolicyLevel, PolicyPackActivationReview,
+    PolicyReportDiagnostic, PolicyReportDocument, PolicyReportEvaluationContext,
+    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySemanticHash, PolicySeveritySpec,
+    PolicySourceLocation, PolicySuppressionPolicyHashState, PolicySuppressionReview,
+    PolicyWorkReport, ProofMetadata, RelatedPolicyLocation, WitnessStep, WitnessStepKind,
 };
 
 const SARIF_SCHEMA_URI: &str =
@@ -364,7 +363,7 @@ impl<'a> SarifResult<'a> {
             }),
             locations: [SarifLocation::primary(finding.primary())],
             related_locations: SarifRelatedLocations(finding.related()),
-            code_flows: SarifCodeFlows(finding.display_path()),
+            code_flows: SarifCodeFlows(finding.witnesses()),
             partial_fingerprints: (finding.identity_stability()
                 == FindingIdentityStability::Strong)
                 .then(|| SarifPartialFingerprints {
@@ -515,11 +514,11 @@ impl Serialize for SarifRelatedLocations<'_> {
     }
 }
 
-struct SarifCodeFlows<'a>(Option<&'a TaintDisplayPath>);
+struct SarifCodeFlows<'a>(&'a [BoundedWitness]);
 
 impl SarifCodeFlows<'_> {
     fn is_empty(&self) -> bool {
-        self.0.is_none()
+        self.0.is_empty()
     }
 }
 
@@ -528,9 +527,9 @@ impl Serialize for SarifCodeFlows<'_> {
     where
         S: Serializer,
     {
-        let mut sequence = serializer.serialize_seq(Some(usize::from(self.0.is_some())))?;
-        if let Some(path) = self.0 {
-            sequence.serialize_element(&SarifCodeFlow::from_display_path(path))?;
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for witness in self.0 {
+            sequence.serialize_element(&SarifCodeFlow::from_witness(witness))?;
         }
         sequence.end()
     }
@@ -635,10 +634,10 @@ impl<'a> SarifLocation<'a> {
         }
     }
 
-    fn display_step(step: &'a TaintDisplayStep) -> Self {
+    fn witness(step: &'a WitnessStep) -> Self {
         Self {
             id: None,
-            physical_location: Some(SarifPhysicalLocation::from_policy(step.location())),
+            physical_location: step.location().map(SarifPhysicalLocation::from_policy),
             message: Some(SarifMessage { text: step.label() }),
             properties: None,
         }
@@ -723,51 +722,36 @@ impl SarifRegion {
 struct SarifCodeFlow<'a> {
     message: SarifMessage<'a>,
     thread_flows: [SarifThreadFlow<'a>; 1],
-    properties: SarifDisplayPathProperties<'a>,
+    properties: SarifWitnessProperties<'a>,
 }
 
 impl<'a> SarifCodeFlow<'a> {
-    fn from_display_path(path: &'a TaintDisplayPath) -> Self {
+    fn from_witness(witness: &'a BoundedWitness) -> Self {
         Self {
             message: SarifMessage {
-                text: "Bifrost policy display path",
+                text: witness.id().as_str(),
             },
             thread_flows: [SarifThreadFlow {
-                id: path.witness_id().as_str(),
-                locations: SarifThreadFlowLocations(path.steps()),
+                id: witness.id().as_str(),
+                locations: SarifThreadFlowLocations(witness.steps()),
             }],
-            properties: SarifDisplayPathProperties {
-                schema_version: path.schema_version(),
-                representative_witness_id: path.witness_id().as_str(),
-                witness_ids: path.witness_ids(),
-                canonical_incomplete: path.canonical_incomplete(),
-                omitted_meaningful_steps: path.omitted_meaningful_steps(),
-                alternatives_truncated: path.alternatives_truncated(),
-                omitted_alternative_paths_lower_bound: path.omitted_alternative_paths_lower_bound(),
-                omitted_witnesses_lower_bound: path.omitted_witnesses_lower_bound(),
+            properties: SarifWitnessProperties {
+                witness_id: witness.id().as_str(),
+                truncated: witness.truncated(),
+                omitted_steps_lower_bound: witness.omitted_steps_lower_bound(),
             },
         }
     }
 }
 
 #[derive(Serialize)]
-struct SarifDisplayPathProperties<'a> {
-    #[serde(rename = "bifrost.displayPathSchemaVersion")]
-    schema_version: u32,
-    #[serde(rename = "bifrost.representativeWitnessId")]
-    representative_witness_id: &'a str,
-    #[serde(rename = "bifrost.witnessIds")]
-    witness_ids: &'a [crate::WitnessId],
-    #[serde(rename = "bifrost.canonicalIncomplete")]
-    canonical_incomplete: bool,
-    #[serde(rename = "bifrost.omittedMeaningfulSteps")]
-    omitted_meaningful_steps: u64,
-    #[serde(rename = "bifrost.alternativesTruncated")]
-    alternatives_truncated: bool,
-    #[serde(rename = "bifrost.omittedAlternativePathsLowerBound")]
-    omitted_alternative_paths_lower_bound: u64,
-    #[serde(rename = "bifrost.omittedWitnessesLowerBound")]
-    omitted_witnesses_lower_bound: u64,
+struct SarifWitnessProperties<'a> {
+    #[serde(rename = "bifrost.witnessId")]
+    witness_id: &'a str,
+    #[serde(rename = "bifrost.truncated")]
+    truncated: bool,
+    #[serde(rename = "bifrost.omittedStepsLowerBound")]
+    omitted_steps_lower_bound: u64,
 }
 
 #[derive(Serialize)]
@@ -776,7 +760,7 @@ struct SarifThreadFlow<'a> {
     locations: SarifThreadFlowLocations<'a>,
 }
 
-struct SarifThreadFlowLocations<'a>(&'a [TaintDisplayStep]);
+struct SarifThreadFlowLocations<'a>(&'a [WitnessStep]);
 
 impl Serialize for SarifThreadFlowLocations<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -785,7 +769,7 @@ impl Serialize for SarifThreadFlowLocations<'_> {
     {
         let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
         for step in self.0 {
-            sequence.serialize_element(&SarifThreadFlowLocation::from_display_step(step))?;
+            sequence.serialize_element(&SarifThreadFlowLocation::from_step(step))?;
         }
         sequence.end()
     }
@@ -794,22 +778,27 @@ impl Serialize for SarifThreadFlowLocations<'_> {
 #[derive(Serialize)]
 struct SarifThreadFlowLocation<'a> {
     location: SarifLocation<'a>,
-    properties: SarifDisplayStepProperties,
+    properties: SarifWitnessStepProperties<'a>,
 }
 
 impl<'a> SarifThreadFlowLocation<'a> {
-    fn from_display_step(step: &'a TaintDisplayStep) -> Self {
+    fn from_step(step: &'a WitnessStep) -> Self {
         Self {
-            location: SarifLocation::display_step(step),
-            properties: SarifDisplayStepProperties { kind: step.kind() },
+            location: SarifLocation::witness(step),
+            properties: SarifWitnessStepProperties {
+                kind: step.kind(),
+                evidence_refs: step.evidence_refs(),
+            },
         }
     }
 }
 
 #[derive(Serialize)]
-struct SarifDisplayStepProperties {
+struct SarifWitnessStepProperties<'a> {
     #[serde(rename = "bifrost.kind")]
-    kind: TaintDisplayStepKind,
+    kind: WitnessStepKind,
+    #[serde(rename = "bifrost.evidenceRefs")]
+    evidence_refs: &'a [crate::EvidenceRef],
 }
 
 #[derive(Serialize)]
@@ -1312,34 +1301,36 @@ mod tests {
         );
         assert_eq!(related_wire["properties"]["bifrost.relationship"], "source");
 
-        let path = TaintDisplayPath::for_test(
+        let witness = BoundedWitness::try_new(
+            crate::WitnessId::try_new("test", "flow").unwrap(),
             vec![
-                TaintDisplayStep::new(TaintDisplayStepKind::Source, source_location, "source step"),
-                TaintDisplayStep::new(TaintDisplayStepKind::Sink, sink_location, "sink step"),
+                WitnessStep::try_new(
+                    WitnessStepKind::Source,
+                    Some(source_location),
+                    "source step",
+                    Vec::new(),
+                )
+                .unwrap(),
+                WitnessStep::try_new(
+                    WitnessStepKind::Violation,
+                    Some(sink_location),
+                    "sink step",
+                    Vec::new(),
+                )
+                .unwrap(),
             ],
             true,
             2,
-        );
-        let code_flow = serde_json::to_value(SarifCodeFlow::from_display_path(&path)).unwrap();
-        assert_eq!(
-            code_flow["properties"]["bifrost.displayPathSchemaVersion"],
-            1
-        );
-        assert_eq!(
-            code_flow["properties"]["bifrost.representativeWitnessId"],
-            "test:display"
-        );
-        assert_eq!(
-            code_flow["properties"]["bifrost.witnessIds"][0],
-            "test:display"
-        );
-        assert_eq!(code_flow["properties"]["bifrost.canonicalIncomplete"], true);
-        assert_eq!(code_flow["properties"]["bifrost.omittedMeaningfulSteps"], 2);
+        )
+        .unwrap();
+        let code_flow = serde_json::to_value(SarifCodeFlow::from_witness(&witness)).unwrap();
+        assert_eq!(code_flow["properties"]["bifrost.truncated"], true);
+        assert_eq!(code_flow["properties"]["bifrost.omittedStepsLowerBound"], 2);
         let locations = code_flow["threadFlows"][0]["locations"].as_array().unwrap();
         assert_eq!(locations.len(), 2);
         assert_eq!(locations[0]["location"]["message"]["text"], "source step");
         assert_eq!(locations[1]["location"]["message"]["text"], "sink step");
         assert_eq!(locations[0]["properties"]["bifrost.kind"], "source");
-        assert_eq!(locations[1]["properties"]["bifrost.kind"], "sink");
+        assert_eq!(locations[1]["properties"]["bifrost.kind"], "violation");
     }
 }

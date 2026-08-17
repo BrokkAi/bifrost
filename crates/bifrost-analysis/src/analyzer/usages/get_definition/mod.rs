@@ -103,9 +103,9 @@ use brokk_bifrost_ruby::graph::syntax::{
 };
 pub(crate) use rust::{
     AnalyzerRustDefinitionProvider, RustTypeLookupCache, resolve_rust_bounded,
-    rust_associated_call_applicable_candidates, rust_expression_type_definition_candidates_cached,
-    rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,
-    rust_is_type_definition, rust_resolve_type_node_fqn,
+    rust_expression_type_definition_candidates_cached, rust_expression_type_definition_fqn_cached,
+    rust_field_definition_type_candidates_cached, rust_is_type_definition,
+    rust_resolve_type_node_fqn,
 };
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};
@@ -137,7 +137,6 @@ pub(crate) use call_sites::{
     CallSiteSyntax, CallSyntaxKind, ExactCallReference, ExactCallReferenceGap,
     call_reference_ranges_in_tree, call_reference_requires_point_lookup,
     call_site_syntax_for_reference, exact_call_reference_for_call, is_call_reference_range_in_tree,
-    range_is_call_keyword_label,
 };
 pub(crate) use cpp::{cpp_type_lookup_resolution_in_session, resolve_cpp_bounded};
 pub(crate) use csharp::{
@@ -155,7 +154,6 @@ pub(crate) use kotlin::{
 pub(crate) use php::{
     PhpDefinitionProvider, php_type_lookup_resolution_bounded, resolve_php_bounded,
 };
-pub use python::python_visible_same_file_candidates;
 pub(crate) use python::{
     PythonDefinitionProvider, python_type_lookup_resolution_bounded, resolve_python_bounded,
 };

@@ -4696,7 +4696,7 @@ mod watcher_startup_tests {
 
         assert_eq!(result.status, "unreliable");
         assert_eq!(result.exit_status, POLICY_EXIT_UNRELIABLE);
-        assert_eq!(result.report.schema_version(), 4);
+        assert_eq!(result.report.schema_version(), 3);
         assert!(result.report.rules().is_empty());
         assert!(result.report.runs().is_empty());
         assert_eq!(
@@ -4883,7 +4883,7 @@ mod watcher_startup_tests {
         };
 
         assert_eq!(structured["status"], "unreliable");
-        assert_eq!(structured["report"]["schema_version"], 4);
+        assert_eq!(structured["report"]["schema_version"], 3);
         assert_eq!(
             structured["report"]["execution"]["termination"],
             "deadline_exceeded"

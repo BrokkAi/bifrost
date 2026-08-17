@@ -1,29 +1,13 @@
 use crate::analyzer::cpp::cpp_is_range_for_binding_name;
 use crate::analyzer::{Language, Range};
 use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
-use brokk_bifrost_csharp::syntax::{
-    csharp_implicit_accessor_value, csharp_is_type_position, csharp_local_binder_name,
-};
-use brokk_bifrost_js_ts::syntax::{
-    JsTsLexicalBindingIndex, is_catch_clause_binder as jsts_catch_clause_binder,
-    is_declaration_identifier as jsts_declaration_identifier, is_export_alias_identifier,
-    is_named_function_expression_declaration as jsts_named_function_expression_declaration,
-    is_object_property_key as jsts_object_property_key,
-};
+use brokk_bifrost_js_ts::syntax::{JsTsLexicalBindingIndex, is_export_alias_identifier};
 use brokk_bifrost_jvm::java::graph::resolver::is_declaration_name as java_is_declaration_name;
 use brokk_bifrost_jvm::scala::bare_name_scopes::ScalaBareNameDeclarationScopes;
-use brokk_bifrost_jvm::scala::graph::syntax::is_recovered_membership_reference as scala_is_recovered_membership_reference;
-use brokk_bifrost_jvm::scala::graph::syntax::named_argument_invocation_owner as scala_named_argument_owner;
 use brokk_bifrost_php::bare_name_scopes::PhpBareNameFunctionScopes;
 use brokk_bifrost_php::graph::resolver::is_declaration_name as php_declaration_name;
 use brokk_bifrost_php::graph::resolver::is_recovered_membership_reference as php_is_recovered_membership_reference;
-use brokk_bifrost_python::syntax::{
-    python_deferred_annotation_identifier_ranges,
-    python_keyword_argument_label as python_keyword_label,
-};
-use brokk_bifrost_rust::declarations::rust_node_text;
-use brokk_bifrost_rust::graph::ast::is_rust_declaration_name;
-use brokk_bifrost_rust::lexical_scope::is_pattern_binding_identifier;
+use brokk_bifrost_python::syntax::python_deferred_annotation_identifier_ranges;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,9 +130,7 @@ pub fn census_identifier_ranges(
 /// JS/TS shorthand destructuring properties (#2037). Java membership also
 /// descends parser-recovery subtrees while excluding structured declaration and
 /// label roles: valid inverse references remain backed without proposing those
-/// recovery tokens as forward census sites (#2086). PHP (#1867) and Scala
-/// (#2085) descend recovery too, and admit only the terminals whose reference
-/// role the grammar still states there.
+/// recovery tokens as forward census sites (#2086).
 pub fn census_membership_identifier_ranges(
     root: Node<'_>,
     language: Language,
@@ -289,7 +271,7 @@ fn collect_candidate_ranges(
         // still colors and resolves inside a broken edit.
         if (matches!(frontier, CandidateFrontier::Census)
             || (matches!(frontier, CandidateFrontier::CensusMembership)
-                && !matches!(language, Language::Java | Language::Php | Language::Scala)))
+                && !matches!(language, Language::Java | Language::Php)))
             && node.is_error()
         {
             continue;
@@ -318,18 +300,11 @@ fn collect_candidate_ranges(
                         && node.kind() == "shorthand_property_identifier_pattern")
             }
         };
-        // Inside recovery, PHP (#1867) and Scala (#2085) admit only the
-        // terminals whose reference role the grammar still spells out; Java
-        // (#2086) admits its whole identifier frontier there and drops the
-        // declaration and label roles in `is_excluded_reference_candidate`.
         let candidate = candidate
-            && (!inside_error
-                || !matches!(frontier, CandidateFrontier::CensusMembership)
-                || match language {
-                    Language::Php => php_is_recovered_membership_reference(node),
-                    Language::Scala => scala_is_recovered_membership_reference(node),
-                    _ => true,
-                });
+            && !(inside_error
+                && language == Language::Php
+                && matches!(frontier, CandidateFrontier::CensusMembership)
+                && !php_is_recovered_membership_reference(node));
         if candidate
             && !is_excluded_reference_candidate(language, node, frontier)
             && (node.named_child_count() == 0 || compound)
@@ -439,101 +414,12 @@ pub fn go_is_declaration_or_import_name(node: Node<'_>) -> bool {
     })
 }
 
-/// Whether a JavaScript/TypeScript terminal names a binding the language
-/// declares at this occurrence: a variable, function, class, interface, enum,
-/// type alias, method, field, parameter, pattern binder, label, import binder
-/// or export alias.
-///
-/// The census keeps its raw identifier superset, so the differential engine
-/// needs the same structural test the forward resolver applies before it
-/// decides whether a site is a reference probe at all (#2067).
-pub fn jsts_is_declaration_name(node: Node<'_>) -> bool {
-    jsts_declaration_identifier(node)
-}
-
-/// Whether a JavaScript/TypeScript terminal is an object property key: the
-/// `key` field of an object-literal `pair` or of a destructuring
-/// `pair_pattern`.
-pub fn jsts_is_object_property_key(node: Node<'_>) -> bool {
-    jsts_object_property_key(node)
-}
-
-/// Whether a JavaScript/TypeScript terminal names a function expression, whose
-/// binding is visible only inside that expression's own body.
-pub fn jsts_is_named_function_expression_name(node: Node<'_>) -> bool {
-    jsts_named_function_expression_declaration(node)
-}
-
-/// Whether a JavaScript/TypeScript terminal is the exception binder of a
-/// `catch` clause.
-pub fn jsts_is_catch_binder(node: Node<'_>) -> bool {
-    jsts_catch_clause_binder(node)
-}
-
-/// Whether a C# terminal is a bare occurrence of the implicit `value` parameter
-/// of a `set`, `init`, `add` or `remove` accessor. The language-owned helper
-/// stays the source of truth; this analysis facade keeps the root corpus runner
-/// independent of language crates.
-pub fn csharp_is_implicit_accessor_value(node: Node<'_>, source: &str) -> bool {
-    csharp_implicit_accessor_value(node, source)
-}
-
-/// Whether a C# terminal names a binding the grammar introduces at this
-/// occurrence and that C# analysis publishes no CodeUnit for.
-pub fn csharp_is_local_binder_name(node: Node<'_>) -> bool {
-    csharp_local_binder_name(node)
-}
-
-/// Whether a C# terminal occupies a type position, so that only a type
-/// declaration can be its target.
-pub fn csharp_is_type_reference(node: Node<'_>) -> bool {
-    csharp_is_type_position(node)
-}
-
 /// Whether a PHP terminal is a namespace or constant declaration name rather
 /// than a definition probe. The language-owned helper remains the source of
 /// truth; this analysis facade keeps the root runner independent of language
 /// crate dependencies.
 pub fn php_is_declaration_name(node: Node<'_>) -> bool {
     php_declaration_name(node)
-}
-
-/// Whether a Python terminal is the label of a keyword argument: the `x` in
-/// `f(x=1)`. The language-owned helper stays the source of truth; this analysis
-/// facade keeps the root corpus runner independent of language crates.
-pub fn python_is_keyword_argument_label(node: Node<'_>) -> bool {
-    python_keyword_label(node)
-}
-
-/// Whether a Scala terminal is the label of a named argument: the `a` in
-/// `Foo(a = 3)` or `new Foo(a = 3)`. The forward resolver's own predicate stays
-/// the source of truth -- it is what sorts the site into
-/// `ScalaReferenceNode::NamedArgument`, whose target is a member or parameter of
-/// the callee rather than a name in scope.
-pub fn scala_is_named_argument_label(node: Node<'_>) -> bool {
-    node.kind() == "identifier" && scala_named_argument_owner(node).is_some()
-}
-
-/// Whether a Rust identifier is the name field of an indexed item declaration.
-///
-/// The language-owned AST helper is shared with diagnostics and usage scans;
-/// the analysis facade exposes it to the corpus runner without duplicating the
-/// Rust grammar's declaration-kind list.
-pub fn rust_is_declaration_name(node: Node<'_>) -> bool {
-    is_rust_declaration_name(node)
-}
-
-/// Whether the Rust parser reads this identifier as a local binding pattern.
-///
-/// Bare enum variants in match patterns share this syntax, so callers must
-/// retain a site when indexed enum-variant evidence exists for the spelling.
-pub fn rust_is_pattern_binding_name(node: Node<'_>) -> bool {
-    is_pattern_binding_identifier(node)
-}
-
-/// Canonical source spelling for one Rust identifier-like node.
-pub fn rust_identifier_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    rust_node_text(node, source)
 }
 
 fn is_csharp_tuple_element_name(node: Node<'_>) -> bool {
@@ -950,117 +836,6 @@ class Result {
         assert!(
             !membership.contains(&arbitrary_recovery),
             "arbitrary recovery leaves are not membership references: {membership:?}"
-        );
-    }
-
-    /// tree-sitter-scala loses whole template bodies to recovery on Scala 3
-    /// source it cannot parse. `def be_==/(...)` -- a method name that mixes
-    /// alphanumeric and operator characters, which Scala admits -- wraps the
-    /// enclosing trait's body in one ERROR node, and the soft keyword `export`
-    /// used as a member name wraps the selection it appears in. The signature
-    /// types and the selection's owner inside those subtrees are ordinary
-    /// references the inverse usage scan reports, so membership must hold them
-    /// (#2085). The declaration names beside them, and the leaves recovery
-    /// merely left lying around, must not enter, and the forward probe frontier
-    /// must not move at all.
-    #[test]
-    fn scala_census_membership_backs_only_structured_references_inside_recovery() {
-        let signatures = concat!(
-            "package probe\n",
-            "\n",
-            "trait Matchers:\n",
-            "  type Alias = Int\n",
-            "\n",
-            "  def deep(node: Alias): XmlMatcher =\n",
-            "    build(node)\n",
-            "\n",
-            "  def be_==/(node: Alias): XmlMatcher =\n",
-            "    build(node)\n",
-            "\n",
-            "  def build(node: Alias): XmlMatcher =\n",
-            "    XmlMatcher(node)\n",
-        );
-        let census = census_offsets(Language::Scala, "Matchers.scala", signatures);
-        let membership = census_membership_offsets(Language::Scala, "Matchers.scala", signatures);
-        let recovered_return_type = signatures
-            .find("Alias): XmlMatcher")
-            .expect("recovered return type")
-            + "Alias): ".len();
-        let recovered_parameter_type = signatures
-            .find("node: Alias")
-            .expect("recovered parameter type")
-            + "node: ".len();
-        let alias_binder = signatures.find("type Alias").expect("type alias") + "type ".len();
-        let function_binder = signatures.find("def deep").expect("function binder") + "def ".len();
-        for recovered in [recovered_return_type, recovered_parameter_type] {
-            assert!(
-                !census.contains(&recovered),
-                "the forward census must keep excluding the ERROR subtree at {recovered}: {census:?}"
-            );
-            assert!(
-                membership.contains(&recovered),
-                "the recovered signature type at {recovered} must back inverse precision: {membership:?}"
-            );
-        }
-        for excluded in [alias_binder, function_binder] {
-            assert!(
-                !membership.contains(&excluded),
-                "the binder at byte {excluded} is not a reference: {membership:?}"
-            );
-        }
-
-        let selection = concat!(
-            "package probe\n",
-            "\n",
-            "class Task {\n",
-            "  def second(value: String): String = {\n",
-            "    val file = Area.export(value, value)\n",
-            "    file\n",
-            "  }\n",
-            "}\n",
-        );
-        let census = census_offsets(Language::Scala, "Task.scala", selection);
-        let membership = census_membership_offsets(Language::Scala, "Task.scala", selection);
-        let recovered_owner = selection
-            .find("Area.export")
-            .expect("recovered selection owner");
-        let recovery_noise =
-            selection.find("export(value").expect("recovery noise") + "export(".len();
-        assert!(
-            !census.contains(&recovered_owner),
-            "the forward census must keep excluding the ERROR subtree: {census:?}"
-        );
-        assert!(
-            membership.contains(&recovered_owner),
-            "the recovered selection owner must back inverse precision: {membership:?}"
-        );
-        assert!(
-            !membership.contains(&recovery_noise),
-            "the argument recovery read as a member name is not a reference: {membership:?}"
-        );
-    }
-
-    /// Control: outside recovery the Scala membership frontier is exactly the
-    /// forward census frontier, so nothing about an ordinary file moved (#2085).
-    #[test]
-    fn scala_census_membership_matches_the_census_without_recovery() {
-        let source = concat!(
-            "package probe\n",
-            "\n",
-            "trait Matchers:\n",
-            "  type Alias = Int\n",
-            "\n",
-            "  def deep(node: Alias): XmlMatcher =\n",
-            "    build(node)\n",
-            "\n",
-            "  def build(node: Alias): XmlMatcher =\n",
-            "    XmlMatcher(node)\n",
-        );
-        let census = census_offsets(Language::Scala, "Matchers.scala", source);
-        let membership = census_membership_offsets(Language::Scala, "Matchers.scala", source);
-        assert_eq!(
-            census, membership,
-            "an error-free Scala file must keep one identifier frontier"
         );
     }
 

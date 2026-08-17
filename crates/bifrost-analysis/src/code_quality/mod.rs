@@ -96,28 +96,6 @@ pub(crate) fn resolve_project_files(project: &dyn Project, inputs: Vec<String>) 
     }
 }
 
-/// Resolve explicit paths, or select every file already indexed by `analyzer`
-/// when the caller requests workspace discovery with an empty list.
-///
-/// Most code-quality tools are deliberately file-bounded and should keep using
-/// [`resolve_project_files`]. Discovery-oriented tools opt into this helper so
-/// an empty list has one explicit meaning without changing those tools' API.
-pub(crate) fn resolve_project_files_or_all_analyzed(
-    analyzer: &dyn IAnalyzer,
-    inputs: Vec<String>,
-) -> ResolvedFiles {
-    if !inputs.is_empty() {
-        return resolve_project_files(analyzer.project(), inputs);
-    }
-
-    ResolvedFiles {
-        files: analyzer.get_analyzed_files().into_iter().collect(),
-        skipped_inputs: 0,
-        input_truncated: false,
-        ambiguous_paths: Vec::new(),
-    }
-}
-
 pub(crate) fn append_ambiguous_path_notes(
     lines: &mut ReportLines,
     ambiguous: &[AmbiguousPathInput],

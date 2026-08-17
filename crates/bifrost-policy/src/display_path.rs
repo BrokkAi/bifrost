@@ -1,12 +1,10 @@
 //! Bounded, non-canonical display paths for concise taint findings.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 
 use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
 use brokk_bifrost_analysis::analyzer::dataflow::{SummaryWitness, SummaryWitnessStepKind};
 use brokk_bifrost_analysis::analyzer::semantic::{IcfgEdgeKind, SemanticLocator};
-use serde::Serialize;
 
 use crate::finding::PolicySourceLocation;
 use crate::finding_identity::WitnessId;
@@ -15,8 +13,7 @@ const MAX_DISPLAY_PATH_ROWS: usize = 12;
 const MAX_DISPLAY_LABEL_BYTES: usize = 160;
 const TRUNCATED_LABEL_SUFFIX: &str = "...";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum TaintDisplayStepKind {
     Source,
     Propagation,
@@ -49,7 +46,7 @@ impl TaintDisplayStepKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TaintDisplayStep {
     kind: TaintDisplayStepKind,
     location: PolicySourceLocation,
@@ -82,17 +79,12 @@ impl TaintDisplayStep {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TaintDisplayPath {
-    schema_version: u32,
-    representative_witness_id: WitnessId,
-    witness_ids: Vec<WitnessId>,
+    witness_id: WitnessId,
     steps: Vec<TaintDisplayStep>,
     canonical_incomplete: bool,
     omitted_meaningful_steps: u64,
-    alternatives_truncated: bool,
-    omitted_alternative_paths_lower_bound: u64,
-    omitted_witnesses_lower_bound: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -107,22 +99,6 @@ impl TaintDisplayPathCache {
         debug_assert!(self.0.is_none());
         self.0 = path.map(Box::new);
     }
-
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.0.is_none()
-    }
-}
-
-impl Serialize for TaintDisplayPathCache {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self.get() {
-            Some(path) => path.serialize(serializer),
-            None => serializer.serialize_none(),
-        }
-    }
 }
 
 impl PartialEq for TaintDisplayPathCache {
@@ -133,22 +109,12 @@ impl PartialEq for TaintDisplayPathCache {
 }
 
 impl TaintDisplayPath {
-    pub(crate) const SCHEMA_VERSION: u32 = 1;
-
-    pub(crate) const fn schema_version(&self) -> u32 {
-        self.schema_version
-    }
-
     pub(crate) fn steps(&self) -> &[TaintDisplayStep] {
         &self.steps
     }
 
     pub(crate) const fn witness_id(&self) -> &WitnessId {
-        &self.representative_witness_id
-    }
-
-    pub(crate) fn witness_ids(&self) -> &[WitnessId] {
-        &self.witness_ids
+        &self.witness_id
     }
 
     pub(crate) const fn canonical_incomplete(&self) -> bool {
@@ -159,35 +125,17 @@ impl TaintDisplayPath {
         self.omitted_meaningful_steps
     }
 
-    pub(crate) const fn alternatives_truncated(&self) -> bool {
-        self.alternatives_truncated
-    }
-
-    pub(crate) const fn omitted_alternative_paths_lower_bound(&self) -> u64 {
-        self.omitted_alternative_paths_lower_bound
-    }
-
-    pub(crate) const fn omitted_witnesses_lower_bound(&self) -> u64 {
-        self.omitted_witnesses_lower_bound
-    }
-
     #[cfg(test)]
     pub(crate) fn for_test(
         steps: Vec<TaintDisplayStep>,
         canonical_incomplete: bool,
         omitted_meaningful_steps: u64,
     ) -> Self {
-        let witness_id = WitnessId::try_new("test", "display").unwrap();
         Self {
-            schema_version: Self::SCHEMA_VERSION,
-            representative_witness_id: witness_id.clone(),
-            witness_ids: vec![witness_id],
+            witness_id: WitnessId::try_new("test", "display").unwrap(),
             steps,
             canonical_incomplete,
             omitted_meaningful_steps,
-            alternatives_truncated: false,
-            omitted_alternative_paths_lower_bound: 0,
-            omitted_witnesses_lower_bound: 0,
         }
     }
 }
@@ -413,15 +361,10 @@ fn project_display_rows(
     steps.push(sink);
     TaintDisplayCandidate {
         path: TaintDisplayPath {
-            schema_version: TaintDisplayPath::SCHEMA_VERSION,
-            representative_witness_id: witness_id.clone(),
-            witness_ids: vec![witness_id],
+            witness_id,
             steps,
             canonical_incomplete,
             omitted_meaningful_steps: u64::try_from(omitted_meaningful_steps).unwrap_or(u64::MAX),
-            alternatives_truncated: false,
-            omitted_alternative_paths_lower_bound: 0,
-            omitted_witnesses_lower_bound: 0,
         },
         complete_anchors,
         informative_steps,
@@ -443,48 +386,11 @@ fn location_strictly_contains(outer: &PolicySourceLocation, inner: &PolicySource
 
 pub(crate) fn select_taint_display_path(
     candidates: impl IntoIterator<Item = TaintDisplayCandidate>,
-    omitted_witnesses_lower_bound: u64,
 ) -> Option<TaintDisplayPath> {
-    let mut groups = HashMap::<Vec<TaintDisplayStep>, TaintDisplayGroup>::new();
-    for candidate in candidates {
-        let signature = candidate.path.steps.clone();
-        match groups.entry(signature) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let group = entry.get_mut();
-                group
-                    .witness_ids
-                    .push(candidate.path.representative_witness_id.clone());
-                if compare_candidates(&candidate, &group.representative).is_gt() {
-                    group.representative = candidate;
-                }
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(TaintDisplayGroup {
-                    witness_ids: vec![candidate.path.representative_witness_id.clone()],
-                    representative: candidate,
-                });
-            }
-        }
-    }
-
-    let omitted_alternative_paths_lower_bound =
-        u64::try_from(groups.len().saturating_sub(1)).unwrap_or(u64::MAX);
-    let mut selected = groups
-        .into_values()
-        .max_by(|left, right| compare_candidates(&left.representative, &right.representative))?;
-    selected.witness_ids.sort();
-    selected.witness_ids.dedup();
-    let mut path = selected.representative.path;
-    path.witness_ids = selected.witness_ids;
-    path.alternatives_truncated = omitted_witnesses_lower_bound > 0;
-    path.omitted_alternative_paths_lower_bound = omitted_alternative_paths_lower_bound;
-    path.omitted_witnesses_lower_bound = omitted_witnesses_lower_bound;
-    Some(path)
-}
-
-struct TaintDisplayGroup {
-    representative: TaintDisplayCandidate,
-    witness_ids: Vec<WitnessId>,
+    candidates
+        .into_iter()
+        .max_by(compare_candidates)
+        .map(|candidate| candidate.path)
 }
 
 fn compare_candidates(left: &TaintDisplayCandidate, right: &TaintDisplayCandidate) -> Ordering {
@@ -502,12 +408,7 @@ fn compare_candidates(left: &TaintDisplayCandidate, right: &TaintDisplayCandidat
                 .omitted_meaningful_steps
                 .cmp(&left.path.omitted_meaningful_steps)
         })
-        .then_with(|| {
-            right
-                .path
-                .representative_witness_id
-                .cmp(&left.path.representative_witness_id)
-        })
+        .then_with(|| right.path.witness_id.cmp(&left.path.witness_id))
 }
 
 fn normalize_label(label: &str) -> String {
@@ -614,9 +515,7 @@ mod tests {
         let make =
             |id: &str, informative, removed_noise, canonical_incomplete| TaintDisplayCandidate {
                 path: TaintDisplayPath {
-                    schema_version: TaintDisplayPath::SCHEMA_VERSION,
-                    representative_witness_id: WitnessId::try_new("test", id).unwrap(),
-                    witness_ids: vec![WitnessId::try_new("test", id).unwrap()],
+                    witness_id: WitnessId::try_new("test", id).unwrap(),
                     steps: vec![
                         TaintDisplayStep::new(
                             TaintDisplayStepKind::Source,
@@ -627,75 +526,29 @@ mod tests {
                     ],
                     canonical_incomplete,
                     omitted_meaningful_steps: 0,
-                    alternatives_truncated: false,
-                    omitted_alternative_paths_lower_bound: 0,
-                    omitted_witnesses_lower_bound: 0,
                 },
                 complete_anchors: true,
                 informative_steps: informative,
                 removed_noise,
             };
         let selected =
-            select_taint_display_path(vec![make("z", 1, 0, false), make("a", 4, 0, true)], 0)
+            select_taint_display_path(vec![make("z", 1, 0, false), make("a", 4, 0, true)])
                 .expect("one candidate");
         assert_eq!(selected.witness_id().as_str(), "test:z");
 
         let selected =
-            select_taint_display_path(vec![make("z", 1, 0, false), make("a", 2, 3, false)], 0)
+            select_taint_display_path(vec![make("z", 1, 0, false), make("a", 2, 3, false)])
                 .expect("one candidate");
         assert_eq!(selected.witness_id().as_str(), "test:a");
 
         let selected =
-            select_taint_display_path(vec![make("z", 2, 0, false), make("a", 2, 0, false)], 0)
+            select_taint_display_path(vec![make("z", 2, 0, false), make("a", 2, 0, false)])
                 .expect("one candidate");
         assert_eq!(selected.witness_id().as_str(), "test:a");
         let selected =
-            select_taint_display_path(vec![make("a", 2, 0, false), make("z", 2, 0, false)], 0)
+            select_taint_display_path(vec![make("a", 2, 0, false), make("z", 2, 0, false)])
                 .expect("one candidate");
         assert_eq!(selected.witness_id().as_str(), "test:a");
-    }
-
-    #[test]
-    fn selection_groups_identical_rows_and_keeps_honest_provenance() {
-        let make = |id: &str, sink_start: u64| TaintDisplayCandidate {
-            path: TaintDisplayPath {
-                schema_version: TaintDisplayPath::SCHEMA_VERSION,
-                representative_witness_id: WitnessId::try_new("test", id).unwrap(),
-                witness_ids: vec![WitnessId::try_new("test", id).unwrap()],
-                steps: vec![
-                    TaintDisplayStep::new(TaintDisplayStepKind::Source, location(0, 1), "source()"),
-                    TaintDisplayStep::new(
-                        TaintDisplayStepKind::Sink,
-                        location(sink_start, sink_start + 1),
-                        "sink()",
-                    ),
-                ],
-                canonical_incomplete: false,
-                omitted_meaningful_steps: 0,
-                alternatives_truncated: false,
-                omitted_alternative_paths_lower_bound: 0,
-                omitted_witnesses_lower_bound: 0,
-            },
-            complete_anchors: true,
-            informative_steps: 2,
-            removed_noise: 0,
-        };
-        let selected =
-            select_taint_display_path(vec![make("z", 2), make("a", 2), make("other", 4)], 3)
-                .expect("one selected display path");
-
-        assert_eq!(selected.witness_id().as_str(), "test:a");
-        assert_eq!(
-            selected
-                .witness_ids()
-                .iter()
-                .map(WitnessId::as_str)
-                .collect::<Vec<_>>(),
-            vec!["test:a", "test:z"]
-        );
-        assert_eq!(selected.omitted_alternative_paths_lower_bound(), 1);
-        assert!(selected.alternatives_truncated());
-        assert_eq!(selected.omitted_witnesses_lower_bound(), 3);
     }
 
     #[test]

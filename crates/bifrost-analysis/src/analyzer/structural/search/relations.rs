@@ -743,7 +743,10 @@ impl EnclosingDeclarationIndex {
         let mut retained = false;
         for range in ranges {
             retained = true;
-            self.exact.push(DeclarationValue::new(unit.clone(), range));
+            self.exact.push(DeclarationValue {
+                unit: unit.clone(),
+                range,
+            });
         }
         if !retained {
             self.projection_omitted = true;
@@ -818,9 +821,7 @@ pub(super) fn enclosing_declaration_value(
 ) -> (Option<DeclarationValue>, bool) {
     let declarations = declaration_index_for_seed(analyzer, seed, declarations_by_file);
     (
-        declarations
-            .enclosing(seed_range(seed))
-            .map(|declaration| attach_exact_structural_kind(seed, declaration)),
+        declarations.enclosing(seed_range(seed)),
         declarations.projection_omitted,
     )
 }
@@ -837,41 +838,5 @@ pub(super) fn exact_callable_declaration_value(
     ) {
         return None;
     }
-    declaration_index_for_seed(analyzer, seed, declarations_by_file)
-        .exact(seed_range(seed))
-        .map(|declaration| attach_exact_structural_kind(seed, declaration))
-}
-
-fn attach_exact_structural_kind(
-    seed: &SeedMatch,
-    declaration: DeclarationValue,
-) -> DeclarationValue {
-    let fact = seed.facts.node(seed.fact_match.node);
-    if !refined_declaration_kind(fact.kind) {
-        return declaration;
-    }
-
-    let mut structural_span = fact.span();
-    for decorator in seed
-        .facts
-        .role_targets(seed.fact_match.node, Role::Decorator)
-    {
-        structural_span.start_byte = structural_span.start_byte.min(decorator.span.start_byte);
-        structural_span.end_byte = structural_span.end_byte.max(decorator.span.end_byte);
-    }
-    if structural_span.start_byte == declaration.range.start_byte
-        && structural_span.end_byte == declaration.range.end_byte
-    {
-        declaration.with_structural_kind(fact.kind)
-    } else {
-        declaration
-    }
-}
-
-/// Exact structural projection may retain a leaf kind that refines the
-/// analyzer's coarser `CodeUnitType`, but the generic declaration fact proves
-/// no refinement. Keeping it would erase already-specific kinds such as Rust
-/// fields or C# properties when their ranges happen to coincide.
-pub(super) fn refined_declaration_kind(kind: NormalizedKind) -> bool {
-    kind != NormalizedKind::Declaration && kind.satisfies(NormalizedKind::Declaration)
+    declaration_index_for_seed(analyzer, seed, declarations_by_file).exact(seed_range(seed))
 }

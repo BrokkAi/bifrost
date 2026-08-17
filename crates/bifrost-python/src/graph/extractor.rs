@@ -556,14 +556,6 @@ impl ScanCtx<'_> {
     }
 
     fn module_binding_targets_query(&self, ident: &str, node: Node<'_>) -> bool {
-        // A member receiver must bind the owner symbol itself. A namespace
-        // import only binds the module that contains the owner; treating that
-        // module as the owner conflates `from pkg import child` (the
-        // `pkg.child` module) with a same-named `child` class exported by that
-        // module. Top-level targets still accept either binding kind below.
-        if self.target_member.is_some() {
-            return self.module_binding_targets_symbol(ident, node);
-        }
         if let Some(matches) = self.function_import_binding_targets_query(ident, node) {
             return matches;
         }
@@ -599,12 +591,7 @@ impl ScanCtx<'_> {
         let candidates = resolve_fqn_candidates(self.python, &binding.qualified_name, |name| {
             self.graph.index.definitions(name).collect()
         });
-        let imported_target = self.target_owner.as_ref().unwrap_or(self.target);
-        Some(
-            candidates
-                .iter()
-                .any(|candidate| candidate == imported_target),
-        )
+        Some(candidates.iter().any(|candidate| candidate == self.target))
     }
 
     fn module_binding_matches_query(
@@ -672,38 +659,36 @@ impl ScanCtx<'_> {
     }
 
     fn receiver_type_matches_target(&self, raw_type: &str) -> bool {
+        if receiver_annotation_matches_target(
+            raw_type,
+            self.edges,
+            self.target_short,
+            self.target_self_file,
+        ) {
+            return true;
+        }
+
         let Some(target_owner) = self.target_owner.as_ref() else {
             return false;
         };
-        if let Some(receiver_type) = resolve_receiver_type(
+        let Some(receiver_type) = resolve_receiver_type(
             self.graph,
             self.python,
             self.file,
             raw_type,
             self.target_self_file,
-        ) {
-            if &receiver_type == target_owner {
-                return true;
-            }
-            return self
-                .graph
-                .hierarchy
-                .map(|provider| provider.get_ancestors(&receiver_type))
-                .unwrap_or_default()
-                .into_iter()
-                .any(|ancestor| ancestor == *target_owner);
+        ) else {
+            return false;
+        };
+        if &receiver_type == target_owner {
+            return true;
         }
-
-        // Preserve the annotation-edge/name fallback only when structured
-        // resolution has no answer. When it identifies a concrete owner, even
-        // a negative answer is authoritative: otherwise identically named
-        // vendored package copies widen into one another.
-        receiver_annotation_matches_target(
-            raw_type,
-            self.edges,
-            self.target_short,
-            self.target_self_file,
-        )
+        self.graph
+            .hierarchy
+            .map(|provider| provider.get_ancestors(&receiver_type))
+            .unwrap_or_default()
+            .into_iter()
+            .any(|ancestor| ancestor == *target_owner)
     }
 }
 

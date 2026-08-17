@@ -223,86 +223,67 @@ pub fn collect_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut 
     });
 }
 
-/// One class-like scope waiting on the extraction stack.
-///
-/// A written declaration and an anonymous `new Base(...) { ... }` body differ
-/// only in where their name, header, and supertype come from. Everything after
-/// that -- members, nested types, signature metadata -- is the same walk, so
-/// both ride the one explicit stack rather than a second traversal (#2045).
-enum JavaClassScope<'tree> {
-    Declared(Node<'tree>),
-    Anonymous {
-        creation: Node<'tree>,
-        body: Node<'tree>,
-    },
-}
-
-/// A pending scope together with the owner it hangs off and the file's
-/// top-level owner: `(scope, parent, top level)`.
-type PendingClassScope<'tree> = (JavaClassScope<'tree>, Option<CodeUnit>, Option<CodeUnit>);
-
-/// What the extraction loop needs from one class-like scope, whichever form
-/// introduced it.
-struct JavaClassScopeFacts<'tree> {
-    unit: CodeUnit,
-    /// The node whose range anchors the declaration. The loop also reads its
-    /// kind: only a `record_declaration` has components and a compact
-    /// constructor.
-    anchor: Node<'tree>,
-    body: Option<Node<'tree>>,
-    raw_supertypes: Vec<String>,
-    signature: String,
-    is_interface: bool,
-    is_static: bool,
-}
-
-pub fn visit_class_like<'tree>(
+pub fn visit_class_like(
     file: &ProjectFile,
     source: &str,
-    node: Node<'tree>,
+    node: Node<'_>,
     package_name: &str,
     parent: Option<&CodeUnit>,
     top_level_owner: Option<&CodeUnit>,
     parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
 ) -> Option<CodeUnit> {
     let mut first = None;
-    let mut stack: Vec<PendingClassScope<'tree>> = vec![(
-        JavaClassScope::Declared(node),
-        parent.cloned(),
-        top_level_owner.cloned(),
-    )];
-    while let Some((scope, parent, top_level_owner)) = stack.pop() {
-        let facts = match scope {
-            JavaClassScope::Declared(node) => {
-                let Some(facts) =
-                    declared_class_scope(file, source, node, package_name, parent.as_ref())
-                else {
-                    continue;
-                };
-                facts
-            }
-            JavaClassScope::Anonymous { creation, body } => {
-                let owner = parent.as_ref().expect(
-                    "an anonymous class body is always written inside an enclosing declaration",
-                );
-                anonymous_class_scope(file, source, creation, body, package_name, owner)
-            }
+    let mut stack = vec![(node, parent.cloned(), top_level_owner.cloned())];
+    while let Some((node, parent, top_level_owner)) = stack.pop() {
+        let Some(name_node) = node.child_by_field_name("name") else {
+            continue;
         };
 
-        let code_unit = facts.unit;
+        let simple_name = node_text(name_node, source).trim().to_string();
+        if simple_name.is_empty() {
+            continue;
+        }
+
+        let short_name = parent
+            .as_ref()
+            .map(|parent| format!("{}.{}", parent.short_name(), simple_name))
+            .unwrap_or(simple_name.clone());
+        // A nested class joins its parent with an ordinary `.` in Java's legacy
+        // convention (unlike python/php/ruby's `$`-joined nesting), so it is a
+        // plain `Type` segment hanging off the parent's own `Type` chain; a
+        // top-level class hangs off the package-path `Package` chain instead.
+        let fq = match &parent {
+            Some(parent) => parent
+                .fq()
+                .clone()
+                .with_pushed(java_segment(&simple_name, SegmentKind::Type)),
+            None => java_package_fq(package_name)
+                .with_pushed(java_segment(&simple_name, SegmentKind::Type)),
+        };
+
+        let code_unit = CodeUnit::new_fq(
+            file.clone(),
+            brokk_bifrost_core::analyzer::model::CodeUnitType::Class,
+            package_name.to_string(),
+            short_name,
+            fq,
+        );
         if first.is_none() {
             first = Some(code_unit.clone());
         }
+        let raw_supertypes = extract_raw_supertypes(node, source);
+        let signature = class_signature(node, source);
+        let class_is_static = java_class_like_is_static(node, parent.as_ref());
 
         let top_level = top_level_owner.unwrap_or_else(|| code_unit.clone());
         parsed.add_code_unit(
             code_unit.clone(),
-            facts.anchor,
+            node,
             source,
             parent.clone(),
             Some(top_level.clone()),
         );
-        parsed.set_raw_supertypes(code_unit.clone(), facts.raw_supertypes);
+        parsed.set_raw_supertypes(code_unit.clone(), raw_supertypes);
         // The declaration node's own kind is what separates an interface from a
         // class; recording it here is what lets a family edge state `implements`
         // rather than `overrides` without re-reading the owner's source. A Java
@@ -311,16 +292,19 @@ pub fn visit_class_like<'tree>(
         // class that names one in its `implements` clause implements it.
         parsed.add_signature_with_metadata(
             code_unit.clone(),
-            SignatureMetadata::new(facts.signature, Vec::new())
-                .with_class_like_interface(facts.is_interface)
-                .with_class_like_static(facts.is_static),
+            SignatureMetadata::new(signature, Vec::new())
+                .with_class_like_interface(matches!(
+                    node.kind(),
+                    "interface_declaration" | "annotation_type_declaration"
+                ))
+                .with_class_like_static(class_is_static),
         );
 
-        if facts.anchor.kind() == "record_declaration" {
+        if node.kind() == "record_declaration" {
             visit_record_components(
                 file,
                 source,
-                facts.anchor,
+                node,
                 package_name,
                 &code_unit,
                 &top_level,
@@ -328,69 +312,59 @@ pub fn visit_class_like<'tree>(
             );
         }
 
-        let Some(body) = facts.body else {
-            continue;
-        };
-        for child in class_like_body_children_rev(body) {
-            match child.kind() {
-                kind if is_class_like_declaration_kind(kind) => {
-                    stack.push((
-                        JavaClassScope::Declared(child),
-                        Some(code_unit.clone()),
-                        Some(top_level.clone()),
-                    ));
+        if let Some(body) = node.child_by_field_name("body") {
+            for child in class_like_body_children_rev(body) {
+                match child.kind() {
+                    kind if is_class_like_declaration_kind(kind) => {
+                        stack.push((child, Some(code_unit.clone()), Some(top_level.clone())));
+                    }
+                    "method_declaration" | "constructor_declaration" => {
+                        visit_callable(
+                            file,
+                            source,
+                            child,
+                            package_name,
+                            &code_unit,
+                            &top_level,
+                            parsed,
+                        );
+                    }
+                    "compact_constructor_declaration" if node.kind() == "record_declaration" => {
+                        visit_compact_constructor(
+                            file,
+                            source,
+                            child,
+                            node,
+                            package_name,
+                            &code_unit,
+                            &top_level,
+                            parsed,
+                        );
+                    }
+                    "field_declaration" | "constant_declaration" => {
+                        visit_field_declaration(
+                            file,
+                            source,
+                            child,
+                            package_name,
+                            &code_unit,
+                            &top_level,
+                            parsed,
+                        );
+                    }
+                    "enum_constant" => {
+                        visit_enum_constant(
+                            file,
+                            source,
+                            child,
+                            package_name,
+                            &code_unit,
+                            &top_level,
+                            parsed,
+                        );
+                    }
+                    _ => {}
                 }
-                "method_declaration" | "constructor_declaration" => {
-                    visit_callable(
-                        file,
-                        source,
-                        child,
-                        package_name,
-                        &code_unit,
-                        &top_level,
-                        parsed,
-                        &mut stack,
-                    );
-                }
-                "compact_constructor_declaration"
-                    if facts.anchor.kind() == "record_declaration" =>
-                {
-                    visit_compact_constructor(
-                        file,
-                        source,
-                        child,
-                        facts.anchor,
-                        package_name,
-                        &code_unit,
-                        &top_level,
-                        parsed,
-                        &mut stack,
-                    );
-                }
-                "field_declaration" | "constant_declaration" => {
-                    visit_field_declaration(
-                        file,
-                        source,
-                        child,
-                        package_name,
-                        &code_unit,
-                        &top_level,
-                        parsed,
-                        &mut stack,
-                    );
-                }
-                "enum_constant" => {
-                    visit_enum_constant(
-                        file,
-                        source,
-                        child,
-                        package_name,
-                        &code_unit,
-                        &top_level,
-                        parsed,
-                    );
-                }
-                _ => {}
             }
         }
     }
@@ -398,116 +372,14 @@ pub fn visit_class_like<'tree>(
     first
 }
 
-/// The scope a written `class`/`interface`/`enum`/`record`/`@interface`
-/// declaration introduces, wherever it is written: a top-level type, a nested
-/// member type, or a class local to one method body.
-fn declared_class_scope<'tree>(
+fn visit_callable(
     file: &ProjectFile,
     source: &str,
-    node: Node<'tree>,
-    package_name: &str,
-    parent: Option<&CodeUnit>,
-) -> Option<JavaClassScopeFacts<'tree>> {
-    let name_node = node.child_by_field_name("name")?;
-    let simple_name = node_text(name_node, source).trim();
-    if simple_name.is_empty() {
-        return None;
-    }
-
-    let short_name = parent
-        .map(|parent| format!("{}.{}", parent.short_name(), simple_name))
-        .unwrap_or_else(|| simple_name.to_string());
-    // A nested class joins its parent with an ordinary `.` in Java's legacy
-    // convention (unlike python/php/ruby's `$`-joined nesting), so it is a
-    // plain `Type` segment hanging off the parent's own chain; a top-level
-    // class hangs off the package-path `Package` chain instead. A class local
-    // to a method hangs off that method's `Member` segment the same way, which
-    // is what gives its own members a name the forward lookup can ask for.
-    let fq = match parent {
-        Some(parent) => parent
-            .fq()
-            .clone()
-            .with_pushed(java_segment(simple_name, SegmentKind::Type)),
-        None => {
-            java_package_fq(package_name).with_pushed(java_segment(simple_name, SegmentKind::Type))
-        }
-    };
-
-    Some(JavaClassScopeFacts {
-        unit: CodeUnit::new_fq(
-            file.clone(),
-            brokk_bifrost_core::analyzer::model::CodeUnitType::Class,
-            package_name.to_string(),
-            short_name,
-            fq,
-        ),
-        anchor: node,
-        body: node.child_by_field_name("body"),
-        raw_supertypes: extract_raw_supertypes(node, source),
-        signature: class_signature(node, source),
-        is_interface: matches!(
-            node.kind(),
-            "interface_declaration" | "annotation_type_declaration"
-        ),
-        is_static: java_class_like_is_static(node, parent),
-    })
-}
-
-/// The scope an anonymous `new Base(...) { ... }` body introduces.
-///
-/// The unit takes the same `$anon$line:column` marker the lambda units use, so
-/// no source spelling can name it and it stays synthetic. The written `Base`
-/// becomes its one raw supertype, which is what lets a member the body
-/// inherits resolve exactly as a named subclass's would. The range anchors on
-/// the body, not on the whole expression: the constructor arguments are
-/// written in the enclosing scope and must keep resolving there.
-fn anonymous_class_scope<'tree>(
-    file: &ProjectFile,
-    source: &str,
-    creation: Node<'tree>,
-    body: Node<'tree>,
-    package_name: &str,
-    parent: &CodeUnit,
-) -> JavaClassScopeFacts<'tree> {
-    let (short_name, fq) = java_anonymous_scope_identity(parent, creation);
-    let mut raw_supertypes = Vec::new();
-    if let Some(supertype) = creation.child_by_field_name("type") {
-        collect_supertype_nodes(supertype, source, &mut raw_supertypes);
-    }
-    let header = source
-        .get(creation.start_byte()..body.start_byte())
-        .unwrap_or("")
-        .trim_end();
-
-    JavaClassScopeFacts {
-        unit: CodeUnit::with_signature_and_fq(
-            file.clone(),
-            brokk_bifrost_core::analyzer::model::CodeUnitType::Class,
-            package_name.to_string(),
-            short_name,
-            None,
-            true,
-            fq,
-        ),
-        anchor: body,
-        body: Some(body),
-        raw_supertypes,
-        signature: format!("{} {{", normalize_whitespace(header)),
-        is_interface: false,
-        is_static: false,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn visit_callable<'tree>(
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'tree>,
+    node: Node<'_>,
     package_name: &str,
     parent: &CodeUnit,
     top_level: &CodeUnit,
     parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
-    pending: &mut Vec<PendingClassScope<'tree>>,
 ) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
@@ -571,7 +443,7 @@ fn visit_callable<'tree>(
     );
 
     if let Some(body) = node.child_by_field_name("body") {
-        collect_body_scopes(
+        collect_lambda_expressions(
             file,
             source,
             body,
@@ -579,22 +451,20 @@ fn visit_callable<'tree>(
             &code_unit,
             top_level,
             parsed,
-            pending,
         );
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn visit_compact_constructor<'tree>(
+fn visit_compact_constructor(
     file: &ProjectFile,
     source: &str,
-    node: Node<'tree>,
-    record: Node<'tree>,
+    node: Node<'_>,
+    record: Node<'_>,
     package_name: &str,
     parent: &CodeUnit,
     top_level: &CodeUnit,
     parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
-    pending: &mut Vec<PendingClassScope<'tree>>,
 ) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
@@ -643,7 +513,7 @@ fn visit_compact_constructor<'tree>(
     );
 
     if let Some(body) = node.child_by_field_name("body") {
-        collect_body_scopes(
+        collect_lambda_expressions(
             file,
             source,
             body,
@@ -651,21 +521,18 @@ fn visit_compact_constructor<'tree>(
             &code_unit,
             top_level,
             parsed,
-            pending,
         );
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn visit_field_declaration<'tree>(
+fn visit_field_declaration(
     file: &ProjectFile,
     source: &str,
-    node: Node<'tree>,
+    node: Node<'_>,
     package_name: &str,
     parent: &CodeUnit,
     top_level: &CodeUnit,
     parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
-    pending: &mut Vec<PendingClassScope<'tree>>,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -715,7 +582,7 @@ fn visit_field_declaration<'tree>(
         );
 
         if let Some(value) = child.child_by_field_name("value") {
-            collect_body_scopes(
+            collect_lambda_expressions(
                 file,
                 source,
                 value,
@@ -723,7 +590,6 @@ fn visit_field_declaration<'tree>(
                 parent,
                 top_level,
                 parsed,
-                pending,
             );
         }
     }
@@ -858,52 +724,17 @@ fn visit_enum_constant(
     );
 }
 
-/// Walk one executable body and record the scopes written inside it.
-///
-/// Three scope forms can appear in a method, constructor, or initializer: a
-/// lambda, a class declared local to the body, and an anonymous class body.
-/// The lambda gets its unit here. The two class-like forms are handed to the
-/// caller's own extraction stack, which already knows how to index a class
-/// body and everything under it, and this walk does not descend into them
-/// (#2045). Nothing recurses: the walk keeps its own explicit stack and the
-/// class-like forms leave it entirely.
-#[allow(clippy::too_many_arguments)]
-fn collect_body_scopes<'tree>(
+fn collect_lambda_expressions(
     file: &ProjectFile,
     source: &str,
-    node: Node<'tree>,
+    node: Node<'_>,
     package_name: &str,
     parent: &CodeUnit,
     top_level: &CodeUnit,
     parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
-    pending: &mut Vec<PendingClassScope<'tree>>,
 ) {
     let mut stack = vec![(node, parent.clone())];
     while let Some((node, parent)) = stack.pop() {
-        if is_class_like_declaration_kind(node.kind()) {
-            pending.push((
-                JavaClassScope::Declared(node),
-                Some(parent),
-                Some(top_level.clone()),
-            ));
-            continue;
-        }
-
-        // `new Base(arg) { ... }` splits in two: the class body is its own
-        // scope, while the type arguments and the constructor arguments are
-        // written in this scope and keep being walked here.
-        let anonymous_body = java_anonymous_class_body(node);
-        if let Some(body) = anonymous_body {
-            pending.push((
-                JavaClassScope::Anonymous {
-                    creation: node,
-                    body,
-                },
-                Some(parent.clone()),
-                Some(top_level.clone()),
-            ));
-        }
-
         let next_parent = if node.kind() == "lambda_expression" {
             let lambda = lambda_code_unit(file, package_name, &parent, node);
             parsed.add_code_unit(
@@ -918,10 +749,7 @@ fn collect_body_scopes<'tree>(
             parent
         };
         let mut cursor = node.walk();
-        let children = node
-            .named_children(&mut cursor)
-            .filter(|child| Some(*child) != anonymous_body)
-            .collect::<Vec<_>>();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
         stack.extend(
             children
                 .into_iter()
@@ -931,24 +759,44 @@ fn collect_body_scopes<'tree>(
     }
 }
 
-/// The `class_body` an `object_creation_expression` carries when it declares
-/// an anonymous class rather than only calling a constructor.
-fn java_anonymous_class_body<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
-    if node.kind() != "object_creation_expression" {
-        return None;
-    }
-    (0..node.named_child_count())
-        .filter_map(|index| node.named_child(index))
-        .find(|child| child.kind() == "class_body")
-}
-
 fn lambda_code_unit(
     file: &ProjectFile,
     package_name: &str,
     parent: &CodeUnit,
     node: Node<'_>,
 ) -> CodeUnit {
-    let (short_name, fq) = java_anonymous_scope_identity(parent, node);
+    let line = node.start_position().row;
+    let column = node.start_position().column;
+    let short_name = if parent.is_function() {
+        format!("{}$anon${line}:{column}", parent.short_name())
+    } else {
+        format!(
+            "{}.{}$anon${line}:{column}",
+            parent.short_name(),
+            parent.identifier()
+        )
+    };
+    // The synthetic anonymous-lambda marker is a single `$anon$line:column`
+    // segment whose OWN text embeds a literal `$` between "anon" and the
+    // coordinate (`SegmentKind::Nested` renders one more `$` before it,
+    // regardless of the preceding segment's kind, and segment text is
+    // free-form, so the embedded `$` round-trips untouched). A lambda nested
+    // directly in a method (`parent.is_function()`) hangs the marker off the
+    // method's own `fq`; a lambda in a field/class-level initializer repeats
+    // the owning class's own last segment first (mirroring `parent.identifier()`
+    // in `short_name` above) before the marker.
+    let anon = java_segment(&format!("anon${line}:{column}"), SegmentKind::Nested);
+    let fq = if parent.fq().is_empty() {
+        FqName::new()
+    } else if parent.is_function() {
+        parent.fq().clone().with_pushed(anon)
+    } else {
+        let mut fq = parent.fq().clone();
+        if let Some(last) = parent.fq().last() {
+            fq.push(last);
+        }
+        fq.with_pushed(anon)
+    };
     CodeUnit::with_signature_and_fq(
         file.clone(),
         brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
@@ -958,57 +806,6 @@ fn lambda_code_unit(
         true,
         fq,
     )
-}
-
-/// The `$anon$line:column` short name and structured path a scope written at
-/// `node` hangs off `parent`.
-///
-/// The synthetic marker is a single `$anon$line:column` segment whose OWN text
-/// embeds a literal `$` between "anon" and the coordinate
-/// (`SegmentKind::Nested` renders one more `$` before it, regardless of the
-/// preceding segment's kind, and segment text is free-form, so the embedded
-/// `$` round-trips untouched). A lambda and an anonymous class body share this
-/// identity because no source spelling names either one, and no two of them
-/// can start at the same coordinate.
-///
-/// Where the marker hangs depends on what encloses it. A scope written in a
-/// callable body -- a method, a constructor, or another lambda -- and a scope
-/// written in an anonymous class body hang the marker straight off that
-/// owner's own `fq`. A scope written in a *named* class's field or
-/// class-level initializer runs in that class's implicit initializer, whose
-/// name is the class's own name, so the marker hangs off a repeat of the
-/// class's last segment (`F.F$anon$1:47`).
-///
-/// An anonymous owner has no written name to repeat, and repeating its marker
-/// segment was the #2161 regression: the short name joined the repeat with `.`
-/// while the structured name rendered the repeated `Nested` segment with `$`,
-/// so the two disagreed (`...$anon$140:43.anon$140:43$anon$146:51` against
-/// `...$anon$140:43$anon$140:43$anon$146:51`) and the construction-point
-/// boundary check in `CodeUnit::with_signature_and_fq` panicked the workspace
-/// build.
-fn java_anonymous_scope_identity(parent: &CodeUnit, node: Node<'_>) -> (String, FqName) {
-    let line = node.start_position().row;
-    let column = node.start_position().column;
-    let anon = java_segment(&format!("anon${line}:{column}"), SegmentKind::Nested);
-
-    if parent.is_function() || parent.is_synthetic() {
-        let short_name = format!("{}$anon${line}:{column}", parent.short_name());
-        return (short_name, parent.fq().clone().with_pushed(anon));
-    }
-
-    let short_name = format!(
-        "{}.{}$anon${line}:{column}",
-        parent.short_name(),
-        parent.identifier()
-    );
-    let mut fq = parent.fq().clone();
-    fq.push(
-        parent
-            .fq()
-            .last()
-            .expect("a CodeUnit qualified name always has a terminal segment"),
-    );
-    (short_name, fq.with_pushed(anon))
 }
 
 pub fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
@@ -1059,30 +856,12 @@ pub fn is_class_like_declaration_kind(kind: &str) -> bool {
     )
 }
 
-/// The member declarations one class-like body holds, reversed so a stack pops
-/// them in source order.
-///
-/// A Java `enum_body` is not a flat member list. Its constants come first, and
-/// every ordinary member -- field, method, constructor, nested type -- sits
-/// under one `enum_body_declarations` wrapper introduced by the `;` that ends
-/// the constant list. Splicing that wrapper's own children in place is what
-/// makes an enum's members reach the same dispatch a class body's members
-/// reach; without it they are silently dropped (#2045).
 pub fn class_like_body_children_rev<'tree>(body: Node<'tree>) -> Vec<Node<'tree>> {
     let mut children = Vec::new();
     for index in (0..body.named_child_count()).rev() {
         let Some(child) = body.named_child(index) else {
             continue;
         };
-        if child.kind() == "enum_body_declarations" {
-            for inner in (0..child.named_child_count()).rev() {
-                let Some(inner) = child.named_child(inner) else {
-                    continue;
-                };
-                children.push(inner);
-            }
-            continue;
-        }
         children.push(child);
     }
     children
@@ -1625,12 +1404,6 @@ pub fn extract_raw_supertypes(node: Node<'_>, source: &str) -> Vec<String> {
 fn collect_supertype_nodes(node: Node<'_>, source: &str, raw: &mut Vec<String>) {
     walk_named_tree_preorder(node, true, |node| {
         match node.kind() {
-            // A type argument is not a supertype: `extends ArrayList<String>`
-            // makes the class a list, not a string. Recording the argument left
-            // the hierarchy free to link a class to its own element type, and
-            // left an unresolvable type parameter (`extends SetView<E>`) looking
-            // like a supertype outside the workspace (#2161).
-            "type_arguments" => return WalkControl::SkipChildren,
             "type_identifier" | "scoped_type_identifier" => {
                 let text = node_text(node, source).trim();
                 if !text.is_empty() {

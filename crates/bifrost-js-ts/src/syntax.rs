@@ -406,14 +406,7 @@ pub fn direct_property_definitions<'tree>(
             "assignment_expression" | "augmented_assignment_expression" => node
                 .child_by_field_name("left")
                 .and_then(|left| direct_assignment_receiver(left, source, target_member)),
-            // `{ key: value }` and `{ key }` mint the same property off the same
-            // object literal; only the node that carries the key differs.
-            "pair" => node
-                .child_by_field_name("key")
-                .and_then(|key| direct_object_property_receiver(node, key, source, target_member)),
-            "shorthand_property_identifier" => {
-                direct_object_property_receiver(node, node, source, target_member)
-            }
+            "pair" => direct_object_pair_receiver(node, source, target_member),
             _ => None,
         };
         if let Some((receiver, property)) = receiver
@@ -457,20 +450,16 @@ fn direct_assignment_receiver<'tree>(
     static_member_receiver(receiver, source).map(|receiver| (receiver, property))
 }
 
-/// The receiver chain that owns `property` when `property` is the key of
-/// `entry`, an entry of an object literal that is the whole value of a binding.
-/// `entry` is the `pair` for `{ key: value }` and the shorthand identifier
-/// itself for `{ key }`.
-fn direct_object_property_receiver<'tree>(
-    entry: Node<'tree>,
-    property: Node<'tree>,
+fn direct_object_pair_receiver<'tree>(
+    pair: Node<'tree>,
     source: &str,
     target_member: &str,
 ) -> Option<(JsTsStaticMemberReceiver<'tree>, Node<'tree>)> {
+    let property = pair.child_by_field_name("key")?;
     if slice(property, source) != target_member {
         return None;
     }
-    let object = entry.parent().filter(|parent| parent.kind() == "object")?;
+    let object = pair.parent().filter(|parent| parent.kind() == "object")?;
     let mut value = object;
     while let Some(parent) = value.parent()
         && parent.kind() == "parenthesized_expression"
@@ -830,117 +819,13 @@ pub fn is_export_alias_identifier(node: Node<'_>) -> bool {
 }
 
 pub fn is_explicit_object_literal_key(node: Node<'_>) -> bool {
-    node.parent()
-        .is_some_and(|parent| parent.kind() == "pair" && is_object_property_key(node))
-}
-
-/// Whether the identifier writes a property name at its owner: the `key` field
-/// of an object-literal `pair` (`{ total: 1 }`) or of a destructuring
-/// `pair_pattern` (`const { total: sum } = row`).
-///
-/// A computed key (`{ [total]: 1 }`) is an expression that reads a binding, and
-/// it is excluded here because such an identifier's parent is the
-/// `computed_property_name`, not the pair.
-pub fn is_object_property_key(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    matches!(parent.kind(), "pair" | "pair_pattern")
+    parent.kind() == "pair"
         && parent
             .child_by_field_name("key")
             .is_some_and(|key| key.id() == node.id())
-}
-
-/// The value a renamed destructuring key reads its owner from.
-///
-/// `const { texture: frameTexture } = frame` names `texture` at whatever
-/// `frame` is, so the key is a property read on that expression. The array
-/// form takes one ELEMENT of the expression instead, which is a different
-/// question about the same node and so a different variant rather than a flag.
-#[derive(Clone, Copy, Debug)]
-pub enum JsTsDestructuringSource<'tree> {
-    /// `const { key: alias } = <expression>`.
-    Value(Node<'tree>),
-    /// `const [{ key: alias }] = <expression>`: one element of `<expression>`.
-    Element(Node<'tree>),
-}
-
-/// The expression whose owner declares `key`, when `key` is the `key` field of
-/// a destructuring `pair_pattern` and the pattern binds a whole initializer.
-///
-/// `None` covers both "not a renamed destructuring key" and every pattern whose
-/// destructured value this walk cannot name: a nested pattern (the inner key
-/// belongs to the outer key's member type, not to the initializer), a parameter
-/// or `for ... of` binder, and a second array level. Those fail closed rather
-/// than borrow the outer initializer's owner.
-///
-/// A shorthand entry (`const { cache } = state`) has no key node distinct from
-/// its binder, so it never reaches here: `is_object_property_key` is false for
-/// a `shorthand_property_identifier_pattern`, whose parent is the
-/// `object_pattern` itself.
-pub fn destructured_property_key_source(key: Node<'_>) -> Option<JsTsDestructuringSource<'_>> {
-    let pair = key.parent()?;
-    if pair.kind() != "pair_pattern" || !is_object_property_key(key) {
-        return None;
-    }
-    let mut current = pair;
-    let mut takes_element = false;
-    loop {
-        let parent = current.parent()?;
-        let bound = match parent.kind() {
-            "object_pattern" => None,
-            "array_pattern" if !takes_element => {
-                takes_element = true;
-                None
-            }
-            "variable_declarator" => Some((
-                parent.child_by_field_name("name")?,
-                parent.child_by_field_name("value")?,
-            )),
-            "assignment_expression" => Some((
-                parent.child_by_field_name("left")?,
-                parent.child_by_field_name("right")?,
-            )),
-            _ => return None,
-        };
-        if let Some((pattern, value)) = bound {
-            if pattern.id() != current.id() {
-                return None;
-            }
-            return Some(if takes_element {
-                JsTsDestructuringSource::Element(value)
-            } else {
-                JsTsDestructuringSource::Value(value)
-            });
-        }
-        current = parent;
-    }
-}
-
-/// Whether the identifier names a function EXPRESSION: `const run = function
-/// step() {...}`. The name binds only inside the expression's own body, so no
-/// workspace declaration index publishes it.
-pub fn is_named_function_expression_declaration(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        matches!(parent.kind(), "function_expression" | "generator_function")
-            && parent
-                .child_by_field_name("name")
-                .is_some_and(|name| name.id() == node.id())
-    })
-}
-
-/// Whether the identifier is the exception binder a `catch` clause introduces:
-/// the `parameter` field of `catch (error) {...}`.
-///
-/// A destructuring binder (`catch ({ message })`) reaches its terminals through
-/// the pattern kinds [`is_declaration_identifier`] already covers.
-pub fn is_catch_clause_binder(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "catch_clause"
-            && parent
-                .child_by_field_name("parameter")
-                .is_some_and(|parameter| parameter.id() == node.id())
-    })
 }
 
 pub fn is_property_key_in_member(node: Node<'_>) -> bool {

@@ -13,9 +13,9 @@ use crate::providers::JsTsSource;
 use crate::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, JsTsLexicalBindingScope,
     direct_property_definitions, is_commonjs_require_declarator, is_declaration_identifier,
-    is_lexically_nested_type_declaration, is_named_function_expression_declaration,
-    is_object_in_member_expression, is_property_key_in_member, js_program_is_external_module,
-    nested_type_identifier_parts, pattern_binder_identifiers, slice, static_member_receiver,
+    is_lexically_nested_type_declaration, is_object_in_member_expression,
+    is_property_key_in_member, js_program_is_external_module, nested_type_identifier_parts,
+    pattern_binder_identifiers, slice, static_member_receiver,
     typescript_enclosing_enum_initializer,
 };
 use crate::ts_owners::ts_resolve_type_text_to_property_owners;
@@ -1326,17 +1326,6 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 seed_target_destructuring_bindings(name_node, ctx);
             }
             seed_target_owner_destructuring_binding(name_node, value_node, ctx);
-        } else if expression_iterates_target_owner(value_node, ctx) {
-            // `const [{ texture }] = frames` destructures ONE ELEMENT of the
-            // iterable, which is the same question `for (const { texture } of
-            // frames)` asks and the same answer the forward route reads for
-            // the key (#2039).
-            let mut cursor = name_node.walk();
-            for element in name_node.named_children(&mut cursor) {
-                if element.kind() == "object_pattern" {
-                    seed_target_destructuring_bindings(element, ctx);
-                }
-            }
         }
         return;
     }
@@ -1400,38 +1389,37 @@ fn seed_target_destructuring_bindings(pattern: Node<'_>, ctx: &mut ScanCtx<'_>) 
     };
     let mut cursor = pattern.walk();
     for property in pattern.named_children(&mut cursor) {
-        // The key is the field reference on its own. A binder is what the
-        // entry introduces from it, and a renamed entry can bind a further
-        // pattern (`{ texture: { width } }`) instead of one name, which leaves
-        // the key a reference all the same.
         let (key_node, local_node) = match property.kind() {
-            "shorthand_property_identifier_pattern" => (property, Some(property)),
+            "shorthand_property_identifier_pattern" => (property, property),
             "pair_pattern" => {
                 let Some(key_node) = property.child_by_field_name("key") else {
                     continue;
                 };
-                let local_node = property
-                    .child_by_field_name("value")
-                    .and_then(direct_pattern_binding);
+                let Some(value_node) = property.child_by_field_name("value") else {
+                    continue;
+                };
+                let Some(local_node) = direct_pattern_binding(value_node) else {
+                    continue;
+                };
                 (key_node, local_node)
             }
             "object_assignment_pattern" => {
                 let Some(left) = property.child_by_field_name("left") else {
                     continue;
                 };
-                (left, direct_pattern_binding(left))
+                let Some(local_node) = direct_pattern_binding(left) else {
+                    continue;
+                };
+                (left, local_node)
             }
             _ => continue,
         };
-        if slice(key_node, ctx.source) != target_member {
-            continue;
-        }
-        // The introduced local is separately seeded only to carry that field
-        // value through later expressions.
-        record_hit(key_node, ctx);
-        if let Some(local) = local_node.map(|node| slice(node, ctx.source))
-            && !local.is_empty()
-        {
+        let key = slice(key_node, ctx.source);
+        let local = slice(local_node, ctx.source);
+        if key == target_member && !local.is_empty() {
+            // The pattern key is an immediate field reference. The introduced local is
+            // separately seeded only to carry that field value through later expressions.
+            record_hit(key_node, ctx);
             ctx.binding_engine
                 .seed_symbol(local.to_string(), TARGET_VALUE_BINDING);
         }
@@ -1989,6 +1977,15 @@ fn identifier_is_enclosing_enum_member_reference(
             .any(|range| range.end_byte <= assignment.start_byte())
 }
 
+fn is_named_function_expression_declaration(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "function_expression" | "generator_function")
+            && parent
+                .child_by_field_name("name")
+                .is_some_and(|name| name.id() == node.id())
+    })
+}
+
 fn handle_export_specifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(name) = node.child_by_field_name("name") else {
         return;
@@ -2110,17 +2107,6 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 lexical_bindings,
                 definitions,
             ) {
-                record_hit(property, ctx);
-                return;
-            }
-            // The declaring file can also destructure the property's owner:
-            // `const { cache } = state` binds `cache` to `state.cache`, so
-            // `cache.originalCreateDirectory` reads
-            // `state.cache.originalCreateDirectory` even though the receiver
-            // above spells a different root in a different scope. Only the
-            // structured owner seeds reach here, and the same key destructured
-            // from another root never gets one.
-            if expression_carries_target_object(object, ctx) {
                 record_hit(property, ctx);
             }
             return;

@@ -115,7 +115,6 @@ fn weight_ordinary_type_import(binding: &OrdinaryTypeImport) -> usize {
         |acc, guard| {
             let text = match guard {
                 PreprocessorGuard::Defined(name) | PreprocessorGuard::Undefined(name) => name.len(),
-                PreprocessorGuard::Boolean(expression) => expression.heap_size(),
                 PreprocessorGuard::Expression(expression)
                 | PreprocessorGuard::NegatedExpression(expression) => expression.len(),
                 PreprocessorGuard::Constant(_) => 0,

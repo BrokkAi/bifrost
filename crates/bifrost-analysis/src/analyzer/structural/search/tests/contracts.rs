@@ -1,16 +1,5 @@
 use super::*;
 
-#[test]
-fn exact_structural_kind_requires_a_declaration_refinement() {
-    assert!(!relations::refined_declaration_kind(
-        NormalizedKind::Declaration
-    ));
-    assert!(relations::refined_declaration_kind(NormalizedKind::Method));
-    assert!(!relations::refined_declaration_kind(
-        NormalizedKind::FieldAccess
-    ));
-}
-
 fn diagnostic(
     code: CodeQueryDiagnosticCode,
     impact: CodeQueryDiagnosticImpact,
@@ -986,7 +975,10 @@ fn call_declaration_projection_reports_retained_file_scope_target_as_omitted() {
         start_line: 1,
         end_line: 1,
     };
-    let declaration = DeclarationValue::new(caller.clone(), range);
+    let declaration = DeclarationValue {
+        unit: caller.clone(),
+        range,
+    };
     let site = CallSite {
         file,
         range,
@@ -1047,15 +1039,15 @@ fn outbound_uses_projection_reports_unindexed_target_and_suppresses_advisory() {
         TypescriptAnalyzer::from_project(TestProject::new(root.clone(), Language::TypeScript));
     let file = ProjectFile::new(root, "src/app.ts");
     let caller = CodeUnit::new(file.clone(), CodeUnitType::Function, "", "caller");
-    let declaration = DeclarationValue::new(
-        caller.clone(),
-        Range {
+    let declaration = DeclarationValue {
+        unit: caller.clone(),
+        range: Range {
             start_byte: 0,
             end_byte: 1,
             start_line: 1,
             end_line: 1,
         },
-    );
+    };
     let mut cache = ReferenceTraversalCache::default();
     cache.outbound.insert(
         file.clone(),
@@ -1191,7 +1183,10 @@ fn m3_inbound_reference_distinguishes_missing_real_owner_from_file_scope() {
         start_line: 1,
         end_line: 1,
     };
-    let declaration = DeclarationValue::new(target.clone(), range);
+    let declaration = DeclarationValue {
+        unit: target.clone(),
+        range,
+    };
     let reference_hit = |enclosing_unit| ReferenceHit {
         file: file.clone(),
         range,
@@ -1332,15 +1327,15 @@ fn members_projection_reports_unindexed_direct_child_as_semantic_omission() {
     let analyzer =
         TypescriptAnalyzer::from_project(TestProject::new(root.clone(), Language::TypeScript));
     let file = ProjectFile::new(root, "src/app.ts");
-    let declaration = DeclarationValue::new(
-        CodeUnit::new(file.clone(), CodeUnitType::Class, "", "Owner"),
-        Range {
+    let declaration = DeclarationValue {
+        unit: CodeUnit::new(file.clone(), CodeUnitType::Class, "", "Owner"),
+        range: Range {
             start_byte: 0,
             end_byte: 1,
             start_line: 1,
             end_line: 1,
         },
-    );
+    };
     let mut omissions = BTreeMap::new();
 
     let (expansions, exhausted) = direct_member_expansions(

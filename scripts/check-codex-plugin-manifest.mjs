@@ -358,9 +358,7 @@ for (const target of SUPPORTED_TARGETS) {
 }
 
 const marketplacePath = ".agents/plugins/marketplace.json";
-if (fs.existsSync(marketplacePath)) {
-  JSON.parse(fs.readFileSync(marketplacePath, "utf8"));
-}
+JSON.parse(fs.readFileSync(marketplacePath, "utf8"));
 
 const claudeMarketplacePath = ".claude-plugin/marketplace.json";
 JSON.parse(fs.readFileSync(claudeMarketplacePath, "utf8"));

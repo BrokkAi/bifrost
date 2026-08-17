@@ -26,7 +26,7 @@ pub const STORE_FILE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
 /// migrations that produced them were folded into the baseline, so a store
 /// older than this cannot be carried forward and is refused.
 const BASELINE_MIGRATION_VERSION: i64 = 18;
-const CURRENT_MIGRATION_VERSION: i64 = 23;
+const CURRENT_MIGRATION_VERSION: i64 = 22;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -41,13 +41,6 @@ const RUST_IMPORT_CFG_AND_EXTERN_CRATE_SQL: &str =
     include_str!("../migrations/cache/0021-rust-import-cfg-and-extern-crate.sql");
 const DROP_BM25_LEXICAL_COLUMNS_SQL: &str =
     include_str!("../migrations/cache/0022-drop-bm25-lexical-columns.sql");
-const SIGNATURE_METADATA_COLUMNS_SQL: &str =
-    include_str!("../migrations/cache/0023-signature-metadata-columns.sql");
-
-// Migration 0023 spells the signature-metadata byte cap as the literal 8388608,
-// because a checked-in SQL file cannot interpolate a Rust constant. The two must
-// stay equal or the schema stops enforcing the budget the store believes in.
-const _: () = assert!(crate::analyzer::model::MAX_SIGNATURE_METADATA_COLUMN_BYTES == 8_388_608);
 /// One migration and the schema version a store holds once it has run.
 ///
 /// The version is carried explicitly rather than inferred from the entry's
@@ -63,7 +56,7 @@ struct CacheMigration {
     sql: &'static str,
 }
 
-const CACHE_MIGRATIONS: [CacheMigration; 6] = [
+const CACHE_MIGRATIONS: [CacheMigration; 5] = [
     CacheMigration {
         version: 18,
         sql: CURRENT_BASELINE_SQL,
@@ -83,10 +76,6 @@ const CACHE_MIGRATIONS: [CacheMigration; 6] = [
     CacheMigration {
         version: 22,
         sql: DROP_BM25_LEXICAL_COLUMNS_SQL,
-    },
-    CacheMigration {
-        version: 23,
-        sql: SIGNATURE_METADATA_COLUMNS_SQL,
     },
 ];
 
@@ -1399,9 +1388,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
 
 fn migrate_with_sql(conn: &mut Connection, migrations: &[CacheMigration]) -> Result<()> {
     let user_version = cache_migration_version(conn)?;
-    if current_schema_fast_path(migrations, user_version)
-        && current_schema_claim_is_valid(conn, migrations, user_version)?
-    {
+    if current_schema_fast_path(migrations, user_version) {
         return Ok(());
     }
     // Ordinary migrations keep FK enforcement enabled because their DELETEs rely on
@@ -1449,7 +1436,7 @@ fn migrate_with_sql_locked(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
-    let mut user_version = cache_migration_version(&tx)?;
+    let user_version = cache_migration_version(&tx)?;
     if user_version < 0 {
         return Err(format!(
             "cache DB migration user_version must not be negative: {user_version}"
@@ -1474,16 +1461,9 @@ fn migrate_with_sql_locked(
         ));
     }
     if current_schema_fast_path(migrations, user_version) {
-        if current_schema_claim_is_valid(&tx, migrations, user_version)? {
-            tx.commit()
-                .map_err(|err| format!("cache DB migration fast-path commit error: {err}"))?;
-            return Ok(LockedMigrationOutcome::Complete);
-        }
-        if !rebuild_invalid_schema {
-            return Ok(LockedMigrationOutcome::RebuildRequired);
-        }
-        recreate_schema(&tx)?;
-        user_version = 0;
+        tx.commit()
+            .map_err(|err| format!("cache DB migration fast-path commit error: {err}"))?;
+        return Ok(LockedMigrationOutcome::Complete);
     }
 
     let user_version = match prepare_baseline_migration(&tx, user_version, rebuild_invalid_schema)?
@@ -1692,7 +1672,11 @@ fn baseline_schema_is_valid(conn: &Connection) -> Result<bool> {
     Ok(matches!(versions, Ok(versions) if versions == BASELINE_CACHE_STATE_VERSIONS))
 }
 
-fn current_schema_shape_is_valid(conn: &Connection) -> Result<bool> {
+#[cfg(test)]
+fn current_schema_is_valid(conn: &Connection) -> Result<bool> {
+    if !quick_check_is_ok(conn)? {
+        return Ok(false);
+    }
     if schema_object_definitions(conn)? != *CURRENT_SCHEMA_OBJECTS {
         return Ok(false);
     }
@@ -1703,14 +1687,6 @@ fn current_schema_shape_is_valid(conn: &Connection) -> Result<bool> {
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     );
     Ok(matches!(versions, Ok(versions) if versions == BASELINE_CACHE_STATE_VERSIONS))
-}
-
-#[cfg(test)]
-fn current_schema_is_valid(conn: &Connection) -> Result<bool> {
-    if !quick_check_is_ok(conn)? {
-        return Ok(false);
-    }
-    current_schema_shape_is_valid(conn)
 }
 
 /// Nothing is pending, so skip taking the write lock.
@@ -1725,27 +1701,6 @@ fn current_schema_fast_path(migrations: &[CacheMigration], user_version: i64) ->
     migrations
         .last()
         .is_some_and(|migration| migration.version == user_version)
-}
-
-/// Validate the schema interface when this build's own version number claims
-/// that no migration is pending.
-///
-/// `migrate_with_sql` also builds historical and synthetic future schemas in
-/// tests, so their terminal versions retain the generic version-only fast
-/// path. The production current schema gets the stronger check. Comparing
-/// `sqlite_master` and the singleton version row is bounded by the schema size;
-/// do not run `quick_check` here because that would scan a potentially huge
-/// cache on every workspace open.
-fn current_schema_claim_is_valid(
-    conn: &Connection,
-    migrations: &[CacheMigration],
-    user_version: i64,
-) -> Result<bool> {
-    debug_assert!(current_schema_fast_path(migrations, user_version));
-    if user_version != CURRENT_MIGRATION_VERSION {
-        return Ok(true);
-    }
-    current_schema_shape_is_valid(conn)
 }
 
 fn quick_check_is_ok(conn: &Connection) -> Result<bool> {
@@ -3321,12 +3276,9 @@ mod tests {
                 &migrations_through(CURRENT_MIGRATION_VERSION - 1),
             )
             .unwrap();
-            // The table the last migration is about to drop is already gone, so
-            // that migration cannot run and no bridge claims this shape. This
-            // statement must keep tracking whatever the newest migration
-            // rewrites; a poison aimed at an older migration would let the
-            // upgrade succeed and the test would prove nothing.
-            conn.execute_batch("DROP TABLE unit_signature_metadata;")
+            // The column the last migration is about to drop is already gone,
+            // so that migration cannot run and no bridge claims this shape.
+            conn.execute_batch("ALTER TABLE semantic_file_chunks DROP COLUMN fts_tokens;")
                 .unwrap();
         }
         let poisoned_before = std::fs::read(&poisoned).unwrap();

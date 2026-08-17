@@ -9,12 +9,10 @@ import readline from "node:readline";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
-import { toolInventoryFromMarkdown, unavailableSkillTools } from "./skill-tool-contract.mjs";
-
 const execFileAsync = promisify(execFile);
 const codexHandshake = JSON.parse(
   await fs.readFile(
-    new URL("./fixtures/mcp/codex-sandbox-state-handshake.json", import.meta.url),
+    new URL("../tests/fixtures/mcp/codex-sandbox-state-handshake.json", import.meta.url),
     "utf8"
   )
 );
@@ -266,7 +264,6 @@ async function assertCodexSandboxWorkspaceBinding(codexLaunch, workspaceRoot, en
     });
     const tools = toolList.result?.tools;
     assert.ok(Array.isArray(tools), "MCP tools/list did not return a tools array");
-    await assertPortableSkillToolContract(codexLaunch.cwd, tools);
     assert.ok(tools.some((tool) => tool.name === "search_symbols"), "MCP tools/list did not advertise search_symbols");
     assert.ok(tools.some((tool) => tool.name === "get_summaries"), "MCP tools/list did not advertise get_summaries");
     assert.ok(tools.some((tool) => tool.name === "get_symbol_sources"), "MCP tools/list did not advertise get_symbol_sources");
@@ -450,42 +447,6 @@ async function assertNoPluginWorkspaceCache(pluginCwd) {
     fs.readdir(analyzerCacheDir(pluginCwd)),
     { code: "ENOENT" },
     "Packaged MCP launch wrote analyzer storage under the plugin directory"
-  );
-}
-
-async function assertPortableSkillToolContract(pluginRoot, tools) {
-  const advertisedToolNames = new Set(tools.map((tool) => tool.name));
-  const skillsRoot = path.join(pluginRoot, "skills");
-  const skillDirectories = (await fs.readdir(skillsRoot, { withFileTypes: true }))
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .sort();
-  assert.ok(skillDirectories.length > 0, `Packaged plugin has no portable skills under ${skillsRoot}`);
-
-  const skillContracts = [];
-  for (const skillDirectory of skillDirectories) {
-    const skillPath = path.join(skillsRoot, skillDirectory, "SKILL.md");
-    const skill = await fs.readFile(skillPath, "utf8");
-    const skillToolNames = toolInventoryFromMarkdown(skill);
-    skillContracts.push({ skillPath, skillToolNames });
-  }
-
-  const missingInventories = skillContracts
-    .filter(({ skillToolNames }) => skillToolNames.length === 0)
-    .map(({ skillPath }) => skillPath);
-  assert.deepEqual(
-    missingInventories,
-    [],
-    `Portable skills must declare Bifrost MCP tools in a Markdown table with a Tool column: ${JSON.stringify(missingInventories)}`
-  );
-
-  const unavailableReferences = skillContracts.flatMap(({ skillPath, skillToolNames }) =>
-    unavailableSkillTools(skillToolNames, advertisedToolNames).map((toolName) => ({ skillPath, toolName }))
-  );
-  assert.deepEqual(
-    unavailableReferences,
-    [],
-    `Portable skills advertise tools absent from the packaged MCP server: ${JSON.stringify(unavailableReferences)}`
   );
 }
 

@@ -122,7 +122,6 @@ void test("registers distinct RQL, policy, and Rune IR languages", () => {
     { command: "bifrost.openRqlQueryResult", when: "false" },
     { command: "bifrost.runRqlPolicy", when: "resourceLangId == bifrost-rql-policy" },
     { command: "bifrost.openRqlPolicyFinding", when: "false" },
-    { command: "bifrost.openRqlPolicyDisplayStep", when: "false" },
     { command: "bifrost.showRuneIr", when: runeIrSourceContext }
   ]);
   assert.deepEqual(manifest.contributes.menus["editor/context"], [

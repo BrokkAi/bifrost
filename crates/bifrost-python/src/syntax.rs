@@ -148,20 +148,6 @@ pub fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree
     }
 }
 
-/// Whether `node` is the label of a keyword argument: the `x` in `f(x=1)`.
-///
-/// The label names a parameter or member at the CALLEE, selected by the call's
-/// target, not by anything bound where the label is written. That is why the
-/// occurrence-role adapter in `structural.rs` classifies it `LabelOrKey`, whose
-/// occurrence class is `NonReference`, and it is the rule the reference census
-/// reads to decide that the label is not a forward-reference probe (#2054).
-pub fn python_keyword_argument_label(node: Node<'_>) -> bool {
-    node.kind() == "identifier"
-        && node.parent().is_some_and(|parent| {
-            parent.kind() == "keyword_argument" && parent.child_by_field_name("name") == Some(node)
-        })
-}
-
 /// Return a decorator's callable expression, peeling an optional invocation.
 pub fn decorator_callee<'tree>(decorator: Node<'tree>) -> Option<Node<'tree>> {
     if decorator.kind() != "decorator" {

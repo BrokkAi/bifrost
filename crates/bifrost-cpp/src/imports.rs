@@ -109,11 +109,7 @@ impl IncludeTargetIndex {
         }
     }
 
-    fn resolve_unique_fallback(
-        &self,
-        source_file: &ProjectFile,
-        include: &str,
-    ) -> Vec<ProjectFile> {
+    fn resolve_unique_fallback(&self, include: &str) -> Vec<ProjectFile> {
         let include_path = Path::new(include);
         let matches: Vec<_> = self
             .resolve_indexed(include)
@@ -129,18 +125,7 @@ impl IncludeTargetIndex {
             })
             .collect();
         if matches.len() == 1 {
-            return matches;
-        }
-        let source_reachable = matches
-            .into_iter()
-            .filter(|file| {
-                (0..include_path.components().count())
-                    .try_fold(file.rel_path(), |path, _| path.parent())
-                    .is_some_and(|root| source_file.rel_path().starts_with(root))
-            })
-            .collect::<Vec<_>>();
-        if source_reachable.len() == 1 {
-            source_reachable
+            matches
         } else {
             Vec::new()
         }
@@ -212,7 +197,7 @@ pub fn resolve_include_targets_with_index(
     if Path::new(include).is_absolute() {
         return candidates;
     }
-    candidates.extend(include_targets.resolve_unique_fallback(source_file, include));
+    candidates.extend(include_targets.resolve_unique_fallback(include));
     candidates
 }
 
@@ -409,39 +394,6 @@ mod tests {
         assert_eq!(resolved, vec![target]);
 
         let ambiguous = resolve_include_targets_with_index(&source, "credential.h", &index);
-        assert!(ambiguous.is_empty());
-    }
-
-    #[test]
-    fn indexed_include_resolution_prefers_unique_source_reachable_root() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let source = write_file(&root, "src/config/parse.c");
-        let target = write_file(&root, "src/config/parse.h");
-        let nested_decoy = write_file(&root, "src/build/config/parse.h");
-        let unrelated_source = write_file(&root, "app/main.c");
-        let index = IncludeTargetIndex::build([&source, &target, &nested_decoy, &unrelated_source]);
-
-        let resolved = resolve_include_targets_with_index(&source, "config/parse.h", &index);
-        assert_eq!(resolved, vec![target.clone()]);
-
-        let unrelated =
-            resolve_include_targets_with_index(&unrelated_source, "config/parse.h", &index);
-        assert!(unrelated.is_empty());
-
-        let ambiguous_source = write_file(&root, "src/config/deeper/main.c");
-        let second_reachable = write_file(&root, "src/config/config/parse.h");
-        let ambiguous_index = IncludeTargetIndex::build([
-            &ambiguous_source,
-            &target,
-            &nested_decoy,
-            &second_reachable,
-        ]);
-        let ambiguous = resolve_include_targets_with_index(
-            &ambiguous_source,
-            "config/parse.h",
-            &ambiguous_index,
-        );
         assert!(ambiguous.is_empty());
     }
 }

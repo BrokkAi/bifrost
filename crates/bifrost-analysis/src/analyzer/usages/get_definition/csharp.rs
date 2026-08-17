@@ -26,8 +26,7 @@ use brokk_bifrost_core::analyzer::structural::callable::{
 use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
 use brokk_bifrost_csharp::graph_support::CSharpSource;
 use brokk_bifrost_csharp::syntax::{
-    CSharpNamedArgumentLabel, csharp_constant_pattern_type_candidate, csharp_named_argument_label,
-    csharp_nameof_type_candidates, csharp_using_directive_is_static,
+    CSharpNamedArgumentLabel, csharp_named_argument_label, csharp_using_directive_is_static,
     csharp_using_directive_target_node,
 };
 
@@ -863,7 +862,7 @@ fn resolve_csharp_in_session(
                             return outcome;
                         }
                     }
-                    if !csharp_identifier_allows_type_fallback(identifier, source) {
+                    if !csharp_identifier_allows_type_fallback(identifier) {
                         return no_definition(
                             "no_indexed_definition",
                             format!("`{text}` did not resolve to an indexed C# member"),
@@ -2881,16 +2880,6 @@ fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
         // claim for a field declared in the same class).
         return parent.child_by_field_name("name") != Some(node);
     }
-    if parent.kind() == "property_declaration" {
-        // A property owns its declaration name, its declared type, and the
-        // `value` field that holds its initializer. The name is filtered as a
-        // declaration and the type is classified as a type reference before
-        // this helper runs; the initializer is an ordinary value reference and
-        // routinely names an enclosing constant
-        // (`public int CardinalityLimit { get; set; } = DefaultCardinalityLimit;`,
-        // #2061).
-        return parent.child_by_field_name("value") == Some(node);
-    }
     !matches!(
         parent.kind(),
         "class_declaration"
@@ -2901,60 +2890,17 @@ fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
             | "method_declaration"
             | "local_function_statement"
             | "constructor_declaration"
+            | "property_declaration"
             | "using_directive"
     )
 }
 
-/// Whether an unqualified identifier that bound no value may be reinterpreted
-/// as a type name.
-///
-/// Every arm here is a syntactic role that C# lets a *type* fill even though
-/// the grammar parses it as an ordinary expression, so the value-first lookup
-/// running ahead of this check can legitimately come up empty. Roles that admit
-/// only values are absent on purpose: an identifier that reaches this point in
-/// one of them stays unresolved rather than picking up a same-named type
-/// (#2061).
-fn csharp_identifier_allows_type_fallback(node: Node<'_>, source: &str) -> bool {
+fn csharp_identifier_allows_type_fallback(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    if parent.kind() == "member_access_expression"
+    parent.kind() == "member_access_expression"
         && csharp_member_access_receiver(parent).is_some_and(|receiver| same_node(receiver, node))
-    {
-        return true;
-    }
-    // `x is Structure` parses as a constant pattern because the grammar cannot
-    // tell a type pattern from a constant one; the declaration index decides.
-    // `x is not Structure` nests the same constant pattern under
-    // `negated_pattern`, so the operand's parent is the pattern either way.
-    if csharp_constant_pattern_type_candidate(parent)
-        .is_some_and(|candidate| same_node(candidate, node))
-    {
-        return true;
-    }
-    // `nameof(Structure)` names a type through expression syntax.
-    csharp_nameof_invocation_for_operand(node)
-        .and_then(|invocation| csharp_nameof_type_candidates(invocation, source))
-        .is_some_and(|(operand, _)| same_node(operand, node))
-}
-
-/// The `nameof(...)` invocation whose sole operand is `node`, if any.
-///
-/// The grammar wraps the operand in `argument_list > argument`, and an operand
-/// that is itself parenthesized or a member access is handled by
-/// [`csharp_nameof_type_candidates`], which the caller applies to the
-/// invocation this returns.
-fn csharp_nameof_invocation_for_operand(node: Node<'_>) -> Option<Node<'_>> {
-    let argument = node.parent()?;
-    if argument.kind() != "argument" {
-        return None;
-    }
-    let argument_list = argument.parent()?;
-    if argument_list.kind() != "argument_list" {
-        return None;
-    }
-    let invocation = argument_list.parent()?;
-    (invocation.kind() == "invocation_expression").then_some(invocation)
 }
 
 /// The one C# call-shape applicability check (#1478 M3): the candidates the

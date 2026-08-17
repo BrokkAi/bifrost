@@ -352,7 +352,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
                     "file_paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Project-relative paths of files to analyze, or absolute paths inside the active workspace. Pass an empty array to discover candidates across analyzed workspace files, subject to max_input_files; fq_names without file paths are looked up across the workspace."
+                        "description": "Project-relative paths of files to analyze, or absolute paths inside the active workspace."
                     },
                     "fq_names": {
                         "type": "array",

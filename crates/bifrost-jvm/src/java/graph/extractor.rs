@@ -11,9 +11,7 @@ use super::resolver::{
     same_owner_context, seed_class_binding,
 };
 use super::return_type::{FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache};
-use crate::java::graph_support::{
-    JavaSource, java_switch_selector_expression, resolve_java_usage_type_name_in,
-};
+use crate::java::graph_support::{JavaSource, resolve_java_usage_type_name_in};
 use crate::java::structural::expression_name_node;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
@@ -161,7 +159,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         scan_try_with_resources(node, ctx);
         return;
     }
-    let enters_class_scope = is_java_type_body(node.kind());
+    let enters_class_scope = node.kind() == "class_body";
     let enters_scope = enters_class_scope
         || matches!(
             node.kind(),
@@ -205,21 +203,6 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if enters_scope {
         ctx.bindings.exit_scope();
     }
-}
-
-/// Whether a node is the body of a Java type declaration, and so the scope its
-/// members are declared in.
-///
-/// tree-sitter-java gives each declaration form its own body node. Treating
-/// only `class_body` as a member scope left an enum's, an interface's and an
-/// annotation's fields declared in whatever scope happened to be open around
-/// them, which is what hid a bare implicit-this read of an enum-body field:
-/// the field's own declaration counted as a shadowing local (#2156).
-fn is_java_type_body(kind: &str) -> bool {
-    matches!(
-        kind,
-        "class_body" | "enum_body" | "interface_body" | "annotation_type_body"
-    )
 }
 
 fn scan_try_with_resources(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -321,18 +304,19 @@ fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             resolved_type = infer_type_from_value(value, ctx);
         }
 
-        // Record the type this declaration resolved to, whatever it is. Only a
-        // type target skips the resolution entirely, so that a value binding
-        // never answers a type name. Keeping the type even when it is not the
-        // target's own owner is what lets a receiver chain such as
-        // `config.mode` type its intermediate step (#2162); no consumer of a
-        // field target's bindings distinguishes an unresolved receiver from an
-        // incompatible one, so nothing is claimed that was not claimed before.
-        match resolved_type.as_ref() {
-            Some(resolved) => ctx
-                .bindings
-                .seed_symbol(binding_name.to_string(), resolved.fq_name()),
-            None => ctx.bindings.declare_shadow(binding_name.to_string()),
+        if ctx.spec.kind == TargetKind::Type {
+            ctx.bindings.declare_shadow(binding_name.to_string());
+        } else if let Some(resolved) = resolved_type.as_ref()
+            && (ctx.spec.kind == TargetKind::Method
+                || ctx
+                    .spec
+                    .receiver_owner_fq_names
+                    .contains(&resolved.fq_name()))
+        {
+            ctx.bindings
+                .seed_symbol(binding_name.to_string(), resolved.fq_name());
+        } else {
+            ctx.bindings.declare_shadow(binding_name.to_string());
         }
     }
 }
@@ -349,14 +333,20 @@ fn seed_typed_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         ctx.bindings.declare_shadow(binding_name.to_string());
         return;
     }
-    match node
+    let resolved = node
         .child_by_field_name("type")
-        .and_then(|type_node| resolve_type_from_node(type_node, ctx))
+        .and_then(|type_node| resolve_type_from_node(type_node, ctx));
+    if let Some(resolved) = resolved
+        && (ctx.spec.kind == TargetKind::Method
+            || ctx
+                .spec
+                .receiver_owner_fq_names
+                .contains(&resolved.fq_name()))
     {
-        Some(resolved) => ctx
-            .bindings
-            .seed_symbol(binding_name.to_string(), resolved.fq_name()),
-        None => ctx.bindings.declare_shadow(binding_name.to_string()),
+        ctx.bindings
+            .seed_symbol(binding_name.to_string(), resolved.fq_name());
+    } else {
+        ctx.bindings.declare_shadow(binding_name.to_string());
     }
 }
 
@@ -873,33 +863,6 @@ fn maybe_record_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if is_declaration_name(node) {
-        return;
-    }
-    // The `field` of a `field_access` is a qualified name: it binds in the
-    // receiver's type, which the arm above proves. Reading it a second time as
-    // a simple name would let the *enclosing* class answer for it, and claim
-    // `other.count` as a read of the enclosing class's own `count`.
-    if node
-        .parent()
-        .is_some_and(|parent| parent.child_by_field_name("field") == Some(node))
-    {
-        return;
-    }
-    // A case label written as a simple name binds in the switch selector's
-    // type, not in the lexical scope around the switch (JLS 14.11), so the
-    // enclosing-owner test below can never see it: the label's owner is the
-    // selector's enum, which is not the class the switch is written in. Typing
-    // the selector is the same question the forward lookup asks (#2043). A
-    // selector that does not type to the target owner falls through to the
-    // ordinary rule, which is what keeps a constant-variable label on an
-    // `int` or `String` switch resolving exactly as before.
-    if node
-        .parent()
-        .is_some_and(|parent| parent.kind() == "switch_label")
-        && let Some(selector) = java_switch_selector_expression(node)
-        && receiver_matches_target(selector, ctx) == ReceiverTargetMatch::Matched
-    {
-        hits::push_hit(node, ctx);
         return;
     }
     let same_owner = same_owner_context(node, ctx);

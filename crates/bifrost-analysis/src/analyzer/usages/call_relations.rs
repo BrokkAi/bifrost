@@ -14,8 +14,8 @@ use crate::analyzer::usages::get_definition::{
     IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC, PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC,
     PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC, call_reference_ranges_in_tree,
     call_reference_requires_point_lookup, call_site_syntax_for_reference,
-    exact_call_reference_for_call, parse_tree_for_language, range_is_call_keyword_label,
-    resolve_call_target_batch_with_source, resolve_definition_batch_with_source,
+    exact_call_reference_for_call, parse_tree_for_language, resolve_call_target_batch_with_source,
+    resolve_definition_batch_with_source,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
@@ -208,18 +208,6 @@ struct CallSyntaxCache {
 }
 
 impl CallSyntaxCache {
-    fn facts(&mut self, analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Option<&Arc<FileFacts>> {
-        self.files
-            .entry(file.clone())
-            .or_insert_with(|| {
-                analyzer
-                    .structural_search_providers()
-                    .into_iter()
-                    .find_map(|provider| provider.structural_facts(file))
-            })
-            .as_ref()
-    }
-
     fn syntax_for_range(
         &mut self,
         analyzer: &dyn IAnalyzer,
@@ -227,18 +215,13 @@ impl CallSyntaxCache {
         start_byte: usize,
         end_byte: usize,
     ) -> Option<CallSiteSyntax> {
-        call_site_syntax_for_reference(self.facts(analyzer, file)?, start_byte, end_byte)
-    }
-
-    fn range_is_keyword_label(
-        &mut self,
-        analyzer: &dyn IAnalyzer,
-        file: &ProjectFile,
-        start_byte: usize,
-        end_byte: usize,
-    ) -> bool {
-        self.facts(analyzer, file)
-            .is_some_and(|facts| range_is_call_keyword_label(facts, start_byte, end_byte))
+        let facts = self.files.entry(file.clone()).or_insert_with(|| {
+            analyzer
+                .structural_search_providers()
+                .into_iter()
+                .find_map(|provider| provider.structural_facts(file))
+        });
+        call_site_syntax_for_reference(facts.as_ref()?, start_byte, end_byte)
     }
 }
 
@@ -334,10 +317,6 @@ fn append_outgoing_candidate_diagnostics(
 enum IncomingCallOmission {
     CallerUnavailable,
     SyntaxUnavailable,
-    /// The hit is a named argument's label. It references the callee's
-    /// parameter without being a call site, so dropping it costs the call
-    /// relation nothing.
-    KeywordLabel,
 }
 
 fn project_incoming_call_hit(
@@ -349,22 +328,9 @@ fn project_incoming_call_hit(
 ) -> Result<CallSite, IncomingCallOmission> {
     let caller = nearest_call_relation_unit(analyzer, hit.enclosing.clone())
         .ok_or(IncomingCallOmission::CallerUnavailable)?;
-    let Some(syntax) =
-        syntax_cache.syntax_for_range(analyzer, &hit.file, hit.start_offset, hit.end_offset)
-    else {
-        return Err(
-            if syntax_cache.range_is_keyword_label(
-                analyzer,
-                &hit.file,
-                hit.start_offset,
-                hit.end_offset,
-            ) {
-                IncomingCallOmission::KeywordLabel
-            } else {
-                IncomingCallOmission::SyntaxUnavailable
-            },
-        );
-    };
+    let syntax = syntax_cache
+        .syntax_for_range(analyzer, &hit.file, hit.start_offset, hit.end_offset)
+        .ok_or(IncomingCallOmission::SyntaxUnavailable)?;
     Ok(raw_call_site(
         hit.file,
         caller,
@@ -619,13 +585,7 @@ impl CallRelationService {
             work.examined_candidates = work.examined_candidates.saturating_add(1);
             match project_incoming_call_hit(analyzer, &mut syntax_cache, target, hit, proof) {
                 Ok(site) => sites.push(site),
-                Err(IncomingCallOmission::KeywordLabel) => {}
-                Err(
-                    IncomingCallOmission::CallerUnavailable
-                    | IncomingCallOmission::SyntaxUnavailable,
-                ) => {
-                    omitted = omitted.saturating_add(1);
-                }
+                Err(_) => omitted = omitted.saturating_add(1),
             }
         }
         if omitted > 0 {

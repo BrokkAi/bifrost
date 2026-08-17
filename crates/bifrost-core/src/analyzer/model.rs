@@ -408,27 +408,6 @@ pub enum CallableLinkage {
     Internal,
 }
 
-impl CallableLinkage {
-    /// The spelling this variant is stored as in
-    /// `unit_signature_metadata.callable_linkage`. The column's CHECK
-    /// constraint in `crates/bifrost-core/migrations/cache/0023-signature-metadata-columns.sql`
-    /// lists exactly these strings, so a new variant needs a migration.
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::External => "external",
-            Self::Internal => "internal",
-        }
-    }
-
-    pub fn from_label(label: &str) -> Option<Self> {
-        match label {
-            "external" => Some(Self::External),
-            "internal" => Some(Self::Internal),
-            _ => None,
-        }
-    }
-}
-
 /// Linkage carried by C++ global-field metadata.
 ///
 /// C++ `const` and `constexpr` fields are internal unless an exact peer is
@@ -439,29 +418,6 @@ pub enum CppFieldLinkage {
     External,
     Internal,
     InternalUnlessExternalPeer,
-}
-
-impl CppFieldLinkage {
-    /// The spelling this variant is stored as in
-    /// `unit_signature_metadata.cpp_field_linkage`. The column's CHECK
-    /// constraint lists exactly these strings, so a new variant needs a
-    /// migration.
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::External => "external",
-            Self::Internal => "internal",
-            Self::InternalUnlessExternalPeer => "internal_unless_external_peer",
-        }
-    }
-
-    pub fn from_label(label: &str) -> Option<Self> {
-        match label {
-            "external" => Some(Self::External),
-            "internal" => Some(Self::Internal),
-            "internal_unless_external_peer" => Some(Self::InternalUnlessExternalPeer),
-            _ => None,
-        }
-    }
 }
 
 /// Whether one callable declaration proves that runtime dispatch is closed.
@@ -482,14 +438,6 @@ impl DispatchExtensibility {
         match self {
             Self::Open => "open",
             Self::Closed => "closed",
-        }
-    }
-
-    pub fn from_label(label: &str) -> Option<Self> {
-        match label {
-            "open" => Some(Self::Open),
-            "closed" => Some(Self::Closed),
-            _ => None,
         }
     }
 }
@@ -615,14 +563,7 @@ const MAX_STRUCTURED_TYPE_NAME_COMPONENTS: usize = 1_024;
 const MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES: usize = 1 << 20;
 pub(crate) const MAX_STRUCTURED_TYPE_IDENTITY_NODES: usize = 20_000;
 const MAX_STRUCTURED_TYPE_IDENTITY_EDGES: usize = 40_000;
-/// The largest a single stored signature-metadata text or JSON column may be.
-///
-/// Enforced by CHECK constraints in
-/// `crates/bifrost-core/migrations/cache/0023-signature-metadata-columns.sql`,
-/// which spells the value as the literal 8388608 because a checked-in SQL file
-/// cannot interpolate a Rust constant. A const assertion in
-/// `crates/bifrost-core/src/cache_db.rs` keeps the two equal.
-pub const MAX_SIGNATURE_METADATA_COLUMN_BYTES: usize = 8 << 20;
+pub const MAX_SIGNATURE_METADATA_BLOB_BYTES: usize = 8 << 20;
 
 struct BoundedStructuredTypeNameComponentsSeed {
     max_components: usize,
@@ -1851,29 +1792,6 @@ impl SignatureMetadata {
         self.callable_is_constructor = is_constructor;
         self.callable_declared_visibility = Some(visibility);
         self.callable_modifiers_recorded = true;
-        self
-    }
-
-    /// Restore the four callable modifier facts independently, as a store
-    /// rehydrating a persisted row must.
-    ///
-    /// [`Self::with_callable_modifiers`] is the parser-side entry point:
-    /// calling it *is* the statement that an adapter read the modifier nodes,
-    /// so it cannot express a row where nobody looked. The persisted columns
-    /// are independent, and a reader that reconstructed them through the
-    /// parser-side builder would silently promote "unread" to "read" or drop a
-    /// flag that no builder happens to set on its own today.
-    pub fn with_persisted_callable_modifiers(
-        mut self,
-        is_static: bool,
-        is_constructor: bool,
-        visibility: Option<DeclaredVisibility>,
-        modifiers_recorded: bool,
-    ) -> Self {
-        self.callable_is_static = is_static;
-        self.callable_is_constructor = is_constructor;
-        self.callable_declared_visibility = visibility;
-        self.callable_modifiers_recorded = modifiers_recorded;
         self
     }
 

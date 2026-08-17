@@ -6,24 +6,7 @@ pub(crate) use brokk_bifrost_core::analyzer::usages::scan_scope::UsageScanScope;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::GraphUsageOutcome;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
-use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
-
-/// Language-specific state prepared before the generic usage-query budgets run.
-///
-/// The plan owns its language-specific execution, so framework code never names
-/// a language module or downcasts an untyped payload.
-pub(crate) trait PreparedUsageQuery: Send + Sync {
-    fn candidate_files(&self) -> &HashSet<ProjectFile>;
-
-    fn find_graph_usages(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        overloads: &[CodeUnit],
-        scan_scope: &UsageScanScope<'_>,
-        max_usages: usize,
-    ) -> GraphUsageOutcome;
-}
 
 /// Strategy for resolving usages of one or more overloads within a candidate file set.
 pub trait UsageAnalyzer: Send + Sync {
@@ -38,19 +21,6 @@ pub trait UsageAnalyzer: Send + Sync {
 
 /// Graph-backed usage strategy that can distinguish fallback-safe gaps from terminal failures.
 pub(crate) trait GraphUsageAnalyzer: UsageAnalyzer {
-    /// Prepare language-specific candidate and resolver state before generic
-    /// file-count and source-byte admission. Most languages need no preparation.
-    fn prepare_usage_query(
-        &self,
-        _analyzer: &dyn IAnalyzer,
-        _overloads: &[CodeUnit],
-        _candidate_files: &HashSet<ProjectFile>,
-        _authoritative: bool,
-        _cancellation: &CancellationToken,
-    ) -> Option<Box<dyn PreparedUsageQuery>> {
-        None
-    }
-
     fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,

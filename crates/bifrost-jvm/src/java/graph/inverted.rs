@@ -31,7 +31,6 @@ use super::return_type::{
     method_return_type_for_owner_fqn,
 };
 use crate::java::graph_support::{JavaSource, resolve_java_usage_type_name_in};
-use crate::java::hierarchy::java_nearest_declaring_ancestors;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
@@ -316,28 +315,10 @@ fn record_reference(
                 is_same_owner,
                 |ctx| ctx.record_unproven(name, name_node),
                 |ctx| {
-                    // The receiver's nominal type is where the *name* is
-                    // written, not necessarily where the method is declared.
-                    // Formatting `{receiver owner}.{name}` therefore named a
-                    // type that declares nothing whenever the receiver inherits
-                    // the method, and `record` drops a callee that is not a
-                    // node -- so the call left the graph entirely (#2044:
-                    // Guava's `ImmutableSupplier.get` and
-                    // `ImmutableList.internalArray`).
-                    match method_owner_fqn(node, ctx, bindings) {
-                        Some(owner) => match method_callee(&owner, name, ctx) {
-                            MethodCallee::Resolved(callee) => ctx.record(callee, name_node),
-                            // No workspace declaration answers the name: the
-                            // receiver's type is known, but the method comes
-                            // from outside the workspace. Keeping the nominal
-                            // callee is what it always was, and it names no
-                            // node, so it invents nothing.
-                            MethodCallee::Undeclared => {
-                                ctx.record(format!("{owner}.{name}"), name_node)
-                            }
-                            MethodCallee::Ambiguous => ctx.record_unproven(name, name_node),
-                        },
-                        None => ctx.record_unproven(name, name_node),
+                    if let Some(owner) = method_owner_fqn(node, ctx, bindings) {
+                        ctx.record(format!("{owner}.{name}"), name_node);
+                    } else {
+                        ctx.record_unproven(name, name_node);
                     }
                 },
             );
@@ -354,14 +335,8 @@ fn record_reference(
             if member.is_empty() {
                 return;
             }
-            // The same resolution as an invocation. A method reference names no
-            // arguments, so it can only ever bind what the receiver's static
-            // type provides -- exactly the question `method_callee` answers.
-            // Unlike an invocation, a reference whose member no workspace
-            // declaration answers stays unproven rather than nominal: there is
-            // no receiver-typed call to attribute to an outside declaration.
             if let Some(owner) = receiver_type_fqn(receiver, ctx, bindings)
-                && let MethodCallee::Resolved(callee) = method_callee(&owner, member, ctx)
+                && let Some(callee) = method_reference_callee(&owner, member, ctx)
             {
                 ctx.record(callee, member_node);
             } else {
@@ -424,65 +399,32 @@ fn method_reference_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
     Some((receiver, *member))
 }
 
-/// Which declaration a member named on a receiver of a given static type
-/// actually is -- the one seam both the invocation and the method-reference
-/// arms resolve through.
-enum MethodCallee {
-    /// Exactly one declaration answers the member.
-    Resolved(String),
-    /// The receiver's own type declares nothing of that name and more than one
-    /// supertype at the nearest declaring level does, so no owner can be
-    /// chosen without guessing.
-    Ambiguous,
-    /// No declaration in this workspace answers the member. The receiver's
-    /// type resolved; the method it names did not.
-    Undeclared,
-}
-
-/// Java binds a member to the nearest declaration the receiver's static type
-/// provides (JLS 15.12.2): the type's own declaration first, and only then the
-/// one it inherits. The per-symbol inverse scan already applies exactly this
-/// rule -- `receiver_type_matches_target` answers `Incompatible` as soon as the
-/// receiver's own type declares a matching method -- so an override binds the
-/// override, and the declaration it overrides keeps only its
-/// override-declaration link, never the call.
-///
-/// Ancestors are compared by fully qualified name because that is the identity
-/// an edge is keyed by. One declaration compiled into two source trees (Guava
-/// ships `com.google.common.base.Supplier` under both `guava/` and
-/// `android/guava/`) is one callee, not an ambiguity.
-fn method_callee(owner_fq_name: &str, member: &str, ctx: &JavaScan<'_>) -> MethodCallee {
+fn method_reference_callee(
+    owner_fq_name: &str,
+    member: &str,
+    ctx: &JavaScan<'_>,
+) -> Option<String> {
+    let owner = ctx.graph.index.definitions(owner_fq_name).next()?;
+    let provider = ctx.graph.hierarchy?;
     ctx.graph.with_definitions(|index| {
-        let declares = |scope: &str| {
-            index
-                .fqn(&format!("{scope}.{member}"))
-                .iter()
-                .any(CodeUnit::is_function)
-        };
-        if declares(owner_fq_name) {
-            return MethodCallee::Resolved(format!("{owner_fq_name}.{member}"));
+        let mut candidates = index
+            .fqn(&format!("{owner_fq_name}.{member}"))
+            .iter()
+            .filter(|unit| unit.is_function())
+            .cloned()
+            .collect::<Vec<_>>();
+        for ancestor in provider.get_ancestors(&owner) {
+            candidates.extend(
+                index
+                    .fqn(&format!("{}.{}", ancestor.fq_name(), member))
+                    .iter()
+                    .filter(|unit| unit.is_function())
+                    .cloned(),
+            );
         }
-        let (Some(owner), Some(provider)) = (
-            ctx.graph.index.definitions(owner_fq_name).next(),
-            ctx.graph.hierarchy,
-        ) else {
-            return MethodCallee::Undeclared;
-        };
-        let Some(declaring) = java_nearest_declaring_ancestors(
-            ctx.graph.index,
-            provider,
-            &owner,
-            |ancestor: &CodeUnit| declares(&ancestor.fq_name()),
-        ) else {
-            return MethodCallee::Undeclared;
-        };
-        let mut owners: Vec<String> = declaring.iter().map(CodeUnit::fq_name).collect();
-        owners.sort();
-        owners.dedup();
-        match owners.len() {
-            1 => MethodCallee::Resolved(format!("{}.{member}", owners[0])),
-            _ => MethodCallee::Ambiguous,
-        }
+        candidates.sort();
+        candidates.dedup();
+        (candidates.len() == 1).then(|| candidates[0].fq_name())
     })
 }
 

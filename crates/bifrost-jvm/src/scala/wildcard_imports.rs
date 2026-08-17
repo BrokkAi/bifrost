@@ -245,17 +245,18 @@ fn owners_for_candidate(
     owners
 }
 
-/// The fully qualified paths an import path may denote from an active Scala
-/// package context.
-///
-/// `package a.b.c` nests the compilation unit in `a`, `a.b` and `a.b.c`, so a
-/// relative import resolves against every enclosing package and not only the
-/// complete clause: `import syntax.equal._` written under `package a.b` names
-/// `a.syntax.equal` just as readily as `a.b.syntax.equal` (#2082). This is the
-/// same rule [`scala_enclosing_package_root_candidates`] applies to a
-/// qualified root, so both read it from one place.
 pub fn scala_import_path_candidates(path: &str, package_prefixes: &[String]) -> Vec<String> {
-    scala_enclosing_package_root_candidates(package_prefixes, path)
+    let mut candidates = Vec::new();
+    for prefix in package_prefixes.iter().rev() {
+        if prefix.is_empty() || path.starts_with(&format!("{prefix}.")) {
+            continue;
+        }
+        candidates.push(format!("{prefix}.{path}"));
+    }
+    candidates.push(path.to_string());
+    let mut seen = HashSet::default();
+    candidates.retain(|candidate| seen.insert(candidate.clone()));
+    candidates
 }
 
 /// Candidate package namespaces denoted by a qualified root from an active
@@ -275,11 +276,12 @@ pub fn scala_enclosing_package_root_candidates(
     for package in package_prefixes.iter().rev() {
         let mut enclosing = package.as_str();
         loop {
-            // A path that already spells the enclosing package is absolute
-            // here; qualifying it again would only invent `a.b.a.b.C`.
-            if !enclosing.is_empty() && !root.starts_with(&format!("{enclosing}.")) {
-                candidates.push(format!("{enclosing}.{root}"));
-            }
+            let candidate = if enclosing.is_empty() {
+                root.to_string()
+            } else {
+                format!("{enclosing}.{root}")
+            };
+            candidates.push(candidate);
             let Some((parent, _)) = enclosing.rsplit_once('.') else {
                 break;
             };
@@ -339,11 +341,7 @@ fn scala_package_prefixes_at_impl(
             if child.start_byte() > reference_byte {
                 break;
             }
-            // `package object p` declares its members in package `p`, exactly
-            // as a `package p` clause does (#2082). Its body is therefore a
-            // package scope, and a reference inside it sees the package the
-            // package object completes.
-            if !matches!(child.kind(), "package_clause" | "package_object") {
+            if child.kind() != "package_clause" {
                 continue;
             }
             let Some(name) = child.child_by_field_name("name") else {
@@ -360,17 +358,13 @@ fn scala_package_prefixes_at_impl(
                 if body.start_byte() <= reference_byte && reference_byte < body.end_byte() {
                     segments.extend(clause_segments);
                     prefixes.push(segments.join("."));
-                    // A package object's body is the innermost package scope:
-                    // no further package clause can open inside it.
-                    nested_body = (child.kind() == "package_clause").then_some(body);
+                    nested_body = Some(body);
                     break;
                 }
                 continue;
             }
-            if child.kind() == "package_clause" {
-                segments.extend(clause_segments);
-                prefixes.push(segments.join("."));
-            }
+            segments.extend(clause_segments);
+            prefixes.push(segments.join("."));
         }
         let Some(body) = nested_body else {
             break;

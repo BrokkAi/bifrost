@@ -1363,7 +1363,6 @@ fn related_files_by_git(
     let change_ms = 0.0;
     let mut canonicalize_ms = 0.0;
     let mut processed_commits = 0usize;
-    let mut commits_with_tracked_churn = 0usize;
 
     let baseline_commit_count = changes.len() as f64;
     {
@@ -1395,7 +1394,6 @@ fn related_files_by_git(
             if changed_files.is_empty() {
                 continue;
             }
-            commits_with_tracked_churn += 1;
 
             for file in &changed_files {
                 *file_doc_freq.entry(file.clone()).or_insert(0) += 1;
@@ -1435,15 +1433,6 @@ fn related_files_by_git(
     }
     note_git_counters();
 
-    // A single contributing commit carries no co-occurrence information: every
-    // file in it co-occurs with every other file exactly once, so the scores
-    // only restate that one snapshot. A squashed mirror or a fresh repository
-    // looks like this. The walk itself succeeded, so this is `Complete` with no
-    // signal rather than unavailable history.
-    if commits_with_tracked_churn < 2 {
-        return Ok((Vec::new(), HistoryRankingStatus::Complete));
-    }
-
     if joint_mass.is_empty() {
         return Ok((Vec::new(), HistoryRankingStatus::Complete));
     }
@@ -1464,24 +1453,6 @@ fn related_files_by_git(
         let contribution = seed_weight * conditional * idf;
         if contribution.is_finite() && contribution != 0.0 {
             *scores.entry(target).or_insert(0.0) += contribution;
-        }
-    }
-
-    // A uniform score vector longer than `k` cannot be truncated into a
-    // ranking: the `k` survivors are whichever paths the tie-break happens to
-    // sort first, an arbitrary subset rather than evidence. N identical
-    // snapshot commits produce exactly this. A tie set that fits inside `k` is
-    // kept, because then every file that co-changed with the seeds is returned
-    // and the caller sees the whole tie rather than a slice of it.
-    //
-    // The tolerance is relative because per-target accumulation walks the
-    // joint-mass map in hash order and float addition is not associative, so
-    // equal sums can differ in the last bits.
-    if scores.len() > k {
-        let max = scores.values().copied().fold(f64::NEG_INFINITY, f64::max);
-        let min = scores.values().copied().fold(f64::INFINITY, f64::min);
-        if max - min <= 1e-9 * max {
-            return Ok((Vec::new(), HistoryRankingStatus::Complete));
         }
     }
 
@@ -2054,20 +2025,8 @@ impl GitProjectContext {
         Ok(Some(self.parse_git_log_name_status(&output.stdout)))
     }
 
-    /// The first parent of `oid`, but only when that parent object is present
-    /// locally.
-    ///
-    /// A commit header records its parent ids whether or not this clone holds
-    /// those objects. At a shallow-clone boundary the parent is named and
-    /// absent, and `git log <missing>..<newest>` aborts with "fatal: Invalid
-    /// revision range", which fails the whole history walk. Reporting `None`
-    /// sends the caller to its `--root <newest>` form, which walks the
-    /// truncated history this clone does hold. libgit2 does not resolve missing
-    /// objects through a promisor remote, so probing the parent is local work
-    /// and never a network fetch.
     fn first_parent_oid(&self, oid: Oid) -> Option<Oid> {
-        let parent = self.repo.find_commit(oid).ok()?.parent_ids().next()?;
-        self.repo.find_commit(parent).is_ok().then_some(parent)
+        self.repo.find_commit(oid).ok()?.parent_ids().next()
     }
 
     /// Whether this repository resolves missing objects through a promisor
@@ -3857,15 +3816,7 @@ mod tests {
             &[],
             1,
         );
-        // Every commit after the first has to change file contents, not only
-        // re-add the same blobs. A commit whose tree equals its parent's has an
-        // empty diff, so this history would collapse to one contributing commit
-        // and the co-change guard would suppress the ranking this test compares.
-        write_file(root, "Seed.java", "public class Seed { int step = 2; }");
-        write_file(root, "Target.java", "public class Target { int step = 2; }");
         commit_paths_at(&repo, "seed+target", &["Seed.java", "Target.java"], &[], 2);
-        write_file(root, "Seed.java", "public class Seed { int step = 3; }");
-        write_file(root, "Helper.java", "public class Helper { int step = 3; }");
         commit_paths_at(&repo, "seed+helper", &["Seed.java", "Helper.java"], &[], 3);
 
         let analyzer = java_analyzer(root);

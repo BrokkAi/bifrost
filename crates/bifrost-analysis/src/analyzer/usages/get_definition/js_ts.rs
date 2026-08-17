@@ -10,8 +10,7 @@ use brokk_bifrost_js_ts::imports::{
 use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::syntax::parse_js_ts_tree;
 use brokk_bifrost_js_ts::syntax::{
-    JsTsDestructuringSource, JsTsImportBinder, JsTsLexicalBindingIndex,
-    MAX_STATIC_IMPORT_BINDINGS_PER_NAME, destructured_property_key_source,
+    JsTsImportBinder, JsTsLexicalBindingIndex, MAX_STATIC_IMPORT_BINDINGS_PER_NAME,
     direct_property_definitions, is_declaration_identifier, is_explicit_object_literal_key,
     is_export_alias_identifier, js_program_is_external_module, pattern_binder_identifiers, slice,
     typescript_enclosing_enum_initializer,
@@ -219,28 +218,6 @@ pub(super) fn resolve_js_ts(
             DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND,
             "JS/TS export aliases declare outward bindings and do not reference indexed definitions",
         );
-    }
-    // A renamed destructuring key is a property read on the destructured value,
-    // so it is answered before the declaration terminal below claims the whole
-    // `pair_pattern` (#2039).
-    if let Some(candidates) = focused.and_then(|node| {
-        jsts_destructured_property_key_candidates(
-            analyzer,
-            host,
-            support,
-            file,
-            language,
-            source,
-            tree,
-            imports,
-            aliases,
-            &lexical_bindings,
-            &batch,
-            node,
-        )
-    }) && !candidates.is_empty()
-    {
-        return js_ts_candidates_outcome(analyzer, candidates);
     }
     if focused
         .is_some_and(|node| is_declaration_identifier(node) || is_explicit_object_literal_key(node))
@@ -680,25 +657,6 @@ pub(super) fn resolve_js_ts(
         return js_ts_candidates_outcome(analyzer, same_file);
     }
     if !binding_ranges.is_empty() {
-        // The binding index PROVED this name bound, so what is left is which
-        // binder it named. A binder in a scope narrower than the program is a
-        // local that no analyzer publishes as a CodeUnit -- a `catch` clause's
-        // exception binder is the shape the earlier `local_binding` guard does
-        // not model, because `jsts_scope_contains_binding_before` recognizes
-        // only parameter and declarator binders -- so the answer is the
-        // adjudicated local, not a gap (#2154). A program-scope binder that no
-        // indexed declaration covers in the requested namespace is a real
-        // index gap and keeps the generic kind.
-        if !lexical_bindings.is_program_binding_at(
-            reference,
-            site.focus_start_byte,
-            tree.root_node(),
-        ) {
-            return no_definition(
-                LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
-                format!("`{reference}` binds to a local JS/TS binder, which is not indexed"),
-            );
-        }
         return no_definition(
             "no_indexed_definition",
             format!(
@@ -713,9 +671,10 @@ pub(super) fn resolve_js_ts(
     // `src/Angular.js` declares without importing it -- while a module's
     // top-level binding is file-private. So both sides must be scripts, which
     // is the same `js_program_is_external_module` question the dotted route
-    // asks of its receiver. A name the binding index proves bound never
-    // reaches here: the `binding_ranges` branch above answers every one of
-    // them, whether the binder is local or at the program scope.
+    // asks of its receiver. A lexically visible binding never reaches here:
+    // `resolve_lexical_binding` answers a local before this route runs, and the
+    // `local_binding` guard above rejects a bare name bound in any narrower
+    // scope than the program.
     if !js_program_is_external_module(tree.root_node(), source) {
         let script_global =
             jsts_script_global_bare_candidates(analyzer, host, support, reference, value_position);
@@ -1316,20 +1275,12 @@ fn jsts_exact_local_dotted_candidates(
     let candidates_with_definitions: Vec<_> = candidates
         .into_iter()
         .filter_map(|candidate| {
-            // Only a definition on this reference's own receiver root says
-            // anything about this reference. A same-named property minted on
-            // another root -- `state.cache = { key }` against a read of
-            // `cache.key` -- leaves this chain unmodelled, so the strategy has
-            // to decline rather than fail the reference closed.
-            let definitions: Vec<_> = direct_property_definitions(
+            let definitions = direct_property_definitions(
                 ctx.root,
                 ctx.source,
                 &ctx.analyzer.ranges(&candidate),
                 target_member,
-            )
-            .into_iter()
-            .filter(|definition| slice(definition.receiver.root, ctx.source) == ctx.receiver)
-            .collect();
+            );
             (!definitions.is_empty()).then_some((candidate, definitions))
         })
         .collect();
@@ -1345,7 +1296,8 @@ fn jsts_exact_local_dotted_candidates(
             definitions
                 .into_iter()
                 .any(|definition| {
-                    definition.receiver.members.len() == reference_receiver.members.len()
+                    slice(definition.receiver.root, ctx.source) == ctx.receiver
+                        && definition.receiver.members.len() == reference_receiver.members.len()
                         && definition
                             .receiver
                             .members
@@ -2007,266 +1959,6 @@ fn jsts_receiver_provider_member_candidates(
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     crate::analyzer::common::node_source_text(node, source)
-}
-
-/// Resolve a renamed destructuring key as the property read it is (#2039).
-///
-/// `const { texture: frameTexture } = frame` declares `frameTexture` at the
-/// pair's VALUE child and names `texture` at whatever `frame` is, so the key
-/// must resolve exactly as the equivalent `frame.texture` member expression
-/// does. Every strategy below is one the dotted member route already runs, in
-/// the same order and against the same owner machinery; only the receiver
-/// differs, because a destructuring pattern spells it as the initializer
-/// instead of as the access object.
-///
-/// `None` means the site is not a renamed destructuring key. `Some([])` is a
-/// key whose owner this file cannot prove -- an untyped parameter, an external
-/// package result, a nested or parameter pattern -- which the caller then
-/// reports as the declaration terminal it otherwise is.
-#[allow(clippy::too_many_arguments)]
-fn jsts_destructured_property_key_candidates(
-    analyzer: &dyn IAnalyzer,
-    host: &dyn JsTsSource,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    language: Language,
-    source: &str,
-    tree: &Tree,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    lexical_bindings: &JsTsLexicalBindingIndex,
-    batch: &JsTsDefinitionContext,
-    key: Node<'_>,
-) -> Option<Vec<CodeUnit>> {
-    let destructured = destructured_property_key_source(key)?;
-    let member = node_text(key, source);
-    debug_assert!(
-        !member.is_empty(),
-        "a destructuring key node always spells a property name: {key:?}"
-    );
-    let provider = JsTsReceiverFactProvider::new_with_batch_data(
-        host,
-        support,
-        language,
-        file,
-        source,
-        tree.root_node(),
-        batch.imports.clone(),
-        Arc::clone(&batch.aliases),
-        Arc::clone(&batch.syntax_index),
-    );
-    let budget = ReceiverAnalysisBudget::default();
-
-    // The receiver-fact provider is the machinery a member-expression read uses
-    // for its own object: `this`, a construction, an object literal, a lexical
-    // binding and its type, and a summarized call.
-    let value = match destructured {
-        JsTsDestructuringSource::Element(iterable) => {
-            return Some(
-                provider.resolve_iterable_element_member_targets(iterable, member, budget),
-            );
-        }
-        JsTsDestructuringSource::Value(value) => value,
-    };
-    let mut candidates =
-        match provider.resolve_member_targets(value, member, key.start_byte(), budget) {
-            ReceiverAnalysisOutcome::Precise(targets) => targets,
-            ReceiverAnalysisOutcome::Ambiguous(_)
-            | ReceiverAnalysisOutcome::Unknown
-            | ReceiverAnalysisOutcome::Unsupported { .. }
-            | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
-        };
-
-    // `await` and parentheses wrap the initializer without changing what it
-    // produces. An `as` or `satisfies` cast does change it, so it stays for the
-    // owner strategies below, which read the asserted type.
-    let mut initializer = value;
-    while matches!(
-        initializer.kind(),
-        "await_expression" | "parenthesized_expression"
-    ) {
-        let Some(inner) = initializer.named_child(0) else {
-            break;
-        };
-        initializer = inner;
-    }
-
-    if candidates.is_empty() {
-        let owners = jsts_local_receiver_value_owner_candidates(
-            analyzer,
-            host,
-            support,
-            file,
-            language,
-            source,
-            tree.root_node(),
-            imports,
-            aliases,
-            initializer,
-            key.start_byte(),
-            0,
-        );
-        candidates =
-            jsts_destructured_member_candidates(analyzer, host, support, language, owners, member);
-    }
-    if candidates.is_empty() && language == Language::TypeScript {
-        candidates = ts_call_type_argument_member_candidates(
-            analyzer,
-            host,
-            support,
-            file,
-            source,
-            imports,
-            aliases,
-            initializer,
-            member,
-        );
-    }
-    if candidates.is_empty() && matches!(initializer.kind(), "identifier") {
-        let receiver = node_text(initializer, source);
-        let receiver_candidates = if imports.binding(receiver).is_some() {
-            resolve_js_ts_direct_import_candidates(
-                host,
-                support,
-                language,
-                file,
-                imports,
-                receiver,
-                Some(aliases),
-                true,
-            )
-            .unwrap_or_default()
-        } else {
-            // A same-file receiver must be the binding this reference actually
-            // sees: a module-level object and a same-named parameter are
-            // different owners, and only the lexical index separates them.
-            let reference = format!("{receiver}.{member}");
-            jsts_lexically_bound_receiver_candidates(
-                JstsDottedLookup {
-                    analyzer,
-                    host,
-                    support,
-                    file,
-                    root: tree.root_node(),
-                    source,
-                    reference: &reference,
-                    receiver,
-                    value_position: true,
-                    before_byte: key.start_byte(),
-                },
-                lexical_bindings,
-                &support.file_identifier(file, receiver),
-            )
-        };
-        candidates = jsts_destructured_member_candidates(
-            analyzer,
-            host,
-            support,
-            language,
-            receiver_candidates,
-            member,
-        );
-    }
-    sort_units(&mut candidates);
-    candidates.dedup();
-    Some(candidates)
-}
-
-fn jsts_destructured_member_candidates(
-    analyzer: &dyn IAnalyzer,
-    host: &dyn JsTsSource,
-    support: &dyn BoundedDefinitionLookup,
-    language: Language,
-    owners: Vec<CodeUnit>,
-    member: &str,
-) -> Vec<CodeUnit> {
-    if language == Language::TypeScript {
-        let mut finds = JsTsMemberFinds::default();
-        let candidates =
-            ts_member_candidates(analyzer, host, support, owners, member, true, &mut finds);
-        if !candidates.is_empty() {
-            finds.stage();
-        }
-        candidates
-    } else {
-        jsts_member_candidates(host, support, owners, member, true)
-    }
-}
-
-/// The owners an explicit type argument names for a call's result.
-///
-/// `importActual<typeof UseBaseQueryModule>('../useBaseQuery')` types its own
-/// result at the call site: the author wrote the module the result carries,
-/// which is why this row resolves while the untyped `zxcvbn(password)` next to
-/// it stays closed. Exactly one type argument is required, so a multi-argument
-/// generic such as `new Map<string, User>()` never claims one of its arguments
-/// as the result type.
-#[allow(clippy::too_many_arguments)]
-fn ts_call_type_argument_member_candidates(
-    analyzer: &dyn IAnalyzer,
-    host: &dyn JsTsSource,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
-    call: Node<'_>,
-    member: &str,
-) -> Vec<CodeUnit> {
-    if call.kind() != "call_expression" {
-        return Vec::new();
-    }
-    let Some(arguments) = call.child_by_field_name("type_arguments") else {
-        return Vec::new();
-    };
-    if arguments.named_child_count() != 1 {
-        return Vec::new();
-    }
-    let Some(argument) = arguments.named_child(0) else {
-        return Vec::new();
-    };
-    // `typeof M` where `M` is a module namespace binding names that module's
-    // export surface, which the index publishes per module rather than under a
-    // type name, so it resolves through the module route the dotted `M.member`
-    // read uses.
-    if argument.kind() == "type_query"
-        && let Some(namespace) = argument.named_child(0)
-        && matches!(namespace.kind(), "identifier" | "nested_identifier")
-        && let Some(binding) = imports.binding(node_text(namespace, source))
-        && matches!(
-            binding.kind,
-            ImportKind::Namespace | ImportKind::CommonJsRequire
-        )
-    {
-        return resolve_js_ts_module_binding_candidates(
-            host,
-            support,
-            Language::TypeScript,
-            file,
-            &binding.module_specifier,
-            member,
-            Some(aliases),
-            true,
-        );
-    }
-    let owners = ts_resolve_type_text_to_property_owners(
-        host,
-        support,
-        file,
-        source,
-        imports,
-        aliases,
-        ts_type_annotation_text(argument, source).as_str(),
-        0,
-    );
-    jsts_destructured_member_candidates(
-        analyzer,
-        host,
-        support,
-        Language::TypeScript,
-        owners,
-        member,
-    )
 }
 
 fn jsts_file_scoped_member_candidates(

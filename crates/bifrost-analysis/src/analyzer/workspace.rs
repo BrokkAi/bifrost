@@ -2,7 +2,7 @@ use crate::analyzer::cpp::external::{
     CppDependencyPackAdapter, resolve_cpp_semantic_pack_dependencies,
 };
 use crate::analyzer::languages::language_support;
-use crate::analyzer::multi_analyzer::{WorkspaceBuildContext, build_language_delegate};
+use crate::analyzer::multi_analyzer::build_language_delegate;
 use crate::analyzer::semantic_model::{
     DependencyDiscoveryEvidence, DependencyDiscoveryOutcome, DependencyPackAdapter,
     DependencyPackLimits, DependencyPackPreparationOutcome, SemanticModelActivationPersistence,
@@ -26,32 +26,11 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct EmptyAnalyzer {
     project: Arc<dyn Project>,
-    build_context: Option<Arc<WorkspaceBuildContext>>,
 }
 
 impl EmptyAnalyzer {
     pub fn new(project: Arc<dyn Project>) -> Self {
-        Self {
-            project,
-            build_context: None,
-        }
-    }
-
-    fn new_for_workspace(build_context: Arc<WorkspaceBuildContext>) -> Self {
-        Self {
-            project: Arc::clone(build_context.project()),
-            build_context: Some(build_context),
-        }
-    }
-
-    fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        Self {
-            project: Arc::clone(&project),
-            build_context: self
-                .build_context
-                .as_ref()
-                .map(|context| Arc::new(context.clone_with_project(project))),
-        }
+        Self { project }
     }
 }
 
@@ -374,15 +353,6 @@ impl PythonSemanticModelActivationOutcome {
 }
 
 impl WorkspaceAnalyzer {
-    fn from_updated_multi(analyzer: MultiAnalyzer) -> Self {
-        if analyzer.delegates().is_empty()
-            && let Some(build_context) = analyzer.workspace_build_context()
-        {
-            return Self::Empty(EmptyAnalyzer::new_for_workspace(build_context));
-        }
-        Self::Multi(Box::new(analyzer))
-    }
-
     /// Discover, prepare, and publish exact local dependency packs as one
     /// analyzer-generation transaction. Diagnostic requests only read the
     /// published result and never call this host-owned method.
@@ -629,7 +599,7 @@ impl WorkspaceAnalyzer {
 
     pub fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         match self {
-            Self::Empty(analyzer) => Self::Empty(analyzer.clone_with_project(project)),
+            Self::Empty(_) => Self::Empty(EmptyAnalyzer::new(project)),
             Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.clone_with_project(project))),
         }
     }
@@ -773,20 +743,12 @@ impl WorkspaceAnalyzer {
             delegates.insert(language, delegate?);
         }
 
-        let build_context = Arc::new(WorkspaceBuildContext::new(
-            Arc::clone(&project),
-            config,
-            store_context,
-            requested_languages.cloned(),
-            revalidate_filesystem_paths,
-        ));
-
         Ok(if delegates.is_empty() {
-            Self::Empty(EmptyAnalyzer::new_for_workspace(build_context))
+            Self::Empty(EmptyAnalyzer::new(project))
         } else {
-            Self::Multi(Box::new(MultiAnalyzer::new_for_workspace(
+            Self::Multi(Box::new(MultiAnalyzer::new_with_derived_layer_budget(
                 delegates,
-                build_context,
+                config.memo_cache_budget_bytes() / 8,
             )))
         })
     }
@@ -985,62 +947,16 @@ impl WorkspaceAnalyzer {
             profiling::note(format!("changed_files={}", changed_files.len()));
         }
         match self {
-            Self::Empty(analyzer) => {
-                let Some(build_context) = analyzer.build_context.as_ref() else {
-                    return Self::Empty(analyzer.clone());
-                };
-                let languages = build_context.changed_languages(changed_files);
-                if languages.is_empty() {
-                    return Self::Empty(analyzer.clone());
-                }
-                let delegates = languages
-                    .into_iter()
-                    .map(|language| {
-                        let delegate = build_context.build_delegate(language).unwrap_or_else(|error| {
-                            panic!(
-                                "failed to initialize {language:?} analyzer during update: {error}"
-                            )
-                        });
-                        (language, delegate)
-                    })
-                    .collect();
-                Self::Multi(Box::new(MultiAnalyzer::new_for_workspace(
-                    delegates,
-                    build_context.clone(),
-                )))
-            }
-            Self::Multi(analyzer) => Self::from_updated_multi(analyzer.update(changed_files)),
+            Self::Empty(analyzer) => Self::Empty(analyzer.clone()),
+            Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.update(changed_files))),
         }
     }
 
     pub fn update_all(&self) -> Self {
         let _scope = profiling::scope("WorkspaceAnalyzer::update_all");
         match self {
-            Self::Empty(analyzer) => {
-                let Some(build_context) = analyzer.build_context.as_ref() else {
-                    return Self::Empty(analyzer.clone());
-                };
-                let languages = build_context.project_languages();
-                if languages.is_empty() {
-                    return Self::Empty(analyzer.clone());
-                }
-                let delegates = languages
-                    .into_iter()
-                    .map(|language| {
-                        let delegate = build_context.build_delegate(language).unwrap_or_else(|error| {
-                            panic!(
-                                "failed to initialize {language:?} analyzer during full update: {error}"
-                            )
-                        });
-                        (language, delegate)
-                    })
-                    .collect();
-                Self::Multi(Box::new(MultiAnalyzer::new_for_workspace(
-                    delegates,
-                    build_context.clone(),
-                )))
-            }
-            Self::Multi(analyzer) => Self::from_updated_multi(analyzer.update_all()),
+            Self::Empty(analyzer) => Self::Empty(analyzer.clone()),
+            Self::Multi(analyzer) => Self::Multi(Box::new(analyzer.update_all())),
         }
     }
 }

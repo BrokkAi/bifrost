@@ -22,7 +22,7 @@ use brokk_bifrost_python::bindings::{
     python_direct_scope_bindings_bounded,
 };
 
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v4";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v3";
 
 impl_program_semantics_provider!(PythonAnalyzer, PythonSemanticLowerer);
 
@@ -2647,26 +2647,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         )?;
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
 
-        // A resolver lookup names declarations, but a parameter,
-        // comprehension target, or assignment supplies the callable value at
-        // runtime. Keep that competing target explicit so the shared static
-        // resolver discharge cannot incorrectly close the call (#1993).
-        let ambiguous_target = function.kind() == "identifier"
-            && node_text(self.prepared.source(), function).is_some_and(|name| {
-                self.bindings
-                    .has_runtime_callable_binding_at(name, function)
-            });
-
         self.add_gap(
             builder,
             invoke,
             SemanticGapSubject::CallSite(call_site),
             SemanticCapability::DynamicDispatch,
-            if ambiguous_target {
-                SemanticGapKind::Ambiguous
-            } else {
-                SemanticGapKind::Unknown
-            },
+            SemanticGapKind::Unknown,
             if receiver.is_some() {
                 "attribute dispatch may use descriptors, dynamic attribute lookup, or runtime mutation; complete target coverage requires value and type refinement"
             } else {

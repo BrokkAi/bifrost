@@ -187,11 +187,7 @@ fn descriptors_for_toolset(
 fn hidden_tool_names_for_toolset(name: &str) -> &'static [&'static str] {
     match name {
         #[cfg(feature = "nlp")]
-        "nlp" => &[
-            "semantic_search_status",
-            "get_symbol_sources",
-            "get_summaries",
-        ],
+        "nlp" => &["semantic_search_status"],
         _ => &[],
     }
 }
@@ -311,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn nlp_accepts_internal_support_tools_without_advertising_them() {
+    fn nlp_accepts_status_without_advertising_it() {
         force_semantic_for_tests();
         if !cfg!(feature = "nlp") {
             assert!(resolve_server_spec("nlp").is_err());
@@ -324,8 +320,6 @@ mod tests {
         let accepted = accepted_tool_names("nlp");
         assert!(accepted.contains(&"semantic_search".to_string()));
         assert!(accepted.contains(&"semantic_search_status".to_string()));
-        assert!(accepted.contains(&"get_symbol_sources".to_string()));
-        assert!(accepted.contains(&"get_summaries".to_string()));
     }
 
     #[test]

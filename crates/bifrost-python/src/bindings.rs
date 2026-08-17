@@ -52,7 +52,6 @@ pub struct PythonLexicalScopeInventory<'tree> {
     parameters: HashSet<Box<str>>,
     locals: Vec<PythonLocalBinding<'tree>>,
     local_names: HashMap<Box<str>, PythonLocalBindingKind>,
-    binding_writes: HashSet<Box<str>>,
     globals: HashSet<Box<str>>,
     nonlocals: HashSet<Box<str>>,
     comprehensions: Vec<PythonComprehensionBinding>,
@@ -81,7 +80,6 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
             parameters: parameter_names.into_iter().map(Box::<str>::from).collect(),
             locals: Vec::new(),
             local_names: HashMap::default(),
-            binding_writes: HashSet::default(),
             globals: HashSet::default(),
             nonlocals: HashSet::default(),
             comprehensions: Vec::new(),
@@ -149,7 +147,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                             source,
                             &mut scope_step,
                             |name, declaration| {
-                                inventory.record_binding_write(name, declaration);
+                                inventory.record_local(name, declaration);
                             },
                         )?;
                     }
@@ -170,7 +168,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                             source,
                             &mut scope_step,
                             |name, declaration| {
-                                inventory.record_binding_write(name, declaration);
+                                inventory.record_local(name, declaration);
                             },
                         )?;
                     }
@@ -182,7 +180,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                             source,
                             &mut scope_step,
                             |name, declaration| {
-                                inventory.record_binding_write(name, declaration);
+                                inventory.record_local(name, declaration);
                             },
                         )?;
                     }
@@ -198,7 +196,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                             source,
                             &mut scope_step,
                             |name, declaration| {
-                                inventory.record_binding_write(name, declaration);
+                                inventory.record_local(name, declaration);
                             },
                         )?;
                     }
@@ -211,7 +209,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                             source,
                             &mut scope_step,
                             |name, declaration| {
-                                inventory.record_binding_write(name, declaration);
+                                inventory.record_local(name, declaration);
                             },
                         )?;
                         push_named_children_except(
@@ -234,7 +232,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                             source,
                             &mut scope_step,
                             |name, declaration| {
-                                inventory.record_binding_write(name, declaration);
+                                inventory.record_local(name, declaration);
                             },
                         )?;
                     }
@@ -248,7 +246,7 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                                 source,
                                 &mut scope_step,
                                 |name, declaration| {
-                                    inventory.record_binding_write(name, declaration);
+                                    inventory.record_local(name, declaration);
                                 },
                             )?;
                         }
@@ -366,23 +364,6 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
             && self.local_names.get(name) == Some(&PythonLocalBindingKind::FunctionOnly)
     }
 
-    /// Whether the active callable obtains `name` from a runtime binding
-    /// rather than an untouched function or import declaration.
-    pub fn has_runtime_callable_binding_at(&self, name: &str, reference: Node<'_>) -> bool {
-        let reference_byte = reference.start_byte();
-        self.parameters.contains(name)
-            || self.binding_writes.contains(name)
-            || self.comprehensions.iter().any(|binding| {
-                binding.name.as_ref() == name
-                    && binding.start_byte <= reference_byte
-                    && reference_byte < binding.end_byte
-                    && !binding
-                        .enclosing_iterable_ranges
-                        .iter()
-                        .any(|(start, end)| *start <= reference_byte && reference_byte < *end)
-            })
-    }
-
     pub fn local_function_declaration(
         &self,
         name: &str,
@@ -431,13 +412,6 @@ impl<'tree> PythonLexicalScopeInventory<'tree> {
                 entry.insert(PythonLocalBindingKind::Other);
             }
         }
-    }
-
-    fn record_binding_write(&mut self, name: &str, declaration: Node<'tree>) {
-        if !name.is_empty() {
-            self.binding_writes.insert(name.into());
-        }
-        self.record_local(name, declaration);
     }
 }
 

@@ -29,9 +29,9 @@ concurrency:
 
 jobs:
   smoke:
-    name: policy action (${{ matrix.os }})
+    name: release install (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -40,19 +40,6 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          toolchain: 1.96.0
-
-      - name: Cache Bifrost build
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: policy-scan-smoke
-
-      - name: Build the policy runner
-        run: cargo build --locked --bin bifrost
 
       - name: Write the fixtures
         shell: bash
@@ -92,13 +79,13 @@ jobs:
               return total
           EOF
 
-      # Leg A: a clean workspace must select the local binary, exit 0, and
+      # Leg A: a clean workspace must install the release binary, exit 0, and
       # write a SARIF report.
       - name: Scan the clean fixture
         id: clean
         uses: ./.github/actions/policy-scan
         with:
-          version: local
+          version: v0.9.1
           working-directory: smoke-fixture/clean
           sarif-file: clean.sarif
           upload: 'false'
@@ -112,7 +99,7 @@ jobs:
           CODE: ${{ steps.clean.outputs.exit-code }}
         run: |
           set -euo pipefail
-          # Regression guard for the local-binary path: bifrost-bin must be
+          # Regression guard for the release-install path: bifrost-bin must be
           # the executable, not the extracted stage directory.
           test -f "${BIFROST_BIN}" || { echo "::error::bifrost-bin is not a regular file: ${BIFROST_BIN}"; exit 1; }
           test -x "${BIFROST_BIN}" || { echo "::error::bifrost-bin is not executable: ${BIFROST_BIN}"; exit 1; }
@@ -129,7 +116,7 @@ jobs:
         continue-on-error: true
         uses: ./.github/actions/policy-scan
         with:
-          version: local
+          version: v0.9.1
           working-directory: smoke-fixture/finding
           sarif-file: finding.sarif
           upload: 'false'

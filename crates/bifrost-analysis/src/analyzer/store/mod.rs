@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
+use bincode::Options;
 use git2::Oid;
 use growable_bloom_filter::GrowableBloom;
 use rusqlite::{
@@ -38,16 +39,15 @@ use brokk_bifrost_core::analyzer::rust_facts::{
 
 use crate::CancellationToken;
 use crate::analyzer::fq_name::{FqName, segment_interner};
-use crate::analyzer::structural::DeclaredVisibility;
+use crate::analyzer::model::MAX_SIGNATURE_METADATA_BLOB_BYTES;
 use crate::analyzer::structural::materialization::{
     MaterializationRecord, MaterializationRecordPayload,
 };
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
 use crate::analyzer::{
-    CallableArity, CallableLinkage, CodeUnit, CodeUnitType, CppFieldLinkage, CppTemplateMetadata,
-    DispatchExtensibility, ImportInfo, Language, PackageAnchor, ParameterMetadata, ProjectFile,
+    CodeUnit, CodeUnitType, CppTemplateMetadata, ImportInfo, Language, PackageAnchor, ProjectFile,
     Range, RubyMethodDispatchMode, SignatureMetadata, StructuredImportPath,
-    StructuredImportPathKind, StructuredImportScope, StructuredTypeIdentity, SummaryFileProjection,
+    StructuredImportPathKind, StructuredImportScope, SummaryFileProjection,
 };
 use crate::gitblob;
 use crate::hash::{HashMap, HashSet, set_with_capacity};
@@ -56,16 +56,8 @@ pub(crate) use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
 
 const PREPARED_WRITE_IMMEDIATE_RETRIES: usize = 2;
 const STALE_GENERATION_RECLAIM_ROWS: usize = 10_000;
-/// How many stored bytes one row of a bounded query may materialize, and how
-/// many the whole answer may.
-///
-/// These used to alias the signature-metadata blob cap, which was the same
-/// number for a different reason: that cap was an admission gate on one write,
-/// this is a materialization budget for one read. The schema enforces the write
-/// gate now (see `0023-signature-metadata-columns.sql`), so the read budget
-/// stands on its own.
-const MAX_LIMITED_QUERY_ROW_BYTES: usize = 8 << 20;
-const MAX_LIMITED_QUERY_AGGREGATE_BYTES: usize = 8 << 20;
+const MAX_LIMITED_QUERY_ROW_BYTES: usize = MAX_SIGNATURE_METADATA_BLOB_BYTES;
+const MAX_LIMITED_QUERY_AGGREGATE_BYTES: usize = MAX_SIGNATURE_METADATA_BLOB_BYTES;
 
 pub fn analyzer_db_path(workspace_root: &Path) -> PathBuf {
     gitblob::cache_db_path(workspace_root)
@@ -5284,7 +5276,7 @@ pub(crate) struct PreparedParsedBlob {
     units: Vec<PreparedUnitRow>,
     ranges: Vec<(i64, i64, i64, i64, i64, i64)>,
     signatures: Vec<(i64, i64, String)>,
-    signature_metadata: Vec<(i64, i64, SignatureMetadataColumns)>,
+    signature_metadata: Vec<(i64, i64, Vec<u8>)>,
     cpp_template_metadata: Vec<(i64, Vec<u8>)>,
     supertypes: Vec<(i64, i64, String, String)>,
     children: Vec<(i64, i64, i64)>,
@@ -5752,7 +5744,6 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
     adapter: &A,
     state: Arc<FileState>,
 ) -> Result<PreparedParsedBlob> {
-    require_complete_file_state(state.as_ref())?;
     let stored_units = collect_stored_units(adapter, state.as_ref());
     let unit_keys: HashMap<CodeUnit, i64> = stored_units
         .iter()
@@ -5820,8 +5811,8 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
             continue;
         };
         for (ordinal, metadata) in entries.iter().enumerate() {
-            let columns = SignatureMetadataColumns::encode(metadata)?;
-            signature_metadata.push((unit_key, usize_to_i64(ordinal)?, columns));
+            let metadata = serialize_signature_metadata_blob(metadata)?;
+            signature_metadata.push((unit_key, usize_to_i64(ordinal)?, metadata));
         }
     }
     let mut cpp_template_metadata = Vec::new();
@@ -5939,13 +5930,6 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
     let string_bytes = saturating_sum([
         unit_string_bytes,
         saturating_sum(signatures.iter().map(|(_, _, text)| text.len())),
-        // Must sum exactly what `signature_metadata_row_bytes_sql` sums: this
-        // number is compared against the SQL payload-cost aggregate.
-        saturating_sum(
-            signature_metadata
-                .iter()
-                .map(|(_, _, columns)| columns.stored_text_bytes()),
-        ),
         saturating_sum(
             supertypes
                 .iter()
@@ -5956,6 +5940,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         rust_facts.string_bytes(),
     ]);
     let binary_bytes = saturating_sum([
+        saturating_sum(signature_metadata.iter().map(|(_, _, bytes)| bytes.len())),
         saturating_sum(cpp_template_metadata.iter().map(|(_, bytes)| bytes.len())),
         saturating_sum(scala_exports.iter().map(|(_, _, bytes)| bytes.len())),
         saturating_sum(
@@ -6069,10 +6054,10 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
         }
     );
     insert_rows!(
-        signature_metadata_insert_sql(),
+        "INSERT OR IGNORE INTO unit_signature_metadata(blob_oid, lang, unit_key, ordinal, metadata) VALUES(?1, ?2, ?3, ?4, ?5)",
         &blob.signature_metadata,
         |stmt, row| {
-            row.2.insert(&mut stmt, oid, lang, row.0, row.1)?;
+            stmt.execute(params![oid, lang, row.0, row.1, row.2])?;
         }
     );
     insert_rows!(
@@ -6193,7 +6178,6 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
     adapter: &A,
     state: &FileState,
 ) -> Result<()> {
-    require_complete_file_state(state)?;
     let oid = oid.to_string();
     tx.execute(
         "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2",
@@ -6306,15 +6290,6 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
     };
     insert_blob_meta(tx, &oid, lang, adapter, state, units.len(), side_counts)?;
     update_blob_payload_cost_tx(tx, &oid, lang)?;
-    Ok(())
-}
-
-fn require_complete_file_state(state: &FileState) -> Result<()> {
-    if !state.parse_complete {
-        return Err(StoreError::new(
-            "timed-out file analysis cannot be published as a complete parsed blob",
-        ));
-    }
     Ok(())
 }
 
@@ -6466,20 +6441,19 @@ fn insert_unit_signature_metadata(
     unit_keys: &HashMap<CodeUnit, i64>,
     metadata: &HashMap<CodeUnit, Vec<SignatureMetadata>>,
 ) -> Result<usize> {
-    let mut stmt = tx.prepare(signature_metadata_insert_sql())?;
+    let mut stmt = tx.prepare(
+        "INSERT OR IGNORE INTO unit_signature_metadata(
+           blob_oid, lang, unit_key, ordinal, metadata
+         ) VALUES(?1, ?2, ?3, ?4, ?5)",
+    )?;
     let mut count = 0;
     for (unit, entries) in metadata {
-        let Some(&unit_key) = unit_keys.get(unit) else {
+        let Some(unit_key) = unit_keys.get(unit) else {
             continue;
         };
         for (ordinal, entry) in entries.iter().enumerate() {
-            SignatureMetadataColumns::encode(entry)?.insert(
-                &mut stmt,
-                oid,
-                lang,
-                unit_key,
-                usize_to_i64(ordinal)?,
-            )?;
+            let entry = serialize_signature_metadata_blob(entry)?;
+            stmt.execute(params![oid, lang, unit_key, usize_to_i64(ordinal)?, entry,])?;
             count += 1;
         }
     }
@@ -6768,9 +6742,9 @@ struct RawSideTableCounts {
 }
 
 type BlobMetaRows = HashMap<String, BlobMetaRow>;
-type SignatureMetadataRow = (i64, SignatureMetadata);
+type SignatureMetadataRow = (i64, Vec<u8>);
 type SignatureMetadataRows = HashMap<String, Vec<SignatureMetadataRow>>;
-type CppTemplateMetadataRows = HashMap<String, Vec<(i64, Vec<u8>)>>;
+type CppTemplateMetadataRows = HashMap<String, Vec<SignatureMetadataRow>>;
 type ScalaExportRows = HashMap<String, Vec<(i64, Vec<u8>)>>;
 type MaterializationRecordRows = HashMap<String, Vec<(Option<i64>, Vec<u8>)>>;
 type RangeRow = (i64, i64, i64, i64, i64);
@@ -6888,7 +6862,6 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
         test_region_units,
         materialization_records,
         parse_errors: None,
-        parse_complete: true,
     };
 
     adapter.synthesize_hydrated_units(file, source, &mut state);
@@ -7175,7 +7148,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             unit_string_map_for_file(supertype_lookup_paths_by_oid.get(&oid_text), &by_key);
         let signatures = unit_string_map_for_file(signatures_by_oid.get(&oid_text), &by_key);
         let signature_metadata =
-            signature_metadata_map_for_file(signature_metadata_by_oid.get(&oid_text), &by_key);
+            signature_metadata_map_for_file(signature_metadata_by_oid.get(&oid_text), &by_key)?;
         let cpp_template_metadata = cpp_template_metadata_map_for_file(
             cpp_template_metadata_by_oid.get(&oid_text),
             &by_key,
@@ -7226,7 +7199,6 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             test_region_units,
             materialization_records,
             parse_errors: None,
-            parse_complete: true,
         };
 
         if let Some(source) = source {
@@ -7878,12 +7850,17 @@ fn read_signature_metadata_bulk(
             continue;
         }
         let placeholders = chunk_placeholders(chunk);
-        let columns = signature_metadata_value_columns_sql("metadata");
         let sql = format!(
-            "SELECT metadata.blob_oid, metadata.unit_key, {columns}
-             FROM unit_signature_metadata AS metadata
-             WHERE metadata.lang = ? AND metadata.blob_oid IN ({placeholders})
-             ORDER BY metadata.blob_oid, metadata.unit_key, metadata.ordinal"
+            "SELECT blob_oid,
+                    unit_key,
+                    CASE
+                        WHEN length(metadata) <= {MAX_SIGNATURE_METADATA_BLOB_BYTES}
+                        THEN metadata
+                        ELSE NULL
+                    END
+             FROM unit_signature_metadata
+             WHERE lang = ? AND blob_oid IN ({placeholders})
+             ORDER BY blob_oid, unit_key, ordinal"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -7891,12 +7868,14 @@ fn read_signature_metadata_bulk(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
-                signature_metadata_from_row(row, 2)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
             ))
         })?;
         for row in rows {
             let (oid, key, value) = row?;
-            out.entry(oid).or_default().push((key, value));
+            if let Some(value) = value {
+                out.entry(oid).or_default().push((key, value));
+            }
         }
     }
     Ok(out)
@@ -8081,18 +8060,18 @@ fn unit_string_map_for_file(
 }
 
 fn signature_metadata_map_for_file(
-    rows: Option<&Vec<SignatureMetadataRow>>,
+    rows: Option<&Vec<(i64, Vec<u8>)>>,
     by_key: &HashMap<i64, UnitRow>,
-) -> HashMap<CodeUnit, Vec<SignatureMetadata>> {
+) -> Result<HashMap<CodeUnit, Vec<SignatureMetadata>>> {
     let mut out: HashMap<CodeUnit, Vec<SignatureMetadata>> = HashMap::default();
     for (key, value) in rows.into_iter().flatten() {
         if let Some(unit) = by_key.get(key) {
             out.entry(unit.unit.clone())
                 .or_default()
-                .push(value.clone());
+                .push(deserialize_signature_metadata_blob(value)?);
         }
     }
-    out
+    Ok(out)
 }
 
 fn cpp_template_metadata_map_for_file(
@@ -8306,14 +8285,21 @@ where
 }
 
 fn usage_fact_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageFactRow> {
-    // `fq_segments` occupies index 12, the unit's first signature text 13, and
-    // the outer-joined signature-metadata columns 14 onward. `label` is NOT
-    // NULL in the table, so a NULL there is the join missing, not a row with
-    // no label.
+    // `fq_segments` occupies index 12; the usage-fact extras follow at 13-15.
+    let metadata_len = row.get::<_, Option<i64>>(14)?;
+    if metadata_len
+        .map(i64_to_usize)
+        .transpose()
+        .map_err(rusqlite_error_from_store)?
+        .is_some_and(|len| len > MAX_SIGNATURE_METADATA_BLOB_BYTES)
+    {
+        return Err(rusqlite_error_from_store(StoreError::new(format!(
+            "signature metadata blob exceeds the {MAX_SIGNATURE_METADATA_BLOB_BYTES}-byte cap"
+        ))));
+    }
     let metadata = row
-        .get::<_, Option<String>>(14)?
-        .is_some()
-        .then(|| signature_metadata_from_row(row, 14))
+        .get::<_, Option<Vec<u8>>>(15)?
+        .map(|bytes| deserialize_signature_metadata_blob(&bytes).map_err(rusqlite_error_from_store))
         .transpose()?;
     Ok(UsageFactRow {
         candidate: candidate_row_from_row(row)?,
@@ -8519,13 +8505,17 @@ fn sync_active_blob_oids(conn: &Connection, active_oids: &[Oid]) -> Result<()> {
 }
 
 fn usage_fact_rows_by_lang_conn(conn: &Connection, lang: &str) -> Result<Vec<UsageFactRow>> {
-    let metadata_columns = signature_metadata_value_columns_sql("metadata");
     let sql = format!(
         "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                 units.content_qualifier, units.signature, units.synthetic,
                 units.is_type_alias, units.top_level_ordinal, units.in_declarations,
                 units.in_definition_lookup, units.fq_segments, signature.text,
-                {metadata_columns}
+                length(metadata.metadata),
+                CASE
+                    WHEN length(metadata.metadata) <= {MAX_SIGNATURE_METADATA_BLOB_BYTES}
+                    THEN metadata.metadata
+                    ELSE NULL
+                END
          FROM code_units AS units
          JOIN blob_meta AS meta
            ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
@@ -8907,21 +8897,30 @@ fn read_signature_metadata(
     lang: &str,
     by_key: &HashMap<i64, UnitRow>,
 ) -> Result<HashMap<CodeUnit, Vec<SignatureMetadata>>> {
-    let columns = signature_metadata_value_columns_sql("metadata");
-    let mut stmt = conn.prepare(&format!(
-        "SELECT metadata.unit_key, {columns}
-         FROM unit_signature_metadata AS metadata
-         WHERE metadata.blob_oid = ?1 AND metadata.lang = ?2
-         ORDER BY metadata.unit_key, metadata.ordinal"
-    ))?;
-    let rows = stmt.query_map(params![oid, lang], |row| {
-        Ok((row.get::<_, i64>(0)?, signature_metadata_from_row(row, 1)?))
-    })?;
+    let mut stmt = conn.prepare(
+        "SELECT unit_key,
+                CASE
+                    WHEN length(metadata) <= ?3 THEN metadata
+                    ELSE NULL
+                END
+         FROM unit_signature_metadata
+         WHERE blob_oid = ?1 AND lang = ?2
+         ORDER BY unit_key, ordinal",
+    )?;
+    let rows = stmt.query_map(
+        params![oid, lang, usize_to_i64(MAX_SIGNATURE_METADATA_BLOB_BYTES)?],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+    )?;
     let mut out: HashMap<CodeUnit, Vec<SignatureMetadata>> = HashMap::default();
     for row in rows {
         let (key, metadata) = row?;
+        let Some(metadata) = metadata else {
+            continue;
+        };
         if let Some(unit) = by_key.get(&key) {
-            out.entry(unit.unit.clone()).or_default().push(metadata);
+            out.entry(unit.unit.clone())
+                .or_default()
+                .push(deserialize_signature_metadata_blob(&metadata)?);
         }
     }
     Ok(out)
@@ -8996,14 +8995,22 @@ fn direct_children_for_unit_limited_conn(
     }
 }
 
-/// The bounded per-unit signature-metadata read. Named so a plan pin can
-/// assert it seeks the table's primary key rather than scanning it.
-fn signature_metadata_for_unit_limited_sql() -> &'static str {
-    static SQL: LazyLock<String> = LazyLock::new(|| {
-        let row_bytes = signature_metadata_row_bytes_sql("metadata");
-        let columns = signature_metadata_value_columns_sql("metadata");
-        format!(
-            "SELECT {row_bytes}, {columns}
+fn signature_metadata_for_unit_limited_conn(
+    conn: &Connection,
+    oid: Oid,
+    lang: &str,
+    unit: &CodeUnit,
+    limit: usize,
+) -> Result<LimitedQueryRows<SignatureMetadata>> {
+    if limit == 0 {
+        return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+    }
+    let sql = format!(
+        "SELECT length(metadata.metadata),
+                CASE
+                    WHEN length(metadata.metadata) <= ?9 THEN metadata.metadata
+                    ELSE NULL
+                END
          FROM code_units AS units
          JOIN blob_meta AS meta
            ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
@@ -9021,27 +9028,12 @@ fn signature_metadata_for_unit_limited_sql() -> &'static str {
            AND {PARSED_BLOB_COMPLETE_CONDITION}
          ORDER BY metadata.ordinal
          LIMIT ?8"
-        )
-    });
-    SQL.as_str()
-}
-
-fn signature_metadata_for_unit_limited_conn(
-    conn: &Connection,
-    oid: Oid,
-    lang: &str,
-    unit: &CodeUnit,
-    limit: usize,
-) -> Result<LimitedQueryRows<SignatureMetadata>> {
-    if limit == 0 {
-        return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
-    }
-    let sql = signature_metadata_for_unit_limited_sql();
+    );
     let oid = oid.to_string();
     let kind = code_unit_kind_to_i64(unit.kind());
     let synthetic = bool_to_i64(unit.is_synthetic());
     let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let mut statement = conn.prepare_cached(sql)?;
+    let mut statement = conn.prepare_cached(&sql)?;
     let mut query = statement.query(params![
         oid,
         lang,
@@ -9051,6 +9043,7 @@ fn signature_metadata_for_unit_limited_conn(
         unit.signature(),
         synthetic,
         sql_limit,
+        usize_to_i64(MAX_LIMITED_QUERY_ROW_BYTES)?,
     ])?;
     let mut rows = Vec::new();
     let mut inspected = 0usize;
@@ -9061,7 +9054,10 @@ fn signature_metadata_for_unit_limited_conn(
         if !byte_budget.admit_sqlite_bytes(byte_len)? {
             return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
         }
-        rows.push(signature_metadata_from_row(row, 1)?);
+        let Some(bytes) = row.get::<_, Option<Vec<u8>>>(1)? else {
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+        };
+        rows.push(deserialize_signature_metadata_blob(&bytes)?);
     }
     drop(query);
     if inspected == limit {
@@ -9796,14 +9792,7 @@ fn persisted_blob_mutation_cost_fallback_statement(
 }
 
 fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
-    // The signature-metadata term is composed rather than written out so that
-    // it cannot drift from `SIGNATURE_METADATA_TEXT_COLUMNS`. The subquery
-    // leaves the table unaliased on purpose: a plan pin asserts
-    // `SEARCH unit_signature_metadata USING PRIMARY KEY`.
-    static SQL: LazyLock<String> = LazyLock::new(|| {
-        let signature_metadata_bytes = signature_metadata_row_bytes_sql("unit_signature_metadata");
-        format!(
-            "SELECT
+    "SELECT
        1 + CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
          1 + meta.stored_unit_count + meta.range_count + meta.signature_count
            + meta.signature_metadata_count
@@ -9832,7 +9821,7 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
              ) FROM code_units WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(CAST(text AS BLOB))) FROM unit_signatures
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
-           + COALESCE((SELECT SUM({signature_metadata_bytes}) FROM unit_signature_metadata
+           + COALESCE((SELECT SUM(length(metadata)) FROM unit_signature_metadata
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(metadata)) FROM unit_cpp_template_metadata
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
@@ -9859,9 +9848,6 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
      LEFT JOIN blob_meta AS meta
        ON meta.blob_oid = blob.blob_oid AND meta.lang = blob.lang
      WHERE blob.blob_oid = ?1 AND blob.lang = ?2"
-        )
-    });
-    SQL.as_str()
 }
 
 fn insert_blob_payload_cost_tx(
@@ -10300,440 +10286,36 @@ pub(crate) fn hydrate_unit_fq<A: LanguageAdapter>(
     Ok((prefix, package_segment_count))
 }
 
-/// Every non-key column of `unit_signature_metadata`, in the one order the
-/// writer binds and every reader decodes.
-///
-/// Four queries read this table and two write it. Sharing one order is what
-/// makes positional decoding safe among them: a column added to the schema is
-/// added to this list once, and the encoder and decoder beside it are the only
-/// two places that have to agree about what index it lands on.
-const SIGNATURE_METADATA_VALUE_COLUMNS: [&str; 29] = [
-    "label",
-    "parameters",
-    "return_type_text",
-    "return_type_identity",
-    "underlying_type_identity",
-    "declaration_only",
-    "callable_arity_required",
-    "callable_arity_total",
-    "callable_arity_repeated",
-    "type_parameters",
-    "bare_return_type_parameter",
-    "callable_linkage",
-    "dispatch_extensibility",
-    "extension_receiver_type",
-    "extension_receiver_type_identity",
-    "extension_receiver_is_unconstrained",
-    "field_is_static",
-    "field_is_final",
-    "field_has_initializer",
-    "cpp_field_linkage",
-    "companion_object",
-    "callable_is_static",
-    "callable_is_constructor",
-    "callable_declared_visibility",
-    "callable_modifiers_recorded",
-    "callable_parameter_types",
-    "callable_is_native",
-    "class_like_is_interface",
-    "class_like_is_static",
-];
-
-/// The variable-length subset of the columns above.
-///
-/// Their stored byte lengths are the row's payload cost and the read-side
-/// materialization budget. The flags, the arity integers, and the short enum
-/// spellings are bounded by their own CHECK constraints and are not worth
-/// summing. The Rust accounting in [`SignatureMetadataColumns::stored_text_bytes`]
-/// must sum exactly this set, because a test compares it against the SQL sum.
-const SIGNATURE_METADATA_TEXT_COLUMNS: [&str; 10] = [
-    "label",
-    "parameters",
-    "return_type_text",
-    "return_type_identity",
-    "underlying_type_identity",
-    "type_parameters",
-    "bare_return_type_parameter",
-    "extension_receiver_type",
-    "extension_receiver_type_identity",
-    "callable_parameter_types",
-];
-
-/// The value columns as a SELECT list, each qualified by `qualifier`, which is
-/// the table's name or its alias in the query being built.
-fn signature_metadata_value_columns_sql(qualifier: &str) -> String {
-    SIGNATURE_METADATA_VALUE_COLUMNS
-        .iter()
-        .map(|column| format!("{qualifier}.{column}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// A SQL expression for one row's stored text bytes.
-///
-/// `length()` on a TEXT value counts characters, so every term casts to BLOB
-/// first: the budget is bytes.
-fn signature_metadata_row_bytes_sql(qualifier: &str) -> String {
-    SIGNATURE_METADATA_TEXT_COLUMNS
-        .iter()
-        .map(|column| format!("COALESCE(length(CAST({qualifier}.{column} AS BLOB)), 0)"))
-        .collect::<Vec<_>>()
-        .join(" + ")
-}
-
-/// A plain INSERT, unlike every sibling side table, which uses
-/// `INSERT OR IGNORE`.
-///
-/// This is the only side table whose columns carry CHECK constraints that can
-/// reject a well-keyed row, and `OR IGNORE` suppresses a CHECK failure exactly
-/// as it suppresses a duplicate key: the row is skipped and the statement
-/// succeeds. That would turn the schema's size cap back into the silent
-/// data-loss it was written to replace. The blob's own row is deleted before
-/// any of this runs, and its cascade empties this table for the blob, so a
-/// duplicate key here is impossible and there is nothing left for `OR IGNORE`
-/// to do but hide a real failure.
-fn signature_metadata_insert_sql() -> &'static str {
-    static SQL: LazyLock<String> = LazyLock::new(|| {
-        let columns = SIGNATURE_METADATA_VALUE_COLUMNS.join(", ");
-        let placeholders = (0..SIGNATURE_METADATA_VALUE_COLUMNS.len())
-            .map(|index| format!("?{}", index + 5))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "INSERT INTO unit_signature_metadata(
-           blob_oid, lang, unit_key, ordinal, {columns}
-         ) VALUES(?1, ?2, ?3, ?4, {placeholders})"
-        )
-    });
-    SQL.as_str()
-}
-
-/// One `unit_signature_metadata` row's non-key columns, already converted to
-/// the SQL types they bind as.
-///
-/// The prepared-write path builds these outside the write transaction so it can
-/// charge a blob's payload cost before it takes the lock; the direct write path
-/// builds them per row. Neither checks the size caps: the schema does, and a
-/// row that violates one fails its INSERT and rolls the whole blob back.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SignatureMetadataColumns {
-    label: String,
-    parameters: String,
-    return_type_text: Option<String>,
-    return_type_identity: Option<String>,
-    underlying_type_identity: Option<String>,
-    declaration_only: i64,
-    callable_arity_required: Option<i64>,
-    callable_arity_total: Option<i64>,
-    callable_arity_repeated: Option<i64>,
-    type_parameters: String,
-    bare_return_type_parameter: Option<String>,
-    callable_linkage: Option<&'static str>,
-    dispatch_extensibility: Option<&'static str>,
-    extension_receiver_type: Option<String>,
-    extension_receiver_type_identity: Option<String>,
-    extension_receiver_is_unconstrained: i64,
-    field_is_static: i64,
-    field_is_final: i64,
-    field_has_initializer: i64,
-    cpp_field_linkage: Option<&'static str>,
-    companion_object: i64,
-    callable_is_static: i64,
-    callable_is_constructor: i64,
-    callable_declared_visibility: Option<&'static str>,
-    callable_modifiers_recorded: i64,
-    callable_parameter_types: Option<String>,
-    callable_is_native: i64,
-    class_like_is_interface: i64,
-    class_like_is_static: i64,
-}
-
-impl SignatureMetadataColumns {
-    fn encode(value: &SignatureMetadata) -> Result<Self> {
-        let arity = value.callable_arity();
-        Ok(Self {
-            label: value.label().to_string(),
-            parameters: encode_signature_metadata_json("parameters", value.parameters())?,
-            return_type_text: value.return_type_text().map(str::to_string),
-            return_type_identity: value
-                .return_type_identity()
-                .map(|identity| encode_signature_metadata_json("return_type_identity", identity))
-                .transpose()?,
-            underlying_type_identity: value
-                .underlying_type_identity()
-                .map(|identity| {
-                    encode_signature_metadata_json("underlying_type_identity", identity)
-                })
-                .transpose()?,
-            declaration_only: bool_to_i64(value.is_declaration_only()),
-            callable_arity_required: arity
-                .map(|arity| usize_to_i64(arity.required()))
-                .transpose()?,
-            callable_arity_total: arity.map(|arity| usize_to_i64(arity.total())).transpose()?,
-            callable_arity_repeated: arity.map(|arity| bool_to_i64(arity.is_repeated())),
-            type_parameters: encode_signature_metadata_json(
-                "type_parameters",
-                value.type_parameters(),
-            )?,
-            bare_return_type_parameter: value.bare_return_type_parameter().map(str::to_string),
-            callable_linkage: value.callable_linkage().map(CallableLinkage::label),
-            dispatch_extensibility: value
-                .dispatch_extensibility()
-                .map(DispatchExtensibility::label),
-            extension_receiver_type: value.extension_receiver_type().map(str::to_string),
-            extension_receiver_type_identity: value
-                .extension_receiver_type_identity()
-                .map(|identity| {
-                    encode_signature_metadata_json("extension_receiver_type_identity", identity)
-                })
-                .transpose()?,
-            extension_receiver_is_unconstrained: bool_to_i64(
-                value.extension_receiver_is_unconstrained_type_parameter(),
-            ),
-            field_is_static: bool_to_i64(value.field_is_static()),
-            field_is_final: bool_to_i64(value.field_is_final()),
-            field_has_initializer: bool_to_i64(value.field_has_initializer()),
-            cpp_field_linkage: value.cpp_field_linkage().map(CppFieldLinkage::label),
-            companion_object: bool_to_i64(value.is_companion_object()),
-            callable_is_static: bool_to_i64(value.callable_is_static()),
-            callable_is_constructor: bool_to_i64(value.callable_is_constructor()),
-            callable_declared_visibility: value
-                .callable_declared_visibility()
-                .map(DeclaredVisibility::label),
-            callable_modifiers_recorded: bool_to_i64(value.callable_modifiers_recorded()),
-            callable_parameter_types: value
-                .callable_parameter_types()
-                .map(|types| encode_signature_metadata_json("callable_parameter_types", types))
-                .transpose()?,
-            callable_is_native: bool_to_i64(value.callable_is_native()),
-            class_like_is_interface: bool_to_i64(value.class_like_is_interface()),
-            class_like_is_static: bool_to_i64(value.class_like_is_static()),
-        })
+fn serialize_signature_metadata_blob(value: &SignatureMetadata) -> Result<Vec<u8>> {
+    let serialized_size = usize::try_from(bincode::serialized_size(value).map_err(|err| {
+        StoreError::new(format!("analyzer store serialization size error: {err}"))
+    })?)
+    .map_err(|_| StoreError::new("signature metadata size does not fit in usize"))?;
+    if serialized_size > MAX_SIGNATURE_METADATA_BLOB_BYTES {
+        return Err(StoreError::new(format!(
+            "signature metadata blob requires {serialized_size} bytes, exceeding the \
+             {MAX_SIGNATURE_METADATA_BLOB_BYTES}-byte cap"
+        )));
     }
-
-    /// The bytes this row occupies in the columns [`SIGNATURE_METADATA_TEXT_COLUMNS`]
-    /// names, which is what the SQL payload-cost aggregate sums.
-    fn stored_text_bytes(&self) -> usize {
-        saturating_sum([
-            self.label.len(),
-            self.parameters.len(),
-            self.return_type_text.as_ref().map_or(0, String::len),
-            self.return_type_identity.as_ref().map_or(0, String::len),
-            self.underlying_type_identity
-                .as_ref()
-                .map_or(0, String::len),
-            self.type_parameters.len(),
-            self.bare_return_type_parameter
-                .as_ref()
-                .map_or(0, String::len),
-            self.extension_receiver_type.as_ref().map_or(0, String::len),
-            self.extension_receiver_type_identity
-                .as_ref()
-                .map_or(0, String::len),
-            self.callable_parameter_types
-                .as_ref()
-                .map_or(0, String::len),
-        ])
-    }
-
-    fn insert(
-        &self,
-        stmt: &mut rusqlite::Statement<'_>,
-        oid: &str,
-        lang: &str,
-        unit_key: i64,
-        ordinal: i64,
-    ) -> Result<()> {
-        stmt.execute(params![
-            oid,
-            lang,
-            unit_key,
-            ordinal,
-            self.label,
-            self.parameters,
-            self.return_type_text,
-            self.return_type_identity,
-            self.underlying_type_identity,
-            self.declaration_only,
-            self.callable_arity_required,
-            self.callable_arity_total,
-            self.callable_arity_repeated,
-            self.type_parameters,
-            self.bare_return_type_parameter,
-            self.callable_linkage,
-            self.dispatch_extensibility,
-            self.extension_receiver_type,
-            self.extension_receiver_type_identity,
-            self.extension_receiver_is_unconstrained,
-            self.field_is_static,
-            self.field_is_final,
-            self.field_has_initializer,
-            self.cpp_field_linkage,
-            self.companion_object,
-            self.callable_is_static,
-            self.callable_is_constructor,
-            self.callable_declared_visibility,
-            self.callable_modifiers_recorded,
-            self.callable_parameter_types,
-            self.callable_is_native,
-            self.class_like_is_interface,
-            self.class_like_is_static,
-        ])?;
-        Ok(())
-    }
+    let bytes = serialize_blob(value)?;
+    debug_assert_eq!(bytes.len(), serialized_size);
+    Ok(bytes)
 }
 
-fn encode_signature_metadata_json<T: serde::Serialize + ?Sized>(
-    column: &str,
-    value: &T,
-) -> Result<String> {
-    serde_json::to_string(value).map_err(|err| {
-        StoreError::new(format!(
-            "analyzer store cannot encode signature metadata column {column}: {err}"
-        ))
-    })
-}
-
-fn decode_signature_metadata_json<T: serde::de::DeserializeOwned>(
-    column: &str,
-    text: &str,
-) -> rusqlite::Result<T> {
-    serde_json::from_str(text).map_err(|err| {
-        rusqlite_error_from_store(StoreError::new(format!(
-            "analyzer store cannot decode signature metadata column {column}: {err}"
-        )))
-    })
-}
-
-fn signature_metadata_enum_from_label<T>(
-    column: &str,
-    label: Option<String>,
-    parse: impl Fn(&str) -> Option<T>,
-) -> rusqlite::Result<Option<T>> {
-    label
-        .map(|label| {
-            parse(&label).ok_or_else(|| {
-                rusqlite_error_from_store(StoreError::new(format!(
-                    "analyzer store signature metadata column {column} holds unknown value {label}"
-                )))
-            })
-        })
-        .transpose()
-}
-
-/// Rebuild one [`SignatureMetadata`] from a row whose
-/// [`SIGNATURE_METADATA_VALUE_COLUMNS`] start at index `base`.
-fn signature_metadata_from_row(
-    row: &rusqlite::Row<'_>,
-    base: usize,
-) -> rusqlite::Result<SignatureMetadata> {
-    let flag =
-        |index: usize| -> rusqlite::Result<bool> { Ok(row.get::<_, i64>(base + index)? != 0) };
-    let parameters: Vec<ParameterMetadata> =
-        decode_signature_metadata_json("parameters", &row.get::<_, String>(base + 1)?)?;
-    let mut metadata = SignatureMetadata::new(row.get::<_, String>(base)?, parameters)
-        .with_return_type_text(row.get::<_, Option<String>>(base + 2)?)
-        .with_return_type_identity(signature_metadata_identity_from_row(
-            row,
-            base + 3,
-            "return_type_identity",
-        )?)
-        .with_underlying_type_identity(signature_metadata_identity_from_row(
-            row,
-            base + 4,
-            "underlying_type_identity",
-        )?)
-        .with_declaration_only(flag(5)?)
-        .with_type_parameters(decode_signature_metadata_json(
-            "type_parameters",
-            &row.get::<_, String>(base + 9)?,
-        )?)
-        .with_bare_return_type_parameter(row.get::<_, Option<String>>(base + 10)?)
-        .with_extension_receiver_type(row.get::<_, Option<String>>(base + 13)?)
-        .with_extension_receiver_type_identity(signature_metadata_identity_from_row(
-            row,
-            base + 14,
-            "extension_receiver_type_identity",
-        )?)
-        .with_extension_receiver_is_unconstrained_type_parameter(flag(15)?)
-        .with_field_modifiers(flag(16)?, flag(17)?)
-        .with_field_initializer(flag(18)?)
-        .with_companion_object(flag(20)?)
-        .with_persisted_callable_modifiers(
-            flag(21)?,
-            flag(22)?,
-            signature_metadata_enum_from_label(
-                "callable_declared_visibility",
-                row.get::<_, Option<String>>(base + 23)?,
-                DeclaredVisibility::from_label,
-            )?,
-            flag(24)?,
-        )
-        .with_callable_native(flag(26)?)
-        .with_class_like_interface(flag(27)?)
-        .with_class_like_static(flag(28)?);
-    if let Some(arity) = signature_metadata_arity_from_row(row, base + 6)? {
-        metadata = metadata.with_callable_arity(arity);
+fn deserialize_signature_metadata_blob(bytes: &[u8]) -> Result<SignatureMetadata> {
+    if bytes.len() > MAX_SIGNATURE_METADATA_BLOB_BYTES {
+        return Err(StoreError::new(format!(
+            "signature metadata blob exceeds the {MAX_SIGNATURE_METADATA_BLOB_BYTES}-byte cap"
+        )));
     }
-    if let Some(linkage) = signature_metadata_enum_from_label(
-        "callable_linkage",
-        row.get::<_, Option<String>>(base + 11)?,
-        CallableLinkage::from_label,
-    )? {
-        metadata = metadata.with_callable_linkage(linkage);
-    }
-    if let Some(extensibility) = signature_metadata_enum_from_label(
-        "dispatch_extensibility",
-        row.get::<_, Option<String>>(base + 12)?,
-        DispatchExtensibility::from_label,
-    )? {
-        metadata = metadata.with_dispatch_extensibility(extensibility);
-    }
-    if let Some(linkage) = signature_metadata_enum_from_label(
-        "cpp_field_linkage",
-        row.get::<_, Option<String>>(base + 19)?,
-        CppFieldLinkage::from_label,
-    )? {
-        metadata = metadata.with_cpp_field_linkage(linkage);
-    }
-    if let Some(types) = row.get::<_, Option<String>>(base + 25)? {
-        metadata = metadata.with_callable_parameter_types(decode_signature_metadata_json(
-            "callable_parameter_types",
-            &types,
-        )?);
-    }
-    Ok(metadata)
-}
-
-fn signature_metadata_identity_from_row(
-    row: &rusqlite::Row<'_>,
-    index: usize,
-    column: &str,
-) -> rusqlite::Result<Option<StructuredTypeIdentity>> {
-    row.get::<_, Option<String>>(index)?
-        .map(|text| decode_signature_metadata_json(column, &text))
-        .transpose()
-}
-
-/// The arity trio starting at `index`. The schema keeps the three columns all
-/// present or all absent, so a half-present triple is a corrupted store rather
-/// than a case to interpret.
-fn signature_metadata_arity_from_row(
-    row: &rusqlite::Row<'_>,
-    index: usize,
-) -> rusqlite::Result<Option<CallableArity>> {
-    let (Some(required), Some(total), Some(repeated)) = (
-        row.get::<_, Option<i64>>(index)?,
-        row.get::<_, Option<i64>>(index + 1)?,
-        row.get::<_, Option<i64>>(index + 2)?,
-    ) else {
-        return Ok(None);
-    };
-    Ok(Some(CallableArity::new(
-        i64_to_usize(required).map_err(rusqlite_error_from_store)?,
-        i64_to_usize(total).map_err(rusqlite_error_from_store)?,
-        repeated != 0,
-    )))
+    let byte_limit = u64::try_from(bytes.len())
+        .map_err(|_| StoreError::new("signature metadata blob length does not fit in u64"))?;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(byte_limit)
+        .deserialize(bytes)
+        .map_err(|err| StoreError::new(format!("analyzer store deserialization error: {err}")))
 }
 
 fn deserialize_blob<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
@@ -10807,9 +10389,6 @@ mod tests {
     use crate::analyzer::cpp::CppAdapter;
     use crate::analyzer::go::GoAdapter;
     use crate::analyzer::java::JavaAdapter;
-    use crate::analyzer::model::{
-        MAX_SIGNATURE_METADATA_COLUMN_BYTES, StructuredTypeIdentityBuilder, StructuredTypeName,
-    };
     use crate::analyzer::php::PhpAdapter;
     use crate::analyzer::python::PythonAdapter;
     use crate::analyzer::ruby::RubyAdapter;
@@ -10852,238 +10431,28 @@ mod tests {
         assert_eq!(hydrated_package_segment_count, 0);
     }
 
-    /// One `SignatureMetadata` with every field carrying a non-default value.
-    ///
-    /// The round-trip test below is only as strong as this value is complete:
-    /// a field that stays at its default here would round-trip through a
-    /// column that the encoder never writes and the decoder never reads.
-    fn fully_populated_signature_metadata() -> SignatureMetadata {
-        let named = |path: &str| {
-            StructuredTypeName::new(vec![path.to_string()], vec!["outer".to_string()], true)
-                .expect("structured type name")
-        };
-        let mut builder = StructuredTypeIdentityBuilder::default();
-        let key = builder.named(named("String")).unwrap();
-        let value = builder.named(named("Widget")).unwrap();
-        let map = builder.map(key, value).unwrap();
-        let base = builder.named(named("Registry")).unwrap();
-        let generic = builder.generic(base, vec![map]).unwrap();
-        let return_type_identity = builder.finish(generic).expect("return identity");
-
-        let mut underlying = StructuredTypeIdentityBuilder::default();
-        let element = underlying.named(named("Operation")).unwrap();
-        let pointer = underlying.pointer(element).unwrap();
-        let array = underlying.array(pointer).unwrap();
-        let underlying_type_identity = underlying.finish(array).expect("underlying identity");
-
-        let mut receiver = StructuredTypeIdentityBuilder::default();
-        let receiver_named = receiver.named(named("Receiver")).unwrap();
-        let receiver_slice = receiver.slice(receiver_named).unwrap();
-        let extension_receiver_type_identity = receiver.finish(receiver_slice).expect("receiver");
-
-        SignatureMetadata::new(
-            "fn build(first: String, second: Widget) -> Registry<Map<String, Widget>>",
-            vec![
-                ParameterMetadata::new("first: String", 9, 22),
-                ParameterMetadata::new("second: Widget", 24, 38),
-            ],
-        )
-        .with_return_type_text(Some("Registry<Map<String, Widget>>"))
-        .with_return_type_identity(Some(return_type_identity))
-        .with_underlying_type_identity(Some(underlying_type_identity))
-        .with_declaration_only(true)
-        .with_callable_arity(CallableArity::new(2, 3, true))
-        .with_type_parameters(vec!["T".to_string(), "U".to_string()])
-        .with_bare_return_type_parameter(Some("T"))
-        .with_callable_linkage(CallableLinkage::External)
-        .with_dispatch_extensibility(DispatchExtensibility::Closed)
-        .with_extension_receiver_type(Some("Receiver"))
-        .with_extension_receiver_type_identity(Some(extension_receiver_type_identity))
-        .with_extension_receiver_is_unconstrained_type_parameter(true)
-        .with_field_modifiers(true, true)
-        .with_field_initializer(true)
-        .with_cpp_field_linkage(CppFieldLinkage::InternalUnlessExternalPeer)
-        .with_companion_object(true)
-        .with_callable_modifiers(true, true, DeclaredVisibility::PackagePrivate)
-        .with_callable_parameter_types(vec!["String".to_string(), "Widget".to_string()])
-        .with_callable_native(true)
-        .with_class_like_interface(true)
-        .with_class_like_static(true)
-    }
-
-    /// Write `metadata` as the signature rows of one unit of `file`, then read
-    /// them back through every reader the store has.
-    ///
-    /// Four queries decode this table positionally from one shared column
-    /// list, so a round trip that exercises only one of them proves almost
-    /// nothing about the other three.
-    fn assert_signature_metadata_round_trips<A: LanguageAdapter>(
-        adapter: &A,
-        lang: &str,
-        file: &ProjectFile,
-        metadata: &[SignatureMetadata],
-    ) {
-        let source = file.read_to_string().unwrap();
-        let oid = oid_for(source.as_bytes());
-        let mut state = parse_state(adapter, file);
-        let target = state
-            .signature_metadata
-            .iter()
-            .find(|(_, entries)| !entries.is_empty())
-            .map(|(unit, _)| unit.clone())
-            .expect("fixture should produce signature metadata");
-        state.signature_metadata.clear();
-        state
-            .signature_metadata
-            .insert(target.clone(), metadata.to_vec());
-        let state = Arc::new(state);
-
-        let store = AnalyzerStore::open_in_memory().unwrap();
-        let generation = store
-            .ensure_language_epoch_value(lang, "signature-metadata-round-trip")
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(oid, lang, generation, adapter, state.as_ref())
-            .unwrap();
-
-        let limited = store
-            .signature_metadata_for_unit_limited(oid, lang, generation, &target, usize::MAX)
-            .unwrap();
-        assert!(limited.complete, "{lang}: bounded read must complete");
-        assert_eq!(limited.rows, metadata, "{lang}: bounded per-unit reader");
-
-        let hydrated = store
-            .hydrate_file_state_with_source(oid, lang, generation, adapter, file, &source)
-            .unwrap()
-            .expect("single-file hydration");
-        assert_eq!(
-            hydrated.signature_metadata.get(&target).map(Vec::as_slice),
-            Some(metadata),
-            "{lang}: single-file hydration reader"
-        );
-
-        let bulk = store
-            .hydrate_file_states(
-                &[(file.clone(), oid)],
-                lang,
-                adapter,
-                &HashMap::from_iter([(file.clone(), source.clone())]),
-            )
-            .unwrap();
-        assert_eq!(
-            bulk.get(file)
-                .expect("bulk hydration")
-                .signature_metadata
-                .get(&target)
-                .map(Vec::as_slice),
-            Some(metadata),
-            "{lang}: bulk hydration reader"
-        );
-
-        // The usage-fact projection outer-joins ordinal 0 only, and only for
-        // units the adapter put in declarations.
-        let usage_row = store
-            .usage_fact_rows_by_lang(lang)
-            .unwrap()
-            .into_iter()
-            .find(|row| row.candidate.short_name == target.short_name())
-            .expect("usage-fact row for the target unit");
-        assert_eq!(
-            usage_row.signature_metadata.as_ref(),
-            metadata.first(),
-            "{lang}: usage-fact projection reader"
-        );
-    }
-
     #[test]
-    fn signature_metadata_columns_round_trip_through_every_reader() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let populated = fully_populated_signature_metadata();
-        let bare = SignatureMetadata::new("make", Vec::new());
-        let rows = [populated, bare];
-
-        assert_signature_metadata_round_trips(
-            &RubyAdapter,
-            "ruby",
-            &write_file(
-                temp.path(),
-                "factory.rb",
-                "class Factory\n  def make(value)\n    value\n  end\nend\n",
-            ),
-            &rows,
-        );
-        assert_signature_metadata_round_trips(
-            &JavaAdapter,
-            "java",
-            &write_file(
-                temp.path(),
-                "Factory.java",
-                "class Factory { Object make(Object value) { return value; } }\n",
-            ),
-            &rows,
-        );
-    }
-
-    /// Plain SQL over the persisted table answers a question about real parsed
-    /// source, with no Rust decoding step in between.
-    ///
-    /// This is what the promotion bought and the only test that proves it: the
-    /// round-trip test above reads back values it built itself, and would still
-    /// pass if the columns held anything self-consistent. Here a Java field with
-    /// an initializer and a Java field without one are told apart by a `SUM`
-    /// over one column of an on-disk store file, which is precisely what a
-    /// consumer had to decode two million bincode blobs to learn before.
-    #[test]
-    fn a_persisted_java_field_initializer_is_readable_as_plain_sql() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "Config.java",
-            "class Config { static final int LIMIT = 7; int unset; }\n",
-        );
-        let source = file.read_to_string().unwrap();
-        let oid = oid_for(source.as_bytes());
-        let state = parse_state(&JavaAdapter, &file);
-        let store = AnalyzerStore::open_persistent(
-            &temp
-                .path()
-                .join(brokk_bifrost_core::cache_db::cache_db_file_name()),
-        )
-        .unwrap();
-        let generation = store
-            .ensure_language_epoch_value("java", "field-initializer-observation")
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
-            .unwrap();
-
-        let conn = store.conn.lock().expect("store mutex");
-        let (rows, initialized, labels): (i64, i64, String) = conn
-            .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(field_has_initializer), 0),
-                        COALESCE(GROUP_CONCAT(label, ' | '), '')
-                 FROM unit_signature_metadata",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
+    fn signature_metadata_blob_admission_has_a_fixed_byte_cap() {
+        let ordinary = SignatureMetadata::new("fn make() -> Service", Vec::new());
         assert!(
-            rows >= 2,
-            "the fixture's two fields must persist signature rows: {labels}"
+            !serialize_signature_metadata_blob(&ordinary)
+                .expect("serialize ordinary metadata")
+                .is_empty()
         );
-        assert_eq!(
-            initialized, 1,
-            "exactly the initialized field must report one: {labels}"
+
+        let oversized =
+            SignatureMetadata::new("x".repeat(MAX_SIGNATURE_METADATA_BLOB_BYTES), Vec::new());
+        assert!(
+            serialize_signature_metadata_blob(&oversized)
+                .expect_err("oversized metadata must fail before allocation")
+                .to_string()
+                .contains("exceeding"),
+            "oversized signature metadata must fail the non-allocating size preflight"
         );
     }
 
-    /// The size cap is a schema CHECK now, not a read-side gate, so an
-    /// oversized row must fail its INSERT and take the whole blob's
-    /// transaction with it. The previous shape of this test corrupted a stored
-    /// blob with `zeroblob` and asserted the readers nulled it out; there is no
-    /// longer a column that can hold such a value.
     #[test]
-    fn oversized_signature_metadata_is_rejected_by_the_schema_and_publishes_nothing() {
+    fn bounded_regression_oversized_signature_metadata_cannot_publish_a_complete_blob() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
             temp.path(),
@@ -11102,7 +10471,7 @@ mod tests {
         state.signature_metadata.insert(
             target,
             vec![SignatureMetadata::new(
-                "x".repeat(MAX_SIGNATURE_METADATA_COLUMN_BYTES + 1),
+                "x".repeat(MAX_SIGNATURE_METADATA_BLOB_BYTES),
                 Vec::new(),
             )],
         );
@@ -11112,40 +10481,20 @@ mod tests {
             .ensure_language_epoch_value("ruby", "oversized-signature-metadata-write-v1")
             .unwrap();
 
-        let prepared = AnalyzerStore::prepare_parsed_blob(
+        let prepare_error = AnalyzerStore::prepare_parsed_blob(
             oid,
             "ruby",
             generation,
             &RubyAdapter,
             Arc::clone(&state),
         )
-        .expect("preparation encodes columns without enforcing the cap");
-        let (outcomes, _) = store.persist_prepared_blobs(
-            vec![prepared],
-            PersistBatchLimits {
-                max_blobs: usize::MAX,
-                max_rows: usize::MAX,
-                max_payload_bytes: usize::MAX,
-            },
-        );
-        let prepared_error = outcomes[0]
-            .error
-            .as_ref()
-            .expect("the prepared write must fail")
-            .to_string();
-        assert!(
-            prepared_error.contains("CHECK constraint failed"),
-            "SQLite must reject the oversized label itself: {prepared_error}"
-        );
+        .expect_err("preparation must reject oversized signature metadata");
+        assert!(prepare_error.to_string().contains("exceeding"));
 
         let write_error = store
             .write_parsed_blob_at_generation(oid, "ruby", generation, &RubyAdapter, state.as_ref())
-            .expect_err("direct persistence must reject oversized signature metadata")
-            .to_string();
-        assert!(
-            write_error.contains("CHECK constraint failed"),
-            "SQLite must reject the oversized label itself: {write_error}"
-        );
+            .expect_err("direct persistence must reject oversized signature metadata");
+        assert!(write_error.to_string().contains("exceeding"));
         assert!(
             !store
                 .contains_parsed_blob_at_generation(oid, "ruby", generation)
@@ -11154,61 +10503,135 @@ mod tests {
         );
     }
 
-    /// Both signature-metadata readers that join reach their rows through the
-    /// table's own primary key. A full scan here is a per-language table walk
-    /// on a table measured at two million rows.
     #[test]
-    fn signature_metadata_readers_seek_the_primary_key() {
+    fn resource_bound_oversized_current_epoch_signature_metadata_fails_closed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "factory.rb",
+            "class Service\nend\nclass Factory\n  def make(value)\n    Service.new\n  end\nend\n",
+        );
+        let source = file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let state = parse_state(&RubyAdapter, &file);
+        let target = state
+            .signature_metadata
+            .iter()
+            .find(|(_, metadata)| !metadata.is_empty())
+            .map(|(unit, _)| unit.clone())
+            .expect("fixture should produce signature metadata");
         let store = AnalyzerStore::open_in_memory().unwrap();
-        let conn = store.conn.lock().expect("store mutex");
-        let explain = |sql: &str, parameters: &[&str]| {
-            let mut statement = conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-                .expect("prepare plan");
-            statement
-                .query_map(params_from_iter(parameters.iter().copied()), |row| {
-                    row.get::<_, String>(3)
-                })
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
-        };
+        let generation = store
+            .ensure_language_epoch_value("ruby", "oversized-signature-metadata-v1")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "ruby", generation, &RubyAdapter, &state)
+            .unwrap();
 
-        let columns = signature_metadata_value_columns_sql("metadata");
-        let batch_plan = explain(
-            &format!(
-                "SELECT metadata.blob_oid, metadata.unit_key, {columns}
-                 FROM unit_signature_metadata AS metadata
-                 WHERE metadata.lang = ? AND metadata.blob_oid IN (?, ?)
-                 ORDER BY metadata.blob_oid, metadata.unit_key, metadata.ordinal"
-            ),
-            &["java", "oid-a", "oid-b"],
-        );
-        assert!(
-            batch_plan
-                .iter()
-                .any(|detail| detail.contains("SEARCH metadata USING PRIMARY KEY")),
-            "the batch reader must seek the primary key: {batch_plan:#?}"
-        );
-        assert!(
-            batch_plan.iter().all(|detail| !detail.contains("SCAN")),
-            "the batch reader must not scan any table: {batch_plan:#?}"
-        );
+        let oversized_len = MAX_SIGNATURE_METADATA_BLOB_BYTES + 1;
+        {
+            let conn = store.conn.lock().unwrap();
+            let unit_key: i64 = conn
+                .query_row(
+                    "SELECT metadata.unit_key
+                     FROM unit_signature_metadata AS metadata
+                     JOIN code_units AS units
+                       ON units.blob_oid = metadata.blob_oid
+                      AND units.lang = metadata.lang
+                     AND units.unit_key = metadata.unit_key
+                     WHERE units.blob_oid = ?1
+                       AND units.lang = 'ruby'
+                       AND units.exact_fqn = ?2
+                       AND units.kind = ?3
+                       AND units.short_name = ?4
+                       AND units.signature IS ?5
+                       AND units.synthetic = ?6
+                     ORDER BY metadata.ordinal
+                     LIMIT 1",
+                    params![
+                        oid.to_string(),
+                        target.fq_name(),
+                        code_unit_kind_to_i64(target.kind()),
+                        target.short_name(),
+                        target.signature(),
+                        bool_to_i64(target.is_synthetic()),
+                    ],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE unit_signature_metadata
+                     SET metadata = zeroblob(?3)
+                     WHERE blob_oid = ?1
+                       AND lang = 'ruby'
+                       AND unit_key = ?2
+                       AND ordinal = 0",
+                    params![
+                        oid.to_string(),
+                        unit_key,
+                        i64::try_from(oversized_len).unwrap()
+                    ],
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT length(metadata)
+                     FROM unit_signature_metadata
+                     WHERE blob_oid = ?1
+                       AND lang = 'ruby'
+                       AND unit_key = ?2
+                       AND ordinal = 0",
+                    params![oid.to_string(), unit_key],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+                oversized_len
+            );
+        }
 
-        let joined_plan = explain(
-            signature_metadata_for_unit_limited_sql(),
-            &["oid-a", "java", "a.B", "1", "B", "sig", "0", "10"],
+        assert!(
+            store
+                .usage_fact_rows_by_lang("ruby")
+                .unwrap_err()
+                .to_string()
+                .contains("signature metadata blob exceeds"),
+            "usage-fact projection must reject the oversized row without materializing it"
         );
         assert!(
-            joined_plan
-                .iter()
-                .any(|detail| detail.contains("SEARCH metadata USING PRIMARY KEY")),
-            "the joined reader must seek the primary key: {joined_plan:#?}"
+            store
+                .hydrate_file_state_with_source(
+                    oid,
+                    "ruby",
+                    generation,
+                    &RubyAdapter,
+                    &file,
+                    &source,
+                )
+                .unwrap()
+                .is_none(),
+            "full hydration must skip the oversized row and fail its side-table count"
         );
         assert!(
-            joined_plan.iter().all(|detail| !detail.contains("SCAN")),
-            "the joined reader must not scan any table: {joined_plan:#?}"
+            !store
+                .hydrate_file_states(
+                    &[(file.clone(), oid)],
+                    "ruby",
+                    &RubyAdapter,
+                    &HashMap::from_iter([(file.clone(), source)]),
+                )
+                .unwrap()
+                .contains_key(&file),
+            "bulk hydration must skip the oversized row and fail its side-table count"
         );
+        let limited = store
+            .signature_metadata_for_unit_limited(oid, "ruby", generation, &target, usize::MAX)
+            .unwrap();
+        assert!(!limited.complete);
+        assert!(limited.rows.is_empty());
+        assert_eq!(limited.inspected, 1);
     }
 
     #[test]
@@ -13144,142 +12567,6 @@ mod tests {
         let oid = oid_for(state.source.as_bytes());
         let store = AnalyzerStore::open_in_memory().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_sentinel_class_before_member_callable();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
-        );
-    }
-
-    #[test]
-    fn cpp_namespaced_plain_fragment_boundary_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "types.h",
-            "#define DEPRECATED(message)\n\
-             namespace demo {\n\
-             struct Base {\n\
-             int legacy() const DEPRECATED(\"use replacement\") { return 1; }\n\
-             int replacement() const;\n\
-             };\n\
-             struct Derived : Base {};\n\
-             }\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_namespaced_plain_fragment_boundary();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
-        );
-    }
-
-    #[test]
-    fn cpp_templated_plain_fragment_ownership_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "particle_tile.h",
-            "namespace demo {\n\
-             template <class T> struct ParticleTile {\n\
-             using Alias = T;\n\
-             Alias get() const;\n\
-             };\n\
-             }\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_templated_plain_fragment_ownership();
-        let prior_generation = store
-            .ensure_language_epoch_value("cpp", &prior_epoch)
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(
-                oid,
-                "cpp",
-                prior_generation,
-                &CppAdapter,
-                state.as_ref(),
-            )
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
-
-        let current_generation = store
-            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
-            .unwrap();
-
-        assert_ne!(current_generation, prior_generation);
-        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
-        assert_eq!(
-            store
-                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
-                .unwrap(),
-            vec![(oid, "cpp".to_string())]
-        );
-    }
-
-    #[test]
-    fn cpp_macro_displaced_callable_name_epoch_invalidates_prior_parsed_blobs() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "real_box.h",
-            "class RealBox {\n\
-             public:\n\
-             [[nodiscard]] AMREX_GPU_HOST_DEVICE\n\
-             Real hi(int dir) const noexcept { return dir; }\n\
-             };\n",
-        );
-        let state = Arc::new(parse_state(&CppAdapter, &file));
-        let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
-        let prior_epoch = epoch::cpp_epoch_before_macro_displaced_callable_name();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
             .unwrap();
@@ -15764,7 +15051,6 @@ mod tests {
             test_region_units: parsed.test_region_units,
             materialization_records: parsed.materialization_records,
             parse_errors: Some(Vec::new()),
-            parse_complete: true,
         }
     }
 

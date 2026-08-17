@@ -1,8 +1,7 @@
 import { RQL_POLICY_LANGUAGE_ID } from "./rql_validation";
 
 export const RUN_RQL_POLICY_METHOD = "bifrost/runPolicy";
-export const SUPPORTED_POLICY_REPORT_SCHEMA_VERSION = 4;
-export const SUPPORTED_POLICY_DISPLAY_PATH_SCHEMA_VERSION = 1;
+export const SUPPORTED_POLICY_REPORT_SCHEMA_VERSION = 3;
 
 export interface RqlPolicyDocument {
   languageId: string;
@@ -23,26 +22,6 @@ export interface PolicySourceLocation {
   byte_span?: { start: number; end: number } | null;
 }
 
-export type PolicyDisplayStepKind = "source" | "propagation" | "call" | "return" | "sink";
-
-export interface PolicyDisplayStep {
-  kind: PolicyDisplayStepKind;
-  location: PolicySourceLocation;
-  label: string;
-}
-
-export interface PolicyDisplayPath {
-  schema_version: 1;
-  representative_witness_id: string;
-  witness_ids: string[];
-  steps: PolicyDisplayStep[];
-  canonical_incomplete: boolean;
-  omitted_meaningful_steps: number;
-  alternatives_truncated: boolean;
-  omitted_alternative_paths_lower_bound: number;
-  omitted_witnesses_lower_bound: number;
-}
-
 export type PolicyRunCompletion =
   | { type: "complete" }
   | { type: "proven_subset"; codes: readonly unknown[] }
@@ -56,7 +35,6 @@ export interface PolicyFinding {
   severity: string;
   message: string;
   primary: PolicySourceLocation;
-  display_path?: PolicyDisplayPath;
   suppression: PolicyFindingSuppression | null;
   evidence?: unknown;
   proof?: unknown;
@@ -166,7 +144,7 @@ export interface PolicyReportDiagnostic {
 }
 
 export interface PolicyReport {
-  schema_version: 4;
+  schema_version: 3;
   evaluation: PolicyReportEvaluation;
   execution: PolicyExecutionMetadata;
   rules: PolicyRule[];
@@ -432,7 +410,6 @@ export function policyFindingDetail(finding: PolicyFinding): string {
       severity: finding.severity,
       message: finding.message,
       location: finding.primary,
-      display_path: finding.display_path,
       suppression: finding.suppression,
       terminal: policyFindingTerminalSymbol(finding),
       evidence: finding.evidence,
@@ -443,10 +420,6 @@ export function policyFindingDetail(finding: PolicyFinding): string {
     null,
     2
   );
-}
-
-export function policyFindingDisplayRows(finding: PolicyFinding): readonly PolicyDisplayStep[] {
-  return finding.display_path?.steps ?? [];
 }
 
 export function policyLocationRange(location: PolicySourceLocation): PolicyEditorRange | undefined {
@@ -527,74 +500,9 @@ function isPolicyFinding(value: unknown): value is PolicyFinding {
     typeof value.policy_id === "string" &&
     typeof value.severity === "string" &&
     typeof value.message === "string" &&
-    (value.display_path === undefined || isPolicyDisplayPath(value.display_path)) &&
     (value.suppression === null || isPolicyFindingSuppression(value.suppression)) &&
     isPolicyLocation(value.primary)
   );
-}
-
-function isPolicyDisplayPath(value: unknown): value is PolicyDisplayPath {
-  return (
-    isRecord(value) &&
-    value.schema_version === SUPPORTED_POLICY_DISPLAY_PATH_SCHEMA_VERSION &&
-    typeof value.representative_witness_id === "string" &&
-    value.representative_witness_id.length > 0 &&
-    Array.isArray(value.witness_ids) &&
-    value.witness_ids.length > 0 &&
-    value.witness_ids.every((id) => typeof id === "string" && id.length > 0) &&
-    value.witness_ids.includes(value.representative_witness_id) &&
-    Array.isArray(value.steps) &&
-    value.steps.length > 0 &&
-    value.steps.every(isPolicyDisplayStep) &&
-    typeof value.canonical_incomplete === "boolean" &&
-    isNonNegativeInteger(value.omitted_meaningful_steps) &&
-    typeof value.alternatives_truncated === "boolean" &&
-    isNonNegativeInteger(value.omitted_alternative_paths_lower_bound) &&
-    isNonNegativeInteger(value.omitted_witnesses_lower_bound) &&
-    value.alternatives_truncated === value.omitted_witnesses_lower_bound > 0
-  );
-}
-
-function isPolicyDisplayStep(value: unknown): value is PolicyDisplayStep {
-  return (
-    isRecord(value) &&
-    isPolicyDisplayStepKind(value.kind) &&
-    isPrecisePolicyLocation(value.location) &&
-    typeof value.label === "string" &&
-    value.label.length > 0
-  );
-}
-
-function isPrecisePolicyLocation(value: unknown): value is PolicySourceLocation {
-  if (!isPolicyLocation(value) || !isRecord(value.region)) {
-    return false;
-  }
-  const { start_line, start_column, end_line, end_column } = value.region;
-  return (
-    isPositiveInteger(start_line) &&
-    isPositiveInteger(start_column) &&
-    isPositiveInteger(end_line) &&
-    isPositiveInteger(end_column) &&
-    (start_line < end_line || (start_line === end_line && start_column <= end_column))
-  );
-}
-
-function isPolicyDisplayStepKind(value: unknown): value is PolicyDisplayStepKind {
-  return (
-    value === "source" ||
-    value === "propagation" ||
-    value === "call" ||
-    value === "return" ||
-    value === "sink"
-  );
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0;
-}
-
-function isPositiveInteger(value: unknown): value is number {
-  return isNonNegativeInteger(value) && value > 0;
 }
 
 function isPolicyReportEvaluation(value: unknown): value is PolicyReportEvaluation {
