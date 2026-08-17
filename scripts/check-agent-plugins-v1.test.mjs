@@ -99,10 +99,16 @@ async function withFixture(run) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agent-plugins-v1-test-"));
   try {
     await fs.mkdir(path.join(directory, "skills", "sample"), { recursive: true });
+    await fs.mkdir(path.join(directory, ".codex-plugin"), { recursive: true });
     await fs.mkdir(path.join(directory, ".cursor-plugin"), { recursive: true });
     await fs.writeFile(path.join(directory, "skills", "sample", "SKILL.md"), "---\nname: sample\n---\n");
     await fs.writeFile(path.join(directory, "plugin.json"), `${JSON.stringify(pluginManifest(), null, 2)}\n`);
     await fs.writeFile(path.join(directory, "mcp.json"), `${JSON.stringify(portableMcp(), null, 2)}\n`);
+    await fs.writeFile(
+      path.join(directory, ".codex-plugin", "plugin.json"),
+      `${JSON.stringify(codexManifest(), null, 2)}\n`,
+    );
+    await fs.writeFile(path.join(directory, ".mcp.json"), `${JSON.stringify(codexMcp(), null, 2)}\n`);
     await fs.writeFile(
       path.join(directory, ".cursor-plugin", "plugin.json"),
       `${JSON.stringify({ mcpServers: "./cursor-mcp.json" }, null, 2)}\n`,
@@ -136,6 +142,34 @@ function portableMcp() {
         type: "stdio",
         command: "./bin/bifrost-launcher.mjs",
         args: ["--mcp", "symbol|extended"],
+      },
+    },
+  };
+}
+
+function codexManifest() {
+  return {
+    name: "brokk",
+    version,
+    description: "Test Codex adapter.",
+    author: { name: "Brokk", url: "https://brokk.ai" },
+    homepage: "https://brokk.ai",
+    repository: "https://github.com/BrokkAi/bifrost",
+    license: "Apache-2.0",
+    keywords: ["bifrost"],
+    mcpServers: "./.mcp.json",
+  };
+}
+
+function codexMcp() {
+  return {
+    mcpServers: {
+      bifrost: {
+        command: "./bin/bifrost-launcher.mjs",
+        cwd: ".",
+        args: ["--mcp", "symbol|extended"],
+        startup_timeout_sec: 180,
+        tool_timeout_sec: 300,
       },
     },
   };

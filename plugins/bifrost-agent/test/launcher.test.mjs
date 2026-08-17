@@ -540,6 +540,49 @@ printf '%s\\n' "$@" > "${recordPath}"
   assert.equal(command.startsWith(repoRoot), true);
 });
 
+test("Codex adapter selects package-root launcher from its host-specific manifest", async () => {
+  if (process.platform === "win32") {
+    return;
+  }
+  const temp = await fsp.mkdtemp(path.join(os.tmpdir(), "bifrost-launcher-test-"));
+  const workspace = path.join(temp, "workspace");
+  const recordPath = path.join(temp, "args.txt");
+  const stubBinary = path.join(temp, "bifrost-stub");
+  const metadata = await readReleaseMetadata(path.join(packageDir, "bifrost-release.json"));
+  await fsp.mkdir(workspace);
+  await writeExecutableFixture(stubBinary, `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "bifrost ${metadata.binaryVersion}"
+  exit 0
+fi
+printf '%s\\n' "$@" > "${recordPath}"
+`);
+
+  const codexManifest = JSON.parse(
+    await fsp.readFile(path.join(packageDir, ".codex-plugin", "plugin.json"), "utf8"),
+  );
+  assert.equal(codexManifest.mcpServers, "./.mcp.json");
+  const codexMcp = JSON.parse(await fsp.readFile(path.join(packageDir, ".mcp.json"), "utf8"));
+  const server = codexMcp.mcpServers.bifrost;
+  const installedPackageRoot = path.resolve(packageDir, server.cwd);
+  const command = path.resolve(installedPackageRoot, server.command);
+  await execFileAsync(command, server.args, {
+    cwd: workspace,
+    env: {
+      ...process.env,
+      BIFROST_BINARY_PATH: stubBinary,
+      BIFROST_LAUNCHER_AUTO_INSTALL: "0"
+    }
+  });
+
+  assert.deepEqual(
+    (await fsp.readFile(recordPath, "utf8")).trim().split(/\r?\n/),
+    ["--mcp", "symbol|extended"]
+  );
+  assert.equal(installedPackageRoot, packageDir);
+  assert.equal(command, path.join(packageDir, "bin", "bifrost-launcher.mjs"));
+});
+
 test("Claude MCP manifest resolves the launcher from the installed plugin outside the workspace", async () => {
   if (process.platform === "win32") {
     return;

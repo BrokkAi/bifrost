@@ -132,8 +132,8 @@ That script updates these committed version fields and compatibility bounds:
 - the exclusive Bifrost compatibility upper bound in shipped semantic-pack
   specifications and Bifrost-owned framework, golden, and sanitizer foundry
   sources; other pack metadata and lower bounds remain unchanged
-- `plugins/bifrost-agent/plugin.json`
 - `plugins/bifrost-agent/.claude-plugin/plugin.json`
+- `plugins/bifrost-agent/.codex-plugin/plugin.json`
 - `plugins/bifrost-agent/.cursor-plugin/plugin.json`
 - `plugins/bifrost-agent/plugin.json`
 - `.cursor-plugin/marketplace.json`
@@ -198,10 +198,10 @@ To cut a release:
    node --test plugins/bifrost-agent/test/*.test.mjs
    ```
 
-   `check-agent-plugins-v1.mjs` checks the portable root `plugin.json` and
-   `mcp.json`. `check-codex-plugin-manifest.mjs` checks the portable package,
-   Claude, Cursor, and Pi adapters, the Cursor marketplace versions, and the
-   release metadata. Run both after
+  `check-agent-plugins-v1.mjs` checks the portable root files, the Codex
+  package adapter, and the Cursor adapter. `check-codex-plugin-manifest.mjs`
+  checks the portable package, Codex, Claude, Cursor, and Pi adapters, the
+  Cursor marketplace versions, and the release metadata. Run both after
    the release metadata has been prepared for the version being validated.
 5. Before you create the final tag, treat the RC commit as green only after its
    required branch checks and these release-specific checks pass:

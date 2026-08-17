@@ -27,11 +27,11 @@ const binaryPath = options.binaryPath
   : null;
 await assertEmptyCache(cacheDir);
 
-const portableLaunch = await resolvePortablePluginLaunch(pluginDir);
+const codexLaunch = await resolveCodexPluginLaunch(pluginDir);
 
-await smokeLaunch("portable Agent Plugins v1 package", portableLaunch, path.join(cacheDir, "portable"));
+await smokeLaunch("Codex Agent Plugins adapter", codexLaunch, path.join(cacheDir, "codex"));
 console.log(
-  `Portable Agent Plugins v1 package passed launcher resolution, the recorded Codex ${recordedCodexVersion} ` +
+  `Codex Agent Plugins adapter passed launcher resolution, the recorded Codex ${recordedCodexVersion} ` +
   "handshake replay, and the MCP roots smoke."
 );
 
@@ -138,6 +138,44 @@ async function resolvePortablePluginLaunch(pluginRoot) {
   const command = path.resolve(pluginRoot, server.command);
   await fs.access(command);
   return { command, cwd: pluginRoot, args: server.args, manifestPath, mcpConfigPath };
+}
+
+async function resolveCodexPluginLaunch(pluginRoot) {
+  const manifestPath = path.join(pluginRoot, ".codex-plugin", "plugin.json");
+  const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+  assert.equal(
+    manifest.name,
+    "brokk",
+    `${manifestPath} must use Codex's stable package name`
+  );
+  assert.equal(
+    manifest.mcpServers,
+    "./.mcp.json",
+    `${manifestPath} must select Codex's package adapter`
+  );
+  const mcpConfigPath = path.join(pluginRoot, ".mcp.json");
+  const mcpConfig = JSON.parse(await fs.readFile(mcpConfigPath, "utf8"));
+  const server = mcpConfig.mcpServers?.bifrost;
+  assert.ok(server, `${mcpConfigPath} must define the bifrost MCP server`);
+  assert.equal(
+    server.command,
+    "./bin/bifrost-launcher.mjs",
+    `${mcpConfigPath} must resolve the package-local launcher`
+  );
+  assert.equal(server.cwd, ".", `${mcpConfigPath} must resolve cwd from the package root`);
+  assert.deepEqual(server.args, ["--mcp", "symbol|extended"]);
+  assert.equal(server.startup_timeout_sec, 180);
+  assert.equal(server.tool_timeout_sec, 300);
+  const installedPackageRoot = path.resolve(pluginRoot, server.cwd);
+  const command = path.resolve(installedPackageRoot, server.command);
+  await fs.access(command);
+  return {
+    command,
+    cwd: pluginRoot,
+    args: server.args,
+    manifestPath,
+    mcpConfigPath,
+  };
 }
 
 async function assertEmptyCache(directory) {

@@ -21,6 +21,7 @@ const releaseVersionScript = path.resolve(testDir, "../../../scripts/release-ver
 
 const jsonProjections = [
   "plugins/bifrost-agent/.claude-plugin/plugin.json",
+  "plugins/bifrost-agent/.codex-plugin/plugin.json",
   "plugins/bifrost-agent/.cursor-plugin/plugin.json",
   "plugins/bifrost-agent/plugin.json",
   ".cursor-plugin/marketplace.json",
@@ -327,6 +328,7 @@ async function createFixture(cargoVersion, projectionVersion, lineEnding) {
 
   const values = new Map([
     ["plugins/bifrost-agent/.claude-plugin/plugin.json", basicPlugin],
+    ["plugins/bifrost-agent/.codex-plugin/plugin.json", basicPlugin],
     ["plugins/bifrost-agent/.cursor-plugin/plugin.json", basicPlugin],
     ["plugins/bifrost-agent/plugin.json", basicPlugin],
     [".cursor-plugin/marketplace.json", marketplace],
