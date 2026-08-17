@@ -268,6 +268,47 @@ npm. This npm CLI package is separate from the `@brokk/bifrost-agent` Pi
 package. The npm workflow uses the `npm-publish` environment and npm trusted
 publishing. It does not use a stored npm token.
 
+### Post-release agent-plugin smoke
+
+After the GitHub Release exposes the agent-plugin archive and the platform
+Bifrost archives plus their `.sha256` sidecars, run the consumer smoke from a
+clean checkout using the exact published version:
+
+```bash
+node scripts/smoke-published-agent-plugin.mjs --version 0.10.1
+```
+
+The command downloads `bifrost-agent-v<version>.tar.gz` away from the checkout,
+extracts it, and creates a fresh launcher cache. It then prepares the preferred
+binary with path lookup disabled (therefore exercising the published archive
+and checksum sidecar), runs `doctor` in exact-version mode, and makes an actual
+MCP `list_policies` call through both the published Codex and Claude adapter
+configs. It also checks the exact release tag's Codex and Claude marketplace
+entries, so a missing public marketplace cannot hide behind a valid package
+archive. It does not modify Codex or Claude configuration, start a model
+session, or require host API credentials. The smoke runs for the current
+platform; run it on each supported release platform when platform-specific
+archive coverage is required. The two MCP calls exercise the exact host
+adapter launch configurations without pretending to validate a host's current
+user session; after a pass, a fresh Codex/Claude task can be used for any
+credentialed model-level check.
+
+For a release asset downloaded separately, pass it explicitly:
+
+```bash
+node scripts/smoke-published-agent-plugin.mjs \
+  --version 0.10.1 \
+  --archive /path/to/bifrost-agent-v0.10.1.tar.gz \
+  --keep-temp
+```
+
+`--keep-temp` preserves the isolated archive, extracted package, launcher
+cache, and workspace for diagnosis. A checksum failure means the published
+release metadata and sidecar do not describe the same archive; an adapter
+failure means the plugin is present but its MCP server was not callable. Treat
+either result as a release incident and do not claim that the policy-checking
+skill is usable until a fresh run reports both adapter calls passed.
+
 `publish-crate.yml` and `build-wheels.yml` are reusable children of that parent
 workflow; they are not independently dispatchable. Wheel publication runs as
 the `publish-wheels` job inside `release.yml`. Each stage receives the same tag,
