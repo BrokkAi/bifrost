@@ -430,6 +430,32 @@ test("an always-run summary names targets and safe retry guidance", () => {
   }
 });
 
+test("the summary separates the qualified source from the mutable workflow source", () => {
+  const summary = jobBlock(release, "release-summary");
+  assert.match(summary, /Qualified release source \(immutable\)/u);
+  assert.match(summary, /Mutable workflow definition source/u);
+  assert.match(summary, /QUALIFICATION_RUN_ID: \$\{\{ needs\.promote-qualification\.outputs\.run_id \}\}/u);
+  assert.match(
+    summary,
+    /QUALIFICATION_ARTIFACT_DIGEST: \$\{\{ needs\.promote-qualification\.outputs\.artifact_digest \}\}/u,
+  );
+  assert.match(
+    summary,
+    /QUALIFICATION_MANIFEST_SHA256: \$\{\{ needs\.promote-qualification\.outputs\.manifest_sha256 \}\}/u,
+  );
+  assert.match(summary, /WORKFLOW_SOURCE_SHA: \$\{\{ github\.workflow_sha \}\}/u);
+  assert.match(summary, /NPM_CHILD_RUN_ID: \$\{\{ needs\.publish-npm\.outputs\.child_run_id \}\}/u);
+  assert.match(
+    summary,
+    /must never change the qualified section/u,
+    "the summary states that recovery may move only the mutable workflow source",
+  );
+  const npmDispatch = jobBlock(release, "publish-npm");
+  assert.match(npmDispatch, /^      child_run_id: \$\{\{ steps\.dispatch\.outputs\.run_id \}\}$/mu);
+  assert.match(publishNpm, /npm publication provenance/u);
+  assert.match(publishNpm, /WORKFLOW_SOURCE_SHA: \$\{\{ github\.workflow_sha \}\}/u);
+});
+
 readinessTest("release readiness is manually dispatched for an exact public commit", () => {
   assert.match(readiness, /^  workflow_dispatch:\n/mu);
   assert.match(readiness, /public[_-]commit:/iu);

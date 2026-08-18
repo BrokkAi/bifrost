@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "bifrost": {
+      "command": "./bin/bifrost-launcher.mjs",
+      "cwd": ".",
+      "args": [
+        "--mcp",
+        "symbol|extended"
+      ],
+      "startup_timeout_sec": 180,
+      "tool_timeout_sec": 300
+    }
+  }
+}

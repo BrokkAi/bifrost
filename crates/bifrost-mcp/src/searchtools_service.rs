@@ -1292,9 +1292,11 @@ impl SearchToolsService {
     pub fn new_manual_for_project(project: Arc<dyn Project>) -> Result<Self, String> {
         let root = project.root().to_path_buf();
         let watcher_starter = production_watcher_starter();
-        let workspace =
-            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
-                .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
+        let workspace = WorkspaceAnalyzer::build_persisted_for_service(
+            Arc::clone(&project),
+            AnalyzerConfig::default(),
+        )
+        .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
         let session = assemble_session(
             project,
             workspace,

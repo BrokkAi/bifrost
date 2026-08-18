@@ -214,3 +214,27 @@ jobs:
             --dist "$RUNNER_TEMP/npm-qualified" \
             --release-tag "$RELEASE_TAG" \
             --yes-publish
+
+      - name: Record qualified source and workflow definition source
+        env:
+          WORKFLOW_SOURCE_REF: ${{ github.ref_name }}
+          WORKFLOW_SOURCE_SHA: ${{ github.workflow_sha }}
+        shell: bash
+        run: |
+          {
+            echo "## npm publication provenance"
+            echo
+            echo "### Qualified release source (immutable)"
+            echo
+            echo "- Tag: \`$RELEASE_TAG\` at commit \`$RELEASE_COMMIT\`"
+            echo "- Readiness run: \`$QUALIFICATION_RUN_ID\` (attempt \`$QUALIFICATION_RUN_ATTEMPT\`)"
+            echo "- Qualification artifact: \`$QUALIFICATION_ARTIFACT_ID\`"
+            echo "- Artifact digest: \`$QUALIFICATION_ARTIFACT_DIGEST\`"
+            echo "- Manifest SHA-256: \`$QUALIFICATION_MANIFEST_SHA256\`"
+            echo
+            echo "### Mutable workflow definition source"
+            echo
+            echo "- This run's workflow definition: \`$WORKFLOW_SOURCE_REF\` at \`$WORKFLOW_SOURCE_SHA\`"
+            echo
+            echo "A workflow-only recovery may change the workflow definition source; the published bytes come only from the qualified section above."
+          } >> "$GITHUB_STEP_SUMMARY"

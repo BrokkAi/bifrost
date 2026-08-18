@@ -126,12 +126,12 @@ jobs:
           {
             echo "## Qualification selected"
             echo
-            echo "- Tag: `$RELEASE_TAG`"
-            echo "- Version: `$RELEASE_VERSION`"
-            echo "- Commit: `$RELEASE_COMMIT`"
-            echo "- Readiness run: `$run_id` (attempt `$run_attempt`)"
-            echo "- Artifact: `$artifact_name` (`$artifact_id`)"
-            echo "- Artifact digest: `$artifact_digest`"
+            echo "- Tag: \`$RELEASE_TAG\`"
+            echo "- Version: \`$RELEASE_VERSION\`"
+            echo "- Commit: \`$RELEASE_COMMIT\`"
+            echo "- Readiness run: \`$run_id\` (attempt \`$run_attempt\`)"
+            echo "- Artifact: \`$artifact_name\` (\`$artifact_id\`)"
+            echo "- Artifact digest: \`$artifact_digest\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   promote-qualification:
@@ -210,10 +210,10 @@ jobs:
           {
             echo "## Qualification bytes verified"
             echo
-            echo "- Manifest: `qualification/release-qualification.json`"
-            echo "- Manifest SHA-256: `$manifest_sha256`"
-            echo "- Artifact ID: `$QUALIFICATION_ARTIFACT_ID`"
-            echo "- Artifact digest: `$QUALIFICATION_ARTIFACT_DIGEST`"
+            echo "- Manifest: \`qualification/release-qualification.json\`"
+            echo "- Manifest SHA-256: \`$manifest_sha256\`"
+            echo "- Artifact ID: \`$QUALIFICATION_ARTIFACT_ID\`"
+            echo "- Artifact digest: \`$QUALIFICATION_ARTIFACT_DIGEST\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   release:
@@ -402,6 +402,8 @@ jobs:
     permissions:
       contents: read
       actions: write
+    outputs:
+      child_run_id: ${{ steps.dispatch.outputs.run_id }}
     env:
       RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
       RELEASE_VERSION: ${{ needs.release-context.outputs.version }}
@@ -1001,15 +1003,22 @@ jobs:
       VERSION: ${{ needs.release-context.outputs.version }}
       COMMIT: ${{ needs.release-context.outputs.commit }}
       QUALIFICATION: ${{ needs.promote-qualification.result }}
+      QUALIFICATION_RUN_ID: ${{ needs.promote-qualification.outputs.run_id }}
+      QUALIFICATION_ARTIFACT_ID: ${{ needs.promote-qualification.outputs.artifact_id }}
+      QUALIFICATION_ARTIFACT_DIGEST: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      QUALIFICATION_MANIFEST_SHA256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
       GITHUB_RELEASE: ${{ needs.release.result }}
       CRATE_FACADE: ${{ needs.publish-crate-facade.result }}
       PYPI: ${{ needs.publish-wheels.result }}
       NPM: ${{ needs.publish-npm.result }}
+      NPM_CHILD_RUN_ID: ${{ needs.publish-npm.outputs.child_run_id }}
       AGENT: ${{ needs.publish-agent-plugin.result }}
       PI: ${{ needs.publish-pi-package.result }}
       VSCODE: ${{ needs.publish-vscode.result }}
       OPEN_VSX: ${{ needs.publish-open-vsx.result }}
       POST_RELEASE_SMOKE: ${{ needs.post-release-smoke.result }}
+      WORKFLOW_SOURCE_REF: ${{ github.ref_name }}
+      WORKFLOW_SOURCE_SHA: ${{ github.workflow_sha }}
     steps:
       - name: Record promotion outcomes and recovery guidance
         shell: bash
@@ -1017,19 +1026,34 @@ jobs:
           {
             echo "## Release promotion summary"
             echo
-            echo "- Tag: `$TAG`"
-            echo "- Version: `$VERSION`"
-            echo "- Commit: `$COMMIT`"
-            echo "- Qualification verification: `$QUALIFICATION`"
-            echo "- GitHub Release: `$GITHUB_RELEASE`"
-            echo "- crates.io facade (all crate jobs preserve dependency ordering): `$CRATE_FACADE`"
-            echo "- PyPI: `$PYPI`"
-            echo "- npm: `$NPM`"
-            echo "- Agent asset: `$AGENT`"
-            echo "- Pi asset: `$PI`"
-            echo "- Visual Studio Marketplace: `$VSCODE`"
-            echo "- Open VSX: `$OPEN_VSX`"
-            echo "- Post-release smoke: `$POST_RELEASE_SMOKE`"
+            echo "- Tag: \`$TAG\`"
+            echo "- Version: \`$VERSION\`"
+            echo "- Commit: \`$COMMIT\`"
+            echo "- Qualification verification: \`$QUALIFICATION\`"
+            echo "- GitHub Release: \`$GITHUB_RELEASE\`"
+            echo "- crates.io facade (all crate jobs preserve dependency ordering): \`$CRATE_FACADE\`"
+            echo "- PyPI: \`$PYPI\`"
+            echo "- npm: \`$NPM\`"
+            echo "- Agent asset: \`$AGENT\`"
+            echo "- Pi asset: \`$PI\`"
+            echo "- Visual Studio Marketplace: \`$VSCODE\`"
+            echo "- Open VSX: \`$OPEN_VSX\`"
+            echo "- Post-release smoke: \`$POST_RELEASE_SMOKE\`"
+            echo
+            echo "### Qualified release source (immutable)"
+            echo
+            echo "- Qualified commit: \`$COMMIT\`"
+            echo "- Readiness run: \`$QUALIFICATION_RUN_ID\`"
+            echo "- Qualification artifact: \`$QUALIFICATION_ARTIFACT_ID\`"
+            echo "- Artifact digest: \`$QUALIFICATION_ARTIFACT_DIGEST\`"
+            echo "- Manifest SHA-256: \`$QUALIFICATION_MANIFEST_SHA256\`"
+            echo
+            echo "### Mutable workflow definition source"
+            echo
+            echo "- Release workflow ref: \`$WORKFLOW_SOURCE_REF\` at \`$WORKFLOW_SOURCE_SHA\`"
+            echo "- npm child run (definition from public master): \`$NPM_CHILD_RUN_ID\`"
+            echo
+            echo "A workflow-only recovery may change this mutable section on a retry; it must never change the qualified section above."
             echo
             echo "A retry must reuse the same tag, qualified commit, readiness run, artifact ID, and manifest digest. A different checksum is an incident and is never overwritten."
           } >> "$GITHUB_STEP_SUMMARY"

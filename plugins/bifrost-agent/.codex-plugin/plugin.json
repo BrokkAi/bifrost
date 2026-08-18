@@ -1,0 +1,19 @@
+{
+  "name": "brokk",
+  "version": "0.10.3",
+  "description": "Multi-language code intelligence and Brokk/Bifrost engineering workflows.",
+  "author": {
+    "name": "Brokk",
+    "url": "https://brokk.ai"
+  },
+  "homepage": "https://github.com/BrokkAi/bifrost",
+  "repository": "https://github.com/BrokkAi/bifrost",
+  "license": "Apache-2.0",
+  "keywords": [
+    "bifrost",
+    "mcp",
+    "code-intelligence",
+    "tree-sitter"
+  ],
+  "mcpServers": "./.mcp.json"
+}

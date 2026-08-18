@@ -132,8 +132,8 @@ That script updates these committed version fields and compatibility bounds:
 - the exclusive Bifrost compatibility upper bound in shipped semantic-pack
   specifications and Bifrost-owned framework, golden, and sanitizer foundry
   sources; other pack metadata and lower bounds remain unchanged
-- `plugins/bifrost-agent/plugin.json`
 - `plugins/bifrost-agent/.claude-plugin/plugin.json`
+- `plugins/bifrost-agent/.codex-plugin/plugin.json`
 - `plugins/bifrost-agent/.cursor-plugin/plugin.json`
 - `plugins/bifrost-agent/plugin.json`
 - `.cursor-plugin/marketplace.json`
@@ -202,10 +202,10 @@ To cut a release:
    node --test plugins/bifrost-agent/test/*.test.mjs
    ```
 
-   `check-agent-plugins-v1.mjs` checks the portable root `plugin.json` and
-   `mcp.json`. `check-codex-plugin-manifest.mjs` checks the portable package,
-   Claude, Cursor, and Pi adapters, the Cursor marketplace versions, and the
-   release metadata. Run both after
+  `check-agent-plugins-v1.mjs` checks the portable root files, the Codex
+  package adapter, and the Cursor adapter. `check-codex-plugin-manifest.mjs`
+  checks the portable package, Codex, Claude, Cursor, and Pi adapters, the
+  Cursor marketplace versions, and the release metadata. Run both after
    the release metadata has been prepared for the version being validated.
 6. Before you create the final tag, treat the RC commit as green only after its
    required branch checks and these release-specific checks pass:
@@ -271,6 +271,47 @@ publishes `@brokkai/bifrost` only after all platform versions are visible from
 npm. This npm CLI package is separate from the `@brokk/bifrost-agent` Pi
 package. The npm workflow uses the `npm-publish` environment and npm trusted
 publishing. It does not use a stored npm token.
+
+### Post-release agent-plugin smoke
+
+After the GitHub Release exposes the agent-plugin archive and the platform
+Bifrost archives plus their `.sha256` sidecars, run the consumer smoke from a
+clean checkout using the exact published version:
+
+```bash
+node scripts/smoke-published-agent-plugin.mjs --version 0.10.1
+```
+
+The command downloads `bifrost-agent-v<version>.tar.gz` away from the checkout,
+extracts it, and creates a fresh launcher cache. It then prepares the preferred
+binary with path lookup disabled (therefore exercising the published archive
+and checksum sidecar), runs `doctor` in exact-version mode, and makes an actual
+MCP `list_policies` call through both the published Codex and Claude adapter
+configs. It also checks the exact release tag's Codex and Claude marketplace
+entries, so a missing public marketplace cannot hide behind a valid package
+archive. It does not modify Codex or Claude configuration, start a model
+session, or require host API credentials. The smoke runs for the current
+platform; run it on each supported release platform when platform-specific
+archive coverage is required. The two MCP calls exercise the exact host
+adapter launch configurations without pretending to validate a host's current
+user session; after a pass, a fresh Codex/Claude task can be used for any
+credentialed model-level check.
+
+For a release asset downloaded separately, pass it explicitly:
+
+```bash
+node scripts/smoke-published-agent-plugin.mjs \
+  --version 0.10.1 \
+  --archive /path/to/bifrost-agent-v0.10.1.tar.gz \
+  --keep-temp
+```
+
+`--keep-temp` preserves the isolated archive, extracted package, launcher
+cache, and workspace for diagnosis. A checksum failure means the published
+release metadata and sidecar do not describe the same archive; an adapter
+failure means the plugin is present but its MCP server was not callable. Treat
+either result as a release incident and do not claim that the policy-checking
+skill is usable until a fresh run reports both adapter calls passed.
 
 `publish-crate.yml` and `build-wheels.yml` are reusable children of that parent
 workflow; they are not independently dispatchable. Wheel publication runs as
@@ -407,6 +448,39 @@ evidence that those publisher identities are configured or that publication
 has occurred. A release retry must use the publisher's existing protected
 authentication and the already qualified artifact; it must not upload a new
 artifact for the same version.
+
+### Workflow-only recovery
+
+A workflow-only recovery repairs a defect in the release workflow mechanics
+themselves while the existing qualification remains valid. Its contract:
+
+1. The repair may change only files under `.github/workflows/`. Publisher
+   scripts, packaging code, and Rust sources are checked out from the
+   immutable qualified release commit by the publication jobs, so changing
+   them on public `master` cannot affect an existing tag; such a change needs
+   a new qualification instead.
+2. Land the repair on private `master`, then dispatch **Prepare open-core
+   projection** with `workflow_recovery` set to true and the exact current
+   public head. The projection proves, byte for byte, that the candidate
+   differs from that public head only under `.github/workflows/` and then
+   skips the projected Rust build gate. If anything else changed, the proof
+   step fails and a full projection is required.
+3. A workflow-only recovery does not require a new readiness run or a public
+   CI wait before retrying. The prior immutable qualification (tag commit,
+   readiness run, artifact ID, digest, manifest SHA-256) remains the release
+   evidence. Re-dispatch **Release** with the same tag; the repaired workflow
+   definition comes from public `master` while every publication input stays
+   bound to the qualified artifact.
+4. The release summary records the qualified release source and the mutable
+   workflow definition source separately. A recovery retry may change only
+   the mutable workflow source; a changed qualified identity or checksum is
+   an incident, not a recovery.
+
+The npm trusted-publishing client contract (pinned modern npm, no
+classic-token configuration, cleared `NODE_AUTH_TOKEN`, explicit provenance,
+master-ref child dispatch) is validated before any tag exists by
+`scripts/check-npm-trusted-publishing.mjs`, which runs in the readiness
+preflight and in private CI.
 
 The workflows do not currently claim a fixed duration or speed improvement
 from caching. Any timing target must be measured and recorded by a completed

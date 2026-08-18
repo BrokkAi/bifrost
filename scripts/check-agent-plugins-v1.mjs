@@ -62,6 +62,29 @@ export function validateAgentPluginDirectory(pluginDir, expectedVersion) {
   assert.deepEqual(server?.args, ["--mcp", "symbol|extended"], `${mcpPath} must use the default Bifrost MCP toolset`);
   assert.ok(!server.command.includes("${"), `${mcpPath} must not use a client-specific environment variable`);
 
+  const codexManifestPath = path.join(resolvedPluginDir, ".codex-plugin", "plugin.json");
+  const codexManifest = readJson(codexManifestPath);
+  assert.equal(codexManifest.name, "brokk", `${codexManifestPath} must use Codex's stable package name`);
+  assert.equal(codexManifest.version, expectedVersion, `${codexManifestPath} version must match Cargo.toml`);
+  assert.equal(
+    codexManifest.mcpServers,
+    "./.mcp.json",
+    `${codexManifestPath} must select Codex's package adapter before the portable root MCP file`,
+  );
+  const codexMcpPath = path.join(resolvedPluginDir, ".mcp.json");
+  const codexMcp = readJson(codexMcpPath);
+  const codexServer = codexMcp.mcpServers?.bifrost;
+  assert.equal(
+    codexServer?.command,
+    "./bin/bifrost-launcher.mjs",
+    `${codexMcpPath} must use the package-local launcher`,
+  );
+  assert.equal(codexServer?.cwd, ".", `${codexMcpPath} must resolve cwd from the installed package root`);
+  assert.deepEqual(codexServer?.args, ["--mcp", "symbol|extended"], `${codexMcpPath} must use the default Bifrost MCP toolset`);
+  assert.equal(codexServer?.startup_timeout_sec, 180, `${codexMcpPath} must retain the startup timeout`);
+  assert.equal(codexServer?.tool_timeout_sec, 300, `${codexMcpPath} must retain the tool timeout`);
+  assert.ok(!codexServer.command.includes("${"), `${codexMcpPath} must not use a client-specific environment variable`);
+
   const skillsRoot = path.join(resolvedPluginDir, "skills");
   const skillDirectories = fs.existsSync(skillsRoot)
     ? fs.readdirSync(skillsRoot, { withFileTypes: true })

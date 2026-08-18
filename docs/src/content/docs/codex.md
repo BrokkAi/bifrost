@@ -16,8 +16,12 @@ codex plugin marketplace add BrokkAi/bifrost --sparse .agents/plugins --sparse p
 codex plugin add brokk@bifrost
 ```
 
-The package uses root `plugin.json`, `mcp.json`, and `skills/`. It replaces the
-legacy Codex-only manifest and `.mcp.json` configuration.
+The package keeps root `plugin.json`, `mcp.json`, and `skills/` as the portable
+Agent Plugins v1 fallback. Codex selects the package-specific
+`.codex-plugin/plugin.json`, which points to `.mcp.json`. That adapter resolves
+the launcher from the installed package root and carries Codex's startup and
+tool timeouts; it avoids the workspace-relative command resolution used by the
+portable fallback.
 
 We tested this package with Codex CLI. [VS Code, GitHub Copilot, Kiro, and
 Cursor](https://agent-plugins.org/compatible-clients) support Agent Plugins v1,

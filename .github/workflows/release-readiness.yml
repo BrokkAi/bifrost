@@ -114,6 +114,9 @@ jobs:
       - name: Audit workflow action pins
         run: bash scripts/check-github-actions-security.sh
 
+      - name: Preflight npm trusted-publishing client contract
+        run: node scripts/check-npm-trusted-publishing.mjs
+
   notices:
     name: generate Rust notices
     needs: preflight

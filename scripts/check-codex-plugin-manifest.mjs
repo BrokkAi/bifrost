@@ -22,6 +22,24 @@ if (claudeManifest.version !== cargoVersion) {
   );
 }
 
+const codexManifestPath = "plugins/bifrost-agent/.codex-plugin/plugin.json";
+const codexManifest = JSON.parse(fs.readFileSync(codexManifestPath, "utf8"));
+if (codexManifest.version !== cargoVersion) {
+  throw new Error(
+    `${codexManifestPath} version ${codexManifest.version} does not match Cargo.toml version ${cargoVersion}`,
+  );
+}
+assert.deepStrictEqual(
+  codexManifest.name,
+  "brokk",
+  `${codexManifestPath} should use Codex's stable package name`,
+);
+assert.deepStrictEqual(
+  codexManifest.mcpServers,
+  "./.mcp.json",
+  `${codexManifestPath} should select Codex's package adapter`,
+);
+
 const cursorManifestPath = "plugins/bifrost-agent/.cursor-plugin/plugin.json";
 const cursorManifest = JSON.parse(fs.readFileSync(cursorManifestPath, "utf8"));
 if (cursorManifest.version !== cargoVersion) {
@@ -126,6 +144,8 @@ const claudeLspPath = "plugins/bifrost-agent/.lsp.json";
 const claudeLspConfig = JSON.parse(fs.readFileSync(claudeLspPath, "utf8"));
 const cursorMcpPath = "plugins/bifrost-agent/cursor-mcp.json";
 const cursorMcpConfig = JSON.parse(fs.readFileSync(cursorMcpPath, "utf8"));
+const codexMcpPath = "plugins/bifrost-agent/.mcp.json";
+const codexMcpConfig = JSON.parse(fs.readFileSync(codexMcpPath, "utf8"));
 assert.deepStrictEqual(
   claudeMcpConfig.mcpServers?.bifrost?.command,
   "${CLAUDE_PLUGIN_ROOT}/bin/bifrost-launcher.mjs",
@@ -191,6 +211,31 @@ assert.deepStrictEqual(
   cursorMcpConfig.mcpServers?.bifrost?.args,
   ["--mcp", "symbol|extended"],
   `${cursorMcpPath} should start rootless with the default Bifrost MCP toolset`,
+);
+assert.deepStrictEqual(
+  codexMcpConfig.mcpServers?.bifrost?.command,
+  "./bin/bifrost-launcher.mjs",
+  `${codexMcpPath} should use the package-local launcher`,
+);
+assert.deepStrictEqual(
+  codexMcpConfig.mcpServers?.bifrost?.cwd,
+  ".",
+  `${codexMcpPath} should resolve the launcher cwd from the installed package root`,
+);
+assert.deepStrictEqual(
+  codexMcpConfig.mcpServers?.bifrost?.args,
+  ["--mcp", "symbol|extended"],
+  `${codexMcpPath} should start rootless with the default Bifrost MCP toolset`,
+);
+assert.deepStrictEqual(
+  codexMcpConfig.mcpServers?.bifrost?.startup_timeout_sec,
+  180,
+  `${codexMcpPath} should retain the 180-second startup timeout`,
+);
+assert.deepStrictEqual(
+  codexMcpConfig.mcpServers?.bifrost?.tool_timeout_sec,
+  300,
+  `${codexMcpPath} should retain the 300-second tool timeout`,
 );
 const claudeMcpServer = claudeMcpConfig.mcpServers?.bifrost;
 const cursorMcpServer = cursorMcpConfig.mcpServers?.bifrost;
