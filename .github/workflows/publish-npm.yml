@@ -80,7 +80,6 @@ jobs:
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
       - name: Verify release tag still selects the exact commit
@@ -140,7 +139,7 @@ jobs:
           for file in "${files[@]}"; do cp "qualification/$file" "$RUNNER_TEMP/npm-qualified/"; done
 
       - name: Install npm trusted-publishing client
-        run: npm install --global npm@11.15.0
+        run: npm install --global npm@11.19.0
 
       - name: Reject existing npm versions with a different qualified checksum
         shell: bash
@@ -158,6 +157,12 @@ jobs:
           done
 
       - name: Publish qualified archives without packaging
+        env:
+          # Keep npm on its OIDC trusted-publishing path. setup-node's
+          # registry-url option writes a classic token entry to .npmrc,
+          # which makes npm report a misleading 404 for OIDC publishes.
+          NODE_AUTH_TOKEN: ""
+          NPM_CONFIG_PROVENANCE: "true"
         run: >-
           npm run publish-release --prefix npm --
           --dist "$RUNNER_TEMP/npm-qualified"

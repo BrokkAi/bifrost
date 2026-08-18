@@ -348,6 +348,15 @@ test("publishers preserve their platform, environment, and OIDC protections", ()
   assert.doesNotMatch(npmDispatch, /^      id-token:\s*write$/mu);
   assert.match(publishNpm, /^    environment:\s*npm-publish$/mu);
   assert.match(publishNpm, /^      id-token:\s*write$/mu);
+  assert.match(publishNpm, /^          node-version:\s*24$/mu);
+  assert.doesNotMatch(
+    publishNpm,
+    /^          registry-url:/mu,
+    "trusted npm publishing must not create a classic token entry in .npmrc",
+  );
+  assert.match(publishNpm, /npm install --global npm@11\.19\.0/u);
+  assert.match(publishNpm, /NODE_AUTH_TOKEN:\s*""/u);
+  assert.match(publishNpm, /NPM_CONFIG_PROVENANCE:\s*"true"/u);
   assert.match(publishNpm, /verify-qualified-release\.mjs\s+verify/u);
   assert.match(publishNpm, /--manifest-sha256/u);
   assert.match(publishNpm, /actions\/download-artifact@[0-9a-f]{40}/u);
