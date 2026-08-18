@@ -361,6 +361,12 @@ test("npm dispatch is deterministically correlated with its child run", () => {
     npmDispatch,
     /^      DISPATCH_NONCE: \$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}$/mu,
   );
+  assert.match(
+    npmDispatch,
+    /gh workflow run publish-npm\.yml[\s\\]+--repo "\$GITHUB_REPOSITORY"/u,
+    "the dispatch job has no checkout, so gh must target the release repository explicitly",
+  );
+  assert.doesNotMatch(npmDispatch, /actions\/checkout/u);
   assert.match(npmDispatch, /--field dispatch_nonce="\$DISPATCH_NONCE"/u);
   assert.match(npmDispatch, /expected_title="Publish npm \$\{RELEASE_TAG\} \[\$\{DISPATCH_NONCE\}\]"/u);
   assert.match(npmDispatch, /gh run list[\s\S]{0,300}--workflow publish-npm\.yml/isu);

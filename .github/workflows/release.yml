@@ -422,6 +422,7 @@ jobs:
         run: |
           set -euo pipefail
           gh workflow run publish-npm.yml \
+            --repo "$GITHUB_REPOSITORY" \
             --ref "$RELEASE_TAG" \
             --field release_tag="$RELEASE_TAG" \
             --field release_version="$RELEASE_VERSION" \
