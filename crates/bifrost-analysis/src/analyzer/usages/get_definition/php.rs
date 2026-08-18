@@ -3,16 +3,22 @@ use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::ForwardQueryProvider;
 use crate::analyzer::TypeHierarchyProvider;
 use crate::analyzer::php::{
-    php_file_context_from_tree_at, resolve_php_constant_node, resolve_php_function_node,
-    resolve_php_type_node,
+    PhpDeclaredType, php_dynamic_type_keyword_node, php_file_context_from_tree_at,
+    resolve_php_constant_node, resolve_php_function_node, resolve_php_type_node,
+    resolve_php_type_node_arms,
 };
+use crate::analyzer::usages::local_inference::SymbolResolution;
 use crate::analyzer::usages::php_graph::syntax::{
-    assignment_parts, declared_callable_return_type_fq_name, declared_field_type_fq_name,
-    is_local_scope as php_is_local_scope, object_creation_type as php_object_creation_type,
+    PhpMagicSurface, declared_callable_return_type_fq_name, declared_field_type_fq_name,
+    declared_type_of, is_local_scope as php_is_local_scope, magic_member_names,
+    object_creation_type as php_object_creation_type, seed_assignment_binding,
     seed_parameter_types, static_member_parts as php_static_member_parts,
+    unwrap_parenthesized as php_unwrap_parenthesized,
     variable_identifier as php_variable_identifier,
 };
-use crate::analyzer::usages::php_graph::{PhpAnalyzerFacts, php_graph_source};
+use crate::analyzer::usages::php_graph::{
+    PhpAnalyzerFacts, php_dynamic_type_keyword, php_graph_source, resolve_php_type_arms,
+};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use brokk_bifrost_php::graph_support::{
     php_direct_declared_class_parent, php_file_context_from_source, php_is_interface,
@@ -177,7 +183,7 @@ pub(crate) fn php_type_lookup_resolution_bounded(
             node,
             source,
             &enclosing,
-            &bindings,
+            &bindings.engine,
             &ctx,
             Some(session),
         )
@@ -221,7 +227,7 @@ fn php_expression_type_fqn(
             if name == "this" {
                 enclosing.fqn.clone()
             } else {
-                first_precise(bindings, name)
+                php_precise_owner(bindings, name)
             }
         }
         "object_creation_expression" => php_object_creation_type_with_session(node, session)
@@ -232,7 +238,7 @@ fn php_expression_type_fqn(
             )
         }),
         "function_call_expression" | "scoped_call_expression" => {
-            php_assignment_receiver_fqn(php, support, node, source, enclosing, ctx, session)
+            php_assignment_receiver_fqn(php, support, node, source, enclosing, ctx)
         }
         "member_call_expression" | "nullsafe_member_call_expression" => {
             php_member_call_return_type_fqn(
@@ -361,6 +367,13 @@ fn resolve_php_with_session(
             format!("`{}` is not a PHP reference site", site.text),
         );
     }
+    // A member spelled `$obj->$name` or `$obj->{$expr}` names its member at run
+    // time. That is proven dynamism of the SITE, whatever the receiver's type
+    // is, and it is checked before the variable-reference gate below because
+    // the member position of such a site is itself a variable.
+    if php_dynamic_member_name_access(node, session).is_some() {
+        return php_dynamic_member_name_outcome(&site.text);
+    }
     if php_is_variable_reference(node, session) && !php_is_static_property_name(node, session) {
         return no_definition(
             "local_variable_reference",
@@ -420,9 +433,22 @@ fn resolve_php_with_session(
             };
             let owner =
                 php_static_scope_fqn(php, support, scope, source, &ctx, &enclosing, session);
-            php_member_outcome(php, support, owner, member, access, kind, session)
+            php_member_outcome(
+                php,
+                support,
+                PhpReceiverOwners::nominal(owner.into_iter().collect()),
+                member,
+                access,
+                kind,
+                session,
+            )
         }
         Some(PhpReferenceNode::InstanceMember { object, name, kind }) => {
+            // The same proven-dynamic member name as above, reached when the
+            // site covers the whole access instead of its member position.
+            if name.kind() != "name" {
+                return php_dynamic_member_name_outcome(&site.text);
+            }
             let member = php_node_text(name, source).trim_start_matches('$');
             let bindings = php_bindings_before(
                 php,
@@ -435,13 +461,13 @@ fn resolve_php_with_session(
                 support,
                 session,
             );
-            let owner = php_instance_receiver_fqn(
+            let owners = php_instance_receiver_owners(
                 php, analyzer, support, object, source, &enclosing, &bindings, &ctx, session,
             );
             php_member_outcome(
                 php,
                 support,
-                owner,
+                owners,
                 member,
                 PhpMemberAccess::Instance,
                 kind,
@@ -997,21 +1023,160 @@ enum PhpMemberAccess {
     StaticScope,
 }
 
+/// The diagnostic kind for a PHP member site whose dynamism is *proven*.
+///
+/// It is deliberately not the same kind as `unsupported_php_receiver`. That one
+/// means "this receiver shape is not followed yet", which proves nothing about
+/// the program; the census refuses to grade such a kind as an answer, exactly
+/// as it refuses Scala's `unsupported_scala_receiver`
+/// (`src/reference_differential/mod.rs`, the "Deliberately NOT mapped" block).
+/// This kind carries proof: the declaration says `object`/`mixed`, the member
+/// name is an expression, the receiver is a variable-variable, or the resolved
+/// owner answers the member through a magic method at run time.
+const PHP_DYNAMIC_RECEIVER: &str = "php_dynamic_receiver";
+
+/// What a PHP member reference's receiver proves about its owner.
+///
+/// The three cases are distinct answers. `Nominal` names classes to look the
+/// member up on. `ProvenDynamic` states that no class can be named because the
+/// program itself decides the receiver's member surface at run time, and
+/// carries the proof phrase to report. `Unknown` is the honest "this resolver
+/// does not follow this shape yet", which is a gap in Bifrost, not a fact about
+/// the code.
+enum PhpReceiverOwners {
+    /// At least one class the receiver can be. Never empty.
+    Nominal(Vec<String>),
+    /// Proven dynamic, with the phrase naming the proof.
+    ProvenDynamic(String),
+    /// The receiver shape or type is not followed.
+    Unknown,
+}
+
+impl PhpReceiverOwners {
+    /// The nominal reading of `owners`, which is [`PhpReceiverOwners::Unknown`]
+    /// when the receiver proved no class.
+    fn nominal(owners: Vec<String>) -> Self {
+        if owners.is_empty() {
+            Self::Unknown
+        } else {
+            Self::Nominal(owners)
+        }
+    }
+}
+
+/// The definition outcome for one PHP member reference, given what its receiver
+/// proves.
+///
+/// One owner is the ordinary case and keeps the walk it always had. Two or more
+/// owners is a finite union receiver (`A|B $m`), which forward lookup answers as
+/// an explicit ambiguity carrying the competing declarations rather than as a
+/// silent choice of one arm. A proven-dynamic receiver is a typed refusal; an
+/// unproven one stays the untyped miss it always was.
 fn php_member_outcome(
     php: &PhpAnalyzer,
     support: &dyn BoundedDefinitionLookup,
-    owner: Option<String>,
+    owners: PhpReceiverOwners,
     member: &str,
     access: PhpMemberAccess,
     kind: PhpMemberKind,
     session: Option<&ResolutionSession>,
 ) -> DefinitionLookupOutcome {
-    let Some(owner) = owner else {
-        return no_definition(
-            "unsupported_php_receiver",
-            format!("receiver for PHP member `{member}` is not resolved"),
-        );
+    let owners = match owners {
+        PhpReceiverOwners::Unknown => {
+            return no_definition(
+                "unsupported_php_receiver",
+                format!("receiver for PHP member `{member}` is not resolved"),
+            );
+        }
+        PhpReceiverOwners::ProvenDynamic(proof) => {
+            return no_definition(
+                PHP_DYNAMIC_RECEIVER,
+                format!("PHP member `{member}` is resolved at run time: {proof}"),
+            );
+        }
+        PhpReceiverOwners::Nominal(owners) => owners,
     };
+    debug_assert!(
+        !owners.is_empty(),
+        "PhpReceiverOwners::Nominal is constructed only from a non-empty owner set"
+    );
+    match owners.as_slice() {
+        [owner] => {
+            php_single_owner_member_outcome(php, support, owner, member, access, kind, session)
+        }
+        _ => php_union_owner_member_outcome(php, support, &owners, member, kind, session),
+    }
+}
+
+/// Every member candidate a finite union receiver's arms offer, merged.
+///
+/// Each arm answers with its own direct candidates, or -- when it declares none
+/// -- with its inherited ones, exactly as a single owner would. One total
+/// candidate across all arms is still one answer. Two or more is the ambiguity
+/// the declaration itself states, and the competing declarations travel on the
+/// row (#2167).
+///
+/// No member attribution is staged here: `PhpMemberTrace` is rooted at one base
+/// owner and its hierarchy routes are relative to that root, so a merged
+/// multi-owner answer has no single route to record.
+fn php_union_owner_member_outcome(
+    php: &PhpAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    owners: &[String],
+    member: &str,
+    kind: PhpMemberKind,
+    session: Option<&ResolutionSession>,
+) -> DefinitionLookupOutcome {
+    let mut candidates = Vec::new();
+    for owner in owners {
+        let mut direct = php_fqn_candidates(support, &format!("{owner}.{member}"));
+        direct.retain(|candidate| kind.accepts(candidate));
+        if direct.is_empty() {
+            direct = php_inherited_member_candidates(php, support, owner, member, session, None);
+            direct.retain(|candidate| kind.accepts(candidate));
+        }
+        candidates.extend(direct);
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    let arms = owners.join("`, `");
+    match candidates.len() {
+        0 => gated_boundary(
+            // gated on the owner's workspace-namespace check fused into
+            // `php_crosses_unindexed_boundary`. One workspace-internal arm keeps
+            // the miss actionable: an external arm must not hide it.
+            || {
+                owners
+                    .iter()
+                    .any(|owner| !php_crosses_unindexed_boundary(support, owner))
+            },
+            format!(
+                "`{member}` appears to cross a PHP boundary at every declared receiver type (`{arms}`) not indexed in this workspace"
+            ),
+            "no_indexed_definition",
+            format!("`{member}` is not indexed as a PHP definition on any of `{arms}`"),
+        ),
+        1 => candidates_outcome(candidates),
+        _ => ambiguous_candidates_outcome_of_kind(
+            candidates,
+            "ambiguous_definition",
+            format!(
+                "`{member}` is declared by more than one arm of the union receiver type `{arms}`"
+            ),
+        ),
+    }
+}
+
+fn php_single_owner_member_outcome(
+    php: &PhpAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    owner: &str,
+    member: &str,
+    access: PhpMemberAccess,
+    kind: PhpMemberKind,
+    session: Option<&ResolutionSession>,
+) -> DefinitionLookupOutcome {
+    let owner = owner.to_string();
     let fqn = format!("{owner}.{member}");
     let mut candidates = php_fqn_candidates(support, &fqn);
     candidates.retain(|candidate| kind.accepts(candidate));
@@ -1040,6 +1205,19 @@ fn php_member_outcome(
         }
         return candidates_outcome(inherited);
     }
+    // The owner is indexed and declares the member nowhere on its hierarchy,
+    // but declares the magic hook PHP dispatches an absent member through, so
+    // the site really is resolved at run time. This is checked before the
+    // boundary gate because it is a fact about the owner's own declarations,
+    // not about what this workspace happens to index.
+    if let Some(magic) = php_magic_member_resolver(php, support, &owner, access, kind, session) {
+        return no_definition(
+            PHP_DYNAMIC_RECEIVER,
+            format!(
+                "PHP member `{member}` is resolved at run time: `{owner}` declares no `{member}` and resolves absent members through `{magic}`"
+            ),
+        );
+    }
     // gated on the owner's workspace-namespace check fused into
     // `php_crosses_unindexed_boundary` (its negation is the workspace gate).
     gated_boundary(
@@ -1050,6 +1228,49 @@ fn php_member_outcome(
         "no_indexed_definition",
         format!("`{fqn}` is not indexed as a PHP definition"),
     )
+}
+
+/// The magic method through which `owner` -- or an ancestor on the same
+/// bounded walk the member lookup itself takes -- resolves an absent member of
+/// this access form at run time.
+///
+/// The magic-method table is the shared one in `graph/syntax.rs`, which the
+/// semantic-diagnostics pass reads too, so both surfaces agree on what "the
+/// owner answers this at run time" means.
+fn php_magic_member_resolver(
+    php: &PhpAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    owner: &str,
+    access: PhpMemberAccess,
+    kind: PhpMemberKind,
+    session: Option<&ResolutionSession>,
+) -> Option<&'static str> {
+    let surfaces: &[PhpMagicSurface] = match (access, kind) {
+        (PhpMemberAccess::StaticScope, PhpMemberKind::Callable) => &[PhpMagicSurface::StaticCall],
+        (PhpMemberAccess::StaticScope, _) => &[PhpMagicSurface::StaticData],
+        (PhpMemberAccess::Instance, PhpMemberKind::Callable) => &[PhpMagicSurface::InstanceCall],
+        (PhpMemberAccess::Instance, PhpMemberKind::Field) => &[PhpMagicSurface::InstanceProperty],
+        // The access node did not state which form it is, so either hook can
+        // be the one that answers the member.
+        (PhpMemberAccess::Instance, PhpMemberKind::Any) => &[
+            PhpMagicSurface::InstanceCall,
+            PhpMagicSurface::InstanceProperty,
+        ],
+    };
+    surfaces
+        .iter()
+        .flat_map(|surface| magic_member_names(*surface))
+        .copied()
+        .find(|magic| {
+            let mut declared = php_fqn_candidates(support, &format!("{owner}.{magic}"));
+            if declared.is_empty() {
+                // A receiver-surface probe, not the reference's own answer, so
+                // it stages no attribution.
+                declared =
+                    php_inherited_member_candidates(php, support, owner, magic, session, None);
+            }
+            declared.iter().any(CodeUnit::is_function)
+        })
 }
 
 fn php_inherited_member_candidates(
@@ -1326,6 +1547,16 @@ fn php_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn: &s
     // no-dot case (an empty namespace, which the exists-check always rejects).
     let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Php, fqn);
     let namespace = segments[..segments.len().saturating_sub(1)].join(".");
+    if namespace.is_empty() {
+        // The global namespace is where PHP's own builtins live (`PDO`,
+        // `Redis`, `substr`), and it is not a package any workspace declares,
+        // so asking whether the repository happens to contain a global-
+        // namespace symbol made the answer flip per-repository (#2030). The
+        // owner's own indexed-ness is the fact that decides it: a global-
+        // namespace name this workspace declares is internal, and one it does
+        // not declare is outside the analysis.
+        return php_fqn_candidates(support, fqn).is_empty();
+    }
     !php_workspace_exact_namespace_exists(support, &namespace)
 }
 
@@ -1775,7 +2006,7 @@ fn php_expression_type_fqn_bounded(
                     let value = if name == "this" {
                         enclosing.fqn.clone()
                     } else {
-                        first_precise(bindings, name)
+                        php_precise_owner(bindings, name)
                     }?;
                     values.push(value);
                 }
@@ -1953,6 +2184,32 @@ fn php_declared_unit_type_fqn_bounded(
     unit: &CodeUnit,
     session: &ResolutionSession,
 ) -> Option<String> {
+    let mut arms = php_declared_unit_type_bounded(php, support, unit, session).arms();
+    (arms.len() == 1).then(|| arms.remove(0))
+}
+
+/// What the declared return or field type of `unit` proves, read from the
+/// declaration's own parser nodes.
+///
+/// [`php_declared_unit_type_fqn_bounded`] is this computation's exactly-one-arm
+/// case, so a chain step that must hand on one owner and a final receiver that
+/// may carry a union read the same declaration the same way.
+fn php_declared_unit_type_bounded(
+    php: &PhpAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    unit: &CodeUnit,
+    session: &ResolutionSession,
+) -> PhpDeclaredType {
+    php_declared_unit_type_bounded_inner(php, support, unit, session)
+        .unwrap_or(PhpDeclaredType::Unknown)
+}
+
+fn php_declared_unit_type_bounded_inner(
+    php: &PhpAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    unit: &CodeUnit,
+    session: &ResolutionSession,
+) -> Option<PhpDeclaredType> {
     if !unit.is_function() && !unit.is_field() {
         return None;
     }
@@ -1974,20 +2231,31 @@ fn php_declared_unit_type_fqn_bounded(
     })?;
     if let Some(keyword) = php_relative_type_keyword_bounded(type_node, source, session) {
         let enclosing = php_enclosing_type_from_tree(support, declaration, source, &ctx, session)?;
-        return if keyword.eq_ignore_ascii_case("self") || keyword.eq_ignore_ascii_case("static") {
-            enclosing.fqn().map(str::to_string)
-        } else if keyword.eq_ignore_ascii_case("parent") {
-            let parent_fqn = enclosing.direct_parent_fqn?;
-            let candidates = php_fqn_candidates(support, &parent_fqn);
-            let [parent] = candidates.as_slice() else {
-                return None;
+        let relative =
+            if keyword.eq_ignore_ascii_case("self") || keyword.eq_ignore_ascii_case("static") {
+                enclosing.fqn().map(str::to_string)
+            } else if keyword.eq_ignore_ascii_case("parent") {
+                let parent_fqn = enclosing.direct_parent_fqn?;
+                let candidates = php_fqn_candidates(support, &parent_fqn);
+                let [parent] = candidates.as_slice() else {
+                    return None;
+                };
+                parent.is_class().then_some(parent_fqn)
+            } else {
+                None
             };
-            parent.is_class().then_some(parent_fqn)
-        } else {
-            None
-        };
+        return Some(PhpDeclaredType::nominal(relative.into_iter().collect()));
     }
-    resolve_php_type_node(type_node, source, &ctx, || session.scope_step())
+    if let Some(builtin) = php_dynamic_type_keyword_node(type_node, source, || session.scope_step())
+    {
+        return Some(PhpDeclaredType::Dynamic(builtin));
+    }
+    Some(PhpDeclaredType::nominal(resolve_php_type_node_arms(
+        type_node,
+        source,
+        &ctx,
+        || session.scope_step(),
+    )))
 }
 
 fn php_relative_type_keyword_bounded<'a>(
@@ -2039,7 +2307,7 @@ fn php_instance_receiver_fqn(
             if name == "this" {
                 return enclosing.fqn.clone();
             }
-            first_precise(bindings, name)
+            php_precise_owner(bindings, name)
         }
         // `(new Foo())->member` — the receiver is typed by the constructed class.
         "object_creation_expression" => php_object_creation_type_with_session(object, session)
@@ -2050,7 +2318,7 @@ fn php_instance_receiver_fqn(
             )
         }),
         "function_call_expression" | "scoped_call_expression" => {
-            php_assignment_receiver_fqn(php, support, object, source, enclosing, ctx, session)
+            php_assignment_receiver_fqn(php, support, object, source, enclosing, ctx)
         }
         "member_call_expression" | "nullsafe_member_call_expression" => {
             php_member_call_return_type_fqn(
@@ -2066,6 +2334,262 @@ fn php_instance_receiver_fqn(
     }
 }
 
+/// The one class a local binding proves for `name`, or `None` when it proves
+/// none or more than one.
+///
+/// The shared `first_precise` helper answers with an arbitrary member of a
+/// multi-target precise set, which for a union-typed PHP local would be
+/// first-arm-wins under another name. Every single-owner reader here must fail
+/// closed on a union instead.
+fn php_precise_owner(bindings: &LocalInferenceEngine<String>, name: &str) -> Option<String> {
+    let mut owners = php_precise_owners(bindings, name);
+    (owners.len() == 1).then(|| owners.remove(0))
+}
+
+/// Every class a local binding proves for `name`, in a stable order.
+fn php_precise_owners(bindings: &LocalInferenceEngine<String>, name: &str) -> Vec<String> {
+    let Some(targets) = bindings
+        .resolve_symbol_ref(name)
+        .and_then(SymbolResolution::as_precise)
+    else {
+        return Vec::new();
+    };
+    let mut owners = targets.iter().cloned().collect::<Vec<_>>();
+    owners.sort();
+    owners
+}
+
+/// The owner set the receiver of one member reference proves.
+///
+/// A receiver that types to exactly one class is the ordinary case and stays a
+/// single owner. A receiver whose declared type is a finite union of nominal
+/// arms is the bounded-ambiguity case: forward definition lookup is the one PHP
+/// surface whose answer can carry the competing declarations, so the arms
+/// travel to [`php_member_outcome`] instead of being dropped.
+///
+/// Unions are read at the FINAL receiver position only -- the expression
+/// directly left of the queried member. An interior chain step that is
+/// union-typed still fails closed, because each step must hand exactly one
+/// owner to the next.
+///
+/// A receiver whose declaration proves dynamism -- the builtin `object` or
+/// `mixed`, or PHP's variable-variable spelling -- is answered as such rather
+/// than as an unresolved shape, because the two are different facts (#2030).
+#[allow(clippy::too_many_arguments)]
+fn php_instance_receiver_owners(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    object: Node<'_>,
+    source: &str,
+    enclosing: &PhpEnclosingType,
+    bindings: &PhpLocalBindings,
+    ctx: &FileContext,
+    session: Option<&ResolutionSession>,
+) -> PhpReceiverOwners {
+    if let Some(single) = php_instance_receiver_fqn(
+        php,
+        analyzer,
+        support,
+        object,
+        source,
+        enclosing,
+        &bindings.engine,
+        ctx,
+        session,
+    ) {
+        return PhpReceiverOwners::Nominal(vec![single]);
+    }
+    let object = php_unwrap_parenthesized(object);
+    match object.kind() {
+        // `$$name->m()`: the receiver is whichever variable the inner
+        // expression spells at run time, which is dynamism the source states.
+        "dynamic_variable_name" => PhpReceiverOwners::ProvenDynamic(
+            "the receiver is a variable-variable, whose variable is chosen at run time".to_string(),
+        ),
+        "variable_name" => {
+            let name = php_variable_identifier(object, source);
+            if name == "this" {
+                return PhpReceiverOwners::Unknown;
+            }
+            let owners = php_precise_owners(&bindings.engine, name);
+            if owners.is_empty()
+                && let Some(builtin) = bindings.dynamic.get(name)
+            {
+                return PhpReceiverOwners::ProvenDynamic(format!(
+                    "`${name}` is declared `{builtin}`, which names no class"
+                ));
+            }
+            PhpReceiverOwners::nominal(owners)
+        }
+        "member_access_expression" | "nullsafe_member_access_expression" => {
+            php_receiver_member_unit(
+                php,
+                analyzer,
+                support,
+                object,
+                source,
+                enclosing,
+                &bindings.engine,
+                ctx,
+                session,
+                CodeUnit::is_field,
+            )
+            .map(|field| php_declared_unit_receiver_owners(php, analyzer, support, &field, session))
+            .unwrap_or(PhpReceiverOwners::Unknown)
+        }
+        "member_call_expression" | "nullsafe_member_call_expression" => php_receiver_member_unit(
+            php,
+            analyzer,
+            support,
+            object,
+            source,
+            enclosing,
+            &bindings.engine,
+            ctx,
+            session,
+            CodeUnit::is_function,
+        )
+        .map(|callable| {
+            php_declared_unit_receiver_owners(php, analyzer, support, &callable, session)
+        })
+        .unwrap_or(PhpReceiverOwners::Unknown),
+        "function_call_expression" | "scoped_call_expression" => {
+            php_direct_callable_unit(php, support, object, source, enclosing, ctx, session)
+                .map(|callable| {
+                    php_declared_unit_receiver_owners(php, analyzer, support, &callable, session)
+                })
+                .unwrap_or(PhpReceiverOwners::Unknown)
+        }
+        _ => PhpReceiverOwners::Unknown,
+    }
+}
+
+/// The receiver reading of one declaration's declared type: its classes, or the
+/// builtin it names when that builtin proves the value is dynamic.
+fn php_declared_unit_receiver_owners(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    unit: &CodeUnit,
+    session: Option<&ResolutionSession>,
+) -> PhpReceiverOwners {
+    match php_declared_unit_type(php, analyzer, support, unit, session) {
+        PhpDeclaredType::Nominal(arms) => PhpReceiverOwners::Nominal(arms),
+        PhpDeclaredType::Dynamic(builtin) => PhpReceiverOwners::ProvenDynamic(format!(
+            "`{}` is declared `{builtin}`, which names no class",
+            unit.fq_name()
+        )),
+        PhpDeclaredType::Unknown => PhpReceiverOwners::Unknown,
+    }
+}
+
+/// The one indexed declaration a member step on an instance receiver names.
+///
+/// This is the shared step both the receiver-typing chain and the union-arm
+/// reader take: resolve the step's own receiver to one owner, then take the
+/// owner's direct member of the wanted kind, or its inherited one when the
+/// owner declares none. Anything ambiguous fails closed.
+#[allow(clippy::too_many_arguments)]
+fn php_receiver_member_unit(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    access: Node<'_>,
+    source: &str,
+    enclosing: &PhpEnclosingType,
+    bindings: &LocalInferenceEngine<String>,
+    ctx: &FileContext,
+    session: Option<&ResolutionSession>,
+    wanted: fn(&CodeUnit) -> bool,
+) -> Option<CodeUnit> {
+    let object = access.child_by_field_name("object")?;
+    let name = access.child_by_field_name("name")?;
+    let owner = php_instance_receiver_fqn(
+        php, analyzer, support, object, source, enclosing, bindings, ctx, session,
+    )?;
+    let member = php_node_text(name, source).trim_start_matches('$');
+    if member.is_empty() {
+        return None;
+    }
+    let mut candidates = php_fqn_candidates(support, &format!("{owner}.{member}"));
+    if candidates.is_empty() {
+        // A receiver-type probe, not the reference's own member answer, so it
+        // stages no attribution.
+        candidates = php_inherited_member_candidates(php, support, &owner, member, session, None);
+    }
+    candidates.retain(wanted);
+    sort_units(&mut candidates);
+    candidates.dedup();
+    let [unit] = candidates.as_slice() else {
+        return None;
+    };
+    Some(unit.clone())
+}
+
+/// The one indexed callable a literal free or scoped call names.
+#[allow(clippy::too_many_arguments)]
+fn php_direct_callable_unit(
+    php: &PhpAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    call: Node<'_>,
+    source: &str,
+    enclosing: &PhpEnclosingType,
+    ctx: &FileContext,
+    session: Option<&ResolutionSession>,
+) -> Option<CodeUnit> {
+    let callable_fqn = match call.kind() {
+        "function_call_expression" => {
+            let function = call.child_by_field_name("function")?;
+            let candidates = match session {
+                Some(session) => {
+                    resolve_php_function_node(function, source, ctx, || session.scope_step())?
+                }
+                None => resolve_php_function(
+                    &php_qualified_candidate_text_with_session(function, source, None),
+                    ctx,
+                )?,
+            };
+            php_bound_callable(support, &candidates).to_string()
+        }
+        "scoped_call_expression" => {
+            let (scope, name) = php_static_member_parts(call)?;
+            let owner = php_static_scope_fqn(php, support, scope, source, ctx, enclosing, session)?;
+            let member = php_literal_member_name_unbounded(name, source)?;
+            format!("{owner}.{member}")
+        }
+        _ => return None,
+    };
+    let mut definitions = php_fqn_candidates(support, &callable_fqn)
+        .into_iter()
+        .filter(CodeUnit::is_function);
+    let callable = definitions.next()?;
+    definitions.next().is_none().then_some(callable)
+}
+
+fn php_literal_member_name_unbounded<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    (node.kind() == "name")
+        .then(|| php_node_text(node, source))
+        .filter(|member| !member.is_empty())
+}
+
+/// What one declaration's declared type proves, on whichever path is active.
+/// [`php_field_type_fqn`] and [`php_callable_return_type_fqn`] are the
+/// exactly-one-arm readers of the same declarations.
+fn php_declared_unit_type(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    unit: &CodeUnit,
+    session: Option<&ResolutionSession>,
+) -> PhpDeclaredType {
+    if let Some(session) = session {
+        return php_declared_unit_type_bounded(php, support, unit, session);
+    }
+    let facts = PhpAnalyzerFacts(analyzer);
+    declared_type_of(php, php_graph_source(analyzer, &facts), unit)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn php_member_call_return_type_fqn(
     php: &PhpAnalyzer,
@@ -2078,28 +2602,19 @@ fn php_member_call_return_type_fqn(
     ctx: &FileContext,
     session: Option<&ResolutionSession>,
 ) -> Option<String> {
-    let object = call.child_by_field_name("object")?;
-    let name = call.child_by_field_name("name")?;
-    let owner = php_instance_receiver_fqn(
-        php, analyzer, support, object, source, enclosing, bindings, ctx, session,
+    let callable = php_receiver_member_unit(
+        php,
+        analyzer,
+        support,
+        call,
+        source,
+        enclosing,
+        bindings,
+        ctx,
+        session,
+        CodeUnit::is_function,
     )?;
-    let member = php_node_text(name, source).trim_start_matches('$');
-    if member.is_empty() {
-        return None;
-    }
-    let mut candidates = php_fqn_candidates(support, &format!("{owner}.{member}"));
-    if candidates.is_empty() {
-        // A return-type probe for a receiver, not the reference's own member
-        // answer, so it stages no attribution.
-        candidates = php_inherited_member_candidates(php, support, &owner, member, session, None);
-    }
-    candidates.retain(CodeUnit::is_function);
-    sort_units(&mut candidates);
-    candidates.dedup();
-    let [callable] = candidates.as_slice() else {
-        return None;
-    };
-    php_callable_return_type_fqn(php, analyzer, support, callable, session)
+    php_callable_return_type_fqn(php, analyzer, support, &callable, session)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2127,6 +2642,20 @@ fn php_member_access_receiver_fqn(
     php_field_type_fqn(php, analyzer, support, &field, session)
 }
 
+/// The local bindings in force at one PHP reference site.
+///
+/// `engine` is the ordinary nominal binding state. `dynamic` records the
+/// parameters whose declared type is the builtin `object` or `mixed`, mapped to
+/// that builtin's spelling: those parameters bind no class, so the engine can
+/// only shadow them, yet the declaration still proves the value's member
+/// surface is decided at run time. Keeping the proof beside the engine is what
+/// lets a receiver read of such a parameter refuse with a reason instead of a
+/// generic miss (#2030).
+struct PhpLocalBindings {
+    engine: LocalInferenceEngine<String>,
+    dynamic: HashMap<String, &'static str>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn php_bindings_before(
     php: &PhpAnalyzer,
@@ -2138,9 +2667,12 @@ fn php_bindings_before(
     ctx: &FileContext,
     support: &dyn BoundedDefinitionLookup,
     session: Option<&ResolutionSession>,
-) -> LocalInferenceEngine<String> {
+) -> PhpLocalBindings {
     let scope = php_enclosing_scope(root, byte, session).unwrap_or(root);
-    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    let mut bindings = PhpLocalBindings {
+        engine: LocalInferenceEngine::new(LocalInferenceConfig::default()),
+        dynamic: HashMap::default(),
+    };
     let mut stack = vec![scope];
     while let Some(node) = stack.pop() {
         if session.is_some_and(|session| !session.scope_step()) {
@@ -2163,7 +2695,7 @@ fn php_bindings_before(
                 ctx,
                 support,
                 session,
-                &mut bindings,
+                &mut bindings.engine,
             );
         }
         let mut cursor = node.walk();
@@ -2208,15 +2740,23 @@ fn php_enclosing_scope<'tree>(
     best
 }
 
+/// Seed one scope's parameters, recording both what their declared types name
+/// and which of them are declared with a builtin that names no class.
 fn php_seed_parameters(
     node: Node<'_>,
     source: &str,
     ctx: &FileContext,
     session: Option<&ResolutionSession>,
-    bindings: &mut LocalInferenceEngine<String>,
+    bindings: &mut PhpLocalBindings,
 ) {
     if session.is_none() {
-        seed_parameter_types(node, source, bindings, |raw| resolve_php_type(raw, ctx));
+        let dynamic = &mut bindings.dynamic;
+        seed_parameter_types(node, source, &mut bindings.engine, |name, raw| {
+            if let Some(builtin) = php_dynamic_type_keyword(raw) {
+                dynamic.insert(name.to_string(), builtin);
+            }
+            resolve_php_type_arms(raw, ctx)
+        });
         return;
     }
     let Some(parameters) = node.child_by_field_name("parameters") else {
@@ -2240,13 +2780,25 @@ fn php_seed_parameters(
         if name.is_empty() {
             continue;
         }
-        match child.child_by_field_name("type").and_then(|type_node| {
-            resolve_php_type_node(type_node, source, ctx, || {
+        let type_node = child.child_by_field_name("type");
+        if let Some(builtin) = type_node.and_then(|type_node| {
+            php_dynamic_type_keyword_node(type_node, source, || {
                 session.is_some_and(ResolutionSession::scope_step)
             })
         }) {
-            Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
-            None => bindings.declare_shadow(name.to_string()),
+            bindings.dynamic.insert(name.to_string(), builtin);
+        }
+        let arms = type_node
+            .map(|type_node| {
+                resolve_php_type_node_arms(type_node, source, ctx, || {
+                    session.is_some_and(ResolutionSession::scope_step)
+                })
+            })
+            .unwrap_or_default();
+        if arms.is_empty() {
+            bindings.engine.declare_shadow(name.to_string());
+        } else {
+            bindings.engine.seed_symbol_many(name.to_string(), arms);
         }
     }
 }
@@ -2263,29 +2815,23 @@ fn php_seed_assignment(
     session: Option<&ResolutionSession>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    let Some((left, right)) = assignment_parts(node) else {
-        return;
-    };
-    if left.kind() != "variable_name" {
-        return;
-    }
-    let name = php_variable_identifier(left, source);
-    if name.is_empty() {
-        return;
-    }
-    let resolved = if let Some(session) = session {
-        php_expression_type_fqn_bounded(
-            php, support, right, source, enclosing, bindings, ctx, session,
-        )
-    } else {
-        php_assignment_receiver_fqn(php, support, right, source, enclosing, ctx, None)
-    };
-    match resolved {
-        Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
-        None => bindings.declare_shadow(name.to_string()),
-    }
+    // The bounded evaluator is the session path's whole interpretation of a
+    // right-hand side; only the unbounded legacy walk is restricted to the
+    // shapes below. Both feed the one shared seeding rule, which decides
+    // seed/alias/shadow.
+    seed_assignment_binding(node, source, bindings, |right, bindings| {
+        if let Some(session) = session {
+            php_expression_type_fqn_bounded(
+                php, support, right, source, enclosing, bindings, ctx, session,
+            )
+        } else {
+            php_assignment_receiver_fqn(php, support, right, source, enclosing, ctx)
+        }
+    });
 }
 
+/// The declared type of a right-hand side or direct call receiver on the
+/// unbounded forward path. Parentheses are unwrapped by the caller.
 fn php_assignment_receiver_fqn(
     php: &PhpAnalyzer,
     support: &dyn BoundedDefinitionLookup,
@@ -2293,42 +2839,30 @@ fn php_assignment_receiver_fqn(
     source: &str,
     enclosing: &PhpEnclosingType,
     ctx: &FileContext,
-    session: Option<&ResolutionSession>,
 ) -> Option<String> {
-    if session.is_some() {
-        return None;
-    }
     match right.kind() {
-        "object_creation_expression" => php_object_creation_type_with_session(right, session)
+        "object_creation_expression" => php_object_creation_type_with_session(right, None)
             .and_then(|type_node| resolve_php_type(php_node_text(type_node, source), ctx)),
         "function_call_expression" => {
             let function = right.child_by_field_name("function")?;
-            let raw = php_qualified_candidate_text_with_session(function, source, session);
+            let raw = php_qualified_candidate_text_with_session(function, source, None);
             let candidates = resolve_php_function(&raw, ctx)?;
             php_declared_callable_return_type_fqn(
                 php,
                 support,
                 php_bound_callable(support, &candidates),
-                session,
+                None,
             )
         }
         "scoped_call_expression" => {
             let (scope, name) = php_static_member_parts(right)?;
-            let owner = php_static_scope_fqn(php, support, scope, source, ctx, enclosing, session)?;
+            let owner = php_static_scope_fqn(php, support, scope, source, ctx, enclosing, None)?;
             let method = php_node_text(name, source);
             if method.is_empty() {
                 return None;
             }
-            php_declared_callable_return_type_fqn(
-                php,
-                support,
-                &format!("{owner}.{method}"),
-                session,
-            )
+            php_declared_callable_return_type_fqn(php, support, &format!("{owner}.{method}"), None)
         }
-        "parenthesized_expression" => right.named_child(0).and_then(|inner| {
-            php_assignment_receiver_fqn(php, support, inner, source, enclosing, ctx, session)
-        }),
         _ => None,
     }
 }
@@ -2473,6 +3007,46 @@ fn php_is_declaration_name(node: Node<'_>, session: Option<&ResolutionSession>) 
                 | "simple_parameter"
                 | "property_promotion_parameter"
         )
+}
+
+/// The one refusal both dynamic-member-name checks report.
+fn php_dynamic_member_name_outcome(site_text: &str) -> DefinitionLookupOutcome {
+    no_definition(
+        PHP_DYNAMIC_RECEIVER,
+        format!(
+            "`{site_text}` names its PHP member with an expression, so which member it reaches is decided at run time"
+        ),
+    )
+}
+
+/// The instance member access whose member NAME `node` sits inside, when that
+/// name is an expression rather than a literal identifier.
+///
+/// The walk stops at the FIRST access whose `name` field it reaches, so a
+/// literal member nested inside a dynamic one (`$obj->{$this->key()}` queried
+/// at `key`) answers for itself and is not swallowed by the outer site.
+fn php_dynamic_member_name_access<'tree>(
+    node: Node<'tree>,
+    session: Option<&ResolutionSession>,
+) -> Option<Node<'tree>> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if session.is_some_and(|session| !session.scope_step()) {
+            return None;
+        }
+        if matches!(
+            parent.kind(),
+            "member_call_expression"
+                | "nullsafe_member_call_expression"
+                | "member_access_expression"
+                | "nullsafe_member_access_expression"
+        ) && parent.child_by_field_name("name") == Some(current)
+        {
+            return (current.kind() != "name").then_some(parent);
+        }
+        current = parent;
+    }
+    None
 }
 
 fn php_is_variable_reference(node: Node<'_>, session: Option<&ResolutionSession>) -> bool {

@@ -1,10 +1,12 @@
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
+use crate::analyzer::java::imports::JavaTypeResolution;
 use crate::analyzer::structural::resolution::RejectionReason;
 use crate::analyzer::usages::applicability::{ApplicabilityOutcome, arity_applicability};
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisWork, ReceiverBudgetLimit,
 };
+use crate::analyzer::usages::reference_site::node_range;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_jvm::java::graph::resolver::argument_list_arity;
@@ -1014,7 +1016,7 @@ fn java_method_invocation_binding(
             );
             return JavaInvocationBinding { outcome, receiver };
         }
-        return JavaInvocationBinding::without_receiver(java_unresolved_receiver_outcome(
+        let mut outcome = java_unresolved_receiver_outcome(
             analyzer,
             session,
             file,
@@ -1023,7 +1025,29 @@ fn java_method_invocation_binding(
             object,
             name,
             format!("receiver for Java method `{name}` is not resolved"),
-        ));
+        );
+        // #2354: workspace receiver typing answered nothing, so the receiver's
+        // written declared type names no indexed class. When the external
+        // declaration surface (classpath artifacts plus activated
+        // declaration-fact packs) does name it, publish the call's canonical
+        // external identity -- `<owner FQN>.<member>` -- as the resolved
+        // reference text. That is the one identity an unmaterialized external
+        // callee leaves behind, and #1978's boundary reads exactly this field.
+        // Without it an instance call on an external interface
+        // (`request.getParameter(...)`) carries only its syntactic receiver
+        // *variable* name, which no summary can ever match.
+        if let Some(owner_fqn) = resolve_analyzer::<JavaAnalyzer>(analyzer).and_then(|java| {
+            java_external_receiver_owner_fqn(analyzer, java, session, file, source, root, object)
+        }) {
+            outcome.reference = Some(ResolvedReferenceSite {
+                path: file.to_string(),
+                text: format!("{owner_fqn}.{name}"),
+                range: node_range(node),
+                focus_start_byte: name_node.start_byte(),
+                focus_end_byte: name_node.end_byte(),
+            });
+        }
+        return JavaInvocationBinding::without_receiver(outcome);
     }
 
     let static_import = java_static_import_candidates(
@@ -1651,6 +1675,44 @@ fn java_unresolved_receiver_outcome(
         "unsupported_java_receiver",
         unresolved_message,
     )
+}
+
+/// The fully-qualified name of the external type a receiver's written declared
+/// type spells, or `None` when no external declaration names it.
+///
+/// Called only after workspace receiver typing produced nothing, so the
+/// spelling here is by construction one that resolved to no indexed class. The
+/// answer is the owner half of the canonical external-callee identity
+/// `(language, owner FQN, member, arity, has_receiver)` that an activated
+/// procedure summary binds by (#1978). A type-parameter spelling names no
+/// class and a workspace-source resolution is not external, so both answer
+/// `None` and the call keeps the identity-free boundary it had before.
+fn java_external_receiver_owner_fqn(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    object: Node<'_>,
+) -> Option<String> {
+    let type_node = java_receiver_type_node(session, file, source, root, object)?;
+    let normalized = normalize_java_type_text(java_node_text(type_node, source));
+    if normalized.is_empty()
+        || brokk_bifrost_jvm::java::graph_support::java_type_parameter_in_scope(
+            type_node, source, normalized,
+        )
+        .is_some()
+    {
+        return None;
+    }
+    let resolution = session.query_optional_row(|| {
+        java.resolve_type_name_with_external(analyzer.semantic_model_overlay(), file, normalized)
+    })?;
+    match resolution {
+        JavaTypeResolution::External(external_type) => Some(external_type.fqn().to_owned()),
+        JavaTypeResolution::Source(_) => None,
+    }
 }
 
 /// The written bound of a type-parameter receiver whose bound this file imports

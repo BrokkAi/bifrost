@@ -2633,12 +2633,25 @@ fn binding_free_function_candidates(
         .collect()
 }
 
-fn dedupe_callable_candidates(candidates: &mut Vec<CodeUnit>) {
+/// Collapse the candidates unqualified lookup found to one entry per logical
+/// callable, keeping the first spelling of each.
+///
+/// A header declaration and its out-of-line body spell one parameter type
+/// differently often enough that the persisted signature strings disagree, so
+/// the string triple alone reports one C++ declaration as an overload set and
+/// an unproven argument count then turns it into ambiguity.
+/// `same_logical_callable` answers the string question first and resolves the
+/// written parameter names only when the strings differ (#2010).
+fn dedupe_callable_candidates(
+    candidates: &mut Vec<CodeUnit>,
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+) {
     let mut deduped = Vec::with_capacity(candidates.len());
     for candidate in candidates.drain(..) {
         if !deduped
             .iter()
-            .any(|existing| same_logical_symbol(existing, &candidate))
+            .any(|existing| visibility.same_logical_callable(analyzer, existing, &candidate))
         {
             deduped.push(candidate);
         }
@@ -2655,7 +2668,7 @@ fn resolve_callable_candidates(
     file: &ProjectFile,
 ) -> BareCallTargetResolution {
     let mut candidates = candidates;
-    dedupe_callable_candidates(&mut candidates);
+    dedupe_callable_candidates(&mut candidates, analyzer, visibility);
     if candidates.is_empty() {
         return BareCallTargetResolution::Missing;
     }
@@ -5173,19 +5186,19 @@ fn target_guided_missing_declaration_type_leaf<'tree>(
     {
         return Some(node);
     }
-    let indexed_scope = indexed_enclosing_lexical_scope(&ctx.analyzer, ctx.file, node)?;
     let declaration = nearest_declaration_type_context(node)?;
+    let candidates = visible_type_identifier_candidates(ctx, name);
+    let unique_visible_target = !candidates.is_empty()
+        && candidates
+            .iter()
+            .all(|candidate| same_visible_symbol(candidate, &ctx.spec.target));
+    let indexed_scope = indexed_enclosing_lexical_scope(&ctx.analyzer, ctx.file, node)?;
     let exact_scope_match = indexed_scope_matches_target_name(
         &indexed_scope,
         &components,
         is_globally_qualified_cpp_name(node),
         &ctx.spec.target,
     );
-    let candidates = visible_type_identifier_candidates(ctx, name);
-    let unique_visible_target = !candidates.is_empty()
-        && candidates
-            .iter()
-            .all(|candidate| same_visible_symbol(candidate, &ctx.spec.target));
     if matches!(declaration.kind(), "field_declaration" | "declaration") {
         let parser_lost_declaration_scope =
             target_guided_scope_lost_namespace(&indexed_scope, &ctx.spec.target)
@@ -5781,7 +5794,7 @@ fn bare_name_binds_only_target(
         ctx.visibility
             .declaration_visible_at(&ctx.analyzer, ctx.file, candidate, call.start_byte())
     });
-    dedupe_callable_candidates(&mut candidates);
+    dedupe_callable_candidates(&mut candidates, &ctx.analyzer, ctx.visibility);
     matches!(candidates.as_slice(), [only] if same_visible_symbol(only, &ctx.spec.target))
 }
 
@@ -6000,7 +6013,12 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 .exact(),
             ctx,
         ) {
-            MethodReceiverTargetResolution::Target if receiver_is_self_like(receiver, ctx.file) => {
+            MethodReceiverTargetResolution::Target
+                if receiver_is_self_like(
+                    receiver,
+                    ctx.analyzer.reference_uses_c_semantics(ctx.file),
+                ) =>
+            {
                 push_self_receiver_hit(operator, ctx);
             }
             MethodReceiverTargetResolution::Target => push_hit(operator, ctx),
@@ -6058,7 +6076,10 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     match call_function_target_resolution(function, ctx) {
         MethodReceiverTargetResolution::Target
-            if call_function_has_direct_self_receiver(function, ctx.file) =>
+            if call_function_has_direct_self_receiver(
+                function,
+                ctx.analyzer.reference_uses_c_semantics(ctx.file),
+            ) =>
         {
             push_self_receiver_hit(function_terminal_node(function), ctx);
         }
@@ -6119,7 +6140,10 @@ fn maybe_record_recovered_relational_template_method_hit(
     }
     match explicit_receiver_target_resolution(call.receiver, Some(call.arity), ctx) {
         MethodReceiverTargetResolution::Target
-            if receiver_is_self_like(call.receiver, ctx.file) =>
+            if receiver_is_self_like(
+                call.receiver,
+                ctx.analyzer.reference_uses_c_semantics(ctx.file),
+            ) =>
         {
             push_self_receiver_hit(call.member, ctx);
         }
@@ -7090,7 +7114,7 @@ fn receiver_type_units_with_budget(
                     .into_iter()
                     .collect();
             }
-            "this" if is_c_source_file(ctx.file) => {
+            "this" if ctx.analyzer.reference_uses_c_semantics(ctx.file) => {
                 let name = node_text(current, source);
                 let local = ctx.bindings.resolve_symbol(name);
                 if let Some(bindings) = local.as_precise() {
@@ -7615,7 +7639,8 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .child_by_field_name("argument")
             .or_else(|| node.child_by_field_name("object"))
             .is_some_and(|receiver| {
-                receiver_is_self_like(receiver, ctx.file) && same_owner_context(receiver, ctx)
+                receiver_is_self_like(receiver, ctx.analyzer.reference_uses_c_semantics(ctx.file))
+                    && same_owner_context(receiver, ctx)
                     || receiver_type_units(receiver, ctx.source, ctx)
                         .iter()
                         .any(|target| {
@@ -7629,7 +7654,7 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .child_by_field_name("argument")
             .or_else(|| node.named_child(0))
             .is_some_and(|child| receiver_matches_target(child, ctx)),
-        "identifier" | "this" if is_c_source_file(ctx.file) => ctx
+        "identifier" | "this" if ctx.analyzer.reference_uses_c_semantics(ctx.file) => ctx
             .bindings
             .resolve_symbol(node_text(node, ctx.source))
             .as_precise()
@@ -7651,7 +7676,7 @@ fn declaring_owner_for_explicit_receiver(
     call_arity: Option<usize>,
     ctx: &ScanCtx<'_>,
 ) -> EnclosingMemberOwnerResolution {
-    if receiver_is_self_like(receiver, ctx.file) {
+    if receiver_is_self_like(receiver, ctx.analyzer.reference_uses_c_semantics(ctx.file)) {
         return EnclosingMemberOwnerResolution::Missing;
     }
     let receiver_units = receiver_type_units(receiver, ctx.source, ctx);
@@ -7871,24 +7896,30 @@ fn visible_target_peer_matches_owner(
             })
 }
 
-fn receiver_is_self_like(node: Node<'_>, file: &ProjectFile) -> bool {
+/// Whether `node` is the implicit-object receiver of a member call.
+///
+/// `reference_is_c` is the compilation language the reference is read in
+/// (#1970): `this` is the C++ implicit object only where C++ is what compiles
+/// the source, and is an ordinary identifier in a `.c` file or a header every
+/// reaching translation unit compiles as C.
+fn receiver_is_self_like(node: Node<'_>, reference_is_c: bool) -> bool {
     match node.kind() {
-        "this" => !is_c_source_file(file),
+        "this" => !reference_is_c,
         "pointer_expression" | "parenthesized_expression" => node
             .child_by_field_name("argument")
             .or_else(|| node.named_child(0))
-            .is_some_and(|inner| receiver_is_self_like(inner, file)),
+            .is_some_and(|inner| receiver_is_self_like(inner, reference_is_c)),
         _ => false,
     }
 }
 
-fn call_function_has_direct_self_receiver(function: Node<'_>, file: &ProjectFile) -> bool {
+fn call_function_has_direct_self_receiver(function: Node<'_>, reference_is_c: bool) -> bool {
     match function.kind() {
         "field_expression" => function
             .child_by_field_name("argument")
             .or_else(|| function.child_by_field_name("object"))
-            .is_some_and(|receiver| receiver_is_self_like(receiver, file)),
-        _ => receiver_is_self_like(function, file),
+            .is_some_and(|receiver| receiver_is_self_like(receiver, reference_is_c)),
+        _ => receiver_is_self_like(function, reference_is_c),
     }
 }
 
@@ -7914,7 +7945,7 @@ fn receiver_has_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .child_by_field_name("argument")
             .or_else(|| node.named_child(0))
             .is_some_and(|child| receiver_has_known_non_target(child, ctx)),
-        "identifier" | "this" if is_c_source_file(ctx.file) => ctx
+        "identifier" | "this" if ctx.analyzer.reference_uses_c_semantics(ctx.file) => ctx
             .bindings
             .resolve_symbol(node_text(node, ctx.source))
             .as_precise()

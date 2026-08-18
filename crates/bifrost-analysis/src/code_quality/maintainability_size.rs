@@ -447,7 +447,7 @@ pub fn report_long_method_and_god_object_smells(
     // Resolve files, then dedup and apply file_cap on top of the helper.
     // brokk-core's wrapper does `.limit(fileCap)` after path resolution;
     // mirror that here so the same JSON arguments select the same files.
-    let resolved = resolve_project_files(analyzer.project(), params.file_paths);
+    let resolved = resolve_project_files(analyzer, params.file_paths);
     let mut input_truncated = resolved.input_truncated;
     let skipped_inputs = resolved.skipped_inputs;
     let ambiguous_paths = resolved.ambiguous_paths.clone();

@@ -31,6 +31,7 @@ pub use ir::{
     ReferenceTraversalFilter, RewritePathFilter, SCHEMA_VERSION, ScopeFilter, ScopeSeed,
     SegmentsOfOptions, SetOperator, StateEventFilter, StringPredicate, TaintTraversal,
     TypestateTraversal, UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal, WitnessTraversal,
+    exact_path_globs,
 };
 pub use schema::{
     ALL_CODE_QUERY_EXECUTION_MODES, CallTraversalCompleteness, CodeQueryExecutionMode,

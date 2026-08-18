@@ -1,6 +1,6 @@
 use crate::aliases::{
     PhpCallableCandidates, PhpFileContext, resolve_php_constant, resolve_php_function,
-    resolve_php_type,
+    resolve_php_type, resolve_php_type_arms,
 };
 use crate::graph::PhpGraphSource;
 use crate::graph::hits::{push_hit, push_hit_range, push_import_hit, push_self_receiver_hit_range};
@@ -11,10 +11,9 @@ use crate::graph::resolver::{
     qualified_candidate_text, receiver_type_matches, static_receiver_matches,
 };
 use crate::graph::syntax::{
-    assignment_parts, direct_call_return_type_fq_name, instance_receiver_type_fq_name,
-    is_local_scope, literal_member_identifier, object_creation_type, seed_parameter_types,
+    assignment_parts, assignment_value_type_fq_name, instance_receiver_type_fq_name,
+    is_local_scope, literal_member_identifier, seed_assignment_binding, seed_parameter_types,
     static_member_parts, static_property_identifier, static_scope_type_fq_name,
-    variable_identifier,
 };
 use crate::graph_support::PhpSource;
 use crate::graph_support::php_file_context_from_source;
@@ -563,7 +562,9 @@ fn seed_parameter_receivers(
     ctx: &PhpFileContext,
     engine: &mut LocalInferenceEngine<String>,
 ) {
-    seed_parameter_types(node, source, engine, |raw| resolve_php_type(raw, ctx));
+    seed_parameter_types(node, source, engine, |_name, raw| {
+        resolve_php_type_arms(raw, ctx)
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -577,70 +578,17 @@ fn apply_receiver_assignment(
     ctx: &PhpFileContext,
     engine: &mut LocalInferenceEngine<String>,
 ) {
-    let Some((left, right)) = assignment_parts(node) else {
-        return;
-    };
-    if left.kind() != "variable_name" {
-        return;
-    }
-    let lhs = variable_identifier(left, source);
-    if lhs.is_empty() {
-        return;
-    }
-    let resolved = assignment_receiver_type(right, php, analyzer, file, source, line_starts, ctx);
-    match resolved {
-        Some(fq) => engine.seed_symbol(lhs.to_string(), fq),
-        None => {
-            if right.kind() == "variable_name" {
-                let rhs = variable_identifier(right, source);
-                if !rhs.is_empty() {
-                    engine.alias_symbol(lhs.to_string(), rhs);
-                    return;
-                }
-            }
-            engine.declare_shadow(lhs.to_string());
-        }
-    }
-}
-
-fn assignment_receiver_type(
-    node: Node<'_>,
-    php: &dyn PhpSource,
-    analyzer: PhpGraphSource<'_>,
-    file: &ProjectFile,
-    source: &str,
-    line_starts: &[usize],
-    ctx: &PhpFileContext,
-) -> Option<String> {
-    match node.kind() {
-        "object_creation_expression" => object_creation_type(node)
-            .and_then(|type_node| resolve_php_type(node_text(type_node, source), ctx)),
-        "function_call_expression" | "scoped_call_expression" => {
-            let enclosing_owner = (node.kind() == "scoped_call_expression")
-                .then(|| {
-                    enclosing_owner_fq_name_at(
-                        analyzer,
-                        file,
-                        node.start_byte(),
-                        node.end_byte(),
-                        line_starts,
-                    )
-                })
-                .flatten();
-            direct_call_return_type_fq_name(
-                php,
+    seed_assignment_binding(node, source, engine, |right, _bindings| {
+        assignment_value_type_fq_name(php, analyzer, right, source, ctx, || {
+            enclosing_owner_fq_name_at(
                 analyzer,
-                node,
-                source,
-                ctx,
-                enclosing_owner.as_deref(),
+                file,
+                right.start_byte(),
+                right.end_byte(),
+                line_starts,
             )
-        }
-        "parenthesized_expression" => node.named_child(0).and_then(|inner| {
-            assignment_receiver_type(inner, php, analyzer, file, source, line_starts, ctx)
-        }),
-        _ => None,
-    }
+        })
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

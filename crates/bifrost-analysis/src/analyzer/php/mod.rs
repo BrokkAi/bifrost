@@ -67,8 +67,9 @@ pub(crate) use adapter::PhpAdapter;
 // these through the module, so the chain now runs crate -> shim -> parked file
 // rather than the other way around.
 pub(crate) use brokk_bifrost_php::aliases::{
-    php_file_context_from_tree_at, resolve_php_constant_node, resolve_php_function_node,
-    resolve_php_type_node,
+    PhpDeclaredType, php_dynamic_type_keyword_node, php_file_context_from_tree_at,
+    resolve_php_constant_node, resolve_php_function_node, resolve_php_type_node,
+    resolve_php_type_node_arms,
 };
 // PHP's four public alias names keep their historical `crate::analyzer::` paths
 // even though they now live in `brokk-bifrost-php` -- the `brokk_bifrost_go::packages`
@@ -495,6 +496,10 @@ impl IAnalyzer for PhpAnalyzer {
 
     fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.end_query(context);
+    }
+
+    fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
+        self.inner.record_query_failure(error);
     }
 
     fn begin_streaming_file_read(&self, file: &ProjectFile) {

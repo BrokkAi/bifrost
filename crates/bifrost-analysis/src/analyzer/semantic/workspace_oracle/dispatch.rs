@@ -24,8 +24,10 @@ use crate::analyzer::semantic::{
     StableDigest, UnmaterializedExternalTarget, WorkspaceMountId, WorkspaceRelativePath,
     split_qualified_member, unmaterialized_external_mount, unmaterialized_external_path,
 };
-use crate::analyzer::structural::resolution::{BoundaryStatus, MethodFamilyRelation};
-use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
+use crate::analyzer::structural::resolution::MethodFamilyRelation;
+use crate::analyzer::usages::get_definition::{
+    DefinitionLookupStatus, DispatchQuality, dispatch_quality_for_status,
+};
 use crate::analyzer::usages::{
     CallDispatchBoundaryKind, CallDispatchTarget, CallRelationLimits, CallRelationService,
     ExactCallLocation, UsageProof, call_dispatch_equivalence_source,
@@ -101,17 +103,6 @@ fn dispatch_target_groups(
         });
     }
     groups
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DispatchQuality {
-    Complete,
-    Ambiguous,
-    Unproven,
-    Unknown,
-    Unsupported(SemanticCapability),
-    Truncated,
-    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -772,30 +763,7 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                 Ok(result) => result,
                 Err(outcome) => return Ok(*outcome),
             };
-        let status_quality = match lookup.status {
-            Some(DefinitionLookupStatus::Resolved) => DispatchQuality::Complete,
-            Some(DefinitionLookupStatus::Ambiguous) => DispatchQuality::Ambiguous,
-            Some(DefinitionLookupStatus::UnsupportedLanguage) => {
-                DispatchQuality::Unsupported(SemanticCapability::Calls)
-            }
-            Some(
-                DefinitionLookupStatus::NoDefinition
-                | DefinitionLookupStatus::InvalidLocation
-                | DefinitionLookupStatus::NotFound,
-            )
-            | None => DispatchQuality::Unknown,
-            // A boundary outcome is complete only when the refined evidence
-            // (#1474) actually names the external target. A declared-but-
-            // unindexed dependency leaves the answer partial, and an unknown
-            // external root means the resolver never saw the target at all.
-            Some(DefinitionLookupStatus::UnresolvableImportBoundary) => match lookup.boundary {
-                Some(BoundaryStatus::WorkspaceLocal | BoundaryStatus::ExternalIndexed) => {
-                    DispatchQuality::Complete
-                }
-                Some(BoundaryStatus::ExternalDeclaredUnindexed) => DispatchQuality::Unproven,
-                Some(BoundaryStatus::ExternalUnknown) | None => DispatchQuality::Unknown,
-            },
-        };
+        let status_quality = dispatch_quality_for_status(lookup.status, lookup.boundary);
         let quality = if status_quality == DispatchQuality::Ambiguous
             && matches!(
                 materialization_quality,

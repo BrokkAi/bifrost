@@ -1287,6 +1287,21 @@ impl IAnalyzer for MultiAnalyzer {
             .workspace_file_index_cell()
     }
 
+    /// Recorded on this analyzer's own active contexts rather than forwarded to
+    /// a delegate: `begin_query` shares one context object with every delegate,
+    /// so one recording is enough, and a workspace with no delegate at all
+    /// would otherwise have nowhere to report the failure.
+    fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
+        let contexts = self
+            .query_contexts
+            .lock()
+            .expect("multi-analyzer query context mutex poisoned")
+            .clone();
+        for context in contexts {
+            context.record_store_error(error.clone());
+        }
+    }
+
     fn warm_query_indexes(&self) {
         self.delegates
             .values()

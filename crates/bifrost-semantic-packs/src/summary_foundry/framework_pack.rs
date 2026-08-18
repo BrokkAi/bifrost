@@ -73,6 +73,15 @@ pub const FRAMEWORK_AUDIT_FILE_NAME: &str = "rejects.json";
 /// The producer name recorded in every generated pack.
 const PRODUCER_NAME: &str = "bifrost-framework-foundry";
 
+/// The framework foundry's own version, advanced when the converter changes the
+/// shape of its output. It is deliberately not the crate version: the checked-in
+/// packs are gated on byte equality with this generator, and reading the crate
+/// version would break that gate at every release bump without any content
+/// change. `golden_pack.rs` states the same rule; #1871 applied it there and
+/// left this converter behind, which is what made
+/// `the_checked_in_packs_match_the_generator` fail at v0.10.3.
+const PRODUCER_VERSION: &str = "0.9.0";
+
 /// The pack content version. It is the framework content's own version, not the
 /// Bifrost version, and advances when the shipped declarations change.
 const PACK_CONTENT_VERSION: &str = "0.1.0";
@@ -81,7 +90,9 @@ const PACK_CONTENT_VERSION: &str = "0.1.0";
 const BIFROST_REQUIREMENT: &str = ">=0.8.0, <0.11.0";
 
 /// The authored framework declarations are Bifrost's own recorded surface,
-/// licensed like the workspace. They are not a slice of the described library.
+/// not a slice of the described library. New Bifrost-owned public packs use
+/// the public project license; retained packs may declare their own provenance
+/// and license in their checked-in metadata.
 const PACK_LICENSE: &str = "Apache-2.0";
 
 /// The JDK toolchain requirement. Every claimed type (`Runtime`, `Statement`,
@@ -515,7 +526,7 @@ impl PackIdentity {
             version: PACK_CONTENT_VERSION.to_owned(),
             producer: Producer {
                 name: PRODUCER_NAME.to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
+                version: PRODUCER_VERSION.to_owned(),
             },
             language: "java".to_owned(),
             ecosystem: self.ecosystem.clone(),

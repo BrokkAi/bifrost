@@ -32,6 +32,7 @@ use brokk_bifrost_core::analyzer::capabilities::{TypeAliasProvider, TypeHierarch
 use brokk_bifrost_core::analyzer::model::{CppFieldLinkage, CppTemplateMetadata};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub trait CppSource:
@@ -122,6 +123,42 @@ pub trait CppSource:
 
     /// The persisted C++ template metadata side table's row for `code_unit`.
     fn template_metadata(&self, code_unit: &CodeUnit) -> Option<CppTemplateMetadata>;
+
+    /// Whether a reference written in the header `file` reads the declarations
+    /// it can see with C semantics: every workspace translation unit that
+    /// provably compiles this header compiles it as C (issue #1970).
+    ///
+    /// Always false for a translation unit -- its own extension settles its
+    /// dialect, which [`crate::graph::resolver::is_c_source_file`] answers
+    /// without asking the analyzer. Both halves are combined by
+    /// [`crate::graph::resolver::reference_uses_c_semantics`], the one helper
+    /// resolution asks.
+    ///
+    /// A header both languages provably include reports false: forward
+    /// resolution from it reports the C++ identity, and the site-equivalence
+    /// union below is what keeps inverse in agreement.
+    fn header_uses_c_semantics(&self, file: &ProjectFile) -> bool;
+
+    /// The declarations of `file` as one of its two readings sees them.
+    ///
+    /// `c_semantics` false is the C++ reading, which is exactly
+    /// [`CodeUnitIndex::declarations`]. True is the C reading: the stored
+    /// `cpp:c` row-set when the blob has one, and otherwise the same C++
+    /// row-set, because "no C rows" means the two readings agree.
+    ///
+    /// Candidate enumeration selects a reading here and nowhere else: include
+    /// activation, preprocessor-guard compatibility, block-scope shadowing and
+    /// ambiguity all run unchanged over whichever set comes back.
+    fn declarations_in_reading(&self, file: &ProjectFile, c_semantics: bool) -> BTreeSet<CodeUnit>;
+
+    /// The identities of the other reading that share `code_unit`'s
+    /// declaration site -- the same source file and the same declaration byte
+    /// range -- empty when the two readings agree about it.
+    ///
+    /// Keyed on the range, never on a name. Inverse results are unioned across
+    /// these so a query against either identity of one declaration reports
+    /// every reference found under both readings.
+    fn site_equivalent_units(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
 
     /// Every distinct `compile_commands.json` configuration governing `file`,
     /// empty when the workspace has no compile database entry naming it. The

@@ -167,11 +167,18 @@ impl Language {
     }
 }
 
-/// A source language plus the parser dialect needed to interpret one file.
+/// A source language plus the dialect needed to interpret one file.
 ///
-/// Most languages have one grammar. TypeScript is the exception because `.ts`
-/// and `.tsx` files use distinct tree-sitter grammars while sharing the same
-/// normalized language adapter.
+/// Most languages have one grammar and one set of scoping rules. Two are
+/// exceptions:
+///
+/// - TypeScript, because `.ts` and `.tsx` files use distinct tree-sitter
+///   grammars while sharing the same normalized language adapter.
+/// - C++, because `Language::Cpp` also claims C. A `.c` file is parsed with the
+///   same tree-sitter-cpp grammar but obeys C scoping rules, most visibly that
+///   a struct/union/enum tag declared inside another aggregate's member list
+///   has the scope of the outer declaration rather than a nested one
+///   (C17 6.2.1, 6.7.2.3).
 ///
 /// Resolving a dialect to an actual `tree_sitter::Language` needs the grammar
 /// registry, which is `brokk-bifrost-analysis` machinery: see
@@ -180,6 +187,8 @@ impl Language {
 pub enum LanguageDialect {
     Standard(Language),
     TypeScriptTsx,
+    /// A translation unit compiled as C rather than C++.
+    CppC,
 }
 
 impl LanguageDialect {
@@ -196,27 +205,37 @@ impl LanguageDialect {
         ) {
             return Some(Self::TypeScriptTsx);
         }
+        // Plain `c` stays a spelling of `Language::Cpp` (it is one of that
+        // language's extensions), so the C dialect needs its own label.
+        if normalized.as_str() == "cppc" {
+            return Some(Self::CppC);
+        }
         Language::from_config_label(label).map(Self::Standard)
     }
 
-    /// Select the parser dialect used by the indexed analyzer for `path`.
+    /// Select the dialect used by the indexed analyzer for `path`.
     pub fn for_path(language: Language, path: &Path) -> Self {
+        let extension = path.extension().and_then(std::ffi::OsStr::to_str);
         if language == Language::TypeScript
-            && path
-                .extension()
-                .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("tsx"))
+            && extension.is_some_and(|extension| extension.eq_ignore_ascii_case("tsx"))
         {
-            Self::TypeScriptTsx
-        } else {
-            Self::Standard(language)
+            return Self::TypeScriptTsx;
         }
+        // Exactly lowercase `.c`, never case-insensitively: `.C` conventionally
+        // means C++ and must keep C++ semantics. Every other C/C++ extension,
+        // headers included, has no intrinsic compilation language and stays on
+        // the conservative C++ interpretation.
+        if language == Language::Cpp && extension == Some("c") {
+            return Self::CppC;
+        }
+        Self::Standard(language)
     }
 
     pub const fn language(self) -> Language {
         match self {
             Self::Standard(language) => language,
             Self::TypeScriptTsx => Language::TypeScript,
+            Self::CppC => Language::Cpp,
         }
     }
 
@@ -227,6 +246,7 @@ impl LanguageDialect {
         match self {
             Self::Standard(language) => language.config_label(),
             Self::TypeScriptTsx => "typescript-tsx",
+            Self::CppC => "cpp-c",
         }
     }
 
@@ -235,6 +255,9 @@ impl LanguageDialect {
         match self {
             Self::Standard(language) => language.config_label(),
             Self::TypeScriptTsx => "tsx",
+            // Not `c`: `Language::from_config_label("c")` already answers
+            // `Language::Cpp`, so the short spelling belongs to the language.
+            Self::CppC => "cpp-c",
         }
     }
 
@@ -242,7 +265,7 @@ impl LanguageDialect {
         Language::ANALYZABLE
             .iter()
             .map(|language| language.config_label())
-            .chain(std::iter::once("tsx"))
+            .chain(["tsx", "cpp-c"])
     }
 }
 

@@ -7,8 +7,8 @@ use crate::analyzer::dataflow::{
 use crate::analyzer::semantic::ProgramPointHandle;
 
 use super::{
-    ValueFlowFact, ValueFlowPlan, ValueFlowSinkId, ValueFlowSolveError, ValueFlowSourceId,
-    client::ValueFlowUncertainty,
+    AuthoredArmClosure, ValueFlowFact, ValueFlowPlan, ValueFlowSinkId, ValueFlowSolveError,
+    ValueFlowSourceId, client::ValueFlowUncertainty,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +83,7 @@ pub struct ValueFlowSummaryResult {
     meetings: Box<[ValueFlowMeeting]>,
     discovery_complete: bool,
     proven_by_authored_summaries: bool,
+    authored_arm_closures: Box<[AuthoredArmClosure]>,
     owner: Arc<()>,
 }
 
@@ -132,11 +133,20 @@ impl ValueFlowSummaryResult {
         // accepting authored-complete external summaries closes it.
         let proven_by_authored_summaries = !discovery_complete
             && plan.execution_result_complete_accepting_authored_summaries(&result);
+        // Record what proved a residual-arm closure only when such a closure
+        // decided the run (#2342). A derived-complete run closed nothing this
+        // way, and a run that stayed inconclusive concluded nothing to explain.
+        let authored_arm_closures = if proven_by_authored_summaries {
+            plan.authored_arm_closures(&result).into_boxed_slice()
+        } else {
+            Box::default()
+        };
         Ok(Self {
             result,
             meetings: meetings.into_boxed_slice(),
             discovery_complete,
             proven_by_authored_summaries,
+            authored_arm_closures,
             owner: Arc::clone(plan.owner()),
         })
     }
@@ -158,6 +168,13 @@ impl ValueFlowSummaryResult {
     /// Mutually exclusive with `is_complete`.
     pub fn is_proven_by_authored_summaries(&self) -> bool {
         self.proven_by_authored_summaries
+    }
+
+    /// The authored external summaries that closed a residual dispatch arm in
+    /// this run (#2342), so a consumer can state what proved the closure.
+    /// Empty unless `is_proven_by_authored_summaries` holds.
+    pub fn authored_arm_closures(&self) -> &[AuthoredArmClosure] {
+        &self.authored_arm_closures
     }
 
     pub fn sink_outcome(&self, sink: ValueFlowSinkId) -> ValueFlowSinkOutcome<'_> {

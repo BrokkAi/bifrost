@@ -117,7 +117,7 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         // FQ-name-only selection already discovers its definitions through the
         // analyzer index. Keep an empty path list unbounded instead of first
         // truncating the workspace to `max_input_files`.
-        resolve_project_files(analyzer.project(), params.file_paths)
+        resolve_project_files(analyzer, params.file_paths)
     };
     let ambiguous_paths = resolved.ambiguous_paths.clone();
     let resolved_file_count = resolved.files.len();

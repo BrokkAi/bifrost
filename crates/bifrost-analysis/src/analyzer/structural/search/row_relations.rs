@@ -133,6 +133,13 @@ pub(super) fn occurrences_of_declaration(
                         && row.range.end_byte <= declaration.range.end_byte
                 }
                 OccurrenceTarget::Lexical(_) | OccurrenceTarget::Unresolved(_) => false,
+                // Same reasoning as the occurrence-target step: this relation
+                // is a question about resolution, so a plan reaching it must
+                // have asked for it.
+                OccurrenceTarget::NotDerived => {
+                    debug_assert!(false, "occurrences-of requires derived targets");
+                    false
+                }
             };
             if selected {
                 expansions.push(pipeline_expansion(PipelineValue::Occurrence(

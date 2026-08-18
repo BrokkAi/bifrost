@@ -197,6 +197,20 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
 }
 
 impl CppQueryResolver<'_> {
+    /// The other-reading identities of every requested overload's declaration
+    /// site (#1970), with the requested overloads themselves excluded.
+    fn site_equivalent_overloads(&self, overloads: &[CodeUnit]) -> Vec<CodeUnit> {
+        let mut equivalents: Vec<CodeUnit> = Vec::new();
+        for overload in overloads {
+            for equivalent in self.cpp.site_equivalent_units(overload) {
+                if !overloads.contains(&equivalent) && !equivalents.contains(&equivalent) {
+                    equivalents.push(equivalent);
+                }
+            }
+        }
+        equivalents
+    }
+
     fn find_usages_with_visibility(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -224,7 +238,29 @@ impl CppQueryResolver<'_> {
                 specs.push(spec);
             }
         }
-        let target_group: HashSet<CodeUnit> = overloads.iter().cloned().collect();
+        // #1970: the C and C++ readings of a header give one declaration site
+        // two identities. A query against either must report every reference
+        // found under both, so the site's other identity is scanned alongside
+        // the requested overloads and joins the target group its hits are
+        // attributed to. Site equivalence is keyed on (source file,
+        // declaration byte range); nothing here matches on a name.
+        //
+        // Leniently: an equivalent whose shape yields no `TargetSpec` is
+        // dropped rather than failing the whole query, because the caller
+        // asked about the requested overloads, not about it.
+        let site_equivalents = self.site_equivalent_overloads(overloads);
+        for equivalent in &site_equivalents {
+            if let Some(spec) = TargetSpec::from_target(&source, equivalent)
+                && retain_scan_spec(&mut seen_type_specs, &spec)
+            {
+                specs.push(spec);
+            }
+        }
+        let target_group: HashSet<CodeUnit> = overloads
+            .iter()
+            .chain(site_equivalents.iter())
+            .cloned()
+            .collect();
         let files = self.scan_files(overloads, scan_scope);
 
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();

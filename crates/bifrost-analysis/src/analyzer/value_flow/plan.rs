@@ -2,10 +2,10 @@ use std::{cmp::Ordering, error::Error, fmt, hash::Hash, mem::size_of_val, sync::
 
 use crate::analyzer::dataflow::{
     CuratedCallModel, CuratedCallModelFingerprint, ExternalSemanticSummarySet,
-    ExternalSummarySetFingerprint, MAX_SUMMARY_BOUNDARY_BINDINGS, SemanticInputStatus,
-    SemanticProcedureSummary, SummaryBoundary, SummaryBoundaryKind, SummaryDataflowResult,
-    SummaryEffect, SummaryEffectKey, SummaryEvidence, SummaryExitKind, SummaryPort,
-    SummaryTransfer, UnmodeledCallBehavior,
+    ExternalSummaryOrigin, ExternalSummarySetFingerprint, MAX_SUMMARY_BOUNDARY_BINDINGS,
+    SemanticInputStatus, SemanticProcedureSummary, SummaryBoundary, SummaryBoundaryKind,
+    SummaryDataflowResult, SummaryEffect, SummaryEffectKey, SummaryEvidence, SummaryExitKind,
+    SummaryOrigin, SummaryPort, SummaryTransfer, UnmodeledCallBehavior,
 };
 use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AccessPathRoot, CallArgumentEndpoint, CallBinding,
@@ -13,7 +13,7 @@ use crate::analyzer::semantic::{
     CandidateCoverage, DeclarationLocator, DispatchBoundaryKind, EvidenceCompleteness,
     IcfgEdgeKind, MemoryLocationKind, ObjectCardinality, ProcedureHandle, ProgramPointHandle,
     ProgramPointId, ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticEffect,
-    SemanticGapImpact, SemanticGapKind, ValueFlowRelationKind, ValueFlowSnapshot,
+    SemanticGapImpact, SemanticGapKind, SemanticLocator, ValueFlowRelationKind, ValueFlowSnapshot,
 };
 use crate::hash::HashMap;
 
@@ -363,6 +363,41 @@ fn sanitize_removed_labels<'a>(
 enum SummaryProofRequirement {
     Derived,
     AcceptAuthoredComplete,
+}
+
+/// One residual dispatch arm closed by an authored-complete external summary
+/// (#2342).
+///
+/// A run that concludes `ProvenBySummary` because of such a closure is trusting
+/// an authored claim to describe a call's target set, not only that target's
+/// behavior. That is a stronger use of the claim than binding its transfers, so
+/// the run records which claim it was: the call whose arm was closed, the exact
+/// target the summary was selected by, and the summary's authored origin --
+/// model id, content hash, and contract version. A consumer rendering the run
+/// can state what proved the closure instead of reporting an unexplained
+/// conclusion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoredArmClosure {
+    call: CallSiteHandle,
+    target: SemanticLocator,
+    origin: ExternalSummaryOrigin,
+}
+
+impl AuthoredArmClosure {
+    /// The call whose residual dispatch arm this closure discharged.
+    pub const fn call(&self) -> &CallSiteHandle {
+        &self.call
+    }
+
+    /// The exact target the discharging summary was selected by.
+    pub const fn target(&self) -> &SemanticLocator {
+        &self.target
+    }
+
+    /// The authored identity of the discharging summary.
+    pub const fn origin(&self) -> &ExternalSummaryOrigin {
+        &self.origin
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1702,7 +1737,7 @@ impl ValueFlowPlan {
                 SummaryBoundaryKind::Dispatch(_) => {
                     saw_dispatch = true;
                     if !allocation_call
-                        && !self.dispatch_boundary_is_fully_modeled(boundary, requirement)
+                        && !self.dispatch_boundary_is_fully_modeled(result, boundary, requirement)
                     {
                         return false;
                     }
@@ -1741,7 +1776,7 @@ impl ValueFlowPlan {
         }) {
             return true;
         }
-        self.dispatch_boundary_is_fully_modeled(boundary, requirement)
+        self.dispatch_boundary_is_fully_modeled(result, boundary, requirement)
     }
 
     /// Whether an exceptional-exit profile boundary reports only unlowered
@@ -1814,8 +1849,9 @@ impl ValueFlowPlan {
         })
     }
 
-    fn dispatch_boundary_is_fully_modeled(
+    fn dispatch_boundary_is_fully_modeled<Fact>(
         &self,
+        result: &SummaryDataflowResult<Fact>,
         boundary: &SummaryBoundary,
         requirement: SummaryProofRequirement,
     ) -> bool {
@@ -1835,11 +1871,136 @@ impl ValueFlowPlan {
                 SummaryProofRequirement::AcceptAuthoredComplete => authored_complete,
             };
         }
+        if matches!(kind, DispatchBoundaryKind::Unresolved)
+            && matches!(requirement, SummaryProofRequirement::AcceptAuthoredComplete)
+            && self.authored_arm_closure(result, call).is_some()
+        {
+            return true;
+        }
         // A curated model is a Bifrost-authored fallback, not an external pack
         // summary, so it always answers to the derived requirement.
         self.curated_model_for_call(call).is_some_and(|model| {
             self.model_is_fully_bindable(call, model.transfers(), SummaryProofRequirement::Derived)
         })
+    }
+
+    /// The authored-complete external summary that closes this call's residual
+    /// blanket-refinement arm, if the guards permit the closure (#2342).
+    ///
+    /// A call to a callee with no analyzed body carries two dispatch arms: the
+    /// named-target arm the activated summary binds to, and a residual
+    /// `Unresolved` arm minted from the adapter's blanket "the target may
+    /// select an override" gap. Neither dispatch-gap discharge route in
+    /// `workspace_oracle::dispatch` can fire on such a call, because both
+    /// require a materialized candidate and this call by construction has
+    /// none. The residual arm names no target, so `external_summary_for_boundary`
+    /// can never address it, and `ProvenBySummary` was unreachable for every
+    /// external call regardless of how complete the authored claim was.
+    ///
+    /// An authored-complete summary for the exact target named on a sibling arm
+    /// of the same call is an assertion about that call's behavior at that
+    /// target, so it answers the residual arm as well. The guards keep that
+    /// from becoming a blanket amnesty:
+    ///
+    ///   * The caller admits only `AcceptAuthoredComplete`, so `Complete` keeps
+    ///     asking `Derived` and authored trust still cannot launder into it
+    ///     (#1916).
+    ///   * Only a sibling `External` or `Unmaterialized` arm that names its
+    ///     target qualifies. `External(None)`, `Deferred`, `Truncated`, and a
+    ///     second `Unresolved` arm name none, and a `Limit` or `Continuation`
+    ///     boundary is not a dispatch arm at all -- none of them can carry the
+    ///     summary, so a genuinely ambiguous target set still refuses.
+    ///   * The summary must be authored complete and fully bindable at this
+    ///     call. A partial summary does not claim to close its own boundary, so
+    ///     it certainly does not close a sibling's.
+    ///   * The call must have no analyzed callee of its own. A call that both
+    ///     enters a workspace body and names an unmaterialized declaration --
+    ///     an interface member with one visible implementor, say -- has a
+    ///     target set the summary does not describe, and its residual arm is
+    ///     about the implementors nobody enumerated. That is exactly the
+    ///     genuine ambiguity the residual arm exists to report, so it refuses.
+    ///
+    /// A sibling arm that names a target the activated packs do not summarize
+    /// fails `call_boundaries_are_fully_modeled` on its own turn through the
+    /// loop, so this closure cannot rescue a call that has an unmodeled arm.
+    fn authored_arm_closure<Fact>(
+        &self,
+        result: &SummaryDataflowResult<Fact>,
+        call: &CallSiteHandle,
+    ) -> Option<AuthoredArmClosure> {
+        if self.has_binding_for_call(call) {
+            return None;
+        }
+        result
+            .coverage()
+            .boundaries()
+            .iter()
+            .filter(|sibling| sibling.origin() == Some(call))
+            .find_map(|sibling| {
+                let SummaryBoundaryKind::Dispatch(kind) = sibling.kind() else {
+                    return None;
+                };
+                let target = match kind {
+                    DispatchBoundaryKind::External(Some(target))
+                    | DispatchBoundaryKind::Unmaterialized(target) => target,
+                    DispatchBoundaryKind::External(None)
+                    | DispatchBoundaryKind::Deferred { .. }
+                    | DispatchBoundaryKind::Unresolved
+                    | DispatchBoundaryKind::Truncated => return None,
+                };
+                let summary = self.external_summaries.summary_for(target)?;
+                if !summary.completeness().is_complete()
+                    || !self.model_is_fully_bindable(
+                        call,
+                        summary.transfers(),
+                        SummaryProofRequirement::AcceptAuthoredComplete,
+                    )
+                {
+                    return None;
+                }
+                let SummaryOrigin::External(origin) = summary.key().identity().origin() else {
+                    // An inferred summary is derived from a body Bifrost read,
+                    // so it is not an authored claim and has no authored
+                    // identity to record.
+                    return None;
+                };
+                Some(AuthoredArmClosure {
+                    call: call.clone(),
+                    target: target.clone(),
+                    origin: origin.clone(),
+                })
+            })
+    }
+
+    /// Every residual dispatch arm this result closed by an authored-complete
+    /// external summary, in call order (#2342).
+    ///
+    /// A run that concludes `ProvenBySummary` because of such a closure must be
+    /// able to say which authored claim proved it, so this is retained on the
+    /// result rather than recomputed by a consumer that would have to
+    /// re-derive the guards.
+    pub fn authored_arm_closures<Fact>(
+        &self,
+        result: &SummaryDataflowResult<Fact>,
+    ) -> Vec<AuthoredArmClosure> {
+        let mut closures = Vec::new();
+        for boundary in result.coverage().boundaries() {
+            let (Some(call), SummaryBoundaryKind::Dispatch(DispatchBoundaryKind::Unresolved)) =
+                (boundary.origin(), boundary.kind())
+            else {
+                continue;
+            };
+            if closures
+                .iter()
+                .any(|closure: &AuthoredArmClosure| &closure.call == call)
+            {
+                continue;
+            }
+            if let Some(closure) = self.authored_arm_closure(result, call) {
+                closures.push(closure);
+            }
+        }
+        closures
     }
 
     fn model_is_fully_bindable(

@@ -190,7 +190,7 @@ pub struct TaintAnalysisPlan {
     transforms: Box<[TaintTransformBinding]>,
     identity: TaintEdgeFunction,
     phase_transfers: Box<[ResolvedTaintTransfer]>,
-    discovery_complete: bool,
+    sanitizers_resolved: bool,
     owner: Arc<()>,
 }
 
@@ -362,8 +362,7 @@ impl TaintAnalysisPlan {
             }
         }
         phase_transfers.sort_by(compare_resolved_transfers);
-        let discovery_complete = value_flow.discovery_complete()
-            && sanitizers.iter().all(TaintSanitizerBinding::is_resolved);
+        let sanitizers_resolved = sanitizers.iter().all(TaintSanitizerBinding::is_resolved);
         Ok(Self {
             value_flow,
             universe,
@@ -373,7 +372,7 @@ impl TaintAnalysisPlan {
             transforms: transforms.into_boxed_slice(),
             identity,
             phase_transfers: phase_transfers.into_boxed_slice(),
-            discovery_complete,
+            sanitizers_resolved,
             owner: Arc::new(()),
         })
     }
@@ -411,8 +410,19 @@ impl TaintAnalysisPlan {
             .saturating_add(self.transforms.len())
     }
 
-    pub const fn discovery_complete(&self) -> bool {
-        self.discovery_complete
+    /// Whether every sanitizer this plan compiled resolved to a model.
+    ///
+    /// This is the only discovery input the taint layer owns. Value-flow
+    /// discovery is not re-asked here: `ValueFlowPlan::execution_result_complete`
+    /// already asks it over the solved result, and asks it in the #1952 sense,
+    /// which accepts a snapshot left open only by call-target refinement whose
+    /// residual calls this result fully modeled. The plan-time
+    /// `ValueFlowPlan::discovery_complete` flag is strictly stronger than that:
+    /// it demands every snapshot be complete outright. Conjoining it here
+    /// withheld both `Complete` and `ProvenBySummary` from exactly the runs a
+    /// boundary model exists to close (#2342).
+    pub const fn sanitizers_resolved(&self) -> bool {
+        self.sanitizers_resolved
     }
 
     pub(crate) fn owner(&self) -> &Arc<()> {

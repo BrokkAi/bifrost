@@ -841,6 +841,7 @@ fn policy_assert_to_json(assertion: &PolicyAssert) -> Value {
         PolicyAssert::Occurrence(assertion) => occurrence_assert_to_json(assertion),
         PolicyAssert::Resolution(assertion) => resolution_assert_to_json(assertion),
         PolicyAssert::BindingScope(assertion) => binding_scope_assert_to_json(assertion),
+        PolicyAssert::ValueOrigin(assertion) => value_origin_assert_to_json(assertion),
         PolicyAssert::Boundary(assertion) => boundary_assert_to_json(assertion),
         PolicyAssert::Generation(assertion) => generation_assert_to_json(assertion),
         PolicyAssert::DeclarationState(assertion) => declaration_state_assert_to_json(assertion),
@@ -1112,6 +1113,21 @@ fn binding_scope_assert_to_json(assertion: &BindingScopeAssert) -> Value {
     insert(
         &mut object,
         "declared",
+        json!(assertion.containment.label()),
+    );
+    insert(&mut object, "relative_to", json!(assertion.relative_to));
+    Value::Object(object)
+}
+
+fn value_origin_assert_to_json(assertion: &ValueOriginAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("value_origin"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(&mut object, "role", json!(assertion.role.label()));
+    insert(
+        &mut object,
+        "established",
         json!(assertion.containment.label()),
     );
     insert(&mut object, "relative_to", json!(assertion.relative_to));

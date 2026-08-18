@@ -14,6 +14,9 @@ docs/src/content/docs/semantic-model-packs.md text eol=lf
 # This reviewed upstream artifact is verified by its exact SHA-256 digest.
 tests/fixtures/sarif/sarif-schema-2.1.0.json text eol=lf
 
+# The dsh bundle patch is asserted with an exact-content match in its plugin test.
+plugins/bifrost-dsh/cordis.patch.yml text eol=lf
+
 # The vendored Scala parse table is generated from the reviewed pinned grammar.
 vendor/tree-sitter-scala/src/parser.c linguist-generated=true -diff
 

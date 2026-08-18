@@ -102,6 +102,7 @@ mod pipeline;
 mod receiver;
 mod relations;
 mod render;
+use super::occurrence_rows::OccurrenceDerivationOptions;
 use applicability::{CallableApplicabilityValue, OverloadSelectionValue};
 use callable_signature::{CallableSignatureValue, SignatureParameterValue};
 use dispatch::{DispatchSiteValue, DispatchTargetValue};
@@ -2229,6 +2230,44 @@ pub fn execute_code_query_detailed_eager_index(
         UnionExecutionStrategy::Auto,
         CODE_QUERY_SCHEDULER_WORKERS,
         access_mode,
+        OccurrenceDerivationOptions::ROWS_ONLY,
+        None,
+    )
+}
+
+/// `execute_code_query_detailed_eager_index` for a caller that reads each
+/// occurrence row's identity, role and position but never its resolved target.
+///
+/// The definition batch is one resolution per reference-class row and is the
+/// dominant cost of deriving a large file's occurrences. A consumer that joins
+/// captures to rows by AST identity -- an assertion policy's row families --
+/// needs none of it, and rows come back carrying
+/// `CodeQueryOccurrenceTarget::NotDerived` so the omission is stated rather
+/// than mistaken for an unresolved reference.
+pub fn execute_code_query_detailed_eager_index_without_targets(
+    analyzer: &dyn IAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+) -> DetailedCodeQueryResult {
+    let access_mode = match benchmark_structural_access_mode() {
+        StructuralAccessMode::ScanOnly => StructuralAccessMode::ScanOnly,
+        _ => StructuralAccessMode::EagerAuto,
+    };
+    execute_internal_with_analysis_strategy(
+        analyzer,
+        None,
+        None,
+        0,
+        query,
+        limits,
+        cancellation,
+        None,
+        false,
+        UnionExecutionStrategy::Auto,
+        CODE_QUERY_SCHEDULER_WORKERS,
+        access_mode,
+        OccurrenceDerivationOptions::IDENTITY_ONLY,
         None,
     )
 }
@@ -2262,6 +2301,7 @@ pub fn execute_code_query_detailed_eager_index_workspace(
         UnionExecutionStrategy::Auto,
         CODE_QUERY_SCHEDULER_WORKERS,
         access_mode,
+        OccurrenceDerivationOptions::ROWS_ONLY,
         None,
     )
 }
@@ -2300,6 +2340,7 @@ pub(crate) fn execute_code_query_with_union_strategy(
         strategy,
         CODE_QUERY_SCHEDULER_WORKERS,
         StructuralAccessMode::Auto,
+        OccurrenceDerivationOptions::ROWS_ONLY,
         None,
     )
 }
@@ -2326,6 +2367,7 @@ pub(crate) fn execute_code_query_with_access_mode(
         UnionExecutionStrategy::Sequential,
         CODE_QUERY_SCHEDULER_WORKERS,
         mode,
+        OccurrenceDerivationOptions::ROWS_ONLY,
         Some(&mut failure),
     );
     match failure {
@@ -2402,6 +2444,7 @@ fn execute_internal_with_analysis(
         UnionExecutionStrategy::Auto,
         CODE_QUERY_SCHEDULER_WORKERS,
         benchmark_structural_access_mode(),
+        OccurrenceDerivationOptions::ROWS_ONLY,
         None,
     )
 }
@@ -2441,6 +2484,7 @@ fn execute_internal_with_strategy(
         union_strategy,
         scheduler_workers,
         access_mode,
+        OccurrenceDerivationOptions::ROWS_ONLY,
         access_failure_out,
     )
 }
@@ -2459,6 +2503,7 @@ fn execute_internal_with_analysis_strategy(
     union_strategy: UnionExecutionStrategy,
     scheduler_workers: usize,
     access_mode: StructuralAccessMode,
+    occurrence_options: OccurrenceDerivationOptions,
     access_failure_out: Option<&mut Option<String>>,
 ) -> DetailedCodeQueryResult {
     // Keep repeated analyzer reads coherent and reusable even for direct API
@@ -2519,7 +2564,7 @@ fn execute_internal_with_analysis_strategy(
         seed_scan_ledger: SeedScanLedger::default(),
         indexed_declarations: IndexedDeclarations::default(),
         reference_cache: ReferenceTraversalCache::default(),
-        occurrence_cache: OccurrenceTraversalCache::default(),
+        occurrence_cache: OccurrenceTraversalCache::with_options(occurrence_options),
         environment_cache: EnvironmentTraversalCache::default(),
         materialization_cache: materialization::MaterializationTraversalCache::default(),
         edge_cache: EdgeTraversalCache::default(),

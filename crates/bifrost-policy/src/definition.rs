@@ -335,6 +335,7 @@ pub enum PolicyAssert {
     Occurrence(OccurrenceAssert),
     Resolution(ResolutionAssert),
     BindingScope(BindingScopeAssert),
+    ValueOrigin(ValueOriginAssert),
     Boundary(BoundaryAssert),
     Generation(GenerationAssert),
     DeclarationState(DeclarationStateAssert),
@@ -353,6 +354,7 @@ impl PolicyAssert {
             Self::Occurrence(assertion) => &assertion.id,
             Self::Resolution(assertion) => &assertion.id,
             Self::BindingScope(assertion) => &assertion.id,
+            Self::ValueOrigin(assertion) => &assertion.id,
             Self::Boundary(assertion) => &assertion.id,
             Self::Generation(assertion) => &assertion.id,
             Self::DeclarationState(assertion) => &assertion.id,
@@ -375,6 +377,7 @@ impl PolicyAssert {
             Self::Occurrence(assertion) => Some(&assertion.at),
             Self::Resolution(assertion) => Some(&assertion.at),
             Self::BindingScope(assertion) => Some(&assertion.at),
+            Self::ValueOrigin(assertion) => Some(&assertion.at),
             Self::Boundary(assertion) => Some(&assertion.at),
             Self::Generation(assertion) => Some(&assertion.at),
             Self::DeclarationState(assertion) => Some(&assertion.at),
@@ -398,6 +401,7 @@ impl PolicyAssert {
             Self::Occurrence(assertion) => Some(assertion.role),
             Self::Resolution(assertion) => Some(assertion.role),
             Self::BindingScope(assertion) => Some(assertion.role),
+            Self::ValueOrigin(assertion) => Some(assertion.role),
             Self::Boundary(assertion) => Some(assertion.role),
             Self::EdgeParity(assertion) => Some(assertion.role),
             Self::EdgeClass(assertion) => Some(assertion.role),
@@ -414,6 +418,7 @@ impl PolicyAssert {
             Self::Occurrence(_) => "occurrence",
             Self::Resolution(_) => "resolution",
             Self::BindingScope(_) => "binding_scope",
+            Self::ValueOrigin(_) => "value_origin",
             Self::Boundary(_) => "boundary",
             Self::Generation(_) => "generation",
             Self::DeclarationState(_) => "declaration-state",
@@ -605,6 +610,40 @@ impl BindingScopeAssert {
     pub fn expectation(&self) -> String {
         format!(
             "binding declared {} capture `{}`",
+            self.containment.label(),
+            self.relative_to
+        )
+    }
+}
+
+/// Require the value read at the subject occurrence to be *established*
+/// inside or outside a second captured node.
+///
+/// This is the refined loop-invariance predicate. `BindingScopeAssert` asks
+/// where the binding is declared, which answers "is this a fresh value each
+/// iteration?" only for languages and shapes where a fresh value needs a fresh
+/// binder. A receiver whose binding is declared before the loop but which the
+/// loop body *assigns* on every pass carries a fresh value each iteration and
+/// is not loop-invariant, even though its binding is declared outside.
+///
+/// A value is established inside the related capture when the binding's
+/// declaring scope is inside it, or when some assignment whose left operand
+/// reaches the same binding is written inside it. The requirement is over both
+/// origins, so the violation -- the finding -- is "established by neither".
+#[derive(Debug, Clone)]
+pub struct ValueOriginAssert {
+    pub id: PolicyAssertId,
+    pub at: String,
+    pub role: OccurrenceRole,
+    pub containment: DeclaredContainment,
+    /// The capture whose node interval the origins are compared against.
+    pub relative_to: String,
+}
+
+impl ValueOriginAssert {
+    pub fn expectation(&self) -> String {
+        format!(
+            "value established {} capture `{}`",
             self.containment.label(),
             self.relative_to
         )

@@ -1966,6 +1966,17 @@ pub struct CppVisitor<'a> {
     pub file: &'a ProjectFile,
     pub source: &'a str,
     pub parsed: &'a mut ParsedFile,
+    /// Whether this translation unit is compiled as C -- the `CppC` dialect of
+    /// `LanguageDialect`, i.e. an exact lowercase `.c` extension.
+    ///
+    /// C has no nested tag scope: a struct/union/enum tag declared inside
+    /// another aggregate's member list has the scope of the outer declaration
+    /// itself (C17 6.2.1, 6.7.2.3). `struct outer { struct inner { int v; } i; };`
+    /// therefore declares a file-scope `inner` that a later file-scope
+    /// `struct inner *p;` legitimately references, where C++ would make the
+    /// same shape a nested class `outer::inner`. Headers carry no compilation
+    /// language of their own and keep the conservative C++ interpretation.
+    pub c_tag_semantics: bool,
     pub recovered_class_sibling_scopes: HashMap<usize, ScopeInfo>,
     /// Byte regions whose contents were re-owned by a fragmented export-class
     /// recovery (#938): the scattered members between the fragmented
@@ -2711,6 +2722,26 @@ impl<'a> CppVisitor<'a> {
         );
     }
 
+    /// Whether this class-like declaration is a C tag that belongs to the
+    /// enclosing non-aggregate scope rather than to the aggregate it is
+    /// lexically written inside.
+    ///
+    /// `class_specifier` is deliberately excluded: `class` is not C, so text
+    /// that spells one in a `.c` file is not C code and keeps the C++ reading
+    /// rather than getting a half-C identity.
+    fn mints_tag_at_enclosing_c_scope(
+        &self,
+        declaration_node: Node<'_>,
+        scope: &ScopeInfo,
+    ) -> bool {
+        self.c_tag_semantics
+            && scope.class_unit.is_some()
+            && matches!(
+                declaration_node.kind(),
+                "struct_specifier" | "union_specifier" | "enum_specifier"
+            )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn visit_named_class_like_shape<'tree>(
         &mut self,
@@ -2735,7 +2766,25 @@ impl<'a> CppVisitor<'a> {
             definition_body_present,
             scope,
         );
-        let scope = &recovered_scope;
+        // C tag scope (C17 6.2.1, 6.7.2.3): a tag declared inside another
+        // aggregate's member list is declared at the enclosing non-aggregate
+        // scope, not nested inside the aggregate. `scope.class_unit` is the
+        // only aggregate carrier in this walk, so dropping it puts the tag at
+        // the nearest enclosing non-aggregate scope -- the module at file or
+        // namespace scope, and the same block-scope representation a
+        // function-local aggregate already gets. The tag's own body scope
+        // below still owns its members, so fields and enumerators are
+        // unaffected.
+        let c_tag_scope;
+        let scope = if self.mints_tag_at_enclosing_c_scope(declaration_node, &recovered_scope) {
+            c_tag_scope = ScopeInfo {
+                class_unit: None,
+                ..recovered_scope.clone()
+            };
+            &c_tag_scope
+        } else {
+            &recovered_scope
+        };
         let short_name = if let Some(parent) = &scope.class_unit {
             cpp_join_nested_short(parent.short_name(), &name)
         } else {
@@ -3902,7 +3951,7 @@ impl<'a> CppVisitor<'a> {
         let arity = parameter_labels.len();
         let function = FunctionInfo {
             package_name: scope.package_name.clone(),
-            owner_path: Some(parent.short_name().to_string()),
+            owner: Some(CppMemberOwner::Unit(parent.clone())),
             name: normalize_cpp_whitespace(node_text(name_node, self.source)),
             signature,
         };
@@ -3955,7 +4004,7 @@ impl<'a> CppVisitor<'a> {
         let arity = parameter_labels.len();
         let function = FunctionInfo {
             package_name: scope.package_name.clone(),
-            owner_path: Some(parent.short_name().to_string()),
+            owner: Some(CppMemberOwner::Unit(parent.clone())),
             name: parent.identifier().to_string(),
             signature,
         };
@@ -4467,9 +4516,36 @@ fn strip_cpp_comments_from_line(line: &str, in_block_comment: &mut bool) -> Stri
 #[derive(Clone)]
 struct FunctionInfo {
     package_name: String,
-    owner_path: Option<String>,
+    owner: Option<CppMemberOwner>,
     name: String,
     signature: String,
+}
+
+/// Owner of a member function, kept structured so a literal `$` inside a
+/// source-level class name never crosses a join/split boundary: the legacy
+/// `$`-joined owner string was re-split at fq construction, dropping a leading
+/// `$` (`$262Object` became `262Object` in the fq while short_name kept it)
+/// and tripping the package/short boundary assert -- the #2140 corruption one
+/// level up (#2362).
+#[derive(Clone)]
+enum CppMemberOwner {
+    /// Source-level owner class chain from a qualified declarator-id, one
+    /// class name per component (`Outer::Inner::method` -> `["Outer",
+    /// "Inner"]`); each component may itself contain a literal `$`.
+    Chain(Vec<String>),
+    /// The lexically enclosing or recovered class unit; the member fq extends
+    /// its fq directly instead of re-splitting its `$`-joined short chain.
+    Unit(CodeUnit),
+}
+
+impl CppMemberOwner {
+    /// The legacy `$`-joined owner chain used in the member's short name.
+    fn short_chain(&self) -> String {
+        match self {
+            Self::Chain(chain) => chain.join("$"),
+            Self::Unit(parent) => parent.short_name().to_string(),
+        }
+    }
 }
 
 enum DeclaratorKind<'a> {
@@ -4483,12 +4559,44 @@ impl FunctionInfo {
     }
 
     fn code_unit_with_synthetic(&self, file: ProjectFile, synthetic: bool) -> CodeUnit {
-        let short_name = if let Some(owner) = &self.owner_path {
-            format!("{owner}.{}", self.name)
-        } else {
-            self.name.clone()
+        let short_name = match &self.owner {
+            Some(owner) => cpp_join_member_short(&owner.short_chain(), &self.name),
+            None => self.name.clone(),
         };
-        let fq = cpp_member_fq(&self.package_name, &short_name);
+        let fq = match &self.owner {
+            Some(CppMemberOwner::Chain(chain)) => {
+                debug_assert!(
+                    !chain.is_empty(),
+                    "an empty owner chain is no owner; producers return None instead"
+                );
+                let mut fq = FqName::new();
+                cpp_push_package(&mut fq, &self.package_name);
+                let mut first = true;
+                for component in chain {
+                    let kind = if first {
+                        SegmentKind::Type
+                    } else {
+                        SegmentKind::Nested
+                    };
+                    fq.push(cpp_segment(component, kind));
+                    first = false;
+                }
+                fq.push(cpp_segment(&self.name, SegmentKind::Member));
+                fq
+            }
+            Some(CppMemberOwner::Unit(parent)) if !parent.short_name().is_empty() => parent
+                .fq()
+                .clone()
+                .with_pushed(cpp_segment(&self.name, SegmentKind::Member)),
+            // An anonymous parent (empty short chain) contributes no owner
+            // segment -- the same guard as cpp_join_member_short above.
+            Some(CppMemberOwner::Unit(_)) | None => {
+                let mut fq = FqName::new();
+                cpp_push_package(&mut fq, &self.package_name);
+                fq.push(cpp_segment(&self.name, SegmentKind::Member));
+                fq
+            }
+        };
         CodeUnit::with_signature_and_fq(
             file,
             CodeUnitType::Function,
@@ -4530,13 +4638,13 @@ fn extract_function_info_from_name(
             let name = canonical_cpp_qualified_component(terminal, source)?.name;
             let owner = scope.class_unit.as_ref()?;
             Some((
-                Some(owner.short_name().to_string()),
+                Some(CppMemberOwner::Unit(owner.clone())),
                 name,
                 scope.package_name.clone(),
             ))
         })
         .flatten();
-    let (owner_path, name, package_name) = if let Some(parts) = recovered_specialization_member {
+    let (owner, name, package_name) = if let Some(parts) = recovered_specialization_member {
         parts
     } else if let Some(parts) =
         split_structured_templated_cpp_name(declarator_name_node, source, scope)
@@ -4564,7 +4672,7 @@ fn extract_function_info_from_name(
 
     Some(FunctionInfo {
         package_name,
-        owner_path,
+        owner,
         name,
         signature,
     })
@@ -4685,6 +4793,24 @@ fn cpp_declarator_identity_suffix(
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>();
     normalize_cpp_qualifier_suffix(&parts.join(" "))
+}
+
+/// The identity suffix of one callable declarator, for a consumer that holds
+/// the declarator rather than the declaration walk's parts.
+///
+/// The persisted signature concatenates the parameter spelling and this suffix,
+/// so a comparison that must agree on the suffix alone recomputes it here
+/// instead of splitting the stored string.
+pub(crate) fn cpp_callable_identity_suffix(
+    function_declarator: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    let parameters_node = function_declarator.child_by_field_name("parameters")?;
+    Some(cpp_declarator_identity_suffix(
+        function_declarator,
+        parameters_node,
+        source,
+    ))
 }
 
 fn extract_function_declarator(node: Node<'_>) -> Option<Node<'_>> {
@@ -4913,7 +5039,7 @@ fn is_pointer_wrapper_declarator(node: Node<'_>) -> bool {
     }
 }
 
-fn split_cpp_name(raw_name: &str, scope: &ScopeInfo) -> (Option<String>, String, String) {
+fn split_cpp_name(raw_name: &str, scope: &ScopeInfo) -> (Option<CppMemberOwner>, String, String) {
     let cleaned = raw_name.trim_start_matches("template ").trim();
     // A leading `::` is the explicit-global marker, not an empty owner segment.
     // Error recovery can leave a definition spelled `::X(...)` (e.g. an
@@ -4944,7 +5070,7 @@ fn split_cpp_name(raw_name: &str, scope: &ScopeInfo) -> (Option<String>, String,
             // Lexically inside a class body: the owner is that class, whatever
             // the declarator re-qualifies it as.
             return (
-                Some(class_unit.short_name().to_string()),
+                Some(CppMemberOwner::Unit(class_unit.clone())),
                 name,
                 scope.package_name.clone(),
             );
@@ -4965,11 +5091,13 @@ fn split_cpp_name(raw_name: &str, scope: &ScopeInfo) -> (Option<String>, String,
             // nested-class chain, so the redundant spelling still lands on the
             // same `log4cxx.Foo.method` identity as its header declaration.
             let nested = strip_redundant_namespace_prefix(owner_parts, &scope.package_name);
-            let owner_path = (!nested.is_empty()).then(|| nested.join("$"));
-            return (owner_path, name, scope.package_name.clone());
+            let owner = (!nested.is_empty()).then(|| {
+                CppMemberOwner::Chain(nested.iter().map(|name| name.to_string()).collect())
+            });
+            return (owner, name, scope.package_name.clone());
         }
         // File scope (no enclosing `namespace {}` block, scope package empty).
-        let (owner_path, package_name) = if owner_parts.len() > 1 {
+        let (owner, package_name) = if owner_parts.len() > 1 {
             // A multi-segment qualifier at file scope with no enclosing
             // namespace: treat all but the last owner segment as the namespace
             // path and the last as the owning class (`ns1::ns2::Class::method`
@@ -4982,7 +5110,9 @@ fn split_cpp_name(raw_name: &str, scope: &ScopeInfo) -> (Option<String>, String,
             // using-directive-qualified nested-class shapes remain on this
             // behavior; see #1121).
             (
-                Some(owner_parts.last().unwrap_or(&"").to_string()),
+                Some(CppMemberOwner::Chain(vec![
+                    owner_parts.last().unwrap_or(&"").to_string(),
+                ])),
                 owner_parts[..owner_parts.len() - 1].join("::"),
             )
         } else {
@@ -4998,19 +5128,19 @@ fn split_cpp_name(raw_name: &str, scope: &ScopeInfo) -> (Option<String>, String,
             // the real one -- an identity split that made the same member
             // unresolvable under its own displayed spelling.
             (
-                Some(owner_parts[0].to_string()),
+                Some(CppMemberOwner::Chain(vec![owner_parts[0].to_string()])),
                 cpp_using_directive_namespace_for_bare_owner(scope),
             )
         };
-        return (owner_path, name, package_name);
+        return (owner, name, package_name);
     }
 
     let package_name = scope.package_name.clone();
-    let owner_path = scope
+    let owner = scope
         .class_unit
         .as_ref()
-        .map(|parent| parent.short_name().to_string());
-    (owner_path, cleaned.to_string(), package_name)
+        .map(|parent| CppMemberOwner::Unit(parent.clone()));
+    (owner, cleaned.to_string(), package_name)
 }
 
 /// Drop the leading owner segments of an out-of-line member qualifier that
@@ -5140,7 +5270,7 @@ fn split_structured_templated_cpp_name(
     declarator_name: Node<'_>,
     source: &str,
     scope: &ScopeInfo,
-) -> Option<(Option<String>, String, String)> {
+) -> Option<(Option<CppMemberOwner>, String, String)> {
     let (mut components, explicitly_global) =
         structured_cpp_qualified_components(declarator_name, source)?;
 
@@ -5175,16 +5305,19 @@ fn split_structured_templated_cpp_name(
     } else {
         package_name
     };
-    let owner_path = components[owner_start..]
+    let owner_chain = components[owner_start..]
         .iter()
-        .map(|component| component.name.as_str())
-        .collect::<Vec<_>>()
-        .join("$");
-    if owner_path.is_empty() || terminal.name.is_empty() {
+        .map(|component| component.name.clone())
+        .collect::<Vec<_>>();
+    if owner_chain.is_empty() || terminal.name.is_empty() {
         return None;
     }
 
-    Some((Some(owner_path), terminal.name, package_name))
+    Some((
+        Some(CppMemberOwner::Chain(owner_chain)),
+        terminal.name,
+        package_name,
+    ))
 }
 
 fn canonical_cpp_qualified_component(
@@ -7491,6 +7624,456 @@ fn cpp_parameter_type_identity(
     Some(identity)
 }
 
+/// One callable parameter's comparable shape.
+///
+/// [`CppParameterType`] above answers "which type is written here" for a
+/// structured model and deliberately records no cv-qualifiers, so it reports
+/// the same value for `f(char *)` and `f(const char *)`. Deciding whether two
+/// callable declarations declare one function needs the opposite trade: every
+/// cv-qualifier that C++ counts as part of the parameter type must survive,
+/// while the two declarations may spell the same type through different
+/// qualifications. This slot carries that comparand.
+///
+/// The result is index-parallel with [`cpp_callable_parameter_type_identities`]
+/// and with the rendered parameter spellings of the same callable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CppComparableSlot {
+    /// A declared parameter reduced to its comparable shape.
+    Shape(CppComparableParameter),
+    /// A `...` pack, which declares no parameter type at all.
+    Ellipsis,
+    /// A parameter with no comparable reduction, such as a macro-obscured,
+    /// `decltype`-computed, or function-pointer parameter.
+    Unstructured,
+}
+
+/// A parameter type as a flat arena of nodes plus a root index.
+///
+/// The arena carries the same rationale as [`StructuredTypeIdentity`]: source
+/// can nest types very deeply, and cloning, comparing or dropping the value
+/// must not consume the Rust call stack. Nodes are appended in post-order, so
+/// every child index is smaller than its parent's and the last appended node is
+/// the root.
+///
+/// That post-order append is also what makes the derived `PartialEq` a correct
+/// structural equality: the builder below is deterministic, so one type shape
+/// has exactly one arena layout no matter which spelling produced it. Two
+/// shapes are equal as values iff they are equal as type trees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CppComparableParameter {
+    nodes: Vec<CppComparableNode>,
+    root: usize,
+}
+
+/// One node of a [`CppComparableParameter`] arena.
+///
+/// `Reference` and `Array` carry no qualifiers because the grammar writes none
+/// on them: a reference cannot be cv-qualified in C++, and an array's
+/// qualifiers belong to its element type. A cv-qualifier written on a generic
+/// type (`const std::vector<int>`) is recorded on the generic's base leaf,
+/// which is the only Named node the whole spelling produces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CppComparableNode {
+    Named {
+        name: StructuredTypeName,
+        primitive: bool,
+        konst: bool,
+        volatil: bool,
+    },
+    Pointer {
+        inner: usize,
+        konst: bool,
+        volatil: bool,
+    },
+    Reference {
+        inner: usize,
+    },
+    Array {
+        inner: usize,
+    },
+    Generic {
+        base: usize,
+        arguments: Vec<usize>,
+    },
+}
+
+impl CppComparableParameter {
+    pub fn root(&self) -> usize {
+        self.root
+    }
+
+    pub fn node(&self, index: usize) -> &CppComparableNode {
+        &self.nodes[index]
+    }
+
+    /// Apply the [dcl.fct]/5 parameter-type adjustments, which hold at the
+    /// parameter's top level only.
+    ///
+    /// A top-level cv-qualifier is discarded, so `f(const int)` and `f(int)`
+    /// declare one function, and a top-level array type becomes a pointer to
+    /// its element type, so `f(int[3])` and `f(int *)` do too. The outermost
+    /// type constructor is this arena's root, which is why both adjustments
+    /// are one match on it: cv on an inner pointer level, on a pointee, or on
+    /// an array element keeps distinguishing the type, and an array behind a
+    /// pointer or reference is not a top-level array.
+    fn adjust_parameter_top_level(&mut self) {
+        let root = self.root;
+        match &mut self.nodes[root] {
+            CppComparableNode::Named { konst, volatil, .. }
+            | CppComparableNode::Pointer { konst, volatil, .. } => {
+                *konst = false;
+                *volatil = false;
+            }
+            CppComparableNode::Array { inner } => {
+                let inner = *inner;
+                self.nodes[root] = CppComparableNode::Pointer {
+                    inner,
+                    konst: false,
+                    volatil: false,
+                };
+            }
+            CppComparableNode::Generic { base, .. } => {
+                let base = *base;
+                let CppComparableNode::Named { konst, volatil, .. } = &mut self.nodes[base] else {
+                    unreachable!("a comparable generic's base is always a named leaf");
+                };
+                *konst = false;
+                *volatil = false;
+            }
+            CppComparableNode::Reference { .. } => {}
+        }
+    }
+}
+
+/// The comparable shape of each invocation parameter, in declaration order.
+///
+/// The result is index-parallel with
+/// [`cpp_callable_parameter_type_identities`]; a parameter that admits no
+/// comparable shape is [`CppComparableSlot::Unstructured`], which a comparison
+/// must treat as evidence of nothing rather than as agreement.
+pub fn cpp_comparable_parameter_shapes(
+    function_declarator: Node<'_>,
+    source: &str,
+) -> Vec<CppComparableSlot> {
+    let Some(parameters_node) = function_declarator.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    let lexical_scope = cpp_callable_lexical_scope(function_declarator, source);
+    cpp_callable_parameter_slots(parameters_node, source)
+        .into_iter()
+        .map(|slot| match slot {
+            CppParameterSlot::Ellipsis => CppComparableSlot::Ellipsis,
+            CppParameterSlot::Declared(parameter) => {
+                cpp_comparable_parameter(parameter, source, &lexical_scope)
+                    .map_or(CppComparableSlot::Unstructured, CppComparableSlot::Shape)
+            }
+        })
+        .collect()
+}
+
+fn cpp_comparable_parameter(
+    parameter: Node<'_>,
+    source: &str,
+    lexical_scope: &[String],
+) -> Option<CppComparableParameter> {
+    let type_node = parameter.child_by_field_name("type")?;
+    let levels = match cpp_parameter_declarator(parameter) {
+        Some(declarator) => cpp_comparable_declarator_levels(declarator, source)?,
+        None => Vec::new(),
+    };
+    let mut shape = cpp_comparable_type_shape(
+        type_node,
+        cpp_cv_qualifiers(parameter, source),
+        levels,
+        source,
+        lexical_scope,
+    )?;
+    shape.adjust_parameter_top_level();
+    Some(shape)
+}
+
+/// The `const` and `volatile` qualifiers written as direct named children of
+/// `node`.
+///
+/// The grammar exposes `type_qualifier` as a non-field named child in exactly
+/// the three places a parameter's qualifiers can be written: on the
+/// `parameter_declaration` itself (the base type), on a `type_descriptor`
+/// (inside a template argument list), and on each `pointer_declarator` level
+/// (the pointer object). Every other qualifier the grammar admits - `restrict`
+/// and friends - takes no part in C++ type identity, the same filter
+/// `cpp_parameter_type` applies to the rendered spelling (#1827).
+fn cpp_cv_qualifiers(node: Node<'_>, source: &str) -> CppCvQualifiers {
+    let mut qualifiers = CppCvQualifiers::default();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "type_qualifier" {
+            continue;
+        }
+        match node_text(child, source) {
+            "const" => qualifiers.konst = true,
+            "volatile" => qualifiers.volatil = true,
+            _ => {}
+        }
+    }
+    qualifiers
+}
+
+#[derive(Clone, Copy, Default)]
+struct CppCvQualifiers {
+    konst: bool,
+    volatil: bool,
+}
+
+impl CppCvQualifiers {
+    fn union(self, other: Self) -> Self {
+        Self {
+            konst: self.konst || other.konst,
+            volatil: self.volatil || other.volatil,
+        }
+    }
+}
+
+/// One pointer, reference or array level a declarator chain adds.
+#[derive(Clone, Copy)]
+enum CppComparableLevel {
+    Pointer { konst: bool, volatil: bool },
+    Reference,
+    Array,
+}
+
+/// The levels `declarator` adds, outermost written level first.
+///
+/// C++ declarator syntax binds inside out: the level written closest to the
+/// declared name is the outermost type constructor, and tree-sitter nests it
+/// deepest. `int *a[3]` therefore yields `[Pointer, Array]`, which the builder
+/// applies in order to reach "array of pointer to int", and the qualifier of
+/// `int * const *p` is read on the level it was written next to, the inner
+/// pointer of the resulting type.
+///
+/// A declarator chain that names a function type - a function-pointer
+/// parameter - has no comparable shape and reports `None`, matching the
+/// structured identity channel.
+fn cpp_comparable_declarator_levels(
+    declarator: Node<'_>,
+    source: &str,
+) -> Option<Vec<CppComparableLevel>> {
+    let mut levels = Vec::new();
+    let mut current = declarator;
+    loop {
+        match current.kind() {
+            "pointer_declarator" | "abstract_pointer_declarator" => {
+                let qualifiers = cpp_cv_qualifiers(current, source);
+                levels.push(CppComparableLevel::Pointer {
+                    konst: qualifiers.konst,
+                    volatil: qualifiers.volatil,
+                });
+            }
+            "reference_declarator" | "abstract_reference_declarator" => {
+                levels.push(CppComparableLevel::Reference);
+            }
+            "array_declarator" | "abstract_array_declarator" => {
+                levels.push(CppComparableLevel::Array);
+            }
+            "parenthesized_declarator" | "abstract_parenthesized_declarator" => {}
+            "identifier" | "field_identifier" | "type_identifier" => return Some(levels),
+            _ => return None,
+        }
+        let Some(next) = cpp_nested_declarator(current) else {
+            return Some(levels);
+        };
+        current = next;
+    }
+}
+
+/// Reduce one written type to a comparable arena.
+///
+/// The walk is the work-stack shape `cpp_structured_type_identity` uses, with
+/// two additions: each visited type node carries the cv-qualifiers written on
+/// it, and declarator levels arrive as a prepared list rather than being
+/// rediscovered inside the walk.
+fn cpp_comparable_type_shape(
+    type_node: Node<'_>,
+    qualifiers: CppCvQualifiers,
+    levels: Vec<CppComparableLevel>,
+    source: &str,
+    lexical_scope: &[String],
+) -> Option<CppComparableParameter> {
+    enum Work<'tree> {
+        Visit {
+            node: Node<'tree>,
+            qualifiers: CppCvQualifiers,
+        },
+        ApplyLevels(Vec<CppComparableLevel>),
+        BuildGeneric {
+            argument_count: usize,
+        },
+    }
+
+    let mut nodes: Vec<CppComparableNode> = Vec::new();
+    let mut values: Vec<usize> = Vec::new();
+    let mut work = vec![
+        Work::ApplyLevels(levels),
+        Work::Visit {
+            node: type_node,
+            qualifiers,
+        },
+    ];
+    while let Some(next) = work.pop() {
+        match next {
+            Work::Visit { node, qualifiers } => match node.kind() {
+                "type_descriptor" => {
+                    let inner_type = node
+                        .child_by_field_name("type")
+                        .or_else(|| node.named_child(0))?;
+                    let mut cursor = node.walk();
+                    let declarator = node.child_by_field_name("declarator").or_else(|| {
+                        node.named_children(&mut cursor).find(|child| {
+                            child.id() != inner_type.id() && child.kind() != "type_qualifier"
+                        })
+                    });
+                    let levels = match declarator {
+                        Some(declarator) => cpp_comparable_declarator_levels(declarator, source)?,
+                        None => Vec::new(),
+                    };
+                    work.push(Work::ApplyLevels(levels));
+                    work.push(Work::Visit {
+                        node: inner_type,
+                        qualifiers: qualifiers.union(cpp_cv_qualifiers(node, source)),
+                    });
+                }
+                "sized_type_specifier" => {
+                    // `unsigned char` is one primitive type whose components are
+                    // partly unnamed tokens, so the whole specifier is its own
+                    // name component. Reducing it to the `type` child would make
+                    // `f(unsigned char)` and `f(char)` compare equal.
+                    let name = StructuredTypeName::new(
+                        vec![normalize_cpp_whitespace(node_text(node, source))],
+                        lexical_scope.to_vec(),
+                        false,
+                    )?;
+                    values.push(cpp_push_comparable_node(
+                        &mut nodes,
+                        CppComparableNode::Named {
+                            name,
+                            primitive: true,
+                            konst: qualifiers.konst,
+                            volatil: qualifiers.volatil,
+                        },
+                    ));
+                }
+                "qualified_identifier"
+                | "scoped_identifier"
+                | "scoped_type_identifier"
+                | "type_identifier"
+                | "field_identifier"
+                | "identifier"
+                | "namespace_identifier"
+                | "primitive_type"
+                | "template_type" => {
+                    let name = cpp_structured_named_type(node, source, lexical_scope)?;
+                    values.push(cpp_push_comparable_node(
+                        &mut nodes,
+                        CppComparableNode::Named {
+                            name,
+                            primitive: node.kind() == "primitive_type",
+                            konst: qualifiers.konst,
+                            volatil: qualifiers.volatil,
+                        },
+                    ));
+                    if let Some(arguments_node) = cpp_comparable_template_arguments(node) {
+                        let mut cursor = arguments_node.walk();
+                        let arguments = arguments_node
+                            .named_children(&mut cursor)
+                            .filter(|child| !child.is_extra() && child.kind() != "comment")
+                            .collect::<Vec<_>>();
+                        work.push(Work::BuildGeneric {
+                            argument_count: arguments.len(),
+                        });
+                        work.extend(arguments.into_iter().rev().map(|argument| Work::Visit {
+                            node: argument,
+                            qualifiers: CppCvQualifiers::default(),
+                        }));
+                    }
+                }
+                _ => {
+                    let inner = node.child_by_field_name("type").or_else(|| {
+                        (node.named_child_count() == 1)
+                            .then(|| node.named_child(0))
+                            .flatten()
+                    })?;
+                    work.push(Work::Visit {
+                        node: inner,
+                        qualifiers,
+                    });
+                }
+            },
+            Work::ApplyLevels(levels) => {
+                let mut root = values.pop()?;
+                for level in levels {
+                    let node = match level {
+                        CppComparableLevel::Pointer { konst, volatil } => {
+                            CppComparableNode::Pointer {
+                                inner: root,
+                                konst,
+                                volatil,
+                            }
+                        }
+                        CppComparableLevel::Reference => {
+                            CppComparableNode::Reference { inner: root }
+                        }
+                        CppComparableLevel::Array => CppComparableNode::Array { inner: root },
+                    };
+                    root = cpp_push_comparable_node(&mut nodes, node);
+                }
+                values.push(root);
+            }
+            Work::BuildGeneric { argument_count } => {
+                let value_count = argument_count.checked_add(1)?;
+                let start = values.len().checked_sub(value_count)?;
+                let mut built = values.split_off(start);
+                let base = built.remove(0);
+                values.push(cpp_push_comparable_node(
+                    &mut nodes,
+                    CppComparableNode::Generic {
+                        base,
+                        arguments: built,
+                    },
+                ));
+            }
+        }
+    }
+    let root = (values.len() == 1).then(|| values.pop()).flatten()?;
+    debug_assert_eq!(
+        root,
+        nodes.len().saturating_sub(1),
+        "comparable nodes are appended in post-order, so the root is the last one"
+    );
+    Some(CppComparableParameter { nodes, root })
+}
+
+fn cpp_push_comparable_node(nodes: &mut Vec<CppComparableNode>, node: CppComparableNode) -> usize {
+    nodes.push(node);
+    nodes.len() - 1
+}
+
+/// The template argument list of the name `node` terminates in, if any.
+///
+/// `std::vector<int>` writes its arguments on the `name` of a qualified
+/// identifier, so a walk that stopped at the qualified node would reduce
+/// `std::vector<const int *>` and `std::vector<int *>` to the same name.
+fn cpp_comparable_template_arguments(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "template_type" => return current.child_by_field_name("arguments"),
+            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
+                current = current.child_by_field_name("name")?;
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// The callable declarator of the declaration that covers `start_byte`.
 ///
 /// A consumer that holds a declaration's recorded byte position rather than its
@@ -7628,7 +8211,7 @@ fn cpp_parameter_declarator(parameter: Node<'_>) -> Option<Node<'_>> {
 
 /// Whether a parameter's declarator chain adds indirection - a pointer,
 /// reference, array or function declarator - to the parameter's written type.
-fn cpp_declarator_adds_indirection(declarator: Node<'_>) -> bool {
+pub(crate) fn cpp_declarator_adds_indirection(declarator: Node<'_>) -> bool {
     let mut current = Some(declarator);
     while let Some(node) = current {
         if matches!(
@@ -11354,7 +11937,7 @@ namespace ::cwg311::X {}
 
         let (owner, name, package) = split_cpp_name("X::::doit", &scope);
 
-        assert_eq!(owner, None);
+        assert!(owner.is_none());
         assert_eq!(name, "doit");
         assert_eq!(package, "X");
     }
@@ -13373,6 +13956,418 @@ struct Widget {
         assert_eq!(
             vec!["(const int *)".to_string(), "(int *)".to_string()],
             identity_signatures(&parsed, "Widget.take")
+        );
+    }
+
+    fn comparable_shapes(source: &str, callable_name: &str) -> Vec<CppComparableSlot> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let start = source.find(callable_name).expect("callable declaration");
+        let declarator =
+            cpp_function_declarator_at(tree.root_node(), start).expect("function declarator");
+        cpp_comparable_parameter_shapes(declarator, source)
+    }
+
+    fn sole_comparable_shape(source: &str, callable_name: &str) -> CppComparableParameter {
+        let mut shapes = comparable_shapes(source, callable_name);
+        assert_eq!(1, shapes.len(), "{shapes:?}");
+        match shapes.remove(0) {
+            CppComparableSlot::Shape(shape) => shape,
+            other => panic!("expected a comparable shape, got {other:?}"),
+        }
+    }
+
+    fn comparable_named_leaf(shape: &CppComparableParameter) -> &CppComparableNode {
+        let mut current = shape.root();
+        loop {
+            match shape.node(current) {
+                CppComparableNode::Named { .. } => return shape.node(current),
+                CppComparableNode::Pointer { inner, .. }
+                | CppComparableNode::Reference { inner }
+                | CppComparableNode::Array { inner } => current = *inner,
+                CppComparableNode::Generic { base, .. } => current = *base,
+            }
+        }
+    }
+
+    #[test]
+    fn comparable_shape_keeps_pointee_const() {
+        assert_ne!(
+            sole_comparable_shape("void f(const char* p);", "f("),
+            sole_comparable_shape("void f(char* p);", "f(")
+        );
+    }
+
+    #[test]
+    fn comparable_shape_keeps_inner_pointer_const() {
+        assert_ne!(
+            sole_comparable_shape("void f(int** p);", "f("),
+            sole_comparable_shape("void f(int* const* p);", "f(")
+        );
+    }
+
+    #[test]
+    fn comparable_shape_drops_top_level_pointer_const() {
+        assert_eq!(
+            sole_comparable_shape("void f(int* const p);", "f("),
+            sole_comparable_shape("void f(int* p);", "f(")
+        );
+    }
+
+    #[test]
+    fn comparable_shape_drops_top_level_base_const() {
+        assert_eq!(
+            sole_comparable_shape("void f(const int p);", "f("),
+            sole_comparable_shape("void f(int p);", "f(")
+        );
+    }
+
+    #[test]
+    fn comparable_shape_decays_top_level_array_to_pointer() {
+        assert_eq!(
+            sole_comparable_shape("void f(int a[3]);", "f("),
+            sole_comparable_shape("void f(int* a);", "f(")
+        );
+        assert_eq!(
+            sole_comparable_shape("void f(int* a[3]);", "f("),
+            sole_comparable_shape("void f(int** a);", "f(")
+        );
+    }
+
+    #[test]
+    fn comparable_shape_keeps_array_behind_pointer() {
+        assert_ne!(
+            sole_comparable_shape("struct S { void f(int (*a)[3]); };", "f("),
+            sole_comparable_shape("struct S { void f(int** a); };", "f(")
+        );
+    }
+
+    #[test]
+    fn comparable_shape_records_written_name_and_lexical_scope() {
+        let declared =
+            sole_comparable_shape("namespace ns { struct S { void g(Msg* m); }; }", "g(");
+        let defined = sole_comparable_shape("void ns::S::g(ns::Msg* m) {}", "g(");
+        let CppComparableNode::Named { name, .. } = comparable_named_leaf(&declared) else {
+            panic!("named leaf");
+        };
+        assert_eq!(["Msg".to_string()].as_slice(), name.path());
+        assert_eq!(
+            ["ns".to_string(), "S".to_string()].as_slice(),
+            name.lexical_scope()
+        );
+        let CppComparableNode::Named { name, .. } = comparable_named_leaf(&defined) else {
+            panic!("named leaf");
+        };
+        assert_eq!(
+            ["ns".to_string(), "Msg".to_string()].as_slice(),
+            name.path()
+        );
+        assert!(name.lexical_scope().is_empty());
+        assert_ne!(declared, defined);
+    }
+
+    #[test]
+    fn comparable_shape_marks_sized_primitive_leaf() {
+        let shape = sole_comparable_shape("void f(unsigned char c);", "f(");
+        let CppComparableNode::Named {
+            name, primitive, ..
+        } = comparable_named_leaf(&shape)
+        else {
+            panic!("named leaf");
+        };
+        assert!(primitive);
+        assert_eq!(["unsigned char".to_string()].as_slice(), name.path());
+        assert_ne!(shape, sole_comparable_shape("void f(char c);", "f("));
+    }
+
+    #[test]
+    fn comparable_shape_reports_function_pointer_parameter_as_unstructured() {
+        assert_eq!(
+            vec![CppComparableSlot::Unstructured],
+            comparable_shapes("void f(void (*cb)(int));", "f(")
+        );
+    }
+
+    #[test]
+    fn comparable_shape_reports_ellipsis_slot() {
+        let shapes = comparable_shapes("void f(int a, ...);", "f(");
+        assert_eq!(2, shapes.len(), "{shapes:?}");
+        assert_eq!(CppComparableSlot::Ellipsis, shapes[1]);
+    }
+
+    #[test]
+    fn comparable_shape_keeps_template_argument_const() {
+        assert_ne!(
+            sole_comparable_shape("void f(std::vector<const int*> v);", "f("),
+            sole_comparable_shape("void f(std::vector<int*> v);", "f(")
+        );
+    }
+
+    /// The issue #1970 fixture: C has no nested tag scope, so `inner` is a
+    /// file-scope tag that a later `struct inner *` at file scope may name.
+    #[test]
+    fn c_file_mints_aggregate_member_tag_at_file_scope() {
+        let source = "struct outer {\n  struct inner { int value; } item;\n};\n";
+        let parsed = parse_cpp_declarations(source, "x.c");
+        let declarations = parsed.declarations();
+
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| unit.is_class() && unit.fq_name() == "inner"),
+            "expected a file-scope inner tag, got {declarations:?}"
+        );
+        assert!(
+            declarations
+                .iter()
+                .all(|unit| unit.fq_name() != "outer$inner"),
+            "expected no nested identity, got {declarations:?}"
+        );
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| unit.is_class() && unit.fq_name() == "outer")
+        );
+        // Members still belong to their own aggregate.
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "inner.value")
+        );
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "outer.item")
+        );
+
+        let outer = declarations
+            .iter()
+            .find(|unit| unit.is_class() && unit.fq_name() == "outer")
+            .expect("outer");
+        assert!(
+            parsed
+                .children
+                .get(outer)
+                .into_iter()
+                .flatten()
+                .all(|child| child.fq_name() != "inner"),
+            "the tag must not hang off the aggregate it is written inside: {:?}",
+            parsed.children
+        );
+    }
+
+    /// A header carries no compilation language of its own, and a `.cpp`
+    /// translation unit really does declare a nested class. Both keep exactly
+    /// the C++ extraction they had before the C dialect existed.
+    #[test]
+    fn header_and_cpp_files_keep_nested_tag_identity() {
+        let source = "struct outer {\n  struct inner { int value; } item;\n};\n";
+        for name in ["x.h", "x.cpp", "x.cc", "x.cxx"] {
+            let parsed = parse_cpp_declarations(source, name);
+            let declarations = parsed.declarations();
+            assert!(
+                declarations
+                    .iter()
+                    .any(|unit| unit.is_class() && unit.fq_name() == "outer$inner"),
+                "{name} must keep the nested identity, got {declarations:?}"
+            );
+            assert!(
+                declarations.iter().all(|unit| unit.fq_name() != "inner"),
+                "{name} must not mint a file-scope tag, got {declarations:?}"
+            );
+            assert!(
+                declarations
+                    .iter()
+                    .any(|unit| unit.fq_name() == "outer$inner.value")
+            );
+        }
+    }
+
+    /// Uppercase `.C` conventionally means C++, so it keeps C++ scoping.
+    #[test]
+    fn uppercase_c_extension_keeps_cpp_tag_scope() {
+        let source = "struct outer {\n  struct inner { int value; } item;\n};\n";
+        let parsed = parse_cpp_declarations(source, "x.C");
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.is_class() && unit.fq_name() == "outer$inner")
+        );
+    }
+
+    /// There is no such thing as a partially nested tag in C: every level of a
+    /// nested aggregate chain lands at the same enclosing scope.
+    #[test]
+    fn c_file_mints_every_nesting_level_at_file_scope() {
+        let source = "struct a { struct b { struct c { int v; } cc; } bb; };\n";
+        let parsed = parse_cpp_declarations(source, "z.c");
+        let declarations = parsed.declarations();
+
+        for tag in ["a", "b", "c"] {
+            assert!(
+                declarations
+                    .iter()
+                    .any(|unit| unit.is_class() && unit.fq_name() == tag),
+                "expected a file-scope {tag}, got {declarations:?}"
+            );
+        }
+        assert!(
+            declarations
+                .iter()
+                .all(|unit| !unit.fq_name().contains('$')),
+            "no level may keep a nested identity, got {declarations:?}"
+        );
+        // Each member still belongs to the aggregate that declares it.
+        assert!(declarations.iter().any(|unit| unit.fq_name() == "a.bb"));
+        assert!(declarations.iter().any(|unit| unit.fq_name() == "b.cc"));
+        assert!(declarations.iter().any(|unit| unit.fq_name() == "c.v"));
+    }
+
+    /// An enum tag is a tag; its enumerators stay members of the enum, which is
+    /// what makes them ordinary identifiers at the enum's own (file) scope.
+    #[test]
+    fn c_file_mints_member_list_enum_at_file_scope_with_its_enumerators() {
+        let source = "struct outer { enum color { RED, GREEN } c; };\n";
+        let parsed = parse_cpp_declarations(source, "e.c");
+        let declarations = parsed.declarations();
+
+        let color = declarations
+            .iter()
+            .find(|unit| unit.is_class() && unit.fq_name() == "color")
+            .unwrap_or_else(|| panic!("expected a file-scope color enum, got {declarations:?}"));
+        assert!(
+            declarations
+                .iter()
+                .all(|unit| unit.fq_name() != "outer$color")
+        );
+        for enumerator in ["color.RED", "color.GREEN"] {
+            assert!(
+                declarations.iter().any(|unit| unit.fq_name() == enumerator),
+                "expected {enumerator}, got {declarations:?}"
+            );
+        }
+        let children = parsed
+            .children
+            .get(color)
+            .unwrap_or_else(|| panic!("expected child edges for {color:?}"));
+        assert!(
+            ["color.RED", "color.GREEN"]
+                .iter()
+                .all(|name| children.iter().any(|child| child.fq_name() == *name)),
+            "enumerators must hang off their enum: {children:?}"
+        );
+    }
+
+    #[test]
+    fn c_file_mints_member_list_union_at_file_scope() {
+        let source = "struct outer { union inner { int a; float b; } item; };\n";
+        let parsed = parse_cpp_declarations(source, "u.c");
+        let declarations = parsed.declarations();
+        assert!(
+            declarations
+                .iter()
+                .any(|unit| unit.is_class() && unit.fq_name() == "inner"),
+            "expected a file-scope inner union, got {declarations:?}"
+        );
+        assert!(
+            declarations
+                .iter()
+                .all(|unit| unit.fq_name() != "outer$inner")
+        );
+        assert!(declarations.iter().any(|unit| unit.fq_name() == "inner.a"));
+        assert!(declarations.iter().any(|unit| unit.fq_name() == "inner.b"));
+    }
+
+    /// A tag declared in a namespace member list is not a file-scope tag: the
+    /// nearest enclosing non-aggregate scope is the namespace.
+    #[test]
+    fn c_file_member_list_tag_lands_in_the_enclosing_namespace() {
+        let source = "namespace ns { struct outer { struct inner { int v; } i; }; }\n";
+        let parsed = parse_cpp_declarations(source, "n.c");
+        let declarations = parsed.declarations();
+        let inner = declarations
+            .iter()
+            .find(|unit| unit.is_class() && unit.fq_name() == "ns.inner")
+            .unwrap_or_else(|| panic!("expected ns.inner, got {declarations:?}"));
+        assert_eq!(inner.package_name(), "ns");
+        assert!(
+            declarations
+                .iter()
+                .all(|unit| unit.fq_name() != "ns.outer$inner")
+        );
+    }
+
+    /// Pins today's treatment of a tag declared inside a function body: the
+    /// declaration walk does not descend into statement bodies, so no unit is
+    /// minted for it in either dialect. C block scope is out of scope for the
+    /// dialect change, and this test proves the change did not disturb it.
+    #[test]
+    fn function_local_tags_are_unchanged_in_both_dialects() {
+        let source =
+            "void run(void) {\n  struct localtag { struct deeper { int v; } d; } item;\n}\n";
+        for name in ["y.c", "y.cpp"] {
+            let parsed = parse_cpp_declarations(source, name);
+            let declarations = parsed.declarations();
+            assert!(
+                declarations
+                    .iter()
+                    .any(|unit| unit.is_function() && unit.fq_name() == "run"),
+                "{name}: {declarations:?}"
+            );
+            for tag in ["localtag", "deeper", "localtag$deeper"] {
+                assert!(
+                    declarations.iter().all(|unit| unit.fq_name() != tag),
+                    "{name} must not mint {tag}, got {declarations:?}"
+                );
+            }
+        }
+    }
+
+    /// An anonymous aggregate declares no tag, so the C dialect has nothing to
+    /// re-scope: the typedef name is identical in both dialects.
+    #[test]
+    fn anonymous_typedef_struct_is_identical_in_both_dialects() {
+        let source = "typedef struct { int v; } T;\n";
+        for name in ["t.c", "t.cpp"] {
+            let parsed = parse_cpp_declarations(source, name);
+            let declarations = parsed.declarations();
+            assert!(
+                declarations
+                    .iter()
+                    .any(|unit| unit.is_class() && unit.fq_name() == "T"),
+                "{name}: {declarations:?}"
+            );
+        }
+    }
+
+    /// `class` is not C. Source that spells one in a `.c` file is not C code,
+    /// so it keeps the C++ reading rather than acquiring a half-C identity.
+    #[test]
+    fn class_specifier_in_a_c_file_keeps_cpp_nesting() {
+        let source = "class outer { class inner { int v; }; };\n";
+        let c_parsed = parse_cpp_declarations(source, "k.c");
+        let cpp_parsed = parse_cpp_declarations(source, "k.cpp");
+        let c_declarations = c_parsed.declarations();
+        let cpp_declarations = cpp_parsed.declarations();
+        assert!(
+            c_declarations
+                .iter()
+                .any(|unit| unit.is_class() && unit.fq_name() == "outer$inner"),
+            "{c_declarations:?}"
+        );
+        assert_eq!(
+            c_declarations
+                .iter()
+                .map(|unit| unit.fq_name())
+                .collect::<std::collections::BTreeSet<_>>(),
+            cpp_declarations
+                .iter()
+                .map(|unit| unit.fq_name())
+                .collect::<std::collections::BTreeSet<_>>()
         );
     }
 }

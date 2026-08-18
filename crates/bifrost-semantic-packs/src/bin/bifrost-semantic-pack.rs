@@ -22,7 +22,7 @@ use brokk_bifrost_semantic_packs::summary_foundry::framework_pack::{
     convert_framework_candidates, write_framework_packs,
 };
 use brokk_bifrost_semantic_packs::summary_foundry::golden_pack::{
-    convert_golden_candidates, write_golden_packs,
+    convert_golden_candidates, realm_by_name, write_golden_packs,
 };
 use brokk_bifrost_semantic_packs::summary_foundry::sanitizer_pack::{
     convert_sanitizer_candidates, write_sanitizer_packs,
@@ -588,18 +588,22 @@ fn framework_decl_pack_command(
     Ok(0)
 }
 
-/// Convert the golden-core JDK flow-through summaries into a `procedure_summaries`
-/// pack, drop the duplicate-target candidates, and write the pack source plus the
-/// audit report. The conversion is deterministic.
+/// Convert one realm's golden-core flow-through summaries into a
+/// `procedure_summaries` pack, drop the duplicate-target candidates, and write
+/// the pack source plus the audit report. The conversion is deterministic.
 fn golden_summary_pack_command(
     arguments: Vec<OsString>,
     format: OutputFormat,
 ) -> Result<u8, CommandFailure> {
     require_human_release_output(format)?;
-    let [candidates_dir, output_root] = arguments.as_slice() else {
+    let [candidates_dir, output_root, realm_name] = arguments.as_slice() else {
         return Err(failure(2, usage(), format));
     };
-    let conversion = convert_golden_candidates(Path::new(candidates_dir))
+    let realm = realm_name
+        .to_str()
+        .and_then(realm_by_name)
+        .ok_or_else(|| failure(2, usage(), format))?;
+    let conversion = convert_golden_candidates(Path::new(candidates_dir), realm)
         .map_err(|error_value| failure(2, error_value.to_string(), format))?;
     let written = write_golden_packs(&conversion, Path::new(output_root))
         .map_err(|error_value| failure(2, error_value.to_string(), format))?;
@@ -893,5 +897,5 @@ impl ActivationControlInput {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG\n  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE REPORT.json [JVM_SOURCES]\n  bifrost-semantic-pack sanitizer-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack framework-decl-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack golden-summary-pack CANDIDATES_DIR OUTPUT_ROOT"
+    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG\n  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE REPORT.json [JVM_SOURCES]\n  bifrost-semantic-pack sanitizer-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack framework-decl-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack golden-summary-pack CANDIDATES_DIR OUTPUT_ROOT REALM"
 }

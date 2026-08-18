@@ -766,6 +766,7 @@ pub(super) fn render_occurrence(
         OccurrenceTarget::Unresolved(_) => CodeQueryOccurrenceTarget::Unresolved {
             status: occurrences::target_status_label(&row.target),
         },
+        OccurrenceTarget::NotDerived => CodeQueryOccurrenceTarget::NotDerived,
     };
     occurrences::public_occurrence(row, range, target)
 }

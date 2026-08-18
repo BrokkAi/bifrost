@@ -605,6 +605,7 @@ pub enum RustBareTokenTreeRole {
     Pattern,
     Binding,
     Declaration,
+    NoNamespace,
 }
 
 impl RustBareTokenTreeRole {
@@ -623,10 +624,27 @@ impl RustBareTokenTreeRole {
 #[derive(Default)]
 pub struct RustTokenTreeRoleCache {
     roles: HashMap<(usize, usize), HashMap<(usize, usize), RustBareTokenTreeRole>>,
+    matcher_roles: HashMap<(usize, usize), RustBareTokenTreeRole>,
 }
 
 impl RustTokenTreeRoleCache {
+    pub fn ingest_matcher_role(
+        &mut self,
+        start_byte: usize,
+        end_byte: usize,
+        role: RustBareTokenTreeRole,
+    ) {
+        self.matcher_roles.insert((start_byte, end_byte), role);
+    }
+
     pub fn role(&mut self, node: Node<'_>, source: &str) -> RustBareTokenTreeRole {
+        if let Some(role) = self
+            .matcher_roles
+            .get(&(node.start_byte(), node.end_byte()))
+            .copied()
+        {
+            return role;
+        }
         if !rust_bare_token_tree_identifier(node) {
             return RustBareTokenTreeRole::Reference;
         }
@@ -700,7 +718,9 @@ fn direct_token_tree_role(node: Node<'_>) -> RustBareTokenTreeRole {
 pub fn rust_bare_token_tree_non_reference_role(node: Node<'_>, source: &str) -> bool {
     matches!(
         rust_bare_token_tree_role(node, source),
-        RustBareTokenTreeRole::Binding | RustBareTokenTreeRole::Declaration
+        RustBareTokenTreeRole::Binding
+            | RustBareTokenTreeRole::Declaration
+            | RustBareTokenTreeRole::NoNamespace
     )
 }
 

@@ -22,7 +22,7 @@ sha2 = "0.10.8"
 [dev-dependencies]
 serde_json = "1.0.145"
 # Used by tests/code_intelligence_runtime.rs through its #[path] include of the
-# shared harness ../../../tests/common/inline_project.rs, which lives outside
+# shared harness ../../../test-support/inline_project.rs, which lives outside
 # this crate's directory.
 tempfile = "3.23.0"
 # Persistence unit tests build linked worktrees to prove the extension surface

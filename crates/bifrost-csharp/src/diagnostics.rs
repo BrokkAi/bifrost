@@ -37,6 +37,7 @@ use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use tree_sitter::{Node, Tree};
 
+use crate::graph::resolver::CSharpDeclaredType;
 use crate::graph_support::{
     CSharpSource, first_logical_type_fqn, logical_type_count, visible_type_candidates,
 };
@@ -673,13 +674,21 @@ impl CSharpDiagnosticCollector<'_> {
         if receiver.kind() == "identifier" {
             let symbol = node_text(receiver, self.source).trim();
             match self.declared_type_of_binding(receiver, symbol) {
-                Ok(declared) => {
-                    if is_csharp_dynamic(&declared) {
+                // The seeder proved this identity against the workspace, so it
+                // is looked up as an identity rather than re-read as a written
+                // name.
+                Ok(CSharpDeclaredType::Resolved { fqn }) => {
+                    return self.resolved_type_owner(&fqn, symbol);
+                }
+                Ok(CSharpDeclaredType::Spelling(spelling)) => {
+                    // Only a written spelling can say `dynamic`; a resolved
+                    // workspace fq name never does.
+                    if is_csharp_dynamic(&spelling) {
                         return Err(SemanticDiagnosticIncompleteReason::DynamicBehavior {
                             detail: format!("`{symbol}` is declared `dynamic`"),
                         });
                     }
-                    return self.type_owner(&declared).ok_or_else(|| {
+                    return self.type_owner(&spelling).ok_or_else(|| {
                         SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
                             detail: format!("receiver `{symbol}` has no uniquely resolved type"),
                         }
@@ -723,8 +732,8 @@ impl CSharpDiagnosticCollector<'_> {
         &self,
         receiver: Node<'_>,
         symbol: &str,
-    ) -> Result<String, SemanticDiagnosticIncompleteReason> {
-        let mut bindings = LocalInferenceEngine::<String>::default();
+    ) -> Result<CSharpDeclaredType, SemanticDiagnosticIncompleteReason> {
+        let mut bindings = LocalInferenceEngine::<CSharpDeclaredType>::default();
         crate::graph::resolver::seed_bindings_before(
             file_root(receiver),
             receiver.start_byte(),
@@ -746,6 +755,40 @@ impl CSharpDiagnosticCollector<'_> {
                 detail: format!("receiver `{symbol}` binds more than one declared type"),
             }),
         }
+    }
+
+    /// The declaration a receiver's already-resolved type identity names.
+    ///
+    /// Looked up absolutely, through the ladder's own `global::` branch and the
+    /// request-scoped memo behind it. The seeder proved this identity in this
+    /// same request and analyzer generation, so re-running the relative
+    /// visible-name ladder over it could bind a *different* type -- a file in
+    /// namespace `A.B` re-qualifies `A.B.Widget` into `A.B.A.B.Widget` -- and
+    /// re-paid an ancestor-namespace probe walk per member access (#1842).
+    ///
+    /// A proved identity never reaches external resolution: the workspace holds
+    /// the declaration it names, or this request cannot say what it names.
+    fn resolved_type_owner(
+        &self,
+        fqn: &str,
+        symbol: &str,
+    ) -> Result<MemberOwner, SemanticDiagnosticIncompleteReason> {
+        let candidates = self.visible_types(&format!("global::{fqn}"));
+        // The seeder resolved this fq name against the same generation this
+        // lookup reads, so it names exactly one logical declaration.
+        debug_assert_eq!(
+            logical_type_count(&candidates),
+            1,
+            "resolved receiver type `{fqn}` looked up as {candidates:?}"
+        );
+        if logical_type_count(&candidates) == 1
+            && let Some(owner) = first_logical_type_fqn(&candidates)
+        {
+            return Ok(MemberOwner::Workspace { fqn: owner });
+        }
+        Err(SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+            detail: format!("receiver `{symbol}` has no uniquely resolved type"),
+        })
     }
 
     /// The unique declaration a type name identifies, workspace first.

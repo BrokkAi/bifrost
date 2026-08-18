@@ -75,7 +75,7 @@ pub fn report_structural_clone_smells(
         },
     };
 
-    let resolved = resolve_project_files(analyzer.project(), params.file_paths);
+    let resolved = resolve_project_files(analyzer, params.file_paths);
     let findings = analyzer.find_structural_clone_smells_for_files(&resolved.files, weights);
     let mut truncated = resolved.input_truncated;
     let ambiguous_paths = resolved.ambiguous_paths.clone();

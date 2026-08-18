@@ -318,6 +318,123 @@ fn php_path_segments(
     Some(segments)
 }
 
+/// The declared PHP types that prove a receiver is dynamic: `object` and
+/// `mixed`.
+///
+/// Both are reserved words -- PHP has forbidden them as class names since 7.2
+/// and 8.0 respectively -- so an unqualified spelling of either in a type
+/// position is always the builtin and never a class in the current namespace.
+/// A declaration that names one of them therefore states that its value's
+/// member surface is decided at run time, which is a different fact from a
+/// declaration this resolver merely cannot follow.
+const PHP_DYNAMIC_TYPE_NAMES: &[&str] = &["object", "mixed"];
+
+/// The builtin non-nominal type `raw` names, if any.
+///
+/// `raw` is stored-signature or declaration text, the one boundary in the PHP
+/// resolver where no parser node exists, so it is split on `|` exactly as
+/// [`resolve_php_type_arms`] splits it. A union with a dynamic arm is dynamic:
+/// `A|object` admits any object, so the declaration bounds nothing.
+pub fn php_dynamic_type_keyword(raw: &str) -> Option<&'static str> {
+    raw.split('|').find_map(|piece| {
+        let piece = piece.trim();
+        let piece = piece.strip_prefix('?').map(str::trim).unwrap_or(piece);
+        php_dynamic_type_name(piece)
+    })
+}
+
+/// The builtin non-nominal type the declared-type node `node` names, if any.
+///
+/// This is [`php_dynamic_type_keyword`]'s node-path twin: it reads the parser's
+/// own type structure -- a `union_type`'s children, an `optional_type`'s inner
+/// type -- and never splits text.
+pub fn php_dynamic_type_keyword_node(
+    node: Node<'_>,
+    source: &str,
+    mut step: impl FnMut() -> bool,
+) -> Option<&'static str> {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if !step() {
+            return None;
+        }
+        match current.kind() {
+            // `mixed` is a `primitive_type` and `object` is a `named_type`
+            // wrapping a bare `name`, so both leaf shapes are read here.
+            "primitive_type" | "name" => {
+                if let Some(keyword) =
+                    php_leaf_text(current, source).and_then(php_dynamic_type_name)
+                {
+                    return Some(keyword);
+                }
+            }
+            "named_type" | "optional_type" | "union_type" => {
+                for index in (0..current.named_child_count()).rev() {
+                    if let Some(child) = current.named_child(index) {
+                        stack.push(child);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The builtin non-nominal type one already isolated type spelling names.
+///
+/// A leading `\` makes the spelling an explicit global class name, which is a
+/// nominal reference to a (nonexistent) class rather than the builtin.
+fn php_dynamic_type_name(piece: &str) -> Option<&'static str> {
+    if piece.starts_with('\\') {
+        return None;
+    }
+    PHP_DYNAMIC_TYPE_NAMES
+        .iter()
+        .find(|name| piece.eq_ignore_ascii_case(name))
+        .copied()
+}
+
+/// What a PHP declaration's declared type proves about the values it holds.
+///
+/// The three cases are distinct answers, not degrees of one: a nominal type
+/// names classes to navigate to, `object`/`mixed` proves the member surface is
+/// decided at run time, and everything else proves nothing at all. Collapsing
+/// the middle case into the last one is what made a proven-dynamic receiver
+/// indistinguishable from a shape the resolver does not follow yet (#2030).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhpDeclaredType {
+    /// Every class the declaration names: one for an ordinary or nullable
+    /// type, several for a finite union. Never empty.
+    Nominal(Vec<String>),
+    /// The declaration is the builtin `object` or `mixed`, named here so the
+    /// report can quote it.
+    Dynamic(&'static str),
+    /// The declaration is absent, or names something this resolver does not
+    /// follow.
+    Unknown,
+}
+
+impl PhpDeclaredType {
+    /// The nominal reading of `arms`, which is [`PhpDeclaredType::Unknown`]
+    /// when the arms prove no class.
+    pub fn nominal(arms: Vec<String>) -> Self {
+        if arms.is_empty() {
+            Self::Unknown
+        } else {
+            Self::Nominal(arms)
+        }
+    }
+
+    /// Every class this declaration names, and none when it names none.
+    pub fn arms(self) -> Vec<String> {
+        match self {
+            Self::Nominal(arms) => arms,
+            Self::Dynamic(_) | Self::Unknown => Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PhpStructuredPath {
     segments: Vec<String>,
@@ -327,9 +444,14 @@ struct PhpStructuredPath {
 
 /// Resolves one precise nominal PHP type directly from its parser nodes.
 ///
-/// This intentionally rejects nullable, union, intersection, DNF, and primitive
-/// types. Those forms describe an open set (or no workspace class at all), so
-/// choosing one arm would manufacture precision for bounded receiver analysis.
+/// A nullable `?T` is resolved as `T`: `null` has no members, so a member
+/// navigation that could succeed at run time can only bind through the non-null
+/// arm, and naming `T` manufactures no precision.
+///
+/// Union, intersection, DNF, primitive, and bottom types stay rejected. A union
+/// names two or more classes and picking one arm would invent precision the
+/// declaration does not have; see [`resolve_php_type_node_arms`] for the
+/// caller that wants the whole arm set instead of one name.
 pub fn resolve_php_type_node(
     mut node: Node<'_>,
     source: &str,
@@ -341,16 +463,15 @@ pub fn resolve_php_type_node(
             return None;
         }
         match node.kind() {
-            "named_type" => {
+            "named_type" | "optional_type" => {
                 let child = php_only_named_child(node, &mut step)?;
-                if !matches!(child.kind(), "name" | "qualified_name") {
+                if !matches!(child.kind(), "name" | "qualified_name" | "named_type") {
                     return None;
                 }
                 node = child;
             }
             "name" | "qualified_name" | "namespace_name" | "fully_qualified_name" => break,
-            "optional_type"
-            | "union_type"
+            "union_type"
             | "intersection_type"
             | "disjunctive_normal_form_type"
             | "primitive_type"
@@ -360,7 +481,70 @@ pub fn resolve_php_type_node(
     }
 
     let path = php_structured_path(node, source, &mut step)?;
+    // `object` parses as a `named_type` over a bare `name`, so without this
+    // guard the namespace join below would answer it as a class named `object`
+    // in the current namespace -- a nominal owner no PHP file can declare.
+    if !path.absolute
+        && !path.namespace_relative
+        && let [only] = path.segments.as_slice()
+        && php_dynamic_type_name(only).is_some()
+    {
+        return None;
+    }
     resolve_php_structured_path(path, ctx, &ctx.aliases.type_aliases, &mut step)
+}
+
+/// Resolves every nominal arm a declared PHP type node names, in declaration
+/// order and deduplicated.
+///
+/// A single nominal (or nullable) type yields one arm. A `union_type` yields
+/// one arm per non-`null` member: `null` is dropped because it has no members,
+/// exactly as `?T` is unwrapped above. Anything else -- an intersection, a DNF
+/// type, a primitive arm, or an arm this resolver cannot name -- yields no arms
+/// at all, so the caller makes no claim rather than a partial one.
+///
+/// The arm count is capped at [`PHP_MAX_TYPE_ARMS`]. A wider union yields no
+/// arms: truncating it would report a smaller ambiguity than the declaration
+/// actually has.
+pub fn resolve_php_type_node_arms(
+    node: Node<'_>,
+    source: &str,
+    ctx: &PhpFileContext,
+    mut step: impl FnMut() -> bool,
+) -> Vec<String> {
+    if !step() {
+        return Vec::new();
+    }
+    if node.kind() != "union_type" {
+        return resolve_php_type_node(node, source, ctx, step)
+            .into_iter()
+            .collect();
+    }
+    let mut arms: Vec<String> = Vec::new();
+    for index in 0..node.named_child_count() {
+        if !step() {
+            return Vec::new();
+        }
+        let Some(child) = node.named_child(index) else {
+            return Vec::new();
+        };
+        if php_is_null_type_node(child, source) {
+            continue;
+        }
+        let Some(arm) = resolve_php_type_node(child, source, ctx, &mut step) else {
+            return Vec::new();
+        };
+        if !arms.contains(&arm) {
+            arms.push(arm);
+        }
+    }
+    php_capped_type_arms(arms)
+}
+
+/// The `null` arm of a union, which the grammar spells as a `primitive_type`.
+fn php_is_null_type_node(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "primitive_type"
+        && php_leaf_text(node, source).is_some_and(|text| text.eq_ignore_ascii_case("null"))
 }
 
 /// Resolves one literal PHP function name from parser structure. Dynamic
@@ -653,16 +837,75 @@ pub fn php_namespace_to_fq(name: &str) -> String {
         .join(".")
 }
 
+/// The most nominal arms a declared PHP type may name and still be answered.
+///
+/// This mirrors `DEFAULT_RECEIVER_MAX_TARGETS`, the shared receiver candidate
+/// limit: a wider declaration is not a bounded ambiguity anyone can act on.
+pub const PHP_MAX_TYPE_ARMS: usize = 4;
+
+/// Resolves the one class a declared PHP type names, or `None` when it names
+/// none or more than one.
+///
+/// `?T` and `T|null` resolve to `T` because `null` has no members. A true union
+/// `A|B` resolves to nothing: every caller of this function needs a single
+/// owner fq name, and choosing an arm would manufacture precision. A caller
+/// that can carry the whole set asks [`resolve_php_type_arms`] instead; this
+/// function is that computation's exactly-one-arm case.
 pub fn resolve_php_type(raw: &str, ctx: &PhpFileContext) -> Option<String> {
-    let first = raw.split('|').next().unwrap_or(raw).trim();
-    // A nullable type `?Foo` is `Foo | null`; strip the marker so member access on a
-    // nullable-typed receiver resolves against `Foo` (mirrors the union split above).
-    let first = first.strip_prefix('?').map(str::trim).unwrap_or(first);
-    if first.is_empty() || matches!(first, "self" | "static" | "parent") {
-        return None;
+    let mut arms = resolve_php_type_arms(raw, ctx);
+    (arms.len() == 1).then(|| arms.remove(0))
+}
+
+/// Resolves every nominal arm a declared PHP type string names, in declaration
+/// order and deduplicated.
+///
+/// `raw` is stored-signature or declaration text. It is the one boundary in the
+/// PHP resolver where no parser node exists for the declared type, so it is the
+/// one place a `|` split is legitimate; the node path uses
+/// [`resolve_php_type_node_arms`] and must not gain string parsing.
+///
+/// `null` arms are dropped, and a leading `?` on a piece marks that piece's own
+/// null arm. An empty or relative (`self`/`static`/`parent`) arm yields no arms
+/// at all, and so does a union wider than [`PHP_MAX_TYPE_ARMS`]: truncating it
+/// would claim a narrower ambiguity than the declaration has.
+pub fn resolve_php_type_arms(raw: &str, ctx: &PhpFileContext) -> Vec<String> {
+    let mut arms: Vec<String> = Vec::new();
+    for piece in raw.split('|') {
+        let piece = piece.trim();
+        let piece = piece.strip_prefix('?').map(str::trim).unwrap_or(piece);
+        if piece.eq_ignore_ascii_case("null") {
+            continue;
+        }
+        if piece.is_empty() || matches!(piece, "self" | "static" | "parent") {
+            return Vec::new();
+        }
+        let Some(arm) = resolve_php_nominal_type(piece, ctx) else {
+            return Vec::new();
+        };
+        if !arms.contains(&arm) {
+            arms.push(arm);
+        }
     }
+    php_capped_type_arms(arms)
+}
+
+fn php_capped_type_arms(arms: Vec<String>) -> Vec<String> {
+    if arms.len() > PHP_MAX_TYPE_ARMS {
+        return Vec::new();
+    }
+    arms
+}
+
+/// Resolves one already isolated nominal type name against the file's imports
+/// and namespace.
+fn resolve_php_nominal_type(first: &str, ctx: &PhpFileContext) -> Option<String> {
     if first.starts_with('\\') {
         return Some(php_namespace_to_fq(first));
+    }
+    // The builtins `object` and `mixed` name no class, and joining them onto
+    // the file's namespace would manufacture one (#2030).
+    if php_dynamic_type_name(first).is_some() {
+        return None;
     }
     let normalized = php_namespace_to_fq(first);
     let local = normalized.split('.').next().unwrap_or(normalized.as_str());

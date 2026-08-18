@@ -158,7 +158,7 @@ pub fn seed_visible_bindings_at(
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    seed_visible_bindings_inner(scope, target, csharp, file, source, bindings, true);
+    seed_visible_bindings_inner(scope, target, csharp, file, source, bindings);
 }
 
 pub fn seed_bindings_before(
@@ -167,9 +167,9 @@ pub fn seed_bindings_before(
     csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
-    bindings: &mut LocalInferenceEngine<String>,
+    bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
 ) {
-    seed_bindings_before_inner(node, cutoff_start, csharp, file, source, bindings, false);
+    seed_bindings_before_inner(node, cutoff_start, csharp, file, source, bindings);
 }
 
 pub fn seed_bindings_before_in_session(
@@ -178,7 +178,7 @@ pub fn seed_bindings_before_in_session(
     csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
-    bindings: &mut LocalInferenceEngine<String>,
+    bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
     session: &ResolutionSession,
 ) {
     // Mirror `seed_bindings_before_inner` iteratively so deep local syntax is
@@ -224,18 +224,15 @@ fn seed_bindings_before_inner(
     csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
-    bindings: &mut LocalInferenceEngine<String>,
-    usage: bool,
+    bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
 ) {
     if node.start_byte() >= cutoff_start {
         return;
     }
 
     match node.kind() {
-        "parameter" => seed_parameter(node, csharp, file, source, bindings, usage),
-        "variable_declaration" => {
-            seed_variable_declaration(node, csharp, file, source, bindings, usage)
-        }
+        "parameter" => seed_parameter(node, csharp, file, source, bindings),
+        "variable_declaration" => seed_variable_declaration(node, csharp, file, source, bindings),
         _ => {}
     }
 
@@ -244,7 +241,7 @@ fn seed_bindings_before_inner(
         if child.start_byte() >= cutoff_start {
             break;
         }
-        seed_bindings_before_inner(child, cutoff_start, csharp, file, source, bindings, usage);
+        seed_bindings_before_inner(child, cutoff_start, csharp, file, source, bindings);
     }
 }
 
@@ -271,7 +268,6 @@ fn seed_visible_bindings_inner(
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
-    usage: bool,
 ) {
     if node.start_byte() >= target.start_byte() {
         return;
@@ -286,9 +282,9 @@ fn seed_visible_bindings_inner(
     }
 
     match node.kind() {
-        "parameter" => seed_parameter(node, csharp, file, source, bindings, usage),
+        "parameter" => seed_usage_parameter(node, csharp, file, source, bindings),
         "variable_declaration" => {
-            seed_variable_declaration(node, csharp, file, source, bindings, usage)
+            seed_usage_variable_declaration(node, csharp, file, source, bindings)
         }
         _ => {}
     }
@@ -301,7 +297,7 @@ fn seed_visible_bindings_inner(
         if SCOPE_NODES.contains(&child.kind()) && !node_covers(child, target) {
             continue;
         }
-        seed_visible_bindings_inner(child, target, csharp, file, source, bindings, usage);
+        seed_visible_bindings_inner(child, target, csharp, file, source, bindings);
     }
 }
 
@@ -309,13 +305,12 @@ fn node_covers(container: Node<'_>, target: Node<'_>) -> bool {
     container.start_byte() <= target.start_byte() && target.end_byte() <= container.end_byte()
 }
 
-fn seed_parameter(
+fn seed_usage_parameter(
     node: Node<'_>,
     csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
-    usage: bool,
 ) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
@@ -323,7 +318,23 @@ fn seed_parameter(
     let Some(type_node) = node.child_by_field_name("type") else {
         return;
     };
-    seed_symbol_for_type(name_node, type_node, csharp, file, source, bindings, usage);
+    seed_usage_symbol_for_type(name_node, type_node, csharp, file, source, bindings);
+}
+
+fn seed_parameter(
+    node: Node<'_>,
+    csharp: &dyn CSharpSource,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
+) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return;
+    };
+    seed_symbol_for_type(name_node, type_node, csharp, file, source, bindings);
 }
 
 fn seed_parameter_in_session(
@@ -331,7 +342,7 @@ fn seed_parameter_in_session(
     csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
-    bindings: &mut LocalInferenceEngine<String>,
+    bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
     session: &ResolutionSession,
 ) {
     let Some(name_node) = node.child_by_field_name("name") else {
@@ -345,13 +356,12 @@ fn seed_parameter_in_session(
     );
 }
 
-fn seed_variable_declaration(
+fn seed_usage_variable_declaration(
     node: Node<'_>,
     csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
-    usage: bool,
 ) {
     if is_member_variable_declaration(node) {
         return;
@@ -371,23 +381,73 @@ fn seed_variable_declaration(
         };
         if type_text == "var" {
             if let Some(initializer_type) = object_created_type(child)
-                && let Some(target) = resolve_type_fq_name_for_scope(
+                && let Some(target) = resolve_usage_type_fq_name(
                     csharp,
                     file,
                     &reference_type_text(initializer_type, source),
-                    usage,
                 )
             {
                 bindings.seed_symbol(node_text(name_node, source), target);
             } else if let Some(target) =
-                var_initializer_member_type(child, csharp, file, source, bindings, usage)
+                var_initializer_member_type(child, csharp, file, source, bindings, true)
             {
                 bindings.seed_symbol(node_text(name_node, source), target);
             } else {
                 bindings.declare_shadow(node_text(name_node, source));
             }
         } else {
-            seed_symbol_for_type(name_node, type_node, csharp, file, source, bindings, usage);
+            seed_usage_symbol_for_type(name_node, type_node, csharp, file, source, bindings);
+        }
+    }
+}
+
+fn seed_variable_declaration(
+    node: Node<'_>,
+    csharp: &dyn CSharpSource,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
+) {
+    if is_member_variable_declaration(node) {
+        return;
+    }
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return;
+    };
+    let type_text = reference_type_text(type_node, source);
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "variable_declarator" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        if type_text == "var" {
+            if let Some(initializer_type) = object_created_type(child)
+                && let Some(target) = resolve_type_fq_name(
+                    csharp,
+                    file,
+                    &reference_type_text(initializer_type, source),
+                )
+            {
+                bindings.seed_symbol(
+                    node_text(name_node, source),
+                    CSharpDeclaredType::resolved(target),
+                );
+            } else if let Some(target) =
+                var_initializer_member_type(child, csharp, file, source, bindings, false)
+            {
+                bindings.seed_symbol(
+                    node_text(name_node, source),
+                    CSharpDeclaredType::resolved(target),
+                );
+            } else {
+                bindings.declare_shadow(node_text(name_node, source));
+            }
+        } else {
+            seed_symbol_for_type(name_node, type_node, csharp, file, source, bindings);
         }
     }
 }
@@ -397,7 +457,7 @@ fn seed_variable_declaration_in_session(
     csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
-    bindings: &mut LocalInferenceEngine<String>,
+    bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
     session: &ResolutionSession,
 ) {
     if is_member_variable_declaration(node) {
@@ -424,7 +484,10 @@ fn seed_variable_declaration_in_session(
                     &reference_type_text(initializer_type, source),
                     session,
                 ) {
-                    bindings.seed_symbol(node_text(name_node, source), target);
+                    bindings.seed_symbol(
+                        node_text(name_node, source),
+                        CSharpDeclaredType::resolved(target),
+                    );
                 } else {
                     bindings.declare_shadow(node_text(name_node, source));
                 }
@@ -451,12 +514,12 @@ pub(super) fn is_member_variable_declaration(node: Node<'_>) -> bool {
     })
 }
 
-fn var_initializer_member_type(
+fn var_initializer_member_type<T: DeclaredTypeName>(
     declarator: Node<'_>,
     csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
-    bindings: &LocalInferenceEngine<String>,
+    bindings: &LocalInferenceEngine<T>,
     usage: bool,
 ) -> Option<String> {
     let initializer = variable_declarator_initializer(declarator)?;
@@ -487,22 +550,22 @@ fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
         })
 }
 
-fn expression_type_fq_name(
+fn expression_type_fq_name<T: DeclaredTypeName>(
     expression: Node<'_>,
     csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
-    bindings: &LocalInferenceEngine<String>,
+    bindings: &LocalInferenceEngine<T>,
 ) -> Option<String> {
     expression_type_fq_name_inner(expression, csharp, file, source, bindings, true)
 }
 
-fn expression_type_fq_name_inner(
+fn expression_type_fq_name_inner<T: DeclaredTypeName>(
     expression: Node<'_>,
     csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
-    bindings: &LocalInferenceEngine<String>,
+    bindings: &LocalInferenceEngine<T>,
     usage: bool,
 ) -> Option<String> {
     match expression.kind() {
@@ -561,12 +624,12 @@ fn expression_type_fq_name_inner(
     }
 }
 
-fn invocation_expression_return_type_fq_name(
+fn invocation_expression_return_type_fq_name<T: DeclaredTypeName>(
     invocation: Node<'_>,
     csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
-    bindings: &LocalInferenceEngine<String>,
+    bindings: &LocalInferenceEngine<T>,
     usage: bool,
 ) -> Option<String> {
     let function = invocation.child_by_field_name("function")?;
@@ -631,12 +694,12 @@ fn invocation_expression_return_type_fq_name(
     }
 }
 
-fn receiver_type_units(
+fn receiver_type_units<T: DeclaredTypeName>(
     receiver: Node<'_>,
     csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
-    bindings: &LocalInferenceEngine<String>,
+    bindings: &LocalInferenceEngine<T>,
 ) -> Vec<CodeUnit> {
     match receiver.kind() {
         "identifier" => {
@@ -662,13 +725,22 @@ fn receiver_type_units(
     }
 }
 
-fn first_precise_binding(bindings: &LocalInferenceEngine<String>, name: &str) -> Option<String> {
+/// The one type name a symbol binds, as text.
+///
+/// Both engine flavours answer the same way here: this walk consumes the name
+/// as a lookup key, which is what a written spelling still needs and what a
+/// proved identity already is.
+fn first_precise_binding<T: DeclaredTypeName>(
+    bindings: &LocalInferenceEngine<T>,
+    name: &str,
+) -> Option<String> {
     let SymbolResolution::Precise(targets) = bindings.resolve_symbol(name) else {
         return None;
     };
     (targets.len() == 1)
-        .then(|| targets.into_iter().next())
+        .then(|| targets.iter().next())
         .flatten()
+        .map(|target| target.type_name().to_string())
 }
 
 fn member_access_receiver(node: Node<'_>) -> Option<Node<'_>> {
@@ -1629,32 +1701,109 @@ fn type_text_before_name(signature: &str, name: &str) -> Option<String> {
     csharp_signature_return_type(signature, name)
 }
 
-fn seed_symbol_for_type(
+/// What the binding seeder settled about a local's or parameter's declared
+/// type.
+///
+/// The two variants are not interchangeable spellings of one string. A
+/// `Resolved` identity is one this seeder already proved against the workspace
+/// in the caller's own request and analyzer generation, so a consumer looks it
+/// up absolutely and never re-reads it as written source text. A `Spelling` is
+/// written type text the seeder could not settle, which still has to go through
+/// the visible-name ladder -- and through external-type resolution behind it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CSharpDeclaredType {
+    Resolved { fqn: String },
+    Spelling(String),
+}
+
+impl CSharpDeclaredType {
+    /// The seeded form of a type reference the resolver answered with `fqn`.
+    ///
+    /// `resolve_type_fq_name` answers a canonical builtin identity such as
+    /// `System.Int32` for a keyword type. That names a declaration the
+    /// workspace does not hold, so it stays a spelling for the consumer's own
+    /// lookup -- workspace first, then the external index -- to settle. Every
+    /// other success is a workspace fq name the seeder proved.
+    fn resolved(fqn: String) -> Self {
+        if canonical_builtin_type_identity(&fqn).is_some() {
+            Self::Spelling(fqn)
+        } else {
+            Self::Resolved { fqn }
+        }
+    }
+
+    /// The type text this binding carries, for a consumer that treats a proved
+    /// identity and a written spelling the same way.
+    pub fn as_type_name(&self) -> &str {
+        match self {
+            Self::Resolved { fqn } => fqn,
+            Self::Spelling(spelling) => spelling,
+        }
+    }
+}
+
+/// The type text a seeded binding carries, so the expression-typing walk below
+/// reads a raw-fq-name engine and a [`CSharpDeclaredType`] engine alike.
+trait DeclaredTypeName: Clone + Eq + std::hash::Hash {
+    fn type_name(&self) -> &str;
+}
+
+impl DeclaredTypeName for String {
+    fn type_name(&self) -> &str {
+        self
+    }
+}
+
+impl DeclaredTypeName for CSharpDeclaredType {
+    fn type_name(&self) -> &str {
+        self.as_type_name()
+    }
+}
+
+fn seed_usage_symbol_for_type(
     name_node: Node<'_>,
     type_node: Node<'_>,
     csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
     bindings: &mut LocalInferenceEngine<String>,
-    usage: bool,
 ) {
     let reference = reference_type_text(type_node, source);
-    if let Some(target) = resolve_type_fq_name_for_scope(csharp, file, &reference, usage) {
-        bindings.seed_symbol(node_text(name_node, source), target);
-    } else if !usage {
-        let normalized = normalize_type_text(&reference);
-        let raw_type = csharp
-            .using_aliases_of(file)
-            .get(&normalized)
-            .cloned()
-            .unwrap_or(normalized);
-        if raw_type.is_empty() || raw_type == "var" {
-            bindings.declare_shadow(node_text(name_node, source));
-        } else {
-            bindings.seed_symbol(node_text(name_node, source), raw_type);
-        }
-    } else {
+    match resolve_usage_type_fq_name(csharp, file, &reference) {
+        Some(target) => bindings.seed_symbol(node_text(name_node, source), target),
+        None => bindings.declare_shadow(node_text(name_node, source)),
+    }
+}
+
+fn seed_symbol_for_type(
+    name_node: Node<'_>,
+    type_node: Node<'_>,
+    csharp: &dyn CSharpSource,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
+) {
+    let reference = reference_type_text(type_node, source);
+    if let Some(target) = resolve_type_fq_name(csharp, file, &reference) {
+        bindings.seed_symbol(
+            node_text(name_node, source),
+            CSharpDeclaredType::resolved(target),
+        );
+        return;
+    }
+    let normalized = normalize_type_text(&reference);
+    let raw_type = csharp
+        .using_aliases_of(file)
+        .get(&normalized)
+        .cloned()
+        .unwrap_or(normalized);
+    if raw_type.is_empty() || raw_type == "var" {
         bindings.declare_shadow(node_text(name_node, source));
+    } else {
+        bindings.seed_symbol(
+            node_text(name_node, source),
+            CSharpDeclaredType::Spelling(raw_type),
+        );
     }
 }
 
@@ -1664,12 +1813,15 @@ fn seed_symbol_for_type_in_session(
     csharp: &dyn CSharpSource,
     file: &ProjectFile,
     source: &str,
-    bindings: &mut LocalInferenceEngine<String>,
+    bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
     session: &ResolutionSession,
 ) {
     let reference = reference_type_text(type_node, source);
     if let Some(target) = resolve_type_fq_name_in_session(csharp, file, &reference, session) {
-        bindings.seed_symbol(node_text(name_node, source), target);
+        bindings.seed_symbol(
+            node_text(name_node, source),
+            CSharpDeclaredType::resolved(target),
+        );
         return;
     }
     if !session.observe_cancellation() {
@@ -1683,7 +1835,10 @@ fn seed_symbol_for_type_in_session(
     if raw_type.is_empty() || raw_type == "var" {
         bindings.declare_shadow(node_text(name_node, source));
     } else {
-        bindings.seed_symbol(node_text(name_node, source), raw_type);
+        bindings.seed_symbol(
+            node_text(name_node, source),
+            CSharpDeclaredType::Spelling(raw_type),
+        );
     }
 }
 

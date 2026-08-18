@@ -574,10 +574,20 @@ impl AnalyzerSnapshotCaches {
 /// container must be nameable from the trait signature even though its
 /// representation stays crate-private.
 #[doc(hidden)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WorkspaceFileIndex {
     root: std::path::PathBuf,
-    by_basename: crate::hash::HashMap<String, Vec<ProjectFile>>,
+    /// The bucketed listing, or the error that prevented it.
+    ///
+    /// The failure is carried here rather than returned from
+    /// [`WorkspaceFileIndex::build`] because the index is published through a
+    /// shared `OnceLock` whose `get_or_init` cannot carry one, and dropping the
+    /// single-flight guarantee to gain a `Result` would restore the repeated
+    /// whole-workspace walk that cell exists to eliminate (#1334). Discarding
+    /// the failure and keeping an empty map is the alternative this replaces:
+    /// it made a failed listing indistinguishable from a workspace in which
+    /// every path anchor genuinely does not exist (#2325).
+    by_basename: Result<crate::hash::HashMap<String, Vec<ProjectFile>>, String>,
 }
 
 /// The request-scoped, single-flight cell that holds one [`WorkspaceFileIndex`].
@@ -592,22 +602,29 @@ pub type WorkspaceFileIndexCell = Arc<OnceLock<Arc<WorkspaceFileIndex>>>;
 impl WorkspaceFileIndex {
     /// One ignore-aware listing of `project`, bucketed by basename.
     pub(crate) fn build(project: &dyn Project) -> Self {
-        let mut by_basename: crate::hash::HashMap<String, Vec<ProjectFile>> = Default::default();
-        if let Ok(files) = project.all_files() {
-            for file in files {
-                let Some(name) = file.rel_path().file_name().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-                by_basename.entry(name.to_string()).or_default().push(file);
-            }
-            for matches in by_basename.values_mut() {
-                matches.sort();
-            }
-        }
         Self {
             root: project.root().to_path_buf(),
-            by_basename,
+            by_basename: Self::bucket_by_basename(project),
         }
+    }
+
+    fn bucket_by_basename(
+        project: &dyn Project,
+    ) -> Result<crate::hash::HashMap<String, Vec<ProjectFile>>, String> {
+        let files = project
+            .all_files()
+            .map_err(|err| format!("listing workspace files under {:?}: {err}", project.root()))?;
+        let mut by_basename: crate::hash::HashMap<String, Vec<ProjectFile>> = Default::default();
+        for file in files {
+            let Some(name) = file.rel_path().file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            by_basename.entry(name.to_string()).or_default().push(file);
+        }
+        for matches in by_basename.values_mut() {
+            matches.sort();
+        }
+        Ok(by_basename)
     }
 
     /// Whether this index describes the workspace rooted at `root`. A shared
@@ -619,8 +636,14 @@ impl WorkspaceFileIndex {
         self.root == root
     }
 
-    pub(crate) fn matches(&self, basename: &str) -> Option<&[ProjectFile]> {
-        self.by_basename.get(basename).map(Vec::as_slice)
+    /// The workspace files named `basename`, or the listing failure that makes
+    /// the question unanswerable. `Ok(None)` means the workspace was listed and
+    /// holds no such file; `Err` must not be reported as that answer.
+    pub(crate) fn matches(&self, basename: &str) -> Result<Option<&[ProjectFile]>, &str> {
+        match &self.by_basename {
+            Ok(by_basename) => Ok(by_basename.get(basename).map(Vec::as_slice)),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -701,6 +724,21 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     fn workspace_file_index_cell(&self) -> Option<WorkspaceFileIndexCell> {
         None
     }
+
+    /// Record a failure that a collection-returning read could not return, on
+    /// every request boundary this analyzer currently has open.
+    ///
+    /// This is the producer side of [`AnalyzerQueryContext`]: a best-effort API
+    /// that answers with a collection has no way to say "the answer is not
+    /// zero results, it is unknown", so it records the failure here and the
+    /// service boundary turns the apparently successful response into an error
+    /// (`WorkspaceQueryScope::finish`). Without it a failed workspace listing
+    /// or store probe reads as genuine absence (#2325).
+    ///
+    /// The default is a no-op because an analyzer that opens no request
+    /// boundary has no context to record on.
+    #[doc(hidden)]
+    fn record_query_failure(&self, _error: StoreError) {}
 
     /// Build the expensive lazily-initialized per-generation query indexes
     /// ahead of demand (#1442). Idempotent and safe to call from a background

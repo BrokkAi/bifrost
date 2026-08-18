@@ -133,7 +133,7 @@ pub fn get_file_contents(
     params: GetFileContentsParams,
 ) -> GetFileContentsResult {
     let project = analyzer.project();
-    let resolver = WorkspaceFileResolver::new(project);
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     let mut files = Vec::new();
     let mut not_found = Vec::new();
     let mut ambiguous_paths = Vec::new();
@@ -304,7 +304,7 @@ pub fn search_file_contents(
     params: SearchFileContentsParams,
 ) -> SearchFileContentsResult {
     let project = analyzer.project();
-    let resolver = WorkspaceFileResolver::new(project);
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
 
     let (regexes, invalid_patterns) = compile_regexes(&params.patterns, params.case_insensitive);
     if regexes.is_empty() {
@@ -452,8 +452,7 @@ pub fn search_file_contents(
 }
 
 pub fn skim_files(analyzer: &dyn IAnalyzer, params: SkimFilesParams) -> SkimFilesResult {
-    let project = analyzer.project();
-    let resolver = WorkspaceFileResolver::new(project);
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     let mut files = Vec::new();
     let mut not_found = Vec::new();
     let mut ambiguous_paths = Vec::new();

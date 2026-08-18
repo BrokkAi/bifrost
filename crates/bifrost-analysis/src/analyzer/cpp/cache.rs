@@ -182,3 +182,36 @@ pub(super) fn weight_reconciled_groups(
         .saturating_add(key.owner_terminal.as_ref().map_or(0, String::len));
     size.clamp(1, u32::MAX as usize) as u32
 }
+
+/// Cache admission weight for a header's C reading (#1970).
+///
+/// A `None` entry -- "the two readings of this blob agree" -- still costs a
+/// map slot and is by far the common case, so it is charged the slot rather
+/// than zero.
+pub(super) fn weight_c_reading(
+    _key: &ProjectFile,
+    value: &Option<Arc<super::projection::CppCReading>>,
+) -> u32 {
+    let Some(reading) = value.as_ref() else {
+        return size_of::<Option<Arc<super::projection::CppCReading>>>() as u32;
+    };
+    let units = reading
+        .declarations
+        .len()
+        .saturating_add(reading.c_only.len())
+        .saturating_add(reading.cpp_only.len())
+        .saturating_add(reading.top_level_declarations.len())
+        .saturating_add(reading.children.values().map(Vec::len).sum::<usize>())
+        .saturating_add(
+            reading
+                .site_equivalents
+                .values()
+                .map(Vec::len)
+                .sum::<usize>(),
+        );
+    let ranges = reading.ranges.values().map(Vec::len).sum::<usize>();
+    units
+        .saturating_mul(size_of::<CodeUnit>().saturating_add(64))
+        .saturating_add(ranges.saturating_mul(size_of::<Range>()))
+        .saturating_add(size_of::<super::projection::CppCReading>()) as u32
+}

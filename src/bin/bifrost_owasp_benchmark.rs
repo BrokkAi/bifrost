@@ -201,6 +201,18 @@ mod imp {
             mandatory: true,
             pinned_to_esapi_digest: false,
         },
+        // #2354: the servlet request/response accessors every Benchmark flow
+        // starts at are external interface methods that never materialize, so
+        // require-model has no model for them without this pack.
+        PackDescriptor {
+            pack_id: "bifrost.javax.servlet-api-summaries",
+            file: "framework-decls/staged/bifrost.javax.servlet-api-summaries.json",
+            ecosystem: "maven",
+            package: Some("javax.servlet:javax.servlet-api"),
+            package_version: Some("4.0.1"),
+            mandatory: true,
+            pinned_to_esapi_digest: false,
+        },
         PackDescriptor {
             pack_id: "bifrost.encoder-sanitizers",
             file: "sanitizers/staged/bifrost.encoder-sanitizers.json",

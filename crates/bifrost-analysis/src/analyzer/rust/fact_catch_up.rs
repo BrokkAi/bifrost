@@ -111,7 +111,20 @@ impl RustAnalyzer {
     /// Scan for live blobs without fact rows and apply the threshold policy.
     fn run_rust_fact_catch_up(&self) {
         let _scope = crate::profiling::scope("RustAnalyzer::rust_fact_catch_up");
-        let stale = self.rust_files_without_facts();
+        let stale = match self.rust_files_without_facts() {
+            Ok(stale) => stale,
+            // The probe is the only thing that can say which live blobs lack
+            // rows, so a failed probe is not "nothing to catch up" -- reporting
+            // it as such leaves the facts stale and the answer silently
+            // incomplete (#2325). Record it on the request boundary that
+            // already inspects store failures before presenting a successful
+            // response, and catch nothing up.
+            Err(error) => {
+                self.inner
+                    .record_store_error(error.context("rust fact catch-up live-blob probe"));
+                return;
+            }
+        };
         if stale.is_empty() {
             return;
         }
@@ -149,7 +162,9 @@ impl RustAnalyzer {
     /// One indexed batch query against the store, never a parse: the candidate
     /// set is the analyzed file listing the walks already hold, mapped to oids
     /// through the live snapshot that every store-backed read uses.
-    fn rust_files_without_facts(&self) -> Vec<ProjectFile> {
+    fn rust_files_without_facts(
+        &self,
+    ) -> Result<Vec<ProjectFile>, crate::analyzer::store::StoreError> {
         let snapshot = self.live_path_snapshot();
         let files: Vec<(ProjectFile, git2::Oid)> = self
             .get_analyzed_files()
@@ -160,14 +175,12 @@ impl RustAnalyzer {
             })
             .collect();
         let oids: Vec<git2::Oid> = files.iter().map(|(_, oid)| *oid).collect();
-        let Ok(present) = self.analyzer_store().blobs_with_rust_facts("rust", &oids) else {
-            return Vec::new();
-        };
-        files
+        let present = self.analyzer_store().blobs_with_rust_facts("rust", &oids)?;
+        Ok(files
             .into_iter()
             .filter(|(_, oid)| !present.contains(oid))
             .map(|(file, _)| file)
-            .collect()
+            .collect())
     }
 
     /// Test hook: hold the next deferred batch until the returned barrier is
@@ -250,7 +263,9 @@ mod tests {
         assert!(importers(&analyzer).contains(&part));
 
         analyzer.analyzer_store().delete_rust_facts_for_test("rust");
-        let stale = analyzer.rust_files_without_facts();
+        let stale = analyzer
+            .rust_files_without_facts()
+            .expect("live-blob probe");
         assert_eq!(stale.len(), 2, "both files lost their rows: {stale:?}");
 
         let updated = analyzer.update_all();
@@ -265,7 +280,10 @@ mod tests {
         assert!(updated.rust_usage_facts_ready());
         assert!(updated.rust_usage_facts_warm());
         assert!(
-            updated.rust_files_without_facts().is_empty(),
+            updated
+                .rust_files_without_facts()
+                .expect("live-blob probe")
+                .is_empty(),
             "the catch-up set is empty afterwards"
         );
     }
@@ -305,7 +323,10 @@ mod tests {
         }
         assert!(updated.rust_usage_facts_warm());
         assert!(
-            updated.rust_files_without_facts().is_empty(),
+            updated
+                .rust_files_without_facts()
+                .expect("live-blob probe")
+                .is_empty(),
             "the deferred batch persisted every stale file"
         );
         assert!(importers(&updated).contains(&part));
@@ -325,5 +346,34 @@ mod tests {
 
         assert!(analyzer.rust_usage_facts_warm());
         assert!(!analyzer.hierarchy_index_built_for_test());
+    }
+
+    /// A failed live-blob probe is not an empty catch-up set. Before #2325 the
+    /// probe swallowed its store error and answered "no file needs catching
+    /// up", so a damaged cache left every Rust usage answer quietly composed
+    /// from stale facts and reported success.
+    #[test]
+    fn a_failed_live_blob_probe_reports_the_failure_instead_of_an_empty_catch_up_set() {
+        let (_temp, analyzer) = workspace_of(1);
+        analyzer.analyzer_store().drop_rust_modules_table_for_test();
+
+        assert!(
+            analyzer.rust_files_without_facts().is_err(),
+            "a failed probe must not answer with an empty stale set"
+        );
+
+        let context = std::sync::Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&context);
+        analyzer.warm_usage_facts();
+        let error = context
+            .store_error()
+            .expect("a failed catch-up probe must reach the request boundary");
+        analyzer.end_query(&context);
+        assert!(
+            error
+                .to_string()
+                .contains("rust fact catch-up live-blob probe"),
+            "the recorded failure must name the probe: {error}"
+        );
     }
 }

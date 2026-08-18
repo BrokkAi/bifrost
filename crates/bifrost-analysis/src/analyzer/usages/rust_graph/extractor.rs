@@ -19,10 +19,10 @@ use crate::analyzer::usages::common::{
 // five helpers it needed from this file and `hits.rs` are pure AST readers, and
 // this file is parked on the definition route's `RustTypeLookupCache`.
 use crate::analyzer::usages::get_definition::{
-    RustTypeLookupCache, rust_associated_call_applicable_candidates,
-    rust_expression_type_definition_candidates_cached, rust_expression_type_definition_fqn_cached,
-    rust_field_definition_type_candidates_cached, rust_is_type_definition,
-    rust_resolve_type_node_fqn,
+    RustTypeLookupCache, ingest_file_macro_matcher_roles,
+    rust_associated_call_applicable_candidates, rust_expression_type_definition_candidates_cached,
+    rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,
+    rust_is_type_definition, rust_resolve_type_node_fqn,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{UsageHit, UsageHitSurface};
@@ -366,6 +366,15 @@ pub(super) fn scan_files_for_target(
         let use_binding_names = rust_local_use_alias_names(tree.root_node(), source, &|name| {
             name == target.identifier() || seed_names.contains(name) || direct_names.contains(name)
         });
+        let mut token_tree_roles = RustTokenTreeRoleCache::default();
+        ingest_file_macro_matcher_roles(
+            &mut token_tree_roles,
+            analyzer,
+            &support,
+            file,
+            source,
+            tree,
+        );
         let mut local_hits = BTreeSet::new();
         let mut ctx = ScanCtx {
             file,
@@ -390,7 +399,7 @@ pub(super) fn scan_files_for_target(
             direct_names: &direct_names,
             lexical_scope: &lexical_scope,
             include_routes: &include_routes,
-            token_tree_roles: RustTokenTreeRoleCache::default(),
+            token_tree_roles,
             cancellation,
             cancellation_checks_remaining: 0,
             hits: &mut local_hits,
@@ -1681,6 +1690,15 @@ pub(super) fn scan_files_for_member_target(
         let record_unproven_receivers =
             !receiver_names.is_empty() || !static_owner_names.is_empty() || has_static_trait_call;
         let mut type_lookup_cache = RustTypeLookupCache::default();
+        let mut token_tree_roles = RustTokenTreeRoleCache::default();
+        ingest_file_macro_matcher_roles(
+            &mut token_tree_roles,
+            analyzer,
+            &support,
+            file,
+            source,
+            tree,
+        );
         let mut local_hits = BTreeSet::new();
         let mut local_unproven_hits = BTreeSet::new();
         let target_is_enum_variant = requested_target.is_field()
@@ -1712,7 +1730,7 @@ pub(super) fn scan_files_for_member_target(
             receiver_type_names: &receiver_type_names,
             record_unproven_receivers,
             type_lookup_cache: &mut type_lookup_cache,
-            token_tree_roles: RustTokenTreeRoleCache::default(),
+            token_tree_roles,
             cancellation,
             cancellation_checks_remaining: 0,
             hits: &mut local_hits,

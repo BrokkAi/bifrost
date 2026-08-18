@@ -152,9 +152,34 @@ pub(super) fn evaluate_assertion_policy(
             PolicyAssert::Resolution(_) | PolicyAssert::Boundary(_)
         )
     });
-    let binding_scope_roles = asserted_roles(spec, |assertion| {
-        matches!(assertion, PolicyAssert::BindingScope(_))
+    let value_origin_roles = asserted_roles(spec, |assertion| {
+        matches!(assertion, PolicyAssert::ValueOrigin(_))
     });
+    // Both families read the same binding-of rows, keyed by the role each
+    // assert names. The value-origin family needs one more role --
+    // `value_reference`, the class an assignment's left operand carries -- but
+    // only for a file that actually has an assignment inside a subject's
+    // region. That is decided per file below, after the assignment query runs.
+    let binding_row_roles = asserted_roles(spec, |assertion| {
+        matches!(
+            assertion,
+            PolicyAssert::BindingScope(_) | PolicyAssert::ValueOrigin(_)
+        )
+    });
+    // Only the occurrence family's `:require-target` reads a row's resolved
+    // target; every other family joins rows by AST identity, role and
+    // position. Deriving targets is one definition resolution per
+    // reference-class row and dominates the cost of a large file's
+    // occurrences, so the row families ask for it only when an assert says it
+    // needs it (#1452).
+    let needs_occurrence_targets = spec.asserts.iter().any(|assertion| {
+        matches!(assertion, PolicyAssert::Occurrence(assertion) if assertion.require_target)
+    });
+    let execute_row_query = if needs_occurrence_targets {
+        execute_code_query_detailed_eager_index
+    } else {
+        execute_code_query_detailed_eager_index_without_targets
+    };
     let needs_generation = spec
         .asserts
         .iter()
@@ -263,6 +288,57 @@ pub(super) fn evaluate_assertion_policy(
     for path in paths {
         let file_subjects = &subjects_by_path[path];
         let file_paths = [path];
+        let mut file_incomplete: Vec<PolicyIncompleteReason> = Vec::new();
+
+        // The assignment family runs *before* the other row families, because
+        // its answer decides whether they need the `value_reference` role at
+        // all. Only an assignment written inside a region some value-origin
+        // assert compares against can exempt anything, so a file with none --
+        // which is most files -- never pays for reaching a binding from every
+        // plain value position in it. The verdict is unchanged either way:
+        // with no in-region assignment the exemption is false for every
+        // subject, which is exactly what the skipped rows would have said.
+        let mut assignment_outcome = None;
+        if !value_origin_roles.is_empty() {
+            let query = match assertion_assignment_query(&file_paths, budget) {
+                Ok(query) => query,
+                Err(message) => {
+                    return failed_policy_run(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        message,
+                        budget,
+                    );
+                }
+            };
+            let outcome = execute_row_query(
+                context.analyzer,
+                &query,
+                budget.query_limits(),
+                context.cancellation,
+            );
+            file_incomplete.extend(incomplete_reasons(
+                &outcome.result.completion(),
+                outcome.result.truncated,
+            ));
+            run_failures.extend(failure_reasons(&outcome.result.completion()));
+            query_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
+            total_work = total_work.saturating_add(outcome.work);
+            row_completions.push(outcome.result.completion());
+            assignment_outcome = Some(outcome);
+        }
+        let value_origin_regions = value_origin_regions(spec, file_subjects);
+        let assignments_in_region = assignment_outcome.as_ref().is_some_and(|outcome| {
+            assigned_left_operands(&outcome.result.results)
+                .any(|(_, range)| region_contains_any(&value_origin_regions, range))
+        });
+        let mut binding_row_roles = binding_row_roles.clone();
+        if assignments_in_region {
+            binding_row_roles.push(OccurrenceRole::ValueReference);
+            binding_row_roles.sort();
+            binding_row_roles.dedup();
+        }
+
         let mut queries: Vec<CodeQuery> = Vec::new();
         if !occurrence_roles.is_empty() {
             match assertion_occurrence_query(&file_paths, &occurrence_roles, Vec::new(), budget) {
@@ -295,10 +371,10 @@ pub(super) fn evaluate_assertion_policy(
                 }
             }
         }
-        if !binding_scope_roles.is_empty() {
+        if !binding_row_roles.is_empty() {
             match assertion_occurrence_query(
                 &file_paths,
-                &binding_scope_roles,
+                &binding_row_roles,
                 vec![QueryStep::BindingOf(BindingOfOptions::default())],
                 budget,
             ) {
@@ -325,10 +401,9 @@ pub(super) fn evaluate_assertion_policy(
             }
         }
 
-        let mut file_incomplete: Vec<PolicyIncompleteReason> = Vec::new();
         let mut executed = Vec::new();
         for query in &queries {
-            let outcome = execute_code_query_detailed_eager_index(
+            let outcome = execute_row_query(
                 context.analyzer,
                 query,
                 budget.query_limits(),
@@ -441,6 +516,20 @@ pub(super) fn evaluate_assertion_policy(
             HashMap::new();
         let mut scopes_by_index: HashMap<(&str, u32), &CodeQueryLexicalScope> = HashMap::new();
         let mut sites_by_ast_id: HashMap<&str, Vec<&CodeQueryGenerationSite>> = HashMap::new();
+        // Every assignment in this file whose left operand is a named value
+        // *and* is written inside a region some value-origin assert compares
+        // against, as (left-operand AST id, left-operand region). Filtering
+        // here rather than at each subject keeps the per-subject scan to the
+        // assignments that can possibly exempt anything, and it is the same
+        // predicate the assert applies.
+        let assigned_positions: Vec<(&str, CodeQueryRange)> = assignment_outcome
+            .as_ref()
+            .map(|outcome| {
+                assigned_left_operands(&outcome.result.results)
+                    .filter(|(_, range)| region_contains_any(&value_origin_regions, *range))
+                    .collect()
+            })
+            .unwrap_or_default();
         for query in &executed {
             for item in &query.result.results {
                 match &item.value {
@@ -487,6 +576,9 @@ pub(super) fn evaluate_assertion_policy(
         let mut capability_diagnostics = subject.result.diagnostics.clone();
         for query in &executed {
             capability_diagnostics.extend(query.result.diagnostics.iter().cloned());
+        }
+        if let Some(outcome) = assignment_outcome.as_ref() {
+            capability_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
         }
         let capability = assertion_capabilities(&capability_diagnostics);
 
@@ -665,6 +757,35 @@ pub(super) fn evaluate_assertion_policy(
                         context,
                         &mut late_incomplete,
                     ),
+                    PolicyAssert::ValueOrigin(assertion) => {
+                        match subject.ast_ids(&assertion.relative_to) {
+                            Some(_) => evaluate_value_origin_assert(
+                                assertion,
+                                subject,
+                                &ast_ids,
+                                &bindings_by_occurrence,
+                                &scopes_by_index,
+                                &assigned_positions,
+                                &mut late_incomplete,
+                            ),
+                            None => {
+                                return failed_policy_run_with_reason(
+                                    policy,
+                                    PolicyAnalysisType::Assertion,
+                                    Vec::new(),
+                                    PolicyFailureReason::InvalidExecutionPlan,
+                                    &format!(
+                                        "assert `{}` names capture `{}`, which the subject selector does not bind at {}",
+                                        assertion.id,
+                                        assertion.relative_to,
+                                        subject.path.as_str()
+                                    ),
+                                    work,
+                                    budget,
+                                );
+                            }
+                        }
+                    }
                     PolicyAssert::BindingScope(assertion) => {
                         match subject.ast_ids(&assertion.relative_to) {
                             Some(_) => evaluate_binding_scope_assert(
@@ -3031,6 +3152,172 @@ fn evaluate_binding_scope_assert<'rows>(
     Some(violation)
 }
 
+/// The capture the assignment row family binds to an assignment's left
+/// operand. It is internal to the evaluator: the value-origin family builds
+/// the query, so no authored selector can collide with it.
+const ASSIGNED_VALUE_CAPTURE: &str = "__bifrost_assigned_value";
+
+/// The refined loop-invariance predicate: where is the value read here
+/// *established*?
+///
+/// Two origins count, and the requirement is over their union:
+///
+/// - the declaring scope of the binding in effect at the reference, which is
+///   the question [`evaluate_binding_scope_assert`] asks on its own; and
+/// - any assignment whose left operand reaches that same binding, which is how
+///   a value declared once outside a loop but overwritten on every pass is
+///   distinguished from one that is genuinely re-used unchanged.
+///
+/// The join to an assignment is binding identity, never the spelled name: an
+/// assignment to a different `values` in a nested scope writes a different
+/// value and must not exempt this one.
+fn evaluate_value_origin_assert<'rows>(
+    assertion: &ValueOriginAssert,
+    subject: &AssertionSubject,
+    ast_ids: &[&str],
+    bindings_by_occurrence: &HashMap<(&str, &str), Vec<&'rows CodeQueryBinding>>,
+    scopes_by_index: &HashMap<(&str, u32), &'rows CodeQueryLexicalScope>,
+    assigned_positions: &[(&str, CodeQueryRange)],
+    late_incomplete: &mut Vec<PolicyIncompleteReason>,
+) -> Option<AssertionViolation<'rows>> {
+    let mut reached: Vec<&CodeQueryBinding> = Vec::new();
+    for ast_id in ast_ids {
+        if let Some(rows) = bindings_by_occurrence.get(&(subject.path.as_str(), *ast_id)) {
+            reached.extend(rows.iter().copied().filter(|row| !row.shadowed));
+        }
+    }
+    // As for the binding-scope family: a name that resolves to something other
+    // than a lexical binding has no origin for this assert to constrain, and
+    // that is a complete answer rather than an incomplete one.
+    let binding = reached.first().copied()?;
+    let Some(scope) = scopes_by_index
+        .get(&(binding.path.as_str(), binding.declaring_scope_index))
+        .copied()
+    else {
+        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+        return None;
+    };
+    let Some(related) = subject
+        .captures
+        .get(&assertion.relative_to)
+        .and_then(|captures| captures.iter().find_map(|capture| capture.range))
+    else {
+        late_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
+        return None;
+    };
+    assert_eq!(
+        binding.path.as_str(),
+        subject.path.as_str(),
+        "a binding-of answer must belong to the file of the occurrence it was reached from"
+    );
+    assert_eq!(
+        scope.path.as_str(),
+        subject.path.as_str(),
+        "a declaring scope must belong to the file of the binding that names it"
+    );
+
+    let declared_inside = region_contains(related, scope.range);
+    let assigned_inside = assigned_positions.iter().any(|(ast_id, range)| {
+        region_contains(related, *range)
+            && bindings_by_occurrence
+                .get(&(subject.path.as_str(), *ast_id))
+                .is_some_and(|rows| {
+                    rows.iter()
+                        .filter(|row| !row.shadowed)
+                        .any(|row| same_binding(row, binding))
+                })
+    });
+    let established_inside = declared_inside || assigned_inside;
+    if assertion.containment.satisfied_by(established_inside) {
+        return None;
+    }
+    // State only what was checked. Under the `outside` polarity the violation
+    // is an origin that *was* found inside, and naming which one is the
+    // evidence; under `inside` it is the absence of both, and the message says
+    // both absences rather than implying a search that did not happen.
+    let observed = if established_inside {
+        format!(
+            "binding `{}` is established inside capture `{}`: {}",
+            binding.name,
+            assertion.relative_to,
+            match (declared_inside, assigned_inside) {
+                (true, true) => "declared there, and assigned there",
+                (true, false) => "declared there",
+                (false, true) => "assigned there",
+                (false, false) => unreachable!("an established origin is one of the two"),
+            }
+        )
+    } else {
+        format!(
+            "binding `{}` is declared outside capture `{}`, and no assignment inside it reaches that binding",
+            binding.name, assertion.relative_to
+        )
+    };
+    let mut violation =
+        AssertionViolation::new("reference", assertion.expectation(), Some(observed));
+    violation.actual_count = 1;
+    violation.binding = Some(binding);
+    violation.declaring_scope = Some(scope);
+    Some(violation)
+}
+
+/// The regions every value-origin assert of this policy compares against, for
+/// the subjects of one file.
+///
+/// An assignment outside all of them cannot exempt any subject in the file, so
+/// this is what makes "does this file need the value-reference row family?" a
+/// question the assignment rows alone can answer.
+fn value_origin_regions(
+    spec: &AssertionPolicySpec,
+    file_subjects: &[&AssertionSubject],
+) -> Vec<CodeQueryRange> {
+    let mut regions = Vec::new();
+    for assertion in &spec.asserts {
+        let PolicyAssert::ValueOrigin(assertion) = assertion else {
+            continue;
+        };
+        for subject in file_subjects {
+            let Some(captures) = subject.captures.get(&assertion.relative_to) else {
+                continue;
+            };
+            regions.extend(captures.iter().filter_map(|capture| capture.range));
+        }
+    }
+    regions
+}
+
+fn region_contains_any(regions: &[CodeQueryRange], inner: CodeQueryRange) -> bool {
+    regions.iter().any(|outer| region_contains(*outer, inner))
+}
+
+/// The captured left operands of one assignment-query outcome, as
+/// (AST id, region). A capture without both is unjoinable and is skipped;
+/// the row families that need identity report their own gaps.
+fn assigned_left_operands(
+    results: &[CodeQueryResultItem],
+) -> impl Iterator<Item = (&str, CodeQueryRange)> {
+    results.iter().flat_map(|item| {
+        let captures = match &item.value {
+            CodeQueryResultValue::StructuralMatch { value } => value.captures.as_slice(),
+            _ => &[],
+        };
+        captures.iter().filter_map(|capture| {
+            (capture.name == ASSIGNED_VALUE_CAPTURE)
+                .then(|| capture.ast_id.as_deref().zip(capture.range))
+                .flatten()
+        })
+    })
+}
+
+/// Whether two binding-of rows name the same binder. Rows reached from two
+/// occurrences are two rows of one binding, so identity is the binder token's
+/// file and byte interval rather than the row's own id.
+fn same_binding(left: &CodeQueryBinding, right: &CodeQueryBinding) -> bool {
+    left.path == right.path
+        && left.start_byte == right.start_byte
+        && left.end_byte == right.end_byte
+}
+
 fn collect_assertion_subjects(
     results: &[CodeQueryResultItem],
     evidence: &[DetailedCodeQueryEvidence],
@@ -3102,6 +3389,54 @@ fn assertion_occurrence_query(
         },
         limit: budget.query_limits().max_pipeline_rows,
         // Full detail is what emits `ast_id`, which is the whole join.
+        result_detail: CodeQueryResultDetail::Full,
+        execution_mode: Default::default(),
+    })
+}
+
+/// Every assignment of the subject file whose left operand is a named value,
+/// with that operand captured so its binding-of answer can be joined.
+///
+/// A declaration's initializer is deliberately not special-cased here: its
+/// left operand is a binder rather than a value reference, so it carries no
+/// binding-of row and never joins. Declarations are already the other origin
+/// this family reads, through the declaring scope.
+fn assertion_assignment_query(
+    paths: &[&str],
+    budget: &PolicyBudget,
+) -> Result<CodeQuery, &'static str> {
+    assert!(
+        !paths.is_empty(),
+        "assertion assignment queries require subject paths"
+    );
+    let Ok(where_globs) = exact_path_globs(paths.iter().copied()) else {
+        return Err("an assertion subject path is not a valid scan pattern");
+    };
+    let assigned = Pattern {
+        kinds: vec![NormalizedKind::Identifier],
+        capture: Some(ASSIGNED_VALUE_CAPTURE.to_owned()),
+        ..Pattern::default()
+    };
+    let root = Pattern {
+        kinds: vec![NormalizedKind::Assignment],
+        left: Some(Box::new(assigned)),
+        ..Pattern::default()
+    };
+    Ok(CodeQuery {
+        schema_version: SCHEMA_VERSION,
+        plan: CodeQueryPlan {
+            source: CodeQueryPlanSource::Seed(Box::new(CodeQuerySeed {
+                where_globs,
+                languages: Vec::new(),
+                root,
+                inside: None,
+                inside_decl: None,
+                not_inside: None,
+            })),
+            steps: Vec::new(),
+        },
+        limit: budget.query_limits().max_pipeline_rows,
+        // Full detail is what emits each capture's `ast_id`, which is the join.
         result_detail: CodeQueryResultDetail::Full,
         execution_mode: Default::default(),
     })
@@ -3333,6 +3668,10 @@ fn row_declarations(row: &InternalOccurrenceRow) -> Option<Vec<CodeUnit>> {
             .map(|unit| vec![unit.clone()])
             .filter(|_| row.class == InternalOccurrenceClass::Declaration),
         InternalOccurrenceTarget::Lexical(_) | InternalOccurrenceTarget::Unresolved(_) => None,
+        // The identity families derive their own rows with targets; a row
+        // without them cannot answer this question, and saying "no
+        // declarations" would be a claim the row does not support.
+        InternalOccurrenceTarget::NotDerived => None,
     }
 }
 

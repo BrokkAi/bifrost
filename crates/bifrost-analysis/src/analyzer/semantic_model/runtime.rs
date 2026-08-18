@@ -898,6 +898,30 @@ where
     }
 }
 
+/// Whether two activated records make the same observable claim: the same
+/// completeness, the same named locations, the same transfers, and the same
+/// effects. Identity fields (`id`, `model_id`, `content_sha256`) and the target
+/// spelling are excluded, because they differ between records that nevertheless
+/// propagate identically.
+///
+/// This is what makes a posting with several records still a unique answer. The
+/// canonical member key (#1978) is (language, owner, member, receiver, arity),
+/// so it cannot tell same-arity overloads apart: `String.valueOf(int)`,
+/// `String.valueOf(char[])`, and `String.valueOf(Object)` share one key, and a
+/// standard-library summary pack legitimately ships all three. When their claims
+/// are identical, either choice yields the same propagation, so refusing would
+/// fail a policy closed over an ambiguity that does not change any answer. A
+/// genuine disagreement still resolves to `Conflict` and still fails closed.
+fn procedure_claims_agree(
+    left: &CompiledProcedureSummary,
+    right: &CompiledProcedureSummary,
+) -> bool {
+    left.completeness == right.completeness
+        && left.locations == right.locations
+        && left.transfers == right.transfers
+        && left.effects == right.effects
+}
+
 fn resolve_procedure_posting<'a>(
     shards: &'a [ActiveSemanticModelShard],
     posting: Option<&Vec<RecordAddress>>,
@@ -934,7 +958,7 @@ fn resolve_procedure_posting<'a>(
             .expect("procedure-summary index address must resolve to its record");
         if records
             .iter()
-            .any(|candidate| candidate.record == record && candidate.payload == payload)
+            .any(|candidate| procedure_claims_agree(candidate.record, record))
         {
             continue;
         }
@@ -2340,5 +2364,113 @@ mod semantic_diagnostic_runtime_tests {
             [SemanticDiagnosticIncompleteReason::RuntimeUnavailable { detail }]
                 if detail.starts_with("unavailable activation:")
         ));
+    }
+}
+
+/// The conflict gate for procedure-summary lookup (#1871). The canonical member
+/// key cannot tell same-arity overloads apart, so a posting legitimately carries
+/// several records; whether that is one answer or a refusal is decided entirely
+/// by [`procedure_claims_agree`]. These pin BOTH directions, because only the
+/// second protects soundness: a weakened predicate would silently let two
+/// disagreeing models resolve to whichever record happened to be indexed first.
+#[cfg(test)]
+mod procedure_claim_agreement_tests {
+    use super::*;
+    use crate::analyzer::semantic_model::{
+        CompiledProcedureSummary, CompiledProcedureTarget, CompiledSummaryExitKind,
+        CompiledSummaryInput, CompiledSummaryLocation, CompiledSummaryLocationKind,
+        CompiledSummaryOutput, CompiledSummaryTransfer, Completeness,
+    };
+
+    fn transfer(input: CompiledSummaryInput) -> CompiledSummaryTransfer {
+        CompiledSummaryTransfer {
+            input,
+            exit_kind: CompiledSummaryExitKind::Normal,
+            output: CompiledSummaryOutput::NormalReturn {},
+        }
+    }
+
+    /// Two records that differ in every identity field but make one claim. This
+    /// is the real shape: `String.valueOf(int)` and `String.valueOf(Object)`
+    /// share the canonical key and both carry parameter 0 to the return.
+    fn overload(id: &str, symbol: &str) -> CompiledProcedureSummary {
+        CompiledProcedureSummary {
+            id: id.to_owned(),
+            model_id: format!("model.{id}"),
+            contract_version: 1,
+            content_sha256: format!("{id:0>64}"),
+            target: CompiledProcedureTarget {
+                path: "java.base/java/lang/String.java".to_owned(),
+                symbol: symbol.to_owned(),
+                has_receiver: true,
+                parameter_count: 1,
+            },
+            completeness: Completeness::Complete,
+            locations: Vec::new(),
+            transfers: vec![transfer(CompiledSummaryInput::Parameter { ordinal: 0 })],
+            effects: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn identity_fields_do_not_make_two_records_disagree() {
+        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
+        let right = overload(
+            "valueof-object",
+            "java.lang.String.valueOf(java.lang.Object)",
+        );
+        assert_ne!(
+            left, right,
+            "the two records are genuinely distinct records"
+        );
+        assert!(
+            procedure_claims_agree(&left, &right),
+            "records differing only in id, model id, digest, and target spelling make one claim"
+        );
+    }
+
+    #[test]
+    fn a_different_completeness_is_a_disagreement() {
+        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
+        let mut right = overload(
+            "valueof-object",
+            "java.lang.String.valueOf(java.lang.Object)",
+        );
+        right.completeness = Completeness::Partial;
+        assert!(
+            !procedure_claims_agree(&left, &right),
+            "completeness decides whether a run may conclude ProvenBySummary, so it must refuse"
+        );
+    }
+
+    #[test]
+    fn a_different_transfer_set_is_a_disagreement() {
+        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
+        let mut right = overload(
+            "valueof-object",
+            "java.lang.String.valueOf(java.lang.Object)",
+        );
+        right.transfers = vec![transfer(CompiledSummaryInput::Receiver {})];
+        assert!(
+            !procedure_claims_agree(&left, &right),
+            "a different transfer set propagates differently and must refuse"
+        );
+    }
+
+    #[test]
+    fn a_different_location_set_is_a_disagreement() {
+        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
+        let mut right = overload(
+            "valueof-object",
+            "java.lang.String.valueOf(java.lang.Object)",
+        );
+        right.locations = vec![CompiledSummaryLocation {
+            id: "buffer".to_owned(),
+            location_kind: CompiledSummaryLocationKind::Heap,
+        }];
+        assert!(
+            !procedure_claims_agree(&left, &right),
+            "named locations are ports the transfers bind, so they are part of the claim"
+        );
     }
 }

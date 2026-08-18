@@ -15,6 +15,8 @@
 
 use super::CppAnalyzer;
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile, resolve_analyzer};
+use brokk_bifrost_cpp::graph::CppGraphSource;
+use brokk_bifrost_cpp::graph::resolver::VisibilityIndex;
 use brokk_bifrost_cpp::identity::cpp_header_body_implementation_file;
 
 pub(crate) fn cpp_header_body_files_are_related(
@@ -48,6 +50,32 @@ pub(crate) fn cpp_callable_definitions_share_identity_evidence(
 ) -> bool {
     brokk_bifrost_cpp::identity::cpp_callable_definitions_share_identity_evidence(
         analyzer,
+        left,
+        right,
+        |left_source, right_source| {
+            cpp_header_body_files_are_related(analyzer, left_source, right_source)
+        },
+    )
+}
+
+/// The #2010 variant, which decides the parameter lists by resolving the names
+/// they spell instead of by comparing the persisted signature strings.
+///
+/// Definition lookup uses it; the workspace-scale scans keep the string form
+/// above. Both the graph source and the dispatching analyzer are needed: the
+/// resolved comparison reads the definition index and the prepared syntax
+/// through the former, and the include evidence still comes from the
+/// `resolve_analyzer::<CppAnalyzer>` downcast the wrapper above owns.
+pub(crate) fn cpp_callable_definitions_share_identity_evidence_with_visibility(
+    analyzer: &dyn IAnalyzer,
+    graph: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    left: &CodeUnit,
+    right: &CodeUnit,
+) -> bool {
+    brokk_bifrost_cpp::identity::cpp_callable_definitions_share_identity_evidence_with_visibility(
+        graph,
+        visibility,
         left,
         right,
         |left_source, right_source| {

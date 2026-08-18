@@ -494,6 +494,35 @@ mod tests {
         assert!(RuneIrLanguage::config_labels().any(|label| label == "tsx"));
     }
 
+    /// The C dialect of the C/C++ analyzer (#1970). `c` stays a spelling of
+    /// `Language::Cpp` (it is one of that language's extensions), so the
+    /// dialect owns the distinct `cpp-c` label; `.C` is C++ by convention and
+    /// must not be folded in case-insensitively.
+    #[test]
+    fn c_dialect_has_a_distinct_label_and_exact_lowercase_path_rule() {
+        let c = RuneIrLanguage::from_config_label("cpp-c").unwrap();
+        assert_eq!(c, RuneIrLanguage::CppC);
+        assert_eq!(c.language(), Language::Cpp);
+        assert_eq!(c.config_label(), "cpp-c");
+        assert_eq!(c.stable_label(), "cpp-c");
+        assert_eq!(
+            RuneIrLanguage::from_config_label("c"),
+            Some(RuneIrLanguage::Standard(Language::Cpp))
+        );
+        assert_eq!(
+            RuneIrLanguage::for_path(Language::Cpp, std::path::Path::new("tags.c")),
+            RuneIrLanguage::CppC
+        );
+        for cpp_path in ["tags.C", "tags.h", "tags.cpp", "tags.cc", "tags.cxx"] {
+            assert_eq!(
+                RuneIrLanguage::for_path(Language::Cpp, std::path::Path::new(cpp_path)),
+                RuneIrLanguage::Standard(Language::Cpp),
+                "{cpp_path} must keep C++ semantics"
+            );
+        }
+        assert!(RuneIrLanguage::config_labels().any(|label| label == "cpp-c"));
+    }
+
     #[test]
     fn renderer_marks_each_bounded_dimension() {
         let source = "fn outer() { if true { loop { return; } } }";

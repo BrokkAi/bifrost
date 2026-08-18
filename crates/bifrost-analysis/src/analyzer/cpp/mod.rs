@@ -7,6 +7,7 @@ pub(crate) mod external;
 mod hierarchy;
 mod identity;
 mod imports;
+mod projection;
 mod semantic;
 mod structural;
 #[cfg(test)]
@@ -80,8 +81,11 @@ pub use brokk_bifrost_cpp::identity::{
     cpp_is_recovered_macro_character_token_type,
 };
 pub(crate) use identity::{
-    cpp_callable_definitions_share_identity_evidence, cpp_header_body_files_are_related,
+    cpp_callable_definitions_share_identity_evidence,
+    cpp_callable_definitions_share_identity_evidence_with_visibility,
+    cpp_header_body_files_are_related,
 };
+pub(crate) use imports::HeaderLanguageAttribution;
 #[derive(Clone)]
 pub struct CppAnalyzer {
     inner: TreeSitterAnalyzer<CppAdapter>,
@@ -97,6 +101,15 @@ pub struct CppAnalyzer {
     /// amalgamation's AST once per candidate (issue #1927).
     source_using_index_by_file: Cache<ProjectFile, Arc<SourceUsingIndex>>,
     unconditional_include_reachability: Cache<(ProjectFile, ProjectFile, bool), bool>,
+    /// The C reading of a header blob, when the store holds one (#1970). See
+    /// [`projection::CppCReading`]. `None` is a real, memoized answer: it says
+    /// the two readings of that blob agree, so every question about the C view
+    /// is answered from the file's own row-set.
+    c_readings_by_file: Cache<ProjectFile, Option<Arc<projection::CppCReading>>>,
+    /// Every C-reading-only identity in the workspace, keyed by identifier and
+    /// by fq name (#1970). One whole-workspace pass, memoized for the analyzer
+    /// generation and reset with the other whole-workspace memos.
+    c_reading_index: Arc<PoolSafeMemo<projection::CppCReadingIndex>>,
     /// Every callable declaration sharing one member identifier, bucketed by
     /// owner terminal. The identifier-index store read and the bucketing pass
     /// that produce it are what #1908 stopped repeating per queried fq name.
@@ -116,6 +129,13 @@ pub struct CppAnalyzer {
         Cache<CppReconcileGroupKey, Arc<HashMap<String, Arc<CppReconciledDefinitionIndex>>>>,
     include_target_index: Arc<OnceLock<IncludeTargetIndex>>,
     reverse_include_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    /// The transitive answer over [`Self::reverse_include_index`]: for a
+    /// header, every workspace translation unit (`.c`/`.cc`/`.cpp`/`.cxx`)
+    /// whose include closure reaches it. Built as one iterative fixed point
+    /// (`imports::build_transitive_reverse_tu_index`), not per-header BFS, so
+    /// this memo holds the whole map exactly like `reverse_include_index`
+    /// does. Backs [`Self::header_language_attribution`].
+    transitive_reverse_tu_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     /// `PoolSafeMemo`, not `OnceLock`: this whole-workspace build is reached
     /// from rayon workers during cold scans, and a blocking `get_or_init` parks
     /// every one of them behind the single initializer for its full duration.
@@ -253,6 +273,8 @@ impl CppAnalyzer {
                 memo_budget / 8,
                 weight_include_reachability,
             ),
+            c_readings_by_file: build_weighted_cache(memo_budget / 8, cache::weight_c_reading),
+            c_reading_index: Arc::new(PoolSafeMemo::new()),
             reconcile_candidates_by_identifier: build_weighted_cache(
                 memo_budget / 8,
                 weight_reconcile_candidates,
@@ -263,6 +285,7 @@ impl CppAnalyzer {
             ),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
+            transitive_reverse_tu_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             compile_contexts: Arc::new(OnceLock::new()),
             external_header_closures: Arc::new(KeyedPoolSafeMemo::new()),
@@ -378,6 +401,8 @@ impl CppAnalyzer {
                 self.memo_budget / 8,
                 weight_include_reachability,
             ),
+            c_readings_by_file: build_weighted_cache(self.memo_budget / 8, cache::weight_c_reading),
+            c_reading_index: Arc::new(PoolSafeMemo::new()),
             reconcile_candidates_by_identifier: build_weighted_cache(
                 self.memo_budget / 8,
                 weight_reconcile_candidates,
@@ -388,6 +413,7 @@ impl CppAnalyzer {
             ),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
+            transitive_reverse_tu_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             compile_contexts: Arc::new(OnceLock::new()),
             external_header_closures: Arc::new(KeyedPoolSafeMemo::new()),
@@ -581,7 +607,11 @@ impl CppAnalyzer {
     }
 
     pub fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
-        self.inner.structural_parent_of(code_unit)
+        self.inner
+            .structural_parent_of(code_unit)
+            // #1970: a unit only the C reading of a header mints has no `cpp`
+            // rows, so its owner edge lives in that reading.
+            .or_else(|| self.c_reading_parent(code_unit))
     }
 
     pub(crate) fn template_metadata(
@@ -875,6 +905,18 @@ impl CppSource for CppAnalyzer {
         CppAnalyzer::compile_contexts_for(self, file)
     }
 
+    fn header_uses_c_semantics(&self, file: &ProjectFile) -> bool {
+        CppAnalyzer::header_uses_c_semantics(self, file)
+    }
+
+    fn declarations_in_reading(&self, file: &ProjectFile, c_semantics: bool) -> BTreeSet<CodeUnit> {
+        CppAnalyzer::declarations_in_reading(self, file, c_semantics)
+    }
+
+    fn site_equivalent_units(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        CppAnalyzer::site_equivalent_units(self, code_unit)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn record_cpp_parent_resolution_for_test(&self) {
         CppAnalyzer::record_cpp_parent_resolution_for_test(self);
@@ -973,8 +1015,15 @@ impl CodeUnitIndex for CppAnalyzer {
         self.inner.retain_analyzed(candidates)
     }
 
+    /// #1970: a header some translation unit provably compiles as C carries a
+    /// second, C-reading identity for each tag its C++ reading nested. Both
+    /// identities are real declarations of one site, so both are listed.
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
-        self.inner.all_declarations()
+        Box::new(
+            self.inner
+                .all_declarations()
+                .chain(self.c_reading_index_additions_for_workspace()),
+        )
     }
 
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
@@ -999,11 +1048,19 @@ impl CodeUnitIndex for CppAnalyzer {
         // include-visible class table confirms belong here, so a header
         // declaration and its `.cpp` definition unify at resolution time.
         let reconciled = self.reconciled_definitions(fq_name);
-        if reconciled.rekeyed.is_empty() {
+        // #1970: likewise for a C-attributed header's C-reading identities,
+        // which have no `cpp` rows to be found under.
+        let c_reading_index = self.c_reading_index();
+        let c_reading_units = c_reading_index
+            .by_fq_name
+            .get(fq_name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if reconciled.rekeyed.is_empty() && c_reading_units.is_empty() {
             return Box::new(inner.into_iter());
         }
         let mut definitions = inner;
-        for unit in &reconciled.rekeyed {
+        for unit in reconciled.rekeyed.iter().chain(c_reading_units) {
             if !definitions.contains(unit) {
                 definitions.push(unit.clone());
             }
@@ -1012,7 +1069,13 @@ impl CodeUnitIndex for CppAnalyzer {
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.inner.direct_children(code_unit)
+        let children = self.inner.direct_children(code_unit);
+        if !children.is_empty() {
+            return children;
+        }
+        // #1970: a unit only the C reading of a header mints has no `cpp` rows
+        // at all, so the store cannot answer for it.
+        self.c_reading_children(code_unit).unwrap_or(children)
     }
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
@@ -1030,7 +1093,8 @@ impl CodeUnitIndex for CppAnalyzer {
         {
             return self.inner.ranges(provisional);
         }
-        ranges
+        // #1970: likewise for a unit only the C reading of a header mints.
+        self.c_reading_ranges(code_unit).unwrap_or(ranges)
     }
 
     fn ranges_with_limit(
@@ -1081,8 +1145,12 @@ impl CodeUnitIndex for CppAnalyzer {
         self.inner.project()
     }
 
+    /// See [`CodeUnitIndex::all_declarations`] above: both identities of a
+    /// C-attributed header's declaration site are listed (#1970).
     fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        self.inner.get_all_declarations()
+        let mut declarations = self.inner.get_all_declarations();
+        declarations.extend(self.c_reading_index_additions_for_workspace());
+        declarations
     }
 
     fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
@@ -1093,7 +1161,14 @@ impl CodeUnitIndex for CppAnalyzer {
         // declaration and its `.cpp` definition unify at query time).
         {
             let reconciled = self.reconciled_definitions(fq_name);
-            for unit in &reconciled.rekeyed {
+            // #1970: and a C-attributed header's C-reading identities.
+            let c_reading_index = self.c_reading_index();
+            let c_reading_units = c_reading_index
+                .by_fq_name
+                .get(fq_name)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            for unit in reconciled.rekeyed.iter().chain(c_reading_units) {
                 if !definitions.contains(unit) {
                     definitions.push(unit.clone());
                 }
@@ -1140,8 +1215,14 @@ impl CodeUnitIndex for CppAnalyzer {
         self.inner.has_complete_symbol_lookup_index()
     }
 
+    /// #1970: a C-attributed header's C-reading identities are not in the
+    /// store's `cpp` rows, so the identifier index cannot answer for them.
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
-        self.inner.lookup_declarations_by_identifier(identifier)
+        let mut candidates = self.inner.lookup_declarations_by_identifier(identifier);
+        if let Some(units) = self.c_reading_index().by_identifier.get(identifier) {
+            candidates.extend(units.iter().cloned());
+        }
+        candidates
     }
 }
 
@@ -1165,6 +1246,10 @@ impl IAnalyzer for CppAnalyzer {
 
     fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.end_query(context);
+    }
+
+    fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
+        self.inner.record_query_failure(error);
     }
 
     fn begin_streaming_file_read(&self, file: &ProjectFile) {

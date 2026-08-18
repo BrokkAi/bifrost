@@ -1,0 +1,6 @@
+# Registers the Bifrost bundle in a DeepSeek Harness profile. The row's
+# `name` must stay in sync with package.json `name` and the module `name`
+# exported from src/index.js (the dsh rename invariant).
+- insert:
+    - id: bifrost
+      name: '@brokkai/dsh-plugin-bifrost'

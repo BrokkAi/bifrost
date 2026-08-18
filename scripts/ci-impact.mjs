@@ -101,7 +101,12 @@ function isLspPath(path) {
 
 function isPluginPath(path) {
   return (
-    startsWithAny(path, ["plugins/bifrost-agent/", ".claude-plugin/", ".cursor-plugin/"]) ||
+    startsWithAny(path, [
+      "plugins/bifrost-agent/",
+      "plugins/bifrost-dsh/",
+      ".claude-plugin/",
+      ".cursor-plugin/",
+    ]) ||
     [
       "scripts/check-codex-plugin-manifest.mjs",
       "scripts/check-codex-plugin-manifest.test.mjs",
@@ -128,6 +133,42 @@ function isRustPath(path) {
     "tests/",
     "examples/",
   ]);
+}
+
+// The `nlp` Cargo feature uniquely compiles the semantic-search stack: the
+// bifrost-nlp crate, the `cfg(feature = "nlp")` code in bifrost-mcp and the
+// facade, and the semantic/persistence test suites. A change to any of these
+// can break the `--features nlp` build without breaking the featureless build,
+// so the per-push Linux tier must build with nlp when one is touched. Changes
+// elsewhere in the analyzer compile featureless on push and are covered by the
+// unconditional full-nlp hourly and nightly tiers, so they do not force the
+// expensive nlp build on every commit.
+function isNlpPath(path) {
+  return (
+    startsWithAny(path, [
+      "crates/bifrost-nlp/",
+      "tests/suite_semantic/",
+      "tests/suite_persistence/",
+    ]) ||
+    [
+      "src/lib.rs",
+      "src/bin/chunk_probe.rs",
+      "src/bin/embed_probe.rs",
+      "src/bin/embed_seq_probe.rs",
+      "src/bin/semantic_extraction_profile.rs",
+      "src/bin/semantic_index_profile.rs",
+      "crates/bifrost-mcp/src/lib.rs",
+      "crates/bifrost-mcp/src/mcp_nlp.rs",
+      "crates/bifrost-mcp/src/mcp_registry.rs",
+      "crates/bifrost-mcp/src/searchtools_service.rs",
+      "crates/bifrost-mcp/tests/bifrost_mcp_server.rs",
+      "crates/bifrost-mcp/Cargo.toml",
+      "tests/nlp_semantic_search_models.rs",
+      "tests/suite_symbols/searchtools_service.rs",
+      "Cargo.toml",
+      "Cargo.lock",
+    ].includes(path)
+  );
 }
 
 function isDocumentationPath(path) {
@@ -217,7 +258,31 @@ function fullDecision(reason, changedPaths) {
   };
 }
 
-export function classifyChangeSet({ eventName, ref = "", changedPaths = [], diffFailed = false }) {
+// The nlp build variant is orthogonal to which component jobs run: it decides
+// only whether the per-push Linux job compiles `--features nlp`. It defaults to
+// required whenever we cannot trust the change set (merge queue, a failed diff,
+// or an event we do not compute paths for) and is skipped only when a reliable
+// diff contains no nlp-relevant path.
+function nlpRequired({ eventName, changedPaths = [], diffFailed = false }) {
+  if (eventName === "merge_group") {
+    return true;
+  }
+  if (diffFailed) {
+    return true;
+  }
+  if (eventName !== "push" && eventName !== "pull_request") {
+    return true;
+  }
+  return changedPaths.some(isNlpPath);
+}
+
+export function classifyChangeSet(input) {
+  const decision = classifyComponents(input);
+  decision.nlp = nlpRequired(input);
+  return decision;
+}
+
+function classifyComponents({ eventName, ref = "", changedPaths = [], diffFailed = false }) {
   if (eventName === "merge_group") {
     return fullDecision("merge queue requires the full matrix", changedPaths);
   }
@@ -290,6 +355,7 @@ function writeOutputs(outputPath, decision) {
   for (const component of COMPONENTS) {
     lines.push(`${component}=${decision.selected.has(component)}`);
   }
+  lines.push(`nlp=${decision.nlp}`);
   appendFileSync(outputPath, `${lines.join("\n")}\n`);
 }
 
@@ -305,6 +371,7 @@ function writeSummary(summaryPath, decision) {
     "",
     `Schema version: \`${decision.schemaVersion}\`  `,
     `Mode: \`${decision.mode}\`  `,
+    `NLP build (per-push Linux tier): \`${decision.nlp ? "required" : "skipped"}\`  `,
     `Selected checks: ${selected.length === 0 ? "always-on baseline only" : selected.map((name) => `\`${name}\``).join(", ")}`,
     "",
     "| Changed path | Decision |",
@@ -319,7 +386,11 @@ function main() {
   const options = parseArgs(process.argv.slice(2));
   let changedPaths = [];
   let diffFailed = false;
-  if (options.event === "pull_request") {
+  // Pull requests select their component matrix from the diff; master pushes
+  // still run the full component matrix, but the diff drives the per-push nlp
+  // build gate. For a push, --base is the prior commit (github.event.before);
+  // an unreachable base fails the diff and conservatively forces the nlp build.
+  if (options.event === "pull_request" || options.event === "push") {
     ({ changedPaths, diffFailed } = changedPathsFromGit(options.base, options.head));
   }
   const decision = classifyChangeSet({

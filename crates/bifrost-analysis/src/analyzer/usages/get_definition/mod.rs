@@ -106,10 +106,11 @@ use brokk_bifrost_ruby::graph::syntax::{
     symbol_or_string_value as ruby_symbol_or_string_value,
 };
 pub(crate) use rust::{
-    AnalyzerRustDefinitionProvider, RustTypeLookupCache, resolve_rust_bounded,
-    rust_associated_call_applicable_candidates, rust_expression_type_definition_candidates_cached,
-    rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,
-    rust_is_type_definition, rust_resolve_type_node_fqn,
+    AnalyzerRustDefinitionProvider, RustTypeLookupCache, ingest_file_macro_matcher_roles,
+    resolve_rust_bounded, rust_associated_call_applicable_candidates,
+    rust_expression_type_definition_candidates_cached, rust_expression_type_definition_fqn_cached,
+    rust_field_definition_type_candidates_cached, rust_is_type_definition,
+    rust_resolve_type_node_fqn,
 };
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};
@@ -176,8 +177,8 @@ pub use scala::{
     reset_scala_active_path_node_visits_for_test, scala_active_path_node_visits_for_test,
 };
 pub use trace::{
-    ResolutionTraceResult, TraceCandidate, TraceCandidateRef, TraceCompleteness,
-    resolve_definition_batch_with_trace,
+    DispatchQuality, ResolutionTraceResult, TraceCandidate, TraceCandidateRef, TraceCompleteness,
+    boundary_evidence, dispatch_quality_for_status, resolve_definition_batch_with_trace,
 };
 
 /// Resolve a bare `name` against the lexically enclosing scope chain, innermost
@@ -491,6 +492,19 @@ pub const DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND: &str = "declaration_or_imp
 /// in the file is not evidence that the label can bind to it.
 pub const GO_LITERAL_OWNER_UNRESOLVED_DIAGNOSTIC_KIND: &str = "go_literal_owner_unresolved";
 
+/// A `macro_rules!` matcher was found but no arm consumed the invocation.
+pub const MACRO_MATCHER_FAILED_DIAGNOSTIC_KIND: &str = "macro_matcher_failed";
+
+/// Two matcher arms or two indexed macros bound the focused token differently.
+pub const MACRO_MATCHER_DISAGREEMENT_DIAGNOSTIC_KIND: &str = "macro_matcher_disagreement";
+
+/// The selected matcher fragment carries no namespace (`tt`, `meta`, `vis`,
+/// `lifetime`, `literal`, or an `ident` whose transcriber role is mixed).
+pub const MACRO_FRAGMENT_NO_NAMESPACE_DIAGNOSTIC_KIND: &str = "macro_fragment_no_namespace";
+
+/// Successful matcher binding evidence for census grading.
+pub const MACRO_MATCHER_BINDING_DIAGNOSTIC_KIND: &str = "macro_matcher_binding";
+
 /// Whether a diagnostic kind carries an ADJUDICATED answer: the resolver
 /// identified what the site is and answered it, rather than failing to reach a
 /// target it was looking for.
@@ -509,6 +523,9 @@ pub fn is_adjudicated_answer_diagnostic_kind(kind: &str) -> bool {
         LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND
             | PREDECLARED_SYMBOL_REFERENCE_DIAGNOSTIC_KIND
             | DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND
+            | MACRO_MATCHER_FAILED_DIAGNOSTIC_KIND
+            | MACRO_MATCHER_DISAGREEMENT_DIAGNOSTIC_KIND
+            | MACRO_FRAGMENT_NO_NAMESPACE_DIAGNOSTIC_KIND
     )
 }
 
@@ -669,6 +686,22 @@ pub fn resolve_definition_batch_with_source(
     let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
     context.sources.insert(file, Ok(source));
     resolve_definition_requests(analyzer, &mut context, requests, None, None, true)
+}
+
+/// The traced counterpart of [`resolve_definition_batch_with_source`]: same
+/// inputs and the same resolver decisions, plus one [`ResolutionTraceResult`]
+/// per request. Probe callers (external-boundary auditing) have no
+/// cancellation source of their own, so this wraps
+/// [`trace::resolve_definition_batch_with_trace`] with a token that never
+/// cancels, matching the untraced entry point's unconditional-completion
+/// contract.
+pub fn resolve_definition_batch_with_source_traced(
+    analyzer: &dyn IAnalyzer,
+    requests: Vec<DefinitionLookupRequest>,
+    file: ProjectFile,
+    source: Arc<str>,
+) -> Vec<(DefinitionLookupOutcome, ResolutionTraceResult)> {
+    resolve_definition_batch_with_trace(analyzer, requests, file, source, &CancellationToken::new())
 }
 
 pub fn resolve_navigation_batch_with_source(
@@ -1247,6 +1280,8 @@ fn resolve_one<'a>(
         && !(!allow_rust_field_receiver_lexical
             && language == Language::Rust
             && rust::focused_site_is_field_receiver(tree.root_node(), &site))
+        && !(language == Language::Rust
+            && rust::focused_site_is_macro_argument(tree.root_node(), &site))
         && let Some(identifier) = source.get(site.focus_start_byte..site.focus_end_byte)
     {
         match resolve_lexical_binding(

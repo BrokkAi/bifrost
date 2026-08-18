@@ -151,6 +151,40 @@ impl<'a> CppGraphSource<'a> {
         self.index.declarations(file)
     }
 
+    /// Whether a reference written in `file` reads C++ source with C semantics
+    /// (issue #1970). Without a C++ analyzer behind this source only the path
+    /// evidence is available, which is exactly what
+    /// [`resolver::is_c_source_file`] answered before headers gained a second
+    /// reading.
+    pub fn reference_uses_c_semantics(&self, file: &ProjectFile) -> bool {
+        match self.cpp {
+            Some(cpp) => resolver::reference_uses_c_semantics(cpp, file),
+            None => resolver::is_c_source_file(file),
+        }
+    }
+
+    /// [`crate::graph_support::CppSource::declarations_in_reading`], falling
+    /// back to the single reading a bare index can serve.
+    pub fn declarations_in_reading(
+        &self,
+        file: &ProjectFile,
+        c_semantics: bool,
+    ) -> BTreeSet<CodeUnit> {
+        match self.cpp {
+            Some(cpp) if c_semantics => cpp.declarations_in_reading(file, true),
+            _ => self.index.declarations(file),
+        }
+    }
+
+    /// [`crate::graph_support::CppSource::site_equivalent_units`], empty
+    /// without a C++ analyzer.
+    pub fn site_equivalent_units(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        match self.cpp {
+            Some(cpp) => cpp.site_equivalent_units(code_unit),
+            None => Vec::new(),
+        }
+    }
+
     pub fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.index.direct_children(code_unit)
     }

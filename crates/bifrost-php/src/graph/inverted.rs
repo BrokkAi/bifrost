@@ -31,14 +31,13 @@
 
 use super::resolver::node_text;
 use super::syntax::{
-    assignment_parts, declared_instance_callable, declared_instance_field,
-    direct_call_return_type_fq_name, instance_receiver_type_fq_name, is_local_scope,
-    object_creation_type, seed_parameter_types, static_member_parts, static_scope_type_fq_name,
-    variable_identifier,
+    assignment_value_type_fq_name, declared_instance_callable, declared_instance_field,
+    instance_receiver_type_fq_name, is_local_scope, object_creation_type, seed_assignment_binding,
+    seed_parameter_types, static_member_parts, static_scope_type_fq_name, variable_identifier,
 };
 use crate::aliases::{
     PhpCallableCandidates, PhpFileContext, resolve_php_constant, resolve_php_function,
-    resolve_php_type,
+    resolve_php_type_arms,
 };
 use crate::graph::PhpGraphSource;
 use crate::graph_support::PhpSource;
@@ -91,8 +90,12 @@ struct PhpScan<'a> {
 }
 
 impl PhpScan<'_> {
-    fn resolve_type_fqn(&self, text: &str) -> Option<String> {
-        resolve_php_type(text, &self.ctx)
+    /// Every class a declared type names. The inverted graph itself still needs
+    /// one owner per edge, so a multi-arm answer fails closed when it is read;
+    /// seeding the whole set keeps this surface's interpretation identical to
+    /// the forward one.
+    fn resolve_type_arm_fqns(&self, text: &str) -> Vec<String> {
+        resolve_php_type_arms(text, &self.ctx)
     }
 
     fn resolve_type_reference_fqn(&self, node: Node<'_>) -> Option<String> {
@@ -400,53 +403,29 @@ fn seed_parameters(
     scan: &PhpScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    seed_parameter_types(node, scan.source, bindings, |raw| {
-        scan.resolve_type_fqn(raw)
+    seed_parameter_types(node, scan.source, bindings, |_name, raw| {
+        scan.resolve_type_arm_fqns(raw)
     });
 }
 
-/// Seed `$x = new Foo()` and `$x = factory()` locals into the binding scope when
-/// the RHS has a structurally declared class result. Other assignments shadow the
-/// name (so an untyped local is not later read as a static type).
+/// Seed `$x = new Foo()`, `$x = factory()`, and `$x = $y` locals into the
+/// binding scope through the shared assignment interpretation. Anything else
+/// shadows the name (so an untyped local is not later read as a static type).
 fn seed_assignment(
     node: Node<'_>,
-    scan: &mut PhpScan<'_>,
+    scan: &PhpScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    let Some((left, right)) = assignment_parts(node) else {
-        return;
-    };
-    if left.kind() != "variable_name" {
-        return;
-    }
-    let name = variable_identifier(left, scan.source);
-    if name.is_empty() {
-        return;
-    }
-    let resolved = assignment_receiver_type_fqn(right, scan);
-    match resolved {
-        Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
-        None => bindings.declare_shadow(name.to_string()),
-    }
-}
-
-fn assignment_receiver_type_fqn(right: Node<'_>, scan: &mut PhpScan<'_>) -> Option<String> {
-    match right.kind() {
-        "object_creation_expression" => object_creation_type(right)
-            .and_then(|type_node| scan.resolve_type_fqn(node_text(type_node, scan.source))),
-        "function_call_expression" | "scoped_call_expression" => direct_call_return_type_fq_name(
+    seed_assignment_binding(node, scan.source, bindings, |right, _bindings| {
+        assignment_value_type_fq_name(
             scan.php,
             scan.analyzer,
             right,
             scan.source,
             &scan.ctx,
-            scan.enclosing_class(right.start_byte()),
-        ),
-        "parenthesized_expression" => right
-            .named_child(0)
-            .and_then(|inner| assignment_receiver_type_fqn(inner, scan)),
-        _ => None,
-    }
+            || scan.enclosing_class(right.start_byte()).map(str::to_string),
+        )
+    });
 }
 
 /// True when `node` is the type name inside a `new X(..)` expression (so the

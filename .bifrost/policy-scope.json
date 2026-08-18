@@ -18,6 +18,24 @@
       "policy_categories": [
         "performance"
       ]
+    },
+    {
+      "path": "crates/bifrost-mcp/tests/fixtures/policy-cli",
+      "reason": "Intentional smell fixture: this MCP-owned policy CLI sample exists to trigger the dynamic-evaluation policy in the crate's contract test, so its finding is the expected positive, not a defect."
+    },
+    {
+      "path": "crates/bifrost-mcp/tests",
+      "reason": "Test code is not performance-sensitive; the in-loop performance review prompts do not indicate defects here.",
+      "policy_categories": [
+        "performance"
+      ]
+    },
+    {
+      "path": "crates/bifrost-lsp/tests",
+      "reason": "Test code is not performance-sensitive; the in-loop performance review prompts do not indicate defects here.",
+      "policy_categories": [
+        "performance"
+      ]
     }
   ]
 }

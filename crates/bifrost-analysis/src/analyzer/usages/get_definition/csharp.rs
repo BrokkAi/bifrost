@@ -8,7 +8,8 @@ use crate::analyzer::usages::applicability::{
 };
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::csharp_graph::{
-    canonical_builtin_type_identity, csharp_extension_invocation_return_type_fq_name_in_session,
+    CSharpDeclaredType, canonical_builtin_type_identity,
+    csharp_extension_invocation_return_type_fq_name_in_session,
     csharp_member_declared_type_fq_name_in_session,
     csharp_method_return_type_fq_name_for_arity_in_session, csharp_resolve_type_fq_name,
     csharp_usage_direct_base, csharp_visible_extension_method_candidates_in_session,
@@ -999,13 +1000,21 @@ fn csharp_structured_receiver_type_names(
         );
         let mut names = Vec::new();
         if let Some(types) = bindings.resolve_symbol(name).as_precise() {
-            for reference in types {
-                names.extend(csharp_structured_receiver_reference_type_names(
-                    csharp,
-                    definitions,
-                    file,
-                    reference,
-                ));
+            for declared in types {
+                match declared {
+                    // The seeder already proved this identity against the same
+                    // workspace generation, so it is taken as the answer rather
+                    // than re-fed to the visible-name lookup ladder (#1842).
+                    CSharpDeclaredType::Resolved { fqn } => names.push(fqn.clone()),
+                    CSharpDeclaredType::Spelling(spelling) => {
+                        names.extend(csharp_structured_receiver_reference_type_names(
+                            csharp,
+                            definitions,
+                            file,
+                            spelling,
+                        ));
+                    }
+                }
             }
         }
         names.sort();
@@ -3510,8 +3519,11 @@ fn csharp_receiver_base_types(
                     receiver.start_byte(),
                 );
                 let mut receiver_types = CSharpReceiverTypes::default();
-                if let Some(fqn) = first_precise(&legacy, name) {
-                    receiver_types.push_fq_name(definitions, fqn);
+                // Both forms are pushed as the fq name they carry, which is
+                // what this shadowed-binding fallback already did; only the
+                // resolved form is now typed as one.
+                if let Some(declared) = first_precise(&legacy, name) {
+                    receiver_types.push_fq_name(definitions, declared.as_type_name().to_string());
                 }
                 receiver_types
             } else {
@@ -4257,7 +4269,7 @@ fn csharp_legacy_bindings_before_scoped(
     source: &str,
     root: Node<'_>,
     cutoff_start: usize,
-) -> LocalInferenceEngine<String> {
+) -> LocalInferenceEngine<CSharpDeclaredType> {
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     csharp_seed_legacy_active_path(
         root,
@@ -4278,7 +4290,7 @@ fn csharp_seed_legacy_active_path(
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     source: &str,
-    bindings: &mut LocalInferenceEngine<String>,
+    bindings: &mut LocalInferenceEngine<CSharpDeclaredType>,
 ) {
     let mut stack = vec![(root, 0usize)];
     while let Some((node, next_child)) = stack.pop() {

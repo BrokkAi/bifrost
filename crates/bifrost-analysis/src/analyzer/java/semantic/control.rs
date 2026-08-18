@@ -978,9 +978,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "field_access" => {
                 let object = required_field(node, "object")?;
                 let field = required_field(node, "field")?;
-                if !self.expression_is_non_null(object) {
-                    self.implicit_exception_gap(builder, entry, node)?;
-                }
                 let access = self.point(builder, node, Vec::new())?;
                 let base = self.expression_value(builder, object, expression_value_kind(object))?;
                 let (member, resolved) = self.memory_member_locator(field, object)?;
@@ -1002,6 +999,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     },
                 )?;
                 self.edge(builder, access, next)?;
+                if !self.expression_is_non_null(object) {
+                    // NullPointerException. Its message names the expression,
+                    // not the receiver's value, so the exception carries none.
+                    self.implicit_abort_edge(builder, node, access, scope, None, stack)?;
+                }
                 self.schedule_expressions(
                     builder,
                     entry,
@@ -1012,7 +1014,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )
             }
             "array_access" => {
-                self.implicit_exception_gap(builder, entry, node)?;
                 let array = required_field(node, "array")?;
                 let index = required_field(node, "index")?;
                 let access = self.point(builder, node, Vec::new())?;
@@ -1036,6 +1037,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     },
                 )?;
                 self.edge(builder, access, next)?;
+                // NullPointerException carries nothing, but the message of an
+                // ArrayIndexOutOfBoundsException embeds the offending index,
+                // so a handler that reads the message observes that value.
+                self.implicit_abort_edge(builder, node, access, scope, Some(index_value), stack)?;
                 self.schedule_expressions(
                     builder,
                     entry,
@@ -1060,9 +1065,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.assignment_expression(builder, node, entry, next, scope, stack)
             }
             "binary_expression" | "unary_expression" => {
-                if operation_can_throw_implicitly(node) {
-                    self.implicit_exception_gap(builder, entry, node)?;
-                }
                 let children = runtime_expression_children(node);
                 let terminal = self.point(builder, node, Vec::new())?;
                 let operands = children
@@ -1074,6 +1076,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.session
                     .append_language_defined_value_flows(builder, terminal, operands, result)?;
                 self.edge(builder, terminal, next)?;
+                if operation_can_throw_implicitly(node) {
+                    // ArithmeticException on integral division, and
+                    // NullPointerException on unboxing. Neither message embeds
+                    // an operand value.
+                    self.implicit_abort_edge(builder, node, terminal, scope, None, stack)?;
+                }
                 self.schedule_expressions(
                     builder,
                     entry,
@@ -1090,11 +1098,26 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "array_initializer"
             | "dimensions_expr"
             | "template_expression" => {
-                if operation_can_throw_implicitly(node) {
-                    self.implicit_exception_gap(builder, entry, node)?;
-                }
                 let children = runtime_expression_children(node);
-                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+                if !operation_can_throw_implicitly(node) {
+                    return self
+                        .schedule_expressions(builder, entry, &children, next, scope, stack);
+                }
+                // ClassCastException, NegativeArraySizeException, and
+                // NullPointerException on unboxing. This arm appends no effect
+                // of its own, so the abort leaves a terminal point that the
+                // operands reach first.
+                let terminal = self.point(builder, node, Vec::new())?;
+                self.edge(builder, terminal, next)?;
+                self.implicit_abort_edge(builder, node, terminal, scope, None, stack)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
             }
             kind if is_runtime_leaf(kind) => self.edge(builder, entry, next),
             _ => self.unhandled_control_syntax(builder, node, entry),
@@ -2137,26 +2160,80 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(())
     }
 
-    fn implicit_exception_gap(
+    /// Lower the abort edge of a runtime operation that can fault implicitly:
+    /// a null dereference, an out-of-bounds index, a bad cast, a negative
+    /// array length, or a division by zero.
+    ///
+    /// The edge leaves `operation`, the point that carries the operation's own
+    /// effect, so every value the operands established is already live on the
+    /// abort path. `route` then threads the abort through the enclosing
+    /// cleanup regions to the handler dispatcher, or to the exceptional exit
+    /// when this procedure has no handler for it. This is the same shape
+    /// `call_expression` uses for the exceptional continuation of a call.
+    ///
+    /// The implicitly thrown exception is a fresh object. `carried` names the
+    /// program value the JVM embeds in it, which is the offending index of an
+    /// `ArrayIndexOutOfBoundsException`; the other faults report only source
+    /// text or type names, so they carry nothing.
+    ///
+    /// Effects are appended only when the destination binds the exception to a
+    /// catch parameter. An abort that can only unwind must leave the abort
+    /// point empty, because `abort_paths_run_user_code` discharges the
+    /// implicit-exception gaps that the remaining emitters still raise exactly
+    /// when no abort path runs user code.
+    fn implicit_abort_edge(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
-        point: ProgramPointId,
         node: Node<'tree>,
+        operation: ProgramPointId,
+        scope: ScopeFrameId,
+        carried: Option<ValueId>,
+        stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), JavaLoweringError> {
-        let detail = match node.kind() {
-            "field_access" | "array_access" => {
-                "implicit null, bounds, or initialization exceptions are not yet lowered"
-            }
-            _ => "implicit exceptions from runtime operators are not yet lowered",
+        let Some(route) =
+            builder.resolve_completion(scope, &CompletionRequest::new(CompletionKind::Throw, None))
+        else {
+            return Err(JavaLoweringError::Invalid(
+                "implicit abort has no matching structured continuation".into(),
+            ));
         };
-        self.add_gap(
+        let abort = self.point(builder, node, Vec::new())?;
+        if let Some(binder) = self
+            .catch_binders
+            .get(&route.destination().target())
+            .copied()
+        {
+            let thrown = self.value(builder, abort, SemanticValueKind::Exception)?;
+            if let Some(carried) = carried {
+                self.append_effect(
+                    builder,
+                    abort,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source: carried,
+                        target: thrown,
+                    },
+                )?;
+            }
+            self.append_effect(
+                builder,
+                abort,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    source: thrown,
+                    target: binder,
+                },
+            )?;
+        }
+        self.edge(
             builder,
-            point,
-            SemanticGapSubject::Point,
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapKind::Unsupported,
-            detail,
-        )
+            operation,
+            EdgeTarget {
+                point: abort,
+                kind: ControlEdgeKind::Exceptional,
+            },
+        )?;
+        self.route(builder, abort, &route, stack)
     }
 
     fn unhandled_control_syntax(

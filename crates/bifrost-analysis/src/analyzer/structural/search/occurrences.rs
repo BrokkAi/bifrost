@@ -12,8 +12,8 @@
 
 use super::super::capabilities::{QueryFeature, QueryFeatures};
 use super::super::occurrence_rows::{
-    OccurrenceCompleteness, OccurrenceFileResult, OccurrenceIncompleteReason, OccurrenceRow,
-    OccurrenceTarget, occurrences_for_file,
+    OccurrenceCompleteness, OccurrenceDerivationOptions, OccurrenceFileResult,
+    OccurrenceIncompleteReason, OccurrenceRow, OccurrenceTarget, occurrences_for_file_with_options,
 };
 use super::super::occurrences::OccurrenceRole;
 use super::results::{
@@ -33,9 +33,20 @@ pub(super) struct OccurrenceTraversalCache {
     files: HashMap<ProjectFile, Arc<OccurrenceFileResult>>,
     reported: HashSet<(Language, OccurrenceRole, CodeQueryDiagnosticCode)>,
     reported_files: HashSet<(ProjectFile, CodeQueryDiagnosticCode)>,
+    /// What this execution asked occurrence derivation for. One choice per
+    /// execution, so a memoized file is never replayed to a consumer that
+    /// needed more of it than the first consumer asked for.
+    options: OccurrenceDerivationOptions,
 }
 
 impl OccurrenceTraversalCache {
+    pub(super) fn with_options(options: OccurrenceDerivationOptions) -> Self {
+        Self {
+            options,
+            ..Self::default()
+        }
+    }
+
     /// Derive (or replay) one file's occurrence rows.
     ///
     /// `None` means the request was cancelled; an adapter that classifies
@@ -50,7 +61,8 @@ impl OccurrenceTraversalCache {
             return Some(Arc::clone(cached));
         }
         let token = cancellation.cloned().unwrap_or_default();
-        let derived = occurrences_for_file(analyzer, file, &token).ok()?;
+        let derived =
+            occurrences_for_file_with_options(analyzer, file, self.options, &token).ok()?;
         let derived = Arc::new(derived);
         self.files.insert(file.clone(), Arc::clone(&derived));
         Some(derived)
@@ -222,5 +234,6 @@ pub(super) fn target_status_label(target: &OccurrenceTarget) -> &'static str {
         OccurrenceTarget::Resolved(_) => "resolved",
         OccurrenceTarget::Lexical(_) => "lexical",
         OccurrenceTarget::Unresolved(status) => status.as_str(),
+        OccurrenceTarget::NotDerived => "not_derived",
     }
 }

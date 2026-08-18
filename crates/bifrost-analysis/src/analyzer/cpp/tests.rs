@@ -334,3 +334,289 @@ void SidePanelContentProxy::ResetAvailableCallback() {
         "normally-qualified member keeps its owner chain: {declarations:?}"
     );
 }
+
+/// ExecPlan Milestone 2 (`.agents/plans/c-compilation-language-tag-scope.md`):
+/// [`HeaderLanguageAttribution`] and the transitive reverse-include closure it
+/// is built on. `header_language_attribution` and
+/// `transitive_reaching_translation_units` are `pub(crate)` analyzer
+/// capabilities with no consumer yet, so these are crate-internal fixture
+/// tests beside the analyzer (like the rest of this file) rather than
+/// integration tests through the public facade.
+#[cfg(test)]
+mod header_language_attribution_tests {
+    use super::*;
+
+    #[test]
+    fn header_included_only_by_a_c_file_is_attributed_c() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "shared.h")
+            .write("struct Widget { int value; };\n")
+            .expect("write header");
+        ProjectFile::new(root.clone(), "a.c")
+            .write("#include \"shared.h\"\n")
+            .expect("write C translation unit");
+        let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+        let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "shared.h");
+
+        assert_eq!(
+            HeaderLanguageAttribution::C,
+            analyzer.header_language_attribution(&header)
+        );
+    }
+
+    #[test]
+    fn header_included_only_by_a_cpp_file_is_attributed_cpp() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "shared.h")
+            .write("struct Widget { int value; };\n")
+            .expect("write header");
+        ProjectFile::new(root.clone(), "a.cpp")
+            .write("#include \"shared.h\"\n")
+            .expect("write C++ translation unit");
+        let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+        let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "shared.h");
+
+        assert_eq!(
+            HeaderLanguageAttribution::Cpp,
+            analyzer.header_language_attribution(&header)
+        );
+    }
+
+    #[test]
+    fn header_included_by_both_a_c_and_a_cpp_file_is_mixed() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "shared.h")
+            .write("struct Widget { int value; };\n")
+            .expect("write header");
+        ProjectFile::new(root.clone(), "a.c")
+            .write("#include \"shared.h\"\n")
+            .expect("write C translation unit");
+        ProjectFile::new(root.clone(), "b.cpp")
+            .write("#include \"shared.h\"\n")
+            .expect("write C++ translation unit");
+        let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+        let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "shared.h");
+
+        assert_eq!(
+            HeaderLanguageAttribution::Mixed,
+            analyzer.header_language_attribution(&header)
+        );
+    }
+
+    #[test]
+    fn orphan_header_nothing_reaches_is_unknown() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "orphan.h")
+            .write("struct Widget { int value; };\n")
+            .expect("write orphan header");
+        ProjectFile::new(root.clone(), "unrelated.cpp")
+            .write("int main() { return 0; }\n")
+            .expect("write unrelated translation unit");
+        let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+        let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "orphan.h");
+
+        assert_eq!(
+            HeaderLanguageAttribution::Unknown,
+            analyzer.header_language_attribution(&header)
+        );
+        assert!(
+            analyzer
+                .transitive_reaching_translation_units(&header)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn transitive_chain_through_an_intermediate_header_attributes_the_leaf_c() {
+        // a.c -> x.h -> y.h: y.h is not directly included by any translation
+        // unit, only reached through the direct reverse-include index's
+        // fixed-point closure.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "y.h")
+            .write("struct Leaf { int value; };\n")
+            .expect("write leaf header");
+        ProjectFile::new(root.clone(), "x.h")
+            .write("#include \"y.h\"\n")
+            .expect("write intermediate header");
+        ProjectFile::new(root.clone(), "a.c")
+            .write("#include \"x.h\"\n")
+            .expect("write C translation unit");
+        let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+        let project_root = analyzer.inner.project().root().to_path_buf();
+        let leaf = ProjectFile::new(project_root.clone(), "y.h");
+        let translation_unit = ProjectFile::new(project_root, "a.c");
+
+        assert_eq!(
+            HeaderLanguageAttribution::C,
+            analyzer.header_language_attribution(&leaf)
+        );
+        assert!(
+            analyzer
+                .transitive_reaching_translation_units(&leaf)
+                .contains(&translation_unit),
+            "the transitive closure must reach through the intermediate header"
+        );
+    }
+
+    #[test]
+    fn compile_database_evidence_overrides_extension_evidence() {
+        // main.cpp is a `.cpp` translation unit, which extension evidence
+        // alone would attribute C++, but its compile-database entry forces
+        // `-x c`, so shared.h -- reached only through main.cpp -- attributes
+        // C instead.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "shared.h")
+            .write("struct Widget { int value; };\n")
+            .expect("write header");
+        ProjectFile::new(root.clone(), "main.cpp")
+            .write("#include \"shared.h\"\n")
+            .expect("write translation unit");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(
+                r#"[{"directory":".","file":"main.cpp","arguments":["clang","-x","c","-c","main.cpp"]}]"#,
+            )
+            .expect("write compile database");
+        let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+        let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "shared.h");
+
+        assert_eq!(
+            HeaderLanguageAttribution::C,
+            analyzer.header_language_attribution(&header)
+        );
+    }
+
+    #[test]
+    fn a_direct_database_entry_naming_the_header_is_decisive() {
+        // The compile database has no entry for the reaching translation
+        // unit at all (only for the header itself), so tier 2 (database TUs
+        // in the closure) and tier 3 (extension evidence) would both say
+        // nothing; the direct entry alone must still decide.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "shared.h")
+            .write("struct Widget { int value; };\n")
+            .expect("write header");
+        ProjectFile::new(root.clone(), "main.cpp")
+            .write("#include \"shared.h\"\n")
+            .expect("write translation unit");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"shared.h","arguments":["clang","-x","c","-c","shared.h"]}]"#)
+            .expect("write compile database");
+        let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+        let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "shared.h");
+
+        assert_eq!(
+            HeaderLanguageAttribution::C,
+            analyzer.header_language_attribution(&header)
+        );
+    }
+}
+
+/// ExecPlan Milestone 3 (`.agents/plans/c-compilation-language-tag-scope.md`):
+/// a header blob is stored twice when its C and C++ readings disagree, and
+/// once when they agree.
+#[cfg(test)]
+mod header_c_projection_storage_tests {
+    use super::*;
+
+    fn analyzer_over(files: &[(&str, &str)]) -> (tempfile::TempDir, CppAnalyzer) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        for (name, source) in files {
+            ProjectFile::new(root.clone(), *name)
+                .write(source)
+                .expect("write fixture file");
+        }
+        let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+        (temp, analyzer)
+    }
+
+    #[test]
+    fn nested_tag_header_stores_a_distinct_c_reading() {
+        let (_temp, analyzer) = analyzer_over(&[
+            (
+                "xdr.h",
+                "struct XDR {\n    struct xdr_ops {\n        int dummy;\n    };\n};\n",
+            ),
+            ("use.c", "#include \"xdr.h\"\n"),
+        ]);
+        let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "xdr.h");
+
+        let reading = analyzer
+            .c_reading(&header)
+            .expect("a nested tag makes the two readings disagree");
+        let mut c_only: Vec<String> = reading.c_only.iter().map(CodeUnit::fq_name).collect();
+        let mut cpp_only: Vec<String> = reading.cpp_only.iter().map(CodeUnit::fq_name).collect();
+        c_only.sort();
+        cpp_only.sort();
+        assert_eq!(
+            vec!["xdr_ops".to_string(), "xdr_ops.dummy".to_string()],
+            c_only,
+            "C gives the inner tag file scope, and its member follows it"
+        );
+        assert_eq!(
+            vec!["XDR$xdr_ops".to_string(), "XDR$xdr_ops.dummy".to_string()],
+            cpp_only
+        );
+
+        let file_scope_tag = reading
+            .c_only
+            .iter()
+            .find(|unit| unit.is_class())
+            .expect("the C reading mints a file-scope tag");
+        let nested_tag = reading
+            .cpp_only
+            .iter()
+            .find(|unit| unit.is_class())
+            .expect("the C++ reading mints a nested class");
+        assert_eq!(
+            vec![nested_tag.clone()],
+            analyzer.site_equivalent_units(file_scope_tag),
+            "the two identities share one declaration site"
+        );
+        assert_eq!(
+            vec![file_scope_tag.clone()],
+            analyzer.site_equivalent_units(nested_tag)
+        );
+    }
+
+    #[test]
+    fn header_without_a_nested_tag_stores_no_c_reading() {
+        let (_temp, analyzer) = analyzer_over(&[
+            ("plain.h", "struct Widget { int value; };\n"),
+            ("use.c", "#include \"plain.h\"\n"),
+        ]);
+        let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "plain.h");
+
+        assert!(
+            analyzer.c_reading(&header).is_none(),
+            "absence of `cpp:c` rows must mean the readings are identical"
+        );
+        assert_eq!(
+            CodeUnitIndex::declarations(&analyzer, &header),
+            analyzer.declarations_in_reading(&header, true),
+            "the C view of an identical header is the file's own row-set"
+        );
+    }
+
+    #[test]
+    fn a_translation_unit_never_carries_a_second_reading() {
+        let (_temp, analyzer) = analyzer_over(&[(
+            "unit.c",
+            "struct XDR {\n    struct xdr_ops {\n        int dummy;\n    };\n};\n",
+        )]);
+        let unit = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "unit.c");
+
+        assert!(analyzer.c_reading(&unit).is_none());
+        assert!(
+            !analyzer.header_uses_c_semantics(&unit),
+            "a translation unit's dialect is settled by its own extension"
+        );
+    }
+}

@@ -35,14 +35,14 @@ into a match policy behind the author's back.
 ### Built-in code-smell pack
 
 The installed binary embeds `bifrost.code-smells`, a catalog of thirteen
-structured match policies. It covers dynamic evaluation, unsafe Python object
-deserialization, rayon parallelism inside blocking Rust lazy initializers,
-and review prompts for sorting, regular-expression compilation,
-file reads, serialization, parsing, database calls, network calls, subprocesses,
-sleep, and expensive operations beneath nested loops. Every rule is an ordinary
-checked-in `.rqlp` source with a stable ID and semantic hash; the manifest also
-records its category, claimed languages, required capabilities, severity
-rationale, and remediation.
+structured policies: twelve match policies and one assertion policy. It covers
+dynamic evaluation, unsafe Python object deserialization, rayon parallelism
+inside blocking Rust lazy initializers, loop-invariant sorting, and review
+prompts for regular-expression compilation, file reads, serialization, parsing,
+database calls, network calls, subprocesses, sleep, and expensive operations
+beneath nested loops. Every rule is an ordinary checked-in `.rqlp` source with a
+stable ID and semantic hash; the manifest also records its category, claimed
+languages, required capabilities, severity rationale, and remediation.
 
 Pack version 1.1 adds Rust coverage to eight performance policies. The Rust
 selectors recognize the standard slice `sort*` family, `Regex::new`,
@@ -76,12 +76,28 @@ when that closure only runs later, and bare `rayon::join`, `rayon::scope`, and
 `ThreadPool::install` are excluded because their unqualified names are too
 generic for a name-based rule.
 
+Pack version 2.0 replaces the review prompt `bifrost.performance.sort-in-loop`
+with `bifrost.performance.loop-invariant-sort`, and the removed ID is why the
+major version moves. The old rule asked only "is a sort call written inside a
+loop?", which on Bifrost's own repository produced 284 findings that triage
+found to be false positives almost without exception: the sorted value was
+built inside the loop, so the work was inherent to the iteration. The new rule
+is an assertion policy over the question those prompts meant to ask -- whether
+the sorted receiver's value is *established* inside the loop, by its binder or
+by an assignment there. It claims Rust, Python, Java, TypeScript, and
+JavaScript, each with positive and near-miss fixtures. The worked rule below is
+its shipped source. The other in-loop prompts stay deliberately naive pending
+the same treatment for their argument forms.
+
 Use `bifrost --list-policies` or MCP `list_policies` to inspect the exact catalog
 in the running build. Select it with `--policy-pack bifrost.code-smells`, a
 `--policy-category`, or a stable `--policy-id`; MCP `run_policy` exposes the same
-pack/category/ID selectors. These are deliberately review-oriented structural
-matches. A call name or lexical location is evidence of the parsed shape, not
-proof of runtime dispatch, loop invariance, or measured cost.
+pack/category/ID selectors. The match policies are deliberately
+review-oriented: a call name or lexical location is evidence of the parsed
+shape, not proof of runtime dispatch, loop invariance, or measured cost.
+`bifrost.performance.loop-invariant-sort` is the exception that proves the rule
+-- it reports only what its assert established -- and it states its own two
+limits in its message and description.
 
 ### A runnable match policy
 
@@ -254,7 +270,7 @@ source/sink leaves should normally use endpoint documents.
 | `match` | One inline or file-backed RQL selector returning supported, location-bearing terminal results. | Executable. |
 | `taint` | Set-oriented sources, sinks, sanitizers, transforms, external models, and optional finding combinations. | Executes the production compiler, compatible batch planner, solver, retained report, and human/JSON/SARIF projection. |
 | `typestate` | Tracked subjects, typed events, deterministic transitions, uncertainty rules, and terminal expectations. | Executes query-local semantic bindings and emits production findings with stable identity, primary/related locations, bounded witnesses, and completeness metadata. |
-| `assertion` | Either a subject selector that captures identifier tokens plus one or more `assert`, `assert-resolution`, `assert-binding-scope`, `assert-boundary`, `assert-canonical`, `assert-route`, or `assert-round-trip` invariants about the [occurrence](/rune-query-language/) each captured token carries and about how it resolved; or a relational plan of `bind`, `join`, `group`, and `assert` records over typed rows. | Executes. Correlates captures to occurrence, candidate, and binding rows by AST identity and emits one multi-location finding per violated invariant or violated row group. |
+| `assertion` | Either a subject selector that captures identifier tokens plus one or more `assert`, `assert-resolution`, `assert-binding-scope`, `assert-value-origin`, `assert-boundary`, `assert-canonical`, `assert-route`, or `assert-round-trip` invariants about the [occurrence](/rune-query-language/) each captured token carries and about how it resolved; or a relational plan of `bind`, `join`, `group`, and `assert` records over typed rows. | Executes. Correlates captures to occurrence, candidate, and binding rows by AST identity and emits one multi-location finding per violated invariant or violated row group. |
 
 ### Taint: broad libraries, specific findings
 
@@ -373,7 +389,7 @@ when the document loads rather than evaluated to a guaranteed verdict.
 
 #### Asserting how a name resolved
 
-Three further assert records state *why* a name means what it means. They share
+Four further assert records state *why* a name means what it means. They share
 the subject selector, the AST-identity join, and the soundness rules above, and
 each carries a required `:role` naming the reference-class occurrence role it is
 about, so capability reporting narrows to exactly that role.
@@ -395,6 +411,19 @@ then require the receiver's binding to be declared inside the loop. The half
 that declares it outside -- and therefore sorts the same list on every iteration
 -- is the finding. `:relative-to` may not name the same capture as `:at`, whose
 containment is fixed.
+
+`(assert-value-origin :id ID :at CAPTURE :role ROLE :established inside|outside
+:relative-to CAPTURE2)` asks the same shape of question about the value rather
+than the binder: it requires the value read at the captured reference to be
+*established* inside, or outside, a second captured node. Two origins establish
+a value and the requirement is over their union -- the declaring scope of the
+binding in effect at the reference, and any assignment whose left operand
+reaches that same binding. That second half is what separates a receiver
+declared before a loop and overwritten on every pass, which is a fresh value
+each iteration, from one that is genuinely re-used unchanged; in languages where
+an assignment writes a binding instead of introducing one, `assert-binding-scope`
+cannot see the difference. The join to an assignment is binding identity, never
+the spelled name, so a write to a shadowing namesake exempts nothing.
 
 `(assert-boundary :id ID :at CAPTURE :role ROLE :forbid-fallback-past
 external_declared_unindexed|external_unknown)` forbids a `name_only_fallback`
@@ -528,54 +557,58 @@ excluded.
 
 #### A worked loop-invariance rule
 
-The rule below is the reason `assert-binding-scope` exists. A structural rule that
-only asks "is this call written inside a loop" cannot tell a collection built
-inside the loop and canonicalized once from a collection built before the loop
-and re-sorted on every pass; the second is the waste worth reporting and the
-first is not. The requirement is therefore that the sorted receiver be declared
-*inside* the loop, and the violation is the half declared outside it.
+The rule below is the reason `assert-value-origin` exists, and it is the one the
+built-in `bifrost.code-smells` pack ships. A structural rule that only asks "is
+this call written inside a loop" cannot tell a collection built inside the loop
+and canonicalized once from a collection built before the loop and re-sorted on
+every pass; the second is the waste worth reporting and the first is not. The
+requirement is therefore that the sorted receiver's value be *established*
+inside the loop -- declared there, or assigned there -- and the violation is the
+half established by neither.
 
 <details>
-<summary>Checked loop-invariance rule fixture</summary>
+<summary>Checked loop-invariance rule (the shipped pack source)</summary>
 
-<!-- policy-doc-test:rqlp:tests/fixtures/policies/loop-invariant-receiver.rqlp -->
+<!-- policy-doc-test:rqlp:crates/bifrost-policy/policy-packs/bifrost.code-smells/policies/loop-invariant-sort.rqlp -->
 ```lisp
-; Candidate rule for issue #1598, grown from the #1474 Milestone 6 prototype.
-; STILL NOT SHIPPED in the built-in pack, but no longer for proof reasons: the
-; pair contract below is proven for all five claimed languages in
-; `tests/suite_bench_policy/policy_loop_invariant_sort.rs`. Promotion is
-; blocked on workspace-scale assertion evaluation: on this repository (~60
-; subject files, several over ten thousand lines) the row-family queries
-; exhaust the pipeline row budget (`pipeline_row_budget` + `partial_discovery`
-; -> inconclusive) and a release-build pack run took 68 minutes. Ship it when
-; assertion evaluation can batch and complete at that scale.
+; Promoted from the #1474 Milestone 6 prototype (issue #1598). The naive
+; sort-in-loop containment rule this replaces asked "is a sort call written
+; inside a loop?" and measured a ~100% false-positive rate on this repository:
+; in almost every finding the sorted value was created inside the loop, so the
+; work was inherent to the iteration. This rule asks the intended question --
+; loop *invariance* of the receiver. The requirement is that the sorted
+; receiver's value be established inside the loop; the violation, and the
+; finding, is the invariant half: the same value, created once outside,
+; re-sorted on every pass.
 ;
-; What it means. The built-in in-loop performance rules ask "is this call
-; written inside a loop?", which produced 284 findings against this repository
-; with a 100% false-positive rate: in almost every case the value being sorted
-; was itself created inside the loop, so the work is inherent to the iteration.
-; The condition those rules actually want is loop *invariance* of the operand:
-; the same value, created once, re-sorted on every pass. That is a
-; binding-of question, and this rule asks it -- the requirement is that
-; the sorted receiver be declared inside the loop, so the violation is the half
-; declared outside it.
+; Two origins establish a value, and the requirement is over their union: the
+; declaring scope of the binding in effect at the receiver, and any assignment
+; whose left operand reaches that same binding. The second half is what keeps
+; a receiver declared before the loop but overwritten on every pass out of the
+; report; in Rust, Java, TypeScript and JavaScript such a write introduces no
+; binder, so a declaration-only predicate would call it invariant. The join to
+; an assignment is binding identity, never the spelled name.
 ;
-; Boundaries, stated because containment cannot decide them:
-; - Only a named receiver is addressed (`:receiver (identifier ...)`). A field
-;   projection or temporary expression receiver carries no receiver-position
-;   occurrence for the assert to address; constraining the subject keeps such
-;   files from turning the whole run inconclusive and makes "named receivers
-;   only" a stated scope instead of an accident.
+; Boundaries, carried verbatim from the prototype because containment cannot
+; decide them:
+; - A receiver that is a field projection (`group.packages.sort()`) has no
+;   receiver-position occurrence for the assert to address, so the rule
+;   abstains under either polarity. It decides nothing there.
 ; - A call written inside a closure or other deferred body inside the loop is
-;   reported, because it is lexically inside the loop. Containment can say
+;   reported because it is lexically inside the loop. Containment can say
 ;   where the call is written; it cannot say how many times the body runs. The
-;   message says so rather than claiming per-iteration cost.
+;   message says so rather than claiming per-iteration cost. A sort guarded by
+;   a condition that leaves the loop is the same class of fact: the rule
+;   reports where the call is written, not how often control reaches it.
 (policy
   :schema-version 1
-  :id "prototype.performance.loop-invariant-receiver"
+  :id "bifrost.performance.loop-invariant-sort"
   :name "Loop-invariant receiver sorted on every iteration"
-  :message "this receiver's binding is declared outside the enclosing loop, so every iteration re-sorts the same value; if the call sits in a closure or other deferred body, it is reported because it is written inside the loop, not because it is proven to run once per iteration"
+  :message "this receiver's value is established outside the enclosing loop and never re-established inside it, so every iteration re-sorts the same value; if the call sits in a closure or other deferred body, it is reported because it is written inside the loop, not because it is proven to run once per iteration"
   :severity warning
+  :description "The sorted receiver's value is established outside the enclosing loop -- its binding is declared outside and no assignment inside the loop reaches that binding -- so the loop re-sorts one unchanged-identity value on every pass. Sort once before the loop, or maintain order incrementally. Receivers that are field projections of another value are outside this rule's evidence and are not reported either way."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
+  :tags ["performance" "collections" "loop" "code-smell"]
   :analysis
     (analysis
       :type assertion
@@ -600,8 +633,8 @@ first is not. The requirement is therefore that the sorted receiver be declared
               (inside (loop :capture "region")
                       (call :callee (name "sort") :receiver (identifier :capture "target"))))))
       :asserts [
-        (assert-binding-scope :id declared-inside :at "target" :role receiver_position
-                         :declared inside :relative-to "region")
+        (assert-value-origin :id established-inside :at "target" :role receiver_position
+                             :established inside :relative-to "region")
       ]))
 ```
 
@@ -614,7 +647,9 @@ rather than an occurrence of a receiver role, so the assert abstains, under
 either polarity. And a call inside a closure is reported because it is written
 inside the loop, which is a lexical fact rather than a claim about how often the
 body runs -- so the message says exactly that instead of asserting per-iteration
-cost.
+cost. The same limit applies to a sort a condition guards before leaving the
+loop: containment says where the call is written, not how often control reaches
+it.
 
 Soundness is stricter here than for a match policy, because `none` and
 `exactly` are claims about a *set*. If the subject query or the occurrence scan

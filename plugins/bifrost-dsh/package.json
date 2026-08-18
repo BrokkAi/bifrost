@@ -1,0 +1,53 @@
+{
+  "name": "@brokkai/dsh-plugin-bifrost",
+  "version": "0.10.3",
+  "description": "DeepSeek Harness (dsh) bundle for Bifrost: multi-language code intelligence over MCP.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "bin",
+    "bifrost-release.json",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": "^22.19 || >=24",
+    "dsh": ">=0.1.0-rc.6"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-mcp-client": ">=0.1.0-rc.6 <0.2"
+  },
+  "scripts": {
+    "sync-launcher": "node scripts/sync-launcher.mjs",
+    "prepack": "node scripts/sync-launcher.mjs --check",
+    "test": "node --test test/plugin.test.mjs"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "bifrost",
+    "mcp",
+    "code-intelligence"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "homepage": "https://github.com/BrokkAi/bifrost",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BrokkAi/bifrost.git",
+    "directory": "plugins/bifrost-dsh"
+  }
+}

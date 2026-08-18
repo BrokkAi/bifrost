@@ -76,15 +76,43 @@ pub(crate) fn occurrence_id(
 /// Candidates are opt-in because they cost a second pass over the file's
 /// lexical environment and force the definition batch to run with a trace
 /// recorder installed. A caller that does not ask pays neither.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OccurrenceDerivationOptions {
     /// Attach the resolution trace to every reference-class row.
     pub candidates: bool,
+    /// Resolve every reference-class row to the declarations it names.
+    ///
+    /// This is the definition batch, and it is by far the most expensive part
+    /// of deriving a file's occurrences: one resolution per reference. A
+    /// consumer that only needs each row's identity, role and position -- an
+    /// assertion joining captures to occurrence rows, for example -- must not
+    /// pay for it. Rows derived without it carry
+    /// [`OccurrenceTarget::NotDerived`], which says "not attempted" and is
+    /// never read as "resolved to nothing".
+    pub targets: bool,
+}
+
+impl Default for OccurrenceDerivationOptions {
+    fn default() -> Self {
+        Self::ROWS_ONLY
+    }
 }
 
 impl OccurrenceDerivationOptions {
-    pub const ROWS_ONLY: Self = Self { candidates: false };
-    pub const WITH_CANDIDATES: Self = Self { candidates: true };
+    /// Rows with their resolved targets, without the resolution trace.
+    pub const ROWS_ONLY: Self = Self {
+        candidates: false,
+        targets: true,
+    };
+    pub const WITH_CANDIDATES: Self = Self {
+        candidates: true,
+        targets: true,
+    };
+    /// Rows addressed by identity, role and position alone.
+    pub const IDENTITY_ONLY: Self = Self {
+        candidates: false,
+        targets: false,
+    };
 }
 
 /// One classified identifier position.
@@ -138,6 +166,13 @@ pub enum OccurrenceTarget {
     Lexical(Box<LexicalDefinition>),
     /// Reference-class row whose resolution failed or stopped at a boundary.
     Unresolved(DefinitionLookupStatus),
+    /// Reference-class row the caller did not ask to resolve.
+    ///
+    /// This is absence of an attempt, not absence of a target: a consumer must
+    /// never read it as `Unresolved`. It exists so that skipping the
+    /// definition batch stays visible in the row rather than being disguised
+    /// as a resolution outcome.
+    NotDerived,
 }
 
 /// Why a file's occurrence rows are less than the whole truth.
@@ -391,6 +426,15 @@ fn resolve_reference_targets(
         .filter(|(_, row)| row.class == OccurrenceClass::Reference)
         .map(|(index, _)| index)
         .collect();
+    if !options.targets {
+        // The caller asked for identity, role and position only. Say so in
+        // every reference row rather than leaving `None`, which means "this
+        // class has nothing to resolve" and would be a different claim.
+        for &index in &reference_indices {
+            rows[index].target = OccurrenceTarget::NotDerived;
+        }
+        return Ok(());
+    }
     if reference_indices.is_empty() {
         return Ok(());
     }
@@ -557,6 +601,16 @@ mod tests {
             occurrences_for_file(
                 self.workspace.analyzer(),
                 &self.file,
+                &CancellationToken::new(),
+            )
+            .expect("uncancelled occurrence derivation")
+        }
+
+        fn identity_only_result(&self) -> OccurrenceFileResult {
+            occurrences_for_file_with_options(
+                self.workspace.analyzer(),
+                &self.file,
+                OccurrenceDerivationOptions::IDENTITY_ONLY,
                 &CancellationToken::new(),
             )
             .expect("uncancelled occurrence derivation")
@@ -1497,6 +1551,85 @@ mod tests {
             ast_id(content, 3),
             occurrence_id(content, 3, OccurrenceRole::Binder),
             "the two domains must not collide"
+        );
+    }
+    /// Identity-only derivation is the same rows, minus the definition batch.
+    ///
+    /// This is the #1452 lever: resolving every reference is the dominant cost
+    /// of deriving a large file's occurrences, and a consumer that joins rows
+    /// by AST identity never reads the result. The contract that makes
+    /// skipping it safe is that nothing else about the rows changes and the
+    /// omission is stated in the row rather than looking like a failed
+    /// resolution.
+    #[test]
+    fn identity_only_rows_match_resolved_rows_and_state_that_targets_were_not_derived() {
+        let fixture = Fixture::new(
+            Language::Rust,
+            "src/lib.rs",
+            "pub fn order(mut values: Vec<usize>) -> usize {\n    values.sort();\n    values.len()\n}\n",
+        );
+        let resolved = fixture.result();
+        let identity_only = fixture.identity_only_result();
+
+        let key = |rows: &OccurrenceFileResult| {
+            rows.rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.ast_id(),
+                        row.id(),
+                        row.role,
+                        row.class,
+                        row.namespace,
+                        row.range.start_byte,
+                        row.range.end_byte,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            key(&identity_only),
+            key(&resolved),
+            "identity, role, class, namespace and position must not depend on target derivation"
+        );
+        assert_eq!(
+            identity_only.completeness, resolved.completeness,
+            "skipping the definition batch says nothing about the file's completeness"
+        );
+
+        let reference_rows: Vec<&OccurrenceRow> = identity_only
+            .rows
+            .iter()
+            .filter(|row| row.class == OccurrenceClass::Reference)
+            .collect();
+        assert!(
+            !reference_rows.is_empty(),
+            "the fixture must contain reference-class rows for this to prove anything"
+        );
+        for row in reference_rows {
+            assert!(
+                matches!(row.target, OccurrenceTarget::NotDerived),
+                "a reference row derived without targets must say so rather than look unresolved; got {:?}",
+                row.target
+            );
+        }
+        for row in identity_only
+            .rows
+            .iter()
+            .filter(|row| row.class != OccurrenceClass::Reference)
+        {
+            assert!(
+                matches!(row.target, OccurrenceTarget::None),
+                "a non-reference row has nothing to resolve either way; got {:?}",
+                row.target
+            );
+        }
+        assert!(
+            resolved.rows.iter().any(|row| !matches!(
+                row.target,
+                OccurrenceTarget::None | OccurrenceTarget::NotDerived
+            )),
+            "the resolved derivation must actually resolve something, or the comparison is vacuous"
         );
     }
 }

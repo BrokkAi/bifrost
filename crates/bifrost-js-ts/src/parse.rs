@@ -49,7 +49,7 @@ pub fn js_ts_tree_sitter_language_for_file(
         LanguageDialect::Standard(Language::JavaScript) => {
             Some(tree_sitter_javascript::LANGUAGE.into())
         }
-        LanguageDialect::Standard(_) => None,
+        LanguageDialect::Standard(_) | LanguageDialect::CppC => None,
     }
 }
 

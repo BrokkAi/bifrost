@@ -1,0 +1,358 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.cpython-golden-summaries",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-golden-foundry",
+    "version": "0.9.0"
+  },
+  "language": "python",
+  "ecosystem": "python",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <0.11.0",
+    "toolchains": [
+      {
+        "name": "cpython",
+        "requirement": ">=3.8.0"
+      }
+    ]
+  },
+  "provenance": {
+    "source": "hand-authored golden-core CPython flow-through summaries",
+    "revision": "golden-core"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "summaries.python",
+      "activation": [
+        {
+          "toolchain": {
+            "name": "cpython",
+            "version": ">=3.8.0"
+          },
+          "targets": [],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "base64.b64decode-s",
+            "target": {
+              "path": "base64.py",
+              "symbol": "base64.b64decode(s)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "base64.b64encode-s",
+            "target": {
+              "path": "base64.py",
+              "symbol": "base64.b64encode(s)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "codecs.decode-obj-encoding",
+            "target": {
+              "path": "codecs.py",
+              "symbol": "codecs.decode(obj,encoding)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "json.dumps-obj",
+            "target": {
+              "path": "json/__init__.py",
+              "symbol": "json.dumps(obj)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "json.loads-s",
+            "target": {
+              "path": "json/__init__.py",
+              "symbol": "json.loads(s)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "os.path.join-a-p",
+            "target": {
+              "path": "posixpath.py",
+              "symbol": "os.path.join(a,p)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "urllib.parse.quote-string",
+            "target": {
+              "path": "urllib/parse.py",
+              "symbol": "urllib.parse.quote(string)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "urllib.parse.quote-string-safe",
+            "target": {
+              "path": "urllib/parse.py",
+              "symbol": "urllib.parse.quote(string,safe)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "urllib.parse.unquote-string",
+            "target": {
+              "path": "urllib/parse.py",
+              "symbol": "urllib.parse.unquote(string)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "urllib.parse.unquote-string-encoding",
+            "target": {
+              "path": "urllib/parse.py",
+              "symbol": "urllib.parse.unquote(string,encoding)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "urllib.parse.unquote_plus-string",
+            "target": {
+              "path": "urllib/parse.py",
+              "symbol": "urllib.parse.unquote_plus(string)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "urllib.parse.urljoin-base-url",
+            "target": {
+              "path": "urllib/parse.py",
+              "symbol": "urllib.parse.urljoin(base,url)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              },
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

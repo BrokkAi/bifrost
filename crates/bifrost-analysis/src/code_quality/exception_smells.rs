@@ -149,7 +149,7 @@ pub fn report_exception_handling_smells(
         ),
     };
 
-    let resolved = resolve_project_files(analyzer.project(), params.file_paths);
+    let resolved = resolve_project_files(analyzer, params.file_paths);
     let mut input_truncated = resolved.input_truncated;
     let ambiguous_paths = resolved.ambiguous_paths.clone();
     let mut findings: Vec<ExceptionHandlingSmell> = Vec::new();

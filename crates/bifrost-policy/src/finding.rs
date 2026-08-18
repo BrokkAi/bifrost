@@ -1671,23 +1671,57 @@ pub struct PolicyDiagnostic {
     code: PolicyDiagnosticCode,
     severity: PolicyDiagnosticSeverity,
     impact: PolicyDiagnosticImpact,
+    family: String,
     message: String,
+    /// How many produced diagnostics this entry stands for. It is 1 for a
+    /// verbatim diagnostic and the family's total once a capped list has been
+    /// folded by family.
+    family_count: u64,
     primary: Option<PolicySourceLocation>,
     related: Vec<RelatedPolicyLocation>,
 }
 
 impl PolicyDiagnostic {
+    /// One diagnostic whose reason family is its code.
+    ///
+    /// Use [`PolicyDiagnostic::try_new_in_family`] when the message repeats one
+    /// named reason across many sites and only the site differs; the family is
+    /// what a capped report keeps a count of.
     pub fn try_new(
         code: PolicyDiagnosticCode,
         severity: PolicyDiagnosticSeverity,
         impact: PolicyDiagnosticImpact,
         message: impl Into<String>,
         primary: Option<PolicySourceLocation>,
+        related: Vec<RelatedPolicyLocation>,
+    ) -> Result<Self, ReportValueError> {
+        let family = code.stable_label();
+        Self::try_new_in_family(code, severity, impact, family, message, primary, related)
+    }
+
+    /// One diagnostic that declares the reason family its message belongs to.
+    ///
+    /// `family` must name only the repeating reason, never the per-site
+    /// procedure, path, or count: a corpus-scale run produces one diagnostic
+    /// per site, and the per-policy diagnostic cap then drops all but the first
+    /// `max_diagnostics` of them. Folding the capped list by family is what
+    /// keeps every reason visible with its count (#2356).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_in_family(
+        code: PolicyDiagnosticCode,
+        severity: PolicyDiagnosticSeverity,
+        impact: PolicyDiagnosticImpact,
+        family: impl Into<String>,
+        message: impl Into<String>,
+        primary: Option<PolicySourceLocation>,
         mut related: Vec<RelatedPolicyLocation>,
     ) -> Result<Self, ReportValueError> {
         let mut message = message.into();
+        let mut family = family.into();
         validate_report_prose(&message)?;
+        validate_report_prose(&family)?;
         tighten_string(&mut message);
+        tighten_string(&mut family);
         if related.len() > MAX_RELATED_LOCATIONS {
             return Err(ReportValueError::TooManyItems {
                 field: "diagnostic_related_locations",
@@ -1701,7 +1735,9 @@ impl PolicyDiagnostic {
             code,
             severity,
             impact,
+            family,
             message,
+            family_count: 1,
             primary,
             related,
         })
@@ -1709,6 +1745,14 @@ impl PolicyDiagnostic {
 
     pub const fn code(&self) -> &PolicyDiagnosticCode {
         &self.code
+    }
+
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
+    pub const fn family_count(&self) -> u64 {
+        self.family_count
     }
 
     pub const fn severity(&self) -> PolicyDiagnosticSeverity {
@@ -1745,6 +1789,29 @@ pub enum PolicyDiagnosticCode {
     CvssVariantBudget,
     ProjectionScenarioMembershipBudget,
     OrganizationalRiskOverlayBudget,
+}
+
+impl PolicyDiagnosticCode {
+    /// The stable rendering label, and the default reason family of a
+    /// diagnostic that does not declare one.
+    pub fn stable_label(&self) -> String {
+        match self {
+            Self::CodeQuery { code } => format!("code_query/{}", code.as_str()),
+            Self::UnsupportedAnalysis => "unsupported_analysis".to_owned(),
+            Self::StableAnchorUnavailable => "stable_anchor_unavailable".to_owned(),
+            Self::EndpointDominanceUndecidable => "endpoint_dominance_undecidable".to_owned(),
+            Self::EvaluationFailure => "evaluation_failure".to_owned(),
+            Self::BatchFindingLimit => "batch_finding_limit".to_owned(),
+            Self::ReportRetentionBudget => "report_retention_budget".to_owned(),
+            Self::CvssVariantBudget => "cvss_variant_budget".to_owned(),
+            Self::ProjectionScenarioMembershipBudget => {
+                "projection_scenario_membership_budget".to_owned()
+            }
+            Self::OrganizationalRiskOverlayBudget => {
+                "organizational_risk_overlay_budget".to_owned()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -3128,16 +3195,12 @@ pub(crate) fn insert_policy_diagnostic_bounded(
     diagnostic: PolicyDiagnostic,
     max_diagnostics: usize,
 ) -> bool {
-    let mut truncated = normalize_policy_diagnostics_bounded(diagnostics, max_diagnostics);
+    let truncated = normalize_policy_diagnostics_bounded(diagnostics, max_diagnostics);
     match diagnostics.binary_search_by(|current| compare_policy_diagnostics(current, &diagnostic)) {
         Ok(_) => truncated,
         Err(index) => {
             diagnostics.insert(index, diagnostic);
-            if diagnostics.len() > max_diagnostics {
-                diagnostics.truncate(max_diagnostics);
-                truncated = true;
-            }
-            truncated
+            truncated | normalize_policy_diagnostics_bounded(diagnostics, max_diagnostics)
         }
     }
 }
@@ -3148,12 +3211,54 @@ pub(crate) fn normalize_policy_diagnostics_bounded(
 ) -> bool {
     diagnostics.sort_by(compare_policy_diagnostics);
     diagnostics.dedup();
+    if diagnostics.len() <= max_diagnostics {
+        return false;
+    }
+    // A corpus produces one diagnostic per site, so a plain truncation here
+    // kept whichever reasons sorted first and silently dropped every later
+    // one: the report then named some abstention causes and hid the rest
+    // (#2356). Folding by declared reason family keeps every cause with the
+    // count of the sites it covers, and only then does the cap apply.
+    fold_policy_diagnostics_by_family(diagnostics);
     if diagnostics.len() > max_diagnostics {
         diagnostics.truncate(max_diagnostics);
-        true
-    } else {
-        false
     }
+    true
+}
+
+/// Collapse a diagnostic list to one entry per reason family, summing how many
+/// produced diagnostics each family covers.
+///
+/// A family that covers more than one diagnostic gets the family label as its
+/// message and loses the per-site locations, because a message and a location
+/// that named one site cannot stand for many. A family that covers exactly one
+/// diagnostic keeps that diagnostic verbatim.
+fn fold_policy_diagnostics_by_family(diagnostics: &mut Vec<PolicyDiagnostic>) {
+    let mut folded = Vec::<PolicyDiagnostic>::new();
+    for diagnostic in std::mem::take(diagnostics) {
+        match folded.iter_mut().find(|candidate| {
+            candidate.family == diagnostic.family
+                && candidate.code == diagnostic.code
+                && candidate.severity == diagnostic.severity
+                && candidate.impact == diagnostic.impact
+        }) {
+            Some(existing) => {
+                existing.family_count = existing
+                    .family_count
+                    .saturating_add(diagnostic.family_count);
+            }
+            None => folded.push(diagnostic),
+        }
+    }
+    for entry in &mut folded {
+        if entry.family_count > 1 {
+            entry.message = entry.family.clone();
+            entry.primary = None;
+            entry.related = Vec::new();
+        }
+    }
+    folded.sort_by(compare_policy_diagnostics);
+    *diagnostics = folded;
 }
 
 fn compare_policy_diagnostics(
@@ -3164,6 +3269,7 @@ fn compare_policy_diagnostics(
         &left.code,
         left.severity,
         left.impact,
+        &left.family,
         &left.message,
         &left.primary,
         &left.related,
@@ -3172,6 +3278,7 @@ fn compare_policy_diagnostics(
             &right.code,
             right.severity,
             right.impact,
+            &right.family,
             &right.message,
             &right.primary,
             &right.related,
@@ -3413,6 +3520,7 @@ impl RetainedSize for CertaintyReason {
 impl RetainedSize for PolicyDiagnostic {
     fn retained_size(&self) -> usize {
         size_of::<Self>()
+            .saturating_add(self.family.capacity())
             .saturating_add(self.message.capacity())
             .saturating_add(retained_extra(&self.primary))
             .saturating_add(retained_extra(&self.related))
@@ -3521,6 +3629,68 @@ mod tests {
     };
     use crate::source::{PolicySourceIdentity, parse_rqlp_source};
     use serde_json::json;
+
+    /// #2356: the per-policy diagnostic cap must not hide a reason family.
+    ///
+    /// A corpus-scale run emits one diagnostic per site, so the three abstention
+    /// families of the OWASP bakeoff arrive as thousands of distinct messages.
+    /// A plain truncation kept whichever messages sorted first, which on that
+    /// corpus meant one family filled the whole cap and the report never named
+    /// the other two. Folding by declared family keeps every family with the
+    /// number of sites it covers.
+    #[test]
+    fn a_capped_diagnostic_list_keeps_every_reason_family_with_its_count() {
+        let families = ["alpha cause", "beta cause", "gamma cause"];
+        let per_family = 200_u64;
+        let mut diagnostics = Vec::new();
+        for family in families {
+            for site in 0..per_family {
+                diagnostics.push(
+                    PolicyDiagnostic::try_new_in_family(
+                        PolicyDiagnosticCode::EvaluationFailure,
+                        PolicyDiagnosticSeverity::Warning,
+                        PolicyDiagnosticImpact::RunIncomplete,
+                        family,
+                        format!("{family} at site {site}"),
+                        None,
+                        Vec::new(),
+                    )
+                    .expect("a valid diagnostic"),
+                );
+            }
+        }
+        let produced = u64::try_from(diagnostics.len()).expect("the fixture is small");
+
+        let truncated = normalize_policy_diagnostics_bounded(&mut diagnostics, 256);
+
+        assert!(truncated, "a condensed list is not the verbatim list");
+        assert_eq!(
+            diagnostics.len(),
+            families.len(),
+            "one entry per family: {diagnostics:#?}"
+        );
+        for family in families {
+            let entry = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.family() == family)
+                .unwrap_or_else(|| {
+                    panic!("family {family} must survive the cap: {diagnostics:#?}")
+                });
+            assert_eq!(
+                entry.family_count(),
+                per_family,
+                "the family must carry the count of the sites it covers"
+            );
+        }
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(PolicyDiagnostic::family_count)
+                .sum::<u64>(),
+            produced,
+            "the counts must account for every produced diagnostic"
+        );
+    }
 
     #[test]
     fn issue_1916_proven_by_summary_ranks_between_complete_and_inconclusive() {
@@ -4378,6 +4548,10 @@ mod tests {
         ));
         assert_eq!(retained.len(), 1);
 
+        // Past the cap the list is no longer verbatim. It used to keep
+        // whichever message sorted first and drop the rest without trace; it
+        // now folds to one entry per reason family carrying the count of the
+        // diagnostics that family covers (#2356). Neither cause is lost.
         retained.clear();
         assert!(!insert_policy_diagnostic_bounded(
             &mut retained,
@@ -4389,6 +4563,9 @@ mod tests {
             diagnostic("a cause"),
             1,
         ));
-        assert_eq!(retained[0].message(), "a cause");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].family(), "evaluation_failure");
+        assert_eq!(retained[0].message(), "evaluation_failure");
+        assert_eq!(retained[0].family_count(), 2);
     }
 }

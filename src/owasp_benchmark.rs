@@ -545,6 +545,14 @@ const SOURCE_CALLEES: &[&str] = &[
 fn category_sinks(category: InjectionCategory) -> Vec<Sink> {
     let s = |callee, argument| Sink { callee, argument };
     match category {
+        // The JDBC lane (`prepareStatement` .. `addBatch`) plus the Spring
+        // `JdbcTemplate` lane. The Benchmark routes 156 of its `sqli` cases
+        // through `DatabaseHelper.JDBCtemplate`, whose query family takes the
+        // SQL text as positional argument 0 in every overload the corpus uses:
+        // `queryForObject(sql, Class)` / `queryForObject(sql, Object[], Class)`,
+        // `query(sql, RowMapper)`, `queryForList(sql)`, `queryForMap(sql)`,
+        // `queryForRowSet(sql)` and `batchUpdate(sql)`. `JdbcTemplate.execute`
+        // is already covered by the JDBC `execute` entry above.
         InjectionCategory::Sqli => vec![
             s("prepareStatement", 0),
             s("prepareCall", 0),
@@ -553,6 +561,12 @@ fn category_sinks(category: InjectionCategory) -> Vec<Sink> {
             s("executeUpdate", 0),
             s("executeLargeUpdate", 0),
             s("addBatch", 0),
+            s("query", 0),
+            s("queryForObject", 0),
+            s("queryForList", 0),
+            s("queryForMap", 0),
+            s("queryForRowSet", 0),
+            s("batchUpdate", 0),
         ],
         InjectionCategory::Cmdi => vec![s("exec", 0), s("command", 0), s("ProcessBuilder", 0)],
         // DirContext.search(name, filter, ...): both the distinguished name and
@@ -813,6 +827,19 @@ pub struct CategoryRunStatus {
     pub work: BTreeMap<String, u64>,
 }
 
+/// One diagnostic as the artifact records it, with the number of diagnostics it
+/// stands for when the per-policy cap folded its reason family (#2356).
+///
+/// Without the count a folded entry reads like a single site, which is exactly
+/// the corpus-scale reading the cap used to make impossible.
+fn census_line(message: &str, family_count: u64) -> String {
+    if family_count > 1 {
+        format!("{message} [x{family_count}]")
+    } else {
+        message.to_owned()
+    }
+}
+
 fn load_pack(spec: &PackSpec) -> Result<LoadedPack, String> {
     let source = fs::read(&spec.json_path)
         .map_err(|error| format!("read {}: {error}", spec.json_path.display()))?;
@@ -1002,7 +1029,10 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
                     policy_run.findings().len(),
                 );
                 for diagnostic in policy_run.diagnostics() {
-                    eprintln!("[debug]     run-diagnostic: {}", diagnostic.message());
+                    eprintln!(
+                        "[debug]     run-diagnostic: {}",
+                        census_line(diagnostic.message(), diagnostic.family_count()),
+                    );
                 }
             }
             for diagnostic in outcome.report().diagnostics() {
@@ -1036,7 +1066,7 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
         for policy_run in outcome.report().runs() {
             completion_label = format!("{:?}", policy_run.completion());
             for diagnostic in policy_run.diagnostics() {
-                let message = diagnostic.message().to_owned();
+                let message = census_line(diagnostic.message(), diagnostic.family_count());
                 if !sample_diagnostics.contains(&message) {
                     sample_diagnostics.push(message);
                 }
@@ -1450,6 +1480,9 @@ mod tests {
         // collide by name and abort binding (#1935 cause 1). An operand at
         // argument index 0 requires at least one positional argument.
         assert!(policy.contains("(call :callee (name \"executeQuery\") (arity :min 1))"));
+        // The sqli policy also models the Spring `JdbcTemplate` lane, which 156
+        // benchmark cases sink through; its SQL operand is argument 0 too.
+        assert!(policy.contains("(call :callee (name \"queryForObject\") (arity :min 1))"));
         // A pathtraver policy names the file sinks, not the sql ones.
         let pathtraver = build_policy(InjectionCategory::Pathtraver);
         assert!(pathtraver.contains("FileInputStream"));

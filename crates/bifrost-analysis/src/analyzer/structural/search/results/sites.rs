@@ -59,6 +59,9 @@ pub enum CodeQueryOccurrenceTarget {
     Unresolved {
         status: &'static str,
     },
+    /// The consumer did not ask for this row's target, so none was attempted.
+    /// Distinct from `unresolved`, which is a resolution outcome.
+    NotDerived,
 }
 
 #[derive(Debug, Clone, Serialize)]

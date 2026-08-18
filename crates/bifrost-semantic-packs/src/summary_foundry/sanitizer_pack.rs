@@ -65,6 +65,15 @@ pub const SANITIZER_PACK_AUDIT_FORMAT: &str = "bifrost_sanitizer_pack_audit/v1";
 /// The producer name recorded in every generated pack.
 const PRODUCER_NAME: &str = "bifrost-sanitizer-foundry";
 
+/// The sanitizer foundry's own version, advanced when the converter changes the
+/// shape of its output. It is deliberately not the crate version: the checked-in
+/// packs are gated on byte equality with this generator, and reading the crate
+/// version would break that gate at every release bump without any content
+/// change. `golden_pack.rs` states the same rule; #1871 applied it there and
+/// left this converter behind, which is what made
+/// `the_checked_in_packs_match_the_generator` fail at v0.10.3.
+const PRODUCER_VERSION: &str = "0.9.0";
+
 /// The pack content version. It is the sanitizer content's own version, not the
 /// Bifrost version, and advances when the shipped claims change.
 const PACK_CONTENT_VERSION: &str = "0.1.0";
@@ -72,8 +81,10 @@ const PACK_CONTENT_VERSION: &str = "0.1.0";
 /// The Bifrost compatibility requirement every generated pack declares.
 const BIFROST_REQUIREMENT: &str = ">=0.8.0, <0.11.0";
 
-/// The authored sanitizer content is Bifrost's own claim, licensed like the
-/// workspace. It is not a slice of the described library.
+/// The authored sanitizer content is Bifrost's own claim, not a slice of the
+/// described library. New Bifrost-owned public packs use the public project
+/// license; retained packs may declare their own provenance and license in
+/// their checked-in metadata.
 const PACK_LICENSE: &str = "Apache-2.0";
 
 /// The JDK toolchain requirement. Every claimed API (`Integer.parseInt`,
@@ -616,9 +627,14 @@ fn summary_input(port: &SanitizerPort) -> AuthoredSummaryInput {
 /// lowercase ASCII alphanumerics plus `.`, `-`, and `_`; every other character
 /// collapses to a single `-`, and leading or trailing separators are trimmed.
 ///
+/// An array suffix is spelled out first. Collapsing `[]` to a separator would
+/// make `append(char[])` and `append(char)` slug identically, and two shipped
+/// overloads must not share an id.
+///
 /// Shared with the golden-core and framework-declaration converters, which slug
 /// a summary id or a pack coordinate the same way.
 pub(crate) fn summary_id(symbol: &str) -> String {
+    let symbol = symbol.replace("[]", "_array");
     let mut id = String::with_capacity(symbol.len());
     let mut last_dash = false;
     for character in symbol.chars() {
@@ -727,7 +743,7 @@ impl PackIdentity {
             version: PACK_CONTENT_VERSION.to_owned(),
             producer: Producer {
                 name: PRODUCER_NAME.to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
+                version: PRODUCER_VERSION.to_owned(),
             },
             language: "java".to_owned(),
             ecosystem: self.ecosystem.clone(),

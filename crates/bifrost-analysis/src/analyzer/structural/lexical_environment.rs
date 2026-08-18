@@ -26,6 +26,8 @@
 //! Rows are derived per request and never persisted; the facts snapshot
 //! underneath them is the cached part.
 
+use std::collections::HashMap;
+
 use super::facts::{FileFacts, Span};
 use super::kinds::NormalizedKind;
 use super::occurrence_rows::ast_id;
@@ -265,11 +267,62 @@ pub struct EnvironmentFileResult {
     pub bindings: Vec<BindingRow>,
     pub package: PackageClauseRow,
     pub completeness: EnvironmentCompleteness,
+    /// Binding row indices grouped by binder name, in row order.
+    ///
+    /// The question this layer exists to answer -- which binding of *this
+    /// name* is in effect here -- is asked once per occurrence, and the file's
+    /// binding list is the wrong place to ask it: a 13k-line file has
+    /// thousands of bindings, and a linear pass compared every one of their
+    /// names against the spelling. That made the environment cost
+    /// O(occurrences x bindings) in string comparisons, which is why one large
+    /// file took minutes. The name is a key, so it is indexed as one; the
+    /// candidate list a lookup returns is the same set the linear filter kept,
+    /// in the same order.
+    bindings_by_name: HashMap<Box<str>, Vec<usize>>,
 }
 
 impl EnvironmentFileResult {
+    /// Build a file's environment and the name index over its bindings.
+    ///
+    /// The index is derived here rather than lazily so that every result has
+    /// it: a caller cannot construct one without it, and no query path can
+    /// fall back to the linear scan it replaces.
+    pub fn new(
+        scopes: Vec<ScopeRow>,
+        bindings: Vec<BindingRow>,
+        package: PackageClauseRow,
+        completeness: EnvironmentCompleteness,
+    ) -> Self {
+        let mut bindings_by_name: HashMap<Box<str>, Vec<usize>> = HashMap::new();
+        for (index, binding) in bindings.iter().enumerate() {
+            match bindings_by_name.get_mut(binding.name.as_str()) {
+                Some(rows) => rows.push(index),
+                None => {
+                    bindings_by_name.insert(binding.name.as_str().into(), vec![index]);
+                }
+            }
+        }
+        Self {
+            scopes,
+            bindings,
+            package,
+            completeness,
+            bindings_by_name,
+        }
+    }
+
     pub fn scope(&self, index: u32) -> &ScopeRow {
         &self.scopes[index as usize]
+    }
+
+    /// The binding rows whose binder spells `name`, in row order.
+    ///
+    /// Row order is what the shadowing sort below relies on for its final
+    /// tie-break, so the index preserves it rather than grouping arbitrarily.
+    pub fn bindings_named(&self, name: &str) -> &[usize] {
+        self.bindings_by_name
+            .get(name)
+            .map_or(&[][..], Vec::as_slice)
     }
 
     /// The innermost scope containing `position_byte`.
@@ -371,28 +424,24 @@ pub fn environment_for_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Env
     assign_source_order(&mut bindings);
 
     let package = package_clause(analyzer, file, language);
-    EnvironmentFileResult {
-        scopes,
-        bindings,
-        package,
-        completeness: completeness(support, reasons),
-    }
+    let completeness = completeness(support, reasons);
+    EnvironmentFileResult::new(scopes, bindings, package, completeness)
 }
 
 fn unavailable(file: &ProjectFile, reason: EnvironmentIncompleteReason) -> EnvironmentFileResult {
-    EnvironmentFileResult {
-        scopes: Vec::new(),
-        bindings: Vec::new(),
-        package: PackageClauseRow {
+    EnvironmentFileResult::new(
+        Vec::new(),
+        Vec::new(),
+        PackageClauseRow {
             file: file.clone(),
             package_fq: None,
             syntactic: false,
         },
-        completeness: EnvironmentCompleteness::Incomplete {
+        EnvironmentCompleteness::Incomplete {
             unsupported_axes: ENVIRONMENT_PRODUCER_AXES.to_vec(),
             reasons: vec![reason],
         },
-    }
+    )
 }
 
 /// Record a reason once. Which axis is incomplete is what matters; how many
@@ -851,21 +900,27 @@ pub fn binding_of(
     };
     let ancestry = env.scope_ancestry(innermost);
 
+    // Only bindings that spell this name can be in effect for it, and the
+    // index knows which those are. The remaining predicates are the same ones
+    // the linear pass applied, in the same order, over the same rows.
     let mut candidates: Vec<usize> = env
-        .bindings
+        .bindings_named(name)
         .iter()
-        .enumerate()
-        .filter(|(_, binding)| {
-            binding.name == name
-                && !binding
-                    .import
-                    .as_ref()
-                    .is_some_and(|detail| detail.wildcard)
+        .copied()
+        .filter(|index| {
+            let binding = &env.bindings[*index];
+            debug_assert_eq!(
+                binding.name, name,
+                "the binding name index must group rows by their binder spelling"
+            );
+            !binding
+                .import
+                .as_ref()
+                .is_some_and(|detail| detail.wildcard)
                 && namespace.is_none_or(|wanted| binding.namespace() == wanted)
                 && binding.is_active_at(position_byte)
                 && ancestry.contains(&binding.declaring_scope)
         })
-        .map(|(index, _)| index)
         .collect();
     if candidates.is_empty() {
         return BindingOfOutcome::NoBinding;

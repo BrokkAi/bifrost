@@ -612,6 +612,10 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner.end_query(context);
     }
 
+    fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
+        self.inner.record_query_failure(error);
+    }
+
     fn begin_streaming_file_read(&self, file: &ProjectFile) {
         self.inner.begin_streaming_file_read(file);
     }

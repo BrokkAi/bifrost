@@ -1509,6 +1509,7 @@ fn project_code_query_row_field<'a>(
                 CodeQueryOccurrenceTarget::Resolved { .. } => "resolved",
                 CodeQueryOccurrenceTarget::Lexical { .. } => "lexical",
                 CodeQueryOccurrenceTarget::Unresolved { .. } => "unresolved",
+                CodeQueryOccurrenceTarget::NotDerived => "not_derived",
             };
             Some(Scalar::ConstrainedEnum(kind))
         }
@@ -1523,6 +1524,10 @@ fn project_code_query_row_field<'a>(
                 CodeQueryOccurrenceTarget::Resolved { units } => units.len(),
                 CodeQueryOccurrenceTarget::Lexical { .. } => 1,
                 CodeQueryOccurrenceTarget::None | CodeQueryOccurrenceTarget::Unresolved { .. } => 0,
+                // No attempt was made, so there is no count to report. Zero
+                // would be the answer for "resolved to nothing", which is a
+                // different statement.
+                CodeQueryOccurrenceTarget::NotDerived => return None,
             };
             Some(Scalar::Integer(count as u64))
         }

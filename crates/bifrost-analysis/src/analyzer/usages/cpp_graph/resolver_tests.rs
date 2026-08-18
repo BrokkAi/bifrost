@@ -520,7 +520,8 @@ ABSL_NAMESPACE_END
                 *include_discovery_counts.entry(file.clone()).or_default() += 1;
                 adjacency.get(file).cloned().unwrap_or_default()
             },
-            |file| declarations_by_file.get(file).cloned().unwrap_or_default(),
+            |_root| false,
+            |file, _c_semantics| declarations_by_file.get(file).cloned().unwrap_or_default(),
         );
 
         assert_eq!(include_discovery_counts.len(), adjacency.len());
@@ -580,7 +581,8 @@ ABSL_NAMESPACE_END
             &roots,
             None,
             |file| adjacency.get(file).cloned().unwrap_or_default(),
-            |file| declarations.get(file).cloned().unwrap_or_default(),
+            |_root| false,
+            |file, _c_semantics| declarations.get(file).cloned().unwrap_or_default(),
         );
         let cpp = visibility_analyzer(&visible_by_file);
         let visibility = visibility_index(&cpp, visible_by_file);

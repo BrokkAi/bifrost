@@ -9,7 +9,7 @@
 //! `searchtools_service.rs` (and any future caller) stay flat:
 //! `crate::code_quality::compute_cyclomatic_complexity` etc.
 
-use crate::analyzer::{CodeUnit, IAnalyzer, Project, ProjectFile, SummaryFileProjection};
+use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, SummaryFileProjection};
 use crate::hash::HashMap;
 use crate::path_utils::{AmbiguousPathInput, ResolvedFileInput, WorkspaceFileResolver};
 use regex::Regex;
@@ -70,9 +70,12 @@ pub(crate) struct ResolvedFiles {
 ///
 /// Caller is responsible for any further filtering (dedup, file-cap,
 /// language gating).
-pub(crate) fn resolve_project_files(project: &dyn Project, inputs: Vec<String>) -> ResolvedFiles {
+pub(crate) fn resolve_project_files(
+    analyzer: &dyn IAnalyzer,
+    inputs: Vec<String>,
+) -> ResolvedFiles {
     let input_truncated = inputs.len() > MAX_FILE_PATHS;
-    let resolver = WorkspaceFileResolver::new(project);
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
     let mut files: Vec<ProjectFile> = Vec::new();
     let mut skipped_inputs: usize = 0;
     let mut ambiguous_paths: Vec<AmbiguousPathInput> = Vec::new();
@@ -107,7 +110,7 @@ pub(crate) fn resolve_project_files_or_all_analyzed(
     inputs: Vec<String>,
 ) -> ResolvedFiles {
     if !inputs.is_empty() {
-        return resolve_project_files(analyzer.project(), inputs);
+        return resolve_project_files(analyzer, inputs);
     }
 
     ResolvedFiles {

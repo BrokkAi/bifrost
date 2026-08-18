@@ -38,8 +38,8 @@ pub use model::{
 };
 pub(crate) use plan::ValueFlowCarrierSummaryIdentity;
 pub use plan::{
-    ValueFlowCuratedCallModel, ValueFlowIncompleteCause, ValueFlowInput, ValueFlowPlan,
-    ValueFlowPlanError, ValueFlowPlanLimits, ValueFlowSummaryLocationBinding,
+    AuthoredArmClosure, ValueFlowCuratedCallModel, ValueFlowIncompleteCause, ValueFlowInput,
+    ValueFlowPlan, ValueFlowPlanError, ValueFlowPlanLimits, ValueFlowSummaryLocationBinding,
 };
 pub use provider::{ValueFlowCache, ValueFlowProvider, WorkspaceValueFlowProvider};
 pub use result::{

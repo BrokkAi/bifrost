@@ -42,7 +42,7 @@ use crate::graph::resolver::{
     canonical_cpp_scope_components, constructor_style_local_declaration, cpp_callable_arity,
     cpp_template_reference_arguments, cpp_type_name_components, declarator_name_node,
     designated_initializer_owner, extract_variable_name, first_type_child, function_terminal_node,
-    has_ancestor_kind, infer_cpp_initializer_binding, infer_cpp_initializer_type, is_c_source_file,
+    has_ancestor_kind, infer_cpp_initializer_binding, infer_cpp_initializer_type,
     is_cpp_template_argument_type_leaf, is_declaration_name, is_declarator_node,
     is_globally_qualified_cpp_name, is_nested_type_node,
     is_recovered_qualified_friend_class_type_reference, normalize_type_text,
@@ -863,7 +863,7 @@ fn record_call(node: Node<'_>, ctx: &mut CppScan<'_>, bindings: &LocalInferenceE
             else {
                 return;
             };
-            if receiver_is_self_like(receiver, ctx.file) {
+            if receiver_is_self_like(receiver, ctx.analyzer.reference_uses_c_semantics(ctx.file)) {
                 // `this->m()` / `(*this).m()` is a same-owner call (#1138):
                 // record it as unproven inbound rather than dropping it, so a
                 // member reachable only through same-owner calls reads
@@ -1071,13 +1071,19 @@ fn enclosing_callable_owner(node: Node<'_>, ctx: &CppScan<'_>) -> Option<CodeUni
     })
 }
 
-fn receiver_is_self_like(receiver: Node<'_>, file: &ProjectFile) -> bool {
+/// Whether `receiver` is the implicit-object receiver of a member call.
+///
+/// `reference_is_c` is the compilation language the reference is read in
+/// (#1970): `this` is the C++ implicit object only where C++ compiles the
+/// source, and is an ordinary identifier in a `.c` file or a header every
+/// reaching translation unit compiles as C.
+fn receiver_is_self_like(receiver: Node<'_>, reference_is_c: bool) -> bool {
     match receiver.kind() {
-        "this" => !is_c_source_file(file),
+        "this" => !reference_is_c,
         "parenthesized_expression" | "pointer_expression" => receiver
             .child_by_field_name("argument")
             .or_else(|| receiver.named_child(0))
-            .is_some_and(|inner| receiver_is_self_like(inner, file)),
+            .is_some_and(|inner| receiver_is_self_like(inner, reference_is_c)),
         _ => false,
     }
 }
@@ -1151,7 +1157,7 @@ fn receiver_type_unit(
                     })
             })
         }
-        "this" if is_c_source_file(ctx.file) => {
+        "this" if ctx.analyzer.reference_uses_c_semantics(ctx.file) => {
             first_precise(bindings, node_text(receiver, ctx.source))
         }
         "this" => ctx.enclosing_class(receiver.start_byte()).and_then(|fqn| {

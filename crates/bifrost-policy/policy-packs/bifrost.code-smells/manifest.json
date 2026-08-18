@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "bifrost.code-smells",
-  "version": "1.5.0",
+  "version": "2.0.0",
   "name": "Bifrost code smells",
   "description": "Curated structured RQLP checks for bug-prone and potentially expensive source patterns.",
   "policies": [
@@ -38,23 +38,26 @@
       "remediation": "Use a data-only format, then validate the decoded schema before use."
     },
     {
-      "path": "policies/sort-in-loop.rqlp",
-      "id": "bifrost.performance.sort-in-loop",
-      "semantic_hash": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "path": "policies/loop-invariant-sort.rqlp",
+      "id": "bifrost.performance.loop-invariant-sort",
+      "semantic_hash": "933ab0a333030b76e26fdc97b8139797a6d388fa258cabc9f7fdb50d1222fcf1",
       "category": "performance",
       "supported_languages": [
+        "rust",
         "python",
         "java",
         "typescript",
-        "rust"
+        "javascript"
       ],
       "required_capabilities": [
         "structural-match",
-        "declaration-bounded-containment",
-        "normalized-call"
+        "normalized-call-roles",
+        "lexical-environment",
+        "reaching-binding-assertion",
+        "value-origin-assertion"
       ],
-      "severity_rationale": "Repeated sorting often multiplies an O(n log n) operation by the loop trip count.",
-      "remediation": "Sort once before the loop, maintain an ordered structure, or prove that each iteration requires distinct input."
+      "severity_rationale": "The receiver's value is established outside the loop and no assignment inside re-establishes it, so the loop provably re-sorts one unchanged-identity value on every pass.",
+      "remediation": "Sort once before the loop or maintain order incrementally. Calls in deferred bodies are reported lexically; verify how often the body runs before restructuring."
     },
     {
       "path": "policies/regex-compile-in-loop.rqlp",

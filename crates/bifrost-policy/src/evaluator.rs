@@ -50,7 +50,9 @@ use brokk_bifrost_analysis::analyzer::structural::search::{
     CodeQueryStableOwnerDerivation, DetailedCodeQueryDomain, DetailedCodeQueryEvidence,
     DetailedCodeQueryIdentityCandidate, DetailedCodeQueryKey, DetailedCodeQueryProvenanceEvidence,
     DetailedCodeQueryProvenanceIdentities, DetailedCodeQueryProvenanceRefEvidence,
-    execute_code_query_detailed_eager_index, execute_code_query_detailed_eager_index_workspace,
+    execute_code_query_detailed_eager_index,
+    execute_code_query_detailed_eager_index_without_targets,
+    execute_code_query_detailed_eager_index_workspace,
 };
 use brokk_bifrost_analysis::analyzer::structural::{BoundaryStatus, PrecedenceTier};
 use brokk_bifrost_analysis::analyzer::structural::{
@@ -65,14 +67,15 @@ use brokk_bifrost_analysis::analyzer::structural::{
     QueryValueKind,
 };
 use brokk_bifrost_analysis::analyzer::structural::{
-    OccurrenceRow as InternalOccurrenceRow, OccurrenceTarget as InternalOccurrenceTarget,
-    canonical_identity_of,
+    NormalizedKind, OccurrenceRow as InternalOccurrenceRow,
+    OccurrenceTarget as InternalOccurrenceTarget, canonical_identity_of,
 };
 use brokk_bifrost_analysis::analyzer::usages::{UsageHitSurface, UsageProof};
 use brokk_bifrost_analysis::analyzer::{CodeUnit, IAnalyzer, ProjectFile, WorkspaceAnalyzer};
 use brokk_bifrost_rql::{
-    BindingOfOptions, CandidateFilter, CodeQueryPlan, CodeQueryPlanSource, GenerationSiteSeed,
-    OccurrenceSeed, QueryStep, SCHEMA_VERSION, ScopeSeed,
+    BindingOfOptions, CandidateFilter, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed,
+    GenerationSiteSeed, OccurrenceSeed, Pattern, QueryStep, SCHEMA_VERSION, ScopeSeed,
+    exact_path_globs,
 };
 use std::sync::Arc;
 
@@ -93,7 +96,7 @@ use super::definition::{
     EdgeClassConstraint, EdgeParityAssert, EstablishmentRequirement, FindingSeverity,
     FlowEstablishmentAssert, GenerationAssert, OccurrenceAssert, PolicyAnalysis,
     PolicyAnalysisType, PolicyAssert, PolicyId, PolicyLevel, PolicyMessageSpec, PolicySeveritySpec,
-    ResolutionAssert, RoundTripAssert, RouteAssert,
+    ResolutionAssert, RoundTripAssert, RouteAssert, ValueOriginAssert,
 };
 use super::finding::{
     CertaintyReason, FindingCertainty, FindingCompleteness, FindingIncompleteReason,

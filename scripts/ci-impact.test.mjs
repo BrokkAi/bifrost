@@ -241,3 +241,58 @@ test("an empty pull request retains the always-on baseline", () => {
   assert.equal(decision.mode, "impact");
   assert.deepEqual(selected(decision), []);
 });
+
+test("the nlp build gate follows the nlp compile surface, not the full Rust surface", () => {
+  const nlpPaths = [
+    ["crates/bifrost-nlp/src/indexer.rs"],
+    ["crates/bifrost-mcp/src/mcp_nlp.rs"],
+    ["crates/bifrost-mcp/src/searchtools_service.rs"],
+    ["src/lib.rs"],
+    ["src/bin/embed_probe.rs"],
+    ["tests/suite_semantic/semantic_search.rs"],
+    ["tests/suite_persistence/main.rs"],
+    ["tests/nlp_semantic_search_models.rs"],
+    ["Cargo.toml"],
+    ["Cargo.lock"],
+  ];
+  for (const changedPaths of nlpPaths) {
+    assert.equal(
+      classifyChangeSet({ eventName: "push", ref: "refs/heads/master", changedPaths }).nlp,
+      true,
+      `expected nlp build for ${changedPaths[0]}`,
+    );
+  }
+
+  const nonNlpPaths = [
+    ["crates/bifrost-analysis/src/analyzer/javascript/semantic.rs"],
+    ["crates/bifrost-core/src/analyzer/capabilities.rs"],
+    ["tests/suite_analyzers/language_behavior.rs"],
+    ["editors/vscode/src/rql/index.ts"],
+  ];
+  for (const changedPaths of nonNlpPaths) {
+    assert.equal(
+      classifyChangeSet({ eventName: "push", ref: "refs/heads/master", changedPaths }).nlp,
+      false,
+      `expected no nlp build for ${changedPaths[0]}`,
+    );
+  }
+});
+
+test("the nlp build gate stays conservative when the change set is untrusted", () => {
+  // Merge queue, a failed diff, and events we do not diff all force the build.
+  assert.equal(classifyChangeSet({ eventName: "merge_group" }).nlp, true);
+  assert.equal(classifyChangeSet({ eventName: "pull_request", diffFailed: true }).nlp, true);
+  assert.equal(classifyChangeSet({ eventName: "workflow_dispatch" }).nlp, true);
+  // A push touching a non-nlp path alongside an nlp path still builds nlp.
+  assert.equal(
+    classifyChangeSet({
+      eventName: "push",
+      ref: "refs/heads/master",
+      changedPaths: [
+        "crates/bifrost-analysis/src/analyzer/rust/semantic.rs",
+        "crates/bifrost-nlp/src/engine.rs",
+      ],
+    }).nlp,
+    true,
+  );
+});

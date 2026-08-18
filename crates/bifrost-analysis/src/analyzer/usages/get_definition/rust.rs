@@ -19,18 +19,29 @@ use crate::analyzer::usages::rust_graph::{
 use crate::analyzer::{RustReferenceContext, SignatureMetadata, StructuredTypeIdentity};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+use brokk_bifrost_rust::declarations::rust_macro_invocation_arguments;
 use brokk_bifrost_rust::field_roles::{
     RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
 };
+use brokk_bifrost_rust::graph::resolver::{RustBareTokenTreeRole, RustTokenTreeRoleCache};
 use brokk_bifrost_rust::graph_support::{
     RustFactSource, RustSource, is_rust_export_visible_declaration,
     is_rust_macro_export_declaration, is_rust_trait_declaration,
-    is_rust_trait_impl_member_declaration,
+    is_rust_trait_impl_member_declaration, rust_declaration_node,
 };
 use brokk_bifrost_rust::lexical_scope;
+use brokk_bifrost_rust::macro_matcher::{
+    self, MacroFragmentKind, MacroMatchError, MacroNamespaceEvidence,
+    enclosing_macro_invocation_for_argument, is_macro_rules_definition, match_macro_rules,
+    token_namespace_evidence,
+};
 use std::cell::RefCell;
 
-use super::{DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND, LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND};
+use super::{
+    DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND, LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+    MACRO_FRAGMENT_NO_NAMESPACE_DIAGNOSTIC_KIND, MACRO_MATCHER_BINDING_DIAGNOSTIC_KIND,
+    MACRO_MATCHER_DISAGREEMENT_DIAGNOSTIC_KIND, MACRO_MATCHER_FAILED_DIAGNOSTIC_KIND,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RustResolutionSemantics {
@@ -1437,6 +1448,11 @@ fn rust_exact_reference_role_outcome(
             "Rust declaration names do not reference another definition",
         ));
     }
+    if let Some(outcome) =
+        rust_macro_argument_outcome(analyzer, support, file, source, tree, site, focused)
+    {
+        return Some(outcome);
+    }
     if crate::analyzer::usages::rust_graph::rust_bare_token_tree_non_reference_role(focused, source)
     {
         let focused_name = rust_node_text(focused, source).trim();
@@ -1710,11 +1726,74 @@ fn rust_macro_name_outcome(
     {
         return None;
     }
-    let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
-    let refs = support.forward_reference_context(rust, file)?;
+    match rust_collect_macro_units(
+        analyzer,
+        support,
+        file,
+        source,
+        tree,
+        site.focus_start_byte,
+        site.focus_end_byte,
+        invocation,
+        focused,
+    ) {
+        MacroUnitResolution::Found(candidates) if candidates.is_empty() => {
+            let name = rust_macro_invocation_name(invocation, source).unwrap_or("?");
+            Some(no_definition(
+                "unindexed_macro",
+                format!("Rust macro `{name}` did not resolve to an indexed macro definition"),
+            ))
+        }
+        MacroUnitResolution::Found(candidates) => Some(candidates_outcome(candidates)),
+        MacroUnitResolution::Boundary(outcome) => Some(*outcome),
+        MacroUnitResolution::NotAMacroName => None,
+    }
+}
+
+enum MacroUnitResolution {
+    Found(Vec<CodeUnit>),
+    Boundary(Box<DefinitionLookupOutcome>),
+    NotAMacroName,
+}
+
+fn rust_macro_invocation_name<'a>(invocation: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let macro_name = invocation.child_by_field_name("macro")?;
     let name_node = macro_name.child_by_field_name("name").unwrap_or(macro_name);
     let name = rust_node_text(name_node, source).trim();
-    let candidates = if let Some(path) = macro_name.child_by_field_name("path") {
+    (!name.is_empty()).then_some(name)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rust_collect_macro_units(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    lookup_start: usize,
+    lookup_end: usize,
+    invocation: Node<'_>,
+    focused: Node<'_>,
+) -> MacroUnitResolution {
+    let Some(macro_name) = invocation.child_by_field_name("macro") else {
+        return MacroUnitResolution::Found(Vec::new());
+    };
+    if macro_name.kind() == "scoped_identifier"
+        && macro_name
+            .child_by_field_name("path")
+            .is_some_and(|path| node_within(path, focused))
+    {
+        return MacroUnitResolution::NotAMacroName;
+    }
+    let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
+        return MacroUnitResolution::Found(Vec::new());
+    };
+    let Some(refs) = support.forward_reference_context(rust, file) else {
+        return MacroUnitResolution::Found(Vec::new());
+    };
+    let name_node = macro_name.child_by_field_name("name").unwrap_or(macro_name);
+    let name = rust_node_text(name_node, source).trim();
+    let mut candidates = if let Some(path) = macro_name.child_by_field_name("path") {
         let path = rust_node_text(path, source).trim();
         refs.resolve_scoped(path, name)
             .into_iter()
@@ -1727,37 +1806,37 @@ fn rust_macro_name_outcome(
             support,
             file,
             source,
-            site.focus_start_byte,
+            lookup_start,
             name,
             RustBareReferenceRole::Macro,
         ) {
             RustVisibleImportResolution::Resolved(candidates)
             | RustVisibleImportResolution::GlobResolved(candidates) => candidates,
             RustVisibleImportResolution::BoundButUnindexed => {
-                // An unresolvable macro import must not blind the reference to a
-                // workspace-declared macro of the same name in an enclosing
-                // scope: macros keep their own namespace, so consult it before
-                // claiming an unindexed boundary (#1158, the macro-namespace
-                // analogue of the type-namespace fallback its siblings run).
                 if let Some(unit) = resolve_in_enclosing_scopes(
                     analyzer,
                     file,
                     name,
-                    site.focus_start_byte,
+                    lookup_start,
                     CodeUnit::is_macro,
                 ) {
-                    return Some(candidates_outcome(vec![unit]));
+                    vec![unit]
+                } else {
+                    let same_package = rust_same_package_macros(analyzer, rust, file, name);
+                    if same_package.is_empty() {
+                        return MacroUnitResolution::Boundary(Box::new(boundary_unchecked(
+                            format!(
+                                "Rust macro `{name}` is imported across a crate/module boundary that is not indexed"
+                            ),
+                        )));
+                    }
+                    same_package
                 }
-                // gated upstream: the macro-namespace enclosing-scope fallback
-                // above is the workspace check.
-                return Some(boundary_unchecked(format!(
-                    "Rust macro `{name}` is imported across a crate/module boundary that is not indexed"
-                )));
             }
             RustVisibleImportResolution::GlobBoundButUnindexed => {
-                return Some(boundary_unchecked(format!(
+                return MacroUnitResolution::Boundary(Box::new(boundary_unchecked(format!(
                     "Rust macro `{name}` is inherited from an unindexed import"
-                )));
+                ))));
             }
             RustVisibleImportResolution::Unbound => rust_current_module_candidates(
                 analyzer,
@@ -1765,21 +1844,614 @@ fn rust_macro_name_outcome(
                 support,
                 file,
                 tree.root_node(),
-                site.focus_start_byte,
-                site.focus_end_byte,
+                lookup_start,
+                lookup_end,
                 name,
                 RustBareReferenceRole::Macro,
             ),
         }
     };
-    Some(if candidates.is_empty() {
+    if candidates.is_empty()
+        && let Some(unit) =
+            resolve_in_enclosing_scopes(analyzer, file, name, lookup_start, CodeUnit::is_macro)
+    {
+        candidates = vec![unit];
+    }
+    if candidates.is_empty() {
+        candidates = rust_same_package_macros(analyzer, rust, file, name);
+    }
+    MacroUnitResolution::Found(candidates)
+}
+
+fn rust_same_crate_types(
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let crate_root = rust_crate_root_package(file);
+    rust.get_analyzed_files()
+        .into_iter()
+        .filter(|candidate| rust_crate_root_package(candidate) == crate_root)
+        .flat_map(|candidate| analyzer.declarations(&candidate))
+        .filter(|unit| {
+            unit.identifier() == name
+                && (unit.is_class() || rust_declaration_is_module_type_alias(rust, unit))
+        })
+        .collect()
+}
+
+fn rust_same_package_macros(
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let crate_root = rust_crate_root_package(file);
+    rust.get_analyzed_files()
+        .into_iter()
+        .filter(|candidate| rust_crate_root_package(candidate) == crate_root)
+        .flat_map(|candidate| analyzer.declarations(&candidate))
+        .filter(|unit| unit.is_macro() && unit.identifier() == name)
+        .collect()
+}
+
+pub(crate) fn ingest_file_macro_matcher_roles(
+    cache: &mut RustTokenTreeRoleCache,
+    analyzer: &dyn IAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+) {
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "macro_invocation" {
+            ingest_invocation_matcher_roles(cache, analyzer, support, file, source, tree, node);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+}
+
+fn ingest_invocation_matcher_roles(
+    cache: &mut RustTokenTreeRoleCache,
+    analyzer: &dyn IAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    invocation: Node<'_>,
+) {
+    let Some(arguments) = rust_macro_invocation_arguments(invocation) else {
+        return;
+    };
+    let MacroUnitResolution::Found(units) = rust_collect_macro_units(
+        analyzer,
+        support,
+        file,
+        source,
+        tree,
+        invocation.start_byte(),
+        invocation.end_byte(),
+        invocation,
+        arguments,
+    ) else {
+        return;
+    };
+    for unit in &units {
+        let Some((def_source, def_tree)) = rust_macro_definition_source(unit, file, source, tree)
+        else {
+            continue;
+        };
+        let Some(definition) = rust_macro_definition_node(analyzer, unit, &def_tree) else {
+            continue;
+        };
+        if !is_macro_rules_definition(definition, &def_source) {
+            continue;
+        }
+        let Ok(arm_match) = match_macro_rules(definition, &def_source, arguments, source) else {
+            continue;
+        };
+        for binding in &arm_match.bindings {
+            let namespace = token_namespace_evidence(
+                &arm_match,
+                definition,
+                &def_source,
+                binding.start_byte,
+                binding.end_byte,
+            )
+            .unwrap_or(MacroNamespaceEvidence::NoNamespace);
+            match namespace {
+                MacroNamespaceEvidence::Interior(fragment) => {
+                    ingest_interior_fragment_roles(
+                        cache,
+                        fragment,
+                        source,
+                        arguments,
+                        binding.start_byte,
+                        binding.end_byte,
+                    );
+                }
+                other => {
+                    if let Some(role) = matcher_namespace_to_role(other) {
+                        cache.ingest_matcher_role(binding.start_byte, binding.end_byte, role);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn ingest_interior_fragment_roles(
+    cache: &mut RustTokenTreeRoleCache,
+    fragment: MacroFragmentKind,
+    source: &str,
+    arguments: Node<'_>,
+    start: usize,
+    end: usize,
+) {
+    let Some(fragment_source) = source.get(start..end) else {
+        return;
+    };
+    let mut stack = vec![arguments];
+    while let Some(node) = stack.pop() {
+        if node.end_byte() <= start || node.start_byte() >= end {
+            continue;
+        }
+        if matches!(node.kind(), "identifier" | "type_identifier")
+            && node.start_byte() >= start
+            && node.end_byte() <= end
+        {
+            let rel_start = node.start_byte() - start;
+            let rel_end = node.end_byte() - start;
+            if let Some(namespace) = macro_matcher::classify_fragment_interior(
+                fragment,
+                fragment_source,
+                rel_start,
+                rel_end,
+            ) && let Some(role) = matcher_namespace_to_role(namespace)
+            {
+                cache.ingest_matcher_role(node.start_byte(), node.end_byte(), role);
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+}
+
+fn matcher_namespace_to_role(namespace: MacroNamespaceEvidence) -> Option<RustBareTokenTreeRole> {
+    Some(match namespace {
+        MacroNamespaceEvidence::Type => RustBareTokenTreeRole::TypeReference,
+        MacroNamespaceEvidence::Value => RustBareTokenTreeRole::Reference,
+        MacroNamespaceEvidence::Pattern => RustBareTokenTreeRole::Pattern,
+        MacroNamespaceEvidence::Declaration => RustBareTokenTreeRole::Declaration,
+        MacroNamespaceEvidence::NoNamespace => RustBareTokenTreeRole::NoNamespace,
+        MacroNamespaceEvidence::Interior(_) => return None,
+    })
+}
+
+pub(super) fn focused_site_is_macro_argument(root: Node<'_>, site: &ResolvedReferenceSite) -> bool {
+    smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
+        .is_some_and(|node| enclosing_macro_invocation_for_argument(node).is_some())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rust_macro_argument_outcome(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    focused: Node<'_>,
+) -> Option<DefinitionLookupOutcome> {
+    let invocation = enclosing_macro_invocation_for_argument(focused)?;
+    let Some(arguments) = rust_macro_invocation_arguments(invocation) else {
+        return Some(no_definition(
+            MACRO_MATCHER_FAILED_DIAGNOSTIC_KIND,
+            "Rust macro invocation has no argument token tree",
+        ));
+    };
+    let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
+        return Some(no_definition(
+            "rust_analyzer_unavailable",
+            "Rust analyzer is unavailable",
+        ));
+    };
+    let name_node = invocation
+        .child_by_field_name("macro")
+        .map(|macro_name| macro_name.child_by_field_name("name").unwrap_or(macro_name));
+    let macro_name = name_node
+        .map(|node| rust_node_text(node, source).trim().to_string())
+        .unwrap_or_default();
+    let units = match rust_collect_macro_units(
+        analyzer,
+        support,
+        file,
+        source,
+        tree,
+        invocation.start_byte(),
+        invocation.end_byte(),
+        invocation,
+        focused,
+    ) {
+        MacroUnitResolution::Found(units) => units,
+        MacroUnitResolution::Boundary(outcome) => {
+            return Some(argument_boundary_outcome(&macro_name, *outcome));
+        }
+        MacroUnitResolution::NotAMacroName => return None,
+    };
+    if units.is_empty() {
+        return Some(boundary_unchecked(format!(
+            "Rust macro `{macro_name}` is defined outside the indexed workspace and matcher evidence is unavailable"
+        )));
+    }
+    let mut evidences = Vec::new();
+    let mut saw_macro_rules = false;
+    for unit in &units {
+        let Some((def_source, def_tree)) = rust_macro_definition_source(unit, file, source, tree)
+        else {
+            continue;
+        };
+        let Some(definition) = rust_macro_definition_node(analyzer, unit, &def_tree) else {
+            continue;
+        };
+        if !is_macro_rules_definition(definition, &def_source) {
+            continue;
+        }
+        saw_macro_rules = true;
+        match match_macro_rules(definition, &def_source, arguments, source) {
+            Ok(arm_match) => {
+                let Some(binding) =
+                    arm_match.binding_containing(site.focus_start_byte, site.focus_end_byte)
+                else {
+                    continue;
+                };
+                let Some(namespace) = token_namespace_evidence(
+                    &arm_match,
+                    definition,
+                    &def_source,
+                    site.focus_start_byte,
+                    site.focus_end_byte,
+                ) else {
+                    continue;
+                };
+                let namespace = match namespace {
+                    MacroNamespaceEvidence::Interior(fragment) => {
+                        let rel_start = site.focus_start_byte.saturating_sub(binding.start_byte);
+                        let rel_end = site.focus_end_byte.saturating_sub(binding.start_byte);
+                        let Some(fragment_source) =
+                            source.get(binding.start_byte..binding.end_byte)
+                        else {
+                            continue;
+                        };
+                        macro_matcher::classify_fragment_interior(
+                            fragment,
+                            fragment_source,
+                            rel_start,
+                            rel_end,
+                        )
+                        .unwrap_or(MacroNamespaceEvidence::NoNamespace)
+                    }
+                    other => other,
+                };
+                evidences.push(MatcherTokenEvidence {
+                    fqn: unit.fq_name(),
+                    arm: arm_match.arm_index,
+                    metavar: binding.name.clone(),
+                    fragment: binding.fragment,
+                    namespace,
+                });
+            }
+            Err(MacroMatchError::NoArmMatched) => {}
+            Err(MacroMatchError::NotMacroRules | MacroMatchError::EmptyRules) => {}
+        }
+    }
+    if !saw_macro_rules {
+        return Some(boundary_unchecked(format!(
+            "Rust macro `{macro_name}` is defined outside the indexed workspace and matcher evidence is unavailable"
+        )));
+    }
+    if evidences.is_empty() {
+        return Some(no_definition(
+            MACRO_MATCHER_FAILED_DIAGNOSTIC_KIND,
+            format!("Rust macro `{macro_name}` has no matcher arm that accepts this invocation"),
+        ));
+    }
+    let first = &evidences[0];
+    if evidences.iter().any(|evidence| {
+        evidence.fragment != first.fragment || evidence.namespace != first.namespace
+    }) {
+        return Some(no_definition(
+            MACRO_MATCHER_DISAGREEMENT_DIAGNOSTIC_KIND,
+            format!(
+                "Rust macro `{macro_name}` matcher arms bind this token with disagreeing fragment kinds or roles"
+            ),
+        ));
+    }
+    Some(rust_matcher_namespace_outcome(
+        analyzer, rust, support, file, source, tree, site, focused, first,
+    ))
+}
+
+fn argument_boundary_outcome(
+    macro_name: &str,
+    mut outcome: DefinitionLookupOutcome,
+) -> DefinitionLookupOutcome {
+    if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary {
+        outcome.diagnostics.insert(
+            0,
+            DefinitionLookupDiagnostic {
+                kind: "unresolvable_import_boundary".to_string(),
+                message: format!(
+                    "Rust macro `{macro_name}` is defined outside the indexed workspace and matcher evidence is unavailable"
+                ),
+            },
+        );
+    }
+    outcome
+}
+
+struct MatcherTokenEvidence {
+    fqn: String,
+    arm: usize,
+    metavar: String,
+    fragment: MacroFragmentKind,
+    namespace: MacroNamespaceEvidence,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rust_matcher_namespace_outcome(
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    focused: Node<'_>,
+    evidence: &MatcherTokenEvidence,
+) -> DefinitionLookupOutcome {
+    let mut outcome = match evidence.namespace {
+        MacroNamespaceEvidence::Declaration => no_definition(
+            DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND,
+            format!(
+                "`{}` is a macro-generated declaration name and is not an indexed reference",
+                rust_node_text(focused, source).trim()
+            ),
+        ),
+        MacroNamespaceEvidence::NoNamespace => no_definition(
+            MACRO_FRAGMENT_NO_NAMESPACE_DIAGNOSTIC_KIND,
+            format!(
+                "`${}` is a `{}` fragment and carries no namespace evidence",
+                evidence.metavar,
+                evidence.fragment.as_str()
+            ),
+        ),
+        MacroNamespaceEvidence::Type => rust_resolve_matcher_bare_name(
+            analyzer,
+            rust,
+            support,
+            file,
+            source,
+            tree,
+            site,
+            RustBareReferenceRole::Type,
+        ),
+        MacroNamespaceEvidence::Value | MacroNamespaceEvidence::Pattern => {
+            if let Some(lexical) = rust_matcher_lexical_value(tree, source, site) {
+                lexical
+            } else {
+                rust_resolve_matcher_bare_name(
+                    analyzer,
+                    rust,
+                    support,
+                    file,
+                    source,
+                    tree,
+                    site,
+                    RustBareReferenceRole::Value,
+                )
+            }
+        }
+        MacroNamespaceEvidence::Interior(_) => no_definition(
+            MACRO_FRAGMENT_NO_NAMESPACE_DIAGNOSTIC_KIND,
+            format!(
+                "`{}` is inside a `{}` fragment whose interior role could not be proven",
+                rust_node_text(focused, source).trim(),
+                evidence.fragment.as_str()
+            ),
+        ),
+    };
+    outcome.diagnostics.push(DefinitionLookupDiagnostic {
+        kind: MACRO_MATCHER_BINDING_DIAGNOSTIC_KIND.to_string(),
+        message: format!(
+            "macro_fqn={} arm={} metavar=${} fragment={}",
+            evidence.fqn,
+            evidence.arm,
+            evidence.metavar,
+            evidence.fragment.as_str()
+        ),
+    });
+    outcome
+}
+
+fn rust_matcher_lexical_value(
+    tree: &Tree,
+    source: &str,
+    site: &ResolvedReferenceSite,
+) -> Option<DefinitionLookupOutcome> {
+    let identifier = source.get(site.focus_start_byte..site.focus_end_byte)?;
+    match crate::analyzer::lexical_definitions::resolve_lexical_binding(
+        Language::Rust,
+        tree.root_node(),
+        source,
+        site.focus_start_byte,
+        site.focus_end_byte,
+        identifier,
+    ) {
+        Some(
+            crate::analyzer::lexical_definitions::LexicalBindingResolution::Parameter(definition)
+            | crate::analyzer::lexical_definitions::LexicalBindingResolution::OtherLocal(definition),
+        ) => Some(lexical_definition_outcome(definition)),
+        None => {
+            if lexical_scope::name_shadowed_in_tree(
+                tree.root_node(),
+                source,
+                identifier,
+                site.focus_start_byte,
+            ) {
+                Some(no_definition(
+                    LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+                    format!("`{identifier}` is a local Rust binding, which is not indexed"),
+                ))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rust_resolve_matcher_bare_name(
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    role: RustBareReferenceRole,
+) -> DefinitionLookupOutcome {
+    let reference = rust_node_text(
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)
+            .unwrap_or_else(|| tree.root_node()),
+        source,
+    )
+    .trim();
+    match rust_visible_import_resolution(
+        rust,
+        support,
+        file,
+        source,
+        site.focus_start_byte,
+        reference,
+        role,
+    ) {
+        RustVisibleImportResolution::Resolved(candidates)
+        | RustVisibleImportResolution::GlobResolved(candidates) => {
+            if !candidates.is_empty() {
+                return candidates_outcome(candidates);
+            }
+        }
+        RustVisibleImportResolution::BoundButUnindexed => {
+            let local = rust_current_module_candidates(
+                analyzer,
+                rust,
+                support,
+                file,
+                tree.root_node(),
+                site.focus_start_byte,
+                site.focus_end_byte,
+                reference,
+                role,
+            );
+            if !local.is_empty() {
+                return candidates_outcome(local);
+            }
+            if role == RustBareReferenceRole::Type {
+                if let RustVisibleImportResolution::Resolved(candidates)
+                | RustVisibleImportResolution::GlobResolved(candidates) =
+                    rust_visible_import_resolution(
+                        rust,
+                        support,
+                        file,
+                        source,
+                        site.focus_start_byte,
+                        reference,
+                        RustBareReferenceRole::Value,
+                    )
+                {
+                    let types: Vec<_> = candidates
+                        .into_iter()
+                        .filter(|candidate| {
+                            candidate.is_class()
+                                || rust_declaration_is_module_type_alias(rust, candidate)
+                        })
+                        .collect();
+                    if !types.is_empty() {
+                        return candidates_outcome(types);
+                    }
+                }
+                let crate_types = rust_same_crate_types(analyzer, rust, file, reference);
+                if !crate_types.is_empty() {
+                    return candidates_outcome(crate_types);
+                }
+            }
+            // gated upstream: matcher-proven namespace already consulted the
+            // current module and the value-namespace class view of the import.
+            return boundary_unchecked(format!(
+                "`{reference}` is explicitly imported across a Rust crate/module boundary that is not indexed"
+            ));
+        }
+        RustVisibleImportResolution::GlobBoundButUnindexed => {
+            return boundary_unchecked(format!(
+                "`{reference}` is inherited from an unindexed Rust import"
+            ));
+        }
+        RustVisibleImportResolution::Unbound => {}
+    }
+    let local = rust_current_module_candidates(
+        analyzer,
+        rust,
+        support,
+        file,
+        tree.root_node(),
+        site.focus_start_byte,
+        site.focus_end_byte,
+        reference,
+        role,
+    );
+    if local.is_empty() {
         no_definition(
-            "unindexed_macro",
-            format!("Rust macro `{name}` did not resolve to an indexed macro definition"),
+            "no_indexed_definition",
+            format!(
+                "the matcher-proven `{reference}` reference resolved to no workspace definition"
+            ),
         )
     } else {
-        candidates_outcome(candidates)
-    })
+        candidates_outcome(local)
+    }
+}
+
+fn rust_macro_definition_source(
+    unit: &CodeUnit,
+    current_file: &ProjectFile,
+    current_source: &str,
+    current_tree: &Tree,
+) -> Option<(String, Tree)> {
+    if unit.source() == current_file {
+        return Some((current_source.to_string(), current_tree.clone()));
+    }
+    let source = unit.source().read_to_string().ok()?;
+    let tree = lexical_scope::parse_rust_tree(&source)?;
+    Some((source, tree))
+}
+
+fn rust_macro_definition_node<'tree>(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    tree: &'tree Tree,
+) -> Option<Node<'tree>> {
+    let node = rust_declaration_node(analyzer, unit, tree.root_node())?;
+    let mut current = node;
+    loop {
+        if current.kind() == "macro_definition" {
+            return Some(current);
+        }
+        current = current.parent()?;
+    }
 }
 
 fn rust_identifier_is_explicit_receiver(node: Node<'_>) -> bool {

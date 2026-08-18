@@ -10,7 +10,9 @@ use crate::analyzer::semantic::{
     EvidenceCompleteness, IcfgEdgeKind, IcfgProvider, ProcedureHandle, ProofStatus, SemanticBudget,
     ValueFlowRelationKind,
 };
-use crate::analyzer::value_flow::{ValueFlowCarrierId, ValueFlowObservationPhase, ValueFlowSinkId};
+use crate::analyzer::value_flow::{
+    AuthoredArmClosure, ValueFlowCarrierId, ValueFlowObservationPhase, ValueFlowSinkId,
+};
 
 use super::model::TaintClassId;
 use super::{SourceClassId, TaintAnalysisPlan, TaintClassSet, TaintUniverse};
@@ -1232,28 +1234,46 @@ pub struct TaintSummaryResult {
     owner: Arc<()>,
     discovery_complete: bool,
     proven_by_authored_summaries: bool,
+    authored_arm_closures: Box<[AuthoredArmClosure]>,
 }
 
 impl TaintSummaryResult {
     fn from_result(plan: &TaintAnalysisPlan, result: RawTaintSummaryResult) -> Self {
         let value_flow = plan.value_flow();
         let facts = result.fact_result();
-        let plan_complete = plan.discovery_complete();
+        // The taint layer adds exactly one discovery input of its own: whether
+        // every sanitizer resolved. Value-flow discovery is asked once, by
+        // `execution_result_complete` over the solved result, in the #1952
+        // sense that a snapshot left open only by call-target refinement is
+        // closed when this result fully models its residual calls. Conjoining
+        // the plan-time value-flow flag here asked it a second time and more
+        // strictly, which withheld both tiers from every run a boundary model
+        // exists to close (#2342).
+        let sanitizers_resolved = plan.sanitizers_resolved();
         let derived_complete = value_flow.execution_result_complete(facts);
-        let discovery_complete = derived_complete && plan_complete;
+        let discovery_complete = derived_complete && sanitizers_resolved;
         // The run is proven only by authored models when every open boundary is
         // closed by an authored-complete external summary (#1916): the plan is
         // structurally complete, derived proof alone does not close the run, and
         // accepting authored-complete summaries does. Deriving the run in full
         // stays the strictly stronger `Complete`, never this tier.
-        let proven_by_authored_summaries = plan_complete
+        let proven_by_authored_summaries = sanitizers_resolved
             && !derived_complete
             && value_flow.execution_result_complete_accepting_authored_summaries(facts);
+        // Record what proved a residual-arm closure only when such a closure
+        // decided the run (#2342). A derived-complete run closed nothing this
+        // way, and a run that stayed inconclusive concluded nothing to explain.
+        let authored_arm_closures = if proven_by_authored_summaries {
+            value_flow.authored_arm_closures(facts).into_boxed_slice()
+        } else {
+            Box::default()
+        };
         Self {
             result,
             owner: Arc::clone(plan.owner()),
             discovery_complete,
             proven_by_authored_summaries,
+            authored_arm_closures,
         }
     }
 
@@ -1292,6 +1312,13 @@ impl TaintSummaryResult {
     /// proof (#1916). Mutually exclusive with `is_complete`.
     pub fn is_proven_by_authored_summaries(&self) -> bool {
         self.proven_by_authored_summaries
+    }
+
+    /// The authored external summaries that closed a residual dispatch arm in
+    /// this run (#2342), so a rendered finding can state what proved the
+    /// closure. Empty unless `is_proven_by_authored_summaries` holds.
+    pub fn authored_arm_closures(&self) -> &[AuthoredArmClosure] {
+        &self.authored_arm_closures
     }
 
     pub(crate) fn owner(&self) -> &Arc<()> {

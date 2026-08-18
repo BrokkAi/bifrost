@@ -271,8 +271,14 @@ class Child extends Base {
         }
     }
 
+    /// The #2030 milestone-2 receiver policy: `?T` resolves as `T` because
+    /// `null` has no members, so a member access that could succeed at run
+    /// time can only bind through `T`. A finite union of two or more nominal
+    /// arms and an intersection still make no single-owner claim on this
+    /// surface (`tests/suite_usages/issue_2030_php_union_nullable_receivers.rs`
+    /// covers the forward-lookup ambiguity those unions publish instead).
     #[test]
-    fn bounded_php_nullable_and_union_types_never_publish_one_arm_as_precise() {
+    fn bounded_php_nullable_types_resolve_and_unions_never_publish_one_arm() {
         let source = r#"<?php
 namespace App;
 
@@ -299,15 +305,22 @@ function callIntersection(Left&Right $intersection): void {
 }
 "#;
 
-        for receiver in [
-            "$union",
-            "$nullable",
-            "$intersection",
-            "maybeUnion()",
-            "maybeNullable()",
-            "$holder->choice",
-            "$holder->maybe",
-        ] {
+        for receiver in ["$nullable", "maybeNullable()", "$holder->maybe"] {
+            assert_resolved_fqn(
+                resolve_receiver(
+                    source,
+                    receiver,
+                    ReceiverAnalysisBudget {
+                        max_scope_nodes: 100_000,
+                        ..ReceiverAnalysisBudget::default()
+                    },
+                    None,
+                ),
+                "App.Service",
+            );
+        }
+
+        for receiver in ["$union", "$intersection", "maybeUnion()", "$holder->choice"] {
             assert_no_precise_type(resolve_receiver(
                 source,
                 receiver,

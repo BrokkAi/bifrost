@@ -3925,6 +3925,25 @@ impl AnalyzerStore {
         }
     }
 
+    /// Test hook: make the Rust fact witness table unreadable, so
+    /// [`Self::blobs_with_rust_facts`] fails the way a damaged or concurrently
+    /// migrated cache would.
+    ///
+    /// The catch-up probe has no production trigger for a read failure, and
+    /// the defect it guards -- a failed probe reported as "no file needs
+    /// catching up" -- is only observable when the read actually fails
+    /// (#2325). Same intent as `delete_rust_facts_for_test` above: put the
+    /// store into a state only recovery code should see.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn drop_rust_modules_table_for_test(&self) {
+        self.conn
+            .lock()
+            .expect("analyzer store mutex poisoned")
+            .execute("DROP TABLE rust_modules", [])
+            .expect("drop rust_modules");
+    }
+
     /// Which of `oids` already carry Rust fact rows.
     ///
     /// `rust_modules` is the witness table: every analyzed Rust blob records
@@ -5416,6 +5435,10 @@ pub(crate) struct PreparedParsedBlob {
     payload_bytes: usize,
     mutation_logical_rows: usize,
     mutation_payload_bytes: usize,
+    /// Prepared row-sets for the same blob under other storage language keys
+    /// (see [`FileState::additional_projections`]). Always empty on a nested
+    /// entry, so `write_prepared_blob_unchecked_tx` recurses exactly once.
+    additional: Vec<PreparedParsedBlob>,
 }
 
 impl PreparedParsedBlob {
@@ -5868,6 +5891,22 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
     state: Arc<FileState>,
 ) -> Result<PreparedParsedBlob> {
     require_complete_file_state(state.as_ref())?;
+    // The same blob's other readings (see `FileState::additional_projections`).
+    // Their store generation is not known here -- the batch carries one
+    // generation per prepared blob -- so it is read inside the write
+    // transaction; nothing consults the placeholder recorded on these nested
+    // entries. A projection state carries no projections of its own, so this
+    // recursion terminates after one level.
+    let mut additional = Vec::with_capacity(state.additional_projections.len());
+    for (projection_lang, projection_state) in &state.additional_projections {
+        additional.push(prepare_parsed_blob(
+            oid,
+            projection_lang,
+            GenerationId::BOOTSTRAP,
+            adapter,
+            Arc::clone(projection_state),
+        )?);
+    }
     let stored_units = collect_stored_units(adapter, state.as_ref());
     let unit_keys: HashMap<CodeUnit, i64> = stored_units
         .iter()
@@ -6112,8 +6151,15 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         content_package,
         logical_rows,
         payload_bytes,
-        mutation_logical_rows: logical_rows,
-        mutation_payload_bytes: payload_bytes,
+        mutation_logical_rows: saturating_sum(
+            std::iter::once(logical_rows)
+                .chain(additional.iter().map(|blob| blob.mutation_logical_rows)),
+        ),
+        mutation_payload_bytes: saturating_sum(
+            std::iter::once(payload_bytes)
+                .chain(additional.iter().map(|blob| blob.mutation_payload_bytes)),
+        ),
+        additional,
     })
 }
 
@@ -6121,6 +6167,24 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
 // before invoking this helper. Keeping that validation at the batch boundary avoids
 // repeating the same point lookup for every blob in a language.
 fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedBlob) -> Result<()> {
+    write_prepared_blob_rows_tx(tx, blob, blob.generation)?;
+    // See `write_parsed_blob_tx`: a second reading of the same blob under its
+    // own storage language key. Its generation is not known at preparation
+    // time (the batch carries one generation per prepared blob), so it is read
+    // inside this transaction, which is also the only point where it can be
+    // read consistently with the rows being written.
+    for projection in &blob.additional {
+        let generation = current_generation_conn(tx, projection.lang())?;
+        write_prepared_blob_rows_tx(tx, projection, generation)?;
+    }
+    Ok(())
+}
+
+fn write_prepared_blob_rows_tx(
+    tx: &Transaction<'_>,
+    blob: &PreparedParsedBlob,
+    generation: GenerationId,
+) -> Result<()> {
     let oid = blob.oid_text.as_str();
     let lang = blob.lang.as_str();
     tx.execute(
@@ -6129,7 +6193,7 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
     )?;
     tx.execute(
         "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, ?3)",
-        params![oid, lang, blob.generation.0],
+        params![oid, lang, generation.0],
     )?;
     {
         let mut stmt = tx.prepare(
@@ -6301,6 +6365,34 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
 }
 
 fn write_parsed_blob_tx<A: LanguageAdapter>(
+    tx: &Transaction<'_>,
+    oid: Oid,
+    lang: &str,
+    generation: GenerationId,
+    adapter: &A,
+    state: &FileState,
+) -> Result<()> {
+    write_parsed_blob_rows_tx(tx, oid, lang, generation, adapter, state)?;
+    // A second reading of the same blob (issue #1970: the C projection of a
+    // C++ header) lands under its own storage language key in the same
+    // transaction, at that key's own current generation. `additional_
+    // projections` is always empty on a projection state, so this is one level
+    // deep by construction.
+    for (projection_lang, projection_state) in &state.additional_projections {
+        let projection_generation = current_generation_conn(tx, projection_lang)?;
+        write_parsed_blob_rows_tx(
+            tx,
+            oid,
+            projection_lang,
+            projection_generation,
+            adapter,
+            projection_state,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_parsed_blob_rows_tx<A: LanguageAdapter>(
     tx: &Transaction<'_>,
     oid: Oid,
     lang: &str,
@@ -7004,6 +7096,7 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
         materialization_records,
         parse_errors: None,
         parse_complete: true,
+        additional_projections: Vec::new(),
     };
 
     adapter.synthesize_hydrated_units(file, source, &mut state);
@@ -7342,6 +7435,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             materialization_records,
             parse_errors: None,
             parse_complete: true,
+            additional_projections: Vec::new(),
         };
 
         if let Some(source) = source {
@@ -13843,6 +13937,146 @@ mod tests {
         );
     }
 
+    /// A cache written before headers gained a stored C reading (#1970) holds
+    /// `cpp` rows for a header with no `cpp:c` companion, which the loader
+    /// would read as "the two readings agree". The salt bump is what stops
+    /// that from being believed.
+    #[test]
+    fn cpp_c_header_projection_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "tags.h",
+            "struct outer {\n\
+             struct inner { int value; } item;\n\
+             };\n",
+        );
+        let state = Arc::new(parse_state(&CppAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_epoch = epoch::cpp_epoch_before_c_header_projection();
+        let prior_generation = store
+            .ensure_language_epoch_value("cpp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+    }
+
+    #[test]
+    fn cpp_c_tag_scope_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "tags.c",
+            "struct outer {\n\
+             struct inner { int value; } item;\n\
+             };\n",
+        );
+        let state = Arc::new(parse_state(&CppAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_epoch = epoch::cpp_epoch_before_c_tag_scope();
+        let prior_generation = store
+            .ensure_language_epoch_value("cpp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .unwrap(),
+            vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    /// A `.c` blob and a byte-identical `.cpp` blob are two different
+    /// extractions of one content hash, so they must live under different cache
+    /// `lang` keys or the second one analyzed would read the first one's rows.
+    #[test]
+    fn c_and_cpp_projections_of_one_blob_use_distinct_storage_language_keys() {
+        use crate::analyzer::LanguageAdapter;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = "struct outer {\n\
+             struct inner { int value; } item;\n\
+             };\n";
+        let c_file = write_file(temp.path(), "tags.c", source);
+        let cpp_file = write_file(temp.path(), "tags.cpp", source);
+        let header_file = write_file(temp.path(), "tags.h", source);
+
+        assert_eq!(CppAdapter.storage_language_key_for_file(&c_file), "cpp:c");
+        assert_eq!(CppAdapter.storage_language_key_for_file(&cpp_file), "cpp");
+        assert_eq!(
+            CppAdapter.storage_language_key_for_file(&header_file),
+            "cpp"
+        );
+        assert_eq!(
+            CppAdapter
+                .storage_language_keys()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            vec!["cpp".to_string(), "cpp:c".to_string()]
+        );
+
+        let state = Arc::new(parse_state(&CppAdapter, &c_file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let epochs = CppAdapter
+            .storage_language_keys()
+            .into_iter()
+            .map(|(key, ts_language)| {
+                (
+                    key,
+                    epoch::epoch_for(Language::Cpp, &ts_language).to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let generations = store.ensure_language_epoch_values(&epochs).unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp:c",
+                generations["cpp:c"],
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+
+        assert!(store.contains_parsed_blob(oid, "cpp:c").unwrap());
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+    }
+
     #[test]
     fn cpp_abstract_reference_declarator_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -16430,6 +16664,7 @@ mod tests {
             materialization_records: parsed.materialization_records,
             parse_errors: Some(Vec::new()),
             parse_complete: true,
+            additional_projections: Vec::new(),
         }
     }
 

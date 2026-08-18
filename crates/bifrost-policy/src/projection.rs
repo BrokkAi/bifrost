@@ -1617,10 +1617,11 @@ fn record_rejection(
         *completion = PolicyRunCompletion::Failed {
             reasons: vec![PolicyFailureReason::InternalInvariant],
         };
-        let diagnostic = PolicyDiagnostic::try_new(
+        let diagnostic = PolicyDiagnostic::try_new_in_family(
             PolicyDiagnosticCode::EvaluationFailure,
             PolicyDiagnosticSeverity::Error,
             PolicyDiagnosticImpact::RunFailed,
+            format!("analysis projection rejected: {}", error.family()),
             format!("analysis projection rejected: {error}"),
             None,
             Vec::new(),
@@ -1664,12 +1665,12 @@ fn record_rejection(
         ) => PolicyDiagnosticCode::ProjectionScenarioMembershipBudget,
         _ => PolicyDiagnosticCode::EvaluationFailure,
     };
-    let message = format!("analysis projection rejected: {error}");
-    let diagnostic = PolicyDiagnostic::try_new(
+    let diagnostic = PolicyDiagnostic::try_new_in_family(
         code,
         PolicyDiagnosticSeverity::Warning,
         PolicyDiagnosticImpact::RunIncomplete,
-        message,
+        format!("analysis projection rejected: {}", error.family()),
+        format!("analysis projection rejected: {error}"),
         None,
         Vec::new(),
     );
@@ -1749,6 +1750,58 @@ pub(crate) enum ProjectionAuthorityError {
     TypestateEventJoinMismatch,
     TypestateTransitionJoinMismatch,
     TypestateExpectationJoinMismatch,
+}
+
+impl ProjectionAuthorityError {
+    /// The rejection's reason family: the part that repeats across findings,
+    /// without the exact limit value or the analysis error text that makes one
+    /// rejection unique. A capped diagnostic list is folded on this, so it must
+    /// stay stable across sites (#2356).
+    fn family(&self) -> String {
+        match self {
+            Self::MissingResolvedSpecification { .. } => {
+                "loaded policy is missing its resolved specification".to_owned()
+            }
+            Self::AuthorityMismatch => "projection batch sealed for another authority".to_owned(),
+            Self::InvalidProjectionFacts(_) => "invalid projection facts".to_owned(),
+            Self::FindingEnvelopeMismatch { field } => {
+                format!("projected finding envelope has an invalid {field} join")
+            }
+            Self::UnknownTaintSource => "projection names an unknown taint source".to_owned(),
+            Self::UnknownTaintSink => "projection names an unknown taint sink".to_owned(),
+            Self::UnknownTypestateSubject => {
+                "projection names an unknown typestate subject".to_owned()
+            }
+            Self::EndpointHashMismatch { role } => format!("{role} projection hash mismatch"),
+            Self::EndpointModelMismatch { role } => format!("{role} projection model mismatch"),
+            Self::SinkRejectedReachedLabel => {
+                "taint sink does not accept every reported reached label".to_owned()
+            }
+            Self::SourceScenarioIdentityCollision => {
+                "source scenario identity collision".to_owned()
+            }
+            Self::DuplicateProjectionIdentity => "duplicate projection identity".to_owned(),
+            Self::ProjectionCountBudget { .. } => {
+                "projection count exceeds the host limit".to_owned()
+            }
+            Self::ReportBudgetExceeded { field, .. } => {
+                format!("projected {field} exceeds the effective report limit")
+            }
+            Self::CompiledProjectionHashMismatch => {
+                "typestate projection is not bound to its compilation hashes".to_owned()
+            }
+            Self::UnknownTypestateEvent => "typestate event is unknown".to_owned(),
+            Self::UnknownTypestateExpectation => "typestate expectation is unknown".to_owned(),
+            Self::TypestateSubjectJoinMismatch => "typestate subject join mismatch".to_owned(),
+            Self::TypestateEventJoinMismatch => "typestate event join mismatch".to_owned(),
+            Self::TypestateTransitionJoinMismatch => {
+                "typestate transition join mismatch".to_owned()
+            }
+            Self::TypestateExpectationJoinMismatch => {
+                "typestate expectation join mismatch".to_owned()
+            }
+        }
+    }
 }
 
 impl fmt::Display for ProjectionAuthorityError {

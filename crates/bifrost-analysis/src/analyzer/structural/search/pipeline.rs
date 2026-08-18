@@ -1881,6 +1881,14 @@ pub(super) fn apply_pipeline_step(
                     OccurrenceTarget::None
                     | OccurrenceTarget::Lexical(_)
                     | OccurrenceTarget::Unresolved(_) => Vec::new(),
+                    // Unreachable in practice: a plan carrying this step
+                    // derives targets. Stated rather than folded into the
+                    // empty arm so a future plan that forgets to ask cannot
+                    // silently read "not attempted" as "resolves to nothing".
+                    OccurrenceTarget::NotDerived => {
+                        debug_assert!(false, "an occurrence-target step requires derived targets");
+                        Vec::new()
+                    }
                 }
             }
             (PipelineValue::Occurrence(value), QueryStep::FileOf) => {

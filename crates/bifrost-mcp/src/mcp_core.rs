@@ -230,6 +230,23 @@ fn location_references_schema(path_description: &str, max_items: Option<usize>) 
     })
 }
 
+/// The `max_duration_secs` property both scan tools publish.
+///
+/// The ceiling is read from the analyzer constant so the advertised number cannot drift from the
+/// one the scan applies, and it is stated here so a caller knows the maximum before it calls
+/// rather than after a clamped run (#1886). The schema deliberately carries no `maximum`: a larger
+/// value is accepted and reported back in `scope.max_duration_clamped`, not refused.
+fn scan_usages_max_duration_property() -> Value {
+    let ceiling_secs = crate::searchtools::SCAN_USAGES_MAX_DURATION_CEILING.as_secs();
+    json!({
+        "type": "integer",
+        "minimum": 0,
+        "description": format!(
+            "Override the default wall-clock budget for this call. Leave unset for interactive use; a batch/background caller scanning a large workspace can request more time. Values above the server ceiling of {ceiling_secs} seconds run at that ceiling instead, and the response reports the requested and applied budgets in `scope.max_duration_clamped`."
+        )
+    })
+}
+
 fn scan_usages_by_reference_descriptor() -> Value {
     tool_descriptor(
         "scan_usages_by_reference",
@@ -258,11 +275,7 @@ fn scan_usages_by_reference_descriptor() -> Value {
                     "items": { "type": "string" },
                     "description": "Optional project-relative paths or globs used to narrow where usages are searched."
                 },
-                "max_duration_secs": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Override the default wall-clock budget for this call. Leave unset for interactive use; a batch/background caller scanning a large workspace can request more time (capped server-side)."
-                }
+                "max_duration_secs": scan_usages_max_duration_property()
             },
             "required": ["symbols"]
         }),
@@ -321,11 +334,7 @@ fn scan_usages_by_location_descriptor() -> Value {
                     "items": { "type": "string" },
                     "description": "Optional project-relative paths or globs used to narrow where usages are searched."
                 },
-                "max_duration_secs": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Override the default wall-clock budget for this call. Leave unset for interactive use; a batch/background caller scanning a large workspace can request more time (capped server-side)."
-                }
+                "max_duration_secs": scan_usages_max_duration_property()
             },
             "required": ["targets"]
         }),

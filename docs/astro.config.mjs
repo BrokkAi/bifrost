@@ -102,6 +102,7 @@ export default defineConfig({
             { label: 'Zed Agent', slug: 'zed-mcp' },
             { label: 'Amp', slug: 'amp' },
             { label: 'Antigravity', slug: 'antigravity' },
+            { label: 'DeepSeek Harness', slug: 'deepseek-harness' },
           ],
         },
         {

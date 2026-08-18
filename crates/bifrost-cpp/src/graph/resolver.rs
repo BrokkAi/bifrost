@@ -4,9 +4,11 @@ use crate::call_match::{
 #[cfg(test)]
 use crate::declarations::cpp_displaced_preprocessor_terminator;
 use crate::declarations::{
+    CppComparableNode, CppComparableParameter, CppComparableSlot, cpp_callable_identity_suffix,
+    cpp_comparable_parameter_shapes, cpp_declarator_adds_indirection,
     cpp_displaced_preprocessor_boundary, cpp_export_macro_token, cpp_field_declaration_linkage,
-    cpp_template_term, node_text, normalize_cpp_whitespace, recovered_exported_class_has_body,
-    recovered_fragmented_plain_class_has_body,
+    cpp_function_declarator_at, cpp_template_term, node_text, normalize_cpp_whitespace,
+    recovered_exported_class_has_body, recovered_fragmented_plain_class_has_body,
 };
 use crate::graph::CppGraphSource;
 use crate::graph::extractor::ScanCtx;
@@ -17,7 +19,7 @@ use crate::imports::{
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, CodeUnitType, CppFieldLinkage, CppTemplateExpression, CppTemplateMetadata,
-    CppTemplateParameterMetadata, CppTemplateTerm,
+    CppTemplateParameterMetadata, CppTemplateTerm, Language, LanguageDialect, StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
@@ -603,6 +605,11 @@ type MacroLocalBindingTemplateCache =
 pub struct MacroEnvironment {
     bindings: HashMap<String, MacroBinding>,
     known_undefined_names: HashSet<String>,
+    /// Names the translation unit's compile command proves defined (#2011):
+    /// the `-D`s that survive command ordering, intersected across every
+    /// configuration naming the TU. Seeded once at TU start. An explicit
+    /// `#undef` seen later lands in `known_undefined_names` and wins.
+    build_proven_defines: HashSet<String>,
     unknown_names: bool,
     applied_pragma_once_files: HashSet<ProjectFile>,
     maybe_applied_pragma_once_files: HashSet<ProjectFile>,
@@ -642,6 +649,11 @@ impl MacroEnvironment {
             *binding = MacroBinding::uncertain_from(binding, source, byte);
         }
         self.known_undefined_names.clear();
+        // An untracked include could `#undef` a command-line define, so the
+        // may-hold filter must stop treating the build facts as decisive from
+        // here on. The additive proof path keeps its facts: they still hold at
+        // the include chain's activation point.
+        self.build_proven_defines.clear();
         self.unknown_names = true;
     }
 
@@ -659,10 +671,13 @@ impl MacroEnvironment {
     fn boolean_guard_may_hold(&self, expression: &BooleanGuardExpression) -> bool {
         match expression {
             BooleanGuardExpression::Defined(name) => !self.known_undefined_names.contains(name),
-            BooleanGuardExpression::Undefined(name) => self
-                .bindings
-                .get(name)
-                .is_none_or(|binding| !binding.is_exact()),
+            BooleanGuardExpression::Undefined(name) => {
+                self.bindings
+                    .get(name)
+                    .is_none_or(|binding| !binding.is_exact())
+                    && (!self.build_proven_defines.contains(name)
+                        || self.known_undefined_names.contains(name))
+            }
             BooleanGuardExpression::Truthy(_) | BooleanGuardExpression::Falsy(_) => true,
             BooleanGuardExpression::Opaque(_)
             | BooleanGuardExpression::NegatedOpaque(_)
@@ -769,6 +784,20 @@ type VisibleParserAliasNameSetCell = Arc<OnceLock<HashSet<String>>>;
 type IndexedStructuralClassScopeCache = HashMap<(ProjectFile, usize, usize), Option<Vec<String>>>;
 type IndexedEnclosingOwnerScopeCache = HashMap<(ProjectFile, usize, usize), Option<Vec<String>>>;
 
+/// One callable declaration's inputs to [`VisibilityIndex::same_logical_callable`],
+/// read from its declaration syntax rather than from its persisted signature
+/// string: the comparable shape of each parameter, and the trailing identity
+/// suffix that shape does not carry.
+struct ExtractedComparable {
+    shapes: Vec<CppComparableSlot>,
+    suffix: String,
+}
+
+/// How many alias hops [`VisibilityIndex::same_logical_callable`] follows
+/// before giving up on a written type name. A visited set already stops a
+/// cycle; this stops an adversarially long chain from costing a lookup per hop.
+const MAX_COMPARABLE_ALIAS_HOPS: usize = 32;
+
 /// Per-query C++ visibility facts.
 ///
 /// The analyzer is *borrowed*, never cloned: `TreeSitterAnalyzer::clone` gives
@@ -794,6 +823,7 @@ pub struct VisibilityIndex<'a> {
     callable_reference_specs:
         Mutex<HashMap<(ProjectFile, LogicalSymbolKey), CallableReferenceSpecCell>>,
     include_activation_cells: Mutex<HashMap<(ProjectFile, ProjectFile), Option<usize>>>,
+    compile_proven_guard_cells: Mutex<HashMap<ProjectFile, Arc<HashSet<PreprocessorGuard>>>>,
     conditional_include_projection_cells: Mutex<ConditionalIncludeProjectionCache>,
     #[cfg(any(test, feature = "test-support"))]
     conditional_include_projection_index_build_count: AtomicUsize,
@@ -817,6 +847,7 @@ pub struct VisibilityIndex<'a> {
     visible_parser_alias_target_names_build_count: AtomicUsize,
     field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
     structured_alias_targets: Mutex<HashMap<CodeUnit, Option<StructuredAliasTarget>>>,
+    callable_comparables: Mutex<HashMap<CodeUnit, Option<Arc<ExtractedComparable>>>>,
     indexed_structural_class_scopes: Mutex<IndexedStructuralClassScopeCache>,
     indexed_enclosing_owner_scopes: Mutex<IndexedEnclosingOwnerScopeCache>,
     precise_parent_cache: Mutex<HashMap<CodeUnit, Option<CodeUnit>>>,
@@ -1131,7 +1162,7 @@ struct DeclaredFieldTypeFact {
     template_arguments: Option<Vec<CppTemplateExpression>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum StructuredAliasTarget {
     Builtin,
     Named {
@@ -1232,6 +1263,7 @@ impl<'a> VisibilityIndex<'a> {
             project_using_index: OnceLock::new(),
             callable_reference_specs: Mutex::new(HashMap::default()),
             include_activation_cells: Mutex::new(HashMap::default()),
+            compile_proven_guard_cells: Mutex::new(HashMap::default()),
             conditional_include_projection_cells: Mutex::new(HashMap::default()),
             conditional_include_projection_index_build_count: AtomicUsize::new(0),
             conditional_include_projection_state_count: AtomicUsize::new(0),
@@ -1245,6 +1277,7 @@ impl<'a> VisibilityIndex<'a> {
             visible_parser_alias_target_names_build_count: AtomicUsize::new(0),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
+            callable_comparables: Mutex::new(HashMap::default()),
             indexed_structural_class_scopes: Mutex::new(HashMap::default()),
             indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
             precise_parent_cache: Mutex::new(HashMap::default()),
@@ -1304,7 +1337,8 @@ impl<'a> VisibilityIndex<'a> {
                     })
                     .collect()
             },
-            |file| analyzer.declarations(file),
+            |root| analyzer.reference_uses_c_semantics(root),
+            |file, c_semantics| analyzer.declarations_in_reading(file, c_semantics),
         );
         extend_with_out_of_line_owner_bindings(cpp, &mut visible_by_file);
         let mut global_field_internal_linkage = HashMap::default();
@@ -1358,6 +1392,7 @@ impl<'a> VisibilityIndex<'a> {
             project_using_index: OnceLock::new(),
             callable_reference_specs: Mutex::new(HashMap::default()),
             include_activation_cells: Mutex::new(HashMap::default()),
+            compile_proven_guard_cells: Mutex::new(HashMap::default()),
             conditional_include_projection_cells: Mutex::new(HashMap::default()),
             #[cfg(any(test, feature = "test-support"))]
             conditional_include_projection_index_build_count: AtomicUsize::new(0),
@@ -1381,6 +1416,7 @@ impl<'a> VisibilityIndex<'a> {
             visible_parser_alias_target_names_build_count: AtomicUsize::new(0),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),
+            callable_comparables: Mutex::new(HashMap::default()),
             indexed_structural_class_scopes: Mutex::new(HashMap::default()),
             indexed_enclosing_owner_scopes: Mutex::new(HashMap::default()),
             precise_parent_cache: Mutex::new(HashMap::default()),
@@ -1837,6 +1873,22 @@ impl<'a> VisibilityIndex<'a> {
             .expect("C++ macro environment cursor poisoned");
         if frontier < cursor.frontier {
             *cursor = MacroEnvironmentCursor::default();
+        }
+        // Seed the TU's build-proven defines once, before any event applies
+        // (#2011). They are facts of the whole compile, so they hold from the
+        // first byte; a later explicit #undef event still overrides them
+        // through `known_undefined_names`.
+        if cursor.frontier == 0 {
+            let proven = self.compile_proven_guards(file);
+            if !proven.is_empty() && cursor.environment.build_proven_defines.len() != proven.len() {
+                Arc::make_mut(&mut cursor.environment).build_proven_defines = proven
+                    .iter()
+                    .filter_map(|guard| match guard {
+                        PreprocessorGuard::Defined(name) => Some(name.clone()),
+                        _ => None,
+                    })
+                    .collect();
+            }
         }
         if frontier > cursor.frontier {
             #[cfg(any(test, feature = "test-support"))]
@@ -2865,6 +2917,17 @@ impl<'a> VisibilityIndex<'a> {
                 .is_some_and(|visible| visible.contains(target))
     }
 
+    /// Whether some declaration of `declaration`'s logical symbol is visible at
+    /// `reference_byte` in `file`.
+    ///
+    /// The question is asked of the *logical* symbol, not of the physical unit:
+    /// an out-of-line body in a `.cpp` nobody includes is never itself visible,
+    /// and it does not have to be - what makes the call legal is the header
+    /// declaration that the reference file does include. Reading that relation
+    /// through `same_logical_callable` rather than through signature strings is
+    /// the same #2010 correction the gates make, and it matters here because
+    /// the body and the declaration are exactly the pair that spells one
+    /// parameter type two ways.
     pub fn declaration_visible_at(
         &self,
         analyzer: &CppGraphSource<'_>,
@@ -2875,7 +2938,7 @@ impl<'a> VisibilityIndex<'a> {
         let reference_guards = OnceCell::new();
         self.visible_identifier_candidates(file, declaration.identifier())
             .filter(|candidate| {
-                same_logical_symbol(candidate, declaration)
+                self.same_logical_callable(analyzer, candidate, declaration)
                     || flattened_macro_namespace_declaration_matches(
                         analyzer,
                         self.cpp,
@@ -3039,6 +3102,100 @@ impl<'a> VisibilityIndex<'a> {
             .is_some_and(|activation| activation <= reference_byte)
     }
 
+    /// The preprocessor facts the translation unit's compile command proves
+    /// for `file` (#2011).
+    ///
+    /// Every `-D` that survives its command's `-D`/`-U` ordering is a positive
+    /// `Defined` fact, and a fact holds only when every compile configuration
+    /// that names the file agrees on it (intersection). A file without a
+    /// database entry has no facts and every check runs on source structure
+    /// alone. The facts are strictly additive to the reference's active guard
+    /// set: they can prove a required guard, but the guard check itself is
+    /// never weakened and no implication is ever inferred from source text.
+    pub fn compile_proven_guards(&self, file: &ProjectFile) -> Arc<HashSet<PreprocessorGuard>> {
+        if let Some(cached) = self
+            .compile_proven_guard_cells
+            .lock()
+            .expect("C++ compile-proven guard cache poisoned")
+            .get(file)
+        {
+            return Arc::clone(cached);
+        }
+        let contexts = self.cpp.compile_contexts_for(file);
+        let proven: HashSet<PreprocessorGuard> = match contexts.split_first() {
+            None => HashSet::default(),
+            Some((first, rest)) => first
+                .defined_macros
+                .iter()
+                .filter(|name| {
+                    rest.iter()
+                        .all(|context| context.defined_macros.contains(*name))
+                })
+                .cloned()
+                .map(PreprocessorGuard::Defined)
+                .collect(),
+        };
+        let proven = Arc::new(proven);
+        self.compile_proven_guard_cells
+            .lock()
+            .expect("C++ compile-proven guard cache poisoned")
+            .insert(file.clone(), Arc::clone(&proven));
+        proven
+    }
+
+    /// Whether a lookup miss for `identifier` in `file` is explainable by
+    /// missing compile context (#2011): some same-name declaration is
+    /// reachable through a conditional include whose required guards neither
+    /// contradict the reference's active guards nor follow from them, and the
+    /// translation unit has no compile-commands entry that could decide the
+    /// question. Callers surface this as an explicit "requires compile
+    /// context" incompleteness instead of an indistinguishable miss.
+    ///
+    /// A structurally disproven declaration (contradicting guards) and a TU
+    /// whose compile context exists but does not prove the guard both answer
+    /// `false`: those misses are decided, not incomplete.
+    pub fn miss_requires_compile_context(
+        &self,
+        file: &ProjectFile,
+        identifier: &str,
+        reference: Node<'_>,
+    ) -> bool {
+        if !self.cpp.compile_contexts_for(file).is_empty() {
+            return false;
+        }
+        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+            return false;
+        };
+        let reference_guards = preprocessor_guard_environment(reference, prepared.source());
+        let reference_byte = reference.start_byte();
+        let mut sources = self
+            .visible_identifier_candidates(file, identifier)
+            .map(CodeUnit::source)
+            .filter(|source| *source != file)
+            .collect::<Vec<_>>();
+        sources.sort();
+        sources.dedup();
+        sources.into_iter().any(|declaration_source| {
+            self.conditional_include_projections_for_source(
+                file,
+                prepared.as_ref(),
+                declaration_source,
+            )
+            .iter()
+            .any(|projection| {
+                projection.activation_byte <= reference_byte
+                    && !guard_requirements_hold_at_reference(
+                        &projection.required_guards,
+                        reference_guards.as_ref(),
+                    )
+                    && guards_compatible_at_reference(
+                        &projection.required_guards,
+                        reference_guards.as_ref(),
+                    )
+            })
+        })
+    }
+
     /// Decide whether a declaration that lives in another file reaches a
     /// reference in `file`.
     ///
@@ -3058,6 +3215,20 @@ impl<'a> VisibilityIndex<'a> {
         reference_guards: Option<&HashSet<PreprocessorGuard>>,
         reference_byte: usize,
     ) -> bool {
+        // The translation unit's build-proven defines join the reference's
+        // active guard set (#2011): a conditional include like the nng
+        // `NNG_PLATFORM_POSIX` chain is provable only by the compile command.
+        // A reference whose own environment is unknown stays unknown -- the
+        // facts extend an environment, they never invent one.
+        let proven = self.compile_proven_guards(file);
+        let augmented;
+        let reference_guards = match reference_guards {
+            Some(active) if !proven.is_empty() => {
+                augmented = active.union(&proven).cloned().collect();
+                Some(&augmented)
+            }
+            other => other,
+        };
         if !guards_compatible_at_reference(declaration_guards, reference_guards) {
             return false;
         }
@@ -4181,9 +4352,23 @@ impl<'a> VisibilityIndex<'a> {
                         .copied()
                         .filter(|candidate| self.is_physically_visible(file, candidate))
                         .collect::<Vec<_>>();
-                    if !physically_visible.is_empty() {
-                        // The family is one logical declaration, so multiple
-                        // reachable spellings still produce one answer.
+                    // The family is one logical declaration only when the
+                    // reachable spellings agree. Two same-FQN aliases whose
+                    // written targets differ (`using Choice = Canonical;` in
+                    // one header, `using Choice = ::Canonical;` in another)
+                    // are a genuine conflict, and choosing the first indexed
+                    // one silently binds the reference to an arbitrary owner
+                    // (#2398). Collapse only a single reachable declaration
+                    // or reachable declarations with one structured target;
+                    // everything else stays ambiguous below.
+                    let one_structured_target = physically_visible.len() > 1
+                        && physically_visible.iter().skip(1).all(|candidate| {
+                            let target = self.structured_alias_target(analyzer, candidate);
+                            target.is_some()
+                                && target
+                                    == self.structured_alias_target(analyzer, physically_visible[0])
+                        });
+                    if physically_visible.len() == 1 || one_structured_target {
                         return Ok(physically_visible[0].clone());
                     }
                 }
@@ -4434,7 +4619,15 @@ impl<'a> VisibilityIndex<'a> {
         };
         let qualified = components.join("::");
         let candidates = if *global {
-            self.type_candidates(visible_from, &qualified)
+            // `::A::B` anchors at the root scope, so a candidate whose
+            // canonical path merely ends with the spelled components does not
+            // qualify. Without this filter a global `::Canonical` target also
+            // collects `alpha::Canonical`, the lookup reports a false
+            // ambiguity, and the alias arm silently drops out of its
+            // conflicting family instead of proving the conflict (#2398).
+            let mut candidates = self.type_candidates(visible_from, &qualified);
+            candidates.retain(|candidate| canonical_cpp_scope_components(candidate) == *components);
+            candidates
         } else {
             self.type_candidates_for_declaration(visible_from, declaration, &qualified)
         };
@@ -4793,8 +4986,16 @@ impl<'a> VisibilityIndex<'a> {
         }
         let mut resolved_candidates = Vec::new();
         for candidate in candidates {
-            let resolved =
-                self.type_candidate_preserving_target(analyzer, visible_from, candidate, target)?;
+            // An ifdef branch that aliases an unindexed system type (for
+            // example `typedef pthread_mutex_t k5_os_mutex`) cannot be
+            // canonicalized. That branch does not name `target`. Dropping it
+            // keeps the branch that does. Failing the whole family here would
+            // deny every usage of the reachable spelling (#2368).
+            let Some(resolved) =
+                self.type_candidate_preserving_target(analyzer, visible_from, candidate, target)
+            else {
+                continue;
+            };
             if resolved_candidates
                 .iter()
                 .any(|existing| same_visible_symbol(existing, &resolved))
@@ -5291,6 +5492,367 @@ impl<'a> VisibilityIndex<'a> {
             _ if is_type_alias(&resolved) => self.alias_target(&resolved),
             _ => None,
         }
+    }
+
+    /// Whether two callable declarations declare one function.
+    ///
+    /// [`same_logical_symbol`] compares the persisted signature strings, which
+    /// embed each parameter type exactly as it was spelled. A header
+    /// declaration written inside `namespace zmq { class dist_t { ... } }` says
+    /// `send_to_matching(msg_t *)` while its out-of-line body at file scope
+    /// says `zmq::msg_t *`, so the string comparison reports two symbols where
+    /// C++ ([basic.def], [dcl.fct]) sees one declaration and one definition.
+    /// This resolves the written parameter names before comparing them and
+    /// reports the same answer the language does for the cases it can prove.
+    ///
+    /// Everything it cannot prove stays two symbols: a template declaration, a
+    /// parameter with no comparable shape, a name that resolves on one side
+    /// only, and an alias chain it cannot follow safely (#2010).
+    pub fn same_logical_callable(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        left: &CodeUnit,
+        right: &CodeUnit,
+    ) -> bool {
+        if same_logical_symbol(left, right) {
+            return true;
+        }
+        if left.kind() != right.kind()
+            || !left.is_callable()
+            || !right.is_callable()
+            || left.fq_name() != right.fq_name()
+        {
+            return false;
+        }
+        // A template declaration and its out-of-line body can also diverge
+        // outside the parameter list - `template <class T>` against
+        // `template <typename T>` - and the template head is part of the
+        // persisted signature. Deciding template-head equivalence is a
+        // separate question, so templates keep string identity.
+        if self.callable_is_template_declaration(analyzer, left)
+            || self.callable_is_template_declaration(analyzer, right)
+        {
+            return false;
+        }
+        let (Some(left_comparable), Some(right_comparable)) = (
+            self.callable_comparable(analyzer, left),
+            self.callable_comparable(analyzer, right),
+        ) else {
+            return false;
+        };
+        // The trailing member `const`, ref-qualifier, `noexcept`, trailing
+        // return type and requires-clause are part of C++ callable identity and
+        // an out-of-line definition repeats them verbatim, so they must agree
+        // as written.
+        if left_comparable.suffix != right_comparable.suffix
+            || left_comparable.shapes.len() != right_comparable.shapes.len()
+        {
+            return false;
+        }
+        left_comparable
+            .shapes
+            .iter()
+            .zip(right_comparable.shapes.iter())
+            .all(|(left_slot, right_slot)| match (left_slot, right_slot) {
+                (CppComparableSlot::Ellipsis, CppComparableSlot::Ellipsis) => true,
+                (CppComparableSlot::Shape(left_shape), CppComparableSlot::Shape(right_shape)) => {
+                    self.comparable_shapes_agree(analyzer, left_shape, right_shape)
+                }
+                // An unstructured parameter records that the reduction failed,
+                // not that the two spellings mean the same type, so it agrees
+                // with nothing - including another unstructured parameter.
+                _ => false,
+            })
+    }
+
+    /// Compare two parameter shapes node by node with an explicit paired stack.
+    ///
+    /// Shape variants and cv-qualifiers must agree exactly at every level; only
+    /// the named leaves may be spelled differently, and they agree when they
+    /// resolve to one type declaration.
+    fn comparable_shapes_agree(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        left: &CppComparableParameter,
+        right: &CppComparableParameter,
+    ) -> bool {
+        let mut stack = vec![(left.root(), right.root())];
+        while let Some((left_index, right_index)) = stack.pop() {
+            match (left.node(left_index), right.node(right_index)) {
+                (
+                    CppComparableNode::Named {
+                        name: left_name,
+                        primitive: left_primitive,
+                        konst: left_konst,
+                        volatil: left_volatil,
+                    },
+                    CppComparableNode::Named {
+                        name: right_name,
+                        primitive: right_primitive,
+                        konst: right_konst,
+                        volatil: right_volatil,
+                    },
+                ) => {
+                    if left_konst != right_konst
+                        || left_volatil != right_volatil
+                        || left_primitive != right_primitive
+                        || !self.comparable_names_agree(
+                            analyzer,
+                            left_name,
+                            right_name,
+                            *left_primitive,
+                        )
+                    {
+                        return false;
+                    }
+                }
+                (
+                    CppComparableNode::Pointer {
+                        inner: left_inner,
+                        konst: left_konst,
+                        volatil: left_volatil,
+                    },
+                    CppComparableNode::Pointer {
+                        inner: right_inner,
+                        konst: right_konst,
+                        volatil: right_volatil,
+                    },
+                ) => {
+                    if left_konst != right_konst || left_volatil != right_volatil {
+                        return false;
+                    }
+                    stack.push((*left_inner, *right_inner));
+                }
+                (
+                    CppComparableNode::Reference { inner: left_inner },
+                    CppComparableNode::Reference { inner: right_inner },
+                )
+                | (
+                    CppComparableNode::Array { inner: left_inner },
+                    CppComparableNode::Array { inner: right_inner },
+                ) => stack.push((*left_inner, *right_inner)),
+                (
+                    CppComparableNode::Generic {
+                        base: left_base,
+                        arguments: left_arguments,
+                    },
+                    CppComparableNode::Generic {
+                        base: right_base,
+                        arguments: right_arguments,
+                    },
+                ) => {
+                    if left_arguments.len() != right_arguments.len() {
+                        return false;
+                    }
+                    stack.push((*left_base, *right_base));
+                    stack.extend(
+                        left_arguments.iter().zip(right_arguments.iter()).map(
+                            |(left_argument, right_argument)| (*left_argument, *right_argument),
+                        ),
+                    );
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Whether two written type names denote one type.
+    ///
+    /// A primitive denotes the same type in every scope, so its recorded
+    /// lexical scope is noise and its spelling decides. A nominal name is
+    /// resolved on each side independently: two resolved names agree when they
+    /// reach one type declaration, and two unresolved names agree only on
+    /// exact agreement of what was written, which is no weaker than the
+    /// whole-signature string equality this comparison replaces. Resolution on
+    /// one side only is evidence of difference, never of agreement.
+    fn comparable_names_agree(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        left: &StructuredTypeName,
+        right: &StructuredTypeName,
+        primitive: bool,
+    ) -> bool {
+        if primitive {
+            return left.path() == right.path();
+        }
+        match (
+            self.comparable_name_terminal(analyzer, left),
+            self.comparable_name_terminal(analyzer, right),
+        ) {
+            (Some(left_terminal), Some(right_terminal)) => {
+                same_logical_symbol(&left_terminal, &right_terminal)
+            }
+            (None, None) => {
+                left.path() == right.path() && left.is_absolute() == right.is_absolute()
+            }
+            _ => false,
+        }
+    }
+
+    /// The class declaration a written type name denotes, or `None` when the
+    /// workspace cannot prove one.
+    ///
+    /// The lookup is a closure-independent lexical-scope prefix walk over the
+    /// workspace definition index rather than a visibility lookup: the index
+    /// handed to a definition query is rooted at the reference file, and a
+    /// body's `.cpp` is almost never in that file's include closure. Any name
+    /// this walk resolves is one an enclosing-scope lookup could resolve, so it
+    /// cannot invent a type the compiler could not see; `using`-directives are
+    /// not modelled, and a name that needs one stays unresolved.
+    fn comparable_name_terminal(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        name: &StructuredTypeName,
+    ) -> Option<CodeUnit> {
+        let mut current = self.comparable_name_declaration(analyzer, name)?;
+        let mut visited = HashSet::default();
+        for _ in 0..MAX_COMPARABLE_ALIAS_HOPS {
+            // The alias question is asked before the class question, and
+            // through `declared_type_alias` rather than `is_type_alias`,
+            // because extraction records `using A8 = A7;` as a *Class* unit
+            // whose signature is the alias declaration. Reading the kind first
+            // would end the chase on the alias itself and report an alias
+            // spelling and its underlying class as two types (#2010).
+            if !declared_type_alias(analyzer, &current) {
+                return current.is_class().then_some(current);
+            }
+            if !visited.insert(current.clone()) {
+                return None;
+            }
+            let signature = current.signature()?;
+            // `cpp_alias_declaration_target_text` reads the declaration's
+            // `type` field only, so `typedef Foo *Bar` reports `Foo` and the
+            // pointer is silently dropped. Substituting such an alias would
+            // fuse `f(Bar)` and `f(Foo)`, which are two functions.
+            if cpp_alias_declaration_adds_indirection(signature) {
+                return None;
+            }
+            let raw_target = cpp_alias_declaration_target_text(signature)?;
+            current = self.comparable_alias_target(analyzer, &current, &raw_target)?;
+        }
+        None
+    }
+
+    /// The declaration one alias hop lands on: the type `raw_target` names,
+    /// looked up from the alias declaration's own enclosing namespace.
+    ///
+    /// The hop takes the same closure-independent prefix walk the first lookup
+    /// took, and deliberately not `resolve_type_for_declaration`: that one
+    /// answers out of the `VisibilityIndex`, which is rooted at the reference
+    /// file, while the alias declaration this hop starts from is reached
+    /// through the workspace definition index and its file need not be in that
+    /// root's include closure - where the visibility lookup answers nothing and
+    /// the chase would stop on the alias itself (#2010).
+    fn comparable_alias_target(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        alias: &CodeUnit,
+        raw_target: &str,
+    ) -> Option<CodeUnit> {
+        // `raw_target` is the alias declaration's written type text, so it is a
+        // plain `::`-joined qualified-id: the same domain the shared symbol-path
+        // parser reads, and the same leading `::` that marks an absolute name
+        // everywhere else this crate normalizes a reference.
+        let absolute = raw_target.trim_start().starts_with("::");
+        let normalized = normalize_reference_name(raw_target)?;
+        let path = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+            brokk_bifrost_core::analyzer::Language::Cpp,
+            &normalized,
+        );
+        let lexical_scope = cpp_namespace_for(alias).map_or_else(Vec::new, |namespace| {
+            brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
+                brokk_bifrost_core::analyzer::Language::Cpp,
+                &namespace,
+            )
+        });
+        let name = StructuredTypeName::new(path, lexical_scope, absolute)?;
+        self.comparable_name_declaration(analyzer, &name)
+    }
+
+    /// The one type declaration `name` names, by enclosing scope, innermost
+    /// first.
+    ///
+    /// The first prefix depth that names anything decides: an inner scope hides
+    /// an outer one, so a match there is the answer even when an outer scope
+    /// also declares the name. Several logically distinct declarations at that
+    /// depth are an ambiguity this comparison must not guess at.
+    fn comparable_name_declaration(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        name: &StructuredTypeName,
+    ) -> Option<CodeUnit> {
+        let definitions = analyzer.global_usage_definition_index();
+        let first_depth = if name.is_absolute() {
+            0
+        } else {
+            name.lexical_scope().len()
+        };
+        for depth in (0..=first_depth).rev() {
+            let mut components = Vec::with_capacity(depth.saturating_add(name.path().len()));
+            components.extend_from_slice(&name.lexical_scope()[..depth]);
+            components.extend_from_slice(name.path());
+            let mut candidates =
+                definitions
+                    .fqn(&components.join("."))
+                    .into_iter()
+                    .filter(|unit| {
+                        unit.kind() == CodeUnitType::Class || declared_type_alias(analyzer, unit)
+                    });
+            let Some(first) = candidates.next() else {
+                continue;
+            };
+            return candidates
+                .all(|unit| same_logical_symbol(unit, first))
+                .then(|| first.clone());
+        }
+        None
+    }
+
+    /// The comparison inputs of one callable declaration, extracted once.
+    ///
+    /// The comparison itself runs only when two candidates share kind and fully
+    /// qualified name but not signature, which is rare; re-reading the same
+    /// declaration for every pair in a candidate set is not.
+    fn callable_comparable(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        unit: &CodeUnit,
+    ) -> Option<Arc<ExtractedComparable>> {
+        if let Some(cached) = self
+            .callable_comparables
+            .lock()
+            .expect("C++ callable comparable cache poisoned")
+            .get(unit)
+            .cloned()
+        {
+            return cached;
+        }
+        let extracted = self
+            .extract_callable_comparable(analyzer, unit)
+            .map(Arc::new);
+        self.callable_comparables
+            .lock()
+            .expect("C++ callable comparable cache poisoned")
+            .insert(unit.clone(), extracted.clone());
+        extracted
+    }
+
+    fn extract_callable_comparable(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        unit: &CodeUnit,
+    ) -> Option<ExtractedComparable> {
+        let prepared = self.cpp.prepared_syntax(unit.source())?;
+        let root = prepared.tree().root_node();
+        let declarator = analyzer
+            .ranges(unit)
+            .into_iter()
+            .find_map(|range| cpp_function_declarator_at(root, range.start_byte))?;
+        Some(ExtractedComparable {
+            shapes: cpp_comparable_parameter_shapes(declarator, prepared.source()),
+            suffix: cpp_callable_identity_suffix(declarator, prepared.source())?,
+        })
     }
 
     pub fn canonical_type_for_reference(
@@ -6100,15 +6662,26 @@ pub struct VisibilityData {
     pub visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
 }
 
-pub fn build_visibility_data<F, D>(
+/// Build the per-root include closure and the declarations each root can see
+/// through it.
+///
+/// `declarations_for` takes the reading to answer in (issue #1970): a root
+/// compiled as C sees the C reading of every file in its closure, a root
+/// compiled as C++ sees the C++ reading, and `reading_is_c_for` decides which
+/// per root. The two readings agree for all but a handful of headers, so the
+/// C map is built only when some root actually asks for it, and only over the
+/// files that root reaches.
+pub fn build_visibility_data<F, R, D>(
     roots: &HashSet<ProjectFile>,
     cancellation: Option<&CancellationToken>,
     mut targets_for: F,
+    mut reading_is_c_for: R,
     mut declarations_for: D,
 ) -> VisibilityData
 where
     F: FnMut(&ProjectFile) -> Vec<ProjectFile>,
-    D: FnMut(&ProjectFile) -> BTreeSet<CodeUnit>,
+    R: FnMut(&ProjectFile) -> bool,
+    D: FnMut(&ProjectFile, bool) -> BTreeSet<CodeUnit>,
 {
     let mut include_graph = IncludeGraph::default();
     for file in roots {
@@ -6117,11 +6690,12 @@ where
         }
         include_graph.extend_with(file, cancellation, &mut targets_for);
     }
-    let declarations_by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>> = include_graph
+    let cpp_declarations_by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>> = include_graph
         .files()
         .take_while(|_| !cancellation.is_some_and(CancellationToken::is_cancelled))
-        .map(|file| (file.clone(), declarations_for(file)))
+        .map(|file| (file.clone(), declarations_for(file, false)))
         .collect();
+    let mut c_declarations_by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>> = HashMap::default();
     let mut visible_by_file = HashMap::default();
     let mut visible_source_files_by_root = HashMap::default();
     for file in roots {
@@ -6130,9 +6704,20 @@ where
         }
         let mut visited = HashSet::default();
         let mut visible = HashSet::default();
+        let declarations_by_file = if reading_is_c_for(file) {
+            for reached in cpp_declarations_by_file.keys() {
+                if !c_declarations_by_file.contains_key(reached) {
+                    let declarations = declarations_for(reached, true);
+                    c_declarations_by_file.insert(reached.clone(), declarations);
+                }
+            }
+            &c_declarations_by_file
+        } else {
+            &cpp_declarations_by_file
+        };
         collect_visible_declarations(
             &include_graph,
-            &declarations_by_file,
+            declarations_by_file,
             file,
             &mut visited,
             &mut visible,
@@ -8745,6 +9330,50 @@ pub fn cpp_alias_declaration_target_text(declaration: &str) -> Option<String> {
     None
 }
 
+/// Whether an alias declaration's own declarator adds indirection that
+/// [`cpp_alias_declaration_target_text`] does not report.
+///
+/// That function reads the declaration's `type` field, where `typedef Foo *Bar`
+/// keeps only `Foo`: the `*` lives in the sibling declarator. Substituting such
+/// an alias would equate `f(Bar)` with `f(Foo)`, so a comparison that cannot
+/// prove the alias adds no indirection must refuse to follow it. A declaration
+/// this cannot read at all is refused for the same reason.
+fn cpp_alias_declaration_adds_indirection(declaration: &str) -> bool {
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .is_err()
+    {
+        return true;
+    }
+    let Some(tree) = parser.parse(declaration, None) else {
+        return true;
+    };
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let declarators = match node.kind() {
+            "type_definition" => {
+                let mut cursor = node.walk();
+                node.children_by_field_name("declarator", &mut cursor)
+                    .collect::<Vec<_>>()
+            }
+            "alias_declaration" => node
+                .child_by_field_name("type")
+                .and_then(|type_node| type_node.child_by_field_name("declarator"))
+                .into_iter()
+                .collect::<Vec<_>>(),
+            _ => {
+                let mut cursor = node.walk();
+                let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+                stack.extend(children.into_iter().rev());
+                continue;
+            }
+        };
+        return declarators.into_iter().any(cpp_declarator_adds_indirection);
+    }
+    true
+}
+
 /// True when an alias declarator names a function type.
 ///
 /// The declarator chain is walked through the `declarator` field, so the
@@ -9342,11 +9971,28 @@ pub fn extract_variable_name(node: Node<'_>, source: &str) -> Option<String> {
 /// compilation dialect on their own, so only an exact `.c` source extension is
 /// sufficient to reinterpret C++-grammar keyword nodes such as `this` as C
 /// identifiers.
+///
+/// The exact-lowercase-`.c` rule itself lives in [`LanguageDialect::for_path`],
+/// which extraction reads too (a `.c` file is extracted with C tag scope), so
+/// the doctrine has exactly one definition.
 pub fn is_c_source_file(file: &ProjectFile) -> bool {
-    file.rel_path()
-        .extension()
-        .and_then(|extension| extension.to_str())
-        == Some("c")
+    LanguageDialect::for_path(Language::Cpp, file.rel_path()) == LanguageDialect::CppC
+}
+
+/// Whether a reference written in `file` reads C++ source with C semantics.
+///
+/// [`is_c_source_file`] answers the half a path settles on its own. The other
+/// half is a header, which has no dialect of its own: it is read as C exactly
+/// when every workspace translation unit that provably compiles it compiles it
+/// as C ([`CppSource::header_uses_c_semantics`], issue #1970).
+///
+/// This is the gate for anything that is really about the compilation
+/// language of the code being read -- which reading of an included header's
+/// declarations is in scope, whether `this` is an ordinary identifier. It is
+/// NOT the gate for a question that is genuinely about a `.c` file on disk;
+/// those keep calling [`is_c_source_file`].
+pub fn reference_uses_c_semantics(cpp: &dyn CppSource, file: &ProjectFile) -> bool {
+    is_c_source_file(file) || cpp.header_uses_c_semantics(file)
 }
 
 pub fn is_declarator_node(node: Node<'_>) -> bool {

@@ -78,7 +78,9 @@ export const THIRD_PARTY_SEMANTIC_PACK_SPECS = [
 export const BIFROST_OWNED_SEMANTIC_PACK_SPECS = [
   "semantic-packs/framework-decls/bifrost.jdk-framework-decls.json",
   "semantic-packs/framework-decls/staged/bifrost.javax.servlet-api-framework-decls.json",
+  "semantic-packs/framework-decls/staged/bifrost.javax.servlet-api-summaries.json",
   "semantic-packs/golden-core/bifrost.jdk-golden-summaries.json",
+  "semantic-packs/golden-core/cpython/bifrost.cpython-golden-summaries.json",
   "semantic-packs/sanitizers/bifrost.esapi-sanitizers.json",
   "semantic-packs/sanitizers/bifrost.java-sanitizers.json",
   "semantic-packs/sanitizers/staged/bifrost.commons-text-sanitizers.json",
@@ -228,6 +230,27 @@ function collectProjectionUpdates(repoRoot, version) {
   const existingReleaseMetadata = readJson(repoRoot, "plugins/bifrost-agent/bifrost-release.json");
   const canCopyReleaseChecksums = existingReleaseMetadata.binaryVersion === version;
 
+  const agentReleaseUpdate = updateJson(
+    repoRoot,
+    "plugins/bifrost-agent/bifrost-release.json",
+    (json) => {
+      const previousPreferred = json.binaryVersion;
+      json.binaryVersion = version;
+      if (!sameMinorSeries(previousPreferred, version)) {
+        json.minimumBinaryVersion = version;
+      } else {
+        json.minimumBinaryVersion ??= version;
+      }
+      json.allowPrerelease ??= false;
+    },
+  );
+  // The dsh bundle vendors bifrost-release.json; the copies must stay
+  // byte-identical (enforced by check-codex-plugin-manifest.mjs), so project
+  // the exact updated bytes of the canonical file rather than re-serializing.
+  const agentReleaseContents =
+    agentReleaseUpdate?.contents ??
+    readFile(repoRoot, "plugins/bifrost-agent/bifrost-release.json");
+
   const updates = [
     updateText(repoRoot, "CITATION.cff", (contents) =>
       syncCitationVersion(contents, version),
@@ -270,17 +293,16 @@ function collectProjectionUpdates(repoRoot, version) {
         }
       }
     }),
-    updateJson(repoRoot, "plugins/bifrost-agent/bifrost-release.json", (json) => {
-      const previousPreferred = json.binaryVersion;
-      json.binaryVersion = version;
-      if (!sameMinorSeries(previousPreferred, version)) {
-        json.minimumBinaryVersion = version;
-      } else {
-        json.minimumBinaryVersion ??= version;
-      }
-      json.allowPrerelease ??= false;
-    }),
+    agentReleaseUpdate,
+    updateText(
+      repoRoot,
+      "plugins/bifrost-dsh/bifrost-release.json",
+      () => agentReleaseContents,
+    ),
     updateJson(repoRoot, "plugins/bifrost-agent/package.json", (json) => {
+      json.version = version;
+    }),
+    updateJson(repoRoot, "plugins/bifrost-dsh/package.json", (json) => {
       json.version = version;
     }),
     updateJson(repoRoot, "plugins/bifrost-agent/package-lock.json", (json) => {

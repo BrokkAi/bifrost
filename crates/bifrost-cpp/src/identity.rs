@@ -16,8 +16,10 @@
 //!   rebuilding them wholesale.
 
 use crate::declarations::{cpp_file_using_namespaces, cpp_member_fq, node_text};
+use crate::graph::CppGraphSource;
 use crate::graph::resolver::{
-    cpp_type_name_components, declarator_name_node, qualified_name_has_concrete_scope_separators,
+    VisibilityIndex, cpp_type_name_components, declarator_name_node,
+    qualified_name_has_concrete_scope_separators,
 };
 use crate::graph_support::CppSource;
 use crate::imports::{IncludeTargetIndex, include_paths, resolve_include_targets_with_index};
@@ -137,6 +139,42 @@ pub fn cpp_callable_definitions_share_identity_evidence(
             )
             && matches!(
                 cpp_indexed_callable_linkage(index, right),
+                Some(CallableLinkage::External)
+            )
+            && header_body_related(left.source(), right.source()))
+}
+
+/// The same evidence, with the signature-string conjunct answered by the
+/// resolved parameter comparison instead.
+///
+/// The persisted signature embeds each parameter type exactly as it was
+/// spelled, and a header declaration and its out-of-line body routinely spell
+/// one type two ways - `msg_t *` inside `namespace zmq` against `zmq::msg_t *`
+/// at file scope - so string equality alone refuses to unify the very pair this
+/// predicate exists to unify (#2010). [`VisibilityIndex::same_logical_callable`]
+/// compares the strings first and resolves the written parameter names only
+/// when they differ, so this is strictly the wider relation; every other
+/// conjunct - equal `fq_name`, external linkage on both sides, and the include
+/// evidence relating the two files - is unchanged.
+///
+/// Definition lookup uses this variant. The workspace-scale scans keep the
+/// string form above, where the candidate set is the whole index.
+pub fn cpp_callable_definitions_share_identity_evidence_with_visibility(
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    left: &CodeUnit,
+    right: &CodeUnit,
+    header_body_related: impl Fn(&ProjectFile, &ProjectFile) -> bool,
+) -> bool {
+    left.source() == right.source()
+        || (left.fq_name() == right.fq_name()
+            && visibility.same_logical_callable(analyzer, left, right)
+            && matches!(
+                cpp_indexed_callable_linkage(analyzer.index, left),
+                Some(CallableLinkage::External)
+            )
+            && matches!(
+                cpp_indexed_callable_linkage(analyzer.index, right),
                 Some(CallableLinkage::External)
             )
             && header_body_related(left.source(), right.source()))

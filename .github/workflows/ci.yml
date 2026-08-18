@@ -37,9 +37,26 @@ jobs:
       - name: Run public doctests
         run: cargo test --workspace --doc --locked
 
+      - name: Run MCP contract tests
+        run: cargo test -p brokk-bifrost-mcp --locked
+
+      - name: Run LSP contract tests
+        run: cargo test -p brokk-bifrost-lsp --locked
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+
+      - name: Install MCP conformance harness
+        run: npm ci --prefix crates/bifrost-mcp/tests/conformance
+
+      - name: Run MCP conformance harness
+        run: node crates/bifrost-mcp/tests/conformance/run.mjs --ci
+
       - name: Check release metadata
         run: node scripts/release-version.mjs check
 
-      # Before v0.10.0, add deliberately small public CLI, MCP, LSP, and
-      # embedded semantic-pack contract smokes. Do not copy the private
-      # assurance corpus to satisfy this gate.
+      # The published MCP and LSP suites plus the conformance gate above now
+      # cover those two protocol surfaces. Before v0.10.0, add deliberately
+      # small public CLI and embedded semantic-pack contract smokes. Do not
+      # copy the private assurance corpus to satisfy this gate.

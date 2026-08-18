@@ -30,6 +30,25 @@ pub struct CppCompileContext {
     pub forced_includes: Vec<PathBuf>,
     pub defined_macros: HashSet<String>,
     include_search_roots: Vec<CppIncludeSearchRoot>,
+    /// The invocation's driver basename (`arguments[0]`, minus one trailing
+    /// extension such as `.exe`), used by [`Self::tu_language`] only when
+    /// nothing stronger settles the language.
+    driver_basename: Option<String>,
+    /// Language forced by `-x <lang>` / `-xc` / `-xc++` or MSVC `/TC` / `/TP`.
+    /// The strongest evidence [`Self::tu_language`] considers.
+    explicit_language: Option<CompiledLanguage>,
+    /// Language implied by `-std=<value>`: the C family (`c11`, `gnu17`, ...)
+    /// versus the C++ family (`c++17`, `gnu++20`, ...), told apart by whether
+    /// the value contains `++`.
+    std_language: Option<CompiledLanguage>,
+}
+
+/// The language a compile-database entry says its translation unit is
+/// compiled as. See [`CppCompileContext::tu_language`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompiledLanguage {
+    C,
+    Cpp,
 }
 
 /// Why one compiler include-search entry exists.
@@ -165,6 +184,42 @@ impl CppCompileContexts {
 }
 
 impl CppCompileContext {
+    /// The language this compile configuration says `source_path` is
+    /// compiled as, strongest evidence first:
+    ///
+    /// 1. An explicit `-x <lang>` / `-xc` / `-xc++` or MSVC `/TC` / `/TP`.
+    /// 2. A `-std=<value>` family (C when the value has no `++`, C++ when it
+    ///    does).
+    /// 3. The driver basename: `g++`, `clang++`, `c++`, and similar names
+    ///    ending in `++` compile as C++ regardless of extension.
+    /// 4. `source_path`'s extension: exactly `c` (case-sensitive, matching
+    ///    `is_c_source_file`) is C, everything else is C++. This is also the
+    ///    rule `cl.exe` itself uses when neither `/TC` nor `/TP` is given.
+    pub fn tu_language(&self, source_path: &Path) -> CompiledLanguage {
+        if let Some(language) = self.explicit_language {
+            return language;
+        }
+        if let Some(language) = self.std_language {
+            return language;
+        }
+        if self
+            .driver_basename
+            .as_deref()
+            .is_some_and(|driver| driver.ends_with("++"))
+        {
+            return CompiledLanguage::Cpp;
+        }
+        if source_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("c")
+        {
+            CompiledLanguage::C
+        } else {
+            CompiledLanguage::Cpp
+        }
+    }
+
     /// Explicit external roots in compiler search order for angle includes.
     pub fn external_angle_include_roots<'a>(
         &'a self,
@@ -238,15 +293,32 @@ fn parse_compile_arguments(directory: &Path, arguments: &[String]) -> Option<Cpp
         return None;
     }
 
+    let driver_basename = driver_basename(&arguments[0]);
     let mut project_include_roots = Vec::new();
     let mut system_include_roots = Vec::new();
     let mut forced_includes = Vec::new();
     let mut defined_macros = HashSet::default();
     let mut include_search_roots = Vec::new();
+    let mut explicit_language = None;
+    let mut std_language = None;
     let mut index = 1;
     while index < arguments.len() {
         let argument = &arguments[index];
         match argument.as_str() {
+            "-x" => {
+                if let Some(language) = language_from_x_value(arguments.get(index + 1)?) {
+                    explicit_language = Some(language);
+                }
+                index += 2;
+            }
+            "/TC" => {
+                explicit_language = Some(CompiledLanguage::C);
+                index += 1;
+            }
+            "/TP" => {
+                explicit_language = Some(CompiledLanguage::Cpp);
+                index += 1;
+            }
             "-I" | "/I" => {
                 let path = argument_path(directory, arguments.get(index + 1)?)?;
                 project_include_roots.push(path.clone());
@@ -280,6 +352,14 @@ fn parse_compile_arguments(directory: &Path, arguments: &[String]) -> Option<Cpp
             }
             "-D" => {
                 defined_macros.insert(macro_name(arguments.get(index + 1)?)?);
+                index += 2;
+            }
+            // The compiler applies -D and -U in command order, so a later -U
+            // removes an earlier -D. An -U proves nothing on its own: a header
+            // can still define the name, so only the surviving defines are
+            // positive facts (#2011).
+            "-U" => {
+                defined_macros.remove(&macro_name(arguments.get(index + 1)?)?);
                 index += 2;
             }
             _ => {
@@ -319,6 +399,18 @@ fn parse_compile_arguments(directory: &Path, arguments: &[String]) -> Option<Cpp
                     });
                 } else if let Some(definition) = argument.strip_prefix("-D") {
                     defined_macros.insert(macro_name(definition)?);
+                } else if let Some(name) = argument.strip_prefix("-U") {
+                    defined_macros.remove(&macro_name(name)?);
+                } else if let Some(value) = argument.strip_prefix("-std=") {
+                    std_language = Some(if value.contains("++") {
+                        CompiledLanguage::Cpp
+                    } else {
+                        CompiledLanguage::C
+                    });
+                } else if let Some(value) = argument.strip_prefix("-x")
+                    && let Some(language) = language_from_x_value(value)
+                {
+                    explicit_language = Some(language);
                 }
                 index += 1;
             }
@@ -331,7 +423,36 @@ fn parse_compile_arguments(directory: &Path, arguments: &[String]) -> Option<Cpp
         forced_includes,
         defined_macros,
         include_search_roots,
+        driver_basename,
+        explicit_language,
+        std_language,
     })
+}
+
+/// The driver invocation's basename, with one trailing extension (`.exe` on
+/// Windows) stripped. `-c++`-style drivers such as `g++`, `clang++`, and
+/// `arm-none-eabi-g++` keep their identifying `++` suffix; `cl.exe` reduces to
+/// `cl`, which decides nothing by itself.
+fn driver_basename(driver: &str) -> Option<String> {
+    Path::new(driver)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_owned)
+}
+
+/// The C/C++ family named by an `-x` value, split (`-x c++`) or glued
+/// (`-xc++`) alike. `None` for a value this evidence hierarchy does not
+/// classify, such as `-x assembler`.
+fn language_from_x_value(value: &str) -> Option<CompiledLanguage> {
+    let family = value
+        .strip_suffix("-header")
+        .or_else(|| value.strip_suffix("-cpp-output"))
+        .unwrap_or(value);
+    match family {
+        "c" => Some(CompiledLanguage::C),
+        "c++" => Some(CompiledLanguage::Cpp),
+        _ => None,
+    }
 }
 
 fn argument_path(directory: &Path, raw: &str) -> Option<PathBuf> {
@@ -359,9 +480,22 @@ fn macro_name(definition: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CppCompileContexts, CppExternalIncludeResolution};
+    use super::{CompiledLanguage, CppCompileContexts, CppExternalIncludeResolution};
     use brokk_bifrost_core::analyzer::project::TestProject;
     use brokk_bifrost_core::analyzer::{Language, ProjectFile};
+    use std::path::Path;
+
+    /// Parses one argument vector into a compile context the same way
+    /// [`super::CompilationDatabaseEntry::compile_context`] does, without a
+    /// project or a `compile_commands.json` fixture.
+    fn context(arguments: &[&str]) -> super::CppCompileContext {
+        let arguments = arguments
+            .iter()
+            .map(|argument| argument.to_string())
+            .collect::<Vec<_>>();
+        super::parse_compile_arguments(Path::new("/workspace"), &arguments)
+            .expect("non-empty argument vector parses")
+    }
 
     fn project_with_database(database: Option<&str>) -> (tempfile::TempDir, TestProject) {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -438,6 +572,24 @@ mod tests {
             context.project_include_roots
         );
         assert!(context.defined_macros.contains("NAME"));
+    }
+
+    #[test]
+    fn undefine_flags_apply_in_command_order() {
+        let context = context(&[
+            "cc",
+            "-DKEPT",
+            "-DCANCELLED",
+            "-U",
+            "CANCELLED",
+            "-UREVIVED",
+            "-DREVIVED",
+            "-UNEVER_DEFINED",
+        ]);
+        assert!(context.defined_macros.contains("KEPT"));
+        assert!(context.defined_macros.contains("REVIVED"));
+        assert!(!context.defined_macros.contains("CANCELLED"));
+        assert!(!context.defined_macros.contains("NEVER_DEFINED"));
     }
 
     #[test]
@@ -613,5 +765,102 @@ mod tests {
 
         assert_eq!(1, context.project_include_roots.len());
         assert_eq!(2, context.system_include_roots.len());
+    }
+
+    #[test]
+    fn default_by_extension_c_is_c_and_everything_else_is_cpp() {
+        let cx = context(&["cc", "-c", "file.c"]);
+        assert_eq!(CompiledLanguage::C, cx.tu_language(Path::new("file.c")));
+
+        let cx = context(&["cc", "-c", "file.cc"]);
+        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.cc")));
+        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.hpp")));
+    }
+
+    #[test]
+    fn driver_basename_ending_in_plus_plus_selects_cpp_over_a_c_extension() {
+        let cx = context(&["clang++", "-c", "file.c"]);
+        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.c")));
+
+        // A driver that does not end in `++` (even a cross-compiler prefix
+        // form) falls through to extension evidence.
+        let cx = context(&["arm-none-eabi-gcc", "-c", "file.c"]);
+        assert_eq!(CompiledLanguage::C, cx.tu_language(Path::new("file.c")));
+
+        // Prefixed driver names ending in `++` are still recognized.
+        let cx = context(&["arm-none-eabi-g++", "-c", "file.h"]);
+        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.h")));
+    }
+
+    #[test]
+    fn driver_exe_suffix_is_stripped_before_the_plus_plus_check() {
+        let cx = context(&["clang++.exe", "-c", "file.c"]);
+        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.c")));
+    }
+
+    #[test]
+    fn std_family_outranks_the_driver_basename() {
+        // -std outranks the driver: a g++ invocation pinned to a C standard
+        // compiles as C even though the driver name ends in `++`.
+        let cx = context(&["g++", "-std=gnu11", "-c", "file.c"]);
+        assert_eq!(CompiledLanguage::C, cx.tu_language(Path::new("file.c")));
+
+        let cx = context(&["gcc", "-std=c++17", "-c", "file.cc"]);
+        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.cc")));
+
+        let cx = context(&["gcc", "-std=c17", "-c", "file.cc"]);
+        assert_eq!(CompiledLanguage::C, cx.tu_language(Path::new("file.cc")));
+
+        let cx = context(&["gcc", "-std=gnu++20", "-c", "file.c"]);
+        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.c")));
+    }
+
+    #[test]
+    fn explicit_x_split_form_outranks_std_and_driver() {
+        let cx = context(&["clang", "-x", "c", "-std=c++17", "-c", "file.cpp"]);
+        assert_eq!(CompiledLanguage::C, cx.tu_language(Path::new("file.cpp")));
+    }
+
+    #[test]
+    fn explicit_x_glued_form_is_recognized() {
+        let cx = context(&["gcc", "-xc++", "-c", "file.c"]);
+        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.c")));
+
+        let cx = context(&["g++", "-xc", "-c", "file.cpp"]);
+        assert_eq!(CompiledLanguage::C, cx.tu_language(Path::new("file.cpp")));
+    }
+
+    #[test]
+    fn explicit_x_on_a_c_file_overrides_the_extension() {
+        // The precedence example from the ExecPlan: `-x c++` on a `.c` file
+        // compiles as C++.
+        let cx = context(&["gcc", "-x", "c++", "-c", "file.c"]);
+        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.c")));
+    }
+
+    #[test]
+    fn unrecognized_x_value_is_ignored() {
+        let cx = context(&["gcc", "-x", "assembler", "-c", "file.s"]);
+        // No C/C++ evidence at all in this configuration, so the extension
+        // (not "c") decides.
+        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.s")));
+    }
+
+    #[test]
+    fn msvc_tc_and_tp_force_the_language_regardless_of_extension() {
+        let cx = context(&["cl.exe", "/TC", "/c", "file.cpp"]);
+        assert_eq!(CompiledLanguage::C, cx.tu_language(Path::new("file.cpp")));
+
+        let cx = context(&["cl.exe", "/TP", "/c", "file.c"]);
+        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.c")));
+    }
+
+    #[test]
+    fn cl_exe_without_tc_or_tp_decides_by_extension() {
+        let cx = context(&["cl.exe", "/c", "file.c"]);
+        assert_eq!(CompiledLanguage::C, cx.tu_language(Path::new("file.c")));
+
+        let cx = context(&["cl.exe", "/c", "file.cpp"]);
+        assert_eq!(CompiledLanguage::Cpp, cx.tu_language(Path::new("file.cpp")));
     }
 }

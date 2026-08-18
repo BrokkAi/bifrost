@@ -43,7 +43,7 @@ pub fn compute_cyclomatic_complexity(
     } else {
         DEFAULT_CYCLOMATIC_THRESHOLD
     };
-    let resolved = resolve_project_files(analyzer.project(), params.file_paths);
+    let resolved = resolve_project_files(analyzer, params.file_paths);
     let mut truncated = resolved.input_truncated;
     let ambiguous_paths = resolved.ambiguous_paths.clone();
 

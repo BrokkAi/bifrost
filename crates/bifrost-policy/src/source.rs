@@ -4793,6 +4793,7 @@ fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> 
             PolicyRecord::Assert,
             PolicyRecord::AssertResolution,
             PolicyRecord::AssertBindingScope,
+            PolicyRecord::AssertValueOrigin,
             PolicyRecord::AssertBoundary,
             PolicyRecord::AssertGeneration,
             PolicyRecord::AssertDeclarationState,
@@ -4814,6 +4815,9 @@ fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> 
         PolicyRecord::AssertBindingScope => Ok(PolicyAssert::BindingScope(
             decode_binding_scope_assert(expr)?,
         )),
+        PolicyRecord::AssertValueOrigin => {
+            Ok(PolicyAssert::ValueOrigin(decode_value_origin_assert(expr)?))
+        }
         PolicyRecord::AssertBoundary => Ok(PolicyAssert::Boundary(decode_boundary_assert(expr)?)),
         PolicyRecord::AssertGeneration => {
             Ok(PolicyAssert::Generation(decode_generation_assert(expr)?))
@@ -5053,6 +5057,46 @@ fn decode_binding_scope_assert(expr: &Expr) -> Result<BindingScopeAssert, Policy
         ));
     }
     Ok(BindingScopeAssert {
+        id,
+        at,
+        role,
+        containment,
+        relative_to,
+    })
+}
+
+fn decode_value_origin_assert(expr: &Expr) -> Result<ValueOriginAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertValueOrigin,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let role = decode_reference_role(fields.required("role"), "`assert-value-origin`")?;
+    let containment = match expect_atom(
+        fields.required("established"),
+        AtomDomain::DeclaredContainment,
+        "established containment",
+    )? {
+        PolicyAtomValue::DeclaredInside => DeclaredContainment::Inside,
+        PolicyAtomValue::DeclaredOutside => DeclaredContainment::Outside,
+        value => unreachable!("DeclaredContainment registry returned {value:?}"),
+    };
+    let relative_to_expr = fields.required("relative-to");
+    let relative_to = decode_assert_capture(relative_to_expr, "assert related capture name")?;
+    // A node is trivially inside itself and never outside itself, so comparing
+    // a capture against itself states a verdict rather than a rule.
+    if relative_to == at {
+        return Err(source_error(
+            "contradictory-assert-containment",
+            relative_to_expr.range.clone(),
+            format!(
+                "`:relative-to` names the same capture as `:at` (`{at}`), whose containment is fixed"
+            ),
+        ));
+    }
+    Ok(ValueOriginAssert {
         id,
         at,
         role,

@@ -831,6 +831,7 @@ impl CodeQueryOccurrenceTarget {
                 range.start_line
             )],
             Self::Unresolved { status } => vec![format!("-> unresolved ({status})")],
+            Self::NotDerived => vec!["-> target not derived (not requested)".to_string()],
         }
     }
 }

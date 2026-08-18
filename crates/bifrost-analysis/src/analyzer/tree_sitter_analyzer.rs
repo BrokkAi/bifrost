@@ -598,6 +598,31 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     }
     fn extract_call_receiver(&self, reference: &str) -> Option<String>;
     fn parse_file(&self, file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile;
+    /// Extra row-sets this blob contributes under storage language keys other
+    /// than [`LanguageAdapter::storage_language_key_for_file`]'s answer.
+    ///
+    /// One blob normally has one reading, and the default says so. C++ is the
+    /// exception: a header has no compilation language of its own, so its
+    /// blob has both a C and a C++ reading, and the two disagree about where a
+    /// tag declared inside an aggregate member list lives (issue #1970). The
+    /// adapter returns the second reading only when it actually differs from
+    /// `primary`, which is what makes "no rows under the other key" mean
+    /// "identical to the primary" rather than "not computed yet".
+    ///
+    /// Called once per blob parse, on the same tree the primary walk used, so
+    /// an implementor must not re-parse. The result is persisted under each
+    /// returned key at that key's own store generation and is never hydrated
+    /// back into the file's own state.
+    fn additional_projections(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        tree: &Tree,
+        primary: &ParsedFile,
+    ) -> Vec<(&'static str, ParsedFile)> {
+        let _ = (file, source, tree, primary);
+        Vec::new()
+    }
     fn definition_priority(&self, _code_unit: &CodeUnit) -> i32 {
         0
     }
@@ -730,6 +755,16 @@ pub struct FileState {
     /// marker for in-memory reads, but the store must never publish that
     /// marker as a complete parsed blob.
     pub(crate) parse_complete: bool,
+    /// Row-sets this same blob contributes under storage language keys other
+    /// than the file's own, produced by
+    /// [`LanguageAdapter::additional_projections`] and persisted alongside the
+    /// primary row-set (see `write_parsed_blob_tx`).
+    ///
+    /// Empty for every language but C++, and empty on a hydrated state: a
+    /// projection is a write-side product of one parse, never a hydration
+    /// output. `blobs`/`code_units` are already keyed `(blob_oid, lang)`, so
+    /// this needs no schema of its own.
+    pub(crate) additional_projections: Vec<(&'static str, Arc<FileState>)>,
 }
 
 impl FileState {
@@ -2869,18 +2904,36 @@ where
             BoundedParse::Rejected => return None,
         };
         let mut parsed = adapter.parse_file(file, &source, &tree);
+        // Asked before the file scope is added: `add_file_scope` contributes
+        // the identical module unit to every reading of one blob, so an
+        // implementor comparing its projection against `parsed` compares only
+        // what the language walk itself produced.
+        let projections = adapter.additional_projections(file, &source, &tree, &parsed);
         parsed.add_file_scope(file, &source);
         let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
         let mut parse_errors = Vec::new();
         collect_parse_errors(tree.root_node(), &mut parse_errors);
+        let additional_projections = projections
+            .into_iter()
+            .map(|(storage_key, mut projection)| {
+                projection.add_file_scope(file, &source);
+                (
+                    storage_key,
+                    Arc::new(Self::file_state_from_parsed(
+                        String::new(),
+                        projection,
+                        contains_tests,
+                        None,
+                        true,
+                    )),
+                )
+            })
+            .collect();
 
-        Some(Self::file_state_from_parsed(
-            source,
-            parsed,
-            contains_tests,
-            Some(parse_errors),
-            true,
-        ))
+        let mut state =
+            Self::file_state_from_parsed(source, parsed, contains_tests, Some(parse_errors), true);
+        state.additional_projections = additional_projections;
+        Some(state)
     }
 
     /// Assemble a `FileState` from a completed parse.
@@ -2923,6 +2976,7 @@ where
             materialization_records: parsed.materialization_records,
             parse_errors,
             parse_complete,
+            additional_projections: Vec::new(),
         }
     }
 
@@ -3443,7 +3497,7 @@ where
             out.insert(file, oid);
         }
         if let Some(liveness) = store_context.liveness.as_ref() {
-            let _ = liveness.refresh_overlay(live_entries.iter().cloned());
+            liveness.refresh_overlay(live_entries.iter().cloned())?;
         }
         if replace_live_paths {
             store_context.live_paths.replace_all(live_entries);
@@ -4553,6 +4607,41 @@ where
         let oid = self.resolve_live_oid_for_file(file)?;
         let key = Self::transient_cache_key(oid, file);
         self.fetch_file_state_for_key(file, &key)
+    }
+
+    /// The second reading of `file`'s blob stored under `storage_key`, when
+    /// this adapter wrote one (see [`LanguageAdapter::additional_projections`]).
+    ///
+    /// `None` means no rows exist under that key for this blob, which by that
+    /// method's contract means the reading is identical to the file's own
+    /// row-set -- so a caller falls back to [`Self::fetch_file_state`] rather
+    /// than treating the absence as an error.
+    ///
+    /// Deliberately not routed through the file-state caches: those are keyed
+    /// by `(oid, path)` alone, which is exactly the identity a projection
+    /// shares with the primary reading. The caller memoizes instead, on the
+    /// analyzer that knows when a projection is worth asking for at all.
+    pub(crate) fn projection_file_state(
+        &self,
+        file: &ProjectFile,
+        storage_key: &str,
+    ) -> Option<Arc<FileState>> {
+        let generation = self.store_context.generations.get(storage_key).copied()?;
+        let oid = self.resolve_live_oid_for_file(file)?;
+        let source = self.source_for_oid(file, oid)?;
+        self.store_query_or_record(
+            self.store_context.store.hydrate_file_state_with_source(
+                oid,
+                storage_key,
+                generation,
+                self.adapter.as_ref(),
+                file,
+                &source,
+            ),
+            format!("hydrating the `{storage_key}` projection of `{file}`"),
+        )
+        .flatten()
+        .map(Arc::new)
     }
 
     fn current_source(&self, file: &ProjectFile) -> Option<String> {
@@ -9316,7 +9405,7 @@ impl<A> TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
-    fn record_store_error(&self, error: StoreError) {
+    pub(crate) fn record_store_error(&self, error: StoreError) {
         let contexts = self.query_read_cache_lock().contexts.clone();
         for context in contexts {
             context.record_store_error(error.clone());
@@ -10027,6 +10116,10 @@ where
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.query_read_cache_lock().workspace_file_index_cell()
+    }
+
+    fn record_query_failure(&self, error: StoreError) {
+        TreeSitterAnalyzer::record_store_error(self, error);
     }
 
     fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
@@ -11284,6 +11377,7 @@ mod tests {
             materialization_records: Vec::new(),
             parse_errors: None,
             parse_complete: true,
+            additional_projections: Vec::new(),
         }
     }
 

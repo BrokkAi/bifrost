@@ -2,7 +2,7 @@ use super::*;
 use crate::analyzer::LanguageAdapter;
 use crate::analyzer::cpp::CppAdapter;
 use crate::analyzer::cpp::{
-    CppOccurrenceRole, cpp_callable_definitions_share_identity_evidence,
+    CppOccurrenceRole, cpp_callable_definitions_share_identity_evidence_with_visibility,
     cpp_header_body_files_are_related, cpp_indexed_callable_linkage, cpp_is_range_for_binding_name,
     cpp_occurrence_role_for_range,
 };
@@ -25,6 +25,7 @@ use brokk_bifrost_cpp::call_match::{
     cpp_signature_param_types, cpp_signature_trailing_qualifiers, cpp_type_text_pointer_depth,
     normalize_cpp_type_name,
 };
+use brokk_bifrost_cpp::graph::CppGraphSource;
 use brokk_bifrost_cpp::graph::resolver::{
     OrdinaryMacroReferenceResolution, cpp_alias_declaration_target_text,
     cpp_member_using_declaration_scopes, cpp_qualified_name_has_scope_suffix, is_c_source_file,
@@ -156,8 +157,18 @@ pub(super) fn select_navigation_targets(
         let range_owner = cpp
             .and_then(|cpp| cpp.reconciled_provisional(candidate))
             .unwrap_or_else(|| candidate.clone());
-        let ranges = index.ranges(&range_owner);
+        let mut ranges = index.ranges(&range_owner).to_vec();
         source_ranges_truncated |= index.is_truncated(&range_owner);
+        // #1970: this navigation index is the C++ walk of the file, so it has
+        // nothing for an identity only the C reading of a header mints. Those
+        // declaration ranges live in the stored `cpp:c` row-set, which the
+        // analyzer overlays; `c_reading_ranges` answers only for a unit that
+        // reading actually mints, so no other candidate is affected.
+        if ranges.is_empty()
+            && let Some(c_reading_ranges) = cpp.and_then(|cpp| cpp.c_reading_ranges(candidate))
+        {
+            ranges = c_reading_ranges;
+        }
         if ranges.is_empty() && !candidate.is_callable() && !candidate.is_class() {
             classified.push((candidate.clone(), None, CppOccurrenceRole::Both, None));
             continue;
@@ -469,6 +480,37 @@ pub(super) fn resolve_cpp<'a>(
                 ctx.support,
                 text,
                 Some(CppTargetKind::GlobalField),
+                cpp_lexical_namespace(identifier, ctx.source).as_deref(),
+            );
+            if !candidates.is_empty() {
+                return candidates_outcome(candidates);
+            }
+            // A function used as a value (`pthread_create(..., worker, ...)`,
+            // an initializer, or an assignment RHS) is an Identifier, not a
+            // Call. Field lookup above is empty for that spelling.
+            let candidates = ctx
+                .support
+                .file_identifier(ctx.file, text)
+                .into_iter()
+                .filter(|unit| {
+                    cpp_unit_matches_kind(
+                        ctx.analyzer,
+                        ctx.support,
+                        unit,
+                        CppTargetKind::FreeFunction,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !candidates.is_empty() {
+                return candidates_outcome(candidates);
+            }
+            let candidates = cpp_visible_name_candidates(
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                ctx.support,
+                text,
+                Some(CppTargetKind::FreeFunction),
                 cpp_lexical_namespace(identifier, ctx.source).as_deref(),
             );
             if !candidates.is_empty() {
@@ -1494,9 +1536,29 @@ fn cpp_bounded_type_candidates_for_name(
     })
 }
 
+fn cpp_bounded_name_has_any_declaration(
+    provider: &CppBoundedProvider<'_>,
+    lexical_scopes: &[String],
+    relative_fqn: &str,
+    name: &str,
+) -> bool {
+    for scope in lexical_scopes.iter().rev() {
+        if !provider.session.scope_step() {
+            return true;
+        }
+        if !provider
+            .definitions_named(&format!("{scope}.{relative_fqn}"), name)
+            .is_empty()
+        {
+            return true;
+        }
+    }
+    !provider.definitions_named(relative_fqn, name).is_empty()
+}
+
 fn cpp_bounded_type_candidates(
     provider: &CppBoundedProvider<'_>,
-    _file: &ProjectFile,
+    file: &ProjectFile,
     source: &str,
     node: Node<'_>,
 ) -> Option<CppBoundedTypeResolution> {
@@ -1537,6 +1599,43 @@ fn cpp_bounded_type_candidates(
             .into_iter()
             .filter(CodeUnit::is_class)
             .collect();
+    }
+    // GLib `G_DECLARE_*` and the same token-paste idiom mint `typedef struct _T T`
+    // without leaving an indexed `T`. When no declaration named `T` exists, the
+    // unique file-scope tag `_T` is that type (#2370).
+    if candidates.is_empty()
+        && is_c_source_file(file)
+        && !name.starts_with('_')
+        && !name.contains("::")
+        && !cpp_bounded_name_has_any_declaration(provider, &lexical_scopes, relative_fqn, name)
+    {
+        let tag = format!("_{name}");
+        if !structured_path
+            .as_ref()
+            .is_some_and(|path| path.is_absolute)
+        {
+            for scope in lexical_scopes.iter().rev() {
+                if !provider.session.scope_step() {
+                    return None;
+                }
+                let candidate_fqn = format!("{scope}.{tag}");
+                candidates = provider
+                    .definitions_named(&candidate_fqn, &tag)
+                    .into_iter()
+                    .filter(CodeUnit::is_class)
+                    .collect();
+                if !candidates.is_empty() {
+                    break;
+                }
+            }
+        }
+        if candidates.is_empty() {
+            candidates = provider
+                .definitions_named(&tag, &tag)
+                .into_iter()
+                .filter(CodeUnit::is_class)
+                .collect();
+        }
     }
     sort_units(&mut candidates);
     candidates.dedup();
@@ -4522,7 +4621,11 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 };
                 if !member_candidates.is_empty() {
                     if call_arity.is_none()
-                        && !cpp_candidates_are_one_logical_symbol(&member_candidates)
+                        && !cpp_candidates_are_one_logical_symbol(
+                            &ctx_dispatch.source(),
+                            ctx.visibility,
+                            &member_candidates,
+                        )
                     {
                         // The competing members are in hand; an ambiguous answer
                         // must carry them rather than drop them (#1811).
@@ -4566,6 +4669,23 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             if !macros.is_empty() {
                 return candidates_outcome(macros);
             }
+            // #2011: a declaration behind a conditional include whose guard
+            // only a build configuration can prove is an incomplete answer,
+            // not a decided miss. Say so, so absent compile data is an
+            // observable, actionable state.
+            if ctx
+                .visibility
+                .miss_requires_compile_context(ctx.file, name, call)
+            {
+                return no_definition(
+                    "missing_compile_context",
+                    format!(
+                        "`{name}` is declared behind a conditional include whose guard needs \
+                         compile-context proof, and no compile_commands.json entry covers this \
+                         translation unit"
+                    ),
+                );
+            }
             no_definition(
                 "no_indexed_definition",
                 format!("`{name}` did not resolve to an indexed C++ callable"),
@@ -4600,8 +4720,10 @@ fn cpp_bare_free_function_definition_candidates(
                         ctx.support,
                         candidate,
                         CppTargetKind::FreeFunction,
-                    ) && cpp_callable_definitions_share_identity_evidence(
+                    ) && cpp_callable_definitions_share_identity_evidence_with_visibility(
                         ctx.analyzer,
+                        &ctx_dispatch.source(),
+                        ctx.visibility,
                         &unit,
                         candidate,
                     )
@@ -5063,12 +5185,16 @@ fn cpp_visible_name_candidates(
     if let Some(kind) = kind {
         candidates.retain(|unit| cpp_unit_matches_kind(analyzer, support, unit, kind));
     }
+    let dispatch = CppDispatch::new(analyzer);
+    let graph = dispatch.source();
     candidates = candidates
         .into_iter()
         .flat_map(|unit| {
             let mut indexed = support.fqn(&unit.fq_name());
             indexed.retain(|candidate| {
-                cpp_callable_definitions_share_identity_evidence(analyzer, &unit, candidate)
+                cpp_callable_definitions_share_identity_evidence_with_visibility(
+                    analyzer, &graph, visibility, &unit, candidate,
+                )
             });
             if indexed.is_empty() {
                 vec![unit]
@@ -5091,10 +5217,23 @@ fn cpp_visible_name_candidates(
 /// gets from `resolve_callable_candidates` (#1811). A genuine overload set
 /// differs in signature, including by a trailing cv- or ref-qualifier, so it
 /// stays ambiguous.
-fn cpp_candidates_are_one_logical_symbol(candidates: &[CodeUnit]) -> bool {
-    candidates
-        .split_first()
-        .is_some_and(|(first, rest)| rest.iter().all(|other| same_logical_symbol(first, other)))
+///
+/// The signature string embeds each parameter type exactly as it was spelled,
+/// so a declaration inside `namespace zmq { class dist_t { ... } }` reading
+/// `send_to_matching(msg_t *)` and its file-scope body reading `zmq::msg_t *`
+/// carry different strings for what C++ ([dcl.fct]) reads as one declaration.
+/// Resolved parameter-spelling agreement therefore counts too:
+/// `same_logical_callable` answers the string question first and resolves the
+/// written parameter names only when the strings differ (#2010).
+fn cpp_candidates_are_one_logical_symbol(
+    analyzer: &CppGraphSource<'_>,
+    visibility: &CppVisibilityIndex,
+    candidates: &[CodeUnit],
+) -> bool {
+    candidates.split_first().is_some_and(|(first, rest)| {
+        rest.iter()
+            .all(|other| visibility.same_logical_callable(analyzer, first, other))
+    })
 }
 
 /// Cross-file C/C++ callable bodies selected from include evidence are useful
@@ -6332,7 +6471,7 @@ fn cpp_filter_candidates_by_call(
     visibility: &CppVisibilityIndex,
     file: &ProjectFile,
 ) -> Vec<CodeUnit> {
-    let arity_filtered = cpp_filter_candidates_by_arity(candidates, arity, analyzer);
+    let arity_filtered = cpp_filter_candidates_by_arity(candidates, arity, analyzer, visibility);
     let Some(arg_types) = arg_types else {
         return arity_filtered;
     };
@@ -6350,7 +6489,7 @@ fn cpp_filter_candidates_by_call_lazy<F>(
 where
     F: FnOnce() -> Option<Vec<Option<CppType>>>,
 {
-    let arity_filtered = cpp_filter_candidates_by_arity(candidates, arity, analyzer);
+    let arity_filtered = cpp_filter_candidates_by_arity(candidates, arity, analyzer, visibility);
     if arity_filtered.len() <= 1 {
         return arity_filtered;
     }
@@ -6400,6 +6539,7 @@ fn cpp_filter_candidates_by_arity(
     candidates: Vec<CodeUnit>,
     arity: Option<usize>,
     analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
 ) -> Vec<CodeUnit> {
     let Some(expected) = arity else {
         return candidates;
@@ -6408,29 +6548,50 @@ fn cpp_filter_candidates_by_arity(
     if filtered.is_empty() {
         candidates
     } else {
+        let dispatch = CppDispatch::new(analyzer);
+        let graph = dispatch.source();
         candidates
             .into_iter()
             .filter(|candidate| {
                 filtered.contains(candidate)
                     || filtered.iter().any(|declaration| {
-                        cpp_callable_overload_identity_matches(analyzer, declaration, candidate)
-                            && cpp_known_callable_arity(analyzer, candidate)
-                                .is_none_or(|candidate_arity| candidate_arity.accepts(expected))
+                        cpp_callable_overload_identity_matches(
+                            analyzer,
+                            &graph,
+                            visibility,
+                            declaration,
+                            candidate,
+                        ) && cpp_known_callable_arity(analyzer, candidate)
+                            .is_none_or(|candidate_arity| candidate_arity.accepts(expected))
                     })
             })
             .collect()
     }
 }
 
+/// Whether one arity winner and one candidate are the same overload seen twice.
+///
+/// The parameter-type spellings are compared on top of the cross-file identity
+/// evidence, and both readings have to agree with #2010: a declaration and its
+/// out-of-line body that spell one parameter type two ways pass the evidence
+/// check through the resolved comparison, and a plain string comparison of the
+/// spellings would then re-split the pair the evidence just unified. So the
+/// spelling comparison defers to the same relation, which answers string
+/// equality first.
 fn cpp_callable_overload_identity_matches(
     analyzer: &dyn IAnalyzer,
+    graph: &CppGraphSource<'_>,
+    visibility: &CppVisibilityIndex,
     left: &CodeUnit,
     right: &CodeUnit,
 ) -> bool {
     left.fq_name() == right.fq_name()
-        && cpp_callable_definitions_share_identity_evidence(analyzer, left, right)
-        && left.signature().and_then(cpp_signature_param_types)
+        && cpp_callable_definitions_share_identity_evidence_with_visibility(
+            analyzer, graph, visibility, left, right,
+        )
+        && (left.signature().and_then(cpp_signature_param_types)
             == right.signature().and_then(cpp_signature_param_types)
+            || visibility.same_logical_callable(graph, left, right))
 }
 
 fn cpp_filter_candidates_by_arity_strict(
@@ -8218,6 +8379,39 @@ fn cpp_resolve_type_unit_in_namespace(
     }
     let mut seen = HashSet::default();
     cpp_resolve_type_unit_inner(analyzer, visibility, file, type_text, &mut seen)
+        .or_else(|| cpp_c_underscore_tag_type_unit(visibility, file, &name))
+}
+
+/// GLib `G_DECLARE_*` mints `typedef struct _T T` without an indexed `T`.
+/// When the workspace has no declaration named `T`, the unique C tag `_T`
+/// is that type (#2370).
+fn cpp_c_underscore_tag_type_unit(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    name: &str,
+) -> Option<CodeUnit> {
+    if !is_c_source_file(file)
+        || name.is_empty()
+        || name.starts_with('_')
+        || name.contains("::")
+        || name.contains('<')
+        || name.contains(' ')
+    {
+        return None;
+    }
+    if visibility
+        .type_name_candidates(file, name)
+        .iter()
+        .any(|unit| unit.identifier() == name)
+    {
+        return None;
+    }
+    let tag = format!("_{name}");
+    visibility
+        .type_name_candidates(file, &tag)
+        .into_iter()
+        .find(|unit| unit.is_class() && unit.identifier() == tag)
+        .cloned()
 }
 
 fn cpp_resolve_type_alias_unit(
@@ -8526,6 +8720,7 @@ fn cpp_call_return_type(
                 ),
                 Some(arity),
                 analyzer,
+                visibility,
             )
         }
         "identifier" | "dependent_name" | "template_function" | "template_method" => {
@@ -8542,6 +8737,7 @@ fn cpp_call_return_type(
                 ),
                 Some(arity),
                 analyzer,
+                visibility,
             )
         }
         "field_expression" => {

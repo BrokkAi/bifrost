@@ -357,4 +357,55 @@ assert.deepStrictEqual(
   `${cursorMarketplacePath} plugin version should match Cargo.toml`,
 );
 
+const dshManifestPath = "plugins/bifrost-dsh/package.json";
+const dshManifest = JSON.parse(fs.readFileSync(dshManifestPath, "utf8"));
+if (dshManifest.version !== cargoVersion) {
+  throw new Error(
+    `${dshManifestPath} version ${dshManifest.version} does not match Cargo.toml version ${cargoVersion}`,
+  );
+}
+assert.deepStrictEqual(
+  dshManifest.name,
+  "@brokkai/dsh-plugin-bifrost",
+  `${dshManifestPath} should keep the published dsh bundle name`,
+);
+assert.deepStrictEqual(
+  dshManifest.dsh,
+  { bundle: { patch: "./cordis.patch.yml" } },
+  `${dshManifestPath} should declare the dsh bundle patch`,
+);
+assert.ok(
+  dshManifest.keywords?.includes("dsh-plugin"),
+  `${dshManifestPath} should carry the dsh-plugin discovery keyword`,
+);
+assert.equal(
+  typeof dshManifest.engines?.dsh,
+  "string",
+  `${dshManifestPath} should pin a dsh compatibility floor in engines.dsh`,
+);
+assert.equal(
+  typeof dshManifest.peerDependencies?.["@deepseek-ai/dsh-mcp-client"],
+  "string",
+  `${dshManifestPath} should declare the harness-provided MCP client as a peer dependency`,
+);
+const dshPatch = fs.readFileSync("plugins/bifrost-dsh/cordis.patch.yml", "utf8");
+assert.match(
+  dshPatch,
+  /^- insert:\n {4}- id: bifrost\n {6}name: '@brokkai\/dsh-plugin-bifrost'\n$/mu,
+  "plugins/bifrost-dsh/cordis.patch.yml should insert exactly the Bifrost bundle row",
+);
+// The dsh bundle vendors the shared launcher; the canonical files stay in
+// plugins/bifrost-agent and the copies must not drift.
+for (const [canonical, vendored] of [
+  ["plugins/bifrost-agent/bin/bifrost-launcher.mjs", "plugins/bifrost-dsh/bin/bifrost-launcher.mjs"],
+  ["plugins/bifrost-agent/bifrost-release.json", "plugins/bifrost-dsh/bifrost-release.json"],
+]) {
+  if (!fs.readFileSync(canonical).equals(fs.readFileSync(vendored))) {
+    throw new Error(
+      `${vendored} is out of sync with ${canonical}; run node plugins/bifrost-dsh/scripts/sync-launcher.mjs`,
+    );
+  }
+}
+fs.accessSync("plugins/bifrost-dsh/bin/bifrost-launcher.mjs", fsConstants.X_OK);
+
 console.log(`Agent plugin manifests are valid for Bifrost ${cargoVersion}.`);

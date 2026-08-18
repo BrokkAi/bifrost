@@ -425,6 +425,18 @@ impl RenderText for ScanUsagesResult {
             return format!("No {} requests were provided.", self.surface.tool_name());
         }
         let mut sections = Vec::new();
+        // First, and outside the absence-only scope block below: a caller who asked for more
+        // wall-clock time than the server grants must read the substitution whatever the statuses
+        // are, because a clamped scan and a completed scan otherwise look the same (#1886).
+        if let Some(clamp) = self.scope.max_duration_clamped {
+            sections.push(format!(
+                "Note: max_duration_secs={} exceeds the {}-second ceiling for {}; this scan ran with a {}-second budget.",
+                clamp.requested_secs,
+                clamp.applied_secs,
+                self.surface.tool_name(),
+                clamp.applied_secs
+            ));
+        }
         if self.results.iter().any(|entry| {
             matches!(
                 entry.status,
@@ -1313,6 +1325,7 @@ mod tests {
             paths: vec!["src/**/*.rs".to_string()],
             paths_omitted: None,
             ignored_paths: None,
+            max_duration_clamped: None,
         };
 
         let ordinary = render_scan_usages_scope(&scope, false);

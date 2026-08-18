@@ -241,7 +241,9 @@ pub(crate) enum ParserFlavor {
 impl ParserFlavor {
     const fn for_dialect(dialect: LanguageDialect) -> Self {
         match dialect {
-            LanguageDialect::Standard(_) => Self::Default,
+            // C and C++ share one grammar; the dialect only changes how the
+            // parsed tree is interpreted, never which parser produces it.
+            LanguageDialect::Standard(_) | LanguageDialect::CppC => Self::Default,
             LanguageDialect::TypeScriptTsx => Self::TypeScriptTsx,
         }
     }

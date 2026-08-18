@@ -767,7 +767,7 @@ fn finish_boundary(
     }
 }
 
-pub(in crate::analyzer::usages) fn boundary_evidence(
+pub fn boundary_evidence(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     name: &str,
@@ -966,6 +966,139 @@ pub(in crate::analyzer::usages) fn boundary_evidence(
             })
             .unwrap_or((BoundaryStatus::ExternalUnknown, None)),
         Language::None => (BoundaryStatus::ExternalUnknown, None),
+    }
+}
+
+/// How completely a call, reference, or boundary lookup answered the question
+/// dispatch asked. `workspace_oracle::dispatch` reports this as its
+/// `SemanticOutcome` variant; the external-reference probe reports it as one
+/// chain link (#1885) alongside the boundary and trace evidence the same
+/// lookup produced, so the two must read one mapping rather than two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchQuality {
+    Complete,
+    Ambiguous,
+    Unproven,
+    Unknown,
+    Unsupported(crate::analyzer::semantic::SemanticCapability),
+    Truncated,
+    Cancelled,
+}
+
+/// The total mapping from a definition lookup's status and, at a boundary
+/// outcome, its refined [`BoundaryStatus`], to the [`DispatchQuality`] that
+/// status alone supports. This is the single source of truth both
+/// `workspace_oracle::dispatch` (which additionally merges in
+/// materialization-time quality and an ambiguity-preservation rule of its
+/// own) and the external-reference probe read, so a resolver status can never
+/// map to one quality in the semantic oracle and a different one in the
+/// audit.
+///
+/// `status` is `None` for a lookup that named no status at all (for example
+/// because the site was never checked); `boundary` is only consulted for
+/// [`DefinitionLookupStatus::UnresolvableImportBoundary`], and its absence
+/// there is as unproven as [`BoundaryStatus::ExternalUnknown`].
+pub fn dispatch_quality_for_status(
+    status: Option<DefinitionLookupStatus>,
+    boundary: Option<BoundaryStatus>,
+) -> DispatchQuality {
+    match status {
+        Some(DefinitionLookupStatus::Resolved) => DispatchQuality::Complete,
+        Some(DefinitionLookupStatus::Ambiguous) => DispatchQuality::Ambiguous,
+        Some(DefinitionLookupStatus::UnsupportedLanguage) => {
+            DispatchQuality::Unsupported(crate::analyzer::semantic::SemanticCapability::Calls)
+        }
+        Some(
+            DefinitionLookupStatus::NoDefinition
+            | DefinitionLookupStatus::InvalidLocation
+            | DefinitionLookupStatus::NotFound,
+        )
+        | None => DispatchQuality::Unknown,
+        // A boundary outcome is complete only when the refined evidence
+        // (#1474) actually names the external target. A declared-but-
+        // unindexed dependency leaves the answer partial, and an unknown
+        // external root means the resolver never saw the target at all.
+        Some(DefinitionLookupStatus::UnresolvableImportBoundary) => match boundary {
+            Some(BoundaryStatus::WorkspaceLocal | BoundaryStatus::ExternalIndexed) => {
+                DispatchQuality::Complete
+            }
+            Some(BoundaryStatus::ExternalDeclaredUnindexed) => DispatchQuality::Unproven,
+            Some(BoundaryStatus::ExternalUnknown) | None => DispatchQuality::Unknown,
+        },
+    }
+}
+
+#[cfg(test)]
+mod dispatch_quality_tests {
+    use super::*;
+
+    /// Pins the full status/boundary -> quality table so the shared mapping
+    /// (read by both `workspace_oracle::dispatch` and the external-reference
+    /// probe, #1885) cannot drift silently in either direction.
+    #[test]
+    fn dispatch_quality_for_status_covers_every_arm() {
+        use crate::analyzer::semantic::SemanticCapability;
+
+        assert_eq!(
+            dispatch_quality_for_status(Some(DefinitionLookupStatus::Resolved), None),
+            DispatchQuality::Complete
+        );
+        assert_eq!(
+            dispatch_quality_for_status(Some(DefinitionLookupStatus::Ambiguous), None),
+            DispatchQuality::Ambiguous
+        );
+        assert_eq!(
+            dispatch_quality_for_status(Some(DefinitionLookupStatus::UnsupportedLanguage), None),
+            DispatchQuality::Unsupported(SemanticCapability::Calls)
+        );
+        for status in [
+            DefinitionLookupStatus::NoDefinition,
+            DefinitionLookupStatus::InvalidLocation,
+            DefinitionLookupStatus::NotFound,
+        ] {
+            assert_eq!(
+                dispatch_quality_for_status(Some(status), None),
+                DispatchQuality::Unknown
+            );
+        }
+        assert_eq!(
+            dispatch_quality_for_status(None, None),
+            DispatchQuality::Unknown
+        );
+
+        let boundary_status = DefinitionLookupStatus::UnresolvableImportBoundary;
+        assert_eq!(
+            dispatch_quality_for_status(
+                Some(boundary_status),
+                Some(BoundaryStatus::WorkspaceLocal)
+            ),
+            DispatchQuality::Complete
+        );
+        assert_eq!(
+            dispatch_quality_for_status(
+                Some(boundary_status),
+                Some(BoundaryStatus::ExternalIndexed)
+            ),
+            DispatchQuality::Complete
+        );
+        assert_eq!(
+            dispatch_quality_for_status(
+                Some(boundary_status),
+                Some(BoundaryStatus::ExternalDeclaredUnindexed)
+            ),
+            DispatchQuality::Unproven
+        );
+        assert_eq!(
+            dispatch_quality_for_status(
+                Some(boundary_status),
+                Some(BoundaryStatus::ExternalUnknown)
+            ),
+            DispatchQuality::Unknown
+        );
+        assert_eq!(
+            dispatch_quality_for_status(Some(boundary_status), None),
+            DispatchQuality::Unknown
+        );
     }
 }
 
@@ -1231,6 +1364,36 @@ mod boundary_evidence_tests {
                 self.file.clone(),
                 Arc::from(self.source.as_str()),
                 &CancellationToken::new(),
+            )
+            .pop()
+            .expect("one traced outcome per request")
+        }
+
+        /// The same traced resolution as [`Self::trace`], reached through the
+        /// public probe entry point (#1885) instead of the crate-internal one
+        /// [`resolve_definition_batch_with_trace`] wraps. Tests that exercise
+        /// this method prove the widened surface produces the resolver's own
+        /// answer, not a parallel one.
+        fn trace_via_probe_entry_point(
+            &self,
+            needle: &str,
+        ) -> (DefinitionLookupOutcome, ResolutionTraceResult) {
+            let start = self
+                .source
+                .find(needle)
+                .unwrap_or_else(|| panic!("fixture does not contain {needle:?}"));
+            let requests = vec![DefinitionLookupRequest {
+                file: self.file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(start),
+                end_byte: None,
+            }];
+            super::super::resolve_definition_batch_with_source_traced(
+                self.workspace.analyzer(),
+                requests,
+                self.file.clone(),
+                Arc::from(self.source.as_str()),
             )
             .pop()
             .expect("one traced outcome per request")
@@ -1986,6 +2149,137 @@ mod boundary_evidence_tests {
                 .iter()
                 .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
             "with nothing activated and no artifact, nothing is known: {routes:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Milestone 1 (#1885): the public probe entry points read the same
+    // resolver decisions as the crate-internal ones they wrap.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_public_traced_batch_reports_workspace_local_for_an_in_workspace_reference() {
+        // A reference that never leaves the workspace draws no boundary route
+        // at all; `TraceCandidate::selected` defaults every row's boundary to
+        // `WorkspaceLocal`, so that is the honest reading for a plain
+        // in-workspace hit rather than a value `finish_boundary` stamped.
+        let fixture = BoundaryFixture::new(
+            Language::Java,
+            "app/Caller.java",
+            concat!(
+                "package app;\n",
+                "class Helper {}\n",
+                "class Caller {\n",
+                "  Helper helper() { return null; }\n",
+                "}\n",
+            ),
+        );
+        let (outcome, trace) = fixture.trace_via_probe_entry_point("Helper helper");
+        assert_eq!(outcome.status, DefinitionLookupStatus::Resolved);
+        let selected: Vec<_> = trace.selected().collect();
+        assert!(
+            !selected.is_empty(),
+            "a resolved reference reports the candidate it selected: {:?}",
+            trace.candidates
+        );
+        assert!(
+            selected
+                .iter()
+                .all(|row| row.boundary == BoundaryStatus::WorkspaceLocal),
+            "an in-workspace selection is workspace-local: {selected:?}"
+        );
+        assert_eq!(
+            dispatch_quality_for_status(Some(outcome.status), None),
+            DispatchQuality::Complete
+        );
+    }
+
+    #[test]
+    fn the_public_traced_batch_agrees_with_direct_boundary_evidence_for_a_pack_indexed_reference() {
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_PACK_JAVA_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+        let pack = jdk_collections_pack(serde_json::json!([]));
+        activate_fixture_pack(
+            &fixture,
+            "fixture.jdk",
+            &pack,
+            activation_evidence("java", "jdk", "java.base"),
+        );
+
+        let (outcome, trace) = fixture.trace_via_probe_entry_point("Collections helper");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary
+        );
+        let routes = external_routes(&trace);
+        assert!(
+            routes.iter().all(|(boundary, target)| {
+                *boundary == BoundaryStatus::ExternalIndexed
+                    && target.as_deref() == Some("java.util.Collections")
+            }),
+            "the activated pack declares `java.util.Collections`: {routes:?}"
+        );
+
+        // Chain-link agreement (#1885): the direct evidence call must name the
+        // same boundary and target the trace already stamped on the row,
+        // because both read the same `boundary_evidence` fact.
+        let (direct_status, direct_target) = boundary_evidence(
+            fixture.workspace.analyzer(),
+            &fixture.file,
+            "java.util.Collections",
+        );
+        assert_eq!(direct_status, BoundaryStatus::ExternalIndexed);
+        assert_eq!(direct_target.as_deref(), Some("java.util.Collections"));
+
+        assert_eq!(
+            dispatch_quality_for_status(Some(outcome.status), Some(direct_status)),
+            DispatchQuality::Complete
+        );
+    }
+
+    #[test]
+    fn the_public_traced_batch_agrees_with_direct_boundary_evidence_without_the_pack() {
+        // Same reference, no pack activated: dependency discovery never ran
+        // for this fixture (`jvm_config_with_artifact_jar` disables it), so
+        // there is no retained evidence to refine the miss into
+        // `ExternalDeclaredUnindexed`. The honest answer here is
+        // `ExternalUnknown`, matching
+        // `a_java_reference_without_the_pack_stays_external_unknown` above.
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_PACK_JAVA_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+
+        let (outcome, trace) = fixture.trace_via_probe_entry_point("Collections helper");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary
+        );
+        let routes = external_routes(&trace);
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
+            "with nothing activated and no artifact, nothing is known: {routes:?}"
+        );
+
+        let (direct_status, direct_target) = boundary_evidence(
+            fixture.workspace.analyzer(),
+            &fixture.file,
+            "java.util.Collections",
+        );
+        assert_eq!(direct_status, BoundaryStatus::ExternalUnknown);
+        assert_eq!(direct_target, None);
+
+        assert_eq!(
+            dispatch_quality_for_status(Some(outcome.status), Some(direct_status)),
+            DispatchQuality::Unknown
         );
     }
 

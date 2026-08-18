@@ -20,7 +20,7 @@ use super::definition::{
 use super::finding::{
     CompletionReasonError, PolicyDiagnostic, PolicyDiagnosticSeverity, PolicyFinding,
     PolicyFindingError, PolicyIncompleteReason, PolicyRun, PolicyRunCompletion, PolicyRunError,
-    completion_allows_diagnostic_impact,
+    completion_allows_diagnostic_impact, normalize_policy_diagnostics_bounded,
 };
 use super::finding_identity::{FindingIdentityStability, PolicyFindingId};
 use super::identity::{EndpointAnalysisProjectionHash, EndpointSemanticHash, PolicySemanticHash};
@@ -2701,12 +2701,21 @@ impl PolicyReportBuilder {
         if self.runs[run_index].diagnostics().contains(&diagnostic) {
             return Ok(PolicyRetentionOutcome::Retained);
         }
-        let cap_reached =
-            self.runs[run_index].diagnostics().len() >= self.budget.per_policy().max_diagnostics();
         let mut candidate_runs = self.runs.clone();
         let mut diagnostics = candidate_runs[run_index].diagnostics().to_vec();
         diagnostics.push(diagnostic);
-        candidate_runs[run_index].replace_diagnostics(diagnostics, false);
+        // Past the per-policy cap the list is folded to one entry per reason
+        // family with the count of the diagnostics it covers, rather than
+        // dropping the reasons that sort last (#2356).
+        let condensed = normalize_policy_diagnostics_bounded(
+            &mut diagnostics,
+            self.budget.per_policy().max_diagnostics(),
+        );
+        candidate_runs[run_index].replace_diagnostics(diagnostics, condensed);
+        if condensed {
+            candidate_runs[run_index]
+                .mark_inconclusive(PolicyIncompleteReason::ReportRetentionBudget)?;
+        }
         self.refresh_candidate_policy_bytes(&mut candidate_runs, run_index);
         let policy_fits = self
             .policy_retained_bytes(&candidate_runs, run_index)
@@ -2723,7 +2732,7 @@ impl PolicyReportBuilder {
         .checked_add(self.reviews_extra())
         .and_then(|bytes| bytes.checked_add(self.emergency_allowance))
         .is_some_and(|bytes| bytes <= self.budget.max_retained_report_bytes());
-        if cap_reached || !policy_fits || !batch_fits {
+        if !policy_fits || !batch_fits {
             let mut omitted_runs = self.runs.clone();
             let retained = omitted_runs[run_index].diagnostics().to_vec();
             omitted_runs[run_index].replace_diagnostics(retained, true);
@@ -2735,6 +2744,9 @@ impl PolicyReportBuilder {
             return Ok(PolicyRetentionOutcome::DiagnosticOmitted);
         }
         self.runs = candidate_runs;
+        if condensed {
+            return Ok(PolicyRetentionOutcome::DiagnosticOmitted);
+        }
         Ok(PolicyRetentionOutcome::Retained)
     }
 

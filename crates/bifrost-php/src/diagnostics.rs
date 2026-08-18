@@ -8,8 +8,15 @@
 
 use crate::aliases::{
     PhpFileContext, resolve_php_constant, resolve_php_function, resolve_php_type,
+    resolve_php_type_arms,
 };
 use crate::external_surface::{PhpExternalMember, PhpExternalSurface, PhpExternalSymbol};
+use crate::graph::syntax::{
+    PhpMagicSurface, instance_receiver_type_fq_name, is_local_scope, literal_member_identifier,
+    magic_member_names, seed_assignment_binding, seed_parameter_types, static_member_parts,
+    static_property_identifier,
+};
+use crate::graph::{PhpCallableFacts, PhpGraphSource};
 use crate::graph_support::{
     PhpSource, php_direct_declared_class_parent, php_file_context_from_source,
 };
@@ -17,15 +24,13 @@ use brokk_bifrost_core::analyzer::model::{Range, SemanticDiagnostic};
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{node_range, node_text};
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
-use brokk_bifrost_core::analyzer::usages::local_inference::{
-    LocalInferenceEngine, SymbolResolution,
-};
+use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
 use brokk_bifrost_core::analyzer::{
     BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, ProjectFile, SemanticAbsenceProof,
     SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason, SemanticDiagnosticReport,
 };
 use brokk_bifrost_core::hash::HashSet;
-use brokk_bifrost_core::text_utils::compute_line_starts;
+use brokk_bifrost_core::text_utils::{compute_line_starts, find_line_index_for_offset};
 use tree_sitter::{Node, Parser, Tree};
 
 pub const PHP_UNRECOGNIZED_SYMBOL: &str = "php_unrecognized_symbol";
@@ -172,12 +177,37 @@ enum MemberAccessKind {
     ClassConstant,
 }
 
-fn magic_member_names(kind: MemberAccessKind) -> &'static [&'static str] {
+/// The callable-return facts a semantic-diagnostics pass can honestly supply.
+///
+/// The usage-facts index is analysis-owned and this pass never builds one, so
+/// both answers are absent and the shared receiver evaluator falls back to the
+/// declaration's own signature. Answering anything else here would claim a fact
+/// this pass did not compute.
+struct PhpDiagnosticCallableFacts;
+
+impl PhpCallableFacts for PhpDiagnosticCallableFacts {
+    fn declaration_return_type_fqn(&self, _unit: &CodeUnit) -> Option<String> {
+        None
+    }
+
+    fn callable_return_type_fqn(&self, _callable_fqn: &str) -> Option<String> {
+        None
+    }
+}
+
+static PHP_DIAGNOSTIC_CALLABLE_FACTS: PhpDiagnosticCallableFacts = PhpDiagnosticCallableFacts;
+
+/// The shared magic-member surface this pass's access kind addresses, so the
+/// magic-method table itself lives in one place for both this pass and forward
+/// definition lookup (#2030).
+fn magic_surface(kind: MemberAccessKind) -> PhpMagicSurface {
     match kind {
-        MemberAccessKind::InstanceCall => &["__call"],
-        MemberAccessKind::InstanceProperty => &["__get", "__set"],
-        MemberAccessKind::StaticCall => &["__callStatic"],
-        MemberAccessKind::StaticProperty | MemberAccessKind::ClassConstant => &[],
+        MemberAccessKind::InstanceCall => PhpMagicSurface::InstanceCall,
+        MemberAccessKind::InstanceProperty => PhpMagicSurface::InstanceProperty,
+        MemberAccessKind::StaticCall => PhpMagicSurface::StaticCall,
+        MemberAccessKind::StaticProperty | MemberAccessKind::ClassConstant => {
+            PhpMagicSurface::StaticData
+        }
     }
 }
 
@@ -190,7 +220,9 @@ impl PhpDiagnosticCollector<'_> {
             }
             let mut bindings = LocalInferenceEngine::default();
             if is_local_scope(scope) {
-                seed_parameter_types(scope, self.source, &self.ctx, &mut bindings);
+                seed_parameter_types(scope, self.source, &mut bindings, |_name, raw| {
+                    resolve_php_type_arms(raw, &self.ctx)
+                });
             }
             self.scan_scope(scope, &mut bindings, &mut scopes);
         }
@@ -230,29 +262,31 @@ impl PhpDiagnosticCollector<'_> {
     }
 
     fn seed_assignment(&self, node: Node<'_>, bindings: &mut LocalInferenceEngine<String>) {
-        let Some((left, right)) = assignment_parts(node) else {
-            return;
-        };
-        if left.kind() != "variable_name" {
-            return;
-        }
-        let name = variable_identifier(left, self.source);
-        if name.is_empty() {
-            return;
-        }
-        match receiver_type_from_expression(right, self.source, &self.ctx, bindings) {
-            Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
-            None => {
-                if right.kind() == "variable_name" {
-                    let rhs = variable_identifier(right, self.source);
-                    if !rhs.is_empty() {
-                        bindings.alias_symbol(name.to_string(), rhs);
-                        return;
-                    }
-                }
-                bindings.declare_shadow(name.to_string());
-            }
-        }
+        seed_assignment_binding(node, self.source, bindings, |right, bindings| {
+            self.receiver_type_from_expression(right, bindings)
+        });
+    }
+
+    /// The declared type of one receiver expression, evaluated by the shared
+    /// PHP receiver evaluator so diagnostics judge member chains, factory
+    /// results, and nullsafe receivers exactly as usage analysis does.
+    fn receiver_type_from_expression(
+        &self,
+        node: Node<'_>,
+        bindings: &LocalInferenceEngine<String>,
+    ) -> Option<String> {
+        instance_receiver_type_fq_name(
+            self.php,
+            PhpGraphSource {
+                index: self.index,
+                facts: &PHP_DIAGNOSTIC_CALLABLE_FACTS,
+            },
+            node,
+            self.source,
+            &self.ctx,
+            bindings,
+            |start, end| self.enclosing_owner_fqn_at(start, end),
+        )
     }
 
     fn check_reference(&mut self, node: Node<'_>, bindings: &LocalInferenceEngine<String>) {
@@ -283,7 +317,10 @@ impl PhpDiagnosticCollector<'_> {
             | "scoped_property_access_expression" => {
                 self.check_static_member(node);
             }
-            "member_call_expression" | "member_access_expression" => {
+            "member_call_expression"
+            | "member_access_expression"
+            | "nullsafe_member_call_expression"
+            | "nullsafe_member_access_expression" => {
                 self.check_instance_member(node, bindings);
             }
             "name" | "qualified_name" => {
@@ -462,16 +499,14 @@ impl PhpDiagnosticCollector<'_> {
         if member_name.is_empty() {
             return;
         }
-        let owner = if object.kind() == "variable_name"
-            && variable_identifier(object, self.source) == "this"
-        {
-            self.enclosing_owner_fqn(object)
-        } else {
-            receiver_type_from_expression(object, self.source, &self.ctx, bindings)
-        };
+        let owner = self.receiver_type_from_expression(object, bindings);
         let kind = match node.kind() {
-            "member_call_expression" => MemberAccessKind::InstanceCall,
-            "member_access_expression" => MemberAccessKind::InstanceProperty,
+            "member_call_expression" | "nullsafe_member_call_expression" => {
+                MemberAccessKind::InstanceCall
+            }
+            "member_access_expression" | "nullsafe_member_access_expression" => {
+                MemberAccessKind::InstanceProperty
+            }
             _ => return,
         };
         self.check_member(member, owner, member_name, kind);
@@ -532,12 +567,15 @@ impl PhpDiagnosticCollector<'_> {
         // uniquely and the packs published its whole inherited surface.
         match self.external.lookup_type(&owner) {
             PhpExternalSymbol::Indexed { id } => {
-                if let Some(magic) = magic_member_names(kind).iter().find(|magic| {
-                    matches!(
-                        self.external.lookup_member(&id, magic),
-                        PhpExternalMember::Indexed | PhpExternalMember::Ambiguous
-                    )
-                }) {
+                if let Some(magic) = magic_member_names(magic_surface(kind))
+                    .iter()
+                    .find(|magic| {
+                        matches!(
+                            self.external.lookup_member(&id, magic),
+                            PhpExternalMember::Indexed | PhpExternalMember::Ambiguous
+                        )
+                    })
+                {
                     self.push_dynamic_range(
                         range,
                         &format!(
@@ -639,7 +677,7 @@ impl PhpDiagnosticCollector<'_> {
     }
 
     fn has_magic_member_boundary(&self, owner_fqn: &str, kind: MemberAccessKind) -> bool {
-        magic_member_names(kind)
+        magic_member_names(magic_surface(kind))
             .iter()
             .any(|name| self.owner_or_ancestor_has_member(owner_fqn, name))
     }
@@ -695,7 +733,19 @@ impl PhpDiagnosticCollector<'_> {
     }
 
     fn enclosing_owner_fqn(&self, node: Node<'_>) -> Option<String> {
-        let range = node_range(node, self.line_starts);
+        self.enclosing_owner_fqn_at(node.start_byte(), node.end_byte())
+    }
+
+    /// The class that lexically owns `start..end`, which is what `$this`,
+    /// `self`, and `static` name. Byte offsets rather than a node, because the
+    /// shared receiver evaluator reports the position it needs an owner for.
+    fn enclosing_owner_fqn_at(&self, start: usize, end: usize) -> Option<String> {
+        let range = Range {
+            start_byte: start,
+            end_byte: end,
+            start_line: find_line_index_for_offset(self.line_starts, start),
+            end_line: find_line_index_for_offset(self.line_starts, end),
+        };
         self.index
             .enclosing_code_unit(self.file, &range)
             .and_then(|enclosing| self.index.parent_of(&enclosing).or(Some(enclosing)))
@@ -825,17 +875,6 @@ fn push_named_children<'tree>(stack: &mut Vec<Node<'tree>>, node: Node<'tree>) {
     stack.extend(children.into_iter().rev());
 }
 
-fn is_local_scope(node: Node<'_>) -> bool {
-    matches!(
-        node.kind(),
-        "function_definition"
-            | "method_declaration"
-            | "anonymous_function"
-            | "anonymous_function_creation"
-            | "arrow_function"
-    )
-}
-
 fn is_non_reference_container(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
@@ -861,77 +900,10 @@ fn is_non_reference_context(node: Node<'_>) -> bool {
     false
 }
 
-fn seed_parameter_types(
-    node: Node<'_>,
-    source: &str,
-    ctx: &PhpFileContext,
-    bindings: &mut LocalInferenceEngine<String>,
-) {
-    let Some(parameters) = node.child_by_field_name("parameters") else {
-        return;
-    };
-    let mut cursor = parameters.walk();
-    for child in parameters.named_children(&mut cursor) {
-        if !matches!(
-            child.kind(),
-            "simple_parameter" | "property_promotion_parameter"
-        ) {
-            continue;
-        }
-        let Some(name_node) = child.child_by_field_name("name") else {
-            continue;
-        };
-        let name = variable_identifier(name_node, source);
-        if name.is_empty() {
-            continue;
-        }
-        match child
-            .child_by_field_name("type")
-            .and_then(|type_node| resolve_php_type(node_text(type_node, source), ctx))
-        {
-            Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
-            None => bindings.declare_shadow(name.to_string()),
-        }
-    }
-}
-
-fn assignment_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
-    (node.kind() == "assignment_expression")
-        .then(|| {
-            node.child_by_field_name("left")
-                .zip(node.child_by_field_name("right"))
-        })
-        .flatten()
-}
-
 fn object_creation_type(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .find(|child| matches!(child.kind(), "name" | "qualified_name"))
-}
-
-fn static_member_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
-    let scope = node
-        .child_by_field_name("scope")
-        .or_else(|| node.child_by_field_name("class"))
-        .or_else(|| node.named_child(0))?;
-    let name = node
-        .child_by_field_name("name")
-        .or_else(|| node.child_by_field_name("constant"))
-        .or_else(|| node.named_child(1))?;
-    Some((scope, name))
-}
-
-fn variable_identifier<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    node_text(node, source).trim_start_matches('$')
-}
-
-fn literal_member_identifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    (node.kind() == "name").then(|| node_text(node, source))
-}
-
-fn static_property_identifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    (node.kind() == "variable_name").then(|| variable_identifier(node, source))
 }
 
 fn static_member_identifier<'a>(
@@ -943,35 +915,6 @@ fn static_member_identifier<'a>(
         static_property_identifier(member, source)
     } else {
         literal_member_identifier(member, source)
-    }
-}
-
-fn receiver_type_from_expression(
-    node: Node<'_>,
-    source: &str,
-    ctx: &PhpFileContext,
-    bindings: &LocalInferenceEngine<String>,
-) -> Option<String> {
-    match node.kind() {
-        "variable_name" => {
-            let name = variable_identifier(node, source);
-            first_precise(bindings, name)
-        }
-        "object_creation_expression" => object_creation_type(node)
-            .and_then(|type_node| resolve_php_type(node_text(type_node, source), ctx)),
-        "parenthesized_expression" => node
-            .named_child(0)
-            .and_then(|inner| receiver_type_from_expression(inner, source, ctx, bindings)),
-        _ => None,
-    }
-}
-
-fn first_precise(bindings: &LocalInferenceEngine<String>, symbol: &str) -> Option<String> {
-    match bindings.resolve_symbol(symbol) {
-        SymbolResolution::Precise(targets) if targets.len() == 1 => targets.into_iter().next(),
-        SymbolResolution::Unknown | SymbolResolution::Ambiguous | SymbolResolution::Precise(_) => {
-            None
-        }
     }
 }
 

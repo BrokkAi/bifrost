@@ -2492,6 +2492,11 @@ fn write_run_diagnostics<W: Write>(
         .map_err(map_io_error)?;
         write_policy_diagnostic_code(output, diagnostic.code())?;
         write!(output, ": {}", escape_terminal_text(diagnostic.message())).map_err(map_io_error)?;
+        // A folded entry stands for every diagnostic of its reason family, so
+        // the count is the only place that census survives the cap (#2356).
+        if diagnostic.family_count() > 1 {
+            write!(output, " [x{}]", diagnostic.family_count()).map_err(map_io_error)?;
+        }
         if let Some(primary) = diagnostic.primary() {
             write!(output, " at ").map_err(map_io_error)?;
             write_location(output, primary).map_err(map_io_error)?;
@@ -3242,22 +3247,7 @@ fn write_policy_diagnostic_code<W: Write>(
     output: &mut BoundedWriter<W>,
     value: &super::super::PolicyDiagnosticCode,
 ) -> Result<(), PolicyRenderError> {
-    use super::super::PolicyDiagnosticCode as Code;
-    let label = match value {
-        Code::CodeQuery { code } => {
-            return write!(output, "code_query/{}", code.as_str()).map_err(map_io_error);
-        }
-        Code::UnsupportedAnalysis => "unsupported_analysis",
-        Code::StableAnchorUnavailable => "stable_anchor_unavailable",
-        Code::EndpointDominanceUndecidable => "endpoint_dominance_undecidable",
-        Code::EvaluationFailure => "evaluation_failure",
-        Code::BatchFindingLimit => "batch_finding_limit",
-        Code::ReportRetentionBudget => "report_retention_budget",
-        Code::CvssVariantBudget => "cvss_variant_budget",
-        Code::ProjectionScenarioMembershipBudget => "projection_scenario_membership_budget",
-        Code::OrganizationalRiskOverlayBudget => "organizational_risk_overlay_budget",
-    };
-    write!(output, "{label}").map_err(map_io_error)
+    write!(output, "{}", value.stable_label()).map_err(map_io_error)
 }
 
 const fn suppression_match_state(value: PolicySuppressionMatchState) -> &'static str {

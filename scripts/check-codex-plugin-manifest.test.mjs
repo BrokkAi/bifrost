@@ -36,6 +36,7 @@ async function withRepositoryFixture(run) {
       ".cursor-plugin/marketplace.json",
       "editors/vscode/package.json",
       "plugins/bifrost-agent",
+      "plugins/bifrost-dsh",
     ]) {
       const source = path.join(repositoryRoot, relativePath);
       const destination = path.join(fixtureRoot, relativePath);

@@ -1,0 +1,259 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.javax.servlet-api-summaries",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-framework-foundry",
+    "version": "0.9.0"
+  },
+  "language": "java",
+  "ecosystem": "maven",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <0.11.0",
+    "toolchains": [
+      {
+        "name": "jdk",
+        "requirement": ">=17.0.0"
+      }
+    ]
+  },
+  "provenance": {
+    "source": "hand-authored flow-through summaries over javax.servlet:javax.servlet-api:4.0.1",
+    "revision": "framework-decls"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "summaries.maven",
+      "activation": [
+        {
+          "package": {
+            "name": "javax.servlet:javax.servlet-api",
+            "version": "=4.0.1"
+          },
+          "targets": [
+            "jvm"
+          ],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "javax.servlet.http.httpservletrequest.getparametervalues",
+            "target": {
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "javax.servlet.http.HttpServletRequest.getParameterValues(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "javax.servlet.http.httpservletrequest.getparameter",
+            "target": {
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "javax.servlet.http.HttpServletRequest.getParameter(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "javax.servlet.http.httpservletrequest.getquerystring",
+            "target": {
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "javax.servlet.http.HttpServletRequest.getQueryString()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "javax.servlet.http.httpservletrequest.getheaders",
+            "target": {
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "javax.servlet.http.HttpServletRequest.getHeaders(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "javax.servlet.http.httpservletrequest.getparametermap",
+            "target": {
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "javax.servlet.http.HttpServletRequest.getParameterMap()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "javax.servlet.http.httpservletrequest.getparameternames",
+            "target": {
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "javax.servlet.http.HttpServletRequest.getParameterNames()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "javax.servlet.http.httpservletrequest.getheader",
+            "target": {
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "javax.servlet.http.HttpServletRequest.getHeader(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "javax.servlet.http.httpservletrequest.getcookies",
+            "target": {
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "javax.servlet.http.HttpServletRequest.getCookies()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "javax.servlet.http.httpservletrequest.getheadernames",
+            "target": {
+              "path": "javax/servlet/http/HttpServletRequest.java",
+              "symbol": "javax.servlet.http.HttpServletRequest.getHeaderNames()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -268,6 +268,71 @@ struct TaintExecutionBudget {
     remaining_witness_bytes: usize,
 }
 
+/// The request-wide output lane one batch found already spent.
+///
+/// `remaining_findings` is the only lane that is deliberately request-wide
+/// (#2208): the witness lanes are restored per batch, so they read zero only
+/// when the configured budget itself is zero. Either way the lane is a budget,
+/// not a broken invariant, so the run says which one ran out (#2356).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExhaustedTaintLane {
+    Findings,
+    Witnesses,
+    WitnessSteps,
+    WitnessExpansions,
+    WitnessBytes,
+}
+
+impl ExhaustedTaintLane {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Findings => "findings",
+            Self::Witnesses => "witnesses",
+            Self::WitnessSteps => "witness steps",
+            Self::WitnessExpansions => "witness expansions",
+            Self::WitnessBytes => "witness bytes",
+        }
+    }
+
+    /// The findings lane caps how much output the request may produce, which is
+    /// exactly `BatchFindingLimit`. A witness lane caps the evidence a report
+    /// may retain for that output, which is `ReportRetentionBudget`.
+    const fn incomplete_reason(self) -> PolicyIncompleteReason {
+        match self {
+            Self::Findings => PolicyIncompleteReason::BatchFindingLimit,
+            Self::Witnesses | Self::WitnessSteps | Self::WitnessExpansions | Self::WitnessBytes => {
+                PolicyIncompleteReason::ReportRetentionBudget
+            }
+        }
+    }
+
+    const fn diagnostic_code(self) -> PolicyDiagnosticCode {
+        match self {
+            Self::Findings => PolicyDiagnosticCode::BatchFindingLimit,
+            Self::Witnesses | Self::WitnessSteps | Self::WitnessExpansions | Self::WitnessBytes => {
+                PolicyDiagnosticCode::ReportRetentionBudget
+            }
+        }
+    }
+}
+
+/// Why one taint batch produced nothing.
+///
+/// A drained request-wide lane and a broken invariant are different outcomes
+/// and must not share a classification: the first degrades the run to
+/// inconclusive and keeps every finding the earlier batches already produced,
+/// the second fails the run.
+enum TaintBatchError {
+    BudgetExhausted(ExhaustedTaintLane),
+    Internal(String),
+}
+
+impl From<String> for TaintBatchError {
+    fn from(message: String) -> Self {
+        Self::Internal(message)
+    }
+}
+
 impl TaintExecutionBudget {
     fn fresh_semantic(budget: &PolicyBudget) -> SemanticBudget {
         SemanticBudget::new(super::selector_compiler::semantic_work_limits(
@@ -420,7 +485,7 @@ impl ProductionTaintPolicyEvaluator {
         match batches {
             Ok(batches) => {
                 for batch in batches {
-                    if let Err(message) = solve_and_project_batch(
+                    let Err(failure) = solve_and_project_batch(
                         &batch,
                         &metadata,
                         &policies,
@@ -432,12 +497,27 @@ impl ProductionTaintPolicyEvaluator {
                         &mut public_findings,
                         &mut retained_analyses,
                         batch_planning_elapsed,
-                    ) {
-                        for internal_id in batch.policy_ids() {
-                            if let Some(plan) = metadata.get(internal_id) {
+                    ) else {
+                        continue;
+                    };
+                    for internal_id in batch.policy_ids() {
+                        let Some(plan) = metadata.get(internal_id) else {
+                            continue;
+                        };
+                        match &failure {
+                            // A spent output or evidence lane leaves everything
+                            // the earlier batches already produced valid, so the
+                            // payload keeps its projections and only says that
+                            // it stopped early and which lane stopped it.
+                            TaintBatchError::BudgetExhausted(lane) => {
+                                if let Some(payload) = payloads.get_mut(&plan.policy_id) {
+                                    record_exhausted_lane(payload, *lane);
+                                }
+                            }
+                            TaintBatchError::Internal(message) => {
                                 payloads.insert(
                                     plan.policy_id.clone(),
-                                    prepared_failure_payload(&message, PolicyWorkReport::default()),
+                                    prepared_failure_payload(message, PolicyWorkReport::default()),
                                 );
                             }
                         }
@@ -1585,22 +1665,43 @@ impl<'a> TaintPolicyCompiler<'a> {
                 target.has_receiver(),
                 target.arity(),
             ));
-            match matched.disposition {
+            let selected = match matched.disposition {
                 SemanticModelMatchDisposition::Empty => continue,
-                SemanticModelMatchDisposition::Conflict => {
-                    return Err(TaintPolicyCompileError::Model(format!(
-                        "conflicting activated procedure summaries target unmaterialized external {}.{}",
-                        target.owner_fqn(),
-                        target.member()
-                    )));
+                SemanticModelMatchDisposition::Unique => {
+                    let [selected] = matched.records.as_slice() else {
+                        return Err(TaintPolicyCompileError::Model(
+                            "unique unmaterialized procedure-summary lookup returned a non-unique record set"
+                                .to_owned(),
+                        ));
+                    };
+                    selected
                 }
-                SemanticModelMatchDisposition::Unique => {}
-            }
-            let [selected] = matched.records.as_slice() else {
-                return Err(TaintPolicyCompileError::Model(
-                    "unique unmaterialized procedure-summary lookup returned a non-unique record set"
-                        .to_owned(),
-                ));
+                SemanticModelMatchDisposition::Conflict => {
+                    // Several activated summaries collapse to the same
+                    // unmaterialized identity (owner, member, arity,
+                    // has_receiver) because parameter types are unrecoverable for
+                    // an unmaterialized callee, so overloads like
+                    // `StringBuilder.append(String)` / `append(Object)` /
+                    // `append(char[])` map to one key. When they model the same
+                    // flow -- identical transfers and effects -- picking any one
+                    // is exact. When they genuinely differ, the overload cannot
+                    // be disambiguated, so skip this member: the call stays
+                    // unmodeled and require-model abstains, rather than aborting
+                    // the whole compile (instance-method binding at #1936 made
+                    // these members reachable and surfaced the collapse).
+                    let Some(first) = matched.records.first() else {
+                        continue;
+                    };
+                    let identical = matched.records.iter().all(|other| {
+                        other.record.transfers == first.record.transfers
+                            && other.record.effects == first.record.effects
+                    });
+                    if identical {
+                        first
+                    } else {
+                        continue;
+                    }
+                }
             };
             let family_key = selected.payload.as_ptr() as usize;
             let family = unmaterialized_families
@@ -1733,7 +1834,7 @@ fn solve_and_project_batch(
     public_findings: &mut Vec<brokk_bifrost_analysis::analyzer::structural::CodeQueryTaintFinding>,
     retained_analyses: &mut Vec<Arc<ProductionTaintAnalysisResult>>,
     batch_planning_elapsed: Duration,
-) -> Result<(), String> {
+) -> Result<(), TaintBatchError> {
     // Each batch solves its own regions and reconstructs evidence only for its
     // own findings, so give it a fresh solve and witness budget instead of the
     // request-wide remainder a corpus would have already drained (#1935 for the
@@ -1770,16 +1871,32 @@ fn solve_and_project_batch(
         value_flow_limits.max_witness_expansions,
     )
     .map_err(|error| error.to_string())?;
-    if [
-        execution_budget.remaining_findings,
-        execution_budget.remaining_witnesses,
-        execution_budget.remaining_witness_steps,
-        execution_budget.remaining_witness_expansions,
-        execution_budget.remaining_witness_bytes,
+    if let Some(lane) = [
+        (
+            ExhaustedTaintLane::Findings,
+            execution_budget.remaining_findings,
+        ),
+        (
+            ExhaustedTaintLane::Witnesses,
+            execution_budget.remaining_witnesses,
+        ),
+        (
+            ExhaustedTaintLane::WitnessSteps,
+            execution_budget.remaining_witness_steps,
+        ),
+        (
+            ExhaustedTaintLane::WitnessExpansions,
+            execution_budget.remaining_witness_expansions,
+        ),
+        (
+            ExhaustedTaintLane::WitnessBytes,
+            execution_budget.remaining_witness_bytes,
+        ),
     ]
-    .contains(&0)
+    .into_iter()
+    .find_map(|(lane, remaining)| (remaining == 0).then_some(lane))
     {
-        return Err("taint request-wide finding or witness budget is exhausted".to_owned());
+        return Err(TaintBatchError::BudgetExhausted(lane));
     }
     let reconstruction_started = Instant::now();
     let report = collect_taint_findings_with_limits(
@@ -1943,10 +2060,18 @@ fn solve_and_project_batch(
                         Some(status) => status.label().to_owned(),
                         None => "incomplete coverage".to_owned(),
                     };
-                    if let Ok(diagnostic) = PolicyDiagnostic::try_new(
+                    // The family names only the repeating cause. A corpus
+                    // produces one of these per procedure, so without a family
+                    // the per-policy diagnostic cap kept the first 256 by sort
+                    // order and hid every later cause (#2356).
+                    if let Ok(diagnostic) = PolicyDiagnostic::try_new_in_family(
                         PolicyDiagnosticCode::EvaluationFailure,
                         PolicyDiagnosticSeverity::Warning,
                         PolicyDiagnosticImpact::RunIncomplete,
+                        format!(
+                            "taint discovery is incomplete: {} is {status}",
+                            cause.label(),
+                        ),
                         format!(
                             "taint discovery is incomplete: {} for {}:{name} is {status}",
                             cause.label(),
@@ -2084,6 +2209,19 @@ fn project_policy_findings(
     // makes that reachable, because one finding now carries every event's
     // origins and witnesses.
     let report_options = &policy.definition().report;
+    // The host budget is only the ceiling. A witness is validated against the
+    // *effective* limit, so projecting to the ceiling produced witnesses the
+    // authority rejected, and the rejection dropped the whole finding (#2356).
+    let witness_limits = EffectiveWitnessLimits {
+        steps: report_options
+            .witness
+            .max_steps
+            .min(budget.max_witness_steps()),
+        bytes: report_options
+            .witness
+            .max_bytes
+            .min(budget.max_witness_bytes()),
+    };
     let mut projected = Vec::new();
     // One projected finding per declared sink endpoint per *place in the
     // source*, rather than per value-flow event key.
@@ -2291,6 +2429,7 @@ fn project_policy_findings(
                 report_options
                     .witnesses_per_finding
                     .min(budget.max_witnesses_per_finding()),
+                witness_limits,
                 budget,
             )?;
             let witness_refs_truncated = projected_report.witnesses_truncated;
@@ -2452,6 +2591,7 @@ fn project_taint_report(
     origins_truncated: bool,
     witness_incomplete: bool,
     witness_limit: usize,
+    witness_limits: EffectiveWitnessLimits,
     budget: &PolicyBudget,
 ) -> Result<(ProjectedFindingReport, Vec<WitnessId>), String> {
     let certainty = if proven {
@@ -2484,7 +2624,7 @@ fn project_taint_report(
         finding_key,
         finding_incomplete || origins_truncated || witness_incomplete,
         witness_limit,
-        budget,
+        witness_limits,
     )?;
     if omitted_witnesses > 0 || witnesses.iter().any(BoundedWitness::truncated) {
         incomplete.push(FindingIncompleteReason::WitnessTruncated);
@@ -2561,13 +2701,22 @@ struct ProjectedTaintWitnesses {
     display_path: Option<crate::display_path::TaintDisplayPath>,
 }
 
+/// The step and byte bounds one projected witness must respect: the policy's
+/// authored report options capped by the host budget, which is exactly what
+/// `EffectiveReportLimits` in `projection.rs` validates against.
+#[derive(Debug, Clone, Copy)]
+struct EffectiveWitnessLimits {
+    steps: usize,
+    bytes: usize,
+}
+
 fn project_taint_witnesses(
     workspace: &WorkspaceAnalyzer,
     group: &ProjectedSourceGroup<'_>,
     finding_key: &str,
     finding_incomplete: bool,
     witness_limit: usize,
-    budget: &PolicyBudget,
+    witness_limits: EffectiveWitnessLimits,
 ) -> Result<ProjectedTaintWitnesses, String> {
     let mut retained = Vec::<(&TaintOriginFindingEvidence, &SummaryWitness)>::new();
     for origin in &group.origins {
@@ -2601,8 +2750,8 @@ fn project_taint_witnesses(
             workspace,
             witness,
             id.clone(),
-            budget.max_witness_steps(),
-            budget.max_witness_bytes(),
+            witness_limits.steps,
+            witness_limits.bytes,
             |kind| match kind {
                 SummaryWitnessStepKind::Seed => (WitnessStepKind::Source, "taint source"),
                 SummaryWitnessStepKind::Edge(_) => {
@@ -2637,6 +2786,48 @@ fn project_taint_witnesses(
             u64::try_from(omitted).unwrap_or(u64::MAX),
         ),
     })
+}
+
+/// Degrade one payload for a request-wide lane that ran out mid-run.
+///
+/// Before #2356 the caller replaced the payload with a failed one, so a corpus
+/// large enough to spend the request-wide finding cap reported
+/// `Failed { reasons: [InternalInvariant] }` and threw away every finding the
+/// earlier batches had already projected. Exhausting a declared budget is a
+/// normal, honest outcome: the findings stay, the run becomes inconclusive, and
+/// the diagnostic names the lane.
+fn record_exhausted_lane(payload: &mut TaintProjectionPayload, lane: ExhaustedTaintLane) {
+    match &mut payload.completion {
+        PolicyRunCompletion::Complete
+        | PolicyRunCompletion::ProvenSubset { .. }
+        | PolicyRunCompletion::ProvenBySummary => {
+            payload.completion = PolicyRunCompletion::inconclusive(vec![lane.incomplete_reason()])
+                .expect("one incomplete reason is canonical");
+        }
+        PolicyRunCompletion::Inconclusive { reasons } => {
+            reasons.push(lane.incomplete_reason());
+            reasons.sort();
+            reasons.dedup();
+        }
+        // A run that already failed or is unsupported cannot be made more
+        // reliable by a budget note, and its completion forbids an incomplete
+        // diagnostic impact.
+        PolicyRunCompletion::Unsupported { .. } | PolicyRunCompletion::Failed { .. } => return,
+    }
+    let Ok(diagnostic) = PolicyDiagnostic::try_new_in_family(
+        lane.diagnostic_code(),
+        PolicyDiagnosticSeverity::Warning,
+        PolicyDiagnosticImpact::RunIncomplete,
+        format!("taint request-wide budget is exhausted: {}", lane.label()),
+        format!("taint request-wide budget is exhausted: {}", lane.label()),
+        None,
+        Vec::new(),
+    ) else {
+        return;
+    };
+    if !payload.diagnostics.contains(&diagnostic) {
+        payload.diagnostics.push(diagnostic);
+    }
 }
 
 fn prepared_failure_payload(message: &str, work: PolicyWorkReport) -> TaintProjectionPayload {
@@ -3190,8 +3381,17 @@ fn taint_selector_error(
 mod tests {
     use std::sync::Arc;
 
-    use super::{DiscoveryMaterializationCache, TaintExecutionBudget, TaintPolicyCompiler};
+    use super::{
+        DiscoveryMaterializationCache, ProductionTaintPolicyEvaluator, TaintExecutionBudget,
+        TaintPolicyCompiler,
+    };
     use crate::budget::PolicyBudget;
+    use crate::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
+    use crate::coordinator::{PolicyEvaluationOptions, evaluate_policy_source};
+    use crate::finding::{PolicyIncompleteReason, PolicyRunCompletion};
+    use crate::registry::{PolicyRegistry, PolicyRegistryLimits};
+    use crate::source::PolicySourceIdentity;
+    use crate::suppression::PolicyEvaluationDate;
     use brokk_bifrost_analysis::CancellationToken;
     use brokk_bifrost_analysis::analyzer::dataflow::SolverWork;
     use brokk_bifrost_analysis::analyzer::semantic::{
@@ -3203,6 +3403,209 @@ mod tests {
     use brokk_bifrost_analysis::analyzer::{
         AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
     };
+
+    /// One taint flow: `source_one` returns attacker input and `sink_one`
+    /// consumes it through a nested call, which is a witness of several steps.
+    const FIRST_FLOW_SOURCE: &str = "\
+def source_one():
+    return \"one\"
+
+def sink_one(value):
+    pass
+
+def run_one():
+    sink_one(source_one())
+";
+
+    /// A second, independent flow. It lives in its own file so the compile
+    /// discovers a second taint region, and a region is one batch.
+    const SECOND_FLOW_SOURCE: &str = "\
+def source_one():
+    return \"two\"
+
+def sink_one(value):
+    pass
+
+def run_two():
+    sink_one(source_one())
+";
+
+    /// A taint policy over the two fixtures above. `report` is the authored
+    /// report-option block; passing an empty string keeps the defaults.
+    fn two_flow_policy(report: &str) -> String {
+        format!(
+            r#"(policy
+              :schema-version 1
+              :id "test.issue-2356"
+              :name "Issue 2356 taint"
+              :message "tainted value reached sink_one"
+              :severity warning
+              {report}
+              :analysis (analysis
+                :type taint
+                :mode may
+                :call-modeling (call-modeling :unmodeled optimistic)
+                :sources (endpoint-set :entries [
+                  (source :id first :display-name "first source" :categories [input.user]
+                    :selector (rql :schema-version 1
+                      (language python (call :callee (name "source_one"))))
+                    :bind return-value :labels [untrusted])])
+                :sinks (endpoint-set :entries [
+                  (sink :id first-store :display-name "first sink" :categories [data.sensitive]
+                    :selector (rql :schema-version 1
+                      (language python (call :callee (name "sink_one"))))
+                    :dangerous-operand (argument :index 0) :accepts [untrusted])]))
+              :classification (classification
+                :fallback (classification-id :taxonomy "Test" :id "BROAD-TAINT")))"#
+        )
+    }
+
+    fn two_flow_workspace() -> (tempfile::TempDir, WorkspaceAnalyzer) {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        std::fs::write(workspace.path().join("first.py"), FIRST_FLOW_SOURCE)
+            .expect("first fixture source");
+        std::fs::write(workspace.path().join("second.py"), SECOND_FLOW_SOURCE)
+            .expect("second fixture source");
+        let project: Arc<dyn Project> =
+            Arc::new(FilesystemProject::new(workspace.path()).expect("fixture project"));
+        let analyzer = WorkspaceAnalyzer::build_ephemeral(
+            project,
+            AnalyzerConfig {
+                parallelism: Some(1),
+                ..AnalyzerConfig::default()
+            },
+        )
+        .expect("an analyzer over the fixture");
+        (workspace, analyzer)
+    }
+
+    fn registry_for(source: &str) -> PolicyRegistry {
+        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+            CatalogRegistryLimits::default(),
+        ));
+        let mut registry =
+            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
+        registry
+            .register_policy_bytes(
+                PolicySourceIdentity::new("test:issue-2356.rqlp"),
+                source.as_bytes(),
+            )
+            .expect("the fixture policy loads");
+        registry
+    }
+
+    /// #2356: a request-wide lane that runs out is a budget outcome, not a
+    /// broken invariant.
+    ///
+    /// `remaining_findings` is deliberately request-wide (#2208), so on a
+    /// corpus one batch eventually starts with the lane already spent. Before
+    /// this fix that batch returned a bare error string, and the caller turned
+    /// every policy in it into `Failed { reasons: [InternalInvariant] }` and
+    /// replaced the payload, discarding every finding the earlier batches had
+    /// already projected. The run must instead stay inconclusive, name the
+    /// exhausted lane, and keep those findings.
+    #[test]
+    fn an_exhausted_request_wide_lane_degrades_the_run_instead_of_failing_it() {
+        let (_workspace, analyzer) = two_flow_workspace();
+        let registry = registry_for(&two_flow_policy(""));
+        let budget = PolicyBudget::builder()
+            .with_max_findings(1)
+            .expect("one finding is inside the host cap")
+            .build()
+            .expect("a one-finding budget is valid");
+
+        let evaluator = ProductionTaintPolicyEvaluator::prepare(
+            registry.policies(),
+            &analyzer,
+            Ok(None),
+            None,
+            &budget,
+        );
+        let payloads = evaluator.prepared.borrow();
+        let [(_, payload)] = payloads.iter().collect::<Vec<_>>()[..] else {
+            panic!("one taint policy produces one payload");
+        };
+
+        assert!(
+            !matches!(payload.completion, PolicyRunCompletion::Failed { .. }),
+            "a spent budget must not surface as a run failure: {:#?}",
+            payload.completion
+        );
+        let PolicyRunCompletion::Inconclusive { reasons } = &payload.completion else {
+            panic!(
+                "expected an inconclusive run, got {:#?}",
+                payload.completion
+            );
+        };
+        assert!(
+            reasons.contains(&PolicyIncompleteReason::BatchFindingLimit),
+            "the exhausted findings lane must be named: {reasons:#?}"
+        );
+        assert!(
+            payload
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message()
+                    == "taint request-wide budget is exhausted: findings"),
+            "a diagnostic must name the exhausted lane: {:#?}",
+            payload.diagnostics
+        );
+        assert!(
+            !payload.projections.is_empty(),
+            "the findings the earlier batch already projected must survive"
+        );
+    }
+
+    /// #2356: a witness longer than the effective report limit must truncate,
+    /// not take its finding down with it.
+    ///
+    /// The projection authority validates each witness against the policy's
+    /// authored report options capped by the host budget. The taint adapter
+    /// projected against the host budget alone, so an authored `max-steps`
+    /// below the host cap produced an over-long witness, the authority
+    /// rejected the whole envelope, and the finding was lost.
+    #[test]
+    fn a_witness_over_the_effective_report_limit_truncates_instead_of_dropping_the_finding() {
+        let (workspace, analyzer) = two_flow_workspace();
+        let source = two_flow_policy(":report (report :witness (witness :max-steps 2))");
+        let options = PolicyEvaluationOptions::new(
+            PolicyEvaluationDate::from_ymd(2026, 8, 18).expect("fixed evaluation date"),
+        );
+        let outcome = evaluate_policy_source(
+            workspace.path(),
+            PolicySourceIdentity::new("test:issue-2356.rqlp"),
+            &source,
+            &analyzer,
+            &options,
+            None,
+        )
+        .expect("production taint evaluation");
+
+        let [run] = outcome.report().runs() else {
+            panic!("one policy produces one run");
+        };
+        assert!(
+            !run.findings().is_empty(),
+            "the finding must survive a witness that exceeds the report limit: {:#?}",
+            run.diagnostics()
+        );
+        for finding in run.findings() {
+            for witness in finding.witnesses() {
+                assert!(
+                    witness.steps().len() <= 2,
+                    "a projected witness must respect the authored step limit: {witness:#?}"
+                );
+                assert!(
+                    witness.truncated(),
+                    "a shortened witness must say so: {witness:#?}"
+                );
+                assert!(
+                    witness.omitted_steps_lower_bound() > 0,
+                    "a shortened witness must carry its omitted-step lower bound: {witness:#?}"
+                );
+            }
+        }
+    }
 
     /// A batch that starts after an exhausting predecessor must still be able to
     /// solve.

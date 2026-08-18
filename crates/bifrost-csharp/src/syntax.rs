@@ -350,21 +350,27 @@ fn csharp_type_node_segments_with_terminal_suffix(
                     stack.push(inner);
                 }
             }
-            "identifier" | "predefined_type" => {
+            // `implicit_type` is the `var` keyword. It names no declaration,
+            // but the seeders read the spelling to decide that a local takes
+            // its type from its initializer, so it is a segment like any other
+            // keyword type rather than a walk failure.
+            "identifier" | "predefined_type" | "implicit_type" => {
                 let segment = csharp_type_segment_text(current, source);
                 if !segment.is_empty() {
                     segments.push(segment.to_string());
                 }
             }
-            _ => {
-                let fallback = source
-                    .get(current.start_byte()..current.end_byte())
-                    .map(normalize_csharp_type_fragment)
-                    .unwrap_or_default();
-                if !fallback.is_empty() {
-                    segments.push(fallback);
-                }
-            }
+            // Anything else is not a name. A tuple, a function pointer, and a
+            // `ref` or `scoped` type are types with no dotted spelling at all,
+            // and the receiver of `Foo().Bar` is an `invocation_expression`
+            // whose value has a type this pass cannot prove. Reading any of
+            // them back as source text is the source-text-instead-of-AST
+            // pattern, and it hands the visible-type ladder a guaranteed miss
+            // spelled out of arbitrary code. Dropping just the bad segment
+            // would be worse still -- it would promote `Foo().Bar` to the
+            // identity `Bar` -- so the whole walk fails and the caller sees an
+            // empty identity to report structurally (#1842).
+            _ => return Vec::new(),
         }
     }
     if let Some(terminal) = segments.last_mut() {
