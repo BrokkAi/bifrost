@@ -156,6 +156,45 @@ jobs:
             fi
           done
 
+      - name: Inspect npm trusted-publishing OIDC claims
+        shell: bash
+        run: |
+          set -euo pipefail
+          oidc_response="$(
+            curl --fail --silent --show-error \
+              -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              --get \
+              --data-urlencode "audience=npm:registry.npmjs.org" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL"
+          )"
+          oidc_token="$(jq -er '.value' <<<"$oidc_response")"
+          oidc_claims="$(OIDC_TOKEN="$oidc_token" node --input-type=module <<'NODE'
+          const token = process.env.OIDC_TOKEN;
+          const encodedClaims = token?.split(".")[1];
+          if (!encodedClaims) throw new Error("OIDC token did not contain a payload");
+          const claims = JSON.parse(
+            Buffer.from(
+              encodedClaims.replaceAll("-", "+").replaceAll("_", "/"),
+              "base64",
+            ),
+          );
+          const claimNames = [
+            "repository",
+            "repository_owner",
+            "workflow",
+            "job_workflow_ref",
+            "ref",
+            "environment",
+            "sub",
+          ];
+          process.stdout.write(
+            `${JSON.stringify(Object.fromEntries(claimNames.map((name) => [name, claims[name] ?? null])))}\n`,
+          );
+          NODE
+          )"
+          unset oidc_token oidc_response
+          printf 'npm trusted-publishing OIDC claims: %s\n' "$oidc_claims"
+
       - name: Publish qualified archives without packaging
         env:
           # Keep npm on its OIDC trusted-publishing path. setup-node's
@@ -163,6 +202,7 @@ jobs:
           # which makes npm report a misleading 404 for OIDC publishes.
           NODE_AUTH_TOKEN: ""
           NPM_CONFIG_PROVENANCE: "true"
+          NPM_CONFIG_LOGLEVEL: "verbose"
         shell: bash
         run: |
           set -euo pipefail

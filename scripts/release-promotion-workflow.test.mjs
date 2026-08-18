@@ -357,6 +357,20 @@ test("publishers preserve their platform, environment, and OIDC protections", ()
   assert.match(publishNpm, /npm install --global npm@11\.19\.0/u);
   assert.match(publishNpm, /NODE_AUTH_TOKEN:\s*""/u);
   assert.match(publishNpm, /NPM_CONFIG_PROVENANCE:\s*"true"/u);
+  assert.match(publishNpm, /name: Inspect npm trusted-publishing OIDC claims/u);
+  assert.match(publishNpm, /audience=npm:registry\.npmjs\.org/u);
+  for (const claim of [
+    "repository",
+    "repository_owner",
+    "workflow",
+    "job_workflow_ref",
+    "ref",
+    "environment",
+    "sub",
+  ]) {
+    assert.match(publishNpm, new RegExp(`\\\"${claim}\\\"`));
+  }
+  assert.match(publishNpm, /NPM_CONFIG_LOGLEVEL:\s*"verbose"/u);
   assert.match(publishNpm, /test -n "\$\{ACTIONS_ID_TOKEN_REQUEST_URL:-\}"/u);
   assert.match(publishNpm, /test -n "\$\{ACTIONS_ID_TOKEN_REQUEST_TOKEN:-\}"/u);
   assert.match(publishNpm, /unset NODE_AUTH_TOKEN/u);
