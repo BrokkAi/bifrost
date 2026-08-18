@@ -903,7 +903,7 @@ jobs:
         run: >-
           npm run package-release --prefix npm --
           --release-tag "${{ needs.preflight.outputs.tag }}"
-          --assets release-assets
+          --assets "${{ github.workspace }}/release-assets"
       - name: Inspect npm tarballs
         shell: bash
         run: |

@@ -102,6 +102,7 @@ function isPluginPath(path) {
     startsWithAny(path, ["plugins/bifrost-agent/", ".claude-plugin/", ".cursor-plugin/"]) ||
     [
       "scripts/check-codex-plugin-manifest.mjs",
+      "scripts/check-codex-plugin-manifest.test.mjs",
       "scripts/smoke-agent-plugin-release.mjs",
     ].includes(path)
   );

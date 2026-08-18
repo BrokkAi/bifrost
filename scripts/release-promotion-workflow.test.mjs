@@ -437,6 +437,11 @@ readinessTest("release readiness uses bash for the portable binary build", () =>
   assert.match(binaryBuild, /run: cargo build --release --locked --bin "\$BIN_NAME"/u);
 });
 
+readinessTest("npm release packaging resolves assets from the workspace root", () => {
+  const npmPackage = jobBlock(readiness, "npm-package");
+  assert.match(npmPackage, /--assets "\$\{\{ github\.workspace \}\}\/release-assets"/u);
+});
+
 readinessTest("release readiness creates and verifies a retained commit/version qualification bundle", () => {
   assert.match(readiness, /upload-artifact@/u);
   assert.match(readiness, /release-qualification/iu);

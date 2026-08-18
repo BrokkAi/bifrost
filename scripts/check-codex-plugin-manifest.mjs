@@ -313,7 +313,11 @@ for (const target of SUPPORTED_TARGETS) {
 }
 
 const marketplacePath = ".agents/plugins/marketplace.json";
-JSON.parse(fs.readFileSync(marketplacePath, "utf8"));
+// This marketplace is private-only and is absent from the public projection.
+// When present in the canonical checkout, it remains part of validation.
+if (fs.existsSync(marketplacePath)) {
+  JSON.parse(fs.readFileSync(marketplacePath, "utf8"));
+}
 
 const claudeMarketplacePath = ".claude-plugin/marketplace.json";
 JSON.parse(fs.readFileSync(claudeMarketplacePath, "utf8"));
