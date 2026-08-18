@@ -97,7 +97,7 @@ pub struct RenameSymbolParams {
     pub new_name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DefinitionReferenceQuery {
     pub path: String,
     #[serde(default)]
@@ -150,7 +150,32 @@ pub struct RenameTextEdit {
     pub new_text: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// The advertised MCP output schema describes the semantic-model overlay as an
+/// untyped object. The overlay tree evolves with analyzer semantics, so typing
+/// it here would freeze an internal model into a published wire contract; a
+/// permissive subschema narrows nothing away and can be replaced by a derive
+/// once that surface stabilizes. See the Decision Log in
+/// `.agents/plans/mcp-output-schemas-first-slice.md`.
+pub(super) fn semantic_model_overlay_schema(
+    _generator: &mut schemars::SchemaGenerator,
+) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "object",
+        "description": "Semantic model overlay surface; evolving, not yet typed."
+    })
+}
+
+pub(super) fn semantic_model_overlay_array_schema(
+    generator: &mut schemars::SchemaGenerator,
+) -> schemars::Schema {
+    let items = semantic_model_overlay_schema(generator);
+    schemars::json_schema!({
+        "type": "array",
+        "items": items
+    })
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct SearchSymbolsResult {
     pub patterns: Vec<String>,
     pub truncated: bool,
@@ -158,6 +183,7 @@ pub struct SearchSymbolsResult {
     pub files: Vec<SearchSymbolsFile>,
     pub total_model_symbols: usize,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[schemars(schema_with = "semantic_model_overlay_array_schema")]
     pub model_symbols: Vec<crate::analyzer::semantic_model::SemanticModelSymbol>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -174,13 +200,13 @@ pub struct SearchSymbolsResult {
 /// re-deriving it here from `fq_name` alone would produce counts that disagree
 /// with the total. See the Decision Log in
 /// `.agents/plans/searchtools-too-broad-scope-guards.md`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct TooManySymbolMatches {
     pub total_candidates: usize,
     pub cap: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct SearchSymbolsFile {
     pub path: String,
     pub loc: usize,
@@ -191,13 +217,14 @@ pub struct SearchSymbolsFile {
     pub macros: Vec<SearchSymbolHit>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct SearchSymbolHit {
     pub symbol: String,
     pub signature: String,
     pub line: usize,
     pub is_type_alias: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "semantic_model_overlay_schema")]
     pub semantic_model: Option<crate::analyzer::semantic_model::SemanticModelProvenance>,
 }
 
@@ -274,7 +301,7 @@ pub struct SymbolLocation {
     pub end_line: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct GetDefinitionResult {
     pub results: Vec<DefinitionLookupResult>,
 }
@@ -289,10 +316,16 @@ pub struct GetTypeResult {
     pub results: Vec<TypeLookupResult>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct DefinitionLookupResult {
     pub query: DefinitionReferenceQuery,
     pub operation: NavigationOperation,
+    /// Outcome of this lookup. Known values are `resolved`, `no_definition`,
+    /// `no_declaration` (the declaration-operation counterpart of
+    /// `no_definition`), `unresolvable_import_boundary`, `ambiguous`,
+    /// `unsupported_language`, `invalid_location`, and `not_found`. The set is
+    /// deliberately open: a new inconclusive state is an additive change, not a
+    /// contract break, so this is not a closed enumeration.
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference: Option<DefinitionReferenceSite>,
@@ -687,12 +720,26 @@ pub fn get_symbol_locations_with_cancellation(
                 return None;
             }
 
-            let code_units =
-                match resolve_selectable_definitions(analyzer, &symbol, resolve_codeunit_fuzzy) {
-                    SelectableDefinitionResolution::Resolved(code_units) => Some(code_units),
-                    SelectableDefinitionResolution::Ambiguous(_)
-                    | SelectableDefinitionResolution::NotFound(_) => None,
-                };
+            // Every distinct definition the selector names is reported, not
+            // just a lone one. A location row carries the definition's own
+            // display symbol, so a name that several definitions answer (fmt's
+            // `vformat`, which is both `fmt::vformat` and `fmt::detail::vformat`)
+            // is answered completely here and has nothing for the caller to
+            // disambiguate. The content-rendering surfaces still ambiguate:
+            // they must choose one definition to render.
+            let code_units = match resolve_selectable_definition_groups(
+                analyzer,
+                &symbol,
+                resolve_codeunit_fuzzy,
+            ) {
+                SelectableDefinitionGroups::Groups(groups) => Some(
+                    groups
+                        .into_iter()
+                        .flat_map(|(_, units)| units)
+                        .collect::<Vec<_>>(),
+                ),
+                SelectableDefinitionGroups::NotFound(_) => None,
+            };
             let Some(code_units) = code_units else {
                 return Some((
                     index,

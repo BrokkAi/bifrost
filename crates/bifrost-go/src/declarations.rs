@@ -29,7 +29,22 @@ pub fn go_segment(text: &str, kind: SegmentKind) -> SegmentId {
 /// component that itself contains a literal dot (`github.com`) stays a single
 /// segment rather than being re-split on `.` by a downstream consumer. The
 /// resulting [`FqName`] renders back to the exact legacy `package_name` string
-/// (`/`-joined) via [`FqName::display`].
+/// (`/`-joined) via [`FqName::display`] -- but only when `package_name` is
+/// already a clean import path.
+///
+/// This filters out empty path components (from a leading, trailing, or
+/// doubled `/`), matching ordinary path-normalization semantics. That
+/// filtering is a one-way collapse: `"a//b"` and `"a/b"` intern to the same
+/// segments. `package_name` must therefore never contain an empty segment in
+/// the first place, or this and the caller's own `/`-joined `package_name`
+/// string will disagree, which trips the `CodeUnit::with_signature_and_fq`
+/// round-trip assert (`#1189`, `crates/bifrost-core/src/analyzer/model.rs`).
+/// `go_module_path_from_source` (`crates/bifrost-go/src/packages.rs`) is
+/// responsible for upholding this at the parse boundary: it guarantees the
+/// module path it extracts from `go.mod` is a single clean token with no
+/// embedded whitespace or comment text, so a malformed `module` line (such
+/// as one with a same-line `//` comment) can never reach this function as a
+/// doubled slash.
 pub fn go_package_fq(package_name: &str) -> FqName {
     let mut fq = FqName::new();
     for component in package_name.split('/').filter(|c| !c.is_empty()) {
@@ -758,6 +773,16 @@ pub fn go_field_declaration_is_embedded(node: Node<'_>) -> bool {
 pub fn parse_go_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
     let declared_package = determine_go_package_name(tree.root_node(), source);
     let package_name = canonical_go_package_name(file, &declared_package);
+    parse_go_file_with_package_name(file, source, tree, declared_package, package_name)
+}
+
+pub fn parse_go_file_with_package_name(
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    declared_package: String,
+    package_name: String,
+) -> ParsedFile {
     let mut parsed = ParsedFile::new(package_name);
     parsed.content_qualifier = declared_package;
     let root = tree.root_node();

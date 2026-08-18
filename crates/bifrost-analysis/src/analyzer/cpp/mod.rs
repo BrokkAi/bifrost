@@ -71,10 +71,13 @@ use clones::build_clone_candidate_data;
 pub(crate) use brokk_bifrost_cpp::declarations::{
     cpp_sentinel_recovered_classes, is_direct_recovered_exported_class_field_declaration, node_text,
 };
-pub use brokk_bifrost_cpp::identity::cpp_is_constructor_or_destructor_declarator_name;
 pub(crate) use brokk_bifrost_cpp::identity::{
     CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole, cpp_indexed_callable_linkage,
     cpp_is_range_for_binding_name, cpp_occurrence_role_for_range,
+};
+pub use brokk_bifrost_cpp::identity::{
+    cpp_is_constructor_or_destructor_declarator_name, cpp_is_conversion_operator_target_type,
+    cpp_is_recovered_macro_character_token_type,
 };
 pub(crate) use identity::{
     cpp_callable_definitions_share_identity_evidence, cpp_header_body_files_are_related,
@@ -1145,6 +1148,10 @@ impl CodeUnitIndex for CppAnalyzer {
 impl IAnalyzer for CppAnalyzer {
     fn invalidate_cached_file_identities(&self) {
         self.inner.invalidate_cached_file_identities();
+    }
+
+    fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {
+        self.inner.working_tree_identity()
     }
 
     #[cfg(any(test, feature = "test-support"))]

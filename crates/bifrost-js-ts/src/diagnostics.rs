@@ -24,8 +24,8 @@ use crate::parse::{
     FLOW_UNSUPPORTED_DETAIL, flow_dialect_blocks_extraction, js_ts_tree_sitter_language_for_file,
 };
 use crate::syntax::{
-    compute_import_binder, is_declaration_identifier, is_object_in_member_expression,
-    is_property_key_in_member, slice,
+    compute_import_binder, is_declaration_identifier, is_known_js_ts_global,
+    is_object_in_member_expression, is_property_key_in_member, slice,
 };
 use crate::tsconfig::AliasResolver;
 use brokk_bifrost_core::analyzer::model::{
@@ -826,80 +826,4 @@ fn is_unsafe_reference_context(node: Node<'_>, source: &str) -> bool {
             text.starts_with('_') || text == "arguments"
         }
     }
-}
-
-fn is_known_js_ts_global(name: &str) -> bool {
-    matches!(
-        name,
-        "Array"
-            | "ArrayBuffer"
-            | "BigInt"
-            | "Boolean"
-            | "Date"
-            | "Error"
-            | "EvalError"
-            | "Function"
-            | "Infinity"
-            | "Intl"
-            | "JSON"
-            | "Map"
-            | "Math"
-            | "NaN"
-            | "Number"
-            | "Object"
-            | "Promise"
-            | "Proxy"
-            | "RangeError"
-            | "ReferenceError"
-            | "Reflect"
-            | "RegExp"
-            | "Set"
-            | "String"
-            | "Symbol"
-            | "SyntaxError"
-            | "TypeError"
-            | "URIError"
-            | "WeakMap"
-            | "WeakSet"
-            | "console"
-            | "document"
-            | "window"
-            | "global"
-            | "globalThis"
-            | "process"
-            | "module"
-            | "exports"
-            | "require"
-            | "React"
-            | "JSX"
-            | "undefined"
-            | "null"
-            | "true"
-            | "false"
-            | "any"
-            | "unknown"
-            | "never"
-            | "void"
-            | "object"
-            | "string"
-            | "number"
-            | "boolean"
-            | "bigint"
-            | "symbol"
-            | "describe"
-            | "it"
-            | "test"
-            | "expect"
-            | "beforeEach"
-            | "afterEach"
-            | "beforeAll"
-            | "afterAll"
-            | "jest"
-            | "vi"
-            | "setTimeout"
-            | "clearTimeout"
-            | "setInterval"
-            | "clearInterval"
-            | "fetch"
-    )
 }

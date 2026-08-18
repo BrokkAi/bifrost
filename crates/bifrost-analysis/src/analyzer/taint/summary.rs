@@ -9,8 +9,9 @@ use crate::analyzer::dataflow::{
     DataflowRequest, PathQuality, PathQualityFrontier, ProcedureSummaryIdentity,
     ProcedureSummaryKey, ReusableIdeEndSummary, ReusableIdeProcedureSummary,
     ReusableIdeReachedFact, ReusableIdeSummaryProvider, SemanticProcedureSummary,
-    SemanticSummarySetValidationError, SolverTermination, SolverWork, SummaryDependencyKey,
-    SummaryEntry, SummaryExitKind, SummaryRecursiveGroupKey, canonicalize_semantic_summary_items,
+    SemanticSummarySetValidationError, SolverTermination, SolverWork, SummaryCallCycle,
+    SummaryCalledProcedures, SummaryDependencyKey, SummaryEntry, SummaryExitKind,
+    SummaryRecursiveGroupKey, canonicalize_semantic_summary_items,
     validate_recursive_summary_batch,
 };
 use crate::analyzer::semantic::{
@@ -1461,10 +1462,70 @@ struct TaintSummaryOracle<'query> {
     contracts: &'query TaintContractSet,
 }
 
+impl TaintSummaryOracle<'_> {
+    /// Whether the summary's validity contract names every analyzed procedure
+    /// this plan binds a call to, from the summarized body or from anything
+    /// already inside that contract (#2296).
+    ///
+    /// A taint summary is looked up under a dependency contract: the exact
+    /// transitive closure of client contracts of the summarized procedure's
+    /// declared dependencies (`TaintContractSet::try_new`). That closure is
+    /// what makes reuse safe for the completeness verdict. Replaying a summary
+    /// skips the summarized body and every call it makes, so the subtree
+    /// contributes no reached row and no coverage row to this solve (#2291).
+    /// The verdict survives because the summary was published only from a solve
+    /// that walked that subtree and reported itself complete
+    /// (`solve_taint_with_reusable_summaries` returns `Incomplete` and publishes
+    /// nothing otherwise), and because the closure pins each of those
+    /// procedures' value-flow identity -- curated models, external summary
+    /// fingerprints, snapshot presence, local and call rules, unmodeled call
+    /// behavior (`ValueFlowPlan::carrier_summary_identities`) -- so the
+    /// publishing plan discharged that subtree exactly the way this plan would.
+    ///
+    /// A declared dependency list that omits a call the plan binds breaks both
+    /// halves at once: the omitted procedure's identity is absent from the key,
+    /// so a summary published under a plan that modeled that subtree can be
+    /// replayed into a plan that does not, and the run then reports a
+    /// completeness the fresh solve refuses. Detect that here from the plan's
+    /// own call bindings, which cost no semantic work to read, and let the
+    /// solver refuse.
+    ///
+    /// Only bound calls need this. An unbound call is one
+    /// `ValueFlowPlan::execution_discovery_modeled` accepts only through a
+    /// fully modeled dispatch boundary, and the plan inputs that model it --
+    /// curated call models and external summary fingerprints -- are already
+    /// part of the calling procedure's own carrier identity, which the key
+    /// pins. An unbound call that the solver nonetheless resolves into an
+    /// analyzed body leaves that quantifier unsatisfied, so the publishing
+    /// solve was not complete and no summary exists to replay.
+    fn called_procedures(
+        &self,
+        procedure: &ProcedureHandle,
+        contract: &PreparedTaintProcedureContract,
+    ) -> SummaryCalledProcedures {
+        let covered = contract
+            .dependency_contract
+            .0
+            .iter()
+            .filter_map(|row| self.contracts.get_by_key(&row.procedure))
+            .map(|(handle, _)| handle)
+            .collect::<Vec<_>>();
+        for member in std::iter::once(procedure).chain(covered.iter().copied()) {
+            for callee in self.plan.value_flow().bound_callees_of(member) {
+                if callee != procedure && !covered.contains(&callee) {
+                    return SummaryCalledProcedures::MayEscapeContract;
+                }
+            }
+        }
+        SummaryCalledProcedures::CoveredByContract
+    }
+}
+
 impl ReusableIdeSummaryProvider<TaintFact, TaintEdgeFunction> for TaintSummaryOracle<'_> {
     fn summary_for(
         &mut self,
         procedure: &ProcedureHandle,
+        root: &ProcedureHandle,
         entry_fact: TaintFact,
         request: &mut DataflowRequest<'_>,
     ) -> Result<Option<ReusableIdeProcedureSummary<TaintFact, TaintEdgeFunction>>, SolverTermination>
@@ -1474,6 +1535,22 @@ impl ReusableIdeSummaryProvider<TaintFact, TaintEdgeFunction> for TaintSummaryOr
         }
         let Some(contract) = self.contracts.get(procedure) else {
             return Ok(None);
+        };
+        // #2285. Taint summaries are published for whole call cycles at once,
+        // so the repository really can answer for a callee that calls back into
+        // the procedure this solve is rooted at. Report that and let the solver
+        // refuse the summary and solve the body. Without the root's own
+        // contract there is nothing to compare, so report the cycle: refusing
+        // reuse costs recomputation, and a wrong answer here costs a fact.
+        let call_cycle = match self.contracts.get(root) {
+            Some(root_contract) => contract
+                .carrier
+                .procedure
+                .call_cycle_with_root(&root_contract.carrier.procedure),
+            None if contract.carrier.procedure.recursive_group().is_some() => {
+                SummaryCallCycle::IncludesRoot
+            }
+            None => SummaryCallCycle::ExcludesRoot,
         };
         let Ok(entry) = StableTaintFact::from_live(entry_fact, self.plan) else {
             return Ok(None);
@@ -1487,6 +1564,7 @@ impl ReusableIdeSummaryProvider<TaintFact, TaintEdgeFunction> for TaintSummaryOr
         ) else {
             return Ok(None);
         };
+        let called_procedures = self.called_procedures(procedure, contract);
         let row_range = summary.row_range(&entry);
         let observation_range = summary.observation_range(&entry);
         let rows = row_range.len();
@@ -1625,6 +1703,8 @@ impl ReusableIdeSummaryProvider<TaintFact, TaintEdgeFunction> for TaintSummaryOr
         Ok(Some(ReusableIdeProcedureSummary {
             exits: exits.into_boxed_slice(),
             reached: reached.into_boxed_slice(),
+            call_cycle,
+            called_procedures,
         }))
     }
 }

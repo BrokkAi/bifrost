@@ -42,6 +42,7 @@ pub(in crate::analyzer::usages) use brokk_bifrost_cpp::graph::extractor::{
     initialized_ordinary_type_imports as cpp_initialized_effective_using_imports,
     resolve_bare_call_target as cpp_resolve_bare_call_target,
     resolve_block_using_call_target as cpp_resolve_block_using_call_target,
+    resolve_type_components_lexically_at_preserving_alias as cpp_resolve_type_components_lexically_at_preserving_alias,
 };
 pub(in crate::analyzer::usages) use brokk_bifrost_cpp::graph::resolver::{
     CallArityEvidence, CppTemplateResolutionError,

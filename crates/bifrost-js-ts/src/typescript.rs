@@ -18,7 +18,7 @@ use crate::imports::{
 use crate::model::*;
 use crate::parse::flow_dialect_blocks_extraction;
 use crate::providers::JsTsSource;
-use crate::syntax::js_program_is_external_module;
+use crate::syntax::{inline_object_type, js_program_is_external_module};
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, SignatureMetadata};
@@ -354,10 +354,20 @@ fn visit_ts_default_export_value(
             parsed.add_signature(code_unit.clone(), trim_statement(node_text(export, source)));
             visit_ts_object_literal_properties(file, source, value, &code_unit, &code_unit, parsed);
         }
-        // `export default name` points at an existing binding; indexing `default`
-        // here would duplicate that declaration instead of describing new code.
-        // The export declaration itself is still recorded.
-        _ => record_default_reexport(export, parsed),
+        // `export default name` and `export default object.member` point at an
+        // existing binding. Every other expression creates an anonymous default
+        // value that needs its own source-backed declaration (#2301).
+        "identifier" | "member_expression" => record_default_reexport(export, parsed),
+        _ => {
+            let code_unit = add_default_export_unit(
+                file,
+                source,
+                export,
+                brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
+                parsed,
+            );
+            parsed.add_signature(code_unit, trim_statement(node_text(export, source)));
+        }
     }
 }
 
@@ -382,9 +392,7 @@ fn visit_ts_default_export_function(
             ts_parameter_labels(function, source),
         ),
     );
-    visit_ts_return_object_literal_properties(
-        file, source, function, &code_unit, &code_unit, parsed,
-    );
+    visit_ts_return_surface_members(file, source, function, &code_unit, &code_unit, parsed);
     code_unit
 }
 
@@ -597,9 +605,7 @@ fn visit_ts_function(
         // never be treated as runnable behavior (#1658, the da26602 shape).
         .with_declaration_only(definition.kind() == "function_signature"),
     );
-    visit_ts_return_object_literal_properties(
-        file, source, definition, &code_unit, &top_level, parsed,
-    );
+    visit_ts_return_surface_members(file, source, definition, &code_unit, &top_level, parsed);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -759,7 +765,7 @@ fn visit_ts_value(
                         ts_parameter_labels(value, source),
                     ),
                 );
-                visit_ts_return_object_literal_properties(
+                visit_ts_return_surface_members(
                     file, source, value, &code_unit, &top_level, parsed,
                 );
             } else {
@@ -1140,7 +1146,23 @@ fn ts_object_shape_expression(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
-fn visit_ts_return_object_literal_properties(
+/// The members of a function's result surface, from both places TypeScript
+/// lets an author state them.
+///
+/// The object literals the body returns have named those members since #1924.
+/// A declared return type written as an inline type literal --
+/// `export function useFlow(): { id?: string; flow?: string }` -- states the
+/// same fact and is the only statement of it when the body returns a call
+/// instead of a literal, so a read through the call had nothing to resolve to
+/// (#2159).
+///
+/// One identity serves both: a synthetic member off the function's own `fq`,
+/// the scheme the returned-literal members already use, because `useFlow.id` is
+/// a name this analyzer synthesizes rather than one the author wrote. A
+/// function that both declares the type and returns the literal therefore
+/// publishes ONE unit per member carrying a range from each site, with the
+/// literal's range and signature first as before.
+fn visit_ts_return_surface_members(
     file: &ProjectFile,
     source: &str,
     function: Node<'_>,
@@ -1152,6 +1174,70 @@ fn visit_ts_return_object_literal_properties(
     collect_ts_return_object_literals(function, function.id(), &mut objects);
     for object in objects {
         visit_ts_object_literal_properties(file, source, object, parent, top_level, parsed);
+    }
+    if let Some(object_type) = function
+        .child_by_field_name("return_type")
+        .and_then(inline_object_type)
+    {
+        visit_ts_object_type_members(file, source, object_type, parent, top_level, parsed);
+    }
+}
+
+/// Publishes each named member of an anonymous `object_type` under `parent`.
+///
+/// An `index_signature` names no member and is skipped: `[key: string]: T`
+/// declares a shape, not an identity a read can resolve to.
+fn visit_ts_object_type_members(
+    file: &ProjectFile,
+    source: &str,
+    object_type: Node<'_>,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
+) {
+    for index in 0..object_type.named_child_count() {
+        let Some(child) = object_type.named_child(index) else {
+            continue;
+        };
+        let kind = match child.kind() {
+            "property_signature" => brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
+            "method_signature" => brokk_bifrost_core::analyzer::model::CodeUnitType::Function,
+            _ => continue,
+        };
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        if name_node.kind() == "computed_property_name" {
+            continue;
+        }
+        let name = trim_statement(node_text(name_node, source))
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let fq = parent
+            .fq()
+            .clone()
+            .with_pushed(js_ts_segment(&name, SegmentKind::Member));
+        let code_unit = CodeUnit::with_signature_and_fq(
+            file.clone(),
+            kind,
+            "",
+            format!("{}.{}", parent.short_name(), name),
+            None,
+            true,
+            fq,
+        );
+        parsed.add_code_unit(
+            code_unit.clone(),
+            child,
+            source,
+            Some(parent.clone()),
+            Some(top_level.clone()),
+        );
+        parsed.add_signature(code_unit, trim_statement(node_text(child, source)));
     }
 }
 

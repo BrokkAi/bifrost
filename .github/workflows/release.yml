@@ -7,16 +7,20 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to build and release (e.g. v0.1.0)'
+        description: Existing release tag to promote (for example v0.10.3)
         required: true
+        type: string
+      qualification_run_id:
+        description: Optional exact Release readiness run ID for recovery
+        required: false
         type: string
 
 permissions:
   contents: read
+  actions: read
 
 env:
-  BIN_NAME: bifrost
-  ANDROID_API: '21'
+  PUBLIC_REPOSITORY: BrokkAi/bifrost
 
 concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
@@ -31,242 +35,30 @@ jobs:
       tag: ${{ inputs.tag || github.ref_name }}
     permissions:
       contents: read
+      actions: read
 
-  notices:
-    name: generate Rust notices
-    needs: release-context
-    uses: ./.github/workflows/rust-notices.yml
-    with:
-      ref: ${{ needs.release-context.outputs.commit }}
-    permissions:
-      contents: read
-
-  crate-package:
-    name: verify workspace package contents
+  resolve-qualification:
+    name: resolve exact readiness run
     needs: release-context
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 15
     permissions:
       contents: read
+      actions: read
+    outputs:
+      run_id: ${{ steps.select.outputs.run_id }}
+      run_attempt: ${{ steps.select.outputs.run_attempt }}
+      artifact_id: ${{ steps.select.outputs.artifact_id }}
+      artifact_digest: ${{ steps.select.outputs.artifact_digest }}
+      artifact_name: ${{ steps.select.outputs.artifact_name }}
+    env:
+      RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.release-context.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
+      QUALIFICATION_RUN_ID_INPUT: ${{ inputs.qualification_run_id }}
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout validated source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-
-      - name: Verify packaged workspace contents
-        run: bash scripts/check-workspace-packages.sh
-
-  semantic-pack-bundle:
-    name: generate pinned JVM semantic packs
-    needs: release-context
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout validated source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-
-      - name: Generate and verify semantic-pack bundle
-        shell: bash
-        run: bash scripts/build-pinned-jvm-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs" "${RUNNER_TEMP}"
-
-      - name: Package semantic-pack bundle
-        shell: bash
-        run: |
-          mkdir -p dist
-          mv "${RUNNER_TEMP}/bifrost-semantic-packs/measurements.json" \
-            "dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}-measurements.json"
-          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
-            -C "${RUNNER_TEMP}" -cf - bifrost-semantic-packs \
-            | gzip -n > "dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}.tar.gz"
-          cd dist
-          sha256sum "bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}.tar.gz" \
-            > "bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}.tar.gz.sha256"
-
-      - name: Upload semantic-pack bundle
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: bifrost-semantic-packs
-          path: |
-            dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}.tar.gz
-            dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}.tar.gz.sha256
-            dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}-measurements.json
-          if-no-files-found: error
-
-  build-wheels:
-    name: build and verify release wheels
-    needs: [release-context, notices]
-    uses: ./.github/workflows/build-wheels.yml
-    with:
-      tag: ${{ needs.release-context.outputs.tag }}
-      version: ${{ needs.release-context.outputs.version }}
-      commit: ${{ needs.release-context.outputs.commit }}
-    permissions:
-      contents: read
-
-  build:
-    name: build (${{ matrix.target }})
-    needs: [release-context, notices]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            rust_targets: "x86_64-unknown-linux-gnu"
-            runner: ubuntu-latest
-            archive: tar.gz
-          - target: x86_64-unknown-linux-musl
-            rust_targets: "x86_64-unknown-linux-musl"
-            runner: ubuntu-latest
-            archive: tar.gz
-          - target: aarch64-unknown-linux-gnu
-            rust_targets: "aarch64-unknown-linux-gnu"
-            runner: ubuntu-24.04-arm
-            archive: tar.gz
-          - target: aarch64-linux-android
-            rust_targets: "aarch64-linux-android"
-            runner: ubuntu-latest
-            archive: tar.gz
-          - target: universal-apple-darwin
-            rust_targets: "x86_64-apple-darwin aarch64-apple-darwin"
-            runner: macos-latest
-            archive: tar.gz
-          - target: x86_64-pc-windows-msvc
-            rust_targets: "x86_64-pc-windows-msvc"
-            runner: windows-latest
-            archive: zip
-          - target: aarch64-pc-windows-msvc
-            rust_targets: "aarch64-pc-windows-msvc"
-            runner: windows-latest
-            archive: zip
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Download Rust notice report
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: rust-third-party-licenses
-          path: licenses
-
-      - name: Install Rust toolchain
-        shell: bash
-        run: rustup show
-
-      - name: Install Rust targets
-        shell: bash
-        run: rustup target add ${{ matrix.rust_targets }}
-
-      - name: Install musl toolchain
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y musl-tools
-
-      - name: Set up Android NDK
-        if: matrix.target == 'aarch64-linux-android'
-        id: setup-ndk
-        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
-        with:
-          ndk-version: r27d
-          add-to-path: false
-
-      - name: Configure Android toolchain
-        if: matrix.target == 'aarch64-linux-android'
-        shell: bash
-        run: |
-          toolchain_bin="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          api="${ANDROID_API}"
-          {
-            echo "CC_aarch64_linux_android=${toolchain_bin}/aarch64-linux-android${api}-clang"
-            echo "CXX_aarch64_linux_android=${toolchain_bin}/aarch64-linux-android${api}-clang++"
-            echo "AR_aarch64_linux_android=${toolchain_bin}/llvm-ar"
-            echo "RANLIB_aarch64_linux_android=${toolchain_bin}/llvm-ranlib"
-            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${toolchain_bin}/aarch64-linux-android${api}-clang"
-          } >> "$GITHUB_ENV"
-
-      - name: Build
-        if: matrix.target != 'universal-apple-darwin'
-        run: cargo build --release --locked --bin ${{ env.BIN_NAME }} --target ${{ matrix.target }}
-
-      - name: Build macOS universal binary
-        if: matrix.target == 'universal-apple-darwin'
-        shell: bash
-        run: |
-          cargo build --release --locked --bin "${BIN_NAME}" --target x86_64-apple-darwin
-          cargo build --release --locked --bin "${BIN_NAME}" --target aarch64-apple-darwin
-          mkdir -p "target/${{ matrix.target }}/release"
-          lipo -create \
-            "target/x86_64-apple-darwin/release/${BIN_NAME}" \
-            "target/aarch64-apple-darwin/release/${BIN_NAME}" \
-            -output "target/${{ matrix.target }}/release/${BIN_NAME}"
-          lipo -info "target/${{ matrix.target }}/release/${BIN_NAME}"
-
-      - name: Stage artifacts (Unix)
-        if: matrix.archive == 'tar.gz'
-        shell: bash
-        run: |
-          stage="${BIN_NAME}-${{ needs.release-context.outputs.tag }}-${{ matrix.target }}"
-          mkdir -p "dist/${stage}"
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/${stage}/"
-          cp LICENSE.md README.md licenses/GPL-3.0.md licenses/LGPL-3.0.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "dist/${stage}/"
-          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
-          (cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
-
-      - name: Stage artifacts (Windows)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          $stage = "${env:BIN_NAME}-${{ needs.release-context.outputs.tag }}-${{ matrix.target }}"
-          New-Item -ItemType Directory -Path "dist/$stage" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" "dist/$stage/"
-          Copy-Item LICENSE.md, README.md, licenses/GPL-3.0.md, licenses/LGPL-3.0.md, licenses/THIRD_PARTY_LICENSES.html, licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "dist/$stage/"
-          Compress-Archive -Path "dist/$stage" -DestinationPath "dist/$stage.zip"
-          $hash = (Get-FileHash -Algorithm SHA256 "dist/$stage.zip").Hash.ToLower()
-          # Write LF, not CRLF: git-bash sha256sum -c rejects a filename with a trailing \r.
-          # The .NET API resolves a relative path against the process directory, not $PWD, so pass an absolute path.
-          [System.IO.File]::WriteAllText((Join-Path $PWD "dist/$stage.zip.sha256"), "$hash  $stage.zip`n")
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
-          path: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/*.sha256
-          if-no-files-found: error
-
-  agent-plugin-package:
-    name: stage agent plugin package
-    needs: [release-context, build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
+      - name: Checkout exact release commit
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
@@ -278,229 +70,186 @@ jobs:
           node-version: 22
           package-manager-cache: false
 
-      - name: Download release artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Prepare agent plugin release metadata
-        run: >
-          node scripts/prepare-vscode-extension-manifest.mjs
-          --version "${{ needs.release-context.outputs.version }}"
-          --plugin-release plugins/bifrost-agent/bifrost-release.json
-          --dist dist
-
-      - name: Test agent plugin launcher
-        run: node --test plugins/bifrost-agent/test/launcher.test.mjs
-
-      - name: Validate agent plugin manifests
-        run: node scripts/check-codex-plugin-manifest.mjs
-
-      - name: Package agent plugin
+      - name: Collect readiness run and artifact evidence
         shell: bash
-        run: |
-          package_root="${RUNNER_TEMP}/bifrost-agent-package"
-          mkdir -p "$package_root" dist
-          cp -R plugins/bifrost-agent "$package_root/bifrost-agent"
-          cp LICENSE.md "$package_root/bifrost-agent/"
-          tar -C "$package_root" -czf "dist/bifrost-agent-${{ needs.release-context.outputs.tag }}.tar.gz" bifrost-agent
-
-      - name: Upload staged agent plugin
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: bifrost-agent-package
-          path: dist/bifrost-agent-${{ needs.release-context.outputs.tag }}.tar.gz
-          if-no-files-found: error
-
-  agent-plugin-prepublish-smoke:
-    name: prepublication agent plugin smoke
-    needs: [release-context, build, agent-plugin-package]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Set up Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          package-manager-cache: false
-
-      - name: Download built Linux binary
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: ${{ env.BIN_NAME }}-x86_64-unknown-linux-gnu
-          path: ${{ runner.temp }}/bifrost-linux-release
-
-      - name: Download staged agent plugin
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: bifrost-agent-package
-          path: ${{ runner.temp }}/bifrost-agent-prepublish
-
-      - name: Extract staged agent plugin
-        shell: bash
-        run: |
-          package_dir="${RUNNER_TEMP}/bifrost-agent-prepublish"
-          archive="$(find "$package_dir" -maxdepth 1 -type f -name 'bifrost-agent-*.tar.gz' -print -quit)"
-          test -n "$archive"
-          tar -C "$package_dir" -xzf "$archive"
-
-      - name: Extract built Linux binary
-        id: binary
-        shell: bash
-        env:
-          ARTIFACT_DIR: ${{ runner.temp }}/bifrost-linux-release
-        run: |
-          archive="$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
-          test -n "$archive"
-          tar -C "$ARTIFACT_DIR" -xzf "$archive"
-          binary="$(find "$ARTIFACT_DIR" -type f -name "${BIN_NAME}" -print -quit)"
-          test -n "$binary"
-          chmod +x "$binary"
-          echo "path=$binary" >> "$GITHUB_OUTPUT"
-
-      - name: Smoke staged agent plugin with built binary
-        shell: bash
-        run: >
-          node scripts/smoke-agent-plugin-release.mjs
-          --plugin-dir "${RUNNER_TEMP}/bifrost-agent-prepublish/bifrost-agent"
-          --cache-dir "${RUNNER_TEMP}/bifrost-agent-prepublish-cache"
-          --binary-path "${{ steps.binary.outputs.path }}"
-
-  policy-scan-prepublish-smoke:
-    name: prepublication policy scan smoke
-    needs: [release-context, build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout validated source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Download built Linux binary
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: ${{ env.BIN_NAME }}-x86_64-unknown-linux-gnu
-          path: ${{ runner.temp }}/bifrost-linux-release
-
-      - name: Stage the built binary at target/release
-        # The policy-scan action with version=local selects
-        # ${GITHUB_WORKSPACE}/target/release/bifrost when it exists. Put the
-        # release binary there, so the gate uses the staged artifact and not a
-        # binary from PATH.
-        shell: bash
-        env:
-          ARTIFACT_DIR: ${{ runner.temp }}/bifrost-linux-release
         run: |
           set -euo pipefail
-          archive="$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
-          test -n "$archive"
-          tar -C "$ARTIFACT_DIR" -xzf "$archive"
-          binary="$(find "$ARTIFACT_DIR" -type f -name "${BIN_NAME}" -print -quit)"
-          test -n "$binary"
-          mkdir -p "${GITHUB_WORKSPACE}/target/release"
-          cp "$binary" "${GITHUB_WORKSPACE}/target/release/${BIN_NAME}"
-          chmod +x "${GITHUB_WORKSPACE}/target/release/${BIN_NAME}"
+          gh api --paginate --slurp \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/release-readiness.yml/runs?head_sha=${RELEASE_COMMIT}&status=completed&per_page=100" \
+            > "$RUNNER_TEMP/readiness-runs-api.json"
+          gh api --paginate --slurp \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts?name=release-qualification-${RELEASE_COMMIT}-v${RELEASE_VERSION}&per_page=100" \
+            > "$RUNNER_TEMP/readiness-artifacts-api.json"
+          jq '{workflow_runs: [.[] | .workflow_runs[] |
+              {id, path, status, conclusion, head_sha, run_attempt,
+               repository: {full_name: .repository.full_name}}]}' \
+            "$RUNNER_TEMP/readiness-runs-api.json" > "$RUNNER_TEMP/readiness-runs.json"
+          jq '{artifacts: [.[] | .artifacts[] |
+              select(.workflow_run.id != null) |
+              {id, name, expired, expires_at, workflow_run: {id: .workflow_run.id}}]}' \
+            "$RUNNER_TEMP/readiness-artifacts-api.json" > "$RUNNER_TEMP/readiness-artifacts.json"
 
-      - name: Scan this repository with the staged binary
-        # This smoke test proves that the staged binary can complete the scan.
-        # Existing repository findings do not block publication. An unreliable
-        # scan still returns status 2 and blocks publication.
-        # The scan uses no cache, so the release gate is a cold, reproducible
-        # run.
-        uses: ./.github/actions/policy-scan
-        with:
-          version: local
-          upload: 'false'
-          cache: 'false'
-          fail-on: never
+      - name: Select one exact readiness run
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+          selection_args=(
+            select-run
+            --runs "$RUNNER_TEMP/readiness-runs.json"
+            --artifacts "$RUNNER_TEMP/readiness-artifacts.json"
+            --repository "$PUBLIC_REPOSITORY"
+            --commit "$RELEASE_COMMIT"
+            --version "$RELEASE_VERSION"
+          )
+          if [[ -n "${QUALIFICATION_RUN_ID_INPUT:-}" ]]; then
+            selection_args+=(--run-id "$QUALIFICATION_RUN_ID_INPUT")
+          fi
+          node scripts/release-qualification.mjs "${selection_args[@]}" > "$RUNNER_TEMP/qualification-selection.json"
+          artifact_id="$(jq -r '.artifactId' "$RUNNER_TEMP/qualification-selection.json")"
+          run_id="$(jq -r '.runId' "$RUNNER_TEMP/qualification-selection.json")"
+          run_attempt="$(jq -r '.runAttempt' "$RUNNER_TEMP/qualification-selection.json")"
+          artifact_name="$(jq -r '.artifact.name' "$RUNNER_TEMP/qualification-selection.json")"
+          artifact_digest="$(jq -r --argjson id "$artifact_id" \
+            '[.[] | .artifacts[] | select(.id == $id) | (.digest // "")] | unique | if length == 1 then .[0] else "" end' \
+            "$RUNNER_TEMP/readiness-artifacts-api.json")"
+          expected_name="release-qualification-${RELEASE_COMMIT}-v${RELEASE_VERSION}"
+          test "$artifact_name" = "$expected_name"
+          [[ "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          {
+            echo "run_id=$run_id"
+            echo "run_attempt=$run_attempt"
+            echo "artifact_id=$artifact_id"
+            echo "artifact_digest=$artifact_digest"
+            echo "artifact_name=$artifact_name"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Qualification selected"
+            echo
+            echo "- Tag: `$RELEASE_TAG`"
+            echo "- Version: `$RELEASE_VERSION`"
+            echo "- Commit: `$RELEASE_COMMIT`"
+            echo "- Readiness run: `$run_id` (attempt `$run_attempt`)"
+            echo "- Artifact: `$artifact_name` (`$artifact_id`)"
+            echo "- Artifact digest: `$artifact_digest`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-  promotion-evidence:
-    name: promotion evidence
-    needs:
-      - release-context
-      - crate-package
-      - semantic-pack-bundle
-      - build-wheels
-      - build
-      - agent-plugin-package
-      - agent-plugin-prepublish-smoke
-      - policy-scan-prepublish-smoke
-      - pi-package
-      - vscode-package
+  promote-qualification:
+    name: download and verify qualification bundle
+    needs: [release-context, resolve-qualification]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 15
     permissions:
       contents: read
+      actions: read
+    outputs:
+      run_id: ${{ needs.resolve-qualification.outputs.run_id }}
+      run_attempt: ${{ needs.resolve-qualification.outputs.run_attempt }}
+      artifact_id: ${{ needs.resolve-qualification.outputs.artifact_id }}
+      artifact_digest: ${{ needs.resolve-qualification.outputs.artifact_digest }}
+      artifact_name: ${{ needs.resolve-qualification.outputs.artifact_name }}
+      manifest_sha256: ${{ steps.verify.outputs.manifest_sha256 }}
+    env:
+      RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.release-context.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
+      QUALIFICATION_RUN_ID: ${{ needs.resolve-qualification.outputs.run_id }}
+      QUALIFICATION_RUN_ATTEMPT: ${{ needs.resolve-qualification.outputs.run_attempt }}
+      QUALIFICATION_ARTIFACT_ID: ${{ needs.resolve-qualification.outputs.artifact_id }}
+      QUALIFICATION_ARTIFACT_DIGEST: ${{ needs.resolve-qualification.outputs.artifact_digest }}
+      QUALIFICATION_ARTIFACT_NAME: ${{ needs.resolve-qualification.outputs.artifact_name }}
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Checkout validated source
+      - name: Checkout exact release commit
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
           ref: ${{ needs.release-context.outputs.commit }}
 
-      - name: Verify release tag still selects the validated commit
-        # Recovery dispatches run this workflow revision while checking out the
-        # immutable release source, so keep the verifier in this workflow.
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
-          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
-        run: |
-          tag_ref="refs/tags/$RELEASE_TAG"
-          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
-          actual_commit="$(awk -v tag_ref="$tag_ref" '
-            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
-            $2 == tag_ref { fallback = $1 }
-            END { if (!found && fallback) print fallback }
-          ' <<< "$remote_refs")"
-          test -n "$actual_commit"
-          test "$actual_commit" = "$RELEASE_COMMIT"
-
-      - name: Record validated release identity
-        shell: bash
-        run: |
-          echo "Validated release ${{ needs.release-context.outputs.tag }} (${{ needs.release-context.outputs.version }})"
-          echo "Source commit: ${{ needs.release-context.outputs.commit }}"
-
-  release:
-    name: release
-    needs: [release-context, promotion-evidence]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
+          node-version: 22
+          package-manager-cache: false
 
-      - name: Download all artifacts
+      - name: Confirm artifact ID and digest before download
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${QUALIFICATION_ARTIFACT_ID}" > "$RUNNER_TEMP/qualification-artifact.json"
+          jq -e --arg name "$QUALIFICATION_ARTIFACT_NAME" \
+            --arg digest "$QUALIFICATION_ARTIFACT_DIGEST" \
+            '.name == $name and .digest == $digest and .expired == false' \
+            "$RUNNER_TEMP/qualification-artifact.json" >/dev/null
+
+      - name: Download exact readiness artifact
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          path: dist
+          artifact-ids: ${{ needs.resolve-qualification.outputs.artifact_id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.resolve-qualification.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: qualification
           merge-multiple: true
 
-      - name: Verify release tag still selects the validated commit
+      - name: Verify every qualified byte and identity
+        id: verify
         shell: bash
-        env:
-          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
-          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
         run: |
+          set -euo pipefail
+          node scripts/verify-qualified-release.mjs verify \
+            --bundle qualification \
+            --manifest qualification/release-qualification.json \
+            --repository "$PUBLIC_REPOSITORY" \
+            --commit "$RELEASE_COMMIT" \
+            --version "$RELEASE_VERSION" \
+            --run-id "$QUALIFICATION_RUN_ID" \
+            --run-attempt "$QUALIFICATION_RUN_ATTEMPT" \
+            --output "$RUNNER_TEMP/verified-qualification.json"
+          manifest_sha256="$(sha256sum qualification/release-qualification.json | awk '{print $1}')"
+          echo "manifest_sha256=$manifest_sha256" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Qualification bytes verified"
+            echo
+            echo "- Manifest: `qualification/release-qualification.json`"
+            echo "- Manifest SHA-256: `$manifest_sha256`"
+            echo "- Artifact ID: `$QUALIFICATION_ARTIFACT_ID`"
+            echo "- Artifact digest: `$QUALIFICATION_ARTIFACT_DIGEST`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: create GitHub Release from qualified assets
+    needs: [release-context, promote-qualification]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    env:
+      RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.release-context.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
+    steps:
+      - name: Checkout exact release commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-context.outputs.commit }}
+
+      - name: Download qualified release bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: ${{ needs.promote-qualification.outputs.artifact_id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.promote-qualification.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: qualification
+          merge-multiple: true
+
+      - name: Verify tag still selects the qualified commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
           tag_ref="refs/tags/$RELEASE_TAG"
           remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
           actual_commit="$(awk -v tag_ref="$tag_ref" '
@@ -508,1024 +257,778 @@ jobs:
             $2 == tag_ref { fallback = $1 }
             END { if (!found && fallback) print fallback }
           ' <<< "$remote_refs")"
-          test -n "$actual_commit"
           test "$actual_commit" = "$RELEASE_COMMIT"
 
-      - name: Publish GitHub Release
+      - name: Select exact qualified GitHub assets
+        id: assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets="$RUNNER_TEMP/release-assets.txt"
+          jq -r '.files[] |
+            select((.path | test("^bifrost-v.*\\.(tar\\.gz|zip)(\\.sha256)?$")) or
+                   (.path | test("^bifrost-semantic-packs-.*\\.(tar\\.gz|json)(\\.sha256)?$")) or
+                   (.path | test("^(bifrost-agent-.*\\.tar\\.gz|brokk-bifrost-agent-.*\\.tgz|bifrost-vscode-.*\\.vsix)$"))) |
+            "qualification/" + .path' qualification/release-qualification.json > "$assets"
+          test -s "$assets"
+          release_json="$RUNNER_TEMP/github-release.json"
+          release_status="$RUNNER_TEMP/github-release-status.txt"
+          curl --silent --show-error --location \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --output "$release_json" \
+            --write-out '%{http_code}' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            > "$release_status"
+          status="$(tr -d '[:space:]' < "$release_status")"
+          if [[ "$status" == 200 ]]; then
+            missing="$RUNNER_TEMP/release-assets-missing.txt"
+            : > "$missing"
+            while IFS= read -r file; do
+              name="$(basename "$file")"
+              digest="$(sha256sum "$file" | awk '{print $1}')"
+              existing="$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | (.digest // "")' "$release_json")"
+              if [[ -z "$existing" ]]; then
+                printf '%s\n' "$file" >> "$missing"
+                continue
+              fi
+              test "$existing" = "sha256:$digest"
+            done < "$assets"
+            mv "$missing" "$assets"
+          elif [[ "$status" != 404 ]]; then
+            echo "Unexpected GitHub release lookup status: $status" >&2
+            exit 1
+          fi
+          if [[ -s "$assets" ]]; then
+            echo "upload=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "upload=false" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo "files<<EOF"
+            cat "$assets"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release without overwriting assets
+        if: steps.assets.outputs.upload == 'true'
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ needs.release-context.outputs.tag }}
           name: ${{ needs.release-context.outputs.tag }}
           generate_release_notes: true
           overwrite_files: false
-          files: |
-            dist/${{ env.BIN_NAME }}-${{ needs.release-context.outputs.tag }}-*.tar.gz
-            dist/${{ env.BIN_NAME }}-${{ needs.release-context.outputs.tag }}-*.zip
-            dist/${{ env.BIN_NAME }}-${{ needs.release-context.outputs.tag }}-*.sha256
-            dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}.tar.gz
-            dist/bifrost-semantic-packs-${{ needs.release-context.outputs.tag }}.tar.gz.sha256
+          files: ${{ steps.assets.outputs.files }}
+
+  publish-wheels:
+    name: publish qualified wheels and sdist
+    needs: [release-context, promote-qualification]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      RELEASE_VERSION: ${{ needs.release-context.outputs.version }}
+    steps:
+      - name: Download qualified release bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: ${{ needs.promote-qualification.outputs.artifact_id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.promote-qualification.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: qualification
+          merge-multiple: true
+
+      - name: Stage exact qualified Python files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pypi-dist"
+          mapfile -t files < <(jq -r '.files[] | select(
+            (.path | startswith("brokk_bifrost_searchtools-") and (endswith(".whl") or endswith(".tar.gz"))) or
+            (.path | startswith("brokk_bifrost-") and endswith(".whl"))) | .path' qualification/release-qualification.json)
+          test "${#files[@]}" -eq 11
+          for file in "${files[@]}"; do cp "qualification/$file" "$RUNNER_TEMP/pypi-dist/"; done
+
+      - name: Check existing PyPI files against qualified checksums
+        id: pypi-check
+        shell: bash
+        run: |
+          set -euo pipefail
+          publish=0
+          for package in brokk-bifrost-searchtools brokk-bifrost; do
+            response="$RUNNER_TEMP/pypi-${package}.json"
+            status="$(curl --silent --show-error --location --output "$response" --write-out '%{http_code}' \
+              "https://pypi.org/pypi/${package}/${RELEASE_VERSION}/json")"
+            if [[ "$status" == 404 ]]; then
+              publish=1
+              continue
+            fi
+            test "$status" = 200
+            while IFS= read -r file; do
+              [[ "$file" == *"${package//-/_}-"* ]] || continue
+              filename="$(basename "$file")"
+              expected="$(jq -r --arg filename "$filename" '.urls[] | select(.filename == $filename) | .digests.sha256' "$response")"
+              if [[ -z "$expected" ]]; then
+                publish=1
+                continue
+              fi
+              [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+              actual="$(sha256sum "$RUNNER_TEMP/pypi-dist/$filename" | awk '{print $1}')"
+              test "$actual" = "$expected"
+            done < <(find "$RUNNER_TEMP/pypi-dist" -maxdepth 1 -type f -printf '%f\n')
+          done
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+      - name: Publish qualified files to PyPI
+        if: steps.pypi-check.outputs.publish == '1'
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        with:
+          packages-dir: ${{ runner.temp }}/pypi-dist
+          skip-existing: true
+
+  publish-npm:
+    name: dispatch qualified npm publication
+    needs: [release-context, promote-qualification]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: write
+    env:
+      RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.release-context.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
+      QUALIFICATION_RUN_ID: ${{ needs.promote-qualification.outputs.run_id }}
+      QUALIFICATION_RUN_ATTEMPT: ${{ needs.promote-qualification.outputs.run_attempt }}
+      QUALIFICATION_ARTIFACT_ID: ${{ needs.promote-qualification.outputs.artifact_id }}
+      QUALIFICATION_ARTIFACT_DIGEST: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      QUALIFICATION_MANIFEST_SHA256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+      DISPATCH_NONCE: ${{ github.run_id }}-${{ github.run_attempt }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Dispatch the trusted-publishing workflow with exact qualification identity
+        # publish-npm.yml runs npm run publish-release against these qualified
+        # archives so npm's trusted publisher remains bound to its filename.
+        id: dispatch
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run publish-npm.yml \
+            --ref "$RELEASE_TAG" \
+            --field release_tag="$RELEASE_TAG" \
+            --field release_version="$RELEASE_VERSION" \
+            --field release_commit="$RELEASE_COMMIT" \
+            --field qualification_run_id="$QUALIFICATION_RUN_ID" \
+            --field qualification_run_attempt="$QUALIFICATION_RUN_ATTEMPT" \
+            --field qualification_artifact_id="$QUALIFICATION_ARTIFACT_ID" \
+            --field qualification_artifact_digest="$QUALIFICATION_ARTIFACT_DIGEST" \
+            --field qualification_manifest_sha256="$QUALIFICATION_MANIFEST_SHA256" \
+            --field dispatch_nonce="$DISPATCH_NONCE"
+          expected_title="Publish npm ${RELEASE_TAG} [${DISPATCH_NONCE}]"
+          for attempt in $(seq 1 30); do
+            gh run list --repo "$GITHUB_REPOSITORY" --workflow publish-npm.yml \
+              --event workflow_dispatch --branch "$RELEASE_TAG" --limit 10 \
+              --json databaseId,headSha,displayTitle > "$RUNNER_TEMP/npm-runs.json"
+            child_run="$(jq -r --arg commit "$RELEASE_COMMIT" --arg title "$expected_title" \
+              '[.[] | select(.headSha == $commit and .displayTitle == $title)] | first | .databaseId // empty' \
+              "$RUNNER_TEMP/npm-runs.json")"
+            if [[ -n "$child_run" ]]; then
+              echo "run_id=$child_run" >> "$GITHUB_OUTPUT"
+              gh run watch "$child_run" --repo "$GITHUB_REPOSITORY" --exit-status
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "The dispatched publish-npm.yml run did not appear." >&2
+          exit 1
+
+  publish-agent-plugin:
+    name: verify qualified agent plugin asset
+    needs: [release-context, promote-qualification, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    env:
+      RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download qualified release bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: ${{ needs.promote-qualification.outputs.artifact_id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.promote-qualification.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: qualification
+          merge-multiple: true
+
+      - name: Verify GitHub asset matches the qualified agent archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          file="qualification/bifrost-agent-${RELEASE_TAG}.tar.gz"
+          expected="sha256:$(sha256sum "$file" | awk '{print $1}')"
+          release_json="$RUNNER_TEMP/release.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > "$release_json"
+          actual="$(jq -r --arg name "$(basename "$file")" '.assets[] | select(.name == $name) | (.digest // "")' "$release_json")"
+          test "$actual" = "$expected"
+
+  publish-pi-package:
+    name: verify qualified Pi asset
+    needs: [release-context, promote-qualification, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    env:
+      RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.release-context.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download qualified release bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: ${{ needs.promote-qualification.outputs.artifact_id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.promote-qualification.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: qualification
+          merge-multiple: true
+
+      - name: Verify GitHub asset matches the qualified Pi archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          file="qualification/brokk-bifrost-agent-${RELEASE_VERSION}.tgz"
+          expected="sha256:$(sha256sum "$file" | awk '{print $1}')"
+          release_json="$RUNNER_TEMP/release.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > "$release_json"
+          actual="$(jq -r --arg name "$(basename "$file")" '.assets[] | select(.name == $name) | (.digest // "")' "$release_json")"
+          test "$actual" = "$expected"
+
+  attach-vscode:
+    name: verify qualified VSIX asset
+    needs: [release-context, promote-qualification, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    env:
+      RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download qualified release bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: ${{ needs.promote-qualification.outputs.artifact_id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.promote-qualification.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: qualification
+          merge-multiple: true
+
+      - name: Verify GitHub asset matches the qualified VSIX
+        shell: bash
+        run: |
+          set -euo pipefail
+          file="qualification/bifrost-vscode-${RELEASE_TAG}.vsix"
+          expected="sha256:$(sha256sum "$file" | awk '{print $1}')"
+          release_json="$RUNNER_TEMP/release.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > "$release_json"
+          actual="$(jq -r --arg name "$(basename "$file")" '.assets[] | select(.name == $name) | (.digest // "")' "$release_json")"
+          test "$actual" = "$expected"
+
+  publish-vscode:
+    name: publish qualified VSIX to Visual Studio Marketplace
+    needs: [release-context, promote-qualification, attach-vscode]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout exact marketplace tooling
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-context.outputs.commit }}
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Install marketplace tooling
+        run: npm ci
+        working-directory: editors/vscode
+
+      - name: Download qualified release bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: ${{ needs.promote-qualification.outputs.artifact_id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.promote-qualification.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: qualification
+          merge-multiple: true
+
+      - name: Publish exact qualified VSIX
+        run: >-
+          npx --no-install vsce publish
+          --packagePath "${{ github.workspace }}/qualification/bifrost-vscode-${{ needs.release-context.outputs.tag }}.vsix"
+          --skip-duplicate
+        working-directory: editors/vscode
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+  publish-open-vsx:
+    name: publish qualified VSIX to Open VSX
+    needs: [release-context, promote-qualification, attach-vscode]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+      actions: read
+    env:
+      RELEASE_VERSION: ${{ needs.release-context.outputs.version }}
+      RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+    steps:
+      - name: Checkout exact Open VSX tooling
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-context.outputs.commit }}
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Install Open VSX tooling
+        run: npm ci
+        working-directory: editors/vscode
+
+      - name: Download qualified release bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: ${{ needs.promote-qualification.outputs.artifact_id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.promote-qualification.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: qualification
+          merge-multiple: true
+
+      - name: Publish or verify exact qualified VSIX
+        shell: bash
+        working-directory: editors/vscode
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+          VSIX_PATH: ${{ github.workspace }}/qualification/bifrost-vscode-${{ needs.release-context.outputs.tag }}.vsix
+        run: |
+          set -euo pipefail
+          metadata_url="https://open-vsx.org/api/brokk/bifrost-vscode/$RELEASE_VERSION"
+          checksum_url="$metadata_url/file/brokk.bifrost-vscode-$RELEASE_VERSION.sha256"
+          local_checksum="$(sha256sum "$VSIX_PATH" | awk '{print $1}')"
+          metadata_file="$RUNNER_TEMP/open-vsx-bifrost-vscode.json"
+          status="$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --output "$metadata_file" --write-out '%{http_code}' "$metadata_url")"
+          if [[ "$status" == 200 ]]; then
+            registry_checksum="$(curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' "$checksum_url" | tr -d '[:space:]')"
+            [[ "$registry_checksum" =~ ^[0-9a-f]{64}$ ]]
+            test "$registry_checksum" = "$local_checksum"
+            exit 0
+          fi
+          test "$status" = 404
+          test -n "${OVSX_PAT:-}"
+          npx --no-install ovsx publish "$VSIX_PATH" --skip-duplicate
+          for attempt in $(seq 1 30); do
+            status="$(curl --silent --show-error --location --output "$metadata_file" --write-out '%{http_code}' "$metadata_url")"
+            if [[ "$status" == 200 ]]; then
+              registry_checksum="$(curl --fail --silent --show-error --location "$checksum_url" | tr -d '[:space:]')"
+              [[ "$registry_checksum" =~ ^[0-9a-f]{64}$ ]]
+              test "$registry_checksum" = "$local_checksum"
+              exit 0
+            fi
+            test "$status" = 404
+            sleep 10
+          done
+          exit 1
+
+  post-release-smoke:
+    name: start post-release smoke
+    needs: [release-context, release, publish-crate-facade, publish-wheels, publish-npm, publish-agent-plugin, publish-pi-package, publish-vscode, publish-open-vsx]
+    if: ${{ always() && needs.release.result == 'success' && needs.publish-crate-facade.result == 'success' && needs.publish-wheels.result == 'success' && needs.publish-npm.result == 'success' && needs.publish-agent-plugin.result == 'success' && needs.publish-pi-package.result == 'success' && needs.publish-vscode.result == 'success' && needs.publish-open-vsx.result == 'success' }}
+    uses: ./.github/workflows/post-release-smoke.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+    permissions:
+      contents: read
 
   publish-crate-core:
-    name: publish core crate after promotion evidence
-    needs: [release-context, promotion-evidence]
+    name: publish core crate
+    needs: [release-context, promote-qualification]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-core
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
     permissions:
       contents: read
+      actions: read
       id-token: write
 
   publish-crate-go:
-    name: publish go language crate after core
-    needs: [release-context, promotion-evidence, publish-crate-core]
+    name: publish go crate
+    needs: [release-context, promote-qualification, publish-crate-core]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-go
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-cpp:
-    name: publish cpp language crate after core
-    needs: [release-context, promotion-evidence, publish-crate-core]
+    name: publish cpp crate
+    needs: [release-context, promote-qualification, publish-crate-core]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-cpp
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-js-ts:
-    name: publish js-ts language crate after core
-    needs: [release-context, promotion-evidence, publish-crate-core]
+    name: publish js-ts crate
+    needs: [release-context, promote-qualification, publish-crate-core]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-js-ts
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-jvm:
-    name: publish jvm language crate after core
-    needs: [release-context, promotion-evidence, publish-crate-core]
+    name: publish jvm crate
+    needs: [release-context, promote-qualification, publish-crate-core]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-jvm
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-csharp:
-    name: publish csharp language crate after core
-    needs: [release-context, promotion-evidence, publish-crate-core]
+    name: publish csharp crate
+    needs: [release-context, promote-qualification, publish-crate-core]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-csharp
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-php:
-    name: publish php language crate after core
-    needs: [release-context, promotion-evidence, publish-crate-core]
+    name: publish php crate
+    needs: [release-context, promote-qualification, publish-crate-core]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-php
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-python:
-    name: publish python language crate after core
-    needs: [release-context, promotion-evidence, publish-crate-core]
+    name: publish python crate
+    needs: [release-context, promote-qualification, publish-crate-core]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-python
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-ruby:
-    name: publish ruby language crate after core
-    needs: [release-context, promotion-evidence, publish-crate-core]
+    name: publish ruby crate
+    needs: [release-context, promote-qualification, publish-crate-core]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-ruby
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-rust:
-    name: publish rust language crate after core
-    needs: [release-context, promotion-evidence, publish-crate-core]
+    name: publish rust crate
+    needs: [release-context, promote-qualification, publish-crate-core]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-rust
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-rql:
-    name: publish RQL crate after core
-    needs: [release-context, promotion-evidence, publish-crate-core]
+    name: publish RQL crate
+    needs: [release-context, promote-qualification, publish-crate-core]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-rql
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-analysis:
-    name: publish analysis crate after core, language crates and RQL
-    needs: [release-context, promotion-evidence, publish-crate-core, publish-crate-cpp, publish-crate-csharp, publish-crate-go, publish-crate-js-ts, publish-crate-jvm, publish-crate-php, publish-crate-python, publish-crate-ruby, publish-crate-rust, publish-crate-rql]
+    name: publish analysis crate
+    needs: [release-context, promote-qualification, publish-crate-core, publish-crate-go, publish-crate-cpp, publish-crate-js-ts, publish-crate-jvm, publish-crate-csharp, publish-crate-php, publish-crate-python, publish-crate-ruby, publish-crate-rust, publish-crate-rql]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-analysis
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-policy:
-    name: publish policy crate after analysis
-    needs: [release-context, publish-crate-analysis]
+    name: publish policy crate
+    needs: [release-context, promote-qualification, publish-crate-analysis]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-policy
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-nlp:
-    name: publish nlp crate after analysis
-    needs: [release-context, publish-crate-analysis]
+    name: publish nlp crate
+    needs: [release-context, promote-qualification, publish-crate-analysis]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-nlp
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-runtime:
-    name: publish runtime crate after policy
-    needs: [release-context, publish-crate-policy]
+    name: publish runtime crate
+    needs: [release-context, promote-qualification, publish-crate-policy]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-runtime
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-semantic-packs:
-    name: publish semantic packs crate after analysis
-    needs: [release-context, publish-crate-analysis]
+    name: publish semantic packs crate
+    needs: [release-context, promote-qualification, publish-crate-analysis]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-semantic-packs
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-mcp:
-    name: publish MCP crate after runtime
-    needs: [release-context, publish-crate-runtime, publish-crate-nlp]
+    name: publish MCP crate
+    needs: [release-context, promote-qualification, publish-crate-runtime, publish-crate-nlp]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-mcp
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-lsp:
-    name: publish LSP crate after runtime
-    needs: [release-context, publish-crate-runtime]
+    name: publish LSP crate
+    needs: [release-context, promote-qualification, publish-crate-runtime]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost-lsp
-    permissions:
-      contents: read
-      id-token: write
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   publish-crate-facade:
-    name: publish facade crate after hosts
-    needs: [release-context, publish-crate-mcp, publish-crate-lsp, publish-crate-semantic-packs, publish-crate-nlp]
+    name: publish facade crate
+    needs: [release-context, promote-qualification, publish-crate-mcp, publish-crate-lsp, publish-crate-semantic-packs, publish-crate-nlp]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
       version: ${{ needs.release-context.outputs.version }}
       commit: ${{ needs.release-context.outputs.commit }}
       package: brokk-bifrost
-    permissions:
-      contents: read
-      id-token: write
-
-  publish-wheels:
-    name: publish wheels after promotion evidence
-    needs: [release-context, promotion-evidence]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    environment: release
-    permissions:
-      contents: read
-      id-token: write
-    env:
-      RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
-      RELEASE_VERSION: ${{ needs.release-context.outputs.version }}
-      RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
-    steps:
-      - name: Checkout validated source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Verify release tag still selects the validated commit
-        shell: bash
-        run: |
-          tag_ref="refs/tags/$RELEASE_TAG"
-          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
-          actual_commit="$(awk -v tag_ref="$tag_ref" '
-            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
-            $2 == tag_ref { fallback = $1 }
-            END { if (!found && fallback) print fallback }
-          ' <<< "$remote_refs")"
-          test -n "$actual_commit"
-          test "$actual_commit" = "$RELEASE_COMMIT"
-
-      - name: Download wheel artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          pattern: wheels-*
-          path: dist
-          merge-multiple: true
-
-      - name: Download source distribution
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: sdist
-          path: dist
-
-      - name: Download uv CLI wheel artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          pattern: cli-wheels-*
-          path: dist
-          merge-multiple: true
-
-      - name: Confirm validated release identity
-        run: echo "Publishing $RELEASE_TAG ($RELEASE_VERSION) from $RELEASE_COMMIT"
-
-      - name: Publish to PyPI (trusted publishing)
-        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
-        with:
-          packages-dir: dist
-
-  pi-package:
-    name: package Pi release asset
-    needs: [release-context, build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Download release artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Set up Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          package-manager-cache: false
-
-      - name: Install Pi package dependencies
-        run: npm ci
-        working-directory: plugins/bifrost-agent
-
-      - name: Prepare Pi release metadata
-        run: >
-          node scripts/prepare-vscode-extension-manifest.mjs
-          --version "${{ needs.release-context.outputs.version }}"
-          --plugin-release plugins/bifrost-agent/bifrost-release.json
-          --dist dist
-
-      - name: Test Pi package
-        run: npm test
-        working-directory: plugins/bifrost-agent
-
-      - name: Check Pi package
-        run: npm run check
-        working-directory: plugins/bifrost-agent
-
-      - name: Test packed Pi package install
-        run: npm run test:packed
-        working-directory: plugins/bifrost-agent
-
-      - name: Package Pi package
-        run: npm pack --pack-destination ../../dist
-        working-directory: plugins/bifrost-agent
-
-      - name: Upload packaged Pi artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: pi-package
-          path: dist/brokk-bifrost-agent-*.tgz
-          if-no-files-found: error
-
-  vscode-package:
-    name: package vscode extension
-    needs: [release-context, build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Download release artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Set up Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          package-manager-cache: false
-
-      - name: Install extension dependencies
-        run: npm ci
-        working-directory: editors/vscode
-
-      - name: Prepare extension manifest
-        run: >
-          node scripts/prepare-vscode-extension-manifest.mjs
-          --version "${{ needs.release-context.outputs.version }}"
-          --manifest editors/vscode/package.json
-          --plugin-release plugins/bifrost-agent/bifrost-release.json
-          --dist dist
-
-      - name: Test agent plugin launcher
-        run: node --test plugins/bifrost-agent/test/launcher.test.mjs
-
-      - name: Validate agent plugin manifests
-        run: node scripts/check-codex-plugin-manifest.mjs
-
-      - name: Test extension
-        run: npm test
-        working-directory: editors/vscode
-
-      - name: Package extension
-        run: npx --no-install vsce package --out "../../dist/bifrost-vscode-${{ needs.release-context.outputs.tag }}.vsix"
-        working-directory: editors/vscode
-
-      - name: Upload packaged editor artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: vscode-package
-          path: dist/*.vsix
-          if-no-files-found: error
-
-  publish-pi-package:
-    name: attach validated Pi package
-    needs: [release-context, promotion-evidence, release, pi-package, publish-agent-plugin]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout validated source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Download validated Pi package
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: pi-package
-          path: dist
-
-      - name: Verify release tag still selects the validated commit
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
-          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
-        run: |
-          tag_ref="refs/tags/$RELEASE_TAG"
-          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
-          actual_commit="$(awk -v tag_ref="$tag_ref" '
-            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
-            $2 == tag_ref { fallback = $1 }
-            END { if (!found && fallback) print fallback }
-          ' <<< "$remote_refs")"
-          test -n "$actual_commit"
-          test "$actual_commit" = "$RELEASE_COMMIT"
-
-      - name: Upload Pi package artifact to GitHub Release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
-        with:
-          tag_name: ${{ needs.release-context.outputs.tag }}
-          files: dist/brokk-bifrost-agent-*.tgz
-
-  attach-vscode:
-    name: attach validated vscode extension
-    needs: [release-context, promotion-evidence, release, vscode-package, publish-agent-plugin]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout validated source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Set up Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          package-manager-cache: false
-
-      - name: Install extension publish tooling
-        run: npm ci
-        working-directory: editors/vscode
-
-      - name: Download validated editor package
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: vscode-package
-          path: dist
-
-      - name: Verify release tag still selects the validated commit
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
-          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
-        run: |
-          tag_ref="refs/tags/$RELEASE_TAG"
-          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
-          actual_commit="$(awk -v tag_ref="$tag_ref" '
-            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
-            $2 == tag_ref { fallback = $1 }
-            END { if (!found && fallback) print fallback }
-          ' <<< "$remote_refs")"
-          test -n "$actual_commit"
-          test "$actual_commit" = "$RELEASE_COMMIT"
-
-      - name: Upload editor artifact to GitHub Release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
-        with:
-          tag_name: ${{ needs.release-context.outputs.tag }}
-          files: dist/*.vsix
-
-  publish-vscode:
-    name: publish validated vscode extension
-    needs: [release-context, promotion-evidence, vscode-package, publish-agent-plugin, attach-vscode]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    environment: release
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout validated source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Set up Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          package-manager-cache: false
-
-      - name: Install extension publish tooling
-        run: npm ci
-        working-directory: editors/vscode
-
-      - name: Download validated editor package
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: vscode-package
-          path: dist
-
-      - name: Verify release tag still selects the validated commit
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
-          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
-        run: |
-          tag_ref="refs/tags/$RELEASE_TAG"
-          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
-          actual_commit="$(awk -v tag_ref="$tag_ref" '
-            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
-            $2 == tag_ref { fallback = $1 }
-            END { if (!found && fallback) print fallback }
-          ' <<< "$remote_refs")"
-          test -n "$actual_commit"
-          test "$actual_commit" = "$RELEASE_COMMIT"
-
-      - name: Publish extension to Visual Studio Marketplace
-        run: >
-          npx --no-install vsce publish
-          --packagePath "../../dist/bifrost-vscode-${{ needs.release-context.outputs.tag }}.vsix"
-        working-directory: editors/vscode
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
-
-  publish-open-vsx:
-    name: publish validated vscode extension to Open VSX
-    needs: [release-context, promotion-evidence, vscode-package, publish-agent-plugin, attach-vscode]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    environment: release
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout validated source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Set up Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          package-manager-cache: false
-
-      - name: Install extension publish tooling
-        run: npm ci
-        working-directory: editors/vscode
-
-      - name: Download validated editor package
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: vscode-package
-          path: dist
-
-      - name: Verify release tag still selects the validated commit
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
-          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
-        run: |
-          tag_ref="refs/tags/$RELEASE_TAG"
-          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
-          actual_commit="$(awk -v tag_ref="$tag_ref" '
-            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
-            $2 == tag_ref { fallback = $1 }
-            END { if (!found && fallback) print fallback }
-          ' <<< "$remote_refs")"
-          test -n "$actual_commit"
-          test "$actual_commit" = "$RELEASE_COMMIT"
-
-      - name: Publish or verify extension on Open VSX
-        shell: bash
-        working-directory: editors/vscode
-        env:
-          OVSX_PAT: ${{ secrets.OVSX_PAT }}
-          RELEASE_VERSION: ${{ needs.release-context.outputs.version }}
-          VSIX_PATH: ../../dist/bifrost-vscode-${{ needs.release-context.outputs.tag }}.vsix
-        run: |
-          set -euo pipefail
-
-          metadata_url="https://open-vsx.org/api/brokk/bifrost-vscode/$RELEASE_VERSION"
-          checksum_url="$metadata_url/file/brokk.bifrost-vscode-$RELEASE_VERSION.sha256"
-          metadata_file="$RUNNER_TEMP/open-vsx-bifrost-vscode.json"
-          local_checksum="$(sha256sum "$VSIX_PATH" | awk '{print $1}')"
-
-          verify_registry_checksum() {
-            registry_checksum="$(curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' "$checksum_url" | tr -d '[:space:]')"
-            if [[ ! "$registry_checksum" =~ ^[0-9a-f]{64}$ ]]; then
-              echo "Open VSX returned an invalid SHA-256 for brokk.bifrost-vscode $RELEASE_VERSION" >&2
-              return 1
-            fi
-            if [[ "$registry_checksum" != "$local_checksum" ]]; then
-              echo "Open VSX already has brokk.bifrost-vscode $RELEASE_VERSION with checksum $registry_checksum; expected $local_checksum" >&2
-              echo "Refusing to overwrite or treat a different immutable artifact as a successful rerun." >&2
-              return 1
-            fi
-            echo "Open VSX brokk.bifrost-vscode $RELEASE_VERSION matches the validated VSIX checksum $local_checksum"
-          }
-
-          registry_status="$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' --output "$metadata_file" --write-out '%{http_code}' "$metadata_url")"
-          case "$registry_status" in
-            200)
-              verify_registry_checksum
-              exit 0
-              ;;
-            404)
-              ;;
-            *)
-              echo "Open VSX metadata check returned unexpected HTTP $registry_status for $metadata_url" >&2
-              exit 1
-              ;;
-          esac
-
-          if [[ -z "${OVSX_PAT:-}" ]]; then
-            echo "OVSX_PAT is not configured in the protected release environment" >&2
-            exit 1
-          fi
-
-          npx --no-install ovsx publish "$VSIX_PATH" --skip-duplicate
-
-          max_attempts=30
-          for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-            registry_status="$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' --output "$metadata_file" --write-out '%{http_code}' "$metadata_url")"
-            if [[ "$registry_status" == "200" ]]; then
-              verify_registry_checksum
-              exit 0
-            fi
-            if [[ "$registry_status" != "404" ]]; then
-              echo "Open VSX visibility check returned unexpected HTTP $registry_status for $metadata_url" >&2
-              exit 1
-            fi
-            echo "Waiting for Open VSX visibility ($attempt/$max_attempts)"
-            sleep 10
-          done
-
-          echo "Open VSX did not expose brokk.bifrost-vscode $RELEASE_VERSION after $max_attempts attempts" >&2
-          exit 1
-
-  agent-plugin-release-smoke:
-    name: packaged agent plugin smoke
-    needs: [release-context, agent-plugin-package, release]
-    runs-on: macos-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout release scripts
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Set up Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          package-manager-cache: false
-
-      - name: Download staged agent plugin
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: bifrost-agent-package
-          path: ${{ runner.temp }}/bifrost-agent-release
-
-      - name: Extract staged agent plugin
-        shell: bash
-        run: >
-          tar -C "${RUNNER_TEMP}/bifrost-agent-release"
-          -xzf "${RUNNER_TEMP}/bifrost-agent-release/bifrost-agent-${{ needs.release-context.outputs.tag }}.tar.gz"
-
-      - name: Smoke packaged launcher and MCP
-        shell: bash
-        run: >
-          node scripts/smoke-agent-plugin-release.mjs
-          --plugin-dir "${RUNNER_TEMP}/bifrost-agent-release/bifrost-agent"
-          --cache-dir "${RUNNER_TEMP}/bifrost-agent-cold-cache"
-
-  publish-agent-plugin:
-    name: publish validated agent plugin
-    needs: [release-context, promotion-evidence, release, agent-plugin-release-smoke]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout release scripts
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Download validated agent plugin
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: bifrost-agent-package
-          path: dist
-
-      - name: Verify release tag still selects the validated commit
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
-          RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
-        run: |
-          tag_ref="refs/tags/$RELEASE_TAG"
-          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
-          actual_commit="$(awk -v tag_ref="$tag_ref" '
-            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
-            $2 == tag_ref { fallback = $1 }
-            END { if (!found && fallback) print fallback }
-          ' <<< "$remote_refs")"
-          test -n "$actual_commit"
-          test "$actual_commit" = "$RELEASE_COMMIT"
-
-      - name: Upload agent plugin to GitHub Release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
-        with:
-          tag_name: ${{ needs.release-context.outputs.tag }}
-          files: dist/bifrost-agent-${{ needs.release-context.outputs.tag }}.tar.gz
-
-      - name: Announce release on Discord
-        continue-on-error: true
-        env:
-          DISCORD_RELEASE_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
-        shell: bash
-        run: bash scripts/announce-discord-release.sh
-
-  export-release-metadata:
-    name: export generated release metadata
-    needs: [release-context, publish-vscode, agent-plugin-release-smoke]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout immutable public release source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          ref: ${{ needs.release-context.outputs.commit }}
-
-      - name: Set up Node
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          package-manager-cache: false
-
-      - name: Download release artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Prepare generated release metadata
-        run: >
-          node scripts/prepare-vscode-extension-manifest.mjs
-          --version "${{ needs.release-context.outputs.version }}"
-          --manifest editors/vscode/package.json
-          --plugin-release plugins/bifrost-agent/bifrost-release.json
-          --dist dist
-
-      - name: Validate synchronized release projections
-        run: node scripts/release-version.mjs check
-
-      - name: Validate agent plugin manifests
-        run: node scripts/check-codex-plugin-manifest.mjs
-
-      - name: Reject non-metadata generated changes
-        shell: bash
-        run: |
-          allowed_canonical="plugins/bifrost-agent/bifrost-release.json"
-          allowed_vscode="editors/vscode/package.json"
-          while IFS= read -r changed_file; do
-            [ -z "$changed_file" ] && continue
-            if [ "$changed_file" != "$allowed_canonical" ] && \
-              [ "$changed_file" != "$allowed_vscode" ]; then
-              echo "Refusing to export unexpected generated change: $changed_file" >&2
-              exit 1
-            fi
-          done < <(
-            {
-              git diff --name-only
-              git diff --cached --name-only
-              # Release artifacts are downloaded into this otherwise-untracked
-              # directory; keep the source-tree guard applied to tracked files
-              # and every other untracked path.
-              git ls-files --others --exclude-standard -- ':!dist/**'
-            } | LC_ALL=C sort -u
-          )
-
-      - name: Export generated release metadata
-        env:
-          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
-          RELEASE_VERSION: ${{ needs.release-context.outputs.version }}
-          PUBLIC_RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
-          METADATA_EXPORT_DIR: ${{ runner.temp }}/bifrost-release-metadata
-        run: >
-          node scripts/export-release-metadata.mjs
-          --tag "$RELEASE_TAG"
-          --version "$RELEASE_VERSION"
-          --public-commit "$PUBLIC_RELEASE_COMMIT"
-          --output-dir "$METADATA_EXPORT_DIR"
-
-      - name: Upload generated release metadata
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: bifrost-release-metadata-${{ needs.release-context.outputs.tag }}
-          path: ${{ runner.temp }}/bifrost-release-metadata
-          if-no-files-found: error
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
 
   release-summary:
     name: release promotion summary
     if: ${{ always() }}
-    needs:
-      - release-context
-      - crate-package
-      - semantic-pack-bundle
-      - build-wheels
-      - build
-      - agent-plugin-package
-      - agent-plugin-prepublish-smoke
-      - agent-plugin-release-smoke
-      - policy-scan-prepublish-smoke
-      - pi-package
-      - vscode-package
-      - promotion-evidence
-      - release
-      - publish-crate-analysis
-      - publish-crate-policy
-      - publish-crate-nlp
-      - publish-crate-semantic-packs
-      - publish-crate-runtime
-      - publish-crate-mcp
-      - publish-crate-lsp
-      - publish-crate-facade
-      - publish-wheels
-      - publish-agent-plugin
-      - publish-pi-package
-      - attach-vscode
-      - publish-vscode
-      - publish-open-vsx
-      - export-release-metadata
+    needs: [release-context, resolve-qualification, promote-qualification, release, publish-crate-facade, publish-wheels, publish-npm, publish-agent-plugin, publish-pi-package, attach-vscode, publish-vscode, publish-open-vsx, post-release-smoke]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 10
     permissions:
-      actions: write
       contents: read
     env:
-      RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
-      RELEASE_VERSION: ${{ needs.release-context.outputs.version }}
-      RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
-      CRATE_PACKAGE: ${{ needs.crate-package.result }}
-      SEMANTIC_PACK_BUNDLE: ${{ needs.semantic-pack-bundle.result }}
-      WHEEL_BUILD: ${{ needs.build-wheels.result }}
-      CLI_BUILD: ${{ needs.build.result }}
-      AGENT_PACKAGE: ${{ needs.agent-plugin-package.result }}
-      AGENT_PREPUBLISH_SMOKE: ${{ needs.agent-plugin-prepublish-smoke.result }}
-      AGENT_PACKAGED_SMOKE: ${{ needs.agent-plugin-release-smoke.result }}
-      POLICY_PREPUBLISH_SMOKE: ${{ needs.policy-scan-prepublish-smoke.result }}
-      PI_BUILD: ${{ needs.pi-package.result }}
-      VSCODE_BUILD: ${{ needs.vscode-package.result }}
-      PROMOTION_EVIDENCE: ${{ needs.promotion-evidence.result }}
+      TAG: ${{ needs.release-context.outputs.tag }}
+      VERSION: ${{ needs.release-context.outputs.version }}
+      COMMIT: ${{ needs.release-context.outputs.commit }}
+      QUALIFICATION: ${{ needs.promote-qualification.result }}
       GITHUB_RELEASE: ${{ needs.release.result }}
-      CRATE_ANALYSIS: ${{ needs.publish-crate-analysis.result }}
-      CRATE_POLICY: ${{ needs.publish-crate-policy.result }}
-      CRATE_NLP: ${{ needs.publish-crate-nlp.result }}
-      CRATE_SEMANTIC_PACKS: ${{ needs.publish-crate-semantic-packs.result }}
-      CRATE_RUNTIME: ${{ needs.publish-crate-runtime.result }}
-      CRATE_MCP: ${{ needs.publish-crate-mcp.result }}
-      CRATE_LSP: ${{ needs.publish-crate-lsp.result }}
       CRATE_FACADE: ${{ needs.publish-crate-facade.result }}
-      WHEELS: ${{ needs.publish-wheels.result }}
-      AGENT_PLUGIN: ${{ needs.publish-agent-plugin.result }}
-      PI_PACKAGE: ${{ needs.publish-pi-package.result }}
-      VSCODE_ATTACHMENT: ${{ needs.attach-vscode.result }}
+      PYPI: ${{ needs.publish-wheels.result }}
+      NPM: ${{ needs.publish-npm.result }}
+      AGENT: ${{ needs.publish-agent-plugin.result }}
+      PI: ${{ needs.publish-pi-package.result }}
       VSCODE: ${{ needs.publish-vscode.result }}
       OPEN_VSX: ${{ needs.publish-open-vsx.result }}
-      METADATA_EXPORT: ${{ needs.export-release-metadata.result }}
+      POST_RELEASE_SMOKE: ${{ needs.post-release-smoke.result }}
     steps:
-      - name: Write promotion outcome and recovery guidance
+      - name: Record promotion outcomes and recovery guidance
         shell: bash
         run: |
           {
             echo "## Release promotion summary"
             echo
-            echo "Validated identity: \`$RELEASE_TAG\` / \`$RELEASE_VERSION\` / \`$RELEASE_COMMIT\`"
+            echo "- Tag: `$TAG`"
+            echo "- Version: `$VERSION`"
+            echo "- Commit: `$COMMIT`"
+            echo "- Qualification verification: `$QUALIFICATION`"
+            echo "- GitHub Release: `$GITHUB_RELEASE`"
+            echo "- crates.io facade (all crate jobs preserve dependency ordering): `$CRATE_FACADE`"
+            echo "- PyPI: `$PYPI`"
+            echo "- npm: `$NPM`"
+            echo "- Agent asset: `$AGENT`"
+            echo "- Pi asset: `$PI`"
+            echo "- Visual Studio Marketplace: `$VSCODE`"
+            echo "- Open VSX: `$OPEN_VSX`"
+            echo "- Post-release smoke: `$POST_RELEASE_SMOKE`"
             echo
-            echo "| Target | Outcome |"
-            echo "| --- | --- |"
-            echo "| CLI archives and checksums built | $CLI_BUILD |"
-            echo "| Crate package contents verified | $CRATE_PACKAGE |"
-            echo "| Pinned JVM semantic packs generated and verified | $SEMANTIC_PACK_BUNDLE |"
-            echo "| Python client and uv CLI wheels built and version-verified | $WHEEL_BUILD |"
-            echo "| Agent plugin packaged | $AGENT_PACKAGE |"
-            echo "| Agent plugin prepublication smoke | $AGENT_PREPUBLISH_SMOKE |"
-            echo "| Agent plugin packaged smoke | $AGENT_PACKAGED_SMOKE |"
-            echo "| Policy scan prepublication smoke | $POLICY_PREPUBLISH_SMOKE |"
-            echo "| Pi package built and tested | $PI_BUILD |"
-            echo "| VS Code extension built and tested | $VSCODE_BUILD |"
-            echo "| Common build, package, and smoke evidence | $PROMOTION_EVIDENCE |"
-            echo "| GitHub Release | $GITHUB_RELEASE |"
-            echo "| crates.io analysis | $CRATE_ANALYSIS |"
-            echo "| crates.io policy | $CRATE_POLICY |"
-            echo "| crates.io nlp | $CRATE_NLP |"
-            echo "| crates.io semantic packs | $CRATE_SEMANTIC_PACKS |"
-            echo "| crates.io runtime | $CRATE_RUNTIME |"
-            echo "| crates.io MCP | $CRATE_MCP |"
-            echo "| crates.io LSP | $CRATE_LSP |"
-            echo "| crates.io facade | $CRATE_FACADE |"
-            echo "| PyPI | $WHEELS |"
-            echo "| Agent plugin release asset | $AGENT_PLUGIN |"
-            echo "| Pi package release asset | $PI_PACKAGE |"
-            echo "| VS Code release asset attachment | $VSCODE_ATTACHMENT |"
-            echo "| VS Code Marketplace | $VSCODE |"
-            echo "| Open VSX | $OPEN_VSX |"
-            echo "| Generated metadata export | $METADATA_EXPORT |"
-            echo
-            echo "### Safe recovery"
-            echo "If a target failed, use **Re-run failed jobs** for this workflow run so it reuses artifacts already validated for \`$RELEASE_COMMIT\`."
-            echo "If a new run is required, dispatch **Release** again with the same \`$RELEASE_TAG\`; the workflow captures and verifies the tag commit before building."
-            echo "Do not retry a partial release with a different tag, branch, or commit."
+            echo "A retry must reuse the same tag, qualified commit, readiness run, artifact ID, and manifest digest. A different checksum is an incident and is never overwritten."
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Start npm publication after successful promotion
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          outcomes=(
-            "$CRATE_PACKAGE" "$SEMANTIC_PACK_BUNDLE" "$WHEEL_BUILD" "$CLI_BUILD"
-            "$AGENT_PACKAGE" "$AGENT_PREPUBLISH_SMOKE" "$AGENT_PACKAGED_SMOKE"
-            "$POLICY_PREPUBLISH_SMOKE"
-            "$PI_BUILD" "$VSCODE_BUILD" "$PROMOTION_EVIDENCE" "$GITHUB_RELEASE"
-            "$CRATE_ANALYSIS" "$CRATE_POLICY" "$CRATE_NLP" "$CRATE_SEMANTIC_PACKS"
-            "$CRATE_RUNTIME" "$CRATE_MCP" "$CRATE_LSP" "$CRATE_FACADE" "$WHEELS"
-            "$AGENT_PLUGIN" "$PI_PACKAGE" "$VSCODE_ATTACHMENT" "$VSCODE"
-            "$OPEN_VSX" "$METADATA_EXPORT"
-          )
-          for outcome in "${outcomes[@]}"; do
-            if [[ "$outcome" != "success" ]]; then
-              echo "npm publication was not started because release promotion is incomplete."
-              exit 0
-            fi
-          done
-          gh workflow run publish-npm.yml \
-            --repo "$GITHUB_REPOSITORY" \
-            --ref "$RELEASE_TAG" \
-            --field release_tag="$RELEASE_TAG" \
-            --field publish=true

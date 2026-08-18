@@ -41,7 +41,8 @@ use brokk_bifrost_jvm::scala::graph::syntax::{
     is_scala_case_pattern_binder, is_scala_class_reference, is_scala_named_argument_assignment,
     named_argument_invocation_owner, qualified_stable_type_reference,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
-    scala_callable_alternative_mismatch, scala_pattern_binder_names, scala_source_facts,
+    scala_callable_alternative_mismatch, scala_callable_completes_call,
+    scala_definition_binder_names, scala_pattern_binder_names, scala_source_facts,
     template_self_types,
 };
 use std::cell::{Cell, RefCell};
@@ -131,6 +132,35 @@ impl ForwardScalaDirectAncestorResolution {
             Self::Incomplete(ancestors) => ScalaDirectAncestorResolution::Incomplete(ancestors),
         }
     }
+}
+
+/// Answer a Scala ambiguity under the diagnostic kind that names the tier where
+/// the tie arose, carrying the declarations the resolver was choosing between.
+///
+/// `contenders` must hold declarations the REFERENCE could denote. A tie at an
+/// intermediate tier -- an owner segment, a companion, a supertype whose own
+/// name is ambiguous -- holds no declaration of the referenced name, so it
+/// passes an empty list and the answer stays a plain miss under the same kind:
+/// naming an owner as if it were the target would assert something the resolver
+/// did not find, and the reference's real target may well live under exactly
+/// one of the tied owners, which is a gap worth grading (#2167).
+fn scala_ambiguous_outcome(
+    kind: &'static str,
+    contenders: Vec<CodeUnit>,
+    message: String,
+) -> DefinitionLookupOutcome {
+    if contenders.is_empty() {
+        return no_definition(kind, message);
+    }
+    ambiguous_candidates_outcome_of_kind(contenders, kind, message)
+}
+
+/// The physical declarations behind a tie between owner identities.
+fn scala_owner_declarations(owners: Vec<ScalaOwnerIdentity>) -> Vec<CodeUnit> {
+    owners
+        .into_iter()
+        .map(|owner| owner._declaration)
+        .collect::<Vec<_>>()
 }
 
 /// Request-scoped, candidate-query replacement for Scala's global inverted
@@ -3654,7 +3684,7 @@ fn resolve_scala_with_context(
             format!("`{}` is not a Scala reference site", site.text),
         );
     }
-    if is_scala_case_pattern_binder(node) {
+    if is_scala_case_pattern_binder(node, source) {
         return no_definition(
             "local_variable_reference",
             format!("`{}` is a local Scala pattern binding", site.text),
@@ -3829,7 +3859,7 @@ fn resolve_scala_with_context(
                                 return candidates_outcome(candidates);
                             }
                         }
-                        ScalaExactMemberResolution::Ambiguous => {
+                        ScalaExactMemberResolution::Ambiguous(_) => {
                             return no_definition(
                                 "ambiguous_scala_local_member",
                                 format!(
@@ -3873,9 +3903,10 @@ fn resolve_scala_with_context(
                             return candidates_outcome(candidates);
                         }
                     }
-                    ScalaExactMemberResolution::Ambiguous => {
-                        return no_definition(
+                    ScalaExactMemberResolution::Ambiguous(contenders) => {
+                        return scala_ambiguous_outcome(
                             "ambiguous_scala_enclosing_member",
+                            contenders,
                             format!("`{text}` has multiple physical enclosing-owner definitions"),
                         );
                     }
@@ -3886,7 +3917,7 @@ fn resolve_scala_with_context(
                 ScalaExactMemberResolution::Found(candidates) => {
                     return candidates_outcome(candidates);
                 }
-                ScalaExactMemberResolution::Ambiguous => {
+                ScalaExactMemberResolution::Ambiguous(_) => {
                     return no_definition(
                         "ambiguous_scala_self_type_member",
                         format!("`{text}` has multiple physical self-type member definitions"),
@@ -3922,6 +3953,11 @@ fn resolve_scala_with_context(
             }
             // `scala_import_boundary_for_name` checks the workspace-package /
             // import-target existence internally, so its negation is the gate.
+            //
+            // A receiver-position caret does not reach here: a written
+            // `Owner.member` path is answered by
+            // `resolve_scala_focused_qualified_path` above, which routes its
+            // own owner miss to the member gate (#2287).
             gated_boundary(
                 || !scala_import_boundary_for_name(scala, support, file, text),
                 format!(
@@ -4077,7 +4113,7 @@ fn scala_import_reference_outcome(
                     ScalaExactMemberResolution::Found(candidates) => {
                         return Some(candidates_outcome(candidates));
                     }
-                    ScalaExactMemberResolution::Ambiguous => {
+                    ScalaExactMemberResolution::Ambiguous(_) => {
                         return Some(no_definition(
                             "ambiguous_scala_local_import_member",
                             format!("imported local member `{name}` has multiple definitions"),
@@ -4195,9 +4231,10 @@ fn scala_wildcard_import_owner_outcome(
         ScalaExactMemberResolution::Found(candidates) => {
             return Some(candidates_outcome(candidates));
         }
-        ScalaExactMemberResolution::Ambiguous => {
-            return Some(no_definition(
+        ScalaExactMemberResolution::Ambiguous(contenders) => {
+            return Some(scala_ambiguous_outcome(
                 "ambiguous_scala_type",
+                contenders,
                 format!("`{display}` resolves to multiple physical Scala owners"),
             ));
         }
@@ -4207,9 +4244,10 @@ fn scala_wildcard_import_owner_outcome(
     let singleton = match resolver.resolve_owner_segments(segments, ScalaOwnerKind::SingletonObject)
     {
         ScalaNameResolution::Resolved(owner) => Some(owner._declaration),
-        ScalaNameResolution::Ambiguous(_) => {
-            return Some(no_definition(
+        ScalaNameResolution::Ambiguous(owners) => {
+            return Some(scala_ambiguous_outcome(
                 "ambiguous_scala_type",
+                scala_owner_declarations(owners),
                 format!("`{display}` resolves to multiple physical Scala owners"),
             ));
         }
@@ -4223,9 +4261,10 @@ fn scala_wildcard_import_owner_outcome(
     for kind in [ScalaOwnerKind::Class, ScalaOwnerKind::TypeNamespace] {
         match resolver.resolve_owner_segments(segments, kind) {
             ScalaNameResolution::Resolved(owner) => owners.push(owner._declaration),
-            ScalaNameResolution::Ambiguous(_) => {
-                return Some(no_definition(
+            ScalaNameResolution::Ambiguous(tied) => {
+                return Some(scala_ambiguous_outcome(
                     "ambiguous_scala_type",
+                    scala_owner_declarations(tied),
                     format!("`{display}` resolves to multiple physical Scala owners"),
                 ));
             }
@@ -4236,8 +4275,9 @@ fn scala_wildcard_import_owner_outcome(
     owners.dedup();
     match owners.as_slice() {
         [owner] => Some(candidates_outcome(vec![owner.clone()])),
-        [_, _, ..] => Some(no_definition(
+        [_, _, ..] => Some(scala_ambiguous_outcome(
             "ambiguous_scala_type",
+            owners,
             format!("`{display}` resolves to multiple physical Scala owners"),
         )),
         [] => None,
@@ -4479,8 +4519,9 @@ fn resolve_scala_focused_qualified_path(
                 "no_indexed_definition",
                 format!("`{member}` is not an indexed child of `{owner_name}.this`"),
             ),
-            _ => no_definition(
+            _ => scala_ambiguous_outcome(
                 "ambiguous_scala_type",
+                candidates,
                 format!("`{owner_name}.this.{member}` has multiple physical child declarations"),
             ),
         });
@@ -4562,9 +4603,10 @@ fn resolve_scala_focused_qualified_path(
         ScalaExactMemberResolution::Found(candidates) => {
             return Some(candidates_outcome(candidates));
         }
-        ScalaExactMemberResolution::Ambiguous => {
-            return Some(no_definition(
+        ScalaExactMemberResolution::Ambiguous(contenders) => {
+            return Some(scala_ambiguous_outcome(
                 "ambiguous_scala_type",
+                contenders,
                 format!("`{display}` resolves to multiple physical Scala owners"),
             ));
         }
@@ -4576,9 +4618,10 @@ fn resolve_scala_focused_qualified_path(
         ScalaNameResolution::Resolved(owner) => {
             return Some(scala_fqn_outcome(ctx.support, &owner.fqn, &display));
         }
-        ScalaNameResolution::Ambiguous(_) => {
-            return Some(no_definition(
+        ScalaNameResolution::Ambiguous(owners) => {
+            return Some(scala_ambiguous_outcome(
                 "ambiguous_scala_type",
+                scala_owner_declarations(owners),
                 format!("`{display}` resolves to multiple physical Scala owners"),
             ));
         }
@@ -4589,8 +4632,9 @@ fn resolve_scala_focused_qualified_path(
             ScalaNameResolution::Resolved(owner) => {
                 scala_fqn_outcome(ctx.support, &owner.fqn, &display)
             }
-            ScalaNameResolution::Ambiguous(_) => no_definition(
+            ScalaNameResolution::Ambiguous(owners) => scala_ambiguous_outcome(
                 "ambiguous_scala_type",
+                scala_owner_declarations(owners),
                 format!("`{display}` resolves to multiple physical Scala owners"),
             ),
             // gated upstream: `MissingExplicitImport` is the resolver's own
@@ -4605,11 +4649,50 @@ fn resolve_scala_focused_qualified_path(
                     "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
                 ))
             }
+            // The receiver-position caret of a written `Owner.member` path:
+            // `Collections` in `Collections.sort`. The owner is what did not
+            // resolve, and the member it qualifies is what decides whether the
+            // pair left the workspace (#2287). A caret further left in a longer
+            // path qualifies another owner segment rather than a member, so it
+            // keeps the plain miss.
+            ScalaNameResolution::Unresolved if path.focus_index + 2 == names.len() => {
+                scala_focused_owner_boundary(ctx, &names, &display)
+            }
             ScalaNameResolution::Unresolved => no_definition(
                 "no_indexed_definition",
                 format!("`{display}` did not resolve to an indexed Scala owner"),
             ),
         },
+    )
+}
+
+/// What a caret on the owner of a written `Owner.member` path reports when the
+/// owner is not a type this workspace indexes (#2287).
+///
+/// The same seam `scala_unresolved_receiver_outcome` uses for a caret on the
+/// member: one written spelling, the shared JVM external declaration surface,
+/// and the shared [`gated_boundary`]. A local binding for the head segment has
+/// already returned above, so a name reaching here is not a value.
+fn scala_focused_owner_boundary(
+    ctx: ScalaLookupCtx<'_>,
+    names: &[&str],
+    display: &str,
+) -> DefinitionLookupOutcome {
+    let spelling = names.join(".");
+    let declared = ctx.scope_step().then(|| {
+        ctx.scala.resolve_member_name_with_external(
+            ctx.analyzer.semantic_model_overlay(),
+            ctx.file,
+            &spelling,
+        )
+    });
+    gated_boundary(
+        || !matches!(declared, Some(Some(_))),
+        format!(
+            "`{spelling}` appears to cross a Scala import boundary not indexed in this workspace"
+        ),
+        "no_indexed_definition",
+        format!("`{display}` did not resolve to an indexed Scala owner"),
     )
 }
 
@@ -4739,9 +4822,15 @@ fn scala_exact_qualified_terminal_outcome(
                 .resolve_owner_segments(owner_segments, ScalaOwnerKind::SingletonObject)
             {
                 ScalaNameResolution::Resolved(owner) => owner._declaration,
-                ScalaNameResolution::Ambiguous(_) => {
-                    return Some(no_definition(
+                ScalaNameResolution::Ambiguous(owners) => {
+                    return Some(scala_ambiguous_outcome(
                         "ambiguous_scala_type",
+                        scala_tied_owner_terminal_candidates(
+                            ctx,
+                            scala_owner_declarations(owners),
+                            member,
+                            role,
+                        ),
                         format!(
                             "`{owner_display}.{member}` resolves to multiple physical Scala owners"
                         ),
@@ -4764,9 +4853,15 @@ fn scala_exact_qualified_terminal_outcome(
                 .resolve_owner_segments(owner_segments, ScalaOwnerKind::TypeNamespace)
             {
                 ScalaNameResolution::Resolved(owner) => owner._declaration,
-                ScalaNameResolution::Ambiguous(_) => {
-                    return Some(no_definition(
+                ScalaNameResolution::Ambiguous(owners) => {
+                    return Some(scala_ambiguous_outcome(
                         "ambiguous_scala_type",
+                        scala_tied_owner_terminal_candidates(
+                            ctx,
+                            scala_owner_declarations(owners),
+                            member,
+                            role,
+                        ),
                         format!(
                             "`{owner_display}.{member}` resolves to multiple physical Scala owners"
                         ),
@@ -4793,9 +4888,15 @@ fn scala_exact_qualified_terminal_outcome(
             ] {
                 match resolver.resolve_owner_segments(owner_segments, kind) {
                     ScalaNameResolution::Resolved(owner) => owners.push(owner._declaration),
-                    ScalaNameResolution::Ambiguous(_) => {
-                        return Some(no_definition(
+                    ScalaNameResolution::Ambiguous(tied) => {
+                        return Some(scala_ambiguous_outcome(
                             "ambiguous_scala_type",
+                            scala_tied_owner_terminal_candidates(
+                                ctx,
+                                scala_owner_declarations(tied),
+                                member,
+                                role,
+                            ),
                             format!(
                                 "`{owner_display}.{member}` resolves to multiple physical Scala owners"
                             ),
@@ -4809,8 +4910,9 @@ fn scala_exact_qualified_terminal_outcome(
             owners.dedup();
             let [owner] = owners.as_slice() else {
                 return if owners.len() > 1 {
-                    Some(no_definition(
+                    Some(scala_ambiguous_outcome(
                         "ambiguous_scala_type",
+                        scala_tied_owner_terminal_candidates(ctx, owners, member, role),
                         format!(
                             "`{owner_display}.{member}` resolves to multiple physical Scala owners"
                         ),
@@ -4880,6 +4982,26 @@ fn scala_exact_terminal_member_candidates(
     candidates
 }
 
+/// The terminal `member` declarations reachable through a tie between owners.
+///
+/// A qualified reference names `member`, not the owner path in front of it, so
+/// an owner tie is only reportable through what each tied owner declares for
+/// the member: those declarations are the site's contenders, and the owners
+/// themselves are not (#2167).
+fn scala_tied_owner_terminal_candidates(
+    ctx: ScalaLookupCtx<'_>,
+    owners: Vec<CodeUnit>,
+    member: &str,
+    role: ScalaQualifiedTerminalRole,
+) -> Vec<CodeUnit> {
+    owners
+        .iter()
+        .flat_map(|owner| {
+            scala_exact_terminal_member_candidates(ctx.scala, ctx.support, owner, member, role)
+        })
+        .collect::<Vec<_>>()
+}
+
 fn scala_terminal_candidates_outcome(
     mut candidates: Vec<CodeUnit>,
 ) -> Option<DefinitionLookupOutcome> {
@@ -4893,9 +5015,11 @@ fn scala_terminal_candidates_outcome(
         .map(CodeUnit::fq_name)
         .collect::<HashSet<_>>();
     if distinct_fqns.len() > 1 {
-        return Some(no_definition(
+        return Some(scala_ambiguous_outcome(
             "ambiguous_scala_type",
-            "the selected Scala terminal has multiple physical declarations across namespaces",
+            candidates,
+            "the selected Scala terminal has multiple physical declarations across namespaces"
+                .to_string(),
         ));
     }
     Some(candidates_outcome(candidates))
@@ -4941,7 +5065,16 @@ fn scala_exact_enclosing_singleton_path(
                     matched = false;
                     break;
                 }
-                [_, _, ..] => return ScalaExactMemberResolution::Ambiguous,
+                // Only the terminal segment's declarations are contenders for
+                // the reference itself; an intermediate tie names an owner on
+                // the way there, not a target (#2167).
+                [_, _, ..] => {
+                    return ScalaExactMemberResolution::Ambiguous(if index + 1 == segments.len() {
+                        children
+                    } else {
+                        Vec::new()
+                    });
+                }
             }
             index += 1;
         }
@@ -4977,7 +5110,7 @@ fn scala_exact_exported_qualified_type(
             ScalaExactMemberResolution::Found(mut candidates) if candidates.len() == 1 => {
                 candidates.remove(0)
             }
-            ScalaExactMemberResolution::Found(_) | ScalaExactMemberResolution::Ambiguous => {
+            ScalaExactMemberResolution::Found(_) | ScalaExactMemberResolution::Ambiguous(_) => {
                 return ScalaTypeNamespaceResolution::NoMatch;
             }
             ScalaExactMemberResolution::NoMatch => {
@@ -5015,7 +5148,7 @@ fn scala_exact_exported_qualified_type(
         [declaration] => {
             return ScalaTypeNamespaceResolution::Resolved(declaration.clone());
         }
-        [_, _, ..] => return ScalaTypeNamespaceResolution::Ambiguous,
+        [_, _, ..] => return ScalaTypeNamespaceResolution::Ambiguous(direct),
         [] => {}
     }
 
@@ -5072,7 +5205,7 @@ fn scala_exact_exported_qualified_type(
     declarations.dedup();
     match declarations.as_slice() {
         [declaration] => ScalaTypeNamespaceResolution::Resolved(declaration.clone()),
-        [_, _, ..] => ScalaTypeNamespaceResolution::Ambiguous,
+        [_, _, ..] => ScalaTypeNamespaceResolution::Ambiguous(declarations),
         [] if matched_export => ScalaTypeNamespaceResolution::AuthoritativeMiss,
         [] => ScalaTypeNamespaceResolution::NoMatch,
     }
@@ -5260,13 +5393,80 @@ fn resolve_scala_parser_proven_term_role(
                     "ambiguous_scala_term_namespace",
                     format!("`{name}` resolves to multiple physical Scala extractor classes"),
                 ),
-                ScalaNameResolution::Unresolved => no_definition(
-                    "no_applicable_scala_callable",
-                    format!("`{name}` has no indexed Scala extractor owner"),
-                ),
+                ScalaNameResolution::Unresolved => {
+                    match scala_enclosing_member_value_units(ctx, node, name) {
+                        ScalaExactMemberResolution::Found(candidates) => {
+                            candidates_outcome(candidates)
+                        }
+                        ScalaExactMemberResolution::Ambiguous(contenders) => {
+                            scala_ambiguous_outcome(
+                                "ambiguous_scala_enclosing_member",
+                                contenders,
+                                format!(
+                                    "`{name}` has multiple physical enclosing-owner definitions"
+                                ),
+                            )
+                        }
+                        ScalaExactMemberResolution::NoMatch => no_definition(
+                            "no_applicable_scala_callable",
+                            format!("`{name}` has no indexed Scala extractor owner"),
+                        ),
+                    }
+                }
             }
         }
     })
+}
+
+/// The value an extractor pattern names when no object and no class of that
+/// name is visible: a value member of an enclosing template, innermost first.
+///
+/// `private val RcVersion = "...".r` is the census's dominant shape.
+/// `scala.util.matching.Regex` declares `unapplySeq`, so `case RcVersion(v)`
+/// is a legal extractor pattern whose target is the value binding itself, not
+/// a type. No eligibility check gates this: Bifrost does not model the type of
+/// an arbitrary initializer, so demanding proof of `unapply`/`unapplySeq`
+/// would reject every witness. Scala's own parser has already proven the
+/// pattern role, and the visible value is the structural answer.
+///
+/// This runs after the object and class tiers, so it can only answer where
+/// both of those fail. An enclosing value and a visible extractor owner of the
+/// same name would, under SLS 2, resolve to the value; no witness writes that
+/// shape, and keeping the tier last leaves every site that resolves today
+/// unchanged.
+fn scala_enclosing_member_value_units(
+    ctx: ScalaLookupCtx<'_>,
+    node: Node<'_>,
+    name: &str,
+) -> ScalaExactMemberResolution {
+    for owner_fqn in scala_enclosing_template_owner_fq_names(
+        ctx.analyzer,
+        ctx.scala,
+        ctx.file,
+        node.start_byte(),
+    ) {
+        for owner in ctx.support.fqn(&owner_fqn) {
+            match scala_exact_owner_member_candidate_units(ctx, &owner, name, false) {
+                ScalaExactMemberResolution::Found(mut candidates) => {
+                    // A nested class or type member of the same name is the
+                    // class tier's business, and it already declined above.
+                    candidates.retain(|unit| {
+                        (unit.is_field() || unit.is_function())
+                            && !ctx.scala.is_type_alias(unit)
+                            && !scala_constructor_only_callable(ctx.scala, unit)
+                    });
+                    if !candidates.is_empty() {
+                        return ScalaExactMemberResolution::Found(candidates);
+                    }
+                }
+                ScalaExactMemberResolution::Ambiguous(contenders) => {
+                    return ScalaExactMemberResolution::Ambiguous(contenders);
+                }
+                ScalaExactMemberResolution::NoMatch => {}
+            }
+        }
+    }
+    ScalaExactMemberResolution::NoMatch
 }
 
 fn scala_extractor_outcome(
@@ -5485,7 +5685,7 @@ fn resolve_scala_bare_apply_fast_path(
                     call_shape.as_ref(),
                 ));
             }
-            ScalaExactMemberResolution::Ambiguous => {
+            ScalaExactMemberResolution::Ambiguous(_) => {
                 return Some(no_definition(
                     "ambiguous_scala_lexical_singleton",
                     format!("`{name}` has multiple physical lexical singleton definitions"),
@@ -5510,7 +5710,7 @@ fn resolve_scala_bare_apply_fast_path(
                     format!("`{name}` is a local Scala type binding without a callable identity"),
                 ));
             }
-            ScalaTypeNamespaceResolution::Ambiguous => {
+            ScalaTypeNamespaceResolution::Ambiguous(_) => {
                 return Some(no_definition(
                     "ambiguous_scala_type",
                     format!("`{name}` resolves to multiple exact Scala type declarations"),
@@ -5593,7 +5793,7 @@ fn scala_exact_lexical_singleton_for_call(
                     return ScalaExactMemberResolution::Found(candidates);
                 }
             }
-            _ => return ScalaExactMemberResolution::Ambiguous,
+            _ => return ScalaExactMemberResolution::Ambiguous(candidates),
         }
     }
     ScalaExactMemberResolution::NoMatch
@@ -6395,9 +6595,10 @@ fn resolve_scala_type(
                 format!("`{text}` is a local Scala type binding without a stable indexed identity"),
             );
         }
-        ScalaTypeNamespaceResolution::Ambiguous => {
-            return no_definition(
+        ScalaTypeNamespaceResolution::Ambiguous(contenders) => {
+            return scala_ambiguous_outcome(
                 "ambiguous_scala_type",
+                contenders,
                 format!("`{text}` resolves to multiple exact Scala type declarations"),
             );
         }
@@ -6445,9 +6646,10 @@ fn resolve_scala_type(
                 ),
             );
         }
-        ScalaTypeNamespaceResolution::Ambiguous => {
-            return no_definition(
+        ScalaTypeNamespaceResolution::Ambiguous(contenders) => {
+            return scala_ambiguous_outcome(
                 "ambiguous_scala_type",
+                contenders,
                 format!("`{text}` resolves through multiple Scala export targets"),
             );
         }
@@ -6465,9 +6667,10 @@ fn resolve_scala_type(
                         "`{intrinsic}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
                     ));
                 }
-                ScalaNameResolution::Ambiguous(_) => {
-                    return no_definition(
+                ScalaNameResolution::Ambiguous(owners) => {
+                    return scala_ambiguous_outcome(
                         "ambiguous_scala_type",
+                        scala_owner_declarations(owners),
                         format!("`{intrinsic}` resolves to multiple higher-precedence Scala types"),
                     );
                 }
@@ -6576,7 +6779,7 @@ fn resolve_scala_named_argument(
                             declaring_callables,
                         )
                     }
-                    ScalaExactMemberResolution::Ambiguous => no_definition(
+                    ScalaExactMemberResolution::Ambiguous(_) => no_definition(
                         "ambiguous_scala_named_argument",
                         format!(
                             "named argument `{arg_name}` has multiple declarations on the exact callee owner"
@@ -6594,9 +6797,27 @@ fn resolve_scala_named_argument(
                     ),
                 };
             }
-            ScalaTypeNamespaceResolution::Ambiguous => {
-                return no_definition(
+            ScalaTypeNamespaceResolution::Ambiguous(owners) => {
+                // The label's target is a member of the callee, so the tied
+                // OWNERS are not what the site names. Ask each of them for the
+                // label exactly as the resolved arm above asks the one owner it
+                // has: the members that answer are the site's real contenders,
+                // and a label only one tied owner declares is not ambiguous at
+                // all (#2167).
+                let contenders = owners
+                    .iter()
+                    .flat_map(|owner| {
+                        match scala_exact_owner_member_candidate_units(ctx, owner, arg_name, false)
+                        {
+                            ScalaExactMemberResolution::Found(candidates) => candidates,
+                            ScalaExactMemberResolution::Ambiguous(candidates) => candidates,
+                            ScalaExactMemberResolution::NoMatch => Vec::new(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                return scala_ambiguous_outcome(
                     "ambiguous_scala_named_argument_owner",
+                    contenders,
                     format!("named argument `{arg_name}` has an ambiguous lexical callee owner"),
                 );
             }
@@ -6848,9 +7069,10 @@ fn resolve_scala_call(
                             );
                         }
                     }
-                    ScalaExactMemberResolution::Ambiguous => {
-                        return no_definition(
+                    ScalaExactMemberResolution::Ambiguous(contenders) => {
+                        return scala_ambiguous_outcome(
                             "ambiguous_scala_enclosing_member",
+                            contenders,
                             format!("`{name}` has multiple physical enclosing-owner definitions"),
                         );
                     }
@@ -6893,9 +7115,10 @@ fn resolve_scala_call(
                                         );
                                     }
                                 }
-                                ScalaExactMemberResolution::Ambiguous => {
-                                    return no_definition(
+                                ScalaExactMemberResolution::Ambiguous(contenders) => {
+                                    return scala_ambiguous_outcome(
                                         "ambiguous_scala_enclosing_member",
+                                        contenders,
                                         format!(
                                             "`{name}` has multiple physical lexically enclosing definitions"
                                         ),
@@ -6937,7 +7160,7 @@ fn resolve_scala_call(
                         );
                     }
                 }
-                ScalaExactMemberResolution::Ambiguous => {
+                ScalaExactMemberResolution::Ambiguous(_) => {
                     return no_definition(
                         "ambiguous_scala_self_type_member",
                         format!("`{name}` has multiple physical self-type member definitions"),
@@ -7450,7 +7673,7 @@ fn resolve_scala_field(
                     }
                     return candidates_outcome(applicable);
                 }
-                ScalaExactMemberResolution::Ambiguous => {
+                ScalaExactMemberResolution::Ambiguous(_) => {
                     return no_definition(
                         "ambiguous_scala_receiver_member",
                         format!(
@@ -7526,10 +7749,136 @@ fn resolve_scala_field(
     if !extension_candidates.is_empty() {
         return candidates_outcome(extension_candidates);
     }
-    no_definition(
-        SCALA_UNSUPPORTED_RECEIVER,
+    scala_unresolved_receiver_outcome(
+        ctx,
+        root,
+        receiver,
+        member,
         format!("receiver for Scala member `{member}` is not resolved"),
     )
+}
+
+/// What a Scala member access reports when its receiver is not a type this
+/// workspace indexes (#2287).
+///
+/// A receiver whose written spelling resolves to an *external* type, on which
+/// the shared JVM external declaration surface declares `member`, is a
+/// reference the workspace cannot index rather than one nothing declares. That
+/// is the import boundary the resolver actually crossed, and reporting it is
+/// what lets the trace name the external declaration the reference landed on.
+/// This is the same seam `java_unresolved_receiver_outcome` uses, through the
+/// same [`gated_boundary`] and the same member surface; only the owner ladder
+/// is Scala's.
+///
+/// Anything else keeps the plain unresolved-receiver miss, so a receiver of
+/// unknown type and a member no surface declares are both unchanged.
+fn scala_unresolved_receiver_outcome(
+    ctx: ScalaLookupCtx<'_>,
+    root: Node<'_>,
+    receiver: Node<'_>,
+    member: &str,
+    unresolved_message: String,
+) -> DefinitionLookupOutcome {
+    let declared = scala_external_member_spelling(ctx, root, receiver, member);
+    let boundary_message = match &declared {
+        Some(spelling) => format!(
+            "`{spelling}` appears to cross a Scala import boundary not indexed in this workspace"
+        ),
+        None => format!(
+            "`{member}` appears to cross a Scala import boundary not indexed in this workspace"
+        ),
+    };
+    gated_boundary(
+        || declared.is_none(),
+        boundary_message,
+        SCALA_UNSUPPORTED_RECEIVER,
+        unresolved_message,
+    )
+}
+
+/// The written `Owner.member` name a Scala member access spells, but only when
+/// the shared JVM external declaration surface declares that member on the
+/// owner that name reaches.
+///
+/// Only a *name path* may be re-read as a type spelling. A receiver that is a
+/// call, a literal, `this`, or any other value expression names no type, and a
+/// bare name a `val`, `var`, or pattern binds is a value even when it happens
+/// to share a short name with a dependency type -- so both answer nothing here
+/// and leave the reference exactly as unresolved as it was.
+fn scala_external_member_spelling(
+    ctx: ScalaLookupCtx<'_>,
+    root: Node<'_>,
+    receiver: Node<'_>,
+    member: &str,
+) -> Option<String> {
+    if member.is_empty() {
+        return None;
+    }
+    let segments = scala_receiver_name_segments(receiver, ctx.source)?;
+    let head = *segments.first()?;
+    if scala_lexical_binding_declares_name_before(root, ctx.source, head, receiver.start_byte()) {
+        return None;
+    }
+    if !ctx.scope_step() {
+        return None;
+    }
+    let spelling = format!("{}.{member}", segments.join("."));
+    ctx.scala
+        .resolve_member_name_with_external(
+            ctx.analyzer.semantic_model_overlay(),
+            ctx.file,
+            &spelling,
+        )
+        .map(|_| spelling)
+}
+
+/// How many segments of a written receiver name path are read.
+///
+/// A receiver spelled as a dotted name is short in practice; a cap keeps a
+/// pathological or recovery-shaped tree from turning one request into an
+/// unbounded walk, exactly as the receiver-typing walks are capped.
+const MAX_SCALA_RECEIVER_PATH_SEGMENTS: usize = 8;
+
+/// The dotted name a Scala receiver expression spells, segment by segment:
+/// `["Collections"]`, or `["java", "util", "Collections"]` for a written
+/// qualified name. Anything that is not a plain name path answers nothing.
+fn scala_receiver_name_segments<'a>(receiver: Node<'_>, source: &'a str) -> Option<Vec<&'a str>> {
+    let mut trailing: Vec<&'a str> = Vec::new();
+    let mut current = receiver;
+    for _ in 0..=MAX_SCALA_RECEIVER_PATH_SEGMENTS {
+        match current.kind() {
+            "identifier" | "type_identifier" => {
+                trailing.push(scala_node_text(current, source).trim());
+                trailing.reverse();
+                return Some(trailing);
+            }
+            "field_expression" => {
+                let field = current.child_by_field_name("field")?;
+                trailing.push(scala_node_text(field, source).trim());
+                current = current.child_by_field_name("value")?;
+            }
+            // A `stable_identifier` is already a whole name path and nests no
+            // further, so its own segments are the head of the answer.
+            "stable_identifier" | "stable_type_identifier" => {
+                let mut cursor = current.walk();
+                let mut leading = Vec::new();
+                for child in current.named_children(&mut cursor) {
+                    if !matches!(child.kind(), "identifier" | "type_identifier") {
+                        return None;
+                    }
+                    leading.push(scala_node_text(child, source).trim());
+                }
+                if leading.is_empty() {
+                    return None;
+                }
+                trailing.reverse();
+                leading.extend(trailing);
+                return Some(leading);
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn scala_receiver_allows_companion_lookup_with_bindings(
@@ -7645,7 +7994,7 @@ fn resolve_scala_stable_identifier(
             }
             return match scala_exact_owner_member_candidate_units(ctx, exact_owner, member, false) {
                 ScalaExactMemberResolution::Found(candidates) => candidates_outcome(candidates),
-                ScalaExactMemberResolution::Ambiguous => no_definition(
+                ScalaExactMemberResolution::Ambiguous(_) => no_definition(
                     "ambiguous_scala_receiver_member",
                     format!(
                         "`{member}` has multiple member definitions in the exact receiver hierarchy of `{owner_fqn}`"
@@ -7862,10 +8211,18 @@ fn scala_member_candidate_units(
     Vec::new()
 }
 
+/// Outcome of an exact Scala member lookup against one owner tier.
+///
+/// `Ambiguous` carries the declarations the tier could not choose between
+/// (#2167), on the same rule as [`ScalaTypeNamespaceResolution::Ambiguous`]:
+/// the list holds declarations of the NAME the caller asked for, so a caller
+/// can answer with them. It is empty when the tie belongs to an intermediate
+/// level -- an owner, a companion or a supertype whose own name is ambiguous --
+/// because no declaration of the asked-for name was ever in hand there.
 enum ScalaExactMemberResolution {
     Found(Vec<CodeUnit>),
     NoMatch,
-    Ambiguous,
+    Ambiguous(Vec<CodeUnit>),
 }
 
 enum ScalaTypedOverloadResolution {
@@ -7953,7 +8310,7 @@ fn scala_explicit_local_member_import_outcome(
         };
         match scala_exact_owner_member_candidate_units(ctx, &owner, member, false) {
             ScalaExactMemberResolution::Found(found) => candidates.extend(found),
-            ScalaExactMemberResolution::Ambiguous => {
+            ScalaExactMemberResolution::Ambiguous(_) => {
                 return Some(no_definition(
                     "ambiguous_scala_local_import_member",
                     format!("imported local member `{visible_name}` has multiple definitions"),
@@ -8649,7 +9006,10 @@ fn scala_exact_owner_member_candidate_units(
         ForwardScalaDirectAncestorResolution::Ambiguous(owners) => {
             let candidates = scala_ambiguous_owner_member_candidates(ctx, owners, member);
             return if candidates.is_empty() {
-                ScalaExactMemberResolution::Ambiguous
+                // no contenders: the tie is the SUPERTYPE name's, and none of
+                // the tied owners declares `member`, so no declaration of
+                // `member` was ever in hand (#2167).
+                ScalaExactMemberResolution::Ambiguous(Vec::new())
             } else {
                 ScalaExactMemberResolution::Found(candidates)
             };
@@ -8708,7 +9068,8 @@ fn scala_exact_owner_member_candidate_units(
             sort_units(&mut ambiguous_matches);
             ambiguous_matches.dedup();
             return if ambiguous_matches.is_empty() {
-                ScalaExactMemberResolution::Ambiguous
+                // no contenders: see the direct-ancestor arm above.
+                ScalaExactMemberResolution::Ambiguous(Vec::new())
             } else {
                 ScalaExactMemberResolution::Found(ambiguous_matches)
             };
@@ -8741,7 +9102,9 @@ fn scala_exact_owner_member_candidate_units(
                     return ScalaExactMemberResolution::Found(candidates);
                 }
             }
-            [_, _, ..] => return ScalaExactMemberResolution::Ambiguous,
+            // no contenders: the tie is the COMPANION owner's, so no
+            // declaration of `member` was ever in hand (#2167).
+            [_, _, ..] => return ScalaExactMemberResolution::Ambiguous(Vec::new()),
             [] => {}
         }
     }
@@ -8764,8 +9127,8 @@ fn scala_self_type_member_candidate_units(
             };
             match scala_exact_owner_member_candidate_units(ctx, &owner, member, false) {
                 ScalaExactMemberResolution::Found(found) => candidates.extend(found),
-                ScalaExactMemberResolution::Ambiguous => {
-                    return ScalaExactMemberResolution::Ambiguous;
+                ScalaExactMemberResolution::Ambiguous(contenders) => {
+                    return ScalaExactMemberResolution::Ambiguous(contenders);
                 }
                 ScalaExactMemberResolution::NoMatch => {}
             }
@@ -8952,6 +9315,71 @@ fn scala_forward_callable_source_alternatives(
         .collect()
 }
 
+/// What the rest of the candidate set says about one candidate's admission.
+///
+/// Scala applicability is not a per-declaration question alone. A `val` and a
+/// `def` may share one name in one template only because the `def` takes
+/// parameters, so the two are never both the denotation of one reference: an
+/// unapplied reference cannot be that `def`, and an application the `def`
+/// completely fills is the method's call rather than an `apply` insertion on
+/// the value (#2170). Overload uniqueness is the same kind of fact, which is
+/// why it lives here too.
+#[derive(Clone, Copy)]
+struct ScalaCandidateSetFacts {
+    /// This is the only same-named callable the site could denote, so an
+    /// unapplied reference to it is a method value and a partial application
+    /// of it has no competitor.
+    unique_callable: bool,
+    /// A same-named term field is a candidate, so an unapplied reference has a
+    /// denotation that needs no argument list.
+    term_field_candidate: bool,
+    /// A same-named ordinary method declares exactly the argument lists the
+    /// site writes, so the site is that method's application.
+    call_completed_by_callable: bool,
+}
+
+impl ScalaCandidateSetFacts {
+    /// One declaration checked outside any candidate set: nothing same-named
+    /// competes with it, so only the callable-uniqueness premise applies.
+    fn lone(unique_callable: bool) -> Self {
+        Self {
+            unique_callable,
+            term_field_candidate: false,
+            call_completed_by_callable: false,
+        }
+    }
+}
+
+/// Whether `unit` declares exactly the argument lists `call_shape` writes.
+fn scala_unit_completes_call(
+    scala: &ScalaAnalyzer,
+    unit: &CodeUnit,
+    call_shape: &ScalaCallSiteShape,
+) -> bool {
+    let alternatives = scala_forward_callable_source_alternatives(scala, unit);
+    if alternatives.is_empty() {
+        let fallback = method_signature_arity(scala, unit)
+            .map(crate::analyzer::CallableArity::exact)
+            .map(ScalaCallableParameterList::explicit)
+            .into_iter()
+            .collect::<Vec<_>>();
+        return scala_callable_completes_call(
+            scala_fallback_callable_role(scala, unit),
+            &fallback,
+            ScalaDeclaredResult::UNDECLARED,
+            call_shape,
+        );
+    }
+    alternatives.iter().any(|alternative| {
+        scala_callable_completes_call(
+            alternative.role,
+            &alternative.shape,
+            alternative.result,
+            call_shape,
+        )
+    })
+}
+
 fn scala_filter_callable_units(
     scala: &ScalaAnalyzer,
     candidates: Vec<CodeUnit>,
@@ -9001,13 +9429,24 @@ fn scala_filter_callable_units(
             }
         })
         .sum::<usize>();
-    let unique_callable = callable_count == 1;
+    let facts = ScalaCandidateSetFacts {
+        unique_callable: callable_count == 1,
+        term_field_candidate: candidates
+            .iter()
+            .any(|unit| unit.is_field() && !scala.is_type_alias(unit)),
+        call_completed_by_callable: call_shape.is_some_and(|call_shape| {
+            candidates
+                .iter()
+                .filter(|unit| unit.is_function())
+                .any(|unit| scala_unit_completes_call(scala, unit, call_shape))
+        }),
+    };
     // One applicability computation decides what the resolver binds and what
     // the trace reports (#1478 M3). `winners` is the production filter this
     // function has always been; `verdicts` is the same pass's per-candidate
     // answer, so the two cannot disagree.
     let applicability =
-        scala_candidate_applicability(scala, &candidates, call_shape, site_role, unique_callable);
+        scala_candidate_applicability(scala, &candidates, call_shape, site_role, facts);
     if trace::recording() {
         scala_record_applicability(&applicability, call_shape);
     }
@@ -9027,13 +9466,13 @@ fn scala_candidate_applicability(
     candidates: &[CodeUnit],
     call_shape: Option<&ScalaCallSiteShape>,
     site_role: ScalaCallableSiteRole,
-    unique_callable: bool,
+    facts: ScalaCandidateSetFacts,
 ) -> ApplicabilityOutcome {
     ApplicabilityOutcome::from_verdicts(
         candidates
             .iter()
-            .map(|unit| {
-                match scala_unit_mismatch(scala, unit, call_shape, site_role, unique_callable) {
+            .map(
+                |unit| match scala_unit_mismatch(scala, unit, call_shape, site_role, facts) {
                     None if call_shape.is_some() => {
                         CandidateApplicability::applicable(unit.clone())
                     }
@@ -9042,8 +9481,8 @@ fn scala_candidate_applicability(
                         unit.clone(),
                         scala_rejection_reason(mismatch),
                     ),
-                }
-            })
+                },
+            )
             .collect(),
     )
 }
@@ -9227,19 +9666,32 @@ fn scala_member_candidate_applies(
 /// means the site is in the wrong callable namespace entirely and says nothing
 /// about the argument lists; only when every alternative failed on the role is
 /// the role the answer.
+///
+/// A term field is a candidate for anything but an application that a
+/// same-named method completely fills: Scala inserts `.apply` on a value only
+/// where no method applies (#2170).
 fn scala_unit_mismatch(
     scala: &ScalaAnalyzer,
     unit: &CodeUnit,
     call_shape: Option<&ScalaCallSiteShape>,
     site_role: ScalaCallableSiteRole,
-    unique_callable: bool,
+    facts: ScalaCandidateSetFacts,
 ) -> Option<ScalaCallableMismatch> {
     if unit.is_field() {
-        return None;
+        return facts
+            .call_completed_by_callable
+            .then_some(ScalaCallableMismatch::Role);
     }
     if !unit.is_function() {
         return Some(ScalaCallableMismatch::Role);
     }
+    // A reference that writes no argument list is not a call, and a `def` that
+    // shares a `val`'s name in one template must take parameters. The competing
+    // term field therefore withdraws the method-value premise: a parameterized
+    // `def` is refused, while a paren-less one still admits the read on its own
+    // and stays a genuine tie (#2170).
+    let unique_callable =
+        facts.unique_callable && !(call_shape.is_none() && facts.term_field_candidate);
     let alternatives = scala_forward_callable_source_alternatives(scala, unit);
     if !alternatives.is_empty() {
         let mut mismatches = Vec::new();
@@ -9286,7 +9738,14 @@ fn scala_member_unit_applies(
     site_role: ScalaCallableSiteRole,
     unique_callable: bool,
 ) -> bool {
-    scala_unit_mismatch(scala, unit, call_shape, site_role, unique_callable).is_none()
+    scala_unit_mismatch(
+        scala,
+        unit,
+        call_shape,
+        site_role,
+        ScalaCandidateSetFacts::lone(unique_callable),
+    )
+    .is_none()
 }
 
 fn scala_fallback_callable_role(scala: &ScalaAnalyzer, unit: &CodeUnit) -> ScalaCallableRole {
@@ -10365,7 +10824,7 @@ fn scala_node_declares_name_before(
             }
             node.child_by_field_name("pattern").is_some_and(|pattern| {
                 lower_bound <= pattern.start_byte()
-                    && scala_pattern_binder_names(pattern, source).contains(&name)
+                    && scala_definition_binder_names(pattern, source).contains(&name)
             })
         }
         "enumerator" => {
@@ -10437,7 +10896,7 @@ fn scala_node_declares_name_before_bounded(
             if lower_bound > pattern.start_byte() {
                 return Some(false);
             }
-            scala_pattern_declares_name_bounded(session, pattern, source, name)
+            scala_definition_declares_name_bounded(session, pattern, source, name)
         }
         "enumerator" => {
             let Some(pattern) =
@@ -10517,6 +10976,18 @@ fn scala_pattern_declares_name_bounded(
         return None;
     }
     Some(scala_pattern_binder_names(pattern, source).contains(&name))
+}
+
+fn scala_definition_declares_name_bounded(
+    session: &ResolutionSession,
+    pattern: Node<'_>,
+    source: &str,
+    name: &str,
+) -> Option<bool> {
+    if !scala_charge_named_descendants(session, pattern) {
+        return None;
+    }
+    Some(scala_definition_binder_names(pattern, source).contains(&name))
 }
 
 fn scala_charge_named_descendants(session: &ResolutionSession, root: Node<'_>) -> bool {
@@ -10654,7 +11125,7 @@ fn scala_resolve_visible_type_node(
             return Some(declaration.fq_name());
         }
         ScalaTypeNamespaceResolution::AuthoritativeMiss
-        | ScalaTypeNamespaceResolution::Ambiguous => return None,
+        | ScalaTypeNamespaceResolution::Ambiguous(_) => return None,
         ScalaTypeNamespaceResolution::NoMatch => {}
     }
     match scala_exact_exported_qualified_type(ctx, resolver, node) {
@@ -10662,7 +11133,7 @@ fn scala_resolve_visible_type_node(
             return Some(declaration.fq_name());
         }
         ScalaTypeNamespaceResolution::AuthoritativeMiss
-        | ScalaTypeNamespaceResolution::Ambiguous => return None,
+        | ScalaTypeNamespaceResolution::Ambiguous(_) => return None,
         ScalaTypeNamespaceResolution::NoMatch => {}
     }
     scala_resolve_visible_type_node_after_lexical_miss(ctx, resolver, node)
@@ -10676,13 +11147,13 @@ fn scala_resolve_visible_type_declaration(
     match scala_exact_lexical_type_namespace(ctx, resolver, node) {
         ScalaTypeNamespaceResolution::Resolved(declaration) => return Some(declaration),
         ScalaTypeNamespaceResolution::AuthoritativeMiss
-        | ScalaTypeNamespaceResolution::Ambiguous => return None,
+        | ScalaTypeNamespaceResolution::Ambiguous(_) => return None,
         ScalaTypeNamespaceResolution::NoMatch => {}
     }
     match scala_exact_exported_qualified_type(ctx, resolver, node) {
         ScalaTypeNamespaceResolution::Resolved(declaration) => return Some(declaration),
         ScalaTypeNamespaceResolution::AuthoritativeMiss
-        | ScalaTypeNamespaceResolution::Ambiguous => return None,
+        | ScalaTypeNamespaceResolution::Ambiguous(_) => return None,
         ScalaTypeNamespaceResolution::NoMatch => {}
     }
 
@@ -10809,16 +11280,49 @@ fn scala_exact_lexical_type_namespace(
             owners.push(unit);
         }
     }
+    // The exact type members one enclosing owner declares in its own body, in
+    // the type namespace: nested classes and traits (never their companion
+    // objects) plus type aliases.
+    let mut direct_type_members = |owner: &CodeUnit, member: &str| -> Vec<CodeUnit> {
+        ctx.direct_children_for_owner(owner)
+            .into_iter()
+            .filter(|unit| unit.identifier() == member)
+            .filter(|unit| unit.source() == owner.source())
+            .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(owner))
+            .filter(|unit| {
+                unit.is_class() && !unit.short_name().ends_with('$')
+                    || ctx.scala.is_type_alias(unit)
+            })
+            .collect()
+    };
     if segments.len() == 1
-        && let Some(owner) = owners.iter().find(|owner| {
+        && let Some(self_index) = owners.iter().position(|owner| {
             !owner.short_name().ends_with('$') && owner.identifier() == root_name.as_str()
         })
     {
-        // An enclosing class introduces its own exact type name before any
-        // inherited type members. Resolve that parser-proven identity without
-        // traversing incomplete ancestors (for example an unindexed
-        // `Serializable` mixin), which cannot make the self type ambiguous.
-        return ScalaTypeNamespaceResolution::Resolved(owner.clone());
+        // SLS 2: a template's own name binds in the scope that encloses the
+        // template, while the type members it declares bind inside its body.
+        // A member type alias or nested type therefore shadows the enclosing
+        // same-named template, as scalacheck's `private type Commands` inside
+        // `trait Commands` does (#2175). Probe the owners at and inside the
+        // self-named one for such a declaration before the self name wins.
+        //
+        // Only direct declarations shadow here: an enclosing class introduces
+        // its own exact type name before any INHERITED type member, so this
+        // probe supplies no ancestors and cannot be made ambiguous by an
+        // incomplete supertype (for example an unindexed `Serializable` mixin).
+        match resolve_exact_lexical_type_namespace(
+            owners[..=self_index].iter().cloned(),
+            root_name,
+            false,
+            &mut direct_type_members,
+            |_| ScalaDirectAncestorResolution::Resolved(Vec::new()),
+        ) {
+            ScalaTypeNamespaceResolution::NoMatch => {
+                return ScalaTypeNamespaceResolution::Resolved(owners[self_index].clone());
+            }
+            shadowing => return shadowing,
+        }
     }
     if segments.len() > 1 {
         if let Some(owner) = owners
@@ -10848,14 +11352,18 @@ fn scala_exact_lexical_type_namespace(
                     &segments[1..],
                     scala_type_node_owner_kind(lookup_node),
                 ),
-                [_, _, ..] => ScalaTypeNamespaceResolution::Ambiguous,
+                // no contenders: the tie is the PATH ROOT's, so no declaration
+                // of the terminal segment was ever in hand (#2167).
+                [_, _, ..] => ScalaTypeNamespaceResolution::Ambiguous(Vec::new()),
             };
         }
         for owner in owners {
             let candidates = match scala_exact_owner_namespace_children(ctx, &owner, &segments[0]) {
                 ScalaExactMemberResolution::Found(candidates) => candidates,
-                ScalaExactMemberResolution::Ambiguous => {
-                    return ScalaTypeNamespaceResolution::Ambiguous;
+                // no contenders: the tie is an INTERMEDIATE segment's, so no
+                // declaration of the terminal segment was ever in hand (#2167).
+                ScalaExactMemberResolution::Ambiguous(_) => {
+                    return ScalaTypeNamespaceResolution::Ambiguous(Vec::new());
                 }
                 ScalaExactMemberResolution::NoMatch => continue,
             };
@@ -10875,18 +11383,7 @@ fn scala_exact_lexical_type_namespace(
         owners.iter().cloned(),
         name,
         false,
-        |owner, member| {
-            ctx.direct_children_for_owner(owner)
-                .into_iter()
-                .filter(|unit| unit.identifier() == member)
-                .filter(|unit| unit.source() == owner.source())
-                .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(owner))
-                .filter(|unit| {
-                    unit.is_class() && !unit.short_name().ends_with('$')
-                        || ctx.scala.is_type_alias(unit)
-                })
-                .collect()
-        },
+        &mut direct_type_members,
         |owner| ctx.direct_ancestors_for_owner(owner),
     );
     match lexical {
@@ -10922,7 +11419,9 @@ fn scala_exact_lexical_type_namespace(
             if companions.is_empty() {
                 continue;
             }
-            return ScalaTypeNamespaceResolution::Ambiguous;
+            // no contenders: the tie is the COMPANION owner's, so no
+            // declaration of `name` was ever in hand (#2167).
+            return ScalaTypeNamespaceResolution::Ambiguous(Vec::new());
         };
         let members = scala_exact_direct_namespace_children(
             ctx,
@@ -10932,7 +11431,7 @@ fn scala_exact_lexical_type_namespace(
         );
         match members.as_slice() {
             [member] => return ScalaTypeNamespaceResolution::Resolved(member.clone()),
-            [_, _, ..] => return ScalaTypeNamespaceResolution::Ambiguous,
+            [_, _, ..] => return ScalaTypeNamespaceResolution::Ambiguous(members),
             [] => {}
         }
     }
@@ -10967,7 +11466,7 @@ fn scala_exact_namespace_descendant(
     }
     match candidates.as_slice() {
         [declaration] => ScalaTypeNamespaceResolution::Resolved(declaration.clone()),
-        [_, _, ..] => ScalaTypeNamespaceResolution::Ambiguous,
+        [_, _, ..] => ScalaTypeNamespaceResolution::Ambiguous(candidates),
         [] => ScalaTypeNamespaceResolution::AuthoritativeMiss,
     }
 }
@@ -11020,7 +11519,7 @@ fn scala_type_member_before_anonymous_refinement(
                 ScalaTypeNamespaceResolution::Resolved(member) => {
                     return ScalaTypeNamespaceResolution::Resolved(member);
                 }
-                ScalaTypeNamespaceResolution::Ambiguous
+                ScalaTypeNamespaceResolution::Ambiguous(_)
                 | ScalaTypeNamespaceResolution::AuthoritativeMiss => {
                     return ScalaTypeNamespaceResolution::AuthoritativeMiss;
                 }
@@ -11061,8 +11560,10 @@ fn scala_exact_owner_namespace_children(
     let mut level = match ctx.direct_ancestors_for_owner(owner) {
         ScalaDirectAncestorResolution::Resolved(ancestors)
         | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
+        // no contenders: the tie is the SUPERTYPE name's, so no declaration of
+        // `name` was ever in hand (#2167).
         ScalaDirectAncestorResolution::Ambiguous => {
-            return ScalaExactMemberResolution::Ambiguous;
+            return ScalaExactMemberResolution::Ambiguous(Vec::new());
         }
     };
     let mut seen = HashSet::from_iter([owner.clone()]);
@@ -11079,8 +11580,9 @@ fn scala_exact_owner_namespace_children(
             match ctx.direct_ancestors_for_owner(&ancestor) {
                 ScalaDirectAncestorResolution::Resolved(ancestors)
                 | ScalaDirectAncestorResolution::Incomplete(ancestors) => next.extend(ancestors),
+                // no contenders: see the direct-ancestor arm above.
                 ScalaDirectAncestorResolution::Ambiguous => {
-                    return ScalaExactMemberResolution::Ambiguous;
+                    return ScalaExactMemberResolution::Ambiguous(Vec::new());
                 }
             }
         }
@@ -11421,7 +11923,7 @@ fn scala_enclosing_member_shadows_bare_call(
             !unit.is_synthetic()
                 && (unit.is_function() || scala_has_term_field_declaration(scala, &unit))
         }),
-        ScalaExactMemberResolution::Ambiguous => true,
+        ScalaExactMemberResolution::Ambiguous(_) => true,
         ScalaExactMemberResolution::NoMatch => false,
     }
 }
@@ -11835,7 +12337,7 @@ fn scala_seed_value_definition(
                 .cloned()
         })
         .flatten();
-    for name in scala_pattern_binder_names(pattern, ctx.source) {
+    for name in scala_definition_binder_names(pattern, ctx.source) {
         if let Some(owner) = exact_stable_owner.clone() {
             seed_scala_binding_with_receiver_declaration(
                 name,

@@ -445,6 +445,9 @@ mod imp {
         findings_total: usize,
         dependency_jars: usize,
         case_limit: Option<usize>,
+        /// The workspace volume the coordinator scales its budget lanes by.
+        analyzed_files: usize,
+        analyzed_source_bytes: u64,
     }
 
     #[derive(Serialize)]
@@ -617,6 +620,8 @@ mod imp {
                 findings_total: result.findings_total,
                 dependency_jars: config.dependency_jars.len(),
                 case_limit: config.case_limit,
+                analyzed_files: result.analyzed_files,
+                analyzed_source_bytes: result.analyzed_source_bytes,
             },
             result: result_summary(result),
             scoring_methodology: vec![
@@ -669,9 +674,18 @@ mod imp {
         println!();
         println!("run-level taint completion per category:");
         for status in &result.category_runs {
+            let termination = status
+                .termination
+                .as_deref()
+                .map(|termination| format!(" [terminated: {termination}]"))
+                .unwrap_or_default();
             println!(
-                "  {:<12} {} (findings={}, retained={})",
-                status.category, status.completion, status.findings, status.retained_analyses
+                "  {:<12} {}{} (findings={}, retained={})",
+                status.category,
+                status.completion,
+                termination,
+                status.findings,
+                status.retained_analyses
             );
             if let Some(sample) = status.sample_diagnostics.first() {
                 println!("      e.g. {sample}");

@@ -13,7 +13,7 @@ pub struct DefinitionContextReferenceQuery {
     pub target: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct DefinitionReferenceSite {
     pub path: String,
     pub target: String,

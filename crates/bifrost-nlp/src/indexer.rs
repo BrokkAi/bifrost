@@ -493,7 +493,12 @@ fn full_build(
     let files: Vec<ProjectFile> = analyzer.analyzed_files().into_iter().collect();
     let rel_paths: Vec<String> = files.iter().map(rel_path_string).collect();
 
-    let path_to_oid = gitcache::working_tree_oids(repo, &rel_paths).map_err(BuildError::Failed)?;
+    // The analyzer scanned this worktree's Git index and dirty set to build the
+    // file list above. Hand that scan to the identity walk instead of taking a
+    // second one.
+    let shared_scan = analyzer.working_tree_identity();
+    let path_to_oid = gitcache::working_tree_oids(repo, &rel_paths, shared_scan.as_deref())
+        .map_err(BuildError::Failed)?;
     materialize_missing(shared, store, embedder, analyzer, &files, &path_to_oid)?;
     eprintln!("bifrost semantic index: {}", metrics::report());
 

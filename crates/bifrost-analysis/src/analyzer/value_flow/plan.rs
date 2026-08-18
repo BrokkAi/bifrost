@@ -301,6 +301,12 @@ fn classify_snapshot_openness(
         ) {
             continue;
         }
+        if crate::analyzer::semantic::workspace_oracle::constructor_call_gap_is_discharged(
+            procedure.semantics(),
+            gap,
+        ) {
+            continue;
+        }
         let call = crate::analyzer::semantic::workspace_oracle::call_target_refinement_call(
             procedure.semantics(),
             gap,
@@ -875,28 +881,11 @@ impl ValueFlowPlan {
             "the retained cause and discovery completeness must agree"
         );
 
-        let mut keyed = carrier_candidates
-            .into_iter()
-            .map(|carrier| Ok((carrier.stable_key()?, carrier)))
-            .collect::<Result<Vec<_>, ValueFlowPlanError>>()?;
-        keyed.sort_by(|left, right| left.0.cmp(&right.0));
-        keyed.dedup_by(|left, right| left.1 == right.1);
-        if keyed.len() > limits.max_carriers {
-            return Err(ValueFlowPlanError::LimitExceeded);
-        }
-        if keyed.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return Err(ValueFlowPlanError::StableCarrierCollision);
-        }
-        let mut carriers = Vec::with_capacity(keyed.len());
-        let mut carrier_keys = Vec::with_capacity(keyed.len());
-        let mut carrier_ids = HashMap::default();
-        for (index, (key, carrier)) in keyed.into_iter().enumerate() {
-            let id = ValueFlowCarrierId::try_from_index(index)
-                .map_err(|_| ValueFlowPlanError::CarrierIdOverflow)?;
-            carrier_ids.insert(carrier.clone(), id);
-            carrier_keys.push(key);
-            carriers.push(carrier);
-        }
+        let CarrierIndex {
+            carriers,
+            carrier_keys,
+            carrier_ids,
+        } = assign_carrier_ids(carrier_candidates, limits.max_carriers)?;
 
         let mut local_rules = Vec::new();
         for input in snapshots {
@@ -1352,29 +1341,17 @@ impl ValueFlowPlan {
             return Err(ValueFlowPlanError::IncompatibleObservationUnion);
         }
 
-        let mut keyed = plans
-            .iter()
-            .flat_map(|plan| plan.carriers.iter().cloned())
-            .map(|carrier| Ok((carrier.stable_key()?, carrier)))
-            .collect::<Result<Vec<_>, ValueFlowPlanError>>()?;
-        keyed.sort_by(|left, right| left.0.cmp(&right.0));
-        keyed.dedup_by(|left, right| left.1 == right.1);
-        if keyed.len() > MAX_VALUE_FLOW_CARRIERS {
-            return Err(ValueFlowPlanError::LimitExceeded);
-        }
-        if keyed.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return Err(ValueFlowPlanError::StableCarrierCollision);
-        }
-        let mut carriers = Vec::with_capacity(keyed.len());
-        let mut carrier_keys = Vec::with_capacity(keyed.len());
-        let mut carrier_ids = HashMap::default();
-        for (index, (key, carrier)) in keyed.into_iter().enumerate() {
-            let id = ValueFlowCarrierId::try_from_index(index)
-                .map_err(|_| ValueFlowPlanError::CarrierIdOverflow)?;
-            carrier_ids.insert(carrier.clone(), id);
-            carrier_keys.push(key);
-            carriers.push(carrier);
-        }
+        let CarrierIndex {
+            carriers,
+            carrier_keys,
+            carrier_ids,
+        } = assign_carrier_ids(
+            plans
+                .iter()
+                .flat_map(|plan| plan.carriers.iter().cloned())
+                .collect(),
+            MAX_VALUE_FLOW_CARRIERS,
+        )?;
         let remap = |id: ValueFlowCarrierId| {
             carrier_ids
                 .get(&first.carriers[id.index()])
@@ -1523,6 +1500,57 @@ impl ValueFlowPlan {
         &self.owner
     }
 
+    /// Whether every row this run reached sits in a procedure this plan has a
+    /// snapshot for, with every call at that point either bound by this plan or
+    /// fully modeled by this result's boundaries.
+    ///
+    /// This quantifier ranges over `result.reached()`, so a result with fewer
+    /// rows satisfies it more easily. That matters because a reuse-backed solve
+    /// really does have fewer: binding a reusable summary for a callee replaces
+    /// the callee's whole body, so nothing that callee calls is entered and the
+    /// subtree contributes no reached row and no coverage row (#2291).
+    ///
+    /// A replay therefore cannot report a completeness the fresh solve refuses,
+    /// but not because of anything in this predicate. Two properties of the
+    /// summary itself carry it, and #2296 constructed the three subtree shapes
+    /// -- an unmodeled dispatch boundary, an unproven relation, a capability
+    /// gap -- that would otherwise break it.
+    ///
+    /// First, a summary exists only because some solve reported itself complete.
+    /// `solve_taint_with_reusable_summaries` in
+    /// `crate::analyzer::taint::summary` returns
+    /// `TaintTransferSummaryCacheStatus::Incomplete` and publishes nothing when
+    /// its own result's `is_complete()` is false, and
+    /// `project_complete_taint_summaries` refuses the projection for the same
+    /// reason. That verdict is this predicate, applied by a solve that did walk
+    /// the subtree. So the subtree's state is recorded in the summary's
+    /// existence, not in the rows the replay drops.
+    ///
+    /// Second, the summary is looked up under a key that pins the analysis
+    /// inputs of that subtree. The taint summary key carries a dependency
+    /// contract: the transitive closure of the summarized procedure's declared
+    /// dependencies, each with the value-flow carrier identity this plan would
+    /// give it (`Self::carrier_summary_identities`), which includes the curated
+    /// call models, external summary fingerprints, snapshot presence, local and
+    /// call rules, and unmodeled call behavior that decide whether a construct
+    /// in that subtree is discharged. A summary published under a plan that
+    /// models the subtree cannot be bound by a plan that does not.
+    ///
+    /// Both rest on the dependency closure naming what the body calls. When it
+    /// does not, the solver refuses the summary rather than trusting it: see
+    /// `SummaryCalledProcedures` in `crate::analyzer::dataflow`. The tests that
+    /// pin all of this are in `tests/suite_semantic/taint_client.rs`, named for
+    /// the three subtree shapes.
+    ///
+    /// One coverage-derived projection does diverge, deliberately and
+    /// documented: `Self::public_semantic_status` merges retained semantic
+    /// boundary statuses without applying the models that discharge them, so a
+    /// replay that retained no boundary reports `Complete` where the fresh
+    /// solve reports the subtree's raw status. No reuse-backed consumer reads
+    /// it today -- the CodeQuery value-flow search paths that do solve through
+    /// the non-reusable entry point -- and
+    /// `a_modeled_subtree_construct_reuses_a_non_leaf_callee_without_claiming_more_completeness`
+    /// fails if that changes.
     fn execution_discovery_modeled<Fact>(
         &self,
         result: &SummaryDataflowResult<Fact>,
@@ -1572,6 +1600,16 @@ impl ValueFlowPlan {
         self.execution_result_modeled(result, SummaryProofRequirement::AcceptAuthoredComplete)
     }
 
+    /// Whether this run terminated precisely and every open edge and boundary
+    /// it retained is discharged.
+    ///
+    /// Like `Self::execution_discovery_modeled`, every quantifier here ranges
+    /// over rows a reuse-backed solve can be missing: `result.coverage()` is
+    /// accumulated as the solver walks edges and materializes call transfers,
+    /// so a skipped subtree contributes no unproven edge, no partial edge, and
+    /// no boundary. See that function's comment for why a replay still cannot
+    /// claim a completeness the fresh solve refuses (#2296), and for the one
+    /// coverage-derived projection that does diverge.
     fn execution_result_modeled<Fact>(
         &self,
         result: &SummaryDataflowResult<Fact>,
@@ -1646,6 +1684,14 @@ impl ValueFlowPlan {
         requirement: SummaryProofRequirement,
     ) -> bool {
         let mut saw_dispatch = false;
+        let allocation_call =
+            crate::analyzer::semantic::workspace_oracle::allocation_call_is_dischargeable(
+                call.procedure().semantics(),
+                call.procedure()
+                    .semantics()
+                    .call_site(call.id())
+                    .expect("call boundary origin must remain live"),
+            );
         for boundary in result
             .coverage()
             .boundaries()
@@ -1655,7 +1701,9 @@ impl ValueFlowPlan {
             match boundary.kind() {
                 SummaryBoundaryKind::Dispatch(_) => {
                     saw_dispatch = true;
-                    if !self.dispatch_boundary_is_fully_modeled(boundary, requirement) {
+                    if !allocation_call
+                        && !self.dispatch_boundary_is_fully_modeled(boundary, requirement)
+                    {
                         return false;
                     }
                 }
@@ -1665,7 +1713,7 @@ impl ValueFlowPlan {
                 }
             }
         }
-        saw_dispatch
+        saw_dispatch || allocation_call
     }
 
     fn boundary_is_fully_modeled<Fact>(
@@ -1681,6 +1729,17 @@ impl ValueFlowPlan {
             return boundary.origin().is_some_and(|call| {
                 self.call_boundaries_are_fully_modeled(result, call, requirement)
             });
+        }
+        if boundary.origin().is_some_and(|call| {
+            crate::analyzer::semantic::workspace_oracle::allocation_call_is_dischargeable(
+                call.procedure().semantics(),
+                call.procedure()
+                    .semantics()
+                    .call_site(call.id())
+                    .expect("call boundary origin must remain live"),
+            )
+        }) {
+            return true;
         }
         self.dispatch_boundary_is_fully_modeled(boundary, requirement)
     }
@@ -1702,6 +1761,18 @@ impl ValueFlowPlan {
         &self,
         result: &SummaryDataflowResult<Fact>,
     ) -> SemanticInputStatus {
+        // A solve that replayed a cross-query reusable summary retained none of
+        // the skipped subtree's coverage boundaries, so folding the boundaries
+        // that are present would answer `Complete` for material this result
+        // never looked at (#2296). The envelope for that subtree is not in the
+        // result at all, which is exactly what `Unknown` states; a consumer
+        // that needs the raw statuses must solve through the non-reusable
+        // entry point, as the CodeQuery value-flow search paths do.
+        let seed = if result.metrics().reusable_summary_hits > 0 {
+            SemanticInputStatus::Unknown
+        } else {
+            SemanticInputStatus::Complete
+        };
         result
             .coverage()
             .boundaries()
@@ -1713,9 +1784,7 @@ impl ValueFlowPlan {
                 | SummaryBoundaryKind::Limit(_)
                 | SummaryBoundaryKind::Continuation { .. } => None,
             })
-            .fold(SemanticInputStatus::Complete, |current, incoming| {
-                current.merge(incoming)
-            })
+            .fold(seed, |current, incoming| current.merge(incoming))
     }
 
     pub(crate) fn exceptional_exit_boundary_is_abort_only(
@@ -1812,6 +1881,27 @@ impl ValueFlowPlan {
         self.binding_pairs
             .iter()
             .any(|(candidate, _)| candidate == call)
+    }
+
+    /// Every analyzed procedure this plan binds a call of `procedure` to
+    /// (#2296).
+    ///
+    /// A bound call is the only kind that `execution_discovery_modeled` above
+    /// accepts without a fully modeled dispatch boundary, so it is also the
+    /// only kind whose callee can contribute reached rows to a complete run
+    /// without appearing in this plan's own boundary coverage. A reusable
+    /// summary provider uses this to check that its summary's validity
+    /// contract names those callees, because they are exactly the procedures a
+    /// replay skips whose analysis inputs the contract would otherwise not
+    /// pin.
+    pub(crate) fn bound_callees_of<'plan>(
+        &'plan self,
+        procedure: &'plan ProcedureHandle,
+    ) -> impl Iterator<Item = &'plan ProcedureHandle> {
+        self.binding_pairs
+            .iter()
+            .filter(move |(call, _)| call.procedure() == procedure)
+            .map(|(_, callee)| callee)
     }
 
     pub(crate) fn carrier_summary_identities(
@@ -2262,11 +2352,19 @@ impl ValueFlowPlan {
     pub(crate) fn local_rule_views(
         &self,
         point: &ProgramPointHandle,
-    ) -> impl Iterator<Item = (ValueFlowCarrierId, ValueFlowCarrierId, bool)> {
+    ) -> impl Iterator<
+        Item = (
+            ValueFlowCarrierId,
+            ValueFlowCarrierId,
+            ValueFlowRelationKind,
+            bool,
+        ),
+    > {
         self.local_rules_at(point).map(|rule| {
             (
                 rule.source,
                 rule.target,
+                rule.kind,
                 matches!(rule.proof, ProofStatus::Proven)
                     && matches!(rule.completeness, EvidenceCompleteness::Complete),
             )
@@ -2470,6 +2568,76 @@ fn validate_event(
         return Err(ValueFlowPlanError::InvalidEventCarrier);
     }
     Ok(())
+}
+
+/// One dense carrier per stable key, plus the reverse map from every handle
+/// that named it.
+struct CarrierIndex {
+    carriers: Vec<ValueFlowCarrier>,
+    carrier_keys: Vec<ValueFlowCarrierKey>,
+    carrier_ids: HashMap<ValueFlowCarrier, ValueFlowCarrierId>,
+}
+
+/// Give every named carrier one dense ID, keyed by its stable identity.
+///
+/// The stable key is the plan's carrier identity: `carrier_keys` is the sorted
+/// domain `carrier_id_for_key` searches, and it is what
+/// `propagation_semantics_hash` hashes. Handle equality is finer than that,
+/// because a `ProcedureHandle` compares its owning `Arc<SemanticArtifact>` by
+/// pointer. A caller that walks an interprocedural closure can therefore
+/// present one procedure twice: the byte-bounded artifact cache may evict an
+/// artifact that a later call resolution re-materializes, and both handles then
+/// reach the plan. Those candidates name one entity, so they share one dense
+/// ID, and `carrier_ids` retains every handle that named it so a client holding
+/// either materialization still resolves it.
+///
+/// Two candidates that share a key but do not name one entity are a real
+/// identity failure: `stable_key` lost a distinction the plan cannot recover,
+/// and merging them would silently join two entities' flows. The plan refuses
+/// that input instead.
+fn assign_carrier_ids(
+    candidates: Vec<ValueFlowCarrier>,
+    max_carriers: usize,
+) -> Result<CarrierIndex, ValueFlowPlanError> {
+    let mut keyed = candidates
+        .into_iter()
+        .map(|carrier| Ok((carrier.stable_key()?, carrier)))
+        .collect::<Result<Vec<_>, ValueFlowPlanError>>()?;
+    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut groups = Vec::new();
+    let mut start = 0usize;
+    while start < keyed.len() {
+        let end = start + keyed[start..].partition_point(|entry| entry.0 == keyed[start].0);
+        groups.push((start, end));
+        start = end;
+    }
+    if groups.len() > max_carriers {
+        return Err(ValueFlowPlanError::LimitExceeded);
+    }
+
+    let mut index = CarrierIndex {
+        carriers: Vec::with_capacity(groups.len()),
+        carrier_keys: Vec::with_capacity(groups.len()),
+        carrier_ids: HashMap::default(),
+    };
+    for (ordinal, (start, end)) in groups.into_iter().enumerate() {
+        let (key, representative) = &keyed[start];
+        if keyed[start + 1..end]
+            .iter()
+            .any(|(_, carrier)| !carrier.denotes_same_entity(representative))
+        {
+            return Err(ValueFlowPlanError::StableCarrierCollision);
+        }
+        let id = ValueFlowCarrierId::try_from_index(ordinal)
+            .map_err(|_| ValueFlowPlanError::CarrierIdOverflow)?;
+        for (_, carrier) in &keyed[start..end] {
+            index.carrier_ids.insert(carrier.clone(), id);
+        }
+        index.carrier_keys.push(key.clone());
+        index.carriers.push(representative.clone());
+    }
+    Ok(index)
 }
 
 fn lookup_carrier(

@@ -118,6 +118,35 @@ impl GoWorkspacePathIndex {
                 .representative_by_directory
                 .contains_key(Path::new(prefix)))
     }
+
+    /// Canonical package identity using the module roots already indexed for
+    /// this workspace. Unlike [`canonical_go_package_name`], this performs no
+    /// ancestor filesystem walk and no repeated `go.mod` reads.
+    pub fn canonical_package_name(&self, file: &ProjectFile, declared_package: &str) -> String {
+        let (declared_base, is_external_test) = declared_package
+            .strip_suffix("_test")
+            .filter(|stripped| !stripped.is_empty())
+            .map_or((declared_package, false), |stripped| (stripped, true));
+        let file_dir = file.parent();
+        let base = self
+            .module_roots
+            .iter()
+            .filter(|module| file_dir.starts_with(&module.workspace_dir))
+            .max_by_key(|module| module.workspace_dir.components().count())
+            .and_then(|module| {
+                let relative = file_dir.strip_prefix(&module.workspace_dir).ok()?;
+                Some(join_import_path(
+                    &module.import_path,
+                    &relative.to_string_lossy().replace('\\', "/"),
+                ))
+            })
+            .unwrap_or_else(|| no_module_base(file, declared_base));
+        if is_external_test {
+            format!("{base}_test")
+        } else {
+            base
+        }
+    }
 }
 
 fn is_go_test_file(file: &ProjectFile) -> bool {
@@ -264,18 +293,192 @@ fn join_import_path(module_path: &str, rel_dir: &str) -> String {
 }
 
 /// Read the `module` path from the `go.mod` in `dir`, if present.
+///
+/// Invariant: the returned path (like [`go_module_path_from_source`]'s) is a
+/// single clean token -- no embedded whitespace, no `//` comment text, no
+/// surrounding quotes. Callers may join it with `/`-separated path segments
+/// without re-normalizing.
 pub fn read_go_module_path(dir: &Path) -> Option<String> {
     let contents = std::fs::read_to_string(dir.join("go.mod")).ok()?;
     go_module_path_from_source(&contents)
 }
 
+/// Extract the `module` directive's path from `go.mod` source.
+///
+/// This follows the go.mod lexical grammar
+/// (<https://go.dev/ref/mod#go-mod-file-lexical>), which this function
+/// implements directly as a small tokenizer rather than pulling in a grammar
+/// dependency for a config format this simple:
+///
+/// - Whitespace (spaces, tabs, carriage returns) separates tokens; it is
+///   never part of a token, so `module` can be followed by a tab as well as
+///   a space.
+/// - `//` starts a line comment that runs to the end of the line. A comment
+///   is not part of the preceding token even when it abuts it with no
+///   intervening space.
+/// - A token is either an unquoted run of non-whitespace, non-comment
+///   characters, or a double-quoted (`"..."`) or backquoted (`` `...` ``)
+///   string, whose contents (including any `/` or whitespace inside the
+///   quotes) are taken verbatim.
+///
+/// The module path is the single token following the `module` keyword. This
+/// only recognizes the single-line `module path` form: `go.mod` permits at
+/// most one `module` directive per file, so the parenthesized block form
+/// that other directives (`require`, `replace`, ...) use does not apply here.
 fn go_module_path_from_source(contents: &str) -> Option<String> {
     contents.lines().find_map(|line| {
-        let trimmed = line.trim();
-        trimmed
-            .strip_prefix("module ")
-            .map(str::trim)
-            .filter(|module| !module.is_empty())
-            .map(str::to_string)
+        let after_keyword = strip_module_keyword(line.trim_start())?;
+        let module_path = next_go_mod_token(after_keyword)?;
+        // Documents and enforces the invariant on `read_go_module_path`: a
+        // well-formed module path can never contain whitespace or a `//`
+        // once the tokenizer above has stripped comments and quoting. If
+        // this ever fires, the tokenizer has a bug -- fail at the
+        // construction point (per #1189's model) instead of handing a
+        // corrupted path to `join_import_path` and `go_package_fq`, whose
+        // divergent `/`-joining is exactly what produced this issue.
+        debug_assert!(
+            !module_path.contains(char::is_whitespace) && !module_path.contains("//"),
+            "go.mod module path token must be a single clean path, got {module_path:?}"
+        );
+        Some(module_path)
     })
+}
+
+/// Strips the leading `module` keyword and the whitespace that must
+/// separate it from its argument. Rejects lines like `modules foo` where
+/// `module` is only a prefix of a longer identifier.
+fn strip_module_keyword(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("module")?;
+    let mut chars = rest.chars();
+    if !chars.next()?.is_whitespace() {
+        return None;
+    }
+    Some(rest.trim_start())
+}
+
+/// Reads one go.mod token from the start of `text` (already past the
+/// `module` keyword and its separating whitespace). Returns `None` when
+/// there is no token: `text` is empty, or it opens with a `//` comment.
+fn next_go_mod_token(text: &str) -> Option<String> {
+    if text.is_empty() || text.starts_with("//") {
+        return None;
+    }
+    if let Some(rest) = text.strip_prefix('"') {
+        let end = rest.find('"')?;
+        return Some(rest[..end].to_string());
+    }
+    if let Some(rest) = text.strip_prefix('`') {
+        let end = rest.find('`')?;
+        return Some(rest[..end].to_string());
+    }
+    // Unquoted token: ends at the first whitespace character or at the
+    // start of a `//` comment, whichever comes first -- a comment can abut
+    // the token with no separating space, as in the go2hx fixture this
+    // handles (`module github.com/go2hx/go4hx //not a real repo...`, where
+    // the space before `//` already ends the token; this branch also covers
+    // the case with no such space).
+    let end = text
+        .char_indices()
+        .find(|&(i, ch)| ch.is_whitespace() || text[i..].starts_with("//"))
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let token = &text[..end];
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::go_module_path_from_source;
+
+    #[test]
+    fn plain_module_path() {
+        assert_eq!(
+            Some("example.com/repo".to_string()),
+            go_module_path_from_source("module example.com/repo\n")
+        );
+    }
+
+    #[test]
+    fn trailing_line_comment_is_excluded() {
+        assert_eq!(
+            Some("example.com/repo".to_string()),
+            go_module_path_from_source("module example.com/repo // comment\n")
+        );
+    }
+
+    #[test]
+    fn comment_with_slashes_in_its_text_is_excluded() {
+        // The go2hx/go4hx go.mod line verbatim: the comment's own text
+        // contains `/` characters, which must not be mistaken for part of
+        // the module path.
+        assert_eq!(
+            Some("github.com/go2hx/go4hx".to_string()),
+            go_module_path_from_source(
+                "module github.com/go2hx/go4hx //not a real repo, used to set the name to go4hx\n"
+            )
+        );
+    }
+
+    #[test]
+    fn comment_directly_abutting_the_path_with_no_space_is_excluded() {
+        assert_eq!(
+            Some("example.com/repo".to_string()),
+            go_module_path_from_source("module example.com/repo//comment\n")
+        );
+    }
+
+    #[test]
+    fn quoted_module_path() {
+        assert_eq!(
+            Some("example.com/repo".to_string()),
+            go_module_path_from_source("module \"example.com/repo\"\n")
+        );
+    }
+
+    #[test]
+    fn quoted_module_path_with_trailing_comment() {
+        assert_eq!(
+            Some("example.com/repo".to_string()),
+            go_module_path_from_source("module \"example.com/repo\" // comment\n")
+        );
+    }
+
+    #[test]
+    fn tab_after_module_keyword() {
+        assert_eq!(
+            Some("example.com/repo".to_string()),
+            go_module_path_from_source("module\texample.com/repo\n")
+        );
+    }
+
+    #[test]
+    fn module_line_that_is_only_a_comment_has_no_path() {
+        assert_eq!(
+            None,
+            go_module_path_from_source("module // just a comment, no path\n")
+        );
+    }
+
+    #[test]
+    fn empty_go_mod_has_no_path() {
+        assert_eq!(None, go_module_path_from_source(""));
+    }
+
+    #[test]
+    fn identifier_that_merely_starts_with_module_is_not_the_keyword() {
+        assert_eq!(
+            None,
+            go_module_path_from_source("modules example.com/repo\n")
+        );
+    }
+
+    #[test]
+    fn module_path_is_found_among_other_directives() {
+        assert_eq!(
+            Some("example.com/repo".to_string()),
+            go_module_path_from_source(
+                "go 1.22\n\nmodule example.com/repo\n\nrequire foo v1.0.0\n"
+            )
+        );
+    }
 }

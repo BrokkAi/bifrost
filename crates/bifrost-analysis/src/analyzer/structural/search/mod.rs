@@ -381,6 +381,63 @@ struct SeedMatch {
 struct DeclarationValue {
     unit: CodeUnit,
     range: Range,
+    // `CodeUnitType` deliberately coarsens every callable to `Function`.
+    // An exact structural projection retains the normalized leaf kind so the
+    // public declaration does not erase method/constructor distinctions
+    // already proved by the seed facts.
+    structural_kind: Option<NormalizedKind>,
+}
+
+impl DeclarationValue {
+    fn new(unit: CodeUnit, range: Range) -> Self {
+        Self {
+            unit,
+            range,
+            structural_kind: None,
+        }
+    }
+
+    fn with_structural_kind(mut self, kind: NormalizedKind) -> Self {
+        debug_assert!(kind.satisfies(NormalizedKind::Declaration));
+        self.structural_kind = Some(kind);
+        self
+    }
+
+    /// The label the rendered declaration's visible `kind` field carries: the
+    /// exact structural leaf kind when an exact projection proved one, and the
+    /// analyzer's coarser unit kind otherwise.
+    fn kind_label(&self) -> &'static str {
+        self.structural_kind
+            .map(NormalizedKind::label)
+            .unwrap_or_else(|| self.unit.kind().display_lowercase())
+    }
+
+    /// The label a *stable declaration id* carries.
+    ///
+    /// One declaration has to have one identity on every route that reaches
+    /// it, because cross-domain joins are stated over that identity: #1478
+    /// Milestone 3 documents an applicability row's `candidate_id` as joining
+    /// to the `callable_signature` row's `declaration_id` of the very callable
+    /// it judged, and one side of that join arrives from a resolver trace while
+    /// the other arrives from a declaration seed.
+    ///
+    /// [`Self::kind_label`] cannot serve that purpose. It refines only where a
+    /// seed's own span matched the declaration exactly, so it answers `method`
+    /// for a declaration a `(method ...)` seed reached and `function` for the
+    /// same declaration reached from a trace candidate or an enclosing-decl
+    /// projection, and a join over the two matches nothing.
+    ///
+    /// This derivation reads the declaration instead of the route that found
+    /// it: `CodeUnitType` coarsens every callable to `Function`, and the
+    /// declaration's own owner segment recovers the member leaf that coarsening
+    /// erased, so every route agrees on one label for one declaration.
+    fn identity_kind_label(&self) -> &'static str {
+        if self.unit.is_callable() && self.unit.owner_is_type_scope() {
+            NormalizedKind::Method.label()
+        } else {
+            self.unit.kind().display_lowercase()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -474,10 +531,7 @@ impl IndexedDeclarations {
                     .ranges_of(unit)
                     .into_iter()
                     .min_by_key(primary_range_key)
-                    .map(|range| DeclarationValue {
-                        unit: unit.clone(),
-                        range,
-                    })
+                    .map(|range| DeclarationValue::new(unit.clone(), range))
             })?
         };
         self.by_unit.insert(unit.clone(), value.clone());
@@ -2809,7 +2863,7 @@ fn detailed_evidence_for_pipeline_value(
         PipelineValue::Declaration(declaration) => {
             let file = declaration.unit.source().clone();
             let path = rel_path_string(&file);
-            let kind = declaration.unit.kind().display_lowercase();
+            let kind = declaration.kind_label();
             let fq_name = declaration.unit.fq_name();
             let byte_span = range_byte_span(declaration.range);
             DetailedCodeQueryEvidence {
@@ -2818,7 +2872,12 @@ fn detailed_evidence_for_pipeline_value(
                 key: DetailedCodeQueryKey::Declaration {
                     kind: kind.to_string(),
                     fq_name: fq_name.clone(),
-                    analyzer_id: Some(declaration_id(&path, kind, &fq_name, declaration.range)),
+                    analyzer_id: Some(declaration_id(
+                        &path,
+                        declaration.identity_kind_label(),
+                        &fq_name,
+                        declaration.range,
+                    )),
                 },
                 file: file.clone(),
                 source_slice_sha256: retained_source
@@ -2857,7 +2916,6 @@ fn detailed_evidence_for_pipeline_value(
         },
         PipelineValue::ReferenceSite(site) => {
             let target_path = rel_path_string(site.target.unit.source());
-            let target_kind = site.target.unit.kind().display_lowercase();
             let target_fq_name = site.target.unit.fq_name();
             let byte_span = range_byte_span(site.range);
             DetailedCodeQueryEvidence {
@@ -2866,7 +2924,7 @@ fn detailed_evidence_for_pipeline_value(
                 key: DetailedCodeQueryKey::ReferenceSite {
                     target_id: Some(declaration_id(
                         &target_path,
-                        target_kind,
+                        site.target.identity_kind_label(),
                         &target_fq_name,
                         site.target.range,
                     )),
@@ -4387,7 +4445,7 @@ fn detailed_declaration_provenance_ref(
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     let file = declaration.unit.source().clone();
     let path = rel_path_string(&file);
-    let kind = declaration.unit.kind().display_lowercase();
+    let kind = declaration.kind_label();
     let fq_name = declaration.unit.fq_name();
     let byte_span = range_byte_span(declaration.range);
     DetailedCodeQueryProvenanceRefEvidence {
@@ -4395,7 +4453,12 @@ fn detailed_declaration_provenance_ref(
         key: DetailedCodeQueryKey::Declaration {
             kind: kind.to_string(),
             fq_name: fq_name.clone(),
-            analyzer_id: Some(declaration_id(&path, kind, &fq_name, declaration.range)),
+            analyzer_id: Some(declaration_id(
+                &path,
+                declaration.identity_kind_label(),
+                &fq_name,
+                declaration.range,
+            )),
         },
         file: file.clone(),
         source_slice_sha256: cached_source_slice_sha256(cache, &file, &byte_span),
@@ -4412,7 +4475,6 @@ fn detailed_reference_provenance_ref(
     cache: &PipelineRenderCache,
 ) -> DetailedCodeQueryProvenanceRefEvidence {
     let target_path = rel_path_string(site.target.unit.source());
-    let target_kind = site.target.unit.kind().display_lowercase();
     let target_fq_name = site.target.unit.fq_name();
     let byte_span = range_byte_span(site.range);
     DetailedCodeQueryProvenanceRefEvidence {
@@ -4420,7 +4482,7 @@ fn detailed_reference_provenance_ref(
         key: DetailedCodeQueryKey::ReferenceSite {
             target_id: Some(declaration_id(
                 &target_path,
-                target_kind,
+                site.target.identity_kind_label(),
                 &target_fq_name,
                 site.target.range,
             )),

@@ -131,6 +131,22 @@ pub fn cpp_filter_candidates_by_args(
     resolve_type: &dyn Fn(&str) -> Option<CodeUnit>,
     assignable: &dyn Fn(&CodeUnit, &CodeUnit) -> bool,
 ) -> Vec<CodeUnit> {
+    cpp_filter_candidates_by_args_with_parameter_types(
+        candidates,
+        arg_types,
+        &|candidate| cpp_signature_param_types(candidate.signature().unwrap_or_default()),
+        resolve_type,
+        assignable,
+    )
+}
+
+pub fn cpp_filter_candidates_by_args_with_parameter_types(
+    candidates: Vec<CodeUnit>,
+    arg_types: &[Option<CppArgType>],
+    parameter_types: &dyn Fn(&CodeUnit) -> Option<Vec<String>>,
+    resolve_type: &dyn Fn(&str) -> Option<CodeUnit>,
+    assignable: &dyn Fn(&CodeUnit, &CodeUnit) -> bool,
+) -> Vec<CodeUnit> {
     if candidates.len() <= 1 || arg_types.iter().any(Option::is_none) {
         return candidates;
     }
@@ -138,27 +154,45 @@ pub fn cpp_filter_candidates_by_args(
     let filtered: Vec<_> = candidates
         .iter()
         .filter(|candidate| {
-            cpp_signature_param_types(candidate.signature().unwrap_or_default()).is_some_and(
-                |params| {
-                    params.len() == arg_types.len()
-                        && params.iter().zip(arg_types.iter()).all(|(param, arg)| {
-                            cpp_param_matches_arg(param, arg, resolve_type, assignable)
-                        })
-                },
-            )
+            let template_candidate = cpp_signature_is_template_candidate(candidate);
+            parameter_types(candidate).is_some_and(|params| {
+                params.len() == arg_types.len()
+                    && params.iter().zip(arg_types.iter()).all(|(param, arg)| {
+                        cpp_param_matches_arg(
+                            param,
+                            arg,
+                            template_candidate,
+                            resolve_type,
+                            assignable,
+                        )
+                    })
+            })
         })
         .cloned()
         .collect();
     if filtered.is_empty() {
+        candidates
+    } else if filtered.iter().any(cpp_signature_is_template_candidate) {
+        // A matching function template keeps the entire arity-compatible
+        // overload set alive. The parameter metadata has no template
+        // substitution or constraint ordering, so it cannot prove that a
+        // concrete sibling wins over a macro-constrained template (#2203).
         candidates
     } else {
         filtered
     }
 }
 
+fn cpp_signature_is_template_candidate(candidate: &CodeUnit) -> bool {
+    candidate
+        .signature()
+        .is_some_and(|signature| signature.trim_start().starts_with('<'))
+}
+
 fn cpp_param_matches_arg(
     param: &str,
     arg: &Option<CppArgType>,
+    template_candidate: bool,
     resolve_type: &dyn Fn(&str) -> Option<CodeUnit>,
     assignable: &dyn Fn(&CodeUnit, &CodeUnit) -> bool,
 ) -> bool {
@@ -170,6 +204,14 @@ fn cpp_param_matches_arg(
     }
     if arg.pointee_const && !cpp_type_text_pointee_is_const(param) {
         return false;
+    }
+    // Parameter metadata records the declared spelling, but it does not carry
+    // template substitution or constraint semantics. Once pointer shape and
+    // constness agree, a function template remains a live overload candidate:
+    // a type-only comparison such as `Vec256<T>` versus `Vec256<int>` cannot
+    // prove that deduction or a macro-shaped constraint fails (#2203).
+    if template_candidate {
+        return true;
     }
     let param_name = normalize_cpp_type_name(param);
     match (resolve_type(&param_name), arg.unit.as_ref()) {
@@ -480,5 +522,25 @@ mod tests {
             &|_, _| false,
         );
         assert_eq!(candidates, filtered);
+    }
+
+    #[test]
+    fn cpp_filter_candidates_keeps_templates_when_only_type_shape_is_unknown() {
+        let candidates = vec![
+            function("take", "void take(Vec256<float> value)"),
+            function("take", "<typename T>(Vec256<T>)"),
+        ];
+        let filtered = cpp_filter_candidates_by_args(
+            candidates.clone(),
+            &[Some(CppArgType {
+                name: "Vec256<int>".to_string(),
+                unit: Some(class("Vec256")),
+                indirection: 0,
+                pointee_const: false,
+            })],
+            &|_| None,
+            &|_, _| false,
+        );
+        assert_eq!(filtered, candidates);
     }
 }

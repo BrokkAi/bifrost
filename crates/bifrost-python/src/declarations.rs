@@ -95,32 +95,93 @@ fn python_package_components_for_file(file: &ProjectFile) -> Vec<String> {
 fn python_configured_import_root(file: &ProjectFile, parent_rel: &Path) -> Option<PathBuf> {
     let mut manifest_dir_rel = Some(parent_rel);
     while let Some(directory) = manifest_dir_rel {
-        let manifest = file.root().join(directory).join("pyproject.toml");
-        if let Ok(source) = std::fs::read_to_string(manifest)
-            && let Ok(document) = source.parse::<toml::Value>()
-            && let Some(where_entries) = document
-                .get("tool")
-                .and_then(|tool| tool.get("setuptools"))
-                .and_then(|setuptools| setuptools.get("packages"))
-                .and_then(|packages| packages.get("find"))
-                .and_then(|find| find.get("where"))
-                .and_then(toml::Value::as_array)
-        {
-            let mut roots = where_entries
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .map(|entry| file.root().join(directory).join(entry).normalize())
-                .filter_map(|root| root.strip_prefix(file.root()).ok().map(Path::to_path_buf))
-                .filter(|root| parent_rel.starts_with(root))
-                .collect::<Vec<_>>();
-            roots.sort_by_key(|root| root.components().count());
-            if let Some(root) = roots.pop() {
-                return Some(root);
-            }
+        let manifest_dir = file.root().join(directory);
+        let mut roots = setuptools_where_entries(&manifest_dir.join("pyproject.toml"))
+            .iter()
+            .map(|entry| manifest_dir.join(entry).normalize())
+            .filter_map(|root| root.strip_prefix(file.root()).ok().map(Path::to_path_buf))
+            .filter(|root| parent_rel.starts_with(root))
+            .collect::<Vec<_>>();
+        roots.sort_by_key(|root| root.components().count());
+        if let Some(root) = roots.pop() {
+            return Some(root);
         }
         manifest_dir_rel = directory.parent();
     }
     None
+}
+
+/// One manifest's memoized `tool.setuptools.packages.find.where` entries.
+///
+/// The stamp is what the memo is validated against, so a manifest edited in a
+/// long-running server is re-read instead of being answered from a stale parse.
+struct ManifestWhereEntries {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    entries: Vec<String>,
+}
+
+/// Read the setuptools package-discovery roots declared by one `pyproject.toml`.
+///
+/// Module identity is resolved once per declaration, not once per file, so this
+/// sits on a hot path: a full read plus TOML parse per call made every Python
+/// identity question proportional to the size of the nearest manifest. The
+/// parse is therefore memoized per manifest and revalidated with one `stat`,
+/// which keeps an edited manifest honored while the steady-state cost is a
+/// metadata probe. An absent, unreadable, malformed, or non-setuptools manifest
+/// declares no roots and leaves the `__init__.py` package-root convention in
+/// charge.
+fn setuptools_where_entries(manifest: &Path) -> Vec<String> {
+    static MEMO: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<PathBuf, ManifestWhereEntries>>,
+    > = std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+
+    let Ok(metadata) = std::fs::metadata(manifest) else {
+        return Vec::new();
+    };
+    let (len, modified) = (metadata.len(), metadata.modified().ok());
+    if let Some(cached) = memo.read().expect("manifest memo").get(manifest)
+        && cached.len == len
+        && cached.modified == modified
+    {
+        return cached.entries.clone();
+    }
+
+    let entries = parse_setuptools_where_entries(manifest);
+    memo.write().expect("manifest memo").insert(
+        manifest.to_path_buf(),
+        ManifestWhereEntries {
+            len,
+            modified,
+            entries: entries.clone(),
+        },
+    );
+    entries
+}
+
+fn parse_setuptools_where_entries(manifest: &Path) -> Vec<String> {
+    let Ok(source) = std::fs::read_to_string(manifest) else {
+        return Vec::new();
+    };
+    let Ok(document) = source.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    document
+        .get("tool")
+        .and_then(|tool| tool.get("setuptools"))
+        .and_then(|setuptools| setuptools.get("packages"))
+        .and_then(|packages| packages.get("find"))
+        .and_then(|find| find.get("where"))
+        .and_then(toml::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn path_components(path: &Path) -> Vec<String> {

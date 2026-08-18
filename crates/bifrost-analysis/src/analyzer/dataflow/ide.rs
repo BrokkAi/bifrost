@@ -17,8 +17,9 @@ use super::{
     IdeDataflowError, IdeEdgeFunctionId, IdeEntryTransfer, IdeMetrics, IdePointValue,
     IdeSummaryDataflowResult, IdeValueId, PathQuality, PathQualityFrontier, ReusableEndSummary,
     ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryProvider, SolverTermination,
-    SolverWork, SummaryDataflowError, SummaryDataflowResult, SummaryEntry, SummarySolveInput,
-    WitnessRetentionLimits, solve_with_reusable_end_summaries,
+    SolverWork, SummaryCallCycle, SummaryCalledProcedures, SummaryDataflowError,
+    SummaryDataflowResult, SummaryEntry, SummarySolveInput, WitnessRetentionLimits,
+    solve_with_reusable_end_summaries,
 };
 
 /// One fact transition coupled to its client-supplied edge function.
@@ -97,6 +98,17 @@ pub struct ReusableIdeReachedFact<Fact, EdgeFunction> {
 pub struct ReusableIdeProcedureSummary<Fact, EdgeFunction> {
     pub exits: Box<[ReusableIdeEndSummary<Fact, EdgeFunction>]>,
     pub reached: Box<[ReusableIdeReachedFact<Fact, EdgeFunction>]>,
+    /// How the summarized procedure's call cycle relates to the solve root.
+    /// See [`SummaryCallCycle`]: the fact solver refuses a summary that shares
+    /// a call cycle with the root, so the callee body is solved instead
+    /// (#2285).
+    pub call_cycle: SummaryCallCycle,
+    /// Whether the summary's validity contract covers every analyzed procedure
+    /// the summarized body calls. See [`SummaryCalledProcedures`]: the fact
+    /// solver refuses a summary that cannot state this, so the callee body is
+    /// solved instead and the run's completeness verdict stays the fresh one
+    /// (#2296).
+    pub called_procedures: SummaryCalledProcedures,
 }
 
 /// Optional context-independent cross-query IDE summary oracle.
@@ -105,10 +117,18 @@ pub struct ReusableIdeProcedureSummary<Fact, EdgeFunction> {
 /// procedure and entry fact supplied here. As with the fact-only provider,
 /// query-local tabulation deduplicates that identity and cannot accept a
 /// call-site-sensitive answer.
+///
+/// `root` is the procedure this solve is rooted at. A provider must report
+/// [`SummaryCallCycle::IncludesRoot`] whenever the summarized procedure and
+/// `root` sit in one call cycle, and whenever it cannot tell (#2285), and
+/// [`SummaryCalledProcedures::MayEscapeContract`] whenever the summary's
+/// validity contract does not cover what the summarized body calls, and
+/// whenever it cannot tell (#2296).
 pub trait ReusableIdeSummaryProvider<Fact, EdgeFunction> {
     fn summary_for(
         &mut self,
         procedure: &ProcedureHandle,
+        root: &ProcedureHandle,
         entry_fact: Fact,
         request: &mut DataflowRequest<'_>,
     ) -> Result<Option<ReusableIdeProcedureSummary<Fact, EdgeFunction>>, SolverTermination>;
@@ -120,6 +140,7 @@ impl<Fact, EdgeFunction> ReusableIdeSummaryProvider<Fact, EdgeFunction> for NoRe
     fn summary_for(
         &mut self,
         _procedure: &ProcedureHandle,
+        _root: &ProcedureHandle,
         _entry_fact: Fact,
         _request: &mut DataflowRequest<'_>,
     ) -> Result<Option<ReusableIdeProcedureSummary<Fact, EdgeFunction>>, SolverTermination> {
@@ -1196,12 +1217,30 @@ where
     fn summary_for(
         &mut self,
         procedure: &ProcedureHandle,
+        root: &ProcedureHandle,
         entry_fact: Fact,
         request: &mut DataflowRequest<'_>,
     ) -> Result<Option<ReusableProcedureSummary<Fact>>, SolverTermination> {
-        let Some(mut summary) = self.provider.summary_for(procedure, entry_fact, request)? else {
+        let Some(mut summary) = self
+            .provider
+            .summary_for(procedure, root, entry_fact, request)?
+        else {
             return Ok(None);
         };
+        // #2291. The IDE half of the reusable-row rule: every reusable reached
+        // row must name the callee's own procedure. Binding a summary skips the
+        // callee's body, and with the body the calls that body makes, so a
+        // non-leaf callee's transitive callees are never entered through this
+        // bind and the value phase has no state there to give a value to. The
+        // replayed projection is a subset of a fresh solve's, values agree
+        // wherever both produce a state, and every missing state sits strictly
+        // below the summarized callee.
+        // `deterministic_ide_family_reuse_matches_fresh_and_reference` in
+        // `tests/suite_semantic/dataflow_ide.rs` pins those claims on the
+        // `non_leaf_reuse` family of the #1563 gate. The full contract, and why
+        // no production consumer turns the omission into a user-visible
+        // verdict, is written out at the matching site in
+        // `Tabulator::apply_reusable_callee_summaries` in `summary.rs`.
         if summary.exits.iter().any(|row| row.qualities.is_empty())
             || summary
                 .reached
@@ -1244,6 +1283,8 @@ where
             return Err(termination);
         }
         let fact_summary = ReusableProcedureSummary {
+            call_cycle: summary.call_cycle,
+            called_procedures: summary.called_procedures,
             exits: summary
                 .exits
                 .iter()
@@ -1265,11 +1306,25 @@ where
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         };
-        self.captured.push(CapturedReusableIdeSummary {
-            procedure: procedure.clone(),
-            entry_fact,
-            summary,
-        });
+        // #2285. The fact solver refuses a summary that shares a call cycle
+        // with the solve root and solves the body instead. Retaining the IDE
+        // rows of a refused summary would be worse than useless: the value
+        // phase would graft the summarized jump functions onto states the fresh
+        // solve computed, which is exactly the reuse the fact solver just
+        // declined. Hand the judgment through so one place decides, and retain
+        // nothing when it refuses.
+        // #2296 rides on the same judgment for the same reason: a summary the
+        // fact solver refuses because its contract does not cover what the body
+        // calls must not leave its jump functions behind either.
+        if fact_summary.call_cycle == SummaryCallCycle::ExcludesRoot
+            && fact_summary.called_procedures == SummaryCalledProcedures::CoveredByContract
+        {
+            self.captured.push(CapturedReusableIdeSummary {
+                procedure: procedure.clone(),
+                entry_fact,
+                summary,
+            });
+        }
         Ok(Some(fact_summary))
     }
 }

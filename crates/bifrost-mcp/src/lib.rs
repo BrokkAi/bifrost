@@ -25,6 +25,7 @@ pub mod mcp_registry;
 pub mod mcp_slopcop;
 pub mod mcp_text;
 pub mod ordered_transport;
+mod output_schemas;
 mod project_watcher;
 pub mod rmcp_host;
 pub mod scoped_project;

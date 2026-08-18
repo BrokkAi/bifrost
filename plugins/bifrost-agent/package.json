@@ -1,6 +1,6 @@
 {
   "name": "@brokk/bifrost-agent",
-  "version": "0.10.2",
+  "version": "0.10.3",
   "description": "Bifrost code intelligence tools for Pi",
   "keywords": [
     "pi-package",
@@ -22,8 +22,6 @@
     "bin/bifrost-launcher.mjs",
     "bin/bifrost-launcher.d.mts",
     "bifrost-release.json",
-    ".codex-plugin/plugin.json",
-    ".mcp.json",
     "plugin.json",
     "mcp.json",
     "extensions/**/*.ts",

@@ -406,7 +406,14 @@ pub fn direct_property_definitions<'tree>(
             "assignment_expression" | "augmented_assignment_expression" => node
                 .child_by_field_name("left")
                 .and_then(|left| direct_assignment_receiver(left, source, target_member)),
-            "pair" => direct_object_pair_receiver(node, source, target_member),
+            // `{ key: value }` and `{ key }` mint the same property off the same
+            // object literal; only the node that carries the key differs.
+            "pair" => node
+                .child_by_field_name("key")
+                .and_then(|key| direct_object_property_receiver(node, key, source, target_member)),
+            "shorthand_property_identifier" => {
+                direct_object_property_receiver(node, node, source, target_member)
+            }
             _ => None,
         };
         if let Some((receiver, property)) = receiver
@@ -450,16 +457,20 @@ fn direct_assignment_receiver<'tree>(
     static_member_receiver(receiver, source).map(|receiver| (receiver, property))
 }
 
-fn direct_object_pair_receiver<'tree>(
-    pair: Node<'tree>,
+/// The receiver chain that owns `property` when `property` is the key of
+/// `entry`, an entry of an object literal that is the whole value of a binding.
+/// `entry` is the `pair` for `{ key: value }` and the shorthand identifier
+/// itself for `{ key }`.
+fn direct_object_property_receiver<'tree>(
+    entry: Node<'tree>,
+    property: Node<'tree>,
     source: &str,
     target_member: &str,
 ) -> Option<(JsTsStaticMemberReceiver<'tree>, Node<'tree>)> {
-    let property = pair.child_by_field_name("key")?;
     if slice(property, source) != target_member {
         return None;
     }
-    let object = pair.parent().filter(|parent| parent.kind() == "object")?;
+    let object = entry.parent().filter(|parent| parent.kind() == "object")?;
     let mut value = object;
     while let Some(parent) = value.parent()
         && parent.kind() == "parenthesized_expression"
@@ -733,6 +744,7 @@ pub fn is_declaration_identifier(node: Node<'_>) -> bool {
             | "abstract_method_signature"
             | "public_field_definition"
             | "property_signature"
+            | "index_signature"
             | "field_definition"
             | "import_specifier"
             | "namespace_import"
@@ -773,6 +785,108 @@ pub fn is_declaration_identifier(node: Node<'_>) -> bool {
         return pattern.start_byte() <= node.start_byte() && node.end_byte() <= pattern.end_byte();
     }
     false
+}
+
+/// Whether this identifier is the name of a JSX intrinsic element rather than
+/// a reference to a workspace declaration. JSX assigns lowercase tag names to
+/// the host environment; capitalized identifiers and member expressions keep
+/// ordinary component-reference semantics.
+pub fn is_jsx_intrinsic_element_name(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "identifier" {
+        return false;
+    }
+    let Some(parent) = node.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "jsx_opening_element" | "jsx_closing_element" | "jsx_self_closing_element"
+        )
+    }) else {
+        return false;
+    };
+    parent.child_by_field_name("name") == Some(node)
+        && slice(node, source)
+            .chars()
+            .next()
+            .is_some_and(char::is_lowercase)
+}
+
+/// Language-, runtime-, and common host-provided JS/TS bindings that do not
+/// require a workspace declaration. Keep this shared with semantic diagnostics
+/// so definition lookup and diagnostics make the same boundary decision.
+pub fn is_known_js_ts_global(name: &str) -> bool {
+    matches!(
+        name,
+        "Array"
+            | "ArrayBuffer"
+            | "BigInt"
+            | "Boolean"
+            | "Date"
+            | "Error"
+            | "EvalError"
+            | "Function"
+            | "Infinity"
+            | "Intl"
+            | "JSON"
+            | "Map"
+            | "Math"
+            | "NaN"
+            | "Number"
+            | "Object"
+            | "Promise"
+            | "Proxy"
+            | "RangeError"
+            | "ReferenceError"
+            | "Reflect"
+            | "RegExp"
+            | "Set"
+            | "String"
+            | "Symbol"
+            | "SyntaxError"
+            | "TypeError"
+            | "URIError"
+            | "WeakMap"
+            | "WeakSet"
+            | "console"
+            | "document"
+            | "window"
+            | "global"
+            | "globalThis"
+            | "process"
+            | "module"
+            | "exports"
+            | "require"
+            | "React"
+            | "JSX"
+            | "undefined"
+            | "null"
+            | "true"
+            | "false"
+            | "any"
+            | "unknown"
+            | "never"
+            | "void"
+            | "object"
+            | "string"
+            | "number"
+            | "boolean"
+            | "bigint"
+            | "symbol"
+            | "describe"
+            | "it"
+            | "test"
+            | "expect"
+            | "beforeEach"
+            | "afterEach"
+            | "beforeAll"
+            | "afterAll"
+            | "jest"
+            | "vi"
+            | "setTimeout"
+            | "clearTimeout"
+            | "setInterval"
+            | "clearInterval"
+            | "fetch"
+    )
 }
 
 /// Return the enclosing enum declaration and current member assignment when
@@ -819,13 +933,144 @@ pub fn is_export_alias_identifier(node: Node<'_>) -> bool {
 }
 
 pub fn is_explicit_object_literal_key(node: Node<'_>) -> bool {
+    node.parent()
+        .is_some_and(|parent| parent.kind() == "pair" && is_object_property_key(node))
+}
+
+/// Whether the identifier writes a property name at its owner: the `key` field
+/// of an object-literal `pair` (`{ total: 1 }`) or of a destructuring
+/// `pair_pattern` (`const { total: sum } = row`).
+///
+/// A computed key (`{ [total]: 1 }`) is an expression that reads a binding, and
+/// it is excluded here because such an identifier's parent is the
+/// `computed_property_name`, not the pair.
+pub fn is_object_property_key(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    parent.kind() == "pair"
+    matches!(parent.kind(), "pair" | "pair_pattern")
         && parent
             .child_by_field_name("key")
             .is_some_and(|key| key.id() == node.id())
+}
+
+/// The value a renamed destructuring key reads its owner from.
+///
+/// `const { texture: frameTexture } = frame` names `texture` at whatever
+/// `frame` is, so the key is a property read on that expression. The array
+/// form takes one ELEMENT of the expression instead, which is a different
+/// question about the same node and so a different variant rather than a flag.
+#[derive(Clone, Copy, Debug)]
+pub enum JsTsDestructuringSource<'tree> {
+    /// `const { key: alias } = <expression>`.
+    Value(Node<'tree>),
+    /// `const [{ key: alias }] = <expression>`: one element of `<expression>`.
+    Element(Node<'tree>),
+}
+
+/// The expression whose owner declares `key`, when `key` is the `key` field of
+/// a destructuring `pair_pattern` and the pattern binds a whole initializer.
+///
+/// `None` covers both "not a renamed destructuring key" and every pattern whose
+/// destructured value this walk cannot name: a nested pattern (the inner key
+/// belongs to the outer key's member type, not to the initializer), a parameter
+/// or `for ... of` binder, and a second array level. Those fail closed rather
+/// than borrow the outer initializer's owner.
+///
+/// A shorthand entry (`const { cache } = state`) has no key node distinct from
+/// its binder, so it never reaches here: `is_object_property_key` is false for
+/// a `shorthand_property_identifier_pattern`, whose parent is the
+/// `object_pattern` itself.
+pub fn destructured_property_key_source(key: Node<'_>) -> Option<JsTsDestructuringSource<'_>> {
+    let pair = key.parent()?;
+    if pair.kind() != "pair_pattern" || !is_object_property_key(key) {
+        return None;
+    }
+    let mut current = pair;
+    let mut takes_element = false;
+    loop {
+        let parent = current.parent()?;
+        let bound = match parent.kind() {
+            "object_pattern" => None,
+            "array_pattern" if !takes_element => {
+                takes_element = true;
+                None
+            }
+            "variable_declarator" => Some((
+                parent.child_by_field_name("name")?,
+                parent.child_by_field_name("value")?,
+            )),
+            "assignment_expression" => Some((
+                parent.child_by_field_name("left")?,
+                parent.child_by_field_name("right")?,
+            )),
+            _ => return None,
+        };
+        if let Some((pattern, value)) = bound {
+            if pattern.id() != current.id() {
+                return None;
+            }
+            return Some(if takes_element {
+                JsTsDestructuringSource::Element(value)
+            } else {
+                JsTsDestructuringSource::Value(value)
+            });
+        }
+        current = parent;
+    }
+}
+
+/// The `object_type` a type annotation is written as, when it is written
+/// inline rather than as a name.
+///
+/// `annotation` is either a `type_annotation` wrapper or a bare type node.
+/// A named type -- `Latest`, `Promise<Latest>`, a union -- names an owner the
+/// declaration index already publishes under that name, and the type-text owner
+/// route answers it; only the anonymous literal has no such owner, which is why
+/// its members are published off the declaration that carries it (#2159).
+///
+/// `Promise<{ ... }>` deliberately answers `None`: those members belong to the
+/// AWAITED value, and treating them as the call's own would claim them for an
+/// unawaited read too.
+pub fn inline_object_type(annotation: Node<'_>) -> Option<Node<'_>> {
+    let mut node = if annotation.kind() == "type_annotation" {
+        annotation.named_child(0)?
+    } else {
+        annotation
+    };
+    loop {
+        match node.kind() {
+            "object_type" => return Some(node),
+            "parenthesized_type" | "readonly_type" => node = node.named_child(0)?,
+            _ => return None,
+        }
+    }
+}
+
+/// Whether the identifier names a function EXPRESSION: `const run = function
+/// step() {...}`. The name binds only inside the expression's own body, so no
+/// workspace declaration index publishes it.
+pub fn is_named_function_expression_declaration(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "function_expression" | "generator_function")
+            && parent
+                .child_by_field_name("name")
+                .is_some_and(|name| name.id() == node.id())
+    })
+}
+
+/// Whether the identifier is the exception binder a `catch` clause introduces:
+/// the `parameter` field of `catch (error) {...}`.
+///
+/// A destructuring binder (`catch ({ message })`) reaches its terminals through
+/// the pattern kinds [`is_declaration_identifier`] already covers.
+pub fn is_catch_clause_binder(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "catch_clause"
+            && parent
+                .child_by_field_name("parameter")
+                .is_some_and(|parameter| parameter.id() == node.id())
+    })
 }
 
 pub fn is_property_key_in_member(node: Node<'_>) -> bool {
@@ -854,6 +1099,138 @@ pub fn is_object_in_member_expression(node: Node<'_>) -> bool {
         .unwrap_or(false)
 }
 
+/// The single bare name a destructuring position introduces, when it
+/// introduces one.
+///
+/// A default (`{ width = 1 }`, `[first = 1]`) binds through its `left` child;
+/// a further pattern binds names of its own and so names none of its own here.
+pub fn direct_pattern_binding(node: Node<'_>) -> Option<Node<'_>> {
+    let binding = match node.kind() {
+        "assignment_pattern" | "object_assignment_pattern" => node.child_by_field_name("left")?,
+        _ => node,
+    };
+    matches!(
+        binding.kind(),
+        "identifier" | "shorthand_property_identifier_pattern"
+    )
+    .then_some(binding)
+}
+
+/// One entry of an object destructuring pattern.
+#[derive(Clone, Copy, Debug)]
+pub struct JsTsObjectPatternEntry<'tree> {
+    /// The token that names the property the entry reads: a `pair_pattern`'s
+    /// key, or the shorthand binder, which names and binds with one token.
+    pub key: Node<'tree>,
+    /// The single bare name the entry introduces, when it introduces one. A
+    /// renamed entry can bind a further pattern (`{ texture: { width } }`)
+    /// instead, whose names belong to the key's member type rather than to the
+    /// destructured value; the key stays a reference all the same.
+    pub binder: Option<Node<'tree>>,
+}
+
+/// Every entry of an object destructuring pattern, in source order.
+///
+/// A rest element (`{ ...others }`) names no property and is skipped.
+pub fn object_pattern_entries(pattern: Node<'_>) -> Vec<JsTsObjectPatternEntry<'_>> {
+    let mut entries = Vec::new();
+    let mut cursor = pattern.walk();
+    for property in pattern.named_children(&mut cursor) {
+        let entry = match property.kind() {
+            "shorthand_property_identifier_pattern" => JsTsObjectPatternEntry {
+                key: property,
+                binder: Some(property),
+            },
+            "pair_pattern" => {
+                let Some(key) = property.child_by_field_name("key") else {
+                    continue;
+                };
+                JsTsObjectPatternEntry {
+                    key,
+                    binder: property
+                        .child_by_field_name("value")
+                        .and_then(direct_pattern_binding),
+                }
+            }
+            "object_assignment_pattern" => {
+                let Some(left) = property.child_by_field_name("left") else {
+                    continue;
+                };
+                JsTsObjectPatternEntry {
+                    key: left,
+                    binder: direct_pattern_binding(left),
+                }
+            }
+            _ => continue,
+        };
+        entries.push(entry);
+    }
+    entries
+}
+
+/// The module whose export surface a value carries, when the author stated it
+/// in the explicit type argument of the call that produced the value.
+///
+/// `vi.importActual<typeof UseBaseQueryModule>('../useBaseQuery')` types its own
+/// result at the call site: `typeof M`, for a module namespace binding `M`,
+/// names that module's export surface. This reads the same argument the forward
+/// definition route reads for such a call (#2039), so the two directions answer
+/// from one fact rather than from two spellings of it.
+///
+/// Exactly one type argument is required. A multi-argument generic such as
+/// `makePair<typeof M, string>(...)` parameterizes the callee; it says nothing
+/// about the call's own result, so it never claims one of its arguments.
+/// `await` and parentheses wrap the call without changing what it produces.
+pub fn call_type_argument_module_specifier(
+    value: Node<'_>,
+    source: &str,
+    imports: &JsTsImportBinder,
+) -> Option<String> {
+    let mut call = value;
+    while matches!(call.kind(), "await_expression" | "parenthesized_expression") {
+        call = call.named_child(0)?;
+    }
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let arguments = call.child_by_field_name("type_arguments")?;
+    if arguments.named_child_count() != 1 {
+        return None;
+    }
+    let argument = arguments.named_child(0)?;
+    if argument.kind() != "type_query" {
+        return None;
+    }
+    let namespace = argument.named_child(0)?;
+    if !matches!(namespace.kind(), "identifier" | "nested_identifier") {
+        return None;
+    }
+    let binding = imports.binding(slice(namespace, source))?;
+    matches!(
+        binding.kind,
+        ImportKind::Namespace | ImportKind::CommonJsRequire
+    )
+    .then(|| binding.module_specifier.clone())
+}
+
+/// The module a top-level declarator's initializer denotes, when it denotes one.
+///
+/// Two spellings produce a module value: a `require` call, whose specifier is
+/// its own argument, and a call whose explicit type argument names an already
+/// bound module (#2160). Both bind the declared names to that module's exports,
+/// so both answer the same question here.
+pub fn declarator_module_value_specifier(
+    declarator: Node<'_>,
+    source: &str,
+    imports: &JsTsImportBinder,
+) -> Option<String> {
+    if let Some(specifier) = commonjs_require_module_specifier_from_declarator(declarator, source) {
+        return Some(specifier);
+    }
+    let value = declarator.child_by_field_name("value")?;
+    call_type_argument_module_specifier(value, source, imports)
+}
+
 pub fn compute_import_binder(source: &str, tree: &Tree) -> JsTsImportBinder {
     let mut binder = JsTsImportBinder::empty();
     let root = tree.root_node();
@@ -868,7 +1245,83 @@ pub fn compute_import_binder(source: &str, tree: &Tree) -> JsTsImportBinder {
             visit_commonjs_require_statement(child, source, &mut binder);
         }
     }
+    // A module can also be bound by a call that states its own result type, and
+    // the namespace binding that type argument names has to be bound already
+    // for that to be readable -- so this is a second pass rather than another
+    // arm above (#2160).
+    bind_type_argument_module_values(root, source, &mut binder);
     binder
+}
+
+/// Bind the names a `const actual = importActual<typeof M>('./m')` declaration
+/// introduces to `M`'s module, whether it binds the module value itself or
+/// destructures exports out of it.
+fn bind_type_argument_module_values(root: Node<'_>, source: &str, binder: &mut JsTsImportBinder) {
+    let mut bound: Vec<(String, ImportBinding)> = Vec::new();
+    for index_id in 0..root.named_child_count() {
+        let Some(child) = root.named_child(index_id) else {
+            continue;
+        };
+        if !matches!(child.kind(), "lexical_declaration" | "variable_declaration") {
+            continue;
+        }
+        let mut cursor = child.walk();
+        for declarator in child.named_children(&mut cursor) {
+            if declarator.kind() != "variable_declarator" {
+                continue;
+            }
+            let Some(name) = declarator.child_by_field_name("name") else {
+                continue;
+            };
+            let Some(value) = declarator.child_by_field_name("value") else {
+                continue;
+            };
+            let Some(module_specifier) = call_type_argument_module_specifier(value, source, binder)
+            else {
+                continue;
+            };
+            match name.kind() {
+                "identifier" => {
+                    let local = slice(name, source).to_string();
+                    if !local.is_empty() {
+                        bound.push((
+                            local,
+                            ImportBinding {
+                                module_specifier,
+                                namespace_imported_module: None,
+                                kind: ImportKind::Namespace,
+                                imported_name: None,
+                            },
+                        ));
+                    }
+                }
+                "object_pattern" => {
+                    for entry in object_pattern_entries(name) {
+                        let Some(local) = entry.binder.map(|node| slice(node, source)) else {
+                            continue;
+                        };
+                        let imported_name = slice(entry.key, source);
+                        if local.is_empty() || imported_name.is_empty() {
+                            continue;
+                        }
+                        bound.push((
+                            local.to_string(),
+                            ImportBinding {
+                                module_specifier: module_specifier.clone(),
+                                namespace_imported_module: None,
+                                kind: ImportKind::Named,
+                                imported_name: Some(imported_name.to_string()),
+                            },
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for (local, binding) in bound {
+        binder.bind_static(local, binding);
+    }
 }
 
 fn visit_commonjs_require_statement(node: Node<'_>, source: &str, binder: &mut JsTsImportBinder) {
@@ -887,11 +1340,6 @@ fn visit_commonjs_require_statement(node: Node<'_>, source: &str, binder: &mut J
             },
         );
     }
-}
-
-pub fn is_commonjs_require_declarator(node: Node<'_>, source: &str) -> bool {
-    node.kind() == "variable_declarator"
-        && commonjs_require_module_specifier_from_declarator(node, source).is_some()
 }
 
 fn visit_import_statement(node: Node<'_>, source: &str, binder: &mut JsTsImportBinder) {

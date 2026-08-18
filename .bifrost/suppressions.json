@@ -1892,6 +1892,105 @@
       "accepted_by": "claude",
       "accepted_at": "2026-08-13",
       "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.file-read-in-loop",
+      "finding_id": "2d8527b894ff0a1a90261bd0b2b7317555da0c7117621b6a40d91099656e7061",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "MCP conformance harness, run.mjs loadTriage: each iteration reads a different one of the three triage files. The read depends on the loop item and cannot be hoisted; the loop runs three times per gate invocation.",
+      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
+      "accepted_by": "claude (PR #2347)",
+      "accepted_at": "2026-08-17",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.parsing-in-loop",
+      "finding_id": "58cb5cfdd4906422709075fba9e3ec322396407cec63e39a835ff09265a5f966",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "MCP conformance harness, run.mjs loadTriage: parses the distinct triage file read in the same iteration. Depends on the loop item; three iterations per gate invocation.",
+      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
+      "accepted_by": "claude (PR #2347)",
+      "accepted_at": "2026-08-17",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.file-read-in-loop",
+      "finding_id": "fa3614bbbd77452b2d5c6a6ed43902f4bc15daaeb4fd65376f56bc0a8a951c3a",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "MCP conformance harness, run.mjs readChecks: probes each per-scenario results subdirectory for its checks.json and returns on the first hit. The path depends on the loop item and cannot be hoisted.",
+      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
+      "accepted_by": "claude (PR #2347)",
+      "accepted_at": "2026-08-17",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.parsing-in-loop",
+      "finding_id": "c45367633856b8f460261c6466950e6df2145f460a8e5cbd1c2527f45b63595e",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "MCP conformance harness, run.mjs readChecks: parses the distinct checks.json found in the same iteration, then returns. Depends on the loop item.",
+      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
+      "accepted_by": "claude (PR #2347)",
+      "accepted_at": "2026-08-17",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.file-read-in-loop",
+      "finding_id": "95d9d7e5d4369a02bc036498b1042639d838977cf21f787b5499ee6fe1a04db9",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "MCP conformance harness, extract-schemas.mjs compareSchemas: each iteration reads a different committed schema file to byte-compare it with the fresh extraction for that revision. Depends on the loop item; four iterations.",
+      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
+      "accepted_by": "claude (PR #2347)",
+      "accepted_at": "2026-08-17",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.serialization-in-loop",
+      "finding_id": "dfaa7eaabf6a176d010e2de3a3f89f4751b295adb550dfb8e4e795486086c92d",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "MCP conformance harness, extract-schemas.mjs extractSchemas: pretty-prints each revision's freshly parsed schema exactly once. The value depends on the loop item and cannot be hoisted; four iterations.",
+      "policy_hash_at_acceptance": "da0b97c9fccd69df43320804e18b2325952a603f136ad01af388816b2a49a4b4",
+      "accepted_by": "claude (PR #2347)",
+      "accepted_at": "2026-08-17",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.parsing-in-loop",
+      "finding_id": "c4f7abf641d03d6d52aacaeb17295411b44bfb1c666d410b8abe28dc7883430e",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "MCP conformance harness, extract-schemas.mjs --write: re-parses each revision's just-written schema text to print its defs count. Depends on the loop item; four iterations, only in the manual regeneration path.",
+      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
+      "accepted_by": "claude (PR #2347)",
+      "accepted_at": "2026-08-17",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.serialization-in-loop",
+      "finding_id": "fd741af979a212816211fb181b16128ed0661b91a150d6db4ce4c6fe5d859fd0",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "MCP conformance harness, bridge.mjs writeToChild: serializes each distinct relayed JSON-RPC message once onto the child's stdin. The message is the loop item; nothing is invariant.",
+      "policy_hash_at_acceptance": "da0b97c9fccd69df43320804e18b2325952a603f136ad01af388816b2a49a4b4",
+      "accepted_by": "claude (PR #2347)",
+      "accepted_at": "2026-08-17",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.serialization-in-loop",
+      "finding_id": "446b8344f3d3d29ede7359f2bab13427dbaa08371ee75fa9f7448b9845649ae9",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "MCP conformance harness, bridge.mjs POST handler: stringifies each distinct request id in the batch to build its routing key. The id is the loop item; batches are tiny.",
+      "policy_hash_at_acceptance": "da0b97c9fccd69df43320804e18b2325952a603f136ad01af388816b2a49a4b4",
+      "accepted_by": "claude (PR #2347)",
+      "accepted_at": "2026-08-17",
+      "expires_at": null
     }
   ]
 }

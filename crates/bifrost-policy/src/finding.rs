@@ -1953,7 +1953,7 @@ impl RetainedSize for PolicyFindingDiff {
     }
 }
 
-/// One normalized finding in the canonical schema-version-2 report model.
+/// One normalized finding in the canonical schema-version-4 report model.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PolicyFinding {
     id: PolicyFindingId,
@@ -1979,7 +1979,7 @@ pub struct PolicyFinding {
     witnesses: Vec<BoundedWitness>,
     witnesses_truncated: bool,
     omitted_witnesses_lower_bound: u64,
-    #[serde(skip)]
+    #[serde(skip_serializing_if = "super::display_path::TaintDisplayPathCache::is_empty")]
     display_path: super::display_path::TaintDisplayPathCache,
     suppression: Option<PolicyFindingSuppression>,
     scope: Option<PolicyFindingScope>,

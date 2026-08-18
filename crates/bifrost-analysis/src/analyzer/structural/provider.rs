@@ -371,7 +371,7 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             StructuralSourceLimitedOutcome::Cancelled
         } else {
-            StructuralSourceLimitedOutcome::Available(snapshot.into_source())
+            StructuralSourceLimitedOutcome::Available(snapshot.1.into_source())
         }
     }
 
@@ -382,7 +382,7 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
         cancellation: Option<&CancellationToken>,
     ) -> StructuralSyntaxLimitedOutcome {
         match self.prepared_syntax_limited_cancellable(file, max_source_bytes, cancellation) {
-            PreparedSyntaxLimitedOutcome::Available(inner) => {
+            PreparedSyntaxLimitedOutcome::Available(_, inner) => {
                 StructuralSyntaxLimitedOutcome::Available(StructuralPreparedSyntax { inner })
             }
             PreparedSyntaxLimitedOutcome::Exceeded(exceeded) => {

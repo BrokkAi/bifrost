@@ -108,7 +108,7 @@ impl RustSymbolNamespace {
         }
     }
 
-    fn accepts(self, reference: RustReferenceNamespace) -> bool {
+    pub fn accepts(self, reference: RustReferenceNamespace) -> bool {
         matches!(reference, RustReferenceNamespace::Any)
             || matches!(
                 (self, reference),
@@ -318,6 +318,9 @@ pub struct RustOriginRoute {
     pub importer_module: ModuleKey,
     pub extent: RustImportExtent,
     pub path: Vec<String>,
+    /// Whether this route came from `use path::*`. Glob imports have lower
+    /// name-resolution precedence than explicit imports and local items.
+    pub is_glob_import: bool,
     pub namespace: RustSymbolNamespace,
     pub origin: RustSymbolIdentity,
     pub domain: Domain,
@@ -563,16 +566,76 @@ impl RustUsageWalks<'_> {
         ) else {
             return false;
         };
-        if domain == Domain::Public {
-            return true;
-        }
-        (declaration.source() == caller_file
+        let files_share_visibility_domain = declaration.source() == caller_file
             || self.owners_intersect(declaration.source(), caller_file)
             || analyzer
                 .cargo_routes()
                 .files_share_target(declaration.source(), caller_file)
-                == Some(true))
-            && domain_contains_module_for_file(&domain, analyzer, caller_file, caller_module)
+                == Some(true);
+        if domain == Domain::Crate(rust_crate_root_package(declaration.source()))
+            && files_share_visibility_domain
+        {
+            return true;
+        }
+        let domain_reaches_caller = |effective: &Domain| {
+            *effective == Domain::Public
+                || (files_share_visibility_domain
+                    && domain_contains_module_for_file(
+                        effective,
+                        analyzer,
+                        caller_file,
+                        caller_module,
+                    ))
+        };
+        match self.effective_module_domains_of(&owner) {
+            Some(owner_domains) => owner_domains
+                .iter()
+                .filter_map(|owner_domain| domain.intersect(owner_domain))
+                .any(|effective| domain_reaches_caller(&effective)),
+            None => domain_reaches_caller(&domain),
+        }
+    }
+
+    fn identity_visible_at(
+        &self,
+        analyzer: &dyn RustFactSource,
+        identity: &RustSymbolIdentity,
+        caller_file: &ProjectFile,
+        caller_byte: usize,
+    ) -> bool {
+        let Some(caller_module) = self.queries().module_at_byte(caller_file, caller_byte) else {
+            return false;
+        };
+        let files_share_visibility_domain = identity.file == *caller_file
+            || self.owners_intersect(&identity.file, caller_file)
+            || analyzer
+                .cargo_routes()
+                .files_share_target(&identity.file, caller_file)
+                == Some(true);
+        let domain_reaches_caller = |domain: &Domain| {
+            *domain == Domain::Public
+                || (files_share_visibility_domain
+                    && domain_contains_module_for_file(
+                        domain,
+                        analyzer,
+                        caller_file,
+                        &caller_module,
+                    ))
+        };
+        let Some(domains) = self.declared_domains_of(identity) else {
+            return false;
+        };
+        match self.effective_module_domains_of(&identity.module) {
+            Some(module_domains) => domains
+                .iter()
+                .flat_map(|domain| {
+                    module_domains
+                        .iter()
+                        .filter_map(|module_domain| domain.intersect(module_domain))
+                })
+                .any(|effective| domain_reaches_caller(&effective)),
+            None => domains.iter().any(domain_reaches_caller),
+        }
     }
 
     /// Files that import one of the `seeds` (plus the seed files themselves).
@@ -992,6 +1055,21 @@ pub fn usage_candidate_files_while(
     walks.importers_of_seeds_while(&seeds, keep_going)
 }
 
+/// Candidate files derived from binding seeds that a caller already prepared.
+///
+/// This is the second half of [`usage_candidate_files_while`]. Keeping it public
+/// lets an analysis-layer query retain the expensive binding-seed result for its
+/// semantic scan instead of rebuilding it only to recover the same file set.
+pub fn usage_candidate_files_from_binding_seeds_while(
+    analyzer: &dyn RustFactSource,
+    seeds: &RustBindingSeeds,
+    keep_going: &(impl Fn() -> bool + Sync),
+) -> Option<HashSet<ProjectFile>> {
+    let walks = RustUsageWalks::new_while(analyzer, keep_going)?;
+    keep_going().then_some(())?;
+    walks.importers_of_seeds_while(seeds, keep_going)
+}
+
 pub fn usage_binding_seeds_while(
     analyzer: &dyn RustFactSource,
     roots: &BTreeSet<CodeUnit>,
@@ -1129,6 +1207,22 @@ pub fn usage_declaration_visible_at(
     byte: usize,
 ) -> bool {
     RustUsageWalks::new(analyzer).declaration_visible_at(analyzer, declaration, file, byte)
+}
+
+pub fn usage_identity_visible_at(
+    analyzer: &dyn RustFactSource,
+    declaration: &CodeUnit,
+    file: &ProjectFile,
+    byte: usize,
+) -> bool {
+    let walks = RustUsageWalks::new(analyzer);
+    if let Some(identity) = walks
+        .identity_of(declaration)
+        .or_else(|| walks.value_constructor_identity_of(declaration))
+    {
+        return walks.identity_visible_at(analyzer, &identity, file, byte);
+    }
+    walks.declaration_visible_at(analyzer, declaration, file, byte)
 }
 
 pub fn usage_exact_root_for_resolution(
@@ -1527,7 +1621,7 @@ pub fn usage_reference_at(
     // import is the answer rather than one of two competing ones (#1377).
     let local_import_visible = origin_routes
         .iter()
-        .any(|route| route.extent.is_local_only());
+        .any(|route| !route.is_glob_import && route.extent.is_local_only());
     let mut matches: HashSet<RustSymbolIdentity> = origin_routes
         .iter()
         .map(|route| route.origin.clone())
@@ -1536,8 +1630,21 @@ pub fn usage_reference_at(
     // guards are proven disjoint read as alternatives of one declaration.
     let mut candidate_conditions: HashMap<RustSymbolIdentity, Vec<RustCfgCondition>> =
         HashMap::default();
+    let mut higher_precedence_conditions: HashMap<RustSymbolIdentity, Vec<RustCfgCondition>> =
+        HashMap::default();
+    let mut glob_conditions: HashMap<RustSymbolIdentity, Vec<RustCfgCondition>> =
+        HashMap::default();
     for route in &origin_routes {
         candidate_conditions
+            .entry(route.origin.clone())
+            .or_default()
+            .push(route.cfg_condition.clone());
+        let conditions = if route.is_glob_import {
+            &mut glob_conditions
+        } else {
+            &mut higher_precedence_conditions
+        };
+        conditions
             .entry(route.origin.clone())
             .or_default()
             .push(route.cfg_condition.clone());
@@ -1636,14 +1743,34 @@ pub fn usage_reference_at(
                 })
                 .map(|(identity, _)| identity)
             {
+                let declared_conditions = walks
+                    .declared_cfg_conditions_of(&identity)
+                    .unwrap_or_else(|| vec![RustCfgCondition::Unknown]);
                 candidate_conditions
                     .entry(identity.clone())
-                    .or_insert_with(|| {
-                        walks
-                            .declared_cfg_conditions_of(&identity)
-                            .unwrap_or_else(|| vec![RustCfgCondition::Unknown])
-                    });
+                    .or_insert_with(|| declared_conditions.clone());
+                higher_precedence_conditions
+                    .entry(identity.clone())
+                    .or_insert(declared_conditions);
                 matches.insert(identity);
+            }
+        }
+        // Rust glob imports are the lowest-precedence way to introduce a name.
+        // Keep a glob candidate only when no explicit import or same-module
+        // declaration can be active at the same time. Mutually exclusive cfg
+        // arms remain peers so each target can still receive the shared site.
+        for (identity, conditions) in &glob_conditions {
+            if higher_precedence_conditions.contains_key(identity) {
+                continue;
+            }
+            let shadowed = higher_precedence_conditions
+                .values()
+                .any(|higher_conditions| {
+                    !cfg_conditions_proven_disjoint(higher_conditions, conditions)
+                });
+            if shadowed {
+                matches.remove(identity);
+                candidate_conditions.remove(identity);
             }
         }
         if matches.is_empty() {
@@ -1775,6 +1902,7 @@ pub fn usage_reference_at(
                 },
             }]
         };
+        let rooted_local_prefix = matches!(prefix.first(), Some(&"crate" | &"self" | &"super"));
         // The one site that genuinely searches by name: the module is
         // resolved but the file that declares the terminal is not known.
         // `identities_named` answers it with the store's indexed short-name
@@ -1796,10 +1924,39 @@ pub fn usage_reference_at(
                         identity.module == resolved
                             && identity.namespace.accepts(namespace)
                             && domains.iter().any(|domain| domain.contains_module(module))
+                            && (!rooted_local_prefix
+                                || walks.owners_intersect(file, &identity.file)
+                                || analyzer
+                                    .cargo_routes()
+                                    .target_relation(file, &identity.file)
+                                    == RustCargoTargetRelation::Shared)
                             && walks.declaration_owner_visible_to(analyzer, identity, file, module)
                     })
                     .map(|(identity, _)| identity.clone()),
             );
+        }
+        if matches.is_empty()
+            && !leading_absolute
+            && let Some(resolved_fqn) = analyzer
+                .reference_context_of(file)
+                .resolve_scoped(&prefix.join("::"), terminal)
+            && let Some(identity) = unique_seed_identity_for_fqn(
+                analyzer,
+                file,
+                byte,
+                seeds,
+                &resolved_fqn,
+                &[],
+                namespace,
+            )
+        {
+            // A module-level glob can introduce the first path segment without
+            // creating a named namespace binder (`use crate::types::*;` followed
+            // by `use ast_elements::Target;`). The forward reference context
+            // already resolves that structured path. Consult it only after the
+            // authoritative binder and physical-module routes fail, and still
+            // require the resolved identity to be one of this query's seeds.
+            matches.insert(identity);
         }
     }
 
@@ -2041,27 +2198,48 @@ fn unique_seed_identity_for_import_targets(
 ) -> Option<RustSymbolIdentity> {
     let importer_module = RustUsageQueries::new(analyzer).module_at_byte(importer, byte)?;
     let importer_module = &importer_module;
+    let walks = RustUsageWalks::new(analyzer);
     let mut matches = seeds
         .identities
         .iter()
         .filter(|identity| {
             identity.namespace.accepts(namespace)
-                && seed_identity_admitted_at(
-                    analyzer,
-                    importer,
-                    byte,
-                    seeds,
-                    identity,
-                    dependency_roots,
-                )
-                && seeds.identity_domains.get(*identity).is_none_or(|domains| {
-                    domains
-                        .iter()
-                        .any(|domain| domain.contains_module(importer_module))
-                })
                 && targets
                     .iter()
                     .any(|(file, name)| identity.file == *file && identity.name == *name)
+                // The visible forward binder already returned a query root as
+                // an exact target. Auxiliary Cargo and inferred-module domains
+                // still constrain propagated aliases, but must not veto that
+                // authoritative root for workspace or custom-target layouts.
+                && ((seeds.root_origins.contains(identity)
+                    && seeds.root_identities.iter().any(|(_, identities)| {
+                        identities.contains(identity)
+                            && walks.identity_visible_at(analyzer, identity, importer, byte)
+                    })
+                    && (identity.file == *importer
+                        || walks.owners_intersect(importer, &identity.file)
+                        || dependency_roots.iter().any(|root| {
+                            walks
+                                .cargo_routes()
+                                .target_relation(root, &identity.file)
+                                == RustCargoTargetRelation::Shared
+                        })
+                        || analyzer
+                            .cargo_routes()
+                            .files_share_target(importer, &identity.file)
+                            == Some(true)))
+                    || (seed_identity_admitted_at(
+                        analyzer,
+                        importer,
+                        byte,
+                        seeds,
+                        identity,
+                        dependency_roots,
+                    ) && seeds.identity_domains.get(*identity).is_none_or(|domains| {
+                        domains
+                            .iter()
+                            .any(|domain| domain.contains_module(importer_module))
+                    })))
         })
         .flat_map(|identity| {
             seeds
@@ -2109,10 +2287,13 @@ fn seed_identity_admitted_at(
         return true;
     }
 
-    seeds.root_identities.iter().any(|(root, identities)| {
+    seeds.root_identities.iter().any(|(_, identities)| {
         identities.contains(identity)
-            && walks.declaration_visible_at(analyzer, root, importer, byte)
+            && walks.identity_visible_at(analyzer, identity, importer, byte)
             && (walks.owners_intersect(importer, &identity.file)
+                || walks
+                    .cargo_routes()
+                    .file_can_reference_target_of(importer, &identity.file)
                 || walks
                     .cargo_routes()
                     .target_relation(importer, &identity.file)

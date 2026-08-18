@@ -99,7 +99,7 @@ pub fn build_server_spec(
 
 pub fn build_server_spec_with_hidden(
     instructions: impl Into<String>,
-    tool_descriptors: Vec<Value>,
+    mut tool_descriptors: Vec<Value>,
     hidden_tool_names: Vec<String>,
 ) -> Result<McpServerSpec, String> {
     let instructions = instructions.into();
@@ -110,8 +110,12 @@ pub fn build_server_spec_with_hidden(
         ));
     }
     let mut tool_names = HashSet::with_capacity(tool_descriptors.len());
-    for descriptor in &tool_descriptors {
-        let Some(name) = descriptor.get("name").and_then(Value::as_str) else {
+    for descriptor in &mut tool_descriptors {
+        let Some(name) = descriptor
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
             return Err("tool descriptor missing string name".to_string());
         };
         let Some(description) = descriptor.get("description").and_then(Value::as_str) else {
@@ -125,7 +129,21 @@ pub fn build_server_spec_with_hidden(
                 "tool descriptor `{name}` description contains {description_chars} characters; maximum is {MCP_DISCOVERY_TEXT_MAX_CHARS}"
             ));
         }
-        tool_names.insert(name.to_string());
+        // The single point where a generated output schema reaches a
+        // descriptor. Every consumer of a server spec -- the MCP host, the CLI
+        // `--tool-help`, the Python module -- goes through here, and the
+        // descriptors themselves stay hand-written JSON.
+        if let Some(output_schema) = crate::output_schemas::output_schema_for(&name) {
+            let previous = descriptor
+                .as_object_mut()
+                .expect("a descriptor with a string name is a JSON object")
+                .insert("outputSchema".to_string(), output_schema);
+            assert!(
+                previous.is_none(),
+                "tool descriptor `{name}` already declares an outputSchema"
+            );
+        }
+        tool_names.insert(name);
     }
     tool_names.extend(hidden_tool_names);
 

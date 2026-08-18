@@ -239,7 +239,7 @@ impl TypescriptAnalyzer {
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
+        let alias_resolver = Arc::new(AliasResolver::new(Arc::clone(&project)));
         Self {
             inner: TreeSitterAnalyzer::new_with_config(project, TypescriptAdapter, config),
             memo_budget,
@@ -259,7 +259,7 @@ impl TypescriptAnalyzer {
         progress: Option<BuildProgress>,
     ) -> Result<Self, crate::analyzer::store::StoreError> {
         let memo_budget = config.memo_cache_budget_bytes();
-        let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
+        let alias_resolver = Arc::new(AliasResolver::new(Arc::clone(&project)));
         let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             project,
             TypescriptAdapter,
@@ -595,6 +595,10 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner.invalidate_cached_file_identities();
     }
 
+    fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {
+        self.inner.working_tree_identity()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
         self
@@ -639,7 +643,7 @@ impl IAnalyzer for TypescriptAnalyzer {
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
         let inner = self.inner.update(changed_files);
         // Rebuild from root so a changed tsconfig.json drops its stale parse cache.
-        let alias_resolver = Arc::new(AliasResolver::new(inner.project().root().to_path_buf()));
+        let alias_resolver = Arc::new(AliasResolver::new(inner.shared_project()));
         Self {
             inner,
             memo_budget: self.memo_budget,
@@ -650,7 +654,7 @@ impl IAnalyzer for TypescriptAnalyzer {
 
     fn update_all(&self) -> Self {
         let inner = self.inner.update_all();
-        let alias_resolver = Arc::new(AliasResolver::new(inner.project().root().to_path_buf()));
+        let alias_resolver = Arc::new(AliasResolver::new(inner.shared_project()));
         Self {
             inner,
             memo_budget: self.memo_budget,

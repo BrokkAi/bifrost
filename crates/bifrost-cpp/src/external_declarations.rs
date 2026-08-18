@@ -5,10 +5,12 @@
 //! crate stays below `brokk-bifrost-analysis` in the dependency graph.
 
 use crate::adapter::parse_cpp_file;
-use crate::declarations::node_text;
+use crate::declarations::{
+    CppParameterType, cpp_callable_parameter_type_identities, cpp_function_declarator_at, node_text,
+};
 use crate::graph::resolver::cpp_name_for;
 use brokk_bifrost_core::analyzer::ProjectFile;
-use brokk_bifrost_core::analyzer::model::{CodeUnit, CodeUnitType};
+use brokk_bifrost_core::analyzer::model::{CodeUnit, CodeUnitType, StructuredTypeIdentity};
 use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
 use brokk_bifrost_core::hash::HashMap;
 use std::path::{Path, PathBuf};
@@ -65,8 +67,14 @@ pub struct CppExternalMember {
     pub visibility: CppExternalVisibility,
     pub is_constructor: bool,
     pub signature: Option<String>,
-    pub parameter_types: Option<Vec<String>>,
-    pub return_type: Option<String>,
+    /// The structured type of each invocation parameter, or `None` when the
+    /// declaration is not a callable or its parameter list was not reached.
+    ///
+    /// These are structured identities rather than rendered spellings because
+    /// the consumer publishes them into a type model, and a spelling such as
+    /// `const T&` is a source text, not a type name.
+    pub parameter_types: Option<Vec<CppParameterType>>,
+    pub return_type: Option<StructuredTypeIdentity>,
     pub source_path: PathBuf,
 }
 
@@ -235,6 +243,19 @@ pub fn extract_external_declarations(
                     .signature_metadata
                     .get(&declaration)
                     .and_then(|records| records.first());
+                let declaration_start = parsed
+                    .ranges
+                    .get(&declaration)
+                    .and_then(|ranges| ranges.iter().map(|range| range.start_byte).min());
+                let parameter_types = (declaration.kind() == CodeUnitType::Function)
+                    .then(|| {
+                        declaration_start
+                            .and_then(|start| cpp_function_declarator_at(tree.root_node(), start))
+                            .map(|declarator| {
+                                cpp_callable_parameter_type_identities(declarator, source)
+                            })
+                    })
+                    .flatten();
                 members.push(CppExternalMember {
                     owner: nearest_type_owner(&declaration, &parent_by_child),
                     name: declaration.terminal_name().to_owned(),
@@ -245,21 +266,16 @@ pub fn extract_external_declarations(
                         CodeUnitType::Macro => CppExternalMemberKind::Macro,
                         _ => unreachable!("the outer match admits exactly member kinds"),
                     },
-                    visibility: parsed
-                        .ranges
-                        .get(&declaration)
-                        .and_then(|ranges| ranges.iter().map(|range| range.start_byte).min())
+                    visibility: declaration_start
                         .map(|start| cpp_member_visibility(tree.root_node(), source, start))
                         .unwrap_or(CppExternalVisibility::Private),
                     is_constructor: metadata
                         .is_some_and(|metadata| metadata.callable_is_constructor()),
                     signature: declaration.signature().map(str::to_owned),
-                    parameter_types: metadata
-                        .and_then(|metadata| metadata.callable_parameter_types())
-                        .map(<[String]>::to_vec),
+                    parameter_types,
                     return_type: metadata
-                        .and_then(|metadata| metadata.return_type_text())
-                        .map(str::to_owned),
+                        .and_then(|metadata| metadata.return_type_identity())
+                        .cloned(),
                     source_path: source_path.to_path_buf(),
                 });
             }

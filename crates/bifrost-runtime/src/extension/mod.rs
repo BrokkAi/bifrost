@@ -59,7 +59,8 @@ pub use version::{
     negotiate_extension_api,
 };
 pub use workspace::{
-    CapabilitySupport, ExtensionCapabilityReport, ExtensionError, ExtensionWorkspace,
-    ExtensionWorkspaceDescription, ExtensionWorkspaceError, ExtensionWorkspaceOptions,
-    LanguageCapabilityReport, OperationCapability, StructuralRequest, StructuralResult,
+    CapabilitySupport, ExtensionCapabilityReport, ExtensionError, ExtensionPersistenceMode,
+    ExtensionStoreReport, ExtensionWorkspace, ExtensionWorkspaceDescription,
+    ExtensionWorkspaceError, ExtensionWorkspaceOptions, LanguageCapabilityReport,
+    OperationCapability, StructuralRequest, StructuralResult,
 };

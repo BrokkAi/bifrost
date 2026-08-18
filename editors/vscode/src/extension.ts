@@ -56,14 +56,14 @@ import {
   runRqlQuery
 } from "./rql_query";
 import { RqlQueryResultsProvider } from "./rql_results";
-import type { RqlPolicyDocument, RqlPolicyResponse } from "./rql_policy";
+import type { PolicySourceLocation, RqlPolicyDocument, RqlPolicyResponse } from "./rql_policy";
 import {
   PolicyRunTracker,
   policyLocationRange,
   policyReportCompletedWithoutFindings,
   runRqlPolicy
 } from "./rql_policy";
-import type { PolicyFindingTarget } from "./rql_policy_results";
+import type { PolicyDisplayStepTarget, PolicyFindingTarget } from "./rql_policy_results";
 import { RqlPolicyResultsProvider } from "./rql_policy_results";
 import type { RuneIrRange, RuneIrResponse } from "./rune_ir";
 import { RUNE_IR_LANGUAGE_ID, RUNE_IR_SOURCE_LANGUAGE_IDS, showRuneIr } from "./rune_ir";
@@ -138,6 +138,10 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand("bifrost.openRqlPolicyFinding", (target: PolicyFindingTarget) =>
       openRqlPolicyFinding(target)
+    ),
+    vscode.commands.registerCommand(
+      "bifrost.openRqlPolicyDisplayStep",
+      (target: PolicyDisplayStepTarget) => openRqlPolicyDisplayStep(target)
     ),
     vscode.commands.registerCommand("bifrost.copyMcpConfig", () => copyMcpConfig(context)),
     vscode.commands.registerCommand("bifrost.openMcpSetup", () => openMcpSetup(context))
@@ -409,11 +413,22 @@ async function openRqlQueryResult(
 }
 
 async function openRqlPolicyFinding(target: PolicyFindingTarget): Promise<void> {
-  const root = vscode.Uri.parse(target.reportRootUri);
-  const uri = vscode.Uri.joinPath(root, target.finding.primary.path);
+  return openRqlPolicyLocation(target.reportRootUri, target.finding.primary);
+}
+
+async function openRqlPolicyDisplayStep(target: PolicyDisplayStepTarget): Promise<void> {
+  return openRqlPolicyLocation(target.reportRootUri, target.step.location);
+}
+
+async function openRqlPolicyLocation(
+  reportRootUri: string,
+  location: PolicySourceLocation
+): Promise<void> {
+  const root = vscode.Uri.parse(reportRootUri);
+  const uri = vscode.Uri.joinPath(root, location.path);
   const document = await vscode.workspace.openTextDocument(uri);
   const editor = await vscode.window.showTextDocument(document, { preview: true });
-  const locationRange = policyLocationRange(target.finding.primary);
+  const locationRange = policyLocationRange(location);
   if (!locationRange) {
     return;
   }

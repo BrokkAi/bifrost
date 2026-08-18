@@ -220,11 +220,11 @@ fn write_concise_finding<W: Write>(
         writeln!(output).map_err(map_io_error)?;
         write_concise_display_path(output, path)?;
 
-        write_concise_alternate_paths(
+        write_concise_display_alternatives(
             output,
-            finding.witnesses().len().saturating_sub(1),
-            finding.witnesses_truncated(),
-            finding.omitted_witnesses_lower_bound(),
+            path.omitted_alternative_paths_lower_bound(),
+            path.alternatives_truncated(),
+            path.omitted_witnesses_lower_bound(),
         )?;
     } else if let Some(witness) = finding.witnesses().first() {
         writeln!(output).map_err(map_io_error)?;
@@ -264,6 +264,34 @@ fn write_concise_display_path<W: Write>(
         writeln!(
             output,
             "    canonical path is incomplete; use --verbose for retained evidence"
+        )
+        .map_err(map_io_error)?;
+    }
+    Ok(())
+}
+
+fn write_concise_display_alternatives<W: Write>(
+    output: &mut BoundedWriter<W>,
+    omitted_alternative_paths_lower_bound: u64,
+    alternatives_truncated: bool,
+    omitted_witnesses_lower_bound: u64,
+) -> Result<(), PolicyRenderError> {
+    if omitted_alternative_paths_lower_bound > 0 {
+        writeln!(
+            output,
+            "    {} distinct alternate path{} omitted; use --verbose for retained evidence",
+            omitted_alternative_paths_lower_bound,
+            plural_suffix_u64(omitted_alternative_paths_lower_bound),
+        )
+        .map_err(map_io_error)?;
+    }
+    if alternatives_truncated {
+        debug_assert!(omitted_witnesses_lower_bound > 0);
+        writeln!(
+            output,
+            "    at least {} canonical witness{} omitted; additional display paths may be unavailable",
+            omitted_witnesses_lower_bound,
+            plural_suffix_u64(omitted_witnesses_lower_bound),
         )
         .map_err(map_io_error)?;
     }

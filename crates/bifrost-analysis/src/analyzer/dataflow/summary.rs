@@ -42,6 +42,14 @@ pub struct ReusableEndSummary<Fact> {
 }
 
 /// One query-visible internal observation retained by a reusable summary.
+///
+/// `point` must lie in the summarized procedure itself. The solver rejects any
+/// row that names another procedure, which is what keeps a summary relative and
+/// replayable. The consequence is that a summary carries no row for anything
+/// the summarized procedure calls, so replaying one for a non-leaf callee
+/// leaves the transitive callees' rows out of the solve entirely (#2291). A
+/// provider that needs those observations to survive must fold them into rows
+/// of its own procedure before returning them, the way the taint route does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReusableReachedFact<Fact> {
     pub point: ProgramPointHandle,
@@ -49,11 +57,77 @@ pub struct ReusableReachedFact<Fact> {
     pub qualities: Box<[PathQuality]>,
 }
 
+/// Whether a summarized callee sits in a call cycle that contains the procedure
+/// the current solve is rooted at (#2285).
+///
+/// A call cycle is a group of procedures that can call one another around, so
+/// that entering any of them can lead back to the same procedure. In call-graph
+/// terms it is a strongly connected component with more than one member, or one
+/// procedure that calls itself.
+///
+/// This matters because a reusable summary is *relative*: it carries only rows
+/// whose entry is its own procedure, and the solver skips the summarized body
+/// when it replays one. A summary therefore cannot express "this procedure
+/// calls back into the procedure you are currently solving". When the
+/// summarized callee and the solve root sit in one call cycle, replaying the
+/// summary would skip the call back into the root, so the root would silently
+/// lose its own recursive entry and every row reached through it. That is a
+/// missing fact reported as a clean result. The solver refuses such a summary
+/// and solves the callee body instead, so the answer is always the fresh one.
+///
+/// A callee in a call cycle that does *not* contain the root stays reusable:
+/// its cycle is published and replayed as one unit and cannot re-enter the
+/// root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryCallCycle {
+    /// No call cycle through this procedure reaches the solve root.
+    ExcludesRoot,
+    /// This procedure and the solve root sit in one call cycle, or the provider
+    /// cannot rule that out. Its summary is not replayable for this solve.
+    IncludesRoot,
+}
+
+/// Whether a reusable summary's validity contract covers every analyzed
+/// procedure the summarized body calls (#2296).
+///
+/// Replaying a summary skips the summarized body, and with it every call that
+/// body makes, so nothing below the summarized callee is entered (#2291). That
+/// omission is safe for a completeness verdict only because the summary was
+/// itself built by a solve that did walk the subtree and reported itself
+/// complete, and because the summary is looked up under a key that pins the
+/// analysis inputs of the whole subtree. Both of those rest on one condition:
+/// the summary's validity contract has to name every analyzed procedure the
+/// summarized body can call. If it does not, the summary can be replayed into
+/// a query whose own inputs leave a construct in that subtree unmodeled, and
+/// the reuse-backed run would report a completeness the fresh solve refuses.
+///
+/// A provider states this per summary. Stating it wrongly costs a false
+/// completeness claim; refusing costs recomputation, so a provider that cannot
+/// tell must report [`SummaryCalledProcedures::MayEscapeContract`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SummaryCalledProcedures {
+    /// Every analyzed procedure the summarized body can call is inside the
+    /// summary's validity contract, so the summary's construction already
+    /// recorded that subtree's state.
+    CoveredByContract,
+    /// The summarized body can call an analyzed procedure the contract does not
+    /// name, or the provider cannot tell. Its summary is not replayable.
+    MayEscapeContract,
+}
+
 /// Complete reusable relation for one exact callee entry fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReusableProcedureSummary<Fact> {
     pub exits: Box<[ReusableEndSummary<Fact>]>,
     pub reached: Box<[ReusableReachedFact<Fact>]>,
+    /// How the summarized procedure's call cycle relates to the solve root.
+    /// There is no default: every provider must state this, because stating it
+    /// wrongly is the one way to lose the root's own recursive rows (#2285).
+    pub call_cycle: SummaryCallCycle,
+    /// Whether the summary's validity contract covers what the summarized body
+    /// calls. There is no default: stating it wrongly is the one way to claim a
+    /// completeness the fresh solve refuses (#2296).
+    pub called_procedures: SummaryCalledProcedures,
 }
 
 /// Optional cross-query summary oracle used by the query-local tabulator.
@@ -65,10 +139,37 @@ pub struct ReusableProcedureSummary<Fact> {
 /// entry fact: query-local tabulation intentionally deduplicates entries by
 /// that identity. Context-sensitive clients must decline reuse until their
 /// context is represented in a future solver-level entry key.
+///
+/// `root` is the procedure this solve is rooted at, supplied by the solver so a
+/// provider judges the exact query it is answering rather than a root it was
+/// built with. A provider must report [`SummaryCallCycle::IncludesRoot`]
+/// whenever the summarized procedure and `root` sit in one call cycle, and
+/// whenever it cannot tell (#2285). The solver refuses those summaries and
+/// solves the body instead. The cost of refusing reuse is recomputation; the
+/// cost of claiming [`SummaryCallCycle::ExcludesRoot`] wrongly is a missing
+/// fact.
+///
+/// A returned summary describes only the summarized procedure. Every reached
+/// row must name that procedure, and binding the summary replaces the whole
+/// body, so a replay never enters anything the procedure calls. Reuse for a
+/// non-leaf procedure therefore omits its transitive callees' rows from the
+/// solve (#2291). A provider whose consumer reads reached rows rather than only
+/// the root's verdict must fold the subtree's observations into rows of the
+/// summarized procedure, as `flatten_taint_observations` in
+/// `crate::analyzer::taint::summary` does.
+///
+/// A provider must also report [`SummaryCalledProcedures`] for the same reason
+/// in the completeness dimension (#2296): the skipped subtree contributes no
+/// reached rows and no coverage rows, so a consumer that reads completeness as
+/// a universally quantified property of those rows would find the quantifier
+/// easier to satisfy after a replay. That is sound only while the summary's own
+/// validity contract covers the subtree, which is what the provider states
+/// here.
 pub trait ReusableSummaryProvider<Fact> {
     fn summary_for(
         &mut self,
         procedure: &ProcedureHandle,
+        root: &ProcedureHandle,
         entry_fact: Fact,
         request: &mut DataflowRequest<'_>,
     ) -> Result<Option<ReusableProcedureSummary<Fact>>, SolverTermination>;
@@ -80,6 +181,7 @@ impl<Fact> ReusableSummaryProvider<Fact> for NoReusableSummaries {
     fn summary_for(
         &mut self,
         _procedure: &ProcedureHandle,
+        _root: &ProcedureHandle,
         _entry_fact: Fact,
         _request: &mut DataflowRequest<'_>,
     ) -> Result<Option<ReusableProcedureSummary<Fact>>, SolverTermination> {
@@ -428,6 +530,11 @@ struct SummaryState<Fact> {
     zero_fact: Fact,
     facts: Vec<Fact>,
     fact_ids: HashMap<Fact, FactId>,
+    /// The procedure this solve is rooted at, as an index into `procedures`.
+    /// `initialize` interns the root first, so this is always zero; it is a
+    /// field rather than a literal so the reusable-summary guard names what it
+    /// means (#2285).
+    root: usize,
     procedures: Vec<ProcedureHandle>,
     procedure_ids: HashMap<ProcedureHandle, usize>,
     point_seeds: HashMap<(usize, ProgramPointId), Vec<Fact>>,
@@ -463,6 +570,7 @@ where
         let best_effort_witness_retention = witness_retention.is_best_effort();
         Self {
             zero_fact,
+            root: 0,
             facts: Vec::new(),
             fact_ids: HashMap::default(),
             procedures: Vec::new(),
@@ -553,6 +661,7 @@ where
         }
 
         let root = self.intern_procedure(input.root().clone());
+        self.root = root;
         let entry_point = input
             .root()
             .point_handle(input.root().semantics().entry_point())
@@ -1754,7 +1863,8 @@ where
                     self.metrics.reusable_summary_misses.saturating_add(1);
                 continue;
             }
-            let summary = match reusable.summary_for(&transfer.callee, entry_fact, request) {
+            let root = self.procedures[self.root].clone();
+            let summary = match reusable.summary_for(&transfer.callee, &root, entry_fact, request) {
                 Ok(Some(summary)) => summary,
                 Ok(None) => {
                     self.metrics.reusable_summary_misses =
@@ -1763,6 +1873,92 @@ where
                 }
                 Err(termination) => return Ok(Some(termination)),
             };
+            if summary.call_cycle == SummaryCallCycle::IncludesRoot {
+                // #2285. A relative summary carries only rows whose entry is
+                // its own procedure, and replaying one skips the summarized
+                // body. A callee that shares a call cycle with the solve root
+                // calls back into the root, and that call would be skipped with
+                // the body, so the root would silently lose its own recursive
+                // entry and every row reached through it. Refuse the summary
+                // and let the worklist solve the callee body: the guard costs
+                // recomputation and never a fact.
+                self.metrics.reusable_summary_cycle_refusals = self
+                    .metrics
+                    .reusable_summary_cycle_refusals
+                    .saturating_add(1);
+                continue;
+            }
+            if summary.called_procedures == SummaryCalledProcedures::MayEscapeContract {
+                // #2296. Binding this summary skips the callee body and every
+                // call it makes, so the subtree contributes no reached row and
+                // no coverage row to this solve. A consumer that reads
+                // completeness as a property of all reached rows and all
+                // coverage rows -- `ValueFlowPlan::execution_result_modeled` in
+                // `crate::analyzer::value_flow::plan` is exactly that shape --
+                // therefore finds its quantifiers easier to satisfy after the
+                // replay than a fresh solve does.
+                //
+                // What makes that sound is not the quantifier: it is that the
+                // summary exists at all. A summary is published only from a
+                // solve that reported itself complete, and that solve did walk
+                // the subtree, so the subtree's state is already recorded in
+                // the summary's existence. That argument holds only while the
+                // summary's validity contract covers what the body calls: it is
+                // the contract that keeps a summary built under one set of
+                // analysis inputs from being replayed into a query whose inputs
+                // leave the same subtree unmodeled. When the provider cannot
+                // state that, refuse and let the worklist solve the body. The
+                // guard costs recomputation and never a completeness claim.
+                self.metrics.reusable_summary_called_procedure_refusals = self
+                    .metrics
+                    .reusable_summary_called_procedure_refusals
+                    .saturating_add(1);
+                continue;
+            }
+            // #2291. Every reusable reached row must name the callee's own
+            // procedure. That rule is what makes a summary relative and
+            // replayable, and it is also the exact reason a replay omits rows:
+            // binding a summary skips the callee's body, and with the body the
+            // calls that body makes, so nothing below the callee is entered
+            // through this bind. For a leaf callee that costs nothing, because
+            // the callee's own rows are the whole subtree. For a non-leaf
+            // callee the transitive callees' rows are simply absent from the
+            // solve.
+            //
+            // This never touches the queried root's own rows, and it never
+            // invents one: the replayed set is a subset of what a fresh solve
+            // reaches, and everything outside the summarized subtree still
+            // agrees exactly. `deterministic_summary_family_reuse_matches_fresh_and_reference`
+            // in `tests/suite_semantic/dataflow_summaries.rs` pins all three of
+            // those claims on the `non_leaf_reuse` family of the #1563 gate.
+            //
+            // No consumer turns the omission into a user-visible verdict today,
+            // and each production oracle is in that position for its own
+            // reason, not by accident:
+            //
+            // - The taint oracle folds a subtree's observations into an
+            //   ancestor's summary along entry transfers
+            //   (`flatten_taint_observations` in `analyzer/taint/summary.rs`)
+            //   and re-injects them at the summarized callee's entry point
+            //   (`TaintSummaryOracle::summary_for` in the same file), so the
+            //   findings and the completeness verdict survive non-leaf reuse.
+            //   `taint_client::wrapper_reuses_dependency_bearing_caller_with_transitive_sink_observations`
+            //   pins both against an uncached solve.
+            // - The typestate oracle cannot reach the case at all. A protocol
+            //   summary needs a binding contract, and
+            //   `ProtocolSemanticSummarySet::build_binding_contracts` in
+            //   `analyzer/typestate/summary.rs` grants one only to a procedure
+            //   with no dependencies -- that is, a leaf -- or to a validated
+            //   recursive group, and a recursive group with any observed effect
+            //   is dropped from publication in the same file. Without a
+            //   contract the oracle declines and the projection marks the
+            //   procedure ineligible, so no dependency-bearing procedure is
+            //   ever published or replayed.
+            //
+            // A new provider must therefore either carry its subtree's
+            // observations forward the way the taint route does, or accept that
+            // the rows below its callee are absent. Do not read a missing row
+            // from a reuse-backed solve as a proven negative.
             if summary.exits.iter().any(|row| row.qualities.is_empty())
                 || summary.reached.iter().any(|row| {
                     row.qualities.is_empty() || row.point.procedure() != &transfer.callee

@@ -1,5 +1,6 @@
 use crate::analyzer::{CodeUnit, PoolSafeMemo, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_go::graph::resolver::GoEdgeIndex;
 use brokk_bifrost_go::hierarchy::GoHierarchyIndex;
 use brokk_bifrost_go::packages::GoWorkspacePathIndex;
 use moka::sync::Cache;
@@ -23,6 +24,8 @@ pub(super) struct GoMemoCaches {
     pub(super) package_clause_names: Arc<OnceLock<HashMap<ProjectFile, String>>>,
     pub(super) workspace_path_index: Arc<OnceLock<GoWorkspacePathIndex>>,
     pub(super) workspace_path_index_build_count: Arc<AtomicUsize>,
+    pub(super) usage_edge_index: Arc<PoolSafeMemo<GoEdgeIndex>>,
+    pub(super) usage_edge_index_build_count: Arc<AtomicUsize>,
     pub(super) package_files: Arc<OnceLock<HashMap<String, Arc<Vec<ProjectFile>>>>>,
     pub(super) dir_parent_files: Arc<OnceLock<HashMap<String, Arc<Vec<ProjectFile>>>>>,
     pub(super) dir_parent_suffix_files: Arc<OnceLock<HashMap<String, Arc<Vec<ProjectFile>>>>>,
@@ -39,6 +42,8 @@ impl GoMemoCaches {
             package_clause_names: Arc::new(OnceLock::new()),
             workspace_path_index: Arc::new(OnceLock::new()),
             workspace_path_index_build_count: Arc::new(AtomicUsize::new(0)),
+            usage_edge_index: Arc::new(PoolSafeMemo::new()),
+            usage_edge_index_build_count: Arc::new(AtomicUsize::new(0)),
             package_files: Arc::new(OnceLock::new()),
             dir_parent_files: Arc::new(OnceLock::new()),
             dir_parent_suffix_files: Arc::new(OnceLock::new()),
@@ -52,5 +57,9 @@ impl GoMemoCaches {
     pub(super) fn workspace_path_index_build_count(&self) -> usize {
         self.workspace_path_index_build_count
             .load(Ordering::Relaxed)
+    }
+
+    pub(super) fn usage_edge_index_build_count(&self) -> usize {
+        self.usage_edge_index_build_count.load(Ordering::Relaxed)
     }
 }

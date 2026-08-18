@@ -35,9 +35,9 @@ use crate::analyzer::project::{OverlayRevision, ProjectSourceOrigin, ProjectSour
 use crate::analyzer::store::liveness::{LivePathEntry, LivePathMap, LiveSnapshot, Liveness};
 use crate::analyzer::store::query::QueryResolver;
 use crate::analyzer::store::{
-    AnalyzerStore, DefinitionOrderCandidateRow, GenerationId, HierarchyStorageKey,
-    LimitedQueryRows, PathSymbolRow, PersistBatchLimits, PersistBatchStats, PreparedParsedBlob,
-    StoreError,
+    ActiveSearchBlob, AnalyzerStore, DefinitionOrderCandidateRow, GenerationId,
+    HierarchyStorageKey, LimitedQueryRows, PathSymbolRow, PersistBatchLimits, PersistBatchStats,
+    PreparedParsedBlob, StoreError,
 };
 use crate::analyzer::structural::materialization::MaterializationRecord;
 use crate::analyzer::{
@@ -285,6 +285,8 @@ fn projection_value_for_unit<'a, T>(
 static PREPARED_FAILURE_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 #[cfg(test)]
 static PREPARATION_FAILURE_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static FORCED_PARSE_TIMEOUT_PATHS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BulkFileStateSource {
@@ -520,6 +522,24 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn hydrate_content_qualifier(&self, content_qualifier: &str, _file: &ProjectFile) -> String {
         content_qualifier.to_string()
     }
+    /// The package prefix `file` contributes on its own, for the storage-side
+    /// name prefilter of a symbol search.
+    ///
+    /// A search pattern is matched against a hydrated fully-qualified name, so a
+    /// prefilter over persisted columns is sound only if every package prefix
+    /// hydration can produce is visible to it. The persisted
+    /// `content_qualifier` is one such prefix; this is the other one, the value
+    /// hydration falls back to when the qualifier carries nothing. The default
+    /// hydrates with an empty qualifier, which is exactly that fallback for
+    /// every adapter whose hydration either ignores the qualifier or returns it
+    /// unchanged.
+    ///
+    /// `None` means hydration blends the qualifier into a path-derived prefix,
+    /// so the reachable prefixes are not enumerable from the path and no
+    /// prefilter may drop this file's declarations.
+    fn prefilter_path_package(&self, file: &ProjectFile) -> Option<String> {
+        Some(self.hydrate_content_qualifier("", file))
+    }
     /// The anchor a unit's persisted package prefix is resolved against when
     /// the extractor recorded none. `None` means this language's packages are
     /// intrinsic to the blob and must be persisted in full.
@@ -705,6 +725,11 @@ pub struct FileState {
     /// falls back to a fresh parse in that case until the next `update`
     /// re-populates the field.
     pub(crate) parse_errors: Option<Vec<crate::analyzer::ParseError>>,
+    /// Whether tree-sitter completed the whole source before this state was
+    /// assembled. A timed-out parse still carries a conservative file-scope
+    /// marker for in-memory reads, but the store must never publish that
+    /// marker as a complete parsed blob.
+    pub(crate) parse_complete: bool,
 }
 
 impl FileState {
@@ -895,7 +920,11 @@ impl PreparedSyntaxLimitExceeded {
 
 #[derive(Debug)]
 pub(crate) enum PreparedSyntaxLimitedOutcome {
-    Available(Arc<PreparedSyntaxTree>),
+    /// The prepared tree, plus the blob identity of the exact source snapshot
+    /// it was prepared from. The two are captured together by
+    /// `resolve_prepared_source`, so a caller may pair anything it derives
+    /// from the source with that identity.
+    Available(Oid, Arc<PreparedSyntaxTree>),
     Exceeded(PreparedSyntaxLimitExceeded),
     Cancelled,
     Unavailable,
@@ -2143,6 +2172,11 @@ pub struct TreeSitterAnalyzer<A> {
     /// Ordinary clones share the owner; updates and overlays replace it.
     snapshot_caches: Arc<crate::analyzer::AnalyzerSnapshotCaches>,
     semantic_cache: crate::analyzer::semantic::service::CompleteSemanticArtifactCache,
+    /// Content digests already derived for a blob, so a repeat semantic
+    /// materialization of an unchanged file does not re-hash it. Keyed by the
+    /// blob identity of the exact source the digest was taken from, so an
+    /// entry is a pure function of content and can never go stale.
+    semantic_source_digests: crate::analyzer::semantic::service::SourceContentIdentityMemo,
     store_context: AnalyzerStoreContext,
     /// Per-request persisted read model. Live OIDs are validated once and
     /// hydrated states remain available for the graph traversal.
@@ -2237,6 +2271,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             structural_index_cache: Arc::clone(&self.structural_index_cache),
             snapshot_caches: Arc::clone(&self.snapshot_caches),
             semantic_cache: self.semantic_cache.clone(),
+            semantic_source_digests: self.semantic_source_digests.clone(),
             store_context: self.store_context.clone(),
             query_read_cache: Arc::new(RwLock::new(QueryReadCache::default())),
             live_source_snapshot: Arc::new(ArcSwapOption::empty()),
@@ -2287,6 +2322,12 @@ impl<A> TreeSitterAnalyzer<A> {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut snapshot = self.clone();
         snapshot.project = project;
+        // A request overlay may publish a transient source OID while it parses
+        // an unsaved revision. Keep that projection local to the request just
+        // as update/update_all keep their next-generation projections local;
+        // sharing it would make a later sibling or cleared overlay resolve the
+        // old transient OID instead of its own project source.
+        snapshot.store_context.live_paths = Arc::new(self.store_context.live_paths.fork());
         snapshot.structural_index_cache = Arc::new(
             crate::analyzer::structural::provider::StructuralSearchSnapshotCache::new(
                 self.config.structural_index_cache_budget_bytes(),
@@ -2440,6 +2481,8 @@ where
             structural_index_cache,
             snapshot_caches,
             semantic_cache,
+            semantic_source_digests:
+                crate::analyzer::semantic::service::SourceContentIdentityMemo::default(),
             store_context,
             query_read_cache: Arc::new(RwLock::new(QueryReadCache::new(
                 query_file_state_cache_budget,
@@ -2527,6 +2570,39 @@ where
 
     pub(crate) fn snapshot_caches(&self) -> &crate::analyzer::AnalyzerSnapshotCaches {
         &self.snapshot_caches
+    }
+
+    pub(crate) fn semantic_source_digests(
+        &self,
+    ) -> &crate::analyzer::semantic::service::SourceContentIdentityMemo {
+        &self.semantic_source_digests
+    }
+
+    /// The workspace's own identity for `file`'s current on-disk content,
+    /// answered without reading the file, or `None` when the workspace cannot
+    /// answer that cheaply and soundly.
+    ///
+    /// `None` is returned for every case where the recorded identity is not
+    /// provably the file's current content:
+    ///
+    /// * an unsaved overlay shadows the file, so its disk stat says nothing
+    ///   about the content an analysis would see;
+    /// * the live path map has no entry, or its entry was recorded without a
+    ///   filesystem stat to pair the identity with (an overlay entry, or an
+    ///   analyzer configured to trust its filesystem generation);
+    /// * the file's current stat differs from the recorded one.
+    ///
+    /// A `Some` answer costs one stat. It is deliberately not a fallback
+    /// chain: a caller uses this to *skip* reading the file, so a hidden read
+    /// here would defeat the purpose and hide real work from a budget.
+    pub(crate) fn stat_paired_live_oid(&self, file: &ProjectFile) -> Option<Oid> {
+        if self.project.has_overlay(file) {
+            return None;
+        }
+        self.store_context
+            .live_paths
+            .snapshot()
+            .stat_paired_oid_for_path(file)
     }
 
     pub(crate) fn materialize_semantics_with_lowerer(
@@ -2619,6 +2695,14 @@ where
         self.project.as_ref()
     }
 
+    /// The project handle itself, for a collaborator that outlives the borrow.
+    /// `AliasResolver` holds one so its workspace-package index can be built on
+    /// demand from the project's cached listing, instead of forcing a workspace
+    /// walk when the resolver is constructed.
+    pub fn shared_project(&self) -> Arc<dyn Project> {
+        Arc::clone(&self.project)
+    }
+
     pub fn adapter(&self) -> &A {
         self.adapter.as_ref()
     }
@@ -2654,6 +2738,8 @@ where
             structural_index_cache,
             snapshot_caches,
             semantic_cache,
+            semantic_source_digests:
+                crate::analyzer::semantic::service::SourceContentIdentityMemo::default(),
             store_context,
             query_read_cache: Arc::new(RwLock::new(QueryReadCache::new(
                 query_file_state_cache_budget,
@@ -2729,7 +2815,28 @@ where
         file: &ProjectFile,
         source: String,
     ) -> Option<FileState> {
-        Self::analyze_source_with_budget(parser, adapter, file, source, COMPLETE_FILE_PARSE_BUDGET)
+        Self::analyze_source_with_budget(
+            parser,
+            adapter,
+            file,
+            source,
+            Self::complete_file_parse_budget(file),
+        )
+    }
+
+    fn complete_file_parse_budget(file: &ProjectFile) -> Duration {
+        #[cfg(test)]
+        if FORCED_PARSE_TIMEOUT_PATHS
+            .lock()
+            .expect("forced parse timeout paths mutex poisoned")
+            .iter()
+            .any(|path| path.as_path() == file.abs_path().as_path())
+        {
+            return Duration::ZERO;
+        }
+        #[cfg(not(test))]
+        let _ = file;
+        COMPLETE_FILE_PARSE_BUDGET
     }
 
     fn analyze_source_with_budget(
@@ -2755,6 +2862,7 @@ where
                     parsed,
                     false,
                     Some(Vec::new()),
+                    false,
                 ));
             }
             BoundedParse::Cancelled => unreachable!("no cancellation token supplied"),
@@ -2771,6 +2879,7 @@ where
             parsed,
             contains_tests,
             Some(parse_errors),
+            true,
         ))
     }
 
@@ -2784,6 +2893,7 @@ where
         mut parsed: ParsedFile,
         contains_tests: bool,
         parse_errors: Option<Vec<crate::analyzer::ParseError>>,
+        parse_complete: bool,
     ) -> FileState {
         let declarations = parsed.take_declarations();
 
@@ -2812,6 +2922,7 @@ where
             test_region_units: parsed.test_region_units,
             materialization_records: parsed.materialization_records,
             parse_errors,
+            parse_complete,
         }
     }
 
@@ -3272,10 +3383,18 @@ where
                 };
                 (oid, LivePathEntry::filesystem(file.clone(), oid))
             } else {
+                // No Git identity source, so the bytes on disk are hashed here.
+                // Nothing else will notice a later disk edit on this
+                // analyzer's behalf, so the identity is not checked for
+                // liveness against the file's stat: the analyzer must keep
+                // answering from the generation it indexed until it is
+                // explicitly refreshed. The stat is still captured with the
+                // hash, so content-derived work can be reused only while the
+                // file provably still holds these bytes.
                 let bytes = std::fs::read(file.abs_path()).map_err(|err| err.to_string())?;
                 let oid =
                     Oid::hash_object(ObjectType::Blob, &bytes).map_err(|err| err.to_string())?;
-                (oid, LivePathEntry::overlay(file.clone(), oid))
+                (oid, LivePathEntry::filesystem_hashed(file.clone(), oid))
             };
             Ok(Some((file.clone(), oid, entry)))
         };
@@ -4207,6 +4326,14 @@ where
             (Arc::clone(&dirty.state), dirty.generation)
         };
 
+        // A bounded parse timeout intentionally retains a conservative state
+        // for this analyzer snapshot. Retrying that same incomplete state can
+        // never make it publishable; a later update or reopen must re-run the
+        // parser against the unchanged source instead.
+        if !state.parse_complete {
+            return Some(state);
+        }
+
         match self.store_context.store.write_parsed_blob_at_generation(
             key.oid,
             storage_key,
@@ -4622,9 +4749,9 @@ where
         &self,
         file: &ProjectFile,
         max_source_bytes: usize,
-    ) -> Result<Option<ProjectSourceSnapshot>, PreparedSyntaxLimitExceeded> {
+    ) -> Result<Option<(Oid, ProjectSourceSnapshot)>, PreparedSyntaxLimitExceeded> {
         self.resolve_prepared_source(file, Some(max_source_bytes))
-            .map(|resolved| resolved.map(|resolved| resolved.snapshot))
+            .map(|resolved| resolved.map(|resolved| (resolved.oid, resolved.snapshot)))
     }
 
     /// Prepare syntax from one atomically captured project source snapshot,
@@ -4633,9 +4760,9 @@ where
         &self,
         file: &ProjectFile,
         max_source_bytes: usize,
-    ) -> Result<Option<Arc<PreparedSyntaxTree>>, PreparedSyntaxLimitExceeded> {
+    ) -> Result<Option<(Oid, Arc<PreparedSyntaxTree>)>, PreparedSyntaxLimitExceeded> {
         match self.prepared_syntax_limited_cancellable(file, max_source_bytes, None) {
-            PreparedSyntaxLimitedOutcome::Available(prepared) => Ok(Some(prepared)),
+            PreparedSyntaxLimitedOutcome::Available(oid, prepared) => Ok(Some((oid, prepared))),
             PreparedSyntaxLimitedOutcome::Exceeded(exceeded) => Err(exceeded),
             PreparedSyntaxLimitedOutcome::Cancelled => {
                 unreachable!("no cancellation token supplied")
@@ -4677,21 +4804,21 @@ where
         };
         let cell = self.prepared_syntax_cache_cell(prepared_key.clone());
         if let Some(cached) = cell.as_ref().and_then(|cell| cell.get()).cloned() {
-            return cached.map_or(
-                PreparedSyntaxLimitedOutcome::Unavailable,
-                PreparedSyntaxLimitedOutcome::Available,
-            );
+            return cached.map_or(PreparedSyntaxLimitedOutcome::Unavailable, |prepared| {
+                PreparedSyntaxLimitedOutcome::Available(resolved.oid, prepared)
+            });
         }
         if let Some(retained) = self.prepared_syntax_store_get(&prepared_key) {
             if let Some(cell) = &cell {
                 let _ = cell.set(Some(Arc::clone(&retained)));
             }
-            return PreparedSyntaxLimitedOutcome::Available(retained);
+            return PreparedSyntaxLimitedOutcome::Available(resolved.oid, retained);
         }
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return PreparedSyntaxLimitedOutcome::Cancelled;
         }
 
+        let oid = resolved.oid;
         let prepared = match self.prepare_exact_syntax_cancellable(
             file,
             origin,
@@ -4718,10 +4845,9 @@ where
             prepared
         };
         self.prepared_syntax_store_retain(prepared_key, prepared.as_ref());
-        prepared.map_or(
-            PreparedSyntaxLimitedOutcome::Unavailable,
-            PreparedSyntaxLimitedOutcome::Available,
-        )
+        prepared.map_or(PreparedSyntaxLimitedOutcome::Unavailable, |prepared| {
+            PreparedSyntaxLimitedOutcome::Available(oid, prepared)
+        })
     }
 
     fn prepared_syntax_store_get(
@@ -5351,14 +5477,29 @@ where
                     );
             }
         }
-        let live_entry = if self.project.has_overlay(file) || self.store_context.liveness.is_none()
-        {
-            LivePathEntry::overlay(file.clone(), oid)
-        } else {
-            LivePathEntry::filesystem(file.clone(), oid)
-        };
-        self.store_context.live_paths.refresh([live_entry]);
+        self.store_context
+            .live_paths
+            .refresh([self.live_entry_for_source(file, oid)]);
         Some(state)
+    }
+
+    /// Classify the identity just derived for `file`'s current source.
+    ///
+    /// An unsaved overlay is an overlay entry: no disk stat describes it. A
+    /// file read from disk with a Git identity source behind it is a
+    /// filesystem entry, whose liveness that source can invalidate. Without
+    /// that source the identity was hashed here, and nothing else will notice
+    /// a later edit on this analyzer's behalf, so the entry stays live for the
+    /// generation that indexed it while still carrying a capture stat for
+    /// content reuse.
+    fn live_entry_for_source(&self, file: &ProjectFile, oid: Oid) -> LivePathEntry {
+        if self.project.has_overlay(file) {
+            LivePathEntry::overlay(file.clone(), oid)
+        } else if self.store_context.liveness.is_some() {
+            LivePathEntry::filesystem(file.clone(), oid)
+        } else {
+            LivePathEntry::filesystem_hashed(file.clone(), oid)
+        }
     }
 
     fn live_snapshot(&self) -> Arc<LiveSnapshot> {
@@ -6662,12 +6803,7 @@ where
         }
         let source = self.project.read_source(file).ok()?;
         let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()?;
-        let live_entry = if self.project.has_overlay(file) || self.store_context.liveness.is_none()
-        {
-            LivePathEntry::overlay(file.clone(), oid)
-        } else {
-            LivePathEntry::filesystem(file.clone(), oid)
-        };
+        let live_entry = self.live_entry_for_source(file, oid);
         let mut parser = Self::build_parser(self.adapter.parser_language());
         let state = Self::analyze_source(&mut parser, self.adapter.as_ref(), file, source)?;
         let storage_key = self.adapter.storage_language_key_for_file(file);
@@ -7980,6 +8116,54 @@ where
         fq_name != *raw && matches(&raw)
     }
 
+    /// Carry the live half of a blob's fully-qualified names into the storage
+    /// prefilter: which required literals its path-derived package prefixes
+    /// supply, or that those prefixes cannot be enumerated at all.
+    ///
+    /// Without this the prefilter would drop declarations it must keep. A Rust
+    /// declaration in `src/usages/finder.rs` has an empty persisted qualifier
+    /// and the package `usages.finder` only after path hydration, so the pattern
+    /// `usages.finder` requires the literals `usages` and `finder` that no
+    /// persisted column of that row contains.
+    fn active_search_blob(
+        &self,
+        snapshot: &LiveSnapshot,
+        oid: Oid,
+        per_pattern: &[Vec<String>],
+    ) -> ActiveSearchBlob {
+        let mut package_literals = String::new();
+        let mut prefilter_exempt = false;
+        for file in snapshot.paths_for_oid(oid) {
+            let Some(package) = self.adapter.prefilter_path_package(file) else {
+                prefilter_exempt = true;
+                continue;
+            };
+            if package.is_empty() {
+                continue;
+            }
+            let package = package.to_ascii_lowercase();
+            // Required literals are already lowercase and cannot contain the
+            // separator, so a hit is recorded as the literal itself rather than
+            // as the whole prefix: the stored text stays empty for the blobs the
+            // prefilter is meant to reject.
+            for literal in per_pattern.iter().flatten() {
+                if package.contains(literal.as_str())
+                    && !package_literals.contains(literal.as_str())
+                {
+                    if !package_literals.is_empty() {
+                        package_literals.push('\n');
+                    }
+                    package_literals.push_str(literal);
+                }
+            }
+        }
+        ActiveSearchBlob {
+            oid,
+            package_literals,
+            prefilter_exempt,
+        }
+    }
+
     fn sql_search_symbol_candidates(
         &self,
         patterns: &SearchSymbolPatternBatch,
@@ -7995,8 +8179,17 @@ where
             .fetch_add(1, Ordering::Relaxed);
         let langs = self.storage_language_keys_for_queries();
         let live_snapshot = self.live_snapshot();
-        let active_oids = live_snapshot.oids().collect::<Vec<_>>();
-        let literal_substrings = patterns.literal_ascii_substrings();
+        let required_literals = patterns.required_storage_literals();
+        let active_blobs = {
+            let _scope = profiling::scope("search_symbols.candidates.active_blobs");
+            live_snapshot
+                .oids()
+                .map(|oid| match required_literals {
+                    Some(per_pattern) => self.active_search_blob(&live_snapshot, oid, per_pattern),
+                    None => ActiveSearchBlob::unfiltered(oid),
+                })
+                .collect::<Vec<_>>()
+        };
         // Phase one enumerates only the names a pattern can match. Phase two
         // hydrates the full candidate projection for the keys that matched, so
         // signature text, primary ranges, and `CodeUnit` construction cost
@@ -8009,8 +8202,8 @@ where
                     .search_candidate_name_rows_for_langs(
                         &langs,
                         self.store_context.generations.as_ref(),
-                        &active_oids,
-                        literal_substrings.as_deref(),
+                        &active_blobs,
+                        required_literals,
                         cancellation,
                     ),
                 format!(
@@ -9793,6 +9986,13 @@ where
         }
     }
 
+    fn working_tree_identity(&self) -> Option<Arc<gitblob::WorkingTreeIdentity>> {
+        self.store_context
+            .liveness
+            .as_ref()
+            .and_then(|liveness| liveness.taken_startup_identity())
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         let mut cache = self.query_read_cache_write();
         let was_active = cache.is_active();
@@ -10783,7 +10983,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let db = root.join("analyzer.db");
-        drop(AnalyzerStore::open_persistent(&db).expect("initialize persistent store"));
+        let store =
+            Arc::new(AnalyzerStore::open_persistent(&db).expect("initialize persistent store"));
         let conn = crate::cache_db::open_unified_connection(&db).expect("open test connection");
         conn.execute_batch(
             "CREATE TRIGGER fail_epoch_publication
@@ -10797,7 +10998,7 @@ mod tests {
 
         let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Java));
         let store_context = AnalyzerStoreContext {
-            store: Arc::new(AnalyzerStore::open_persistent(&db).expect("reopen persistent store")),
+            store,
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             live_paths: Arc::new(LivePathMap::default()),
@@ -11082,6 +11283,7 @@ mod tests {
             test_region_units: HashSet::default(),
             materialization_records: Vec::new(),
             parse_errors: None,
+            parse_complete: true,
         }
     }
 
@@ -11133,35 +11335,196 @@ mod tests {
     }
 
     #[test]
-    fn parse_timeout_persists_a_file_scope_marker() {
+    fn parse_timeout_stays_transient_and_same_content_recovers_on_retry_and_reopen() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
-        let file = ProjectFile::new(root, "Generated.java");
-        let source = format!(
-            "class Generated {{\n{}\n}}\n",
+        let retry = ProjectFile::new(root.clone(), "src/Retry.java");
+        let reopen = ProjectFile::new(root.clone(), "src/Reopen.java");
+        let healthy = ProjectFile::new(root.clone(), "src/Healthy.java");
+        let retry_source = format!(
+            "package demo; class Retry {{\n{}\n}}\n",
             "int generatedField;\n".repeat(10_000)
         );
-        let mut parser = TreeSitterAnalyzer::<JavaAdapter>::build_parser(
-            JavaAdapter.parser_language_for_file(&file),
+        let reopen_source = format!(
+            "package demo; class Reopen {{\n{}\n}}\n",
+            "int generatedField;\n".repeat(10_000)
         );
+        let healthy_source = "package demo; class Healthy {}\n";
+        retry.write(&retry_source).expect("retry fixture");
+        reopen.write(&reopen_source).expect("reopen fixture");
+        healthy.write(healthy_source).expect("healthy fixture");
 
-        let state = TreeSitterAnalyzer::<JavaAdapter>::analyze_source_with_budget(
-            &mut parser,
-            &JavaAdapter,
-            &file,
-            source.clone(),
-            Duration::ZERO,
+        *FORCED_PARSE_TIMEOUT_PATHS
+            .lock()
+            .expect("forced parse timeout paths mutex poisoned") =
+            vec![retry.abs_path(), reopen.abs_path()];
+
+        let db = root.join("analyzer.db");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Java));
+        let store = Arc::new(AnalyzerStore::open_persistent(&db).expect("persistent store"));
+        let store_context = AnalyzerStoreContext {
+            store: Arc::clone(&store),
+            gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
+            liveness: None,
+            live_paths: Arc::new(LivePathMap::default()),
+            generations: Arc::new(HashMap::default()),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
+        };
+        let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            Arc::clone(&project),
+            JavaAdapter,
+            AnalyzerConfig {
+                parallelism: Some(1),
+                ..AnalyzerConfig::default()
+            },
+            store_context,
+            None,
         )
-        .expect("a timed-out source keeps a persistent file marker");
+        .expect("initial timed-out reconciliation");
+        FORCED_PARSE_TIMEOUT_PATHS
+            .lock()
+            .expect("forced parse timeout paths mutex poisoned")
+            .clear();
 
-        assert_eq!(state.declarations.len(), 1);
-        assert!(state.declarations.iter().all(CodeUnit::is_file_scope));
-        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
-        let store = AnalyzerStore::open_in_memory().unwrap();
-        store
-            .write_parsed_blob(oid, "java", &JavaAdapter, &state)
-            .unwrap();
-        assert!(store.contains_parsed_blob(oid, "java").unwrap());
+        assert_eq!(
+            analyzer.state.dirty_snapshot().len(),
+            2,
+            "both timed-out states must remain transient and retryable"
+        );
+        for (file, source, missing_name) in [
+            (&retry, retry_source.as_str(), "Retry"),
+            (&reopen, reopen_source.as_str(), "Reopen"),
+        ] {
+            let state = analyzer
+                .fetch_file_state(file)
+                .expect("timed-out state remains available in memory");
+            assert_eq!(state.source, source, "fixture bytes must participate");
+            assert!(!state.parse_complete);
+            assert_eq!(state.declarations.len(), 1);
+            assert!(state.declarations.iter().all(CodeUnit::is_file_scope));
+            assert!(
+                !analyzer
+                    .get_declarations(file)
+                    .iter()
+                    .any(|declaration| declaration.short_name() == missing_name)
+            );
+            let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
+            assert!(
+                !store.contains_parsed_blob(oid, "java").unwrap(),
+                "a timeout marker must not be published as a complete blob"
+            );
+        }
+
+        let healthy_state = analyzer
+            .fetch_file_state(&healthy)
+            .expect("healthy peer state");
+        assert_eq!(healthy_state.source, healthy_source);
+        assert!(healthy_state.parse_complete);
+        assert!(
+            analyzer
+                .get_declarations(&healthy)
+                .iter()
+                .any(|declaration| declaration.short_name() == "Healthy")
+        );
+        let healthy_oid = Oid::hash_object(ObjectType::Blob, healthy_source.as_bytes()).unwrap();
+        assert!(store.contains_parsed_blob(healthy_oid, "java").unwrap());
+
+        let retry_oid = Oid::hash_object(ObjectType::Blob, retry_source.as_bytes()).unwrap();
+        let retry_generation = analyzer.store_context.generations["java"];
+        let partial_retry_state = analyzer
+            .fetch_file_state(&retry)
+            .expect("partial retry state");
+        let preparation_error = AnalyzerStore::prepare_parsed_blob(
+            retry_oid,
+            "java",
+            retry_generation,
+            &JavaAdapter,
+            Arc::clone(&partial_retry_state),
+        )
+        .expect_err("prepared persistence must reject an incomplete parser result");
+        assert!(
+            preparation_error
+                .to_string()
+                .contains("timed-out file analysis")
+        );
+        let direct_error = store
+            .write_parsed_blob_at_generation(
+                retry_oid,
+                "java",
+                retry_generation,
+                &JavaAdapter,
+                partial_retry_state.as_ref(),
+            )
+            .expect_err("the direct write path must enforce the same completeness invariant");
+        assert!(direct_error.to_string().contains("timed-out file analysis"));
+        assert!(!store.contains_parsed_blob(retry_oid, "java").unwrap());
+
+        let retried = analyzer.update(&BTreeSet::from([retry.clone()]));
+        let retried_state = retried.fetch_file_state(&retry).expect("retried state");
+        assert!(retried_state.parse_complete);
+        let retried_declarations = retried.get_declarations(&retry);
+        assert!(
+            retried_declarations
+                .iter()
+                .any(|declaration| declaration.short_name() == "Retry")
+        );
+        assert!(store.contains_parsed_blob(retry_oid, "java").unwrap());
+
+        drop(retried);
+        drop(analyzer);
+        drop(store);
+
+        let reopened_store =
+            Arc::new(AnalyzerStore::open_persistent(&db).expect("reopen persistent store"));
+        let reopened_context = AnalyzerStoreContext {
+            store: Arc::clone(&reopened_store),
+            gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
+            liveness: None,
+            live_paths: Arc::new(LivePathMap::default()),
+            generations: Arc::new(HashMap::default()),
+            startup_cache_validation: StartupCacheValidation::FullIntegrity,
+        };
+        let reopened = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            project,
+            JavaAdapter,
+            AnalyzerConfig {
+                parallelism: Some(1),
+                ..AnalyzerConfig::default()
+            },
+            reopened_context,
+            None,
+        )
+        .expect("reopen reparses the still-missing same-content blob");
+
+        let reopened_state = reopened
+            .fetch_file_state(&reopen)
+            .expect("reopened complete state");
+        assert_eq!(reopened_state.source, reopen_source);
+        assert!(reopened_state.parse_complete);
+        assert!(
+            reopened
+                .get_declarations(&reopen)
+                .iter()
+                .any(|declaration| declaration.short_name() == "Reopen")
+        );
+        for (file, source) in [(&retry, retry_source.as_str()), (&healthy, healthy_source)] {
+            let state = reopened
+                .fetch_file_state(file)
+                .expect("reopened complete peer state");
+            assert_eq!(state.source, source);
+            assert!(state.parse_complete);
+        }
+        assert_eq!(
+            reopened.get_declarations(&retry),
+            retried_declarations,
+            "same-content update and persisted reopen must converge"
+        );
+        let reopen_oid = Oid::hash_object(ObjectType::Blob, reopen_source.as_bytes()).unwrap();
+        assert!(
+            reopened_store
+                .contains_parsed_blob(reopen_oid, "java")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -12904,7 +13267,7 @@ mod tests {
         let exact = |label: &str| {
             let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
             match analyzer.prepared_syntax_limited(&file, 1 << 20) {
-                Ok(Some(prepared)) => prepared,
+                Ok(Some((_, prepared))) => prepared,
                 other => panic!("{label} exact syntax: {other:?}"),
             }
         };
@@ -13280,7 +13643,7 @@ mod tests {
         assert_eq!(exceeded.minimum_source_bytes(), source.len());
         assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 0);
 
-        let prepared = analyzer
+        let (_, prepared) = analyzer
             .prepared_syntax_limited(&file, source.len())
             .expect("exact source-size cap should be accepted")
             .expect("bounded source should prepare");
@@ -13322,7 +13685,7 @@ mod tests {
         );
 
         let prepared = analyzer.prepared_syntax_limited_cancellable(&file, source.len(), None);
-        let PreparedSyntaxLimitedOutcome::Available(prepared) = prepared else {
+        let PreparedSyntaxLimitedOutcome::Available(_, prepared) = prepared else {
             panic!("a later uncancelled request must retry instead of reading cached failure");
         };
         assert_eq!(prepared.source(), source);
@@ -13371,7 +13734,7 @@ mod tests {
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
         let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
 
-        let prepared = analyzer
+        let (_, prepared) = analyzer
             .prepared_syntax_limited(&file, 0)
             .expect("empty source fits a zero-byte preparation cap")
             .expect("empty source remains valid syntax input");
@@ -13638,6 +14001,45 @@ mod tests {
             1,
             "snapshot should read its own overlay"
         );
+    }
+
+    #[test]
+    fn clone_with_project_isolates_transient_live_paths_from_disk_and_siblings() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/main.rs");
+        std::fs::create_dir_all(file.abs_path().parent().expect("source parent"))
+            .expect("source directory");
+        let disk_source = "fn disk() {}\n";
+        let overlay_source = "fn unsaved() { disk(); }\n";
+        file.write(disk_source).expect("disk source");
+        let base: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
+        let disk = TreeSitterAnalyzer::new(Arc::clone(&base), RustAdapter);
+        let sibling = disk.clone_with_project(Arc::clone(&base));
+        let disk_oid = Oid::hash_object(ObjectType::Blob, disk_source.as_bytes()).unwrap();
+        let overlay_oid = Oid::hash_object(ObjectType::Blob, overlay_source.as_bytes()).unwrap();
+
+        let live_overlay = Arc::new(OverlayProject::new(Arc::clone(&base)));
+        assert!(live_overlay.set(file.abs_path(), overlay_source.to_owned()));
+        let frozen_overlay: Arc<dyn Project> = Arc::new(live_overlay.snapshot());
+        let request = disk.clone_with_project(frozen_overlay);
+        let state = request
+            .fetch_file_state(&file)
+            .expect("parse the transient overlay revision");
+        assert_eq!(state.source, overlay_source);
+        assert_eq!(request.resolve_live_oid_for_file(&file), Some(overlay_oid));
+
+        assert_eq!(disk.resolve_live_oid_for_file(&file), Some(disk_oid));
+        assert_eq!(sibling.resolve_live_oid_for_file(&file), Some(disk_oid));
+        assert_eq!(disk.file_source(&file).as_deref(), Some(disk_source));
+        assert_eq!(sibling.file_source(&file).as_deref(), Some(disk_source));
+
+        assert!(live_overlay.clear(&file.abs_path()));
+        let cleared_project: Arc<dyn Project> = Arc::new(live_overlay.snapshot());
+        let cleared = disk.clone_with_project(cleared_project);
+        assert_eq!(cleared.resolve_live_oid_for_file(&file), Some(disk_oid));
+        assert_eq!(cleared.file_source(&file).as_deref(), Some(disk_source));
+        assert_eq!(request.file_source(&file).as_deref(), Some(overlay_source));
     }
 
     #[test]

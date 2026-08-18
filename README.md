@@ -10,6 +10,7 @@
   <a href="https://github.com/BrokkAi/bifrost/releases/latest"><img src="https://img.shields.io/github/v/release/BrokkAi/bifrost" alt="Latest release"></a>
   <a href="https://crates.io/crates/brokk-bifrost"><img src="https://img.shields.io/crates/v/brokk-bifrost" alt="crates.io"></a>
   <a href="https://pypi.org/project/brokk-bifrost-searchtools/"><img src="https://img.shields.io/pypi/v/brokk-bifrost-searchtools" alt="PyPI"></a>
+  <a href="https://www.npmjs.com/package/@brokkai/bifrost"><img src="https://img.shields.io/npm/v/%40brokkai%2Fbifrost" alt="npm"></a>
   <a href="LICENSE.md"><img src="https://img.shields.io/github/license/BrokkAi/bifrost" alt="Apache-2.0"></a>
 </p>
 
@@ -166,6 +167,28 @@ GitHub Pages publication is handled by `.github/workflows/docs.yml`. Release tag
 builds publish both the latest docs site and a versioned snapshot under
 `versions/<tag>/`.
 
+## Repository Layout
+
+The repository is organized around the public product surfaces:
+
+- **Core analysis:** [`crates/`](crates/) contains the Rust workspace crates;
+  [`src/`](src/) provides the top-level facade and CLI; [`schemas/`](schemas/)
+  holds shared data contracts.
+- **Integrations and distribution:** [`editors/`](editors/) contains editor
+  integrations; [`plugins/`](plugins/) contains coding-agent plugins; and
+  [`npm/`](npm/), [`packaging/`](packaging/), and
+  [`bifrost_searchtools/`](bifrost_searchtools/) expose or package the
+  analyzer.
+- **Documentation and examples:** [`docs/`](docs/) is the documentation site;
+  [`examples/`](examples/) contains runnable examples.
+- **Analysis data and project defaults:** [`semantic-packs/`](semantic-packs/)
+  contains shipped semantic knowledge; [`.bifrost/`](.bifrost/) contains
+  project-level analysis defaults.
+- **Development support:** [`benchmark/`](benchmark/) covers reproducible
+  measurements; [`scripts/`](scripts/) and [`tools/`](tools/) hold maintenance
+  and release helpers. Root manifests plus `.github/`, `.cargo/`, and `.config/`
+  define builds, checks, and automation.
+
 ## License and Commercial Use
 
 Bifrost's public open core is licensed under `Apache-2.0` and may be used in
@@ -175,6 +198,18 @@ terms and [Third-Party Notices](https://bifrost.brokk.ai/third-party-notices/)
 for the additional terms that apply to official binaries and semantic packs.
 
 ## Contributing
+
+<p><strong>Project contributors</strong>&nbsp;&nbsp;
+  <a href="https://github.com/jbellis"><img src="https://github.com/jbellis.png?size=96" width="40" height="40" alt="@jbellis" title="@jbellis"></a>
+  <a href="https://github.com/DavidBakerEffendi"><img src="https://github.com/DavidBakerEffendi.png?size=96" width="40" height="40" alt="@DavidBakerEffendi" title="@DavidBakerEffendi"></a>
+  <a href="https://github.com/foundev"><img src="https://github.com/foundev.png?size=96" width="40" height="40" alt="@foundev" title="@foundev"></a>
+  <a href="https://github.com/sontek"><img src="https://github.com/sontek.png?size=96" width="40" height="40" alt="@sontek" title="@sontek"></a>
+  <a href="https://github.com/alexswearingen"><img src="https://github.com/alexswearingen.png?size=96" width="40" height="40" alt="@alexswearingen" title="@alexswearingen"></a>
+  <a href="https://github.com/joshuadavidthomas"><img src="https://github.com/joshuadavidthomas.png?size=96" width="40" height="40" alt="@joshuadavidthomas" title="@joshuadavidthomas"></a>
+</p>
+
+<sub>The public repository is projected from Bifrost's open-core source, so its
+GitHub contributor graph does not reflect everyone who helped build the project.</sub>
 
 For local development, test commands, repository-local Python workflow, and
 release tagging, see [CONTRIBUTING.md](CONTRIBUTING.md).

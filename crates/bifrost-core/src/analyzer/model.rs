@@ -408,6 +408,27 @@ pub enum CallableLinkage {
     Internal,
 }
 
+impl CallableLinkage {
+    /// The spelling this variant is stored as in
+    /// `unit_signature_metadata.callable_linkage`. The column's CHECK
+    /// constraint in `crates/bifrost-core/migrations/cache/0023-signature-metadata-columns.sql`
+    /// lists exactly these strings, so a new variant needs a migration.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::External => "external",
+            Self::Internal => "internal",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "external" => Some(Self::External),
+            "internal" => Some(Self::Internal),
+            _ => None,
+        }
+    }
+}
+
 /// Linkage carried by C++ global-field metadata.
 ///
 /// C++ `const` and `constexpr` fields are internal unless an exact peer is
@@ -418,6 +439,29 @@ pub enum CppFieldLinkage {
     External,
     Internal,
     InternalUnlessExternalPeer,
+}
+
+impl CppFieldLinkage {
+    /// The spelling this variant is stored as in
+    /// `unit_signature_metadata.cpp_field_linkage`. The column's CHECK
+    /// constraint lists exactly these strings, so a new variant needs a
+    /// migration.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::External => "external",
+            Self::Internal => "internal",
+            Self::InternalUnlessExternalPeer => "internal_unless_external_peer",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "external" => Some(Self::External),
+            "internal" => Some(Self::Internal),
+            "internal_unless_external_peer" => Some(Self::InternalUnlessExternalPeer),
+            _ => None,
+        }
+    }
 }
 
 /// Whether one callable declaration proves that runtime dispatch is closed.
@@ -438,6 +482,14 @@ impl DispatchExtensibility {
         match self {
             Self::Open => "open",
             Self::Closed => "closed",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "open" => Some(Self::Open),
+            "closed" => Some(Self::Closed),
+            _ => None,
         }
     }
 }
@@ -563,7 +615,14 @@ const MAX_STRUCTURED_TYPE_NAME_COMPONENTS: usize = 1_024;
 const MAX_STRUCTURED_TYPE_IDENTITY_STRING_BYTES: usize = 1 << 20;
 pub(crate) const MAX_STRUCTURED_TYPE_IDENTITY_NODES: usize = 20_000;
 const MAX_STRUCTURED_TYPE_IDENTITY_EDGES: usize = 40_000;
-pub const MAX_SIGNATURE_METADATA_BLOB_BYTES: usize = 8 << 20;
+/// The largest a single stored signature-metadata text or JSON column may be.
+///
+/// Enforced by CHECK constraints in
+/// `crates/bifrost-core/migrations/cache/0023-signature-metadata-columns.sql`,
+/// which spells the value as the literal 8388608 because a checked-in SQL file
+/// cannot interpolate a Rust constant. A const assertion in
+/// `crates/bifrost-core/src/cache_db.rs` keeps the two equal.
+pub const MAX_SIGNATURE_METADATA_COLUMN_BYTES: usize = 8 << 20;
 
 struct BoundedStructuredTypeNameComponentsSeed {
     max_components: usize,
@@ -958,6 +1017,28 @@ enum StructuredTypeNode {
     Generic {
         base: StructuredTypeNodeId,
         arguments: Vec<StructuredTypeNodeId>,
+    },
+}
+
+/// A read-only view of one [`StructuredTypeIdentity`] arena node.
+///
+/// The arena's node type stays private so that its invariants - children below
+/// their parent, bounded resources - cannot be bypassed by construction. This
+/// view publishes the same shape for reading, with child edges as ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredTypeNodeView<'a> {
+    Named(&'a StructuredTypeName),
+    Pointer(StructuredTypeNodeId),
+    Reference(StructuredTypeNodeId),
+    Array(StructuredTypeNodeId),
+    Slice(StructuredTypeNodeId),
+    Map {
+        key: StructuredTypeNodeId,
+        value: StructuredTypeNodeId,
+    },
+    Generic {
+        base: StructuredTypeNodeId,
+        arguments: &'a [StructuredTypeNodeId],
     },
 }
 
@@ -1393,6 +1474,36 @@ impl StructuredTypeIdentity {
         })
     }
 
+    /// The arena node the identity's shape starts from.
+    ///
+    /// Together with [`Self::view`] this is the whole read interface a consumer
+    /// needs to translate a parser-derived type into another model, such as a
+    /// semantic-pack type reference, without re-parsing source text. Children
+    /// are handed back as ids rather than as borrowed subtrees so that the
+    /// translation stays iterative on a deeply nested type.
+    pub const fn root_id(&self) -> StructuredTypeNodeId {
+        self.root
+    }
+
+    /// The shape of one arena node, or `None` when the id is not in this arena.
+    pub fn view(&self, id: StructuredTypeNodeId) -> Option<StructuredTypeNodeView<'_>> {
+        Some(match self.node(id)? {
+            StructuredTypeNode::Named(name) => StructuredTypeNodeView::Named(name),
+            StructuredTypeNode::Pointer(inner) => StructuredTypeNodeView::Pointer(*inner),
+            StructuredTypeNode::Reference(inner) => StructuredTypeNodeView::Reference(*inner),
+            StructuredTypeNode::Array(inner) => StructuredTypeNodeView::Array(*inner),
+            StructuredTypeNode::Slice(inner) => StructuredTypeNodeView::Slice(*inner),
+            StructuredTypeNode::Map { key, value } => StructuredTypeNodeView::Map {
+                key: *key,
+                value: *value,
+            },
+            StructuredTypeNode::Generic { base, arguments } => StructuredTypeNodeView::Generic {
+                base: *base,
+                arguments,
+            },
+        })
+    }
+
     pub fn nominal_name(&self) -> Option<&StructuredTypeName> {
         self.nominal_name_with(|| true)
     }
@@ -1714,6 +1825,20 @@ pub struct CppTemplateMetadata {
     pub alias_target: Option<CppTemplateAliasTargetMetadata>,
 }
 
+impl CppTemplateMetadata {
+    /// A primary template declares at least one template parameter and does
+    /// not specialize its name. An explicit empty specialization has neither
+    /// parameters nor specialization arguments, so argument-list emptiness
+    /// alone cannot distinguish it from the primary.
+    pub fn is_primary(&self) -> bool {
+        !self.parameters.is_empty() && self.specialization_arguments.is_empty()
+    }
+
+    pub fn is_specialization(&self) -> bool {
+        !self.is_primary()
+    }
+}
+
 impl SignatureMetadata {
     pub fn new(label: impl Into<String>, parameters: Vec<ParameterMetadata>) -> Self {
         Self {
@@ -1792,6 +1917,29 @@ impl SignatureMetadata {
         self.callable_is_constructor = is_constructor;
         self.callable_declared_visibility = Some(visibility);
         self.callable_modifiers_recorded = true;
+        self
+    }
+
+    /// Restore the four callable modifier facts independently, as a store
+    /// rehydrating a persisted row must.
+    ///
+    /// [`Self::with_callable_modifiers`] is the parser-side entry point:
+    /// calling it *is* the statement that an adapter read the modifier nodes,
+    /// so it cannot express a row where nobody looked. The persisted columns
+    /// are independent, and a reader that reconstructed them through the
+    /// parser-side builder would silently promote "unread" to "read" or drop a
+    /// flag that no builder happens to set on its own today.
+    pub fn with_persisted_callable_modifiers(
+        mut self,
+        is_static: bool,
+        is_constructor: bool,
+        visibility: Option<DeclaredVisibility>,
+        modifiers_recorded: bool,
+    ) -> Self {
+        self.callable_is_static = is_static;
+        self.callable_is_constructor = is_constructor;
+        self.callable_declared_visibility = visibility;
+        self.callable_modifiers_recorded = modifiers_recorded;
         self
     }
 
@@ -2707,6 +2855,26 @@ impl CodeUnit {
             .rendered_name
             .owner_identifier
             .map(|(start, end)| &self.0.rendered_name.display[start..end])
+    }
+
+    /// Whether this declaration's structural owner is a type-like scope -- a
+    /// class, struct, enum, trait, interface, object, or nested type -- rather
+    /// than a package, module, file path, or another callable.
+    ///
+    /// [`CodeUnitType`] coarsens every callable to
+    /// [`CodeUnitType::Function`], so this is what recovers the member leaf a
+    /// consumer needs to tell a method from a module-level function. It reads
+    /// the penultimate [`FqName`] segment's recorded kind; it never splits the
+    /// rendered name, and it never treats "has an owner segment" as "is a
+    /// member of a type", which would make every Go or Python top-level
+    /// function a method of its package.
+    pub fn owner_is_type_scope(&self) -> bool {
+        let segments = self.0.fq.segments();
+        segments.len() >= 2
+            && matches!(
+                segment_interner().resolve(segments[segments.len() - 2]).1,
+                SegmentKind::Type | SegmentKind::Companion | SegmentKind::Nested
+            )
     }
 
     /// Record where this unit's package prefix is anchored, so persistence can
@@ -4286,6 +4454,57 @@ mod project_file_identity_tests {
         assert_eq!(left.cmp(&right), reference_cmp(&left, &right));
         assert_eq!(right.cmp(&left), reference_cmp(&right, &left));
         assert_ne!(hash_of(&left), hash_of(&right));
+    }
+}
+
+#[cfg(test)]
+mod owner_scope_tests {
+    use super::*;
+    use crate::analyzer::fq_name::SegmentKind;
+
+    /// A member of a type and a member of a package both have an owner
+    /// segment, and only the first is a method. Recovering the leaf that
+    /// [`CodeUnitType::Function`] coarsens therefore has to read the owner
+    /// segment's recorded kind: taking "has an owner" for "is a member of a
+    /// type" would make every Go or Python top-level function a method of its
+    /// package.
+    #[test]
+    fn a_type_owner_is_a_member_scope_and_a_package_owner_is_not() {
+        let interner = segment_interner();
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\owner-scope")
+        } else {
+            PathBuf::from("/owner-scope")
+        };
+        let file = ProjectFile::new(root, "app/widget.py");
+        let unit = |fq: FqName, package_segment_count: usize| {
+            CodeUnit::from_fq(
+                file.clone(),
+                CodeUnitType::Function,
+                fq,
+                package_segment_count,
+                None,
+                false,
+            )
+        };
+
+        let method = unit(
+            FqName::new()
+                .with_pushed(interner.intern("app", SegmentKind::Package))
+                .with_pushed(interner.intern("Widget", SegmentKind::Type))
+                .with_pushed(interner.intern("render", SegmentKind::Member)),
+            1,
+        );
+        assert!(method.owner_is_type_scope());
+
+        let module_function = unit(
+            FqName::new()
+                .with_pushed(interner.intern("app", SegmentKind::Package))
+                .with_pushed(interner.intern("render", SegmentKind::Member)),
+            1,
+        );
+        assert_eq!(module_function.owner_identifier(), Some("app"));
+        assert!(!module_function.owner_is_type_scope());
     }
 }
 

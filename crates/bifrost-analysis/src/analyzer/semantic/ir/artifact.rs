@@ -872,6 +872,23 @@ impl ProcedureHandle {
         self.id
     }
 
+    /// The procedure's durable identity: the owning artifact's validity key and
+    /// this procedure's dense ID.
+    ///
+    /// Handle equality is materialization-scoped, so a handle minted from a
+    /// second materialization of one immutable artifact is unequal to the
+    /// first even though both name the same procedure. A caller that holds
+    /// both -- a closure walk whose byte-bounded artifact cache evicted and
+    /// re-materialized a file mid-walk -- keys on this instead, because
+    /// `SemanticArtifactKey` pins the revision, adapter, IR version,
+    /// configuration, and dependencies, and the dense ID is stable beneath it.
+    ///
+    /// This is the owned, hashable form of the comparison
+    /// `value_flow::model` uses for carriers.
+    pub fn durable_key(&self) -> (SemanticArtifactKey, ProcedureId) {
+        (self.artifact.key().clone(), self.id)
+    }
+
     pub fn semantics(&self) -> &ProcedureSemantics {
         // Construction is private and checked by SemanticArtifact::procedure_handle.
         &self.artifact.procedures[self.id.index()]
@@ -980,6 +997,22 @@ impl<I: Copy> ProcedureLocalHandle<I> {
 
     pub const fn id(&self) -> I {
         self.id
+    }
+
+    /// The scoped row's durable identity: the owning procedure's durable key
+    /// and this row's dense ID.
+    ///
+    /// Every dense ID in this family is procedure-local -- a `CallSiteId`
+    /// indexes `ProcedureSemantics::call_sites`, a `ValueId` indexes
+    /// `ProcedureSemantics::values`, and so on -- so the owning procedure's
+    /// durable key is the scope that makes the pair unique.
+    ///
+    /// This mirrors [`ProcedureHandle::durable_key`] and exists for the same
+    /// reason: handle equality compares the owning `Arc<SemanticArtifact>` by
+    /// pointer, so a caller that must recognize one row across two
+    /// materializations of one immutable artifact cannot use it.
+    pub fn durable_key(&self) -> ((SemanticArtifactKey, ProcedureId), I) {
+        (self.procedure.durable_key(), self.id)
     }
 }
 

@@ -1,4 +1,5 @@
 use super::syntax::*;
+use super::values::field_declaration_anchors;
 use super::*;
 
 pub(super) fn lower_procedure<'tree, 'targets>(
@@ -29,6 +30,11 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         prepared,
         session,
         expression_values: HashMap::default(),
+        constant_index_values: HashMap::default(),
+        field_declaration_anchors: field_declaration_anchors(prepared),
+        local_types: HashMap::default(),
+        non_null_values: HashSet::default(),
+        catch_binders: HashMap::default(),
         parameters: HashMap::default(),
         locals: HashMap::default(),
         receiver: None,
@@ -172,6 +178,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .ok_or_else(|| {
                     JavaLoweringError::Invalid("local declaration was not preindexed".into())
                 })?;
+            if self.expression_is_non_null(*initializer) {
+                self.non_null_values.insert(target);
+            }
             let value =
                 self.expression_value(builder, *initializer, expression_value_kind(*initializer))?;
             self.append_effect(
@@ -234,6 +243,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let local = self.local_at(name, left.start_byte());
             let target = local.or_else(|| self.parameters.get(name).copied());
             if let Some(target) = target {
+                if local.is_some() && self.expression_is_non_null(right) {
+                    self.non_null_values.insert(target);
+                }
                 let kind = if local.is_some() {
                     ValueFlowKind::Local
                 } else {
@@ -259,15 +271,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let object = required_field(left, "object")?;
             let field = required_field(left, "field")?;
             let base = self.expression_value(builder, object, expression_value_kind(object))?;
+            let (member, resolved) = self.memory_member_locator(field, object)?;
             let location = self.session.add_memory_location(
                 builder,
                 terminal,
-                MemoryLocationKind::Field {
-                    base,
-                    member: self.memory_member_locator(field)?,
-                },
+                MemoryLocationKind::Field { base, member },
             )?;
-            self.add_field_identity_gap(builder, terminal, location)?;
+            if !resolved {
+                self.add_field_identity_gap(builder, terminal, location)?;
+            }
             self.append_effect(
                 builder,
                 terminal,
@@ -282,8 +294,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let array = required_field(left, "array")?;
             let index = required_field(left, "index")?;
             let base = self.expression_value(builder, array, expression_value_kind(array))?;
-            let index_value =
-                self.expression_value(builder, index, expression_value_kind(index))?;
+            let index_value = self.index_value(builder, index)?;
             let location = self.session.add_memory_location(
                 builder,
                 terminal,
@@ -367,6 +378,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), JavaLoweringError> {
         match (node.kind(), binary_operator(node)) {
+            ("true", _) => self.edge(builder, entry, when_true),
+            ("false", _) => self.edge(builder, entry, when_false),
             ("binary_expression", Some("&&")) => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
@@ -548,7 +561,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let value_node = first_named_child(node)
                     .ok_or_else(|| missing_field(node, "thrown expression"))?;
                 let terminal = self.point(builder, node, Vec::new())?;
+                let expression =
+                    self.expression_value(builder, value_node, expression_value_kind(value_node))?;
                 let value = self.value(builder, terminal, SemanticValueKind::Exception)?;
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source: expression,
+                        target: value,
+                    },
+                )?;
                 self.append_effect(
                     builder,
                     terminal,
@@ -560,7 +584,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     next: EdgeTarget::normal(terminal),
                     scope,
                 });
-                self.abrupt(builder, terminal, scope, CompletionKind::Throw, None, stack)
+                self.abrupt_throw(builder, terminal, scope, value, stack)
             }
             "yield_statement" => {
                 let value_node = first_named_child(node)
@@ -927,10 +951,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "parenthesized_expression" => {
                 if let Some(value) = first_named_child(node) {
+                    let terminal = self.point(builder, node, Vec::new())?;
+                    let inner =
+                        self.expression_value(builder, value, expression_value_kind(value))?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Local,
+                            source: inner,
+                            target: result,
+                        },
+                    )?;
+                    self.edge(builder, terminal, next)?;
                     stack.push(Work::Expression {
                         node: value,
                         entry,
-                        next,
+                        next: EdgeTarget::normal(terminal),
                         scope,
                     });
                     Ok(())
@@ -939,20 +976,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 }
             }
             "field_access" => {
-                self.implicit_exception_gap(builder, entry, node)?;
                 let object = required_field(node, "object")?;
                 let field = required_field(node, "field")?;
+                if !self.expression_is_non_null(object) {
+                    self.implicit_exception_gap(builder, entry, node)?;
+                }
                 let access = self.point(builder, node, Vec::new())?;
                 let base = self.expression_value(builder, object, expression_value_kind(object))?;
+                let (member, resolved) = self.memory_member_locator(field, object)?;
                 let location = self.session.add_memory_location(
                     builder,
                     access,
-                    MemoryLocationKind::Field {
-                        base,
-                        member: self.memory_member_locator(field)?,
-                    },
+                    MemoryLocationKind::Field { base, member },
                 )?;
-                self.add_field_identity_gap(builder, access, location)?;
+                if !resolved {
+                    self.add_field_identity_gap(builder, access, location)?;
+                }
                 self.append_effect(
                     builder,
                     access,
@@ -978,8 +1017,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let index = required_field(node, "index")?;
                 let access = self.point(builder, node, Vec::new())?;
                 let base = self.expression_value(builder, array, expression_value_kind(array))?;
-                let index_value =
-                    self.expression_value(builder, index, expression_value_kind(index))?;
+                let index_value = self.index_value(builder, index)?;
                 let location = self.session.add_memory_location(
                     builder,
                     access,
@@ -1063,6 +1101,50 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
     }
 
+    fn for_condition_starts_true(
+        &self,
+        initializers: &[Node<'tree>],
+        condition: Node<'tree>,
+    ) -> bool {
+        let Some(operator) = condition.child_by_field_name("operator") else {
+            return false;
+        };
+        if operator.kind() != "<" {
+            return false;
+        }
+        let Some(left) = condition.child_by_field_name("left") else {
+            return false;
+        };
+        let Some(right) = condition.child_by_field_name("right") else {
+            return false;
+        };
+        let Some(left_name) = node_text(self.prepared.source(), left) else {
+            return false;
+        };
+        let Some(limit) = decimal_integer_value(self.prepared.source(), right) else {
+            return false;
+        };
+        initializers.iter().any(|initializer| {
+            if initializer.kind() != "local_variable_declaration" {
+                return false;
+            }
+            named_children(*initializer)
+                .into_iter()
+                .filter(|child| child.kind() == "variable_declarator")
+                .any(|declarator| {
+                    let Some(name) = declarator.child_by_field_name("name") else {
+                        return false;
+                    };
+                    let Some(value) = declarator.child_by_field_name("value") else {
+                        return false;
+                    };
+                    node_text(self.prepared.source(), name) == Some(left_name)
+                        && decimal_integer_value(self.prepared.source(), value)
+                            .is_some_and(|start| start < limit)
+                })
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn for_statement(
         &mut self,
@@ -1089,6 +1171,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             None => self.point(builder, node, Vec::new())?,
         };
         let body_entry = self.point(builder, body, Vec::new())?;
+        let initial_condition_target = condition
+            .filter(|condition| self.for_condition_starts_true(&initializers, *condition))
+            .map_or(EdgeTarget::normal(condition_entry), |_| {
+                EdgeTarget::normal(body_entry)
+            });
         let updates = updates
             .into_iter()
             .map(|update| {
@@ -1113,6 +1200,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             &initializers,
             condition.map(|payload| (payload, condition_entry)),
             condition_entry,
+            initial_condition_target,
             (body, body_entry),
             &updates,
             stack,
@@ -1522,18 +1610,44 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .iter()
             .map(|body| self.point(builder, *body, Vec::new()))
             .collect::<Result<Vec<_>, _>>()?;
+        let catch_binders = catches
+            .iter()
+            .map(|catch| {
+                let parameter = named_children(*catch)
+                    .into_iter()
+                    .find(|child| child.kind() == "catch_formal_parameter")?;
+                let name = parameter.child_by_field_name("name")?;
+                let text = node_text(self.prepared.source(), name)?;
+                self.local_declaration_value(text, name.start_byte())
+            })
+            .collect::<Vec<_>>();
+        let precise_single_catch = catches.len() == 1
+            && catch_binders.first().copied().flatten().is_some()
+            && catches
+                .first()
+                .and_then(|catch| {
+                    named_children(*catch)
+                        .into_iter()
+                        .find(|child| child.kind() == "catch_formal_parameter")
+                })
+                .is_some_and(catch_parameter_has_precise_type);
         let try_scope = if catch_entries.is_empty() {
             cleanup_scope
         } else {
             let dispatcher = self.point(builder, node, Vec::new())?;
-            self.add_gap(
-                builder,
-                dispatcher,
-                SemanticGapSubject::Point,
-                SemanticCapability::ExceptionalControlFlow,
-                SemanticGapKind::Unknown,
-                "catch-type compatibility and multi-catch selection require type refinement",
-            )?;
+            if !precise_single_catch {
+                self.add_gap(
+                    builder,
+                    dispatcher,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::ExceptionalControlFlow,
+                    SemanticGapKind::Unknown,
+                    "catch-type compatibility and multi-catch selection require type refinement",
+                )?;
+            }
+            if precise_single_catch && let Some(Some(binder)) = catch_binders.first() {
+                self.catch_binders.insert(dispatcher, *binder);
+            }
             for catch_entry in &catch_entries {
                 self.edge(
                     builder,
@@ -2168,6 +2282,39 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.route(builder, from, &route, stack)
     }
 
+    fn abrupt_throw(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        from: ProgramPointId,
+        scope: ScopeFrameId,
+        value: ValueId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), JavaLoweringError> {
+        let Some(route) =
+            builder.resolve_completion(scope, &CompletionRequest::new(CompletionKind::Throw, None))
+        else {
+            return Err(JavaLoweringError::Invalid(
+                "throw completion has no matching structured continuation".into(),
+            ));
+        };
+        if let Some(target) = self
+            .catch_binders
+            .get(&route.destination().target())
+            .copied()
+        {
+            self.append_effect(
+                builder,
+                from,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    source: value,
+                    target,
+                },
+            )?;
+        }
+        self.route(builder, from, &route, stack)
+    }
+
     fn route(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -2251,4 +2398,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.session
             .add_edge(builder, source_point, target.point, target.kind)
     }
+}
+
+fn decimal_integer_value(source: &str, node: Node<'_>) -> Option<i64> {
+    (node.kind() == "decimal_integer_literal")
+        .then(|| node_text(source, node))
+        .flatten()
+        .and_then(|text| text.parse().ok())
 }

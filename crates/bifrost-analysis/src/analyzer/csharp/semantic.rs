@@ -2432,6 +2432,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             &initializers,
             condition.map(|payload| (payload, condition_entry)),
             condition_entry,
+            ControlTarget::normal(condition_entry),
             (body, body_entry),
             &updates,
             stack,

@@ -2771,6 +2771,20 @@ impl SearchToolsService {
         // Created before the deferred build so listing-backed fast paths
         // (`find_filenames`, #1388) can fill it while indexing is pending.
         let file_listing = listing_cache_for(update_strategy, &canonical);
+        // Warm the commit-history relevance cache alongside the deferred build (#2327). Every
+        // interactive navigation tool carries a cancellation token, so its ranking reads that
+        // cache warm-only and never fills it; without a warm scheduled here, a session that
+        // only navigates ranks without the history tier for its whole life. The walk is a
+        // `git rev-list`/`git log` pair that takes seconds on a large repository, so it gets
+        // its own thread and no request waits for it.
+        match brokk_bifrost_analysis::relevance::spawn_commit_history_warm(canonical.clone()) {
+            // Detached deliberately: nothing in the service ever joins the warm, and the
+            // thread reports its own failures.
+            Ok(_warm) => {}
+            Err(error) => {
+                eprintln!("Failed to spawn commit-history warm thread: {error}");
+            }
+        }
         let handle = std::thread::Builder::new()
             .name("bifrost-index-build".to_string())
             .spawn({
@@ -4696,7 +4710,7 @@ mod watcher_startup_tests {
 
         assert_eq!(result.status, "unreliable");
         assert_eq!(result.exit_status, POLICY_EXIT_UNRELIABLE);
-        assert_eq!(result.report.schema_version(), 3);
+        assert_eq!(result.report.schema_version(), 4);
         assert!(result.report.rules().is_empty());
         assert!(result.report.runs().is_empty());
         assert_eq!(
@@ -4883,7 +4897,7 @@ mod watcher_startup_tests {
         };
 
         assert_eq!(structured["status"], "unreliable");
-        assert_eq!(structured["report"]["schema_version"], 3);
+        assert_eq!(structured["report"]["schema_version"], 4);
         assert_eq!(
             structured["report"]["execution"]["termination"],
             "deadline_exceeded"

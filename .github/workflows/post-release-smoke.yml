@@ -1,0 +1,450 @@
+name: Post-release smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing published release tag to verify (for example v0.10.3)
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing published release tag to verify after promotion
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: post-release-smoke-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: resolve published release identity
+    if: ${{ github.repository == 'BrokkAi/bifrost' && github.event.repository.private == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      version: ${{ steps.identity.outputs.version }}
+    steps:
+      - name: Checkout exact release tag for shared validator
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+          ref: ${{ inputs.tag }}
+
+      - name: Validate release tag and projections
+        id: identity
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          node scripts/release-version.mjs check --tag "$RELEASE_TAG" --github-output "$GITHUB_OUTPUT"
+
+  github-assets:
+    name: GitHub release assets and checksums
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Check every published GitHub asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/BrokkAi/bifrost/releases/tags/${RELEASE_TAG}"
+          metadata="$RUNNER_TEMP/release.json"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 5 --retry-all-errors --retry-delay 2 "$api" -o "$metadata"
+          jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .draft == false' "$metadata" >/dev/null
+
+          asset_dir="$RUNNER_TEMP/release-assets"
+          mkdir -p "$asset_dir"
+          jq -r '.assets[] | [.name, .browser_download_url, (.digest // "")] | @tsv' "$metadata" |
+            while IFS=$'\t' read -r name url digest; do
+              test -n "$name"
+              test -n "$url"
+              if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "GitHub release asset $name has no public SHA-256 digest" >&2
+                exit 1
+              fi
+              curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+                --retry 5 --retry-all-errors --retry-delay 2 "$url" -o "$asset_dir/$name"
+              expected="${digest#sha256:}"
+              actual="$(sha256sum "$asset_dir/$name" | cut -d ' ' -f 1)"
+              if [[ "$actual" != "$expected" ]]; then
+                echo "GitHub release asset $name has SHA-256 $actual, expected $expected" >&2
+                exit 1
+              fi
+            done
+
+          for required in "bifrost-agent-${RELEASE_TAG}.tar.gz" "brokk-bifrost-agent-${RELEASE_VERSION}.tgz" "bifrost-vscode-${RELEASE_TAG}.vsix"; do
+            test -s "$asset_dir/$required"
+          done
+          tar -xOf "$asset_dir/bifrost-agent-${RELEASE_TAG}.tar.gz" bifrost-agent/package.json |
+            jq -e --arg version "$RELEASE_VERSION" '.name == "@brokk/bifrost-agent" and .version == $version' >/dev/null
+          tar -xOf "$asset_dir/brokk-bifrost-agent-${RELEASE_VERSION}.tgz" package/package.json |
+            jq -e --arg version "$RELEASE_VERSION" '.name == "@brokk/bifrost-agent" and .version == $version' >/dev/null
+          unzip -p "$asset_dir/bifrost-vscode-${RELEASE_TAG}.vsix" extension/package.json |
+            jq -e --arg version "$RELEASE_VERSION" '.version == $version' >/dev/null
+          checksums=("$asset_dir"/*.sha256)
+          test "${#checksums[@]}" -gt 0
+          for checksum in "${checksums[@]}"; do
+            (cd "$asset_dir" && sha256sum -c "$(basename "$checksum")")
+          done
+          echo "Verified ${#checksums[@]} GitHub SHA-256 sidecars for $RELEASE_TAG"
+
+  crates-io:
+    name: crates.io availability and checksums
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+      CRATE_PACKAGES: |
+        brokk-bifrost-core
+        brokk-bifrost-go
+        brokk-bifrost-cpp
+        brokk-bifrost-js-ts
+        brokk-bifrost-jvm
+        brokk-bifrost-csharp
+        brokk-bifrost-php
+        brokk-bifrost-python
+        brokk-bifrost-ruby
+        brokk-bifrost-rust
+        brokk-bifrost-rql
+        brokk-bifrost-analysis
+        brokk-bifrost-policy
+        brokk-bifrost-nlp
+        brokk-bifrost-runtime
+        brokk-bifrost-semantic-packs
+        brokk-bifrost-mcp
+        brokk-bifrost-lsp
+        brokk-bifrost
+    steps:
+      - name: Check every published crate with bounded propagation retry
+        shell: bash
+        run: |
+          set -euo pipefail
+          for crate in $CRATE_PACKAGES; do
+            endpoint="https://crates.io/api/v1/crates/${crate}/${RELEASE_VERSION}"
+            response="$RUNNER_TEMP/${crate}.json"
+            found=0
+            for attempt in $(seq 1 30); do
+              status="$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' \
+                --user-agent 'bifrost-post-release-smoke' --output "$response" --write-out '%{http_code}' "$endpoint")"
+              if [[ "$status" == 200 ]]; then
+                jq -e --arg version "$RELEASE_VERSION" \
+                  '.version.num == $version and (.version.checksum | type == "string" and test("^[0-9a-f]{64}$"))' \
+                  "$response" >/dev/null
+                echo "crates.io: $crate $RELEASE_VERSION checksum present"
+                found=1
+                break
+              fi
+              if [[ "$status" != 404 ]]; then
+                echo "Unexpected crates.io HTTP $status for $crate $RELEASE_VERSION" >&2
+                cat "$response" >&2
+                exit 1
+              fi
+              echo "Waiting for crates.io $crate visibility ($attempt/30)"
+              sleep 10
+            done
+            test "$found" = 1
+          done
+
+  pypi:
+    name: PyPI availability and checksums
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Check Python package with bounded propagation retry
+        shell: bash
+        run: |
+          set -euo pipefail
+          endpoint="https://pypi.org/pypi/brokk-bifrost/${RELEASE_VERSION}/json"
+          response="$RUNNER_TEMP/pypi.json"
+          found=0
+          for attempt in $(seq 1 30); do
+            status="$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' \
+              --output "$response" --write-out '%{http_code}' "$endpoint")"
+            if [[ "$status" == 200 ]]; then
+              jq -e --arg version "$RELEASE_VERSION" \
+                '.info.version == $version and (.urls | length > 0) and all(.[]; (.digests.sha256 | test("^[0-9a-f]{64}$")))' \
+                "$response" >/dev/null
+              echo "PyPI: brokk-bifrost $RELEASE_VERSION files and SHA-256 digests present"
+              found=1
+              break
+            fi
+            if [[ "$status" != 404 ]]; then
+              echo "Unexpected PyPI HTTP $status for brokk-bifrost $RELEASE_VERSION" >&2
+              cat "$response" >&2
+              exit 1
+            fi
+            echo "Waiting for PyPI visibility ($attempt/30)"
+            sleep 10
+          done
+          test "$found" = 1
+
+  npm:
+    name: npm package availability and integrity
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+      NPM_PACKAGES: |
+        @brokkai/bifrost
+        @brokkai/bifrost-darwin-universal
+        @brokkai/bifrost-linux-x64-gnu
+        @brokkai/bifrost-linux-x64-musl
+        @brokkai/bifrost-linux-arm64-gnu
+        @brokkai/bifrost-android-arm64
+        @brokkai/bifrost-win32-x64
+        @brokkai/bifrost-win32-arm64
+    steps:
+      - name: Check every npm package with bounded propagation retry
+        shell: bash
+        run: |
+          set -euo pipefail
+          for package in $NPM_PACKAGES; do
+            encoded="${package//@/%40}"
+            encoded="${encoded//\//%2F}"
+            endpoint="https://registry.npmjs.org/${encoded}"
+            safe_package="${package//@/_}"
+            safe_package="${safe_package//\//_}"
+            response="$RUNNER_TEMP/npm-${safe_package}.json"
+            found=0
+            for attempt in $(seq 1 30); do
+              status="$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' \
+                --output "$response" --write-out '%{http_code}' "$endpoint")"
+              if [[ "$status" == 200 ]]; then
+                jq -e --arg version "$RELEASE_VERSION" \
+                  '.versions[$version].version == $version and (.versions[$version].dist.tarball | startswith("https://")) and (.versions[$version].dist.integrity | startswith("sha512-"))' \
+                  "$response" >/dev/null
+                echo "npm: $package $RELEASE_VERSION tarball and integrity present"
+                found=1
+                break
+              fi
+              if [[ "$status" != 404 ]]; then
+                echo "Unexpected npm HTTP $status for $package $RELEASE_VERSION" >&2
+                cat "$response" >&2
+                exit 1
+              fi
+              echo "Waiting for npm visibility $package ($attempt/30)"
+              sleep 10
+            done
+            test "$found" = 1
+          done
+
+  install-smoke:
+    name: install and select published npm binary (${{ matrix.os }})
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Install the published root package
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_dir="${RUNNER_TEMP}/bifrost-npm-install"
+          rm -rf "$install_dir"
+          mkdir -p "$install_dir"
+          npm install --prefix "$install_dir" --ignore-scripts --no-audit --no-fund \
+            --registry https://registry.npmjs.org "@brokkai/bifrost@${RELEASE_VERSION}"
+          selected="$(npm exec --prefix "$install_dir" --no -- bifrost --version)"
+          echo "$selected"
+          grep -F "$RELEASE_VERSION" <<< "$selected"
+
+  extensions:
+    name: VS Marketplace and Open VSX availability
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Verify Visual Studio Marketplace version and install archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          query="$RUNNER_TEMP/marketplace-query.json"
+          jq -n '{filters: [{criteria: [{filterType: 7, value: "brokk.bifrost-vscode"}], pageNumber: 1, pageSize: 1}], flags: 914}' > "$query"
+          response="$RUNNER_TEMP/marketplace.json"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 5 --retry-all-errors --retry-delay 2 \
+            -H 'Content-Type: application/json' -H 'Accept: application/json;api-version=7.2-preview.1' \
+            --data-binary "@$query" \
+            'https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery' -o "$response"
+          jq -e --arg version "$RELEASE_VERSION" \
+            '[.results[0].extensions[0].versions[] | select(.version == $version)] | length == 1' "$response" >/dev/null
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 5 --retry-all-errors --retry-delay 2 \
+            "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/brokk/vsextensions/bifrost-vscode/${RELEASE_VERSION}/vspackage" \
+            -o "$RUNNER_TEMP/bifrost-vscode.vsix"
+          unzip -tq "$RUNNER_TEMP/bifrost-vscode.vsix"
+          echo "Visual Studio Marketplace exposes bifrost-vscode $RELEASE_VERSION and a valid VSIX archive"
+          echo "The Marketplace public API exposes no checksum endpoint; checksum comparison is not claimed here."
+
+      - name: Verify Open VSX version, download, and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/open-vsx.json"
+          endpoint="https://open-vsx.org/api/brokk/bifrost-vscode/${RELEASE_VERSION}"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 5 --retry-all-errors --retry-delay 2 "$endpoint" -o "$metadata"
+          jq -e --arg version "$RELEASE_VERSION" '.version == $version and (.files.download | startswith("https://"))' "$metadata" >/dev/null
+          download_url="$(jq -r '.files.download' "$metadata")"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 5 --retry-all-errors --retry-delay 2 "$download_url" -o "$RUNNER_TEMP/bifrost-open-vsx.vsix"
+          checksum_url="${endpoint}/file/brokk.bifrost-vscode-${RELEASE_VERSION}.sha256"
+          expected="$(curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 5 --retry-all-errors --retry-delay 2 "$checksum_url" | tr -d '[:space:]')"
+          actual="$(sha256sum "$RUNNER_TEMP/bifrost-open-vsx.vsix" | cut -d ' ' -f 1)"
+          [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+          test "$expected" = "$actual"
+          unzip -tq "$RUNNER_TEMP/bifrost-open-vsx.vsix"
+
+  mcp:
+    name: published Codex and Claude MCP list_policies smoke
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Checkout release smoke helper
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - name: Download published agent plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata="$RUNNER_TEMP/release.json"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 5 --retry-all-errors --retry-delay 2 \
+            "https://api.github.com/repos/BrokkAi/bifrost/releases/tags/${RELEASE_TAG}" -o "$metadata"
+          url="$(jq -r --arg name "bifrost-agent-${RELEASE_TAG}.tar.gz" '.assets[] | select(.name == $name) | .browser_download_url' "$metadata")"
+          test -n "$url"
+          mkdir -p "$RUNNER_TEMP/published-agent"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 5 --retry-all-errors --retry-delay 2 "$url" -o "$RUNNER_TEMP/published-agent/agent.tar.gz"
+          tar -C "$RUNNER_TEMP/published-agent" -xzf "$RUNNER_TEMP/published-agent/agent.tar.gz"
+          test -f "$RUNNER_TEMP/published-agent/bifrost-agent/mcp.json"
+          test -f "$RUNNER_TEMP/published-agent/bifrost-agent/claude-mcp.json"
+
+      - name: Invoke published Codex MCP list_policies through the existing helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/smoke-agent-plugin-release.mjs \
+            --plugin-dir "$RUNNER_TEMP/published-agent/bifrost-agent" \
+            --cache-dir "$RUNNER_TEMP/codex-launcher-cache"
+
+      - name: Invoke published Claude MCP list_policies from Claude configuration
+        shell: bash
+        env:
+          CLAUDE_PLUGIN_ROOT: ${{ runner.temp }}/published-agent/bifrost-agent
+          BIFROST_LAUNCHER_AUTO_INSTALL: '1'
+          BIFROST_LAUNCHER_ALLOW_PATH: '0'
+          BIFROST_LAUNCHER_CACHE_DIR: ${{ runner.temp }}/claude-launcher-cache
+        run: |
+          set -euo pipefail
+          node --input-type=module - <<'NODE'
+          import { readFileSync } from "node:fs";
+          import { spawn } from "node:child_process";
+          import process from "node:process";
+
+          const root = process.env.CLAUDE_PLUGIN_ROOT;
+          const config = JSON.parse(readFileSync(`${root}/claude-mcp.json`, "utf8"));
+          const server = config.mcpServers?.bifrost;
+          if (!server || server.type === "sse") throw new Error("Claude MCP configuration has no stdio bifrost server");
+          const command = server.command.replaceAll("${CLAUDE_PLUGIN_ROOT}", root);
+          const child = spawn(command, server.args ?? [], {
+            cwd: root,
+            env: process.env,
+            stdio: ["pipe", "pipe", "inherit"],
+          });
+          let buffer = "";
+          let nextId = 1;
+          const pending = new Map();
+          child.stdout.setEncoding("utf8");
+          child.stdout.on("data", (chunk) => {
+            buffer += chunk;
+            for (;;) {
+              const newline = buffer.indexOf("\n");
+              if (newline < 0) break;
+              const line = buffer.slice(0, newline).trim();
+              buffer = buffer.slice(newline + 1);
+              if (!line) continue;
+              const message = JSON.parse(line);
+              if (message.id !== undefined && pending.has(message.id)) {
+                pending.get(message.id)(message);
+                pending.delete(message.id);
+              }
+            }
+          });
+          child.on("error", (error) => { for (const reject of pending.values()) reject(error); });
+          const request = (method, params) => new Promise((resolve, reject) => {
+            const id = nextId++;
+            const timer = setTimeout(() => { pending.delete(id); reject(new Error(`${method} timed out`)); }, 120000);
+            pending.set(id, (message) => { clearTimeout(timer); resolve(message); });
+            child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+          });
+          const initialize = await request("initialize", {
+            protocolVersion: "2025-06-18",
+            capabilities: {},
+            clientInfo: { name: "post-release-claude-smoke", version: "1" },
+          });
+          if (initialize.error) throw new Error(`Claude initialize failed: ${JSON.stringify(initialize.error)}`);
+          child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} })}\n`);
+          const tools = await request("tools/list", {});
+          if (!(tools.result?.tools ?? []).some((tool) => tool.name === "list_policies")) {
+            throw new Error("Claude MCP did not advertise list_policies");
+          }
+          const call = await request("tools/call", { name: "list_policies", arguments: {} });
+          if (call.error || call.result?.isError) throw new Error(`Claude list_policies failed: ${JSON.stringify(call)}`);
+          if (!Array.isArray(call.result?.content) || call.result.content.length === 0) {
+            throw new Error("Claude list_policies returned no content");
+          }
+          child.kill();
+          console.log("Claude MCP list_policies passed against the published agent plugin");
+          NODE

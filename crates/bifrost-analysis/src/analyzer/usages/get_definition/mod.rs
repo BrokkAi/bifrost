@@ -12,7 +12,8 @@ use crate::analyzer::usages::cpp_graph::{
     cpp_enclosing_lexical_scope_components, cpp_field_declared_type_binding, cpp_first_type_child,
     cpp_function_return_type_text, cpp_initialized_effective_using_imports,
     cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for, cpp_reference_fqn_candidates,
-    cpp_resolve_bare_call_target, cpp_resolve_block_using_call_target, cpp_signature_arity,
+    cpp_resolve_bare_call_target, cpp_resolve_block_using_call_target,
+    cpp_resolve_type_components_lexically_at_preserving_alias, cpp_signature_arity,
     cpp_split_top_level_commas, cpp_template_reference_arguments, cpp_type_name_components,
     extract_variable_name, is_globally_qualified_cpp_name, normalize_cpp_type_text,
 };
@@ -20,9 +21,10 @@ use crate::analyzer::usages::csharp_graph::{
     csharp_argument_count, csharp_extension_invocation_return_type_fq_name,
     csharp_first_type_child, csharp_is_declaration_name, csharp_is_type_reference_node,
     csharp_member_declared_type_fq_name, csharp_method_return_type_fq_name_for_arity,
-    csharp_node_text, csharp_object_created_type, csharp_object_initializer_for_label,
-    csharp_object_initializer_owner_type_node, csharp_reference_type_text,
-    csharp_visible_extension_method_candidates, member_access_name as csharp_member_access_name,
+    csharp_node_text, csharp_object_created_type, csharp_object_creation_assignment_target,
+    csharp_object_initializer_for_label, csharp_object_initializer_owner_type_node,
+    csharp_reference_type_text, csharp_visible_extension_method_candidates,
+    member_access_name as csharp_member_access_name,
     member_access_receiver as csharp_member_access_receiver, seed_csharp_bindings_before,
 };
 use crate::analyzer::usages::go_graph::{
@@ -55,6 +57,8 @@ pub(crate) use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site_with_line_starts,
     simple_reference_name, smallest_named_node_covering,
 };
+use brokk_bifrost_cpp::graph::resolver::OrphanedNamespaceTypeScopeIndex;
+use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::syntax::JsTsImportBinder;
 // The Ruby definition route is parked on `ResolutionSession`'s siblings while
 // `ruby_graph/*` has moved into `brokk-bifrost-ruby`, so this block -- the
@@ -103,9 +107,9 @@ use brokk_bifrost_ruby::graph::syntax::{
 };
 pub(crate) use rust::{
     AnalyzerRustDefinitionProvider, RustTypeLookupCache, resolve_rust_bounded,
-    rust_expression_type_definition_candidates_cached, rust_expression_type_definition_fqn_cached,
-    rust_field_definition_type_candidates_cached, rust_is_type_definition,
-    rust_resolve_type_node_fqn,
+    rust_associated_call_applicable_candidates, rust_expression_type_definition_candidates_cached,
+    rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,
+    rust_is_type_definition, rust_resolve_type_node_fqn,
 };
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};
@@ -137,6 +141,7 @@ pub(crate) use call_sites::{
     CallSiteSyntax, CallSyntaxKind, ExactCallReference, ExactCallReferenceGap,
     call_reference_ranges_in_tree, call_reference_requires_point_lookup,
     call_site_syntax_for_reference, exact_call_reference_for_call, is_call_reference_range_in_tree,
+    range_is_call_keyword_label,
 };
 pub(crate) use cpp::{cpp_type_lookup_resolution_in_session, resolve_cpp_bounded};
 pub(crate) use csharp::{
@@ -154,6 +159,7 @@ pub(crate) use kotlin::{
 pub(crate) use php::{
     PhpDefinitionProvider, php_type_lookup_resolution_bounded, resolve_php_bounded,
 };
+pub use python::python_visible_same_file_candidates;
 pub(crate) use python::{
     PythonDefinitionProvider, python_type_lookup_resolution_bounded, resolve_python_bounded,
 };
@@ -854,6 +860,7 @@ struct DefinitionBatchContext<'a> {
     cpp_indexed_sources: HashMap<ProjectFile, Option<Arc<String>>>,
     cpp_indexed_trees: HashMap<ProjectFile, Option<Tree>>,
     cpp_navigation_indexes: HashMap<ProjectFile, Option<Arc<cpp::CppNavigationIndex>>>,
+    cpp_orphaned_namespace_scopes: HashMap<ProjectFile, Arc<OrphanedNamespaceTypeScopeIndex>>,
     cpp_structural_alias_paths: HashMap<CodeUnit, Vec<String>>,
     cpp_class_ranges: HashMap<ProjectFile, Arc<ClassRangeIndex>>,
     enclosing_owner_chains: HashMap<CodeUnit, Arc<Vec<CodeUnit>>>,
@@ -885,6 +892,7 @@ impl<'a> DefinitionBatchContext<'a> {
             cpp_indexed_sources: HashMap::default(),
             cpp_indexed_trees: HashMap::default(),
             cpp_navigation_indexes: HashMap::default(),
+            cpp_orphaned_namespace_scopes: HashMap::default(),
             cpp_structural_alias_paths: HashMap::default(),
             cpp_class_ranges: HashMap::default(),
             enclosing_owner_chains: HashMap::default(),
@@ -926,8 +934,13 @@ impl<'a> DefinitionBatchContext<'a> {
             .clone()
     }
 
+    /// The per-file JS/TS state this batch reuses. `host` supplies the analyzer's
+    /// own alias resolver rather than a fresh one, so every file in the batch
+    /// resolves specifiers through one warm `tsconfig` memo and one warm
+    /// workspace-package index instead of rebuilding both per file.
     fn js_ts_context(
         &mut self,
+        host: &dyn JsTsSource,
         file: &ProjectFile,
         language: Language,
         source: &str,
@@ -941,9 +954,7 @@ impl<'a> DefinitionBatchContext<'a> {
                         .expect("uncancelled JS/TS syntax index build");
                 JsTsDefinitionContext {
                     imports: compute_jsts_import_binder(source, tree),
-                    aliases: Arc::new(AliasResolver::new(
-                        self.analyzer.project().root().to_path_buf(),
-                    )),
+                    aliases: Arc::clone(host.alias_resolver()),
                     syntax_index,
                 }
             })
@@ -1055,6 +1066,18 @@ impl<'a> DefinitionBatchContext<'a> {
         self.cpp_navigation_indexes
             .insert(file.clone(), index.clone());
         index
+    }
+
+    fn cpp_orphaned_namespace_scopes(
+        &mut self,
+        file: &ProjectFile,
+        root: Node<'_>,
+        source: &str,
+    ) -> Arc<OrphanedNamespaceTypeScopeIndex> {
+        self.cpp_orphaned_namespace_scopes
+            .entry(file.clone())
+            .or_insert_with(|| Arc::new(OrphanedNamespaceTypeScopeIndex::build(root, source)))
+            .clone()
     }
 
     fn cpp_class_ranges(&mut self, file: &ProjectFile) -> Arc<ClassRangeIndex> {
@@ -1707,7 +1730,23 @@ fn navigation_lookup_outcome(
 /// these", so an answer with nothing to choose from is a missing answer, not an
 /// ambiguous one (#1811).
 fn ambiguous_candidates_outcome(
+    candidates: Vec<CodeUnit>,
+    message: impl Into<String>,
+) -> DefinitionLookupOutcome {
+    ambiguous_candidates_outcome_of_kind(candidates, "ambiguous_definition", message)
+}
+
+/// Report `candidates` as an ambiguity under a resolver's own diagnostic kind.
+///
+/// A resolver that names the tier where the tie arose -- Scala's
+/// `ambiguous_scala_type`, `ambiguous_scala_enclosing_member`,
+/// `ambiguous_scala_named_argument_owner` -- keeps that kind, because it says
+/// something the plain kind does not. What it must not keep is an empty answer:
+/// the contenders travel with the verdict so a caller, and an audit, can see
+/// what the resolver was choosing between (#2167).
+fn ambiguous_candidates_outcome_of_kind(
     mut candidates: Vec<CodeUnit>,
+    kind: impl Into<String>,
     message: impl Into<String>,
 ) -> DefinitionLookupOutcome {
     sort_units(&mut candidates);
@@ -1721,7 +1760,7 @@ fn ambiguous_candidates_outcome(
         definitions: candidates,
         lexical_definition: None,
         diagnostics: vec![DefinitionLookupDiagnostic {
-            kind: "ambiguous_definition".to_string(),
+            kind: kind.into(),
             message: message.into(),
         }],
     }
@@ -2024,9 +2063,12 @@ mod tests {
         let tree = parse_tree_for_language(&file, Language::TypeScript, source)
             .expect("parse TypeScript source");
         let mut context = DefinitionBatchContext::new(analyzer, true);
+        let host =
+            crate::analyzer::js_ts::providers::resolve_js_ts_source(analyzer, Language::TypeScript)
+                .expect("TypeScript analyzer is registered for this fixture");
 
-        let first = context.js_ts_context(&file, Language::TypeScript, source, &tree);
-        let second = context.js_ts_context(&file, Language::TypeScript, source, &tree);
+        let first = context.js_ts_context(host, &file, Language::TypeScript, source, &tree);
+        let second = context.js_ts_context(host, &file, Language::TypeScript, source, &tree);
 
         assert_eq!(context.js_ts_contexts.len(), 1);
         assert!(Arc::ptr_eq(&first.aliases, &second.aliases));

@@ -408,15 +408,38 @@ pub fn usage_definition_candidates_by_fqn(source: &dyn CSharpSource, fqn: &str) 
         .collect()
 }
 
+/// The arity-preserving key a reference spelling binds by, or `None` when the
+/// spelling states no generic arity at all.
+///
+/// C# writes a generic declaration's arity into its name, so `Box<T>` is
+/// declared as Box\`1. Every fq-name index below this is keyed by the
+/// arity-*stripping* normalization, so Box\`1 and Box collide there. A
+/// reference that states an arity must be held to it. A reference that states
+/// none must not be: `typeof(Box<>)`, `nameof(Box)` and an unbound base
+/// spelling all name the generic declaration without an arity, and holding
+/// those to arity 0 would refuse the only declaration they can mean.
+fn explicit_generic_arity_key(fqn: &str) -> Option<String> {
+    let arity_key = csharp_arity_preserving_full_name(fqn);
+    (csharp_normalize_full_name(&arity_key) != arity_key).then_some(arity_key)
+}
+
 pub fn type_candidates_by_fqn(source: &dyn CSharpSource, fqn: &str, usage: bool) -> Vec<CodeUnit> {
     if usage {
         return usage_type_candidates_by_fqn(source, fqn);
     }
-    source
+    let mut candidates = source
         .forward_definition_fqn(fqn)
         .into_iter()
         .filter(|unit| unit.is_class())
-        .collect()
+        .collect::<Vec<_>>();
+    // The same filter the usage branch above already applies (#2165). Without
+    // it the external `System.Net.ServerSentEvents.SseItem<T>` bound the
+    // workspace's non-generic `static class SseItem` of the same name, and the
+    // inverse scan then refused every one of those sites as unproven.
+    if let Some(arity_key) = explicit_generic_arity_key(fqn) {
+        candidates.retain(|unit| csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key);
+    }
+    candidates
 }
 
 // ---------------------------------------------------------------------------
@@ -1596,4 +1619,28 @@ pub fn compute_implicit_reference_index(
         },
         parallel,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::explicit_generic_arity_key;
+
+    /// The guard on the forward arity filter (#2165). A spelling that states an
+    /// arity binds by it; one that states none is never held to arity 0, which
+    /// is what keeps `typeof(Box<>)`, `nameof(Box)` and an unbound base
+    /// spelling -- all of which reach resolution as the bare name `Box` -- able
+    /// to name Demo.Box\`1.
+    #[test]
+    fn only_an_explicitly_spelled_arity_produces_a_filter_key() {
+        assert_eq!(explicit_generic_arity_key("Demo.Box"), None);
+        assert_eq!(explicit_generic_arity_key("Demo.Plain"), None);
+        assert_eq!(
+            explicit_generic_arity_key("Demo.Box`1").as_deref(),
+            Some("Demo.Box`1")
+        );
+        assert_eq!(
+            explicit_generic_arity_key("global::Demo.Outer`1+Inner").as_deref(),
+            Some("Demo.Outer`1.Inner")
+        );
+    }
 }

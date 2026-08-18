@@ -1818,16 +1818,30 @@ fn python_same_file_candidates_for_binding_event(
     event_visible_from: usize,
 ) -> Vec<CodeUnit> {
     let visible = python_visible_same_file_candidates(analyzer, file, node, candidates);
-    // A function and a later assignment intentionally share one Python FQN.
-    // Associate this timeline event with the latest physical declaration that
-    // was active when the event became visible instead of merging both units.
-    let latest_end = visible
+    // A function and a later assignment intentionally share one Python FQN, so
+    // this event has to name the physical declaration that was active when the
+    // event became visible instead of merging both units (#2053).
+    //
+    // Repeated assignments to one module-level name are one declaration, and
+    // the analyzer records it once, at its last spelling. An event that precedes
+    // every recorded range is therefore still a binding of that same
+    // declaration, written again further down; rejecting it discarded the
+    // timeline's own answer and reported a bound module-level name as having no
+    // indexed definition (#2157). The anchor is the latest declaration at or
+    // before the event, and the earliest recorded declaration when they all
+    // follow it.
+    let declaration_ends: Vec<usize> = visible
         .iter()
         .flat_map(|candidate| analyzer.ranges(candidate))
-        .filter(|range| range.end_byte <= event_visible_from)
         .map(|range| range.end_byte)
-        .max();
-    let Some(latest_end) = latest_end else {
+        .collect();
+    let anchor_end = declaration_ends
+        .iter()
+        .copied()
+        .filter(|end| *end <= event_visible_from)
+        .max()
+        .or_else(|| declaration_ends.iter().copied().min());
+    let Some(anchor_end) = anchor_end else {
         return Vec::new();
     };
     let reference_path = python_conditional_branch_path(node);
@@ -1835,7 +1849,7 @@ fn python_same_file_candidates_for_binding_event(
         .into_iter()
         .filter(|candidate| {
             analyzer.ranges(candidate).iter().any(|range| {
-                range.end_byte == latest_end
+                range.end_byte == anchor_end
                     && root
                         .named_descendant_for_byte_range(range.start_byte, range.end_byte)
                         .is_some_and(|declaration| {
@@ -1886,7 +1900,16 @@ fn python_conditional_paths_are_compatible(
     })
 }
 
-fn python_visible_same_file_candidates(
+/// Which same-file declarations a bare Python name written at `node` can bind
+/// to: a binding of the class body the name is written in, otherwise a
+/// module-level declaration. A method or an attribute of some other class is
+/// absent, because Python has no implicit receiver -- `list(values)` inside a
+/// class that declares `def list(self, ...)` is the builtin, never `self.list`.
+///
+/// The forward resolver answers same-file lookups with this, and the reference
+/// census grades against the same notion of scope (#2054): a same-file
+/// declaration this rejects is not evidence that forward lookup missed a target.
+pub fn python_visible_same_file_candidates(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     node: Node<'_>,

@@ -480,6 +480,10 @@ impl IAnalyzer for PhpAnalyzer {
         self.inner.invalidate_cached_file_identities();
     }
 
+    fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {
+        self.inner.working_tree_identity()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
         self

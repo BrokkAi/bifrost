@@ -16,7 +16,7 @@ use crate::analyzer::semantic::{
 };
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 
-use super::{PathQuality, PathQualityFrontier, UnmodeledCallBehavior};
+use super::{PathQuality, PathQualityFrontier, SummaryCallCycle, UnmodeledCallBehavior};
 
 pub const SUMMARY_SCHEMA_VERSION: u32 = 1;
 pub const MAX_SUMMARY_TRANSFERS: usize = 65_536;
@@ -474,6 +474,28 @@ impl ProcedureSummaryKey {
 
     pub const fn recursive_group(&self) -> Option<SummaryRecursiveGroupKey> {
         self.recursive_group
+    }
+
+    /// Whether replaying this procedure's summary could skip a call back into
+    /// `root`, in the form the solver's reusable-summary contract asks for
+    /// (#2285).
+    ///
+    /// A recursive group is exactly a call-graph strongly connected component
+    /// with more than one member or with a self-call, and every member of one
+    /// group carries the same group key. Two procedures therefore sit in one
+    /// call cycle exactly when both name a recursive group and the two groups
+    /// are equal. When they do, the solver must not replay this summary: the
+    /// summarized body is skipped on replay, and with it the call back into the
+    /// procedure the query is rooted at.
+    ///
+    /// `root` is the summary key of the solve root. A caller that cannot
+    /// produce one must report [`SummaryCallCycle::IncludesRoot`] itself rather
+    /// than guess.
+    pub fn call_cycle_with_root(&self, root: &Self) -> SummaryCallCycle {
+        match (self.recursive_group, root.recursive_group()) {
+            (Some(callee), Some(root)) if callee == root => SummaryCallCycle::IncludesRoot,
+            _ => SummaryCallCycle::ExcludesRoot,
+        }
     }
 
     pub const fn composition_root(&self) -> Option<SummaryCompositionRootFingerprint> {

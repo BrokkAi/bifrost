@@ -677,11 +677,6 @@ pub fn collect_summary_findings_with_limits(
             && bindings
                 .subject(binding.subject())
                 .is_some_and(|subject| subject.quality().is_definitive());
-        let uncertain = !binding_definitive
-            || observations
-                .states
-                .values()
-                .any(|observation| !observation.uncertainty.is_empty() || observation.abstained);
         let failing_proven = observations.states.iter().any(|(state, observation)| {
             terminal.expected_states().binary_search(state).is_err()
                 && observation.has_definite_proven_path
@@ -693,22 +688,14 @@ pub fn collect_summary_findings_with_limits(
                     && observation.uncertainty.is_empty()
                     && !observation.abstained
             });
-        let certainty = match protocol.semantics().analysis_mode {
-            ProtocolAnalysisMode::May if failing_proven => Some(TypestateFindingCertainty::May),
-            ProtocolAnalysisMode::May if failing > 0 || uncertain || !analysis_complete => {
-                Some(TypestateFindingCertainty::Inconclusive)
-            }
-            ProtocolAnalysisMode::May => None,
-            ProtocolAnalysisMode::Must
-                if failing == actual_states.len() && analysis_complete && all_paths_definitive =>
-            {
-                Some(TypestateFindingCertainty::Must)
-            }
-            ProtocolAnalysisMode::Must if failing > 0 || uncertain || !analysis_complete => {
-                Some(TypestateFindingCertainty::Inconclusive)
-            }
-            ProtocolAnalysisMode::Must => None,
-        };
+        let certainty = terminal_finding_certainty(
+            protocol.semantics().analysis_mode,
+            analysis_complete,
+            failing,
+            actual_states.len(),
+            failing_proven,
+            all_paths_definitive,
+        );
         let Some(certainty) = certainty else {
             continue;
         };
@@ -1093,6 +1080,33 @@ fn error_transition_certainty(
     }
 }
 
+fn terminal_finding_certainty(
+    mode: ProtocolAnalysisMode,
+    analysis_complete: bool,
+    failing: usize,
+    actual_state_count: usize,
+    failing_proven: bool,
+    all_paths_definitive: bool,
+) -> Option<TypestateFindingCertainty> {
+    // A terminal-expectation finding must identify an observed state that
+    // violates the expectation. Incomplete coverage belongs to the report
+    // completion state, so accepting-only observations do not become a
+    // spurious inconclusive finding.
+    if failing == 0 {
+        return None;
+    }
+    match mode {
+        ProtocolAnalysisMode::May if failing_proven => Some(TypestateFindingCertainty::May),
+        ProtocolAnalysisMode::May => Some(TypestateFindingCertainty::Inconclusive),
+        ProtocolAnalysisMode::Must
+            if failing == actual_state_count && analysis_complete && all_paths_definitive =>
+        {
+            Some(TypestateFindingCertainty::Must)
+        }
+        ProtocolAnalysisMode::Must => Some(TypestateFindingCertainty::Inconclusive),
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 struct ObservationAggregate {
     states: HashMap<ProtocolStateId, ObservationEvidence>,
@@ -1364,6 +1378,34 @@ mod tests {
         assert_eq!(
             error_transition_certainty(ProtocolAnalysisMode::Must, false, &aggregate, false),
             TypestateFindingCertainty::Inconclusive
+        );
+    }
+
+    #[test]
+    fn terminal_expectations_require_an_observed_failing_state() {
+        assert_eq!(
+            terminal_finding_certainty(ProtocolAnalysisMode::May, false, 0, 1, false, false),
+            None
+        );
+        assert_eq!(
+            terminal_finding_certainty(ProtocolAnalysisMode::Must, false, 0, 1, false, false),
+            None
+        );
+        assert_eq!(
+            terminal_finding_certainty(ProtocolAnalysisMode::May, false, 1, 1, false, false),
+            Some(TypestateFindingCertainty::Inconclusive)
+        );
+        assert_eq!(
+            terminal_finding_certainty(ProtocolAnalysisMode::May, true, 1, 1, false, true),
+            Some(TypestateFindingCertainty::Inconclusive)
+        );
+        assert_eq!(
+            terminal_finding_certainty(ProtocolAnalysisMode::May, true, 1, 1, true, true),
+            Some(TypestateFindingCertainty::May)
+        );
+        assert_eq!(
+            terminal_finding_certainty(ProtocolAnalysisMode::Must, true, 1, 1, false, true),
+            Some(TypestateFindingCertainty::Must)
         );
     }
 

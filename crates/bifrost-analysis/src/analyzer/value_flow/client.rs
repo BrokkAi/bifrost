@@ -6,6 +6,7 @@ use crate::analyzer::dataflow::{
 };
 use crate::analyzer::semantic::{
     EvidenceCompleteness, IcfgEdgeKind, IcfgProvider, ProcedureHandle, ProofStatus, SemanticBudget,
+    ValueFlowRelationKind,
 };
 
 use super::plan::CallFlowRuleKind;
@@ -109,6 +110,13 @@ impl ActiveFlow {
         }
         self
     }
+
+    const fn with_transfer_completeness(mut self, complete: bool) -> Self {
+        if !complete {
+            self.uncertainty = self.uncertainty.with_semantic();
+        }
+        self
+    }
 }
 
 /// Fact-only direct/indirect value-flow client over one immutable plan.
@@ -173,14 +181,17 @@ impl<'plan> ValueFlowProblem<'plan> {
             &active,
             meetings,
         );
-        for rule in self.plan.local_rules_at(point) {
+        for (source, target, kind, complete) in self.plan.local_rule_views(point) {
+            if kind == ValueFlowRelationKind::Assignment && source != target {
+                active.retain(|flow| flow.carrier != target);
+            }
             let generated = active
                 .iter()
                 .copied()
-                .filter(|flow| flow.carrier == rule.source)
+                .filter(|flow| flow.carrier == source)
                 .map(|flow| ActiveFlow {
-                    carrier: rule.target,
-                    ..flow.with_transfer_quality(&rule.proof, &rule.completeness)
+                    carrier: target,
+                    ..flow.with_transfer_completeness(complete)
                 })
                 .collect::<Vec<_>>();
             active.extend(generated);

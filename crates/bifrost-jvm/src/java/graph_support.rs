@@ -36,6 +36,7 @@ use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, CodeUnitIn
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use tree_sitter::Node;
 
 use crate::java::declarations::{collect_type_identifiers, parse_tree};
 use crate::java::imports::{import_package, non_static_import_path, static_import_path};
@@ -138,6 +139,157 @@ pub fn java_file_is_in_default_package(source: &dyn JavaSource, file: &ProjectFi
         .is_none_or(|package| package.is_empty())
 }
 
+/// The nominal class name a persisted declared-type text spells.
+///
+/// A declaration's recorded type text keeps what the source wrote, so it can
+/// carry type arguments and array brackets that name no class of their own.
+/// Both directions of the field-type question read the same persisted text --
+/// the forward field-access typing (#2043) and the inverse receiver matcher
+/// (#2162) -- so they share this one reading of it.
+pub fn normalize_java_type_text(raw: &str) -> &str {
+    raw.split('<')
+        .next()
+        .unwrap_or(raw)
+        .trim()
+        .trim_end_matches("[]")
+        .trim()
+}
+
+/// The expression a case label's switch selects on: the `condition` of the
+/// nearest enclosing `switch_expression`, stripped of its parentheses.
+///
+/// JLS 14.11 binds a case label written as a simple name in the selector type's
+/// scope, so both directions of the usage relation ask this question: the
+/// forward definition lookup to find the enum a label names, and the usage scan
+/// to decide whether a label occurrence is a use of the enum constant it is
+/// looking for (#2043).
+///
+/// tree-sitter-java spells a switch statement and a switch expression with the
+/// same `switch_expression` node, so one walk serves both. Taking the *nearest*
+/// enclosing switch is what makes a switch written inside a case body read its
+/// own selector rather than the outer one.
+pub fn java_switch_selector_expression<'tree>(label: Node<'tree>) -> Option<Node<'tree>> {
+    let mut current = label;
+    let switch = loop {
+        current = current.parent()?;
+        if current.kind() == "switch_expression" {
+            break current;
+        }
+    };
+    let mut selector = switch.child_by_field_name("condition")?;
+    while selector.kind() == "parenthesized_expression" {
+        selector = selector.named_child(0)?;
+    }
+    Some(selector)
+}
+
+/// The `type_parameter` declaration for `name` that is in scope at `node`.
+///
+/// A Java type parameter is scoped to the declaration that writes it, and an
+/// inner declaration's parameter shadows an enclosing one of the same spelling
+/// (JLS 6.4), so the walk runs outward from `node` and stops at the first
+/// declaration that writes the name. `type_parameters` is a field on every
+/// declaration that can write one -- class, interface, record, method and
+/// constructor -- so no kind list is needed here.
+pub fn java_type_parameter_in_scope<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    name: &str,
+) -> Option<Node<'tree>> {
+    let mut current = Some(node);
+    while let Some(scope) = current {
+        if let Some(parameters) = scope.child_by_field_name("type_parameters")
+            && let Some(parameter) = java_type_parameters(parameters)
+                .into_iter()
+                .find(|parameter| java_type_parameter_name(*parameter, source) == Some(name))
+        {
+            return Some(parameter);
+        }
+        current = scope.parent();
+    }
+    None
+}
+
+/// The type parameters `declaration` writes, in declaration order. Empty when
+/// the declaration is not generic.
+pub fn java_declared_type_parameters<'tree>(declaration: Node<'tree>) -> Vec<Node<'tree>> {
+    declaration
+        .child_by_field_name("type_parameters")
+        .map(java_type_parameters)
+        .unwrap_or_default()
+}
+
+fn java_type_parameters<'tree>(parameters: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "type_parameter")
+        .collect()
+}
+
+/// The node a `type_parameter` declares its name at. A `type_parameter` writes
+/// its annotations first and its name as the only `type_identifier`.
+pub fn java_type_parameter_name_node<'tree>(parameter: Node<'tree>) -> Option<Node<'tree>> {
+    let mut cursor = parameter.walk();
+    parameter
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "type_identifier")
+}
+
+/// The spelling a `type_parameter` declares.
+pub fn java_type_parameter_name<'a>(parameter: Node<'_>, source: &'a str) -> Option<&'a str> {
+    java_type_parameter_name_node(parameter)
+        .and_then(|child| source.get(child.start_byte()..child.end_byte()))
+}
+
+/// The written upper bounds of a `type_parameter`, in declaration order.
+///
+/// An empty result is a parameter with no `extends` clause, whose only bound is
+/// `java.lang.Object`. Several results are an intersection bound
+/// (`T extends A & B`), which gives the parameter every bound's member surface.
+pub fn java_type_parameter_bounds<'tree>(parameter: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut cursor = parameter.walk();
+    let Some(bound) = parameter
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "type_bound")
+    else {
+        return Vec::new();
+    };
+    let mut bounds = bound.walk();
+    bound.named_children(&mut bounds).collect()
+}
+
+/// The type arguments a type spelling supplies, in written order.
+///
+/// Only a `generic_type` carries arguments; an annotated or array spelling
+/// wraps one, so the walk steps through those wrappers to reach it.
+pub fn java_type_argument_nodes<'tree>(type_node: Node<'tree>) -> Vec<Node<'tree>> {
+    let mut current = type_node;
+    loop {
+        match current.kind() {
+            "generic_type" => {
+                let Some(arguments) = current
+                    .named_children(&mut current.walk())
+                    .find(|child| child.kind() == "type_arguments")
+                else {
+                    return Vec::new();
+                };
+                let mut cursor = arguments.walk();
+                return arguments.named_children(&mut cursor).collect();
+            }
+            "array_type" => match current.child_by_field_name("element") {
+                Some(element) => current = element,
+                None => return Vec::new(),
+            },
+            "annotated_type" => match current.named_children(&mut current.walk()).last() {
+                Some(inner) => current = inner,
+                None => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        }
+    }
+}
+
 /// The type identifiers spelled in a Java source snippet.
 pub fn java_extract_type_identifiers(source: &str) -> BTreeSet<String> {
     let Some(tree) = parse_tree(source) else {
@@ -164,10 +316,21 @@ pub fn resolve_java_forward_type_name(
     ))
 }
 
-/// Resolve a simple type name through the lexical classes that enclose
-/// `owner`. Java checks these nested scopes before package and import tiers.
-/// The hierarchy walker uses this for a nested `extends Base` declaration;
-/// member lookup then sees the same ancestor edge (#1905).
+/// Resolve a simple type name through the lexical scopes that enclose `owner`.
+/// Java checks these nested scopes before package and import tiers. The
+/// hierarchy walker uses this for a nested `extends Base` declaration; member
+/// lookup then sees the same ancestor edge (#1905).
+///
+/// A Java lexical type scope is not broken by the callable, lambda, or
+/// anonymous body a declaration is written in: an anonymous `new SetView() {}`
+/// body and a class local to a method are both indexed under that method
+/// (#2045), so their written supertype is still a nested type of the class
+/// that encloses the method. Stopping the walk at the first owner that is not
+/// a class left every such declaration with no ancestor at all, which is what
+/// kept a member the body inherits from resolving (#2046). Only a package ends
+/// the chain: packages are module parents in the analyzer graph, not lexical
+/// type scopes. This is the same chain `java_nested_type_in_scope` walks for a
+/// written type reference (#2161).
 pub fn resolve_java_lexical_type_name(
     source: &dyn JavaSource,
     owner: &CodeUnit,
@@ -178,7 +341,7 @@ pub fn resolve_java_lexical_type_name(
         return None;
     }
 
-    let mut enclosing = source.parent_of(owner).filter(CodeUnit::is_class);
+    let mut enclosing = source.parent_of(owner).filter(|unit| !unit.is_module());
     while let Some(current) = enclosing {
         let fqn = format!("{}.{}", current.fq_name(), normalized);
         let candidates = source
@@ -186,12 +349,42 @@ pub fn resolve_java_lexical_type_name(
             .into_iter()
             .filter(|unit| unit.is_class() && unit.fq_name() == fqn)
             .collect();
-        if let Some(unit) = unique_candidate(candidates) {
+        if let Some(unit) = unique_candidate(java_same_file_candidates(candidates, owner.source()))
+        {
             return Some(unit);
         }
-        enclosing = source.parent_of(&current).filter(CodeUnit::is_class);
+        enclosing = source.parent_of(&current).filter(|unit| !unit.is_module());
     }
     None
+}
+
+/// Narrow a candidate set to the declarations physically written in `file`,
+/// when that leaves anything at all.
+///
+/// A mirrored source tree indexes one fully qualified name twice: Guava ships
+/// `guava/src` and `android/guava/src` copies of the same package, and every
+/// nested type inside them collides. The two copies are not peers to a
+/// declaration written in one of the files: a Java class body lives in exactly
+/// one compilation unit, so a lexically enclosing type named from inside a
+/// file is the copy in that same file. Narrowing here is what keeps the
+/// mirrored pair from looking like an unresolvable ambiguity (#2045).
+///
+/// When no candidate is in `file` the set is returned untouched, so a genuine
+/// collision between two unrelated declarations stays ambiguous.
+pub fn java_same_file_candidates(candidates: Vec<CodeUnit>, file: &ProjectFile) -> Vec<CodeUnit> {
+    if candidates.len() < 2 {
+        return candidates;
+    }
+    let same_file = candidates
+        .iter()
+        .filter(|unit| unit.source() == file)
+        .cloned()
+        .collect::<Vec<_>>();
+    if same_file.is_empty() {
+        candidates
+    } else {
+        same_file
+    }
 }
 
 /// The full candidate set a forward type-name lookup produces. More than
@@ -204,7 +397,7 @@ pub fn resolve_java_forward_type_name_candidates(
     raw_name: &str,
 ) -> Vec<CodeUnit> {
     resolve_java_type_name_with(source, file, raw_name, |fqn| {
-        forward_source_type_by_fqn(source, fqn)
+        forward_source_type_by_fqn(source, file, fqn)
     })
 }
 
@@ -434,11 +627,29 @@ pub fn java_type_name_candidate_fqns(
     candidates
 }
 
-fn forward_source_type_by_fqn(source: &dyn JavaSource, fqn: &str) -> Option<CodeUnit> {
-    source
+/// The declaration a forward type-name tier means by `fqn`, seen from `file`.
+///
+/// A mirrored source tree indexes one fully qualified name more than once, and
+/// which row comes back first is a store-order accident. The referring file
+/// decides: when that file declares `fqn` itself, its own copy is the one the
+/// compilation unit sees, so a supertype named from inside it anchors on the
+/// same physical declaration the descendant index already anchors on
+/// (`same_source_hierarchy_identity`, #2045).
+fn forward_source_type_by_fqn(
+    source: &dyn JavaSource,
+    file: &ProjectFile,
+    fqn: &str,
+) -> Option<CodeUnit> {
+    let candidates = source
         .forward_definition_fqn(fqn)
         .into_iter()
-        .find(|unit| unit.is_class() && unit.fq_name() == fqn)
+        .filter(|unit| unit.is_class() && unit.fq_name() == fqn)
+        .collect::<Vec<_>>();
+    candidates
+        .iter()
+        .find(|unit| unit.source() == file)
+        .or_else(|| candidates.first())
+        .cloned()
 }
 
 /// The single answer of a candidate set, or `None` when the set is empty or

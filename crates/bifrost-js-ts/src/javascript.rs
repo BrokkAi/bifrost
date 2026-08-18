@@ -200,10 +200,20 @@ fn visit_js_default_export_value(
             parsed.add_signature(code_unit.clone(), trim_statement(node_text(export, source)));
             visit_js_object_literal_properties(file, source, value, &code_unit, &code_unit, parsed);
         }
-        // `export default name` points at an existing binding; indexing `default`
-        // here would duplicate that declaration instead of describing new code.
-        // The export declaration itself is still recorded.
-        _ => record_default_reexport(export, parsed),
+        // `export default name` and `export default object.member` point at an
+        // existing binding. Every other expression creates an anonymous default
+        // value that needs its own source-backed declaration (#2301).
+        "identifier" | "member_expression" => record_default_reexport(export, parsed),
+        _ => {
+            let code_unit = add_default_export_unit(
+                file,
+                source,
+                export,
+                brokk_bifrost_core::analyzer::model::CodeUnitType::Field,
+                parsed,
+            );
+            parsed.add_signature(code_unit, trim_statement(node_text(export, source)));
+        }
     }
 }
 

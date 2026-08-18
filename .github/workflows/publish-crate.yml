@@ -1,4 +1,4 @@
-name: Publish crate
+name: Publish qualified crate
 
 on:
   workflow_call:
@@ -19,87 +19,147 @@ on:
         description: Cargo package to publish
         required: true
         type: string
+      qualification_run_id:
+        description: Readiness workflow run containing the immutable bundle
+        required: true
+        type: string
+      qualification_run_attempt:
+        description: Readiness workflow run attempt recorded in the manifest
+        required: true
+        type: string
+      qualification_artifact_id:
+        description: Readiness artifact ID selected by the resolver
+        required: true
+        type: string
+      qualification_artifact_digest:
+        description: Readiness artifact digest selected by the resolver
+        required: true
+        type: string
+      qualification_manifest_sha256:
+        description: SHA-256 of the manifest selected by the resolver
+        required: true
+        type: string
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   publish:
-    name: cargo publish ${{ inputs.package }}
+    name: publish qualified ${{ inputs.package }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     environment: release
     permissions:
       contents: read
+      actions: read
       id-token: write
     env:
       RELEASE_TAG: ${{ inputs.tag }}
       RELEASE_VERSION: ${{ inputs.version }}
       RELEASE_COMMIT: ${{ inputs.commit }}
       CRATE_PACKAGE: ${{ inputs.package }}
+      QUALIFICATION_RUN_ID: ${{ inputs.qualification_run_id }}
+      QUALIFICATION_RUN_ATTEMPT: ${{ inputs.qualification_run_attempt }}
+      QUALIFICATION_ARTIFACT_ID: ${{ inputs.qualification_artifact_id }}
+      QUALIFICATION_ARTIFACT_DIGEST: ${{ inputs.qualification_artifact_digest }}
+      QUALIFICATION_MANIFEST_SHA256: ${{ inputs.qualification_manifest_sha256 }}
     steps:
-      - name: Checkout validated source
+      - name: Checkout validated release scripts
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
           ref: ${{ inputs.commit }}
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
 
-      - name: Confirm validated release identity
+      - name: Download exact readiness bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: ${{ inputs.qualification_artifact_id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.qualification_run_id }}
+          github-token: ${{ github.token }}
+          path: qualification
+          merge-multiple: true
+
+      - name: Verify external artifact identity and qualified bytes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          artifact_json="$RUNNER_TEMP/qualification-artifact.json"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${QUALIFICATION_ARTIFACT_ID}" > "$artifact_json"
+          jq -e --arg expected "release-qualification-${RELEASE_COMMIT}-v${RELEASE_VERSION}" \
+            --arg digest "$QUALIFICATION_ARTIFACT_DIGEST" \
+            '.name == $expected and .digest == $digest and .expired == false' "$artifact_json" >/dev/null
+          node scripts/verify-qualified-release.mjs verify \
+            --bundle qualification \
+            --manifest qualification/release-qualification.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$RELEASE_COMMIT" \
+            --version "$RELEASE_VERSION" \
+            --run-id "$QUALIFICATION_RUN_ID" \
+            --run-attempt "$QUALIFICATION_RUN_ATTEMPT" \
+            --manifest-sha256 "$QUALIFICATION_MANIFEST_SHA256" \
+            --output "$RUNNER_TEMP/verified-qualification.json"
+
+      - name: Resolve exact crate archive, metadata, and checksum
+        id: qualified-crate
         shell: bash
         run: |
-          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
-          tag_ref="refs/tags/$RELEASE_TAG"
-          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
-          actual_commit="$(awk -v tag_ref="$tag_ref" '
-            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
-            $2 == tag_ref { fallback = $1 }
-            END { if (!found && fallback) print fallback }
-          ' <<< "$remote_refs")"
-          test -n "$actual_commit"
-          test "$actual_commit" = "$RELEASE_COMMIT"
-          echo "Publishing $CRATE_PACKAGE from $RELEASE_TAG ($RELEASE_VERSION) at $RELEASE_COMMIT"
-
-      - name: Package exact registry payload
-        id: package
-        shell: bash
-        run: |
-          cargo package --locked --no-verify --package "$CRATE_PACKAGE"
-          archive="target/package/${CRATE_PACKAGE}-${RELEASE_VERSION}.crate"
-          test -f "$archive"
-          echo "checksum=$(sha256sum "$archive" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          manifest=qualification/release-qualification.json
+          crate_name="${CRATE_PACKAGE}-${RELEASE_VERSION}.crate"
+          crate_path="$(jq -r --arg name "$crate_name" '.files[] | select(.path == $name) | .path' "$manifest")"
+          metadata_path="$(jq -r --arg name "$crate_name.metadata.json" '.files[] | select(.path == $name) | .path' "$manifest")"
+          checksum_path="$(jq -r --arg name "$crate_name.sha256" '.files[] | select(.path == $name) | .path' "$manifest")"
+          test -n "$crate_path"
+          test -n "$metadata_path"
+          test -n "$checksum_path"
+          test -f "qualification/$crate_path"
+          test -f "qualification/$metadata_path"
+          test -f "qualification/$checksum_path"
+          jq -e --arg package "$CRATE_PACKAGE" --arg version "$RELEASE_VERSION" \
+            '.name == $package and .vers == $version and (.deps | type == "array")' \
+            "qualification/$metadata_path" >/dev/null
+          expected_checksum="$(awk '{print $1}' "qualification/$checksum_path")"
+          [[ "$expected_checksum" =~ ^[0-9a-f]{64}$ ]]
+          actual_checksum="$(sha256sum "qualification/$crate_path" | awk '{print $1}')"
+          test "$actual_checksum" = "$expected_checksum"
+          {
+            echo "crate_path=$crate_path"
+            echo "metadata_path=$metadata_path"
+            echo "checksum=$actual_checksum"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Check whether exact crate version is already published
         id: existing
-        shell: bash
         env:
-          EXPECTED_CHECKSUM: ${{ steps.package.outputs.checksum }}
+          EXPECTED_CHECKSUM: ${{ steps.qualified-crate.outputs.checksum }}
+        shell: bash
         run: |
           set -euo pipefail
           endpoint="https://crates.io/api/v1/crates/${CRATE_PACKAGE}/${RELEASE_VERSION}"
-          response_file="$(mktemp)"
-          trap 'rm -f "$response_file"' EXIT
-          status="$(curl --silent --show-error --location --output "$response_file" --write-out '%{http_code}' --user-agent 'cargo/1.85.0' "$endpoint")"
-
+          response_file="$RUNNER_TEMP/crates-io-existing.json"
+          status="$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --output "$response_file" --write-out '%{http_code}' --user-agent 'bifrost-qualified-crate' "$endpoint")"
           case "$status" in
             200)
               actual_checksum="$(jq -r '.version.checksum // empty' "$response_file")"
-              test -n "$actual_checksum"
-              if [[ "$actual_checksum" != "$EXPECTED_CHECKSUM" ]]; then
-                echo "Registry checksum mismatch for existing ${CRATE_PACKAGE} ${RELEASE_VERSION}: expected ${EXPECTED_CHECKSUM}, got ${actual_checksum}" >&2
-                exit 1
-              fi
-              echo "${CRATE_PACKAGE} ${RELEASE_VERSION} is already published with the expected checksum"
+              test "$actual_checksum" = "$EXPECTED_CHECKSUM"
               echo "already-published=true" >> "$GITHUB_OUTPUT"
               ;;
             404)
-              echo "${CRATE_PACKAGE} ${RELEASE_VERSION} is not yet published"
               echo "already-published=false" >> "$GITHUB_OUTPUT"
               ;;
             *)
-              echo "Unexpected crates.io response ${status} while checking ${CRATE_PACKAGE} ${RELEASE_VERSION}" >&2
+              echo "Unexpected crates.io HTTP $status for ${CRATE_PACKAGE} ${RELEASE_VERSION}" >&2
               cat "$response_file" >&2
               exit 1
               ;;
@@ -110,39 +170,38 @@ jobs:
         if: steps.existing.outputs.already-published != 'true'
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
-      - name: Publish
+      - name: Publish exact qualified crate payload
         if: steps.existing.outputs.already-published != 'true'
-        run: cargo publish --locked --package "$CRATE_PACKAGE"
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          EXPECTED_CHECKSUM: ${{ steps.qualified-crate.outputs.checksum }}
+        run: >-
+          node scripts/publish-qualified-crate.mjs
+          --metadata-file "qualification/${{ steps.qualified-crate.outputs.metadata_path }}"
+          --crate-file "qualification/${{ steps.qualified-crate.outputs.crate_path }}"
+          --expected-sha256 "$EXPECTED_CHECKSUM"
 
       - name: Verify exact registry version and checksum
         shell: bash
         env:
-          EXPECTED_CHECKSUM: ${{ steps.package.outputs.checksum }}
+          EXPECTED_CHECKSUM: ${{ steps.qualified-crate.outputs.checksum }}
         run: |
           set -euo pipefail
           endpoint="https://crates.io/api/v1/crates/${CRATE_PACKAGE}/${RELEASE_VERSION}"
-          max_attempts=30
-
-          for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-            response="$(curl --fail --silent --show-error --user-agent 'cargo/1.85.0' "$endpoint" 2>/dev/null || true)"
-            checksum="$(jq -r '.version.checksum // empty' <<<"$response")"
-            if [[ -n "$checksum" ]]; then
-              if [[ "$checksum" != "$EXPECTED_CHECKSUM" ]]; then
-                echo "Registry checksum mismatch for ${CRATE_PACKAGE} ${RELEASE_VERSION}: expected ${EXPECTED_CHECKSUM}, got ${checksum}" >&2
-                exit 1
-              fi
-              echo "Registry exposes ${CRATE_PACKAGE} ${RELEASE_VERSION} with checksum ${checksum}"
+          response="$RUNNER_TEMP/crates-io-visible.json"
+          for attempt in $(seq 1 30); do
+            status="$(curl --silent --show-error --location --proto '=https' --proto-redir '=https' \
+              --output "$response" --write-out '%{http_code}' --user-agent 'bifrost-qualified-crate' "$endpoint")"
+            if [[ "$status" == 200 ]]; then
+              actual_checksum="$(jq -r '.version.checksum // empty' "$response")"
+              test "$actual_checksum" = "$EXPECTED_CHECKSUM"
               exit 0
             fi
-
-            if (( attempt < max_attempts )); then
-              delay=$((attempt < 5 ? attempt * 2 : 10))
-              echo "Waiting ${delay}s for crates.io to expose ${CRATE_PACKAGE} ${RELEASE_VERSION} (attempt ${attempt}/${max_attempts})"
-              sleep "$delay"
+            if [[ "$status" != 404 ]]; then
+              cat "$response" >&2
+              exit 1
             fi
+            sleep 10
           done
-
-          echo "crates.io did not expose ${CRATE_PACKAGE} ${RELEASE_VERSION} within the bounded retry window" >&2
+          echo "crates.io did not expose ${CRATE_PACKAGE} ${RELEASE_VERSION}" >&2
           exit 1

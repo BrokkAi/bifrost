@@ -26,7 +26,7 @@
 //! and feeds the pure core. The whole run is a measurement performed once; the
 //! artifact it writes is committed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,6 +35,8 @@ use std::time::Duration;
 use semver::Version;
 use serde::Serialize;
 
+use brokk_bifrost_analysis::analyzer::dataflow::{SemanticInputStatus, SummaryBoundaryKind};
+use brokk_bifrost_analysis::analyzer::semantic::SemanticLocator;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     CatalogCoordinate, CatalogOptions, CompiledSemanticModelPack, CompilerOptions,
     SemanticModelActivationControl, SemanticModelActivationEvidence,
@@ -782,6 +784,12 @@ pub struct RunResult {
     /// so the artifact records why a category concluded as it did (for example,
     /// a run-level `capability_incomplete` abstention with its binding reason).
     pub category_runs: Vec<CategoryRunStatus>,
+    /// The analyzed source volume the policy coordinator measures to scale its
+    /// workspace budget lanes, computed the same way it does. Every density
+    /// constant derived from a bakeoff run is per one of these bytes, so the
+    /// artifact has to carry the denominator (#1936).
+    pub analyzed_files: usize,
+    pub analyzed_source_bytes: u64,
 }
 
 /// The run-level taint completion for one category, with sample diagnostics.
@@ -789,9 +797,20 @@ pub struct RunResult {
 pub struct CategoryRunStatus {
     pub category: String,
     pub completion: String,
+    /// How the policy execution terminated, when it terminated abnormally --
+    /// `DeadlineExceeded` above all. A category whose evaluation is cancelled
+    /// before it registers a run produces a report with no runs, which reads
+    /// as `no_taint_run`; without this field that is indistinguishable from a
+    /// category that ran and found nothing.
+    pub termination: Option<String>,
     pub findings: usize,
     pub retained_analyses: usize,
     pub sample_diagnostics: Vec<String>,
+    /// The policy run's work report, flattened to `name -> value`.  The scan
+    /// and semantic lane charges here are the only measured input available for
+    /// calibrating the workspace-scaled budget lanes against a real corpus,
+    /// which is what the lane model was missing (#1936).
+    pub work: BTreeMap<String, u64>,
 }
 
 fn load_pack(spec: &PackSpec) -> Result<LoadedPack, String> {
@@ -856,6 +875,20 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
     let workspace = WorkspaceAnalyzer::build_ephemeral(project, analyzer_config)
         .map_err(|error| format!("build benchmark workspace: {error}"))?;
 
+    // The same measurement `PolicyCoordinator` takes to scale its budget lanes:
+    // the on-disk size of every analyzed file. Recording it makes the run's
+    // budget lanes reproducible from the artifact alone.
+    let analyzed = workspace.analyzer().analyzed_files();
+    let analyzed_files = analyzed.len();
+    let analyzed_source_bytes: u64 = analyzed
+        .iter()
+        .map(|file| {
+            fs::metadata(file.abs_path())
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        })
+        .sum();
+
     let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
         .map_err(|error| format!("open pack catalog: {error}"))?;
     let mut evidence = Vec::new();
@@ -909,7 +942,6 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
         limits: SemanticModelRuntimeLimits::default(),
     };
 
-    let cancellation = CancellationToken::new().with_timeout(config.timeout);
     let options = PolicyEvaluationOptions::new(
         PolicyEvaluationDate::from_ymd(2026, 1, 1).expect("a fixed evaluation date"),
     );
@@ -917,11 +949,24 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
     // Accumulate per-case state across the six category runs.
     let mut flagged: BTreeMap<String, InjectionCategory> = BTreeMap::new();
     let mut case_completion: BTreeMap<String, CaseCompletion> = BTreeMap::new();
+    // Per case, the distinct reasons its retained analyses gave for not
+    // concluding. Written to the per-case dump so the abstention families can
+    // be counted exactly rather than sampled from capped diagnostics.
+    let mut case_reasons: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut findings_total = 0usize;
     let mut taint_roots = 0usize;
     let mut category_runs = Vec::new();
 
     for category in InjectionCategory::ALL {
+        // One deadline per category, not one shared across all six. A single
+        // token minted before the loop is an absolute wall-clock deadline, so
+        // whichever categories the earlier ones did not leave time for are
+        // cancelled before evaluation and come back as a report with no runs
+        // at all -- silently scoring every one of their cases `NotAnalyzed`.
+        // That is a measurement artifact, not a Bifrost verdict, so each
+        // category gets its own budget and the artifact records when one is
+        // hit.
+        let cancellation = CancellationToken::new().with_timeout(config.timeout);
         let policy = build_policy(category);
         let inputs = [PolicyEvaluationInput::embedded(
             PolicySourceIdentity::new(policy_id(category)),
@@ -963,12 +1008,31 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
             for diagnostic in outcome.report().diagnostics() {
                 eprintln!("[debug]   diagnostic: {}", diagnostic.message());
             }
+            eprintln!(
+                "[debug]   termination={:?} stage={:?}",
+                outcome.report().execution().termination(),
+                outcome.report().execution().terminal_stage(),
+            );
         }
 
         // Record the run-level taint completion and a few diagnostics so the
-        // artifact explains the category's outcome.
-        let mut sample_diagnostics = Vec::new();
+        // artifact explains the category's outcome. Report-level diagnostics
+        // come first: when the evaluation never reached a run, they are the
+        // only account of why, and leaving them out is what made a
+        // deadline-dropped category indistinguishable from a clean empty one.
+        let termination = outcome
+            .report()
+            .execution()
+            .termination()
+            .map(|termination| format!("{termination:?}"));
+        let mut sample_diagnostics: Vec<String> = outcome
+            .report()
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.message().to_owned())
+            .collect();
         let mut completion_label = "no_taint_run".to_owned();
+        let mut work = BTreeMap::new();
         for policy_run in outcome.report().runs() {
             completion_label = format!("{:?}", policy_run.completion());
             for diagnostic in policy_run.diagnostics() {
@@ -977,14 +1041,35 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
                     sample_diagnostics.push(message);
                 }
             }
+            let report = policy_run.work();
+            for (name, value) in [
+                ("scanned_files", report.scanned_files()),
+                ("scanned_source_bytes", report.scanned_source_bytes()),
+                ("fact_nodes", report.fact_nodes()),
+                ("pipeline_rows", report.pipeline_rows()),
+                ("examined_references", report.examined_references()),
+            ] {
+                let slot = work.entry(name.to_owned()).or_insert(0);
+                *slot = (*slot).max(value);
+            }
+            for metric in report.metrics() {
+                let slot = work.entry(metric.name().to_owned()).or_insert(0);
+                *slot = (*slot).max(metric.value());
+            }
         }
-        sample_diagnostics.truncate(6);
+        let sample_cap = std::env::var("BIFROST_OWASP_SAMPLE_DIAGS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(6);
+        sample_diagnostics.truncate(sample_cap);
         category_runs.push(CategoryRunStatus {
             category: category.label().to_owned(),
             completion: completion_label,
+            termination,
             findings: outcome.taint_findings().len(),
             retained_analyses: outcome.taint_analysis_results().len(),
             sample_diagnostics,
+            work,
         });
 
         // A finding on a case's file, in this category's run, flags that case
@@ -1022,6 +1107,60 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
             } else {
                 CaseCompletion::Inconclusive
             };
+            // Why this root did not conclude, taken from the plan's own
+            // retained cause rather than from the run's diagnostic list. This
+            // is the same cause the policy renders into
+            // "taint discovery is incomplete: ..."
+            // (crates/bifrost-policy/src/taint_policy.rs), but recorded per
+            // root: the run's diagnostic list is capped at `MAX_DIAGNOSTICS`
+            // (256) per policy, so counting families from it under-counts at
+            // corpus scale, while this is uncapped and exact.
+            //
+            // `cause:` is the one blocking input. `boundary:` rows are the
+            // solve's whole incomplete-boundary set, which is a superset: an
+            // authored summary can close a boundary that still appears here.
+            // Only `cause:` supports an exact family count.
+            let reasons = case_reasons.entry(name.clone()).or_default();
+            if !matches!(completion, CaseCompletion::Complete) {
+                let coverage = report.result().coverage();
+                reasons.insert(format!("status:{}", coverage.semantic_status().label()));
+                match result.plan().value_flow().first_incomplete_cause() {
+                    Some(cause) => {
+                        let locator = cause.procedure().semantics().locator();
+                        let status = match cause.status() {
+                            Some(SemanticInputStatus::Unsupported { capability }) => {
+                                format!("unsupported({})", capability.label())
+                            }
+                            Some(status) => status.label().to_owned(),
+                            None => "incomplete-coverage".to_owned(),
+                        };
+                        reasons.insert(format!(
+                            "cause:{}:{status}:{}:{}",
+                            cause.label().replace(' ', "-"),
+                            locator.path().as_str(),
+                            declaration_name(locator),
+                        ));
+                    }
+                    None => {
+                        reasons.insert("cause:none".to_owned());
+                    }
+                }
+                for boundary in coverage.boundaries() {
+                    reasons.insert(format!(
+                        "boundary:{}",
+                        summary_boundary_label(boundary.kind())
+                    ));
+                }
+                if !coverage.unproven_edges().is_empty() {
+                    reasons.insert("edges:unproven".to_owned());
+                }
+                if !coverage.partial_edges().is_empty() {
+                    reasons.insert("edges:partial".to_owned());
+                }
+                if !report.result().termination().is_fixed_point() {
+                    reasons.insert(format!("termination:{:?}", report.result().termination()));
+                }
+            }
             merge_completion(&mut case_completion, name, completion);
         }
     }
@@ -1049,9 +1188,13 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
         use std::fmt::Write as _;
         let mut out = String::new();
         for (index, observation) in observations.iter().enumerate() {
+            let reasons = case_reasons
+                .get(&observation.name)
+                .map(|reasons| reasons.iter().cloned().collect::<Vec<_>>().join(","))
+                .unwrap_or_default();
             let _ = writeln!(
                 out,
-                "{index}\t{}\t{}\treal={}\tflagged={}\t{:?}",
+                "{index}\t{}\t{}\treal={}\tflagged={}\t{:?}\t{reasons}",
                 observation.name,
                 observation.category.label(),
                 observation.is_real,
@@ -1075,7 +1218,44 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
         taint_roots,
         findings_total,
         category_runs,
+        analyzed_files,
+        analyzed_source_bytes,
     })
+}
+
+/// A short, stable label for one incomplete summary boundary, so the per-case
+/// dump can be grouped into abstention families by exact string match.
+fn summary_boundary_label(kind: &SummaryBoundaryKind) -> String {
+    match kind {
+        SummaryBoundaryKind::Semantic(status) => match status.unsupported_capability() {
+            Some(capability) => format!("semantic:unsupported:{}", capability.label()),
+            None => format!("semantic:{}", status.label()),
+        },
+        SummaryBoundaryKind::Dispatch(kind) => match kind.target_locator() {
+            // Name the unreached callee, because for a dispatch boundary the
+            // callee is the whole question: which procedure the run would have
+            // needed a body or an authored model for.
+            Some(locator) => format!("dispatch:{}:{}", kind.label(), declaration_name(locator)),
+            None => format!("dispatch:{}", kind.label()),
+        },
+        SummaryBoundaryKind::Limit(kind) => format!("limit:{kind:?}"),
+        SummaryBoundaryKind::Continuation { kind, state } => {
+            format!("continuation:{kind:?}:{state:?}")
+        }
+    }
+}
+
+/// The dotted names of a locator's declaration segments, which for a Java
+/// callee reads as `Type.method`. Debug-printing the locator instead would put
+/// a whole mount digest and every source anchor into every census row.
+fn declaration_name(locator: &SemanticLocator) -> String {
+    locator
+        .declaration()
+        .segments()
+        .iter()
+        .filter_map(|segment| segment.name())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Take the worst (least reliable) completion seen for a case across roots, so a

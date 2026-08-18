@@ -23,7 +23,7 @@ pub(super) type DefinitionCandidateKey = (
 
 pub(super) type DefinitionOutcomeKey = (String, Vec<DefinitionCandidateKey>);
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct DefinitionCandidate {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -44,10 +44,11 @@ pub struct DefinitionCandidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub occurrence_role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "super::navigation::semantic_model_overlay_schema")]
     pub semantic_model: Option<crate::analyzer::semantic_model::SemanticModelProvenance>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct DefinitionDiagnostic {
     pub kind: String,
     pub message: String,
@@ -592,6 +593,21 @@ pub(super) enum SelectableDefinitionResolution {
     NotFound(NotFoundInput),
 }
 
+/// Every distinct definition a selector names, before the one-vs-many verdict.
+///
+/// A surface whose per-result rows already name the definition they describe
+/// (`get_symbol_locations`) answers a multi-definition selector completely and
+/// has nothing to disambiguate; a surface that must pick one definition to
+/// render content for (`get_symbol_sources`, `get_summaries`) folds this into
+/// [`SelectableDefinitionResolution`] instead.
+#[derive(Debug)]
+pub(super) enum SelectableDefinitionGroups {
+    /// One entry per distinct definition: its requestable selector and units.
+    /// Never empty.
+    Groups(Vec<(String, Vec<CodeUnit>)>),
+    NotFound(NotFoundInput),
+}
+
 pub(super) enum DefinitionSelector<'a> {
     Name(&'a str),
     FileAnchored { anchor: String, lookup: &'a str },
@@ -695,6 +711,42 @@ pub(super) fn resolve_selectable_definitions_bounded(
     input: &str,
     resolve: impl Fn(&dyn IAnalyzer, &str) -> Result<CodeUnitResolution, FuzzyResolveStop>,
 ) -> Result<SelectableDefinitionResolution, FuzzyResolveStop> {
+    Ok(
+        match resolve_selectable_definition_groups_bounded(analyzer, input, resolve)? {
+            SelectableDefinitionGroups::NotFound(missing) => {
+                SelectableDefinitionResolution::NotFound(missing)
+            }
+            SelectableDefinitionGroups::Groups(groups) => match groups.as_slice() {
+                [_] => SelectableDefinitionResolution::Resolved(
+                    groups.into_iter().flat_map(|(_, units)| units).collect(),
+                ),
+                _ => SelectableDefinitionResolution::Ambiguous(capped_ambiguous_symbol(
+                    input,
+                    groups.into_iter().map(|(selector, _)| selector).collect(),
+                )),
+            },
+        },
+    )
+}
+
+/// [`resolve_selectable_definitions`] without the one-vs-many verdict: every
+/// distinct definition the selector names, each with its requestable selector.
+pub(super) fn resolve_selectable_definition_groups(
+    analyzer: &dyn IAnalyzer,
+    input: &str,
+    resolve: impl Fn(&dyn IAnalyzer, &str) -> CodeUnitResolution,
+) -> SelectableDefinitionGroups {
+    resolve_selectable_definition_groups_bounded(analyzer, input, |analyzer, lookup| {
+        Ok(resolve(analyzer, lookup))
+    })
+    .expect("an unbounded selectable resolution has no stop condition")
+}
+
+fn resolve_selectable_definition_groups_bounded(
+    analyzer: &dyn IAnalyzer,
+    input: &str,
+    resolve: impl Fn(&dyn IAnalyzer, &str) -> Result<CodeUnitResolution, FuzzyResolveStop>,
+) -> Result<SelectableDefinitionGroups, FuzzyResolveStop> {
     let selector = split_workspace_definition_selector(analyzer, input);
     let (mut anchor, mut lookup) = match selector {
         DefinitionSelector::Name(name) => (None, name),
@@ -718,7 +770,7 @@ pub(super) fn resolve_selectable_definitions_bounded(
                 lookup = path_lookup;
             }
             PathQualifiedSelector::AmbiguousPath(item) => {
-                return Ok(SelectableDefinitionResolution::NotFound(not_found_input(
+                return Ok(SelectableDefinitionGroups::NotFound(not_found_input(
                     input,
                     Some(format!(
                         "path is ambiguous; retry with one of: {}",
@@ -733,7 +785,7 @@ pub(super) fn resolve_selectable_definitions_bounded(
         CodeUnitResolution::Ambiguous(matches) => matches,
         CodeUnitResolution::NotFound => {
             let Some(anchor) = &anchor else {
-                return Ok(SelectableDefinitionResolution::NotFound(
+                return Ok(SelectableDefinitionGroups::NotFound(
                     symbol_not_found_input(input),
                 ));
             };
@@ -746,7 +798,7 @@ pub(super) fn resolve_selectable_definitions_bounded(
                 CodeUnitResolution::NotFound => Vec::new(),
             };
             if global_candidates.is_empty() {
-                return Ok(SelectableDefinitionResolution::NotFound(
+                return Ok(SelectableDefinitionGroups::NotFound(
                     symbol_not_found_input(input),
                 ));
             }
@@ -755,7 +807,7 @@ pub(super) fn resolve_selectable_definitions_bounded(
             } else {
                 Vec::new()
             };
-            return Ok(SelectableDefinitionResolution::NotFound(
+            return Ok(SelectableDefinitionGroups::NotFound(
                 symbol_source_anchor_not_found_input(input, anchor, lookup, &candidate_names),
             ));
         }
@@ -772,15 +824,10 @@ pub(super) fn resolve_selectable_definitions_bounded(
     };
 
     let groups = distinct_definitions(analyzer, code_units);
-    Ok(match groups.as_slice() {
-        [] => SelectableDefinitionResolution::NotFound(symbol_not_found_input(input)),
-        [(_, _)] => SelectableDefinitionResolution::Resolved(
-            groups.into_iter().flat_map(|(_, units)| units).collect(),
-        ),
-        _ => {
-            let matches: Vec<String> = groups.into_iter().map(|(selector, _)| selector).collect();
-            SelectableDefinitionResolution::Ambiguous(capped_ambiguous_symbol(input, matches))
-        }
+    Ok(if groups.is_empty() {
+        SelectableDefinitionGroups::NotFound(symbol_not_found_input(input))
+    } else {
+        SelectableDefinitionGroups::Groups(groups)
     })
 }
 

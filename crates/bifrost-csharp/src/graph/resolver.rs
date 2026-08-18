@@ -1334,7 +1334,6 @@ fn extension_invocation_return_type_fq_name_inner(
         method,
         call_arity,
         explicit_generic_arity,
-        false,
         usage,
         session,
     );
@@ -2122,7 +2121,6 @@ pub fn visible_extension_method_candidates(
     member: &str,
     call_arity: Option<usize>,
     explicit_generic_arity: Option<usize>,
-    fallback_when_inapplicable: bool,
 ) -> Vec<CodeUnit> {
     visible_extension_method_candidates_inner(
         csharp,
@@ -2133,7 +2131,6 @@ pub fn visible_extension_method_candidates(
         member,
         call_arity,
         explicit_generic_arity,
-        fallback_when_inapplicable,
         false,
         None,
     )
@@ -2150,7 +2147,6 @@ pub fn visible_extension_method_candidates_in_session(
     member: &str,
     call_arity: Option<usize>,
     explicit_generic_arity: Option<usize>,
-    fallback_when_inapplicable: bool,
     session: &ResolutionSession,
 ) -> Vec<CodeUnit> {
     visible_extension_method_candidates_inner(
@@ -2162,7 +2158,6 @@ pub fn visible_extension_method_candidates_in_session(
         member,
         call_arity,
         explicit_generic_arity,
-        fallback_when_inapplicable,
         false,
         Some(session),
     )
@@ -2178,7 +2173,6 @@ pub(super) fn usage_visible_extension_method_candidates(
     member: &str,
     call_arity: Option<usize>,
     explicit_generic_arity: Option<usize>,
-    fallback_when_inapplicable: bool,
 ) -> Vec<CodeUnit> {
     visible_extension_method_candidates_inner(
         csharp,
@@ -2189,7 +2183,6 @@ pub(super) fn usage_visible_extension_method_candidates(
         member,
         call_arity,
         explicit_generic_arity,
-        fallback_when_inapplicable,
         true,
         None,
     )
@@ -2205,7 +2198,6 @@ fn visible_extension_method_candidates_inner(
     member: &str,
     call_arity: Option<usize>,
     explicit_generic_arity: Option<usize>,
-    fallback_when_inapplicable: bool,
     usage: bool,
     session: Option<&ResolutionSession>,
 ) -> Vec<CodeUnit> {
@@ -2244,6 +2236,22 @@ fn visible_extension_method_candidates_inner(
             named_candidates.push(unit);
         }
     }
+    // Extension lookup normally stops at the nearest enclosing scope that offers
+    // an applicable declaration, which is what C# does: a `using`-imported
+    // extension loses to one declared in an enclosing namespace. Applicability
+    // is decided by the receiver type, so that ordering is only meaningful when
+    // the scan knows it. A usage-mode site whose receiver never typed --
+    // an external or open-generic receiver, or a capture the local binder cannot
+    // see -- has no receiver to decide with, and stopping at the nearest scope
+    // there names one same-spelled declaration and silently disclaims every
+    // other one. In ILSpy that made `typeHint.GetStackType()` answer
+    // `IL.ILTypeExtensions.GetStackType(this PrimitiveType)` from the enclosing
+    // namespace and report the actual `TypeSystem.TypeUtils.GetStackType(this
+    // IType)` target as verified-absent (#1261). Untyped, every visible scope's
+    // candidates are equally possible, so they are all returned and the caller
+    // records the site as unproven rather than proving or disclaiming one.
+    let receiver_is_untyped = usage && compatible_receiver_types.is_empty();
+    let mut untyped_receiver_candidates = Vec::new();
     for scope in scopes {
         if !resolution_scope_step(session) {
             return Vec::new();
@@ -2337,6 +2345,10 @@ fn visible_extension_method_candidates_inner(
         let candidates = filtered;
         let Some(call_arity) = call_arity else {
             if !candidates.is_empty() {
+                if receiver_is_untyped {
+                    untyped_receiver_candidates.extend(candidates);
+                    continue;
+                }
                 return candidates;
             }
             continue;
@@ -2356,13 +2368,26 @@ fn visible_extension_method_candidates_inner(
             .cloned()
             .collect::<Vec<_>>();
         if !applicable.is_empty() {
+            if receiver_is_untyped {
+                untyped_receiver_candidates.extend(applicable);
+                continue;
+            }
             return applicable;
         }
-        if fallback_when_inapplicable && !candidates.is_empty() {
-            return candidates;
-        }
+        // A declaration whose parameter list cannot accept this argument list is
+        // not the target -- the same verdict #1797 made the ordinary member walk
+        // give, and the one every other caller of this scan has always taken.
+        // Only the forward member branch asked for the rejected set back, which
+        // is how jellyfin's one-argument `typeFilter.Contains(e.Type)` answered
+        // the three-parameter `EnumerableExtensions.Contains` and the MCP SDK's
+        // `options.GetTypeInfo(typeof(T))` answered a receiver-only extension
+        // (#1266). Neither the inverse scan nor extension return typing ever
+        // saw those bindings, which is exactly why they surfaced as
+        // forward/inverse disagreements.
     }
-    Vec::new()
+    untyped_receiver_candidates.sort();
+    untyped_receiver_candidates.dedup();
+    untyped_receiver_candidates
 }
 
 fn extension_visibility_scopes(
@@ -2771,6 +2796,24 @@ pub fn reference_type_text(node: Node<'_>, source: &str) -> String {
     csharp_type_node_identity(reference_type_node(node), source)
 }
 
+/// The outermost node whose locals and parameters are lexically visible at
+/// `node`: the enclosing member declaration.
+///
+/// The walk deliberately passes *through* `local_function_statement` and
+/// `lambda_expression`. C# name lookup inside a local function continues into
+/// the enclosing method, so a local function body sees that method's parameters
+/// and its locals declared before the local function (#2172). Capturing does
+/// not change visibility: a `static` local function that names an enclosing
+/// local is rejected as CS8421, "a static local function cannot contain a
+/// reference to 'x'", which is a capture error naming the binding lookup found,
+/// not a lookup failure. Stopping at the local function instead made every
+/// receiver inside one untyped.
+///
+/// `seed_visible_bindings_at` walks down from here and opens one binding scope
+/// per nested scope it enters, so a local function's own parameters and locals
+/// still shadow the enclosing ones by nearest-scope-wins, and its textual
+/// position rule already matches C#'s CS0841, "cannot use local variable before
+/// it is declared".
 pub fn binding_scope_node(mut node: Node<'_>) -> Node<'_> {
     while let Some(parent) = node.parent() {
         if matches!(
@@ -2779,7 +2822,6 @@ pub fn binding_scope_node(mut node: Node<'_>) -> Node<'_> {
                 | "constructor_declaration"
                 | "property_declaration"
                 | "accessor_declaration"
-                | "local_function_statement"
         ) {
             return parent;
         }
@@ -3473,25 +3515,55 @@ pub fn object_initializer_owner_type_node(initializer: Node<'_>) -> Option<Node<
         "object_creation_expression" => object_creation
             .child_by_field_name("type")
             .or_else(|| first_type_child(object_creation))
-            .or_else(|| implicit_object_creation_declarator_type(object_creation)),
+            .or_else(|| implicit_object_creation_target_type(object_creation)),
         "implicit_object_creation_expression" => {
-            implicit_object_creation_declarator_type(object_creation)
+            implicit_object_creation_target_type(object_creation)
         }
         _ => None,
     }
 }
 
-fn implicit_object_creation_declarator_type(object_creation: Node<'_>) -> Option<Node<'_>> {
+/// The expression a target-typed `new()` must take its type from when the tree
+/// does not write that type: the left side of the assignment it initializes.
+pub fn object_creation_assignment_target(initializer: Node<'_>) -> Option<Node<'_>> {
+    let object_creation = initializer.parent()?;
+    if object_creation.kind() != "implicit_object_creation_expression" {
+        return None;
+    }
+    let assignment = object_creation.parent()?;
+    if assignment.kind() != "assignment_expression" {
+        return None;
+    }
+    if assignment.child_by_field_name("right") != Some(object_creation) {
+        return None;
+    }
+    assignment.child_by_field_name("left")
+}
+
+/// The written type a target-typed `new()` takes its type from.
+///
+/// C# gives `new()` the type of the expression's *target*, so this is a walk to
+/// that target rather than a lookup on the creation itself. Every position
+/// answered here is one where the target's type is written in the tree and can
+/// be read off it: an initialized declarator, property or parameter, and a
+/// `return` statement or expression body, whose target is the enclosing
+/// function's declared return type.
+///
+/// A target whose type the tree does not write is deliberately not answered:
+/// an element of a collection expression, the left side of an assignment, a
+/// call argument, or a switch arm. Each of those needs the target's own
+/// declaration resolved through the index, which is the resolver's work, not
+/// this syntax walk's.
+///
+/// The `= <value>` clause is transparent because the grammar does not always
+/// build one: a `variable_declarator` can carry the value in its own `value`
+/// field, which is why the declarator is matched here rather than through the
+/// clause.
+fn implicit_object_creation_target_type(object_creation: Node<'_>) -> Option<Node<'_>> {
     let mut current = object_creation;
     while let Some(parent) = current.parent() {
         match parent.kind() {
             "equals_value_clause" | "parenthesized_expression" | "checked_expression" => {
-                current = parent;
-            }
-            "ERROR" => {
-                if let Some(type_node) = error_recovered_implicit_declarator_type(parent, current) {
-                    return Some(type_node);
-                }
                 current = parent;
             }
             "variable_declarator" => {
@@ -3506,7 +3578,56 @@ fn implicit_object_creation_declarator_type(object_creation: Node<'_>) -> Option
                     .child_by_field_name("type")
                     .or_else(|| first_type_child(declaration));
             }
+            // A property initializer and a parameter default both state the
+            // target type on the declaration itself.
+            "property_declaration" | "indexer_declaration" | "parameter" => {
+                return crate::declarations::csharp_declared_type_node(parent);
+            }
+            "arrow_expression_clause" | "return_statement" => {
+                return enclosing_function_return_type(parent);
+            }
+            "ERROR" => {
+                if let Some(type_node) = error_recovered_implicit_declarator_type(parent, current) {
+                    return Some(type_node);
+                }
+                current = parent;
+            }
             _ => return None,
+        }
+    }
+    None
+}
+
+/// The declared return type of the function whose body produces `node`.
+///
+/// The walk refuses rather than guesses wherever the enclosing declaration does
+/// not state the type of this value: a lambda or anonymous method has its own
+/// return type, a constructor and a destructor declare none, and a `set`,
+/// `init`, `add` or `remove` accessor produces no value at all.
+fn enclosing_function_return_type(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "lambda_expression"
+            | "anonymous_method_expression"
+            | "constructor_declaration"
+            | "destructor_declaration" => return None,
+            "accessor_declaration" => {
+                let name = parent.child_by_field_name("name")?;
+                if name.kind() != "get" {
+                    return None;
+                }
+                current = parent;
+            }
+            "method_declaration"
+            | "local_function_statement"
+            | "operator_declaration"
+            | "conversion_operator_declaration"
+            | "property_declaration"
+            | "indexer_declaration" => {
+                return crate::declarations::csharp_declared_type_node(parent);
+            }
+            _ => current = parent,
         }
     }
     None

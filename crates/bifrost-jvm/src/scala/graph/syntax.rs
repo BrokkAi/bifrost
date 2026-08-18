@@ -707,6 +707,24 @@ fn scala_type_expression_path(node: Node<'_>, source: &str) -> Option<ScalaTypeE
     })
 }
 
+/// Return only the value binders introduced by a `val`/`var` definition.
+///
+/// A definition whose whole pattern is one simple identifier is a value
+/// definition, so `val Utility = other.Utility` binds `Utility` whatever its
+/// capitalization. Anything else is a real pattern -- `val Some(value) = opt`
+/// -- and follows the pattern rule below.
+pub fn scala_definition_binder_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
+    if matches!(node.kind(), "identifier" | "operator_identifier") {
+        let name = node_text(node, source).trim();
+        return if name.is_empty() {
+            Vec::new()
+        } else {
+            vec![name]
+        };
+    }
+    scala_pattern_binder_names(node, source)
+}
+
 /// Return only the value binders introduced by a Scala pattern.
 ///
 /// Pattern syntax mixes declaration positions with type paths, extractor
@@ -715,7 +733,7 @@ fn scala_type_expression_path(node: Node<'_>, source: &str) -> Option<ScalaTypeE
 /// collector follows the grammar's pattern fields and deliberately excludes
 /// every non-binding role.
 pub fn scala_pattern_binder_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
-    scala_pattern_binder_nodes(node)
+    scala_pattern_binder_nodes(node, source)
         .into_iter()
         .filter_map(|node| {
             let name = node_text(node, source).trim();
@@ -724,12 +742,16 @@ pub fn scala_pattern_binder_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'
         .collect()
 }
 
-fn scala_pattern_binder_nodes(node: Node<'_>) -> Vec<Node<'_>> {
+fn scala_pattern_binder_nodes<'tree>(node: Node<'tree>, source: &str) -> Vec<Node<'tree>> {
     let mut binders = Vec::new();
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
         match node.kind() {
-            "identifier" | "operator_identifier" => binders.push(node),
+            "identifier" | "operator_identifier" => {
+                if is_scala_variable_pattern_name(node, source) {
+                    binders.push(node);
+                }
+            }
             "typed_pattern" | "repeat_pattern" => {
                 if let Some(pattern) = node.child_by_field_name("pattern") {
                     stack.push(pattern);
@@ -786,10 +808,26 @@ fn scala_pattern_binder_nodes(node: Node<'_>) -> Vec<Node<'_>> {
     binders
 }
 
+/// Whether a simple identifier in pattern position introduces a new local
+/// rather than naming an existing stable value.
+///
+/// This is Scala's own rule (SLS 8.1.1): a variable pattern is a simple
+/// identifier that starts with a lower case letter, and every other simple
+/// identifier -- `case Origin =>`, a backquoted `` case `limit` => `` -- is a
+/// stable identifier pattern that *matches against* what the name denotes.
+/// Reading `Origin` as a binder made a case-object pattern shadow the object it
+/// names, so the site recorded no reference at all (#2078).
+fn is_scala_variable_pattern_name(node: Node<'_>, source: &str) -> bool {
+    let name = node_text(node, source).trim();
+    name.chars()
+        .next()
+        .is_none_or(|first| !first.is_uppercase() && first != '`')
+}
+
 /// Whether this exact identifier node declares a case-pattern value binder.
 /// Comparing node identities matters when a binder intentionally has the same
 /// spelling as a qualifier in its own type annotation.
-pub fn is_scala_case_pattern_binder(node: Node<'_>) -> bool {
+pub fn is_scala_case_pattern_binder(node: Node<'_>, source: &str) -> bool {
     if !matches!(node.kind(), "identifier" | "operator_identifier") {
         return false;
     }
@@ -803,7 +841,7 @@ pub fn is_scala_case_pattern_binder(node: Node<'_>) -> bool {
                         && node.end_byte() <= pattern.end_byte()
                 })
                 .is_some_and(|pattern| {
-                    scala_pattern_binder_nodes(pattern)
+                    scala_pattern_binder_nodes(pattern, source)
                         .into_iter()
                         .any(|binder| binder.id() == node.id())
                 });
@@ -1077,7 +1115,10 @@ impl ScalaPackageContextIndex {
         let mut boundaries = vec![0, root.end_byte()];
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
-            if node.kind() == "package_clause" {
+            // A `package object p` body is a package scope of its own (#2082),
+            // exactly like a `package p` clause body, so it starts and ends a
+            // segment here too.
+            if matches!(node.kind(), "package_clause" | "package_object") {
                 boundaries.push(node.start_byte());
                 boundaries.push(node.end_byte());
                 if let Some(body) = node.child_by_field_name("body") {
@@ -1639,6 +1680,27 @@ pub fn resolve_stable_object_expression<T>(
         resolved = resolve_child(&resolved, field)?;
     }
     Some(resolved)
+}
+
+/// The ordered identifier segments of the dotted expression `node` spells.
+///
+/// `pkg.sub.Owner` and `Owner.Nested` both reach here as nested
+/// `field_expression` nodes, and the walk reads the parser's `value`/`field`
+/// structure rather than splitting the source spelling. A path whose root is
+/// not a plain identifier -- a call result, a literal, a `new` -- has no stable
+/// segments and yields `None`.
+pub fn stable_path_segments(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    let segments = resolve_stable_object_expression(
+        node,
+        source,
+        |root| Some(vec![root.to_string()]),
+        |segments, member| {
+            let mut extended = segments.clone();
+            extended.push(member.to_string());
+            Some(extended)
+        },
+    )?;
+    (segments.len() >= 2).then_some(segments)
 }
 
 pub struct ScalaStableIdentifierReference {
@@ -2414,6 +2476,29 @@ pub fn scala_callable_alternative_matches(
     .is_none()
 }
 
+/// Whether the site writes exactly the argument lists this ordinary
+/// declaration declares, so the reference is an application of the method
+/// itself.
+///
+/// Scala inserts `.apply` on a value only where no method applies, so a
+/// same-named `val` is not a denotation of a site this answers `true` for. The
+/// mirror rule holds without an argument list: a `def` that shares a `val`'s
+/// name must take parameters, so a reference that writes none cannot be that
+/// `def`. Together the two are the forward half of the shape test the inverse
+/// index reads from the call node (`member_blocks_callable_lookup_for_call`,
+/// #2081); the unapplied half is the `unique_callable` premise of
+/// [`scala_callable_shape_mismatch`], which a competing term field withdraws.
+pub fn scala_callable_completes_call(
+    declared_role: ScalaCallableRole,
+    declared_shape: &[ScalaCallableParameterList],
+    declared_result: ScalaDeclaredResult,
+    actual: &ScalaCallSiteShape,
+) -> bool {
+    declared_role == ScalaCallableRole::Ordinary
+        && scala_call_shape_relation(declared_shape, declared_result, actual)
+            == ScalaCallShapeRelation::Complete
+}
+
 pub fn scala_callable_alternative_is_candidate(
     declared_role: ScalaCallableRole,
     declared_shape: &[ScalaCallableParameterList],
@@ -2453,6 +2538,52 @@ pub fn scala_callable_shape_is_candidate(
                     .method_value_arity
                     .is_none_or(|arity| next_explicit_arity.accepts(arity))
         }
+    }
+}
+
+/// Whether a Scala terminal states a reference role the grammar still spells
+/// out inside a parser-recovery subtree (#2085).
+///
+/// tree-sitter-scala loses whole template bodies to error recovery on Scala 3
+/// source it cannot parse: a mixed alphanumeric/operator method name such as
+/// `def be_==/(...)` wraps every sibling definition of the enclosing trait in
+/// one ERROR node, and the soft keyword `export` used as a member name
+/// (`DatasetArea.export(domain)`) wraps the selection it appears in. The
+/// declarations inside that ERROR keep their fields -- `parameters`,
+/// `class_parameters`, `extends_clause`, `field_expression` -- so the reference
+/// roles below are exactly as well stated there as outside it, and the inverse
+/// usage scan reports occurrences from them. Census membership must hold those
+/// occurrences or a valid inverse hit counts as unbacked.
+///
+/// Only these roles. An identifier that recovery merely left lying around says
+/// nothing structural, and admitting it would let membership back an inverse
+/// hit that no source occurrence supports.
+///
+/// Declaration binders are NOT among them: a `type` (or `opaque type`)
+/// definition writes its name as the one `type_identifier` that binds rather
+/// than refers, and every other Scala binder -- a class, trait, object, `def`,
+/// `val`, parameter, class parameter or type parameter name -- is an
+/// `identifier` in a `name` field. Neither shape can enter membership here.
+pub fn is_recovered_membership_reference(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    match node.kind() {
+        // Scala gives type positions their own token, so a `type_identifier` is
+        // a type reference wherever it appears: a parameter or class-parameter
+        // type, a `def` return type, a type argument, a bound, an
+        // `extends`/`with` supertype. The single exception is the name a
+        // `type` definition binds.
+        "type_identifier" => {
+            !(parent.kind() == "type_definition"
+                && parent.child_by_field_name("name") == Some(node))
+        }
+        // The qualifier of a member selection names the value the member is
+        // read from, which is a reference at every occurrence.
+        "identifier" => {
+            parent.kind() == "field_expression" && parent.child_by_field_name("value") == Some(node)
+        }
+        _ => false,
     }
 }
 
@@ -2506,6 +2637,13 @@ pub fn is_scala_named_argument_assignment(node: Node<'_>) -> bool {
 pub fn terminal_invocation_owner_name(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "identifier" | "type_identifier" => Some(node),
+        // A curried application such as `f(a)(label = b)` hangs the later
+        // argument lists off nested `call_expression` functions. Every list
+        // applies the same callee, so the terminal name of the inner call is
+        // this invocation's owner name.
+        "call_expression" => node
+            .child_by_field_name("function")
+            .and_then(terminal_invocation_owner_name),
         "generic_function" => node
             .child_by_field_name("function")
             .and_then(terminal_invocation_owner_name),

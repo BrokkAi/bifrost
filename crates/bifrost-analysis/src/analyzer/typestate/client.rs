@@ -1383,6 +1383,7 @@ impl ReusableSummaryProvider<TypestateFact> for NoReusableTypestateSummaries {
     fn summary_for(
         &mut self,
         _procedure: &ProcedureHandle,
+        _root: &ProcedureHandle,
         _entry_fact: TypestateFact,
         _request: &mut DataflowRequest<'_>,
     ) -> Result<Option<ReusableProcedureSummary<TypestateFact>>, SolverTermination> {

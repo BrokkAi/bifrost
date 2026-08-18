@@ -121,6 +121,26 @@ impl Liveness {
         Ok(resolved)
     }
 
+    /// The repository-wide Git identity scan this handle already took, if it
+    /// has one.
+    ///
+    /// It never takes one: a caller that needs OIDs asks for them and pays for
+    /// the scan there. This accessor exists so a second consumer of the same
+    /// worktree -- the semantic indexer, which must derive its own content
+    /// identities -- can reuse the index entries and dirty set this scan already
+    /// read instead of re-reading the index and re-diffing the working tree. On
+    /// the firefox workspace that duplicate cost 4.1 s over 401,804 index
+    /// entries at cold start.
+    ///
+    /// `None` means no scan has been taken yet, or one was invalidated by
+    /// [`Self::invalidate_startup_oids`]; the caller then does its own.
+    pub fn taken_startup_identity(&self) -> Option<Arc<gitblob::WorkingTreeIdentity>> {
+        self.startup_identity
+            .lock()
+            .expect("liveness startup identity mutex poisoned")
+            .clone()
+    }
+
     pub fn invalidate_startup_oids(&self) {
         *self
             .startup_identity
@@ -304,7 +324,22 @@ struct IndexFingerprint {
 #[derive(Clone)]
 struct PathState {
     oid: Oid,
+    /// The stat this entry's *liveness* is checked against. `Some` means "a
+    /// disk change invalidates this generation": the entry is dropped from a
+    /// snapshot and refused by `validated_oid_for_path` once the file moves.
+    /// `None` means the identity is current for as long as the map holds it,
+    /// which is what an overlay and a hashed non-Git identity both need: the
+    /// analyzer indexed that content, and it must keep answering from the
+    /// generation it indexed until it is explicitly refreshed.
     stat: Option<FileStat>,
+    /// The stat observed when this identity was captured, whether or not the
+    /// identity's liveness is checked against it. This answers a different
+    /// question from `stat`: not "is this generation still live" but "is the
+    /// file's content still exactly the content this oid names", which is what
+    /// a caller needs to reuse content-derived work without reading the file.
+    /// Only an identity taken from disk has one; an overlay's content is not a
+    /// function of anything on disk, so no disk stat can confirm it.
+    capture_stat: Option<FileStat>,
     /// Whether this entry is intrinsically current for the lifetime of the
     /// `LiveSnapshot`. Overlay entries have no filesystem stat and can be
     /// trusted until their overlay generation changes. Filesystem entries keep
@@ -325,6 +360,13 @@ impl PartialEq for PathState {
     /// feeds the source-of-truth maps — but the exclusion is correct either
     /// way and documents the intent explicitly rather than relying on that
     /// invariant silently holding).
+    ///
+    /// It ignores `capture_stat` for a related reason: a file that was touched
+    /// without changing its bytes keeps the same `oid`, so it is not a content
+    /// change and must not bump the map's generation. The retained older
+    /// `capture_stat` still names the same content, and the re-stat in
+    /// `stat_paired_oid_for_path` simply declines until the identity is
+    /// captured again, which is the conservative direction.
     fn eq(&self, other: &Self) -> bool {
         self.oid == other.oid && self.stat == other.stat
     }
@@ -339,16 +381,26 @@ impl PathState {
         file: &ProjectFile,
         revalidate_filesystem: bool,
     ) -> Option<Self> {
-        let stat = match validation {
+        let (stat, capture_stat) = match validation {
             LivePathValidation::Filesystem if revalidate_filesystem => {
-                Some(FileStat::from_path(&file.abs_path())?)
+                let stat = FileStat::from_path(&file.abs_path())?;
+                (Some(stat.clone()), Some(stat))
             }
-            LivePathValidation::Filesystem => None,
-            LivePathValidation::Overlay => None,
+            // A hashed identity is checked for content reuse but not for
+            // generation liveness, so a failed stat here is not a reason to
+            // drop the path: the analyzer indexed this content and keeps
+            // answering from it.
+            LivePathValidation::FilesystemHashed if revalidate_filesystem => {
+                (None, FileStat::from_path(&file.abs_path()))
+            }
+            LivePathValidation::Filesystem
+            | LivePathValidation::FilesystemHashed
+            | LivePathValidation::Overlay => (None, None),
         };
         Some(Self {
             oid,
             stat,
+            capture_stat,
             validated: false,
         })
     }
@@ -356,13 +408,25 @@ impl PathState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LivePathValidation {
+    /// An identity supplied by a Git identity source for a file on disk. The
+    /// source can see a working-tree edit the analyzer has not been told
+    /// about, so the entry's liveness is checked against the file's stat.
     Filesystem,
+    /// An identity computed here by hashing the file's bytes, because no Git
+    /// identity source is available. The analyzer indexed exactly those bytes,
+    /// and nothing else will notice a later disk edit on its behalf, so this
+    /// entry stays live until the analyzer refreshes it. The capture stat is
+    /// still recorded, so content-derived work can be reused only while the
+    /// file provably still holds the hashed bytes.
+    FilesystemHashed,
+    /// An unsaved overlay. Its content is not a function of anything on disk,
+    /// so no disk stat can confirm or invalidate it.
     Overlay,
 }
 
 impl LivePathValidation {
     fn is_filesystem(self) -> bool {
-        matches!(self, Self::Filesystem)
+        matches!(self, Self::Filesystem | Self::FilesystemHashed)
     }
 }
 
@@ -379,6 +443,17 @@ impl LivePathEntry {
             file,
             oid,
             validation: LivePathValidation::Filesystem,
+        }
+    }
+
+    /// An identity produced by hashing the file's bytes here, because the
+    /// workspace has no Git identity source. See
+    /// [`LivePathValidation::FilesystemHashed`].
+    pub fn filesystem_hashed(file: ProjectFile, oid: Oid) -> Self {
+        Self {
+            file,
+            oid,
+            validation: LivePathValidation::FilesystemHashed,
         }
     }
 
@@ -546,6 +621,30 @@ impl LiveSnapshot {
         }
     }
 
+    /// The blob identity recorded for `file` from the filesystem, re-confirmed
+    /// against the file's current stat on this call.
+    ///
+    /// Unlike [`Self::validated_oid_for_path`], this never takes the snapshot's
+    /// intrinsic-currency shortcut and never answers from an entry that has no
+    /// recorded capture stat. Only an identity taken from a file on disk under
+    /// filesystem revalidation records one (see [`PathState::new`]), so a
+    /// `Some` answer means "this oid and this stat were captured from the same
+    /// file at the same time, and the file still has that stat". An overlay
+    /// entry and an entry recorded under a trusted filesystem generation both
+    /// answer `None` rather than being trusted.
+    ///
+    /// This is the token a caller uses to reuse content-derived work without
+    /// reading the file. It asks a different question from the token that
+    /// decides which persisted rows are live, which is why it reads its own
+    /// stat: a hashed non-Git identity stays live for the generation that
+    /// indexed it, while the content it names is reusable only while the file
+    /// provably still holds those bytes.
+    pub fn stat_paired_oid_for_path(&self, file: &ProjectFile) -> Option<Oid> {
+        let state = self.path_to_state.get(file)?;
+        let expected = state.capture_stat.as_ref()?;
+        (FileStat::from_path(&file.abs_path()).as_ref() == Some(expected)).then_some(state.oid)
+    }
+
     pub fn contains_oid(&self, oid: Oid) -> bool {
         self.oid_to_paths.contains_key(&oid)
     }
@@ -606,9 +705,10 @@ fn build_snapshot(
             file,
             PathState {
                 oid,
-                stat: Some(stat),
+                stat: Some(stat.clone()),
+                capture_stat: Some(stat),
                 // `Liveness::snapshot()` intentionally never promotes to
-                // `true` — see the `validated` field doc.
+                // `true` -- see the `validated` field doc.
                 validated: false,
             },
         );
@@ -1293,6 +1393,73 @@ mod tests {
         // filesystem validation must refuse its now-stale path instead of
         // serving the old oid.
         assert_eq!(snapshot.validated_oid_for_path(&file_a), None);
+    }
+
+    /// The stat-paired token answers only for an identity that was captured
+    /// with a filesystem stat, and it re-checks that stat every time.
+    ///
+    /// This is what lets a caller reuse content-derived work without reading
+    /// the file. It must therefore refuse three cases the ordinary live-oid
+    /// answer accepts: an overlay identity, an identity recorded under a
+    /// trusted filesystem generation, and a path whose stat has changed. The
+    /// hashed non-Git identity is the case that shows the two questions are
+    /// separate: it stays live while its content stops being reusable.
+    #[test]
+    fn the_stat_paired_token_refuses_anything_it_cannot_re_confirm() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let file = project_file(temp.path(), "a.rs");
+        let oid = Oid::hash_object(ObjectType::Blob, b"fn a() {}\n").unwrap();
+
+        let map = LivePathMap::default();
+        map.refresh([LivePathEntry::filesystem(file.clone(), oid)]);
+        let snapshot = map.snapshot();
+        assert_eq!(snapshot.stat_paired_oid_for_path(&file), Some(oid));
+
+        // An overlay identity has no filesystem stat to pair with, so the file
+        // on disk says nothing about the content this identity describes.
+        let overlay_map = LivePathMap::default();
+        overlay_map.refresh([LivePathEntry::overlay(file.clone(), oid)]);
+        let overlay_snapshot = overlay_map.snapshot();
+        assert_eq!(overlay_snapshot.oid_for_path(&file), Some(oid));
+        assert_eq!(overlay_snapshot.stat_paired_oid_for_path(&file), None);
+
+        // An analyzer that trusts its filesystem generation records no stat
+        // either, so nothing here can be re-confirmed.
+        let trusting_map = LivePathMap::trust_filesystem_generation();
+        trusting_map.refresh([LivePathEntry::filesystem(file.clone(), oid)]);
+        let trusting_snapshot = trusting_map.snapshot();
+        assert_eq!(trusting_snapshot.validated_oid_for_path(&file), Some(oid));
+        assert_eq!(trusting_snapshot.stat_paired_oid_for_path(&file), None);
+
+        // An identity hashed here, outside a Git repository, answers the two
+        // questions separately: it is live for the generation that indexed it,
+        // and its content is reusable only while the file still holds it.
+        let hashed_map = LivePathMap::default();
+        hashed_map.refresh([LivePathEntry::filesystem_hashed(file.clone(), oid)]);
+        let hashed_snapshot = hashed_map.snapshot();
+        assert_eq!(hashed_snapshot.validated_oid_for_path(&file), Some(oid));
+        assert_eq!(hashed_snapshot.stat_paired_oid_for_path(&file), Some(oid));
+
+        // An edit behind the map's back is refused by the re-check, even
+        // though the map still holds the entry.
+        std::fs::write(temp.path().join("a.rs"), "fn a() { edited(); }\n").unwrap();
+        assert_eq!(snapshot.oid_for_path(&file), Some(oid));
+        assert_eq!(snapshot.stat_paired_oid_for_path(&file), None);
+
+        // The same edit decouples the hashed entry's two answers. The analyzer
+        // indexed the old bytes and no one has told it otherwise, so it must
+        // keep answering from that generation; but the file no longer provably
+        // holds those bytes, so nothing derived from them may be reused.
+        assert_eq!(hashed_snapshot.validated_oid_for_path(&file), Some(oid));
+        assert_eq!(hashed_snapshot.stat_paired_oid_for_path(&file), None);
+        // A forked map rebuilds its snapshot from the same states, so this
+        // exercises the build path rather than the memoized snapshot: a hashed
+        // entry must survive it too.
+        assert_eq!(
+            hashed_map.fork().snapshot().validated_oid_for_path(&file),
+            Some(oid)
+        );
     }
 
     #[test]

@@ -3,8 +3,8 @@
 //! Retrieval is dense only. A query is embedded once, scored against the stored
 //! quantized vectors, and the best candidates are resolved to live function
 //! occurrences one at a time (see `super::retrieval`). Two independent signals
-//! come back -- ranked symbols from the dense arm and ranked files from git
-//! co-edit history -- and reranking stays with the caller. Symbol scores are
+//! come back -- ranked symbols from the dense arm and files ranked by the
+//! co-edit cascade -- and reranking stays with the caller. Symbol scores are
 //! min-max normalized within the returned window so a caller does not have to
 //! know the raw cosine scale.
 
@@ -14,9 +14,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
-use brokk_bifrost_analysis::searchtools::{
-    MostRelevantFilesParams, most_relevant_files_history_only,
-};
+use brokk_bifrost_analysis::searchtools::{MostRelevantFilesParams, most_relevant_files};
 use brokk_bifrost_analysis::searchtools_render::{RenderOptions, RenderText};
 
 use super::indexer::{DEFAULT_READY_TIMEOUT, READY_TIMEOUT_MESSAGE, SemanticIndexer};
@@ -279,16 +277,18 @@ pub fn semantic_search(
     let coedit_ranked = if seed_paths.is_empty() {
         Vec::new()
     } else {
-        match most_relevant_files_history_only(
+        match most_relevant_files(
             workspace.analyzer(),
             MostRelevantFilesParams {
                 seed_file_paths: seed_paths,
                 seed_weights: Some(seed_weights),
                 recency_half_life: Some(COEDIT_HALF_LIFE),
-                // Semantic co-edit is the Git history leg. The user-facing
-                // most_relevant_files tool still adds import ranking, but that
-                // graph is unrelated to this retrieval signal and can expand
-                // for minutes in large Java workspaces.
+                // The cascade, which is the default. This leg used to be the
+                // git history ranking alone, because the alternative was the
+                // two-level import graph and that can expand for minutes in a
+                // large Java workspace. The cascade reads import adjacency one
+                // level deep instead, and it answers in the repositories where
+                // the history leg returns nothing at all.
                 ranking_mode: Default::default(),
                 limit: k,
             },

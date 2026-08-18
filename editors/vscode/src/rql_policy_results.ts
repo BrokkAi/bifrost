@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import type {
+  PolicyDisplayStep,
   PolicyFinding,
   PolicyReportDiagnostic,
   PolicyReportEvaluation,
@@ -12,6 +13,7 @@ import type {
 import {
   policyCompletionDetail,
   policyCompletionLabel,
+  policyFindingDisplayRows,
   policyFindingDetail,
   policyFindingTerminalSymbol,
   policyRunDiagnosticCodeLabel,
@@ -23,10 +25,16 @@ export interface PolicyFindingTarget {
   finding: PolicyFinding;
 }
 
+export interface PolicyDisplayStepTarget {
+  reportRootUri: string;
+  step: PolicyDisplayStep;
+}
+
 type PolicyTreeItem =
   | PolicyStaleItem
   | PolicyRunItem
   | PolicyFindingItem
+  | PolicyDisplayStepItem
   | PolicySuppressionSummaryItem
   | PolicySuppressionReviewItem
   | PolicyDiagnosticItem
@@ -75,6 +83,11 @@ export class RqlPolicyResultsProvider implements vscode.TreeDataProvider<PolicyT
     }
     if (element instanceof PolicySuppressionSummaryItem) {
       return element.reviews.map((review) => new PolicySuppressionReviewItem(review));
+    }
+    if (element instanceof PolicyFindingItem) {
+      return policyFindingDisplayRows(element.finding).map(
+        (step, index) => new PolicyDisplayStepItem(element.reportRootUri, step, index)
+      );
     }
     if (element) {
       return [];
@@ -211,10 +224,15 @@ class PolicySuppressionReviewItem extends vscode.TreeItem {
 
 class PolicyFindingItem extends vscode.TreeItem {
   constructor(
-    reportRootUri: string,
+    readonly reportRootUri: string,
     readonly finding: PolicyFinding
   ) {
-    super(compactText(finding.message), vscode.TreeItemCollapsibleState.None);
+    super(
+      compactText(finding.message),
+      policyFindingDisplayRows(finding).length > 0
+        ? vscode.TreeItemCollapsibleState.Collapsed
+        : vscode.TreeItemCollapsibleState.None
+    );
     const terminal = policyFindingTerminalSymbol(finding);
     const region = finding.primary.region;
     const location = region
@@ -239,6 +257,43 @@ class PolicyFindingItem extends vscode.TreeItem {
       title: "Open Bifrost Policy Finding",
       arguments: [{ reportRootUri, finding } satisfies PolicyFindingTarget]
     };
+  }
+}
+
+class PolicyDisplayStepItem extends vscode.TreeItem {
+  constructor(
+    reportRootUri: string,
+    readonly step: PolicyDisplayStep,
+    index: number
+  ) {
+    super(`${index + 1}. ${compactText(step.label)}`, vscode.TreeItemCollapsibleState.None);
+    const region = step.location.region;
+    const location = region
+      ? `${step.location.path}:${region.start_line}:${region.start_column}`
+      : step.location.path;
+    this.description = `${step.kind} · ${location}`;
+    this.tooltip = `${step.kind.toUpperCase()}\n${step.label}\n\n${location}`;
+    this.iconPath = new vscode.ThemeIcon(displayStepIcon(step));
+    this.command = {
+      command: "bifrost.openRqlPolicyDisplayStep",
+      title: "Open Bifrost Policy Display Step",
+      arguments: [{ reportRootUri, step } satisfies PolicyDisplayStepTarget]
+    };
+  }
+}
+
+function displayStepIcon(step: PolicyDisplayStep): string {
+  switch (step.kind) {
+    case "source":
+      return "debug-start";
+    case "call":
+      return "call-outgoing";
+    case "return":
+      return "call-incoming";
+    case "sink":
+      return "target";
+    case "propagation":
+      return "arrow-right";
   }
 }
 

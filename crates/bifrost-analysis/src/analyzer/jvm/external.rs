@@ -13,10 +13,11 @@ use crate::analyzer::semantic_model::{
     DependencyArtifactRole, DependencyDiscoveryOutcome, DependencyDiscoveryProfile,
     DependencyPackAdapter, DependencyPackDiagnostic, DependencyPackDiagnosticSeverity,
     DependencyPackLimits, DependencyPackProduction, DependencyProvenance, ExactDependencyArtifact,
-    ExternalArtifactKind, ExternalArtifactPackProducer, Locator, MemberFact, NameSelector,
-    Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, ResolvedDependency,
-    ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence, TypeFact, TypeKind,
-    Visibility, normalize_artifact_locator_paths, read_exact_artifact_while,
+    ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact, Locator, MemberFact,
+    NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
+    ResolvedDependency, ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence,
+    TypeFact, TypeKind, TypeRef, Visibility, normalize_artifact_locator_paths,
+    read_exact_artifact_while,
 };
 use crate::analyzer::{
     JvmAnalyzerConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalArtifactOrigin,
@@ -50,11 +51,185 @@ const MAX_TOTAL_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_TOTAL_INDEX_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ANALYZER_SOURCE_TYPES: usize = 4_096;
+/// The most member declarations one indexed artifact may contribute to the
+/// external member surface (#1900).
+///
+/// The type-level index bounds an artifact by bytes ([`MAX_TOTAL_ARCHIVE_BYTES`]
+/// against the shared [`MAX_TOTAL_INDEX_BYTES`] remainder) and by entries
+/// ([`MAX_ARCHIVE_ENTRIES`]). Members are a second dimension: one class entry
+/// well inside the byte bound can declare thousands of them, so a jar of
+/// generated API classes could otherwise multiply the retained index far past
+/// what its bytes suggest. Charging members separately keeps the retained
+/// surface bounded in the dimension that actually grows.
+///
+/// Reaching the bound is recorded as a production diagnostic, so the artifact
+/// reports as declared-but-not-fully-indexed rather than as a complete surface
+/// that happens to declare fewer members.
+const MAX_ARTIFACT_MEMBERS: usize = 32_768;
+/// The most owner types one member lookup may walk while following an indexed
+/// owner's supertypes.
+///
+/// An indexed hierarchy comes from class files that were compiled separately
+/// and may disagree, so a cycle is possible; the visited set already stops one,
+/// and this bounds the work of a wide but acyclic hierarchy as well.
+const MAX_MEMBER_SURFACE_OWNERS: usize = 64;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JvmExternalDeclarationIndex {
     types_by_fqn: HashMap<String, JvmExternalType>,
+    /// The member surface of every indexed owner whose own artifact entry this
+    /// index read to the end, keyed by the owner's fully-qualified name
+    /// (#1900).
+    ///
+    /// An owner with no entry here has no read member surface at all, which is
+    /// not the same as an owner that declares no members: see
+    /// [`JvmIndexedOwnerSurface`].
+    members_by_owner: HashMap<String, JvmIndexedOwnerSurface>,
     production_diagnostics: Vec<ProducerDiagnostic>,
+}
+
+/// The member surface one indexed artifact type carries (#1900).
+///
+/// A surface exists only for an owner whose own archive entry passed the byte
+/// budget and parsed, which is what makes the absence of a surface mean "not
+/// read" rather than "declares nothing". This is the artifact half of the same
+/// distinction the pack half draws between a pack that ships an empty `members`
+/// array and no activated pack at all: in both halves only a positive
+/// declaration is ever added, and a lookup that finds none leaves the caller's
+/// status exactly where it was.
+#[derive(Debug, Clone, Default)]
+struct JvmIndexedOwnerSurface {
+    /// One entry per written member name. Overloads are one name and not
+    /// ambiguity -- `sort(List)` and `sort(List, Comparator)` are two
+    /// declarations a reference spells identically -- so the first declaration
+    /// read wins, which is the rule the pack half's `members_of` search already
+    /// applies.
+    members: HashMap<String, JvmExternalMember>,
+    /// The fully-qualified supertypes the owner's own artifact entry named, so
+    /// an inherited member is answered where it is declared. This is the
+    /// artifact half of the pack half's `SemanticModelOverlay::owner_surface`
+    /// closure.
+    supertypes: Vec<String>,
+}
+
+/// What one Java artifact's declaration-fact production yielded, indexed the
+/// way the archive walk consumes it (#1900).
+///
+/// The producer emits a flat list of member facts that point at their owner by
+/// declaration id; the archive walk asks for one owner at a time, by
+/// fully-qualified name, as it finishes reading that owner's entry. This does
+/// the join once.
+struct JavaArtifactFacts {
+    types: HashMap<String, TypeFact>,
+    members_by_owner: HashMap<String, Vec<MemberFact>>,
+}
+
+impl JavaArtifactFacts {
+    fn new(types: HashMap<String, TypeFact>, members: Vec<MemberFact>) -> Self {
+        let name_by_id = types
+            .values()
+            .map(|fact| (fact.id.clone(), fact.name.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut members_by_owner: HashMap<String, Vec<MemberFact>> = HashMap::default();
+        for member in members {
+            // A member whose owner the production never emitted has no name to
+            // hang on, so nothing can spell it.
+            let Some(owner) = name_by_id.get(&member.owner) else {
+                continue;
+            };
+            members_by_owner
+                .entry(owner.clone())
+                .or_default()
+                .push(member);
+        }
+        Self {
+            types,
+            members_by_owner,
+        }
+    }
+
+    /// The member surface for one owner whose artifact entry was just read to
+    /// the end, charged against this artifact's member budget.
+    ///
+    /// Taking rather than borrowing keeps one owner's members from being
+    /// charged twice when the same class appears under two entries.
+    fn take_owner_surface(
+        &mut self,
+        owner_fqn: &str,
+        owner_package: &str,
+        budget: &mut MemberBudget,
+    ) -> JvmIndexedOwnerSurface {
+        let supertypes = self
+            .types
+            .get(owner_fqn)
+            .map(|fact| hierarchy_type_names(&fact.hierarchy))
+            .unwrap_or_default();
+        let mut members = HashMap::default();
+        for fact in self.members_by_owner.remove(owner_fqn).unwrap_or_default() {
+            if !budget.take() {
+                break;
+            }
+            members
+                .entry(fact.name.clone())
+                .or_insert_with(|| JvmExternalMember {
+                    fqn: qualified_name(owner_fqn, &fact.name),
+                    declaring_package: owner_package.to_owned(),
+                    visibility: semantic_visibility(fact.visibility),
+                });
+        }
+        JvmIndexedOwnerSurface {
+            members,
+            supertypes,
+        }
+    }
+}
+
+/// The per-artifact member-count bound [`MAX_ARTIFACT_MEMBERS`] states,
+/// carried across one artifact's whole archive walk.
+///
+/// Once it is spent the walk keeps indexing types and simply records no further
+/// members, and `exhausted` makes the artifact report as not fully read, so a
+/// member the bound dropped is unknown rather than absent.
+struct MemberBudget {
+    remaining: usize,
+    exhausted: bool,
+}
+
+impl MemberBudget {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_ARTIFACT_MEMBERS,
+            exhausted: false,
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        match self.remaining.checked_sub(1) {
+            Some(remaining) => {
+                self.remaining = remaining;
+                true
+            }
+            None => {
+                self.exhausted = true;
+                false
+            }
+        }
+    }
+}
+
+/// The fully-qualified supertype names one indexed type's hierarchy facts name.
+///
+/// A hierarchy target the producer could not name -- an erased type variable,
+/// an array -- is not a type a member surface can be read from, so it is
+/// dropped rather than guessed at.
+fn hierarchy_type_names(hierarchy: &[HierarchyFact]) -> Vec<String> {
+    hierarchy
+        .iter()
+        .filter_map(|relation| match &relation.target {
+            TypeRef::Named { name, .. } => (!name.is_empty()).then(|| name.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1053,6 +1228,48 @@ impl JvmExternalDeclarationIndex {
         self.types_by_fqn.get(fqn)
     }
 
+    /// The member `member_name` names on the indexed owner `owner_fqn`,
+    /// searched over the owner's whole read inherited surface (#1900).
+    ///
+    /// The walk starts at the owner and follows the supertypes its own artifact
+    /// entry named, breadth first, because a JVM member is as often inherited
+    /// as declared: a static factory sits on the class the reference wrote
+    /// while an accessor sits on the base class it extends, and a reference
+    /// spells both the same way. The declaration that answers keeps its own
+    /// qualified name and its own declaring package, so the reported target
+    /// names where the member is declared rather than where it was written,
+    /// and package-private accessibility measures against the right package.
+    ///
+    /// An owner with no read surface, and a supertype whose own class file was
+    /// never read, both contribute nothing rather than proving anything: this
+    /// returns `None` for "not declared here" and for "never read" alike, and a
+    /// caller that finds nothing keeps the status it had.
+    fn member(&self, owner_fqn: &str, member_name: &str) -> Option<&JvmExternalMember> {
+        let mut visited = crate::hash::HashSet::default();
+        let mut queue = std::collections::VecDeque::new();
+        visited.insert(owner_fqn.to_owned());
+        queue.push_back(owner_fqn.to_owned());
+        let mut walked = 0usize;
+        while let Some(owner) = queue.pop_front() {
+            walked = walked.saturating_add(1);
+            if walked > MAX_MEMBER_SURFACE_OWNERS {
+                return None;
+            }
+            let Some(surface) = self.members_by_owner.get(&owner) else {
+                continue;
+            };
+            if let Some(member) = surface.members.get(member_name) {
+                return Some(member);
+            }
+            for supertype in &surface.supertypes {
+                if visited.insert(supertype.clone()) {
+                    queue.push_back(supertype.clone());
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) fn resolve_explicit_import(
         &self,
         import_path: &str,
@@ -1147,8 +1364,11 @@ impl JvmExternalDeclarationIndex {
         let mut total_bytes = 0u64;
         let mut java_facts = None;
         let mut scala_indexed = false;
+        let mut skipped_entries = archive.len().saturating_sub(entry_count);
+        let mut member_budget = MemberBudget::new();
         for index in 0..entry_count {
             let Ok(entry) = archive.by_index(index) else {
+                skipped_entries = skipped_entries.saturating_add(1);
                 continue;
             };
             let Some(language) = SourceJarLanguage::for_entry(entry.name()) else {
@@ -1161,6 +1381,7 @@ impl JvmExternalDeclarationIndex {
                 MAX_TOTAL_ARCHIVE_BYTES.min(index_byte_budget),
                 &mut total_bytes,
             ) {
+                skipped_entries = skipped_entries.saturating_add(1);
                 continue;
             }
             if matches!(language, SourceJarLanguage::Scala) {
@@ -1187,26 +1408,33 @@ impl JvmExternalDeclarationIndex {
                 .is_err()
                 || source.len() as u64 > max_entry_bytes
             {
+                skipped_entries = skipped_entries.saturating_add(1);
                 continue;
             }
             let external_types = language.source_types(artifact_path, &source_path, &source);
             if matches!(language, SourceJarLanguage::Java) && java_facts.is_none() {
-                java_facts =
-                    Some(self.produce_java_type_facts(
-                        artifact_path,
-                        ExternalArtifactKind::JavaSourceJar,
-                    ));
+                java_facts = Some(
+                    self.produce_java_facts(artifact_path, ExternalArtifactKind::JavaSourceJar),
+                );
             }
             for mut external_type in external_types {
-                if let Some(fact) = java_facts
-                    .as_ref()
-                    .and_then(|facts| facts.get(&external_type.fqn))
-                {
-                    apply_java_type_fact(&mut external_type, fact);
+                if let Some(facts) = java_facts.as_mut() {
+                    if let Some(fact) = facts.types.get(&external_type.fqn) {
+                        apply_java_type_fact(&mut external_type, fact);
+                    }
+                    // The entry that declares this type was read to the end, so
+                    // its member surface may answer.
+                    let surface = facts.take_owner_surface(
+                        &external_type.fqn,
+                        &external_type.package_name,
+                        &mut member_budget,
+                    );
+                    self.attach_member_surface(&external_type.fqn, surface);
                 }
                 self.insert(external_type);
             }
         }
+        self.note_bounded_artifact(artifact_path, skipped_entries, member_budget);
         total_bytes
     }
 
@@ -1219,10 +1447,13 @@ impl JvmExternalDeclarationIndex {
         };
         let entry_count = archive.len().min(MAX_ARCHIVE_ENTRIES);
         let mut total_bytes = 0u64;
-        let java_facts =
-            self.produce_java_type_facts(artifact_path, ExternalArtifactKind::JavaClassJar);
+        let mut skipped_entries = archive.len().saturating_sub(entry_count);
+        let mut member_budget = MemberBudget::new();
+        let mut java_facts =
+            self.produce_java_facts(artifact_path, ExternalArtifactKind::JavaClassJar);
         for index in 0..entry_count {
             let Ok(entry) = archive.by_index(index) else {
+                skipped_entries = skipped_entries.saturating_add(1);
                 continue;
             };
             if !entry.name().ends_with(".class") || entry.name().ends_with("module-info.class") {
@@ -1234,6 +1465,7 @@ impl JvmExternalDeclarationIndex {
                 MAX_TOTAL_ARCHIVE_BYTES.min(index_byte_budget),
                 &mut total_bytes,
             ) {
+                skipped_entries = skipped_entries.saturating_add(1);
                 continue;
             }
             let class_entry = entry.name().to_string();
@@ -1244,23 +1476,110 @@ impl JvmExternalDeclarationIndex {
                 .is_err()
                 || bytes.len() as u64 > MAX_CLASS_ENTRY_BYTES
             {
+                skipped_entries = skipped_entries.saturating_add(1);
                 continue;
             }
-            if let Some(mut external_type) = class_type(artifact_path, &class_entry, &bytes) {
-                if let Some(fact) = java_facts.get(&external_type.fqn) {
-                    apply_java_type_fact(&mut external_type, fact);
+            let mut external_type = match class_type(artifact_path, &class_entry, &bytes) {
+                ClassTypeOutcome::Declared(external_type) => external_type,
+                // A module descriptor and a private class were read
+                // completely; the index publishes neither on purpose, and
+                // neither leaves anything unread.
+                ClassTypeOutcome::Excluded => continue,
+                // Bytes that did not parse are a class file this index did not
+                // read: it declares no type here and, just as importantly, no
+                // member surface that could later answer a member spelling
+                // negatively.
+                ClassTypeOutcome::Unreadable => {
+                    skipped_entries = skipped_entries.saturating_add(1);
+                    continue;
                 }
-                self.insert(external_type);
+            };
+            if let Some(fact) = java_facts.types.get(&external_type.fqn) {
+                apply_java_type_fact(&mut external_type, fact);
             }
+            // This entry was read to the end and parsed, so the members the
+            // same class file declares are a surface that may answer (#1900).
+            let surface = java_facts.take_owner_surface(
+                &external_type.fqn,
+                &external_type.package_name,
+                &mut member_budget,
+            );
+            self.attach_member_surface(&external_type.fqn, surface);
+            self.insert(external_type);
         }
+        self.note_bounded_artifact(artifact_path, skipped_entries, member_budget);
         total_bytes
     }
 
-    fn produce_java_type_facts(
+    /// Record the member surface an owner's own artifact entry declared.
+    ///
+    /// Only ever called for an owner whose entry was read to the end, which is
+    /// what gives the presence of an entry in `members_by_owner` its meaning.
+    fn attach_member_surface(&mut self, owner_fqn: &str, surface: JvmIndexedOwnerSurface) {
+        match self.members_by_owner.get_mut(owner_fqn) {
+            // One owner can be read twice -- a binary jar beside its own
+            // source jar, or two artifacts shipping the same class. Merging
+            // keeps every positive declaration either read produced, which is
+            // the only direction this surface ever moves.
+            Some(existing) => {
+                for (name, member) in surface.members {
+                    existing.members.entry(name).or_insert(member);
+                }
+                for supertype in surface.supertypes {
+                    if !existing.supertypes.contains(&supertype) {
+                        existing.supertypes.push(supertype);
+                    }
+                }
+            }
+            None => {
+                self.members_by_owner.insert(owner_fqn.to_owned(), surface);
+            }
+        }
+    }
+
+    /// Record that one artifact was not read to the end.
+    ///
+    /// This is the honest-absence link for the member surface: an entry the
+    /// byte budget refused, an entry that did not parse, and a member set past
+    /// [`MAX_ARTIFACT_MEMBERS`] all leave declarations unread, and every JVM
+    /// boundary already reads [`Self::production_diagnostic_count`] to report
+    /// `external_declared_unindexed` -- "the build declared this and nothing
+    /// finished reading it" -- instead of `external_unknown`. One diagnostic
+    /// per artifact keeps the record bounded no matter how many entries an
+    /// artifact skipped.
+    fn note_bounded_artifact(
+        &mut self,
+        artifact_path: &Path,
+        skipped_entries: usize,
+        member_budget: MemberBudget,
+    ) {
+        if skipped_entries > 0 {
+            self.production_diagnostics.push(ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Warning,
+                code: "jvm.index.unread_entries".to_owned(),
+                location: Some(artifact_path.to_string_lossy().into_owned()),
+                message: format!(
+                    "bounded index read skipped {skipped_entries} archive entries, so this artifact declares types and members the index never read"
+                ),
+            });
+        }
+        if member_budget.exhausted {
+            self.production_diagnostics.push(ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Warning,
+                code: "limit.artifact_members".to_owned(),
+                location: Some(artifact_path.to_string_lossy().into_owned()),
+                message: format!(
+                    "bounded index read stopped after {MAX_ARTIFACT_MEMBERS} member declarations from this artifact"
+                ),
+            });
+        }
+    }
+
+    fn produce_java_facts(
         &mut self,
         artifact_path: &Path,
         artifact_kind: ExternalArtifactKind,
-    ) -> HashMap<String, TypeFact> {
+    ) -> JavaArtifactFacts {
         let production = JavaJarPackProducer.produce_exact_artifact(
             &ArtifactProductionRequest {
                 path: artifact_path.to_path_buf(),
@@ -1297,17 +1616,25 @@ impl JvmExternalDeclarationIndex {
         );
         self.production_diagnostics
             .extend(production.diagnostics.iter().cloned());
-        production
-            .pack
-            .into_iter()
-            .flat_map(|pack| pack.shards)
-            .flat_map(|shard| match shard.payload {
-                AuthoredPayload::DeclarationFacts { types, .. } => types,
-                AuthoredPayload::GeneratorRules { .. }
-                | AuthoredPayload::ProcedureSummaries { .. } => Vec::new(),
-            })
-            .map(|fact| (fact.name.clone(), fact))
-            .collect()
+        let mut types = HashMap::default();
+        let mut members = Vec::new();
+        for shard in production.pack.into_iter().flat_map(|pack| pack.shards) {
+            let AuthoredPayload::DeclarationFacts {
+                types: shard_types,
+                members: shard_members,
+                ..
+            } = shard.payload
+            else {
+                continue;
+            };
+            types.extend(
+                shard_types
+                    .into_iter()
+                    .map(|fact| (fact.name.clone(), fact)),
+            );
+            members.extend(shard_members);
+        }
+        JavaArtifactFacts::new(types, members)
     }
 
     fn produce_scala_type_facts(&mut self, artifact_path: &Path) -> HashMap<String, TypeFact> {
@@ -1462,10 +1789,15 @@ const JVM_PACK_LANGUAGES: [&str; 3] = ["java", "kotlin", "scala"];
 /// publish (#1893).
 ///
 /// Both halves answer the same question -- does an external declaration spell
-/// this fully-qualified name, and may this package see it -- so they are one
-/// lookup with one precedence, not two indexes with two vocabularies. The
-/// artifact half wins a tie: an artifact on disk is the classpath the build
-/// actually resolved, while a pack is a published claim about one.
+/// this name, and may this package see it -- so they are one lookup with one
+/// precedence, not two indexes with two vocabularies. The artifact half wins a
+/// tie: an artifact on disk is the classpath the build actually resolved, while
+/// a pack is a published claim about one.
+///
+/// The name may be a type's or a member's. Both halves carry member
+/// declarations (#1900): the index reads them out of the member tables of the
+/// class files it indexes, and a pack publishes them as declaration facts, so
+/// `Collections.sort` is answered by whichever half declared the owner.
 ///
 /// # Why the pack half is read live
 ///
@@ -1557,16 +1889,19 @@ impl<'a> JvmExternalDeclarations<'a> {
     /// here. A nested type is spelled with the same dot, and its declaration is
     /// a type, so it is decided by the type ladder before this runs.
     ///
-    /// The artifact half declares nothing here yet: the jar- and class-backed
-    /// [`JvmExternalDeclarationIndex`] stores a type's name, package, kind,
-    /// visibility and origin artifact and no members at all, which is the
-    /// remaining half of #1900. So today only the activated packs answer, and a
-    /// jar-backed owner has no member surface to consult.
+    /// Both halves answer here, in the same precedence the type half uses: the
+    /// artifact-derived member surface first, then the activated packs'. The
+    /// owner decides which half can even speak, because an owner is resolved
+    /// once and carries where it came from -- an owner the jar index declared
+    /// has an artifact member surface and no pack declaration id, and a
+    /// pack-declared owner the reverse -- so "artifacts win ties" is settled by
+    /// the owner lookup rather than by a second race here.
     ///
     /// A miss is never a proof of absence. The surface reports what it
     /// declares; a caller that finds nothing keeps the status it had, so a type
-    /// whose pack declares no members leaves every member spelling exactly as
-    /// unknown as it was before activation.
+    /// whose pack declares no members, and a type whose class file the bounded
+    /// index never read, both leave every member spelling exactly as unknown as
+    /// it was before.
     pub(crate) fn resolve_member_spelling(
         &self,
         spelling: &str,
@@ -1578,8 +1913,30 @@ impl<'a> JvmExternalDeclarations<'a> {
             return None;
         }
         let owner = resolve_owner(owner_spelling)?;
-        self.pack_member(&owner, member_name)
+        self.artifact_member(&owner, member_name)
+            .or_else(|| self.pack_member(&owner, member_name))
             .filter(|member| member.is_accessible_from_package(access_package))
+    }
+
+    /// The member the indexed artifacts declare on `owner` (#1900).
+    ///
+    /// Only an artifact-declared owner has an artifact member surface, for the
+    /// same reason [`Self::pack_member`] refuses a non-pack owner: the surface
+    /// is keyed by the identity the half that read it produced. An owner the
+    /// jar index never read has no entry at all, which is why a miss here is
+    /// silence rather than a negative answer.
+    fn artifact_member(
+        &self,
+        owner: &JvmExternalType,
+        member_name: &str,
+    ) -> Option<JvmExternalMember> {
+        match owner.source {
+            JvmExternalDeclarationSource::SourceJar { .. }
+            | JvmExternalDeclarationSource::ClassFile { .. } => {
+                self.artifacts.member(&owner.fqn, member_name).cloned()
+            }
+            JvmExternalDeclarationSource::SemanticPack { .. } => None,
+        }
     }
 
     /// The one declaration the activated packs publish for `fqn`, if exactly
@@ -1675,8 +2032,12 @@ impl<'a> JvmExternalDeclarations<'a> {
     }
 }
 
-/// One member an activated pack declares on an external type (#1900): the
-/// `sort` of `Collections.sort`, not the `Collections`.
+/// One member an external declaration surface declares on an external type
+/// (#1900): the `sort` of `Collections.sort`, not the `Collections`.
+///
+/// Both halves produce this same shape -- the jar index reads it out of a
+/// class file's member table, an activated pack reads it out of a declaration
+/// fact -- so one lookup answers a member spelling whichever half declared it.
 ///
 /// A member is not a type, so it is not a [`JvmExternalType`]: nothing may
 /// resolve a type name to it, and [`pack_type_kind`] rejects every member kind
@@ -2522,23 +2883,44 @@ fn modifier_present(modifiers: &str, expected: &str) -> bool {
         .any(|token| token == expected)
 }
 
-fn class_type(artifact_path: &Path, class_entry: &str, bytes: &[u8]) -> Option<JvmExternalType> {
-    let class_file = jclassfile::class_file::parse(bytes).ok()?;
+/// What one `.class` entry contributed to the index.
+///
+/// The three cases are kept apart because only one of them is a gap. A module
+/// descriptor and a private class are read completely and then deliberately not
+/// published; bytes that do not parse are a hole in what the index knows, and
+/// only a hole may make the artifact report as not fully read (#1900).
+enum ClassTypeOutcome {
+    /// The class file parsed and declares a type a reference outside the
+    /// artifact can name.
+    Declared(JvmExternalType),
+    /// The class file parsed and deliberately declares nothing here: a module
+    /// descriptor, or a class private to its own enclosing type.
+    Excluded,
+    /// The bytes are not a class file this index could read.
+    Unreadable,
+}
+
+fn class_type(artifact_path: &Path, class_entry: &str, bytes: &[u8]) -> ClassTypeOutcome {
+    let Ok(class_file) = jclassfile::class_file::parse(bytes) else {
+        return ClassTypeOutcome::Unreadable;
+    };
     let flags = class_file.access_flags();
     if flags.contains(ClassFlags::ACC_MODULE) {
-        return None;
+        return ClassTypeOutcome::Excluded;
     }
-    let internal_name = class_internal_name(&class_file)?;
+    let Some(internal_name) = class_internal_name(&class_file) else {
+        return ClassTypeOutcome::Unreadable;
+    };
     let (package_name, short_name) = split_internal_class_name(&internal_name);
     if short_name.is_empty() {
-        return None;
+        return ClassTypeOutcome::Unreadable;
     }
     let fqn = qualified_name(&package_name, &short_name);
     let visibility = class_visibility(&class_file, &internal_name);
     if visibility == JvmVisibility::Private {
-        return None;
+        return ClassTypeOutcome::Excluded;
     }
-    Some(JvmExternalType {
+    ClassTypeOutcome::Declared(JvmExternalType {
         fqn,
         package_name,
         short_name,
@@ -2554,6 +2936,158 @@ fn class_type(artifact_path: &Path, class_entry: &str, bytes: &[u8]) -> Option<J
 fn class_internal_name(class_file: &ClassFile) -> Option<String> {
     let class_index = class_file.this_class() as usize;
     class_name_at_class_index(class_file, class_index)
+}
+
+/// One class to assemble into a test class JAR: its binary name, the binary
+/// name of its superclass, and the members it declares (#1900).
+///
+/// Binary names use the `/` separator the class-file format itself uses, for
+/// example `com/example/probe/Registry`, because that is what the bytes hold.
+#[cfg(test)]
+pub(crate) struct TestClassFile<'a> {
+    pub(crate) internal_name: &'a str,
+    pub(crate) super_internal_name: &'a str,
+    pub(crate) methods: &'a [TestClassMethod<'a>],
+    /// Emit the `InnerClasses` attribute a compiler writes for a class nested
+    /// inside another and declared `private`. Real JARs are full of these, and
+    /// the index deliberately publishes none of them, so a fixture needs one to
+    /// show that a deliberate exclusion is not a failed read.
+    pub(crate) private_nested: bool,
+}
+
+/// One public method of a [`TestClassFile`]. `descriptor` is the JVM method
+/// descriptor, for example `(Ljava/lang/String;)V` for a method taking one
+/// `String` and returning nothing.
+#[cfg(test)]
+pub(crate) struct TestClassMethod<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) descriptor: &'a str,
+    pub(crate) is_static: bool,
+}
+
+/// The bytes of a minimal, valid `.class` file for `class`.
+///
+/// Bifrost's JVM tests normally compile fixtures with `javac`, and skip
+/// themselves when no JDK is installed. A skipped test proves nothing, and the
+/// member surface this file indexes is read out of class files, so the #1900
+/// acceptance needs a class JAR that exists on every machine. Emitting the
+/// bytes directly is the only way to get one without a JDK.
+///
+/// This writes only what the class-file format requires of a declaration: the
+/// magic number, a class-file version, a constant pool holding the two class
+/// names and each method's name and descriptor, the access flags, and one
+/// method table entry per method with no attributes. There is no bytecode,
+/// because nothing here executes; `jclassfile` parses it exactly as it parses a
+/// compiled class, which is what the index reads.
+#[cfg(test)]
+pub(crate) fn test_class_file_bytes(class: &TestClassFile<'_>) -> Vec<u8> {
+    const ACC_PUBLIC_CLASS: u16 = 0x0021; // ACC_PUBLIC | ACC_SUPER
+    const ACC_PUBLIC_METHOD: u16 = 0x0001;
+    const ACC_STATIC_METHOD: u16 = 0x0008;
+    const CONSTANT_UTF8: u8 = 1;
+    const CONSTANT_CLASS: u8 = 7;
+    const CLASS_FILE_MAJOR_VERSION: u16 = 52; // Java 8
+
+    let mut pool = Vec::new();
+    let mut next_index = 1u16;
+    // The constant pool is indexed by a `u16`, so a class declaring thousands
+    // of methods only fits when repeated strings are shared. Interning is also
+    // what a compiler emits, so the bytes stay ordinary.
+    let mut interned: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
+    let mut utf8_index = |pool: &mut Vec<u8>, next_index: &mut u16, value: &str| -> u16 {
+        if let Some(index) = interned.get(value) {
+            return *index;
+        }
+        pool.push(CONSTANT_UTF8);
+        pool.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        pool.extend_from_slice(value.as_bytes());
+        let index = *next_index;
+        *next_index += 1;
+        interned.insert(value.to_owned(), index);
+        index
+    };
+    let this_name_index = utf8_index(&mut pool, &mut next_index, class.internal_name);
+    pool.push(CONSTANT_CLASS);
+    pool.extend_from_slice(&this_name_index.to_be_bytes());
+    let this_class_index = next_index;
+    next_index += 1;
+    let super_name_index = utf8_index(&mut pool, &mut next_index, class.super_internal_name);
+    pool.push(CONSTANT_CLASS);
+    pool.extend_from_slice(&super_name_index.to_be_bytes());
+    let super_class_index = next_index;
+    next_index += 1;
+    let mut method_indexes = Vec::with_capacity(class.methods.len());
+    for method in class.methods {
+        let name_index = utf8_index(&mut pool, &mut next_index, method.name);
+        let descriptor_index = utf8_index(&mut pool, &mut next_index, method.descriptor);
+        method_indexes.push((name_index, descriptor_index));
+    }
+    let inner_classes_index = class
+        .private_nested
+        .then(|| utf8_index(&mut pool, &mut next_index, "InnerClasses"));
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&0xCAFE_BABEu32.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&CLASS_FILE_MAJOR_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&next_index.to_be_bytes());
+    bytes.extend_from_slice(&pool);
+    bytes.extend_from_slice(&ACC_PUBLIC_CLASS.to_be_bytes());
+    bytes.extend_from_slice(&this_class_index.to_be_bytes());
+    bytes.extend_from_slice(&super_class_index.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&(class.methods.len() as u16).to_be_bytes());
+    for (method, (name_index, descriptor_index)) in class.methods.iter().zip(method_indexes) {
+        let flags = if method.is_static {
+            ACC_PUBLIC_METHOD | ACC_STATIC_METHOD
+        } else {
+            ACC_PUBLIC_METHOD
+        };
+        bytes.extend_from_slice(&flags.to_be_bytes());
+        bytes.extend_from_slice(&name_index.to_be_bytes());
+        bytes.extend_from_slice(&descriptor_index.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+    }
+    match inner_classes_index {
+        // One `InnerClasses` entry naming this very class as a private nested
+        // class: inner class, no outer, no simple name, `ACC_PRIVATE`.
+        Some(name_index) => {
+            const ACC_PRIVATE_NESTED: u16 = 0x0002;
+
+            bytes.extend_from_slice(&1u16.to_be_bytes());
+            bytes.extend_from_slice(&name_index.to_be_bytes());
+            bytes.extend_from_slice(&10u32.to_be_bytes());
+            bytes.extend_from_slice(&1u16.to_be_bytes());
+            bytes.extend_from_slice(&this_class_index.to_be_bytes());
+            bytes.extend_from_slice(&0u16.to_be_bytes());
+            bytes.extend_from_slice(&0u16.to_be_bytes());
+            bytes.extend_from_slice(&ACC_PRIVATE_NESTED.to_be_bytes());
+        }
+        None => bytes.extend_from_slice(&0u16.to_be_bytes()),
+    }
+    bytes
+}
+
+/// Write `classes` into a class JAR at `path`, one entry per class named after
+/// its binary name, exactly as `jar cf` would lay them out.
+#[cfg(test)]
+pub(crate) fn write_test_class_jar(path: &Path, classes: &[TestClassFile<'_>]) {
+    use std::io::Write;
+
+    let file = File::create(path).expect("create the fixture class jar");
+    let mut jar = zip::ZipWriter::new(file);
+    for class in classes {
+        jar.start_file(
+            format!("{}.class", class.internal_name),
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .expect("start a fixture class entry");
+        jar.write_all(&test_class_file_bytes(class))
+            .expect("write a fixture class entry");
+    }
+    jar.finish().expect("finish the fixture class jar");
 }
 
 fn class_name_at_class_index(class_file: &ClassFile, class_index: usize) -> Option<String> {
@@ -2699,6 +3233,238 @@ mod tests {
     const GROUP_PATH: &str = "com/example/external-lib/1.2.3";
     const BINARY_JAR: &str = "external-lib-1.2.3.jar";
     const SOURCE_JAR: &str = "external-lib-1.2.3-sources.jar";
+
+    // -----------------------------------------------------------------------
+    // The artifact half of the JVM external member surface (#1900).
+    // -----------------------------------------------------------------------
+
+    /// A class JAR declaring `com.example.probe.Registry`, which extends
+    /// `com.example.probe.BaseRegistry`. `register` is declared on the subclass
+    /// and `reset` is inherited from the base, so one fixture covers both
+    /// shapes a written `Owner.member` can take.
+    ///
+    /// The third entry is a private nested class, which every real JAR carries
+    /// and this index deliberately publishes for nobody. It is here so the
+    /// fixture proves a *deliberate exclusion* does not make the artifact
+    /// report as not fully read.
+    fn probe_class_jar(path: &Path) {
+        write_test_class_jar(
+            path,
+            &[
+                TestClassFile {
+                    internal_name: "com/example/probe/Registry",
+                    super_internal_name: "com/example/probe/BaseRegistry",
+                    methods: &[TestClassMethod {
+                        name: "register",
+                        descriptor: "(Ljava/lang/String;)V",
+                        is_static: true,
+                    }],
+                    private_nested: false,
+                },
+                TestClassFile {
+                    internal_name: "com/example/probe/BaseRegistry",
+                    super_internal_name: "java/lang/Object",
+                    methods: &[TestClassMethod {
+                        name: "reset",
+                        descriptor: "()V",
+                        is_static: true,
+                    }],
+                    private_nested: false,
+                },
+                TestClassFile {
+                    internal_name: "com/example/probe/Registry$Hidden",
+                    super_internal_name: "java/lang/Object",
+                    methods: &[TestClassMethod {
+                        name: "secret",
+                        descriptor: "()V",
+                        is_static: true,
+                    }],
+                    private_nested: true,
+                },
+            ],
+        );
+    }
+
+    fn probe_index(jar: &Path) -> JvmExternalDeclarationIndex {
+        JvmExternalDeclarationIndex::build_from_artifacts(vec![ResolvedJvmArtifact {
+            artifact_path: jar.to_path_buf(),
+            source_artifact_path: None,
+            coordinate: None,
+            origin: JvmDependencyOrigin::ExplicitPath,
+        }])
+    }
+
+    #[test]
+    fn a_class_jar_member_answers_a_written_member_spelling() {
+        let root = tempfile::tempdir().unwrap();
+        let jar = root.path().join("probe.jar");
+        probe_class_jar(&jar);
+        let index = probe_index(&jar);
+        let surface = JvmExternalDeclarations::new(&index, None);
+
+        assert!(
+            index.get("com.example.probe.Registry").is_some(),
+            "the type half still indexes the owner"
+        );
+        let owner = |spelling: &str| surface.resolve_qualified_name(spelling, "app");
+        let member = surface
+            .resolve_member_spelling("com.example.probe.Registry.register", "app", owner)
+            .expect("the class jar declares the member");
+        assert_eq!(member.fqn(), "com.example.probe.Registry.register");
+
+        // Inherited: `reset` is declared on the base class in the same jar, and
+        // a reference spells it through the subclass exactly as it spells a
+        // declared member.
+        let inherited = surface
+            .resolve_member_spelling("com.example.probe.Registry.reset", "app", owner)
+            .expect("the base class in the same jar declares the member");
+        assert_eq!(inherited.fqn(), "com.example.probe.BaseRegistry.reset");
+
+        // A member no class file declares is not upgraded: the owner is
+        // decided, and the spelling stays exactly as unknown as before.
+        assert!(
+            surface
+                .resolve_member_spelling("com.example.probe.Registry.absent", "app", owner)
+                .is_none()
+        );
+        // An owner nothing indexed answers nothing at all.
+        assert!(
+            surface
+                .resolve_member_spelling("com.example.probe.Missing.register", "app", owner)
+                .is_none()
+        );
+        // A class the index deliberately publishes for nobody -- the private
+        // nested `Registry$Hidden` -- was read completely and is not a gap.
+        // Counting it as unread would make every ordinary JAR report as
+        // declared-but-not-indexed, which would turn every honest miss in the
+        // whole workspace into "may be there".
+        assert!(
+            index.get("com.example.probe.Registry.Hidden").is_none(),
+            "a private nested class is not published"
+        );
+        assert_eq!(
+            index.production_diagnostic_count(),
+            0,
+            "the whole fixture jar was read: {:?}",
+            index.production_diagnostics()
+        );
+    }
+
+    #[test]
+    fn a_class_entry_the_byte_budget_refused_declares_no_member_surface() {
+        // Honest absence for the artifact half: an owner whose class entry the
+        // bounded read never finished has no member surface, so its members are
+        // unknown rather than absent -- and the index says so, which is what
+        // makes every JVM boundary report `external_declared_unindexed` instead
+        // of `external_unknown`.
+        let root = tempfile::tempdir().unwrap();
+        let jar = root.path().join("probe.jar");
+        probe_class_jar(&jar);
+
+        let mut index = JvmExternalDeclarationIndex::default();
+        // One byte of budget refuses every entry in the archive.
+        index.index_class_jar(&jar, 1);
+        let surface = JvmExternalDeclarations::new(&index, None);
+        assert!(
+            index.get("com.example.probe.Registry").is_none(),
+            "a refused entry declares no type either"
+        );
+        assert!(
+            index
+                .member("com.example.probe.Registry", "register")
+                .is_none(),
+            "a refused entry declares no member surface"
+        );
+        assert!(
+            surface
+                .resolve_member_spelling("com.example.probe.Registry.register", "app", |spelling| {
+                    surface.resolve_qualified_name(spelling, "app")
+                })
+                .is_none()
+        );
+        let diagnostics = index.production_diagnostics();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "jvm.index.unread_entries"),
+            "a refused read must be recorded, not silently look complete: {diagnostics:?}"
+        );
+        assert!(index.production_diagnostic_count() > 0);
+    }
+
+    /// A class JAR whose first entry alone spends the whole per-artifact member
+    /// budget, so `Registry`'s own members are read *after* the charge is gone.
+    /// Everything stays well inside the byte and entry bounds, which is the
+    /// point: members are a bound of their own.
+    fn member_saturated_class_jar(path: &Path) {
+        let names: Vec<String> = (0..MAX_ARTIFACT_MEMBERS)
+            .map(|ordinal| format!("filler{ordinal}"))
+            .collect();
+        let filler_methods: Vec<TestClassMethod<'_>> = names
+            .iter()
+            .map(|name| TestClassMethod {
+                name,
+                descriptor: "()V",
+                is_static: true,
+            })
+            .collect();
+        write_test_class_jar(
+            path,
+            &[
+                TestClassFile {
+                    internal_name: "com/example/probe/Filler",
+                    super_internal_name: "java/lang/Object",
+                    methods: &filler_methods,
+                    private_nested: false,
+                },
+                TestClassFile {
+                    internal_name: "com/example/probe/Registry",
+                    super_internal_name: "java/lang/Object",
+                    methods: &[TestClassMethod {
+                        name: "register",
+                        descriptor: "(Ljava/lang/String;)V",
+                        is_static: true,
+                    }],
+                    private_nested: false,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn the_per_artifact_member_bound_drops_members_and_says_so() {
+        // The second bounded dimension #1900 requires beside
+        // `MAX_TOTAL_INDEX_BYTES`: one artifact well inside the byte budget can
+        // declare any number of members, so members are charged per artifact.
+        // What must not happen is a silent short surface -- the owner type is
+        // still indexed, so a member spelling on it would otherwise look
+        // decidable -- which is why exhausting the charge is recorded.
+        let root = tempfile::tempdir().unwrap();
+        let jar = root.path().join("probe.jar");
+        member_saturated_class_jar(&jar);
+        let index = probe_index(&jar);
+        let surface = JvmExternalDeclarations::new(&index, None);
+
+        assert!(
+            index.get("com.example.probe.Registry").is_some(),
+            "the type half still indexes the owner; only members were bounded"
+        );
+        assert!(
+            surface
+                .resolve_member_spelling("com.example.probe.Registry.register", "app", |spelling| {
+                    surface.resolve_qualified_name(spelling, "app")
+                })
+                .is_none(),
+            "the member fell past the per-artifact bound"
+        );
+        let diagnostics = index.production_diagnostics();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "limit.artifact_members"),
+            "a bounded member read must be recorded, not look complete: {diagnostics:?}"
+        );
+    }
 
     #[test]
     fn configured_jdk_home_discovers_and_generates_exact_source_pack() {

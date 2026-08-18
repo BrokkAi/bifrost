@@ -375,10 +375,17 @@ pub(super) fn render_declaration_ref(
 ) -> CodeQueryResultRef {
     let path = rel_path_string(declaration.unit.source());
     let fq_name = declaration.unit.fq_name();
-    let kind = declaration.unit.kind().display_lowercase();
+    let kind = declaration.kind_label();
     let full = !detail.is_compact();
     CodeQueryResultRef::Declaration {
-        id: full.then(|| declaration_id(&path, kind, &fq_name, declaration.range)),
+        id: full.then(|| {
+            declaration_id(
+                &path,
+                declaration.identity_kind_label(),
+                &fq_name,
+                declaration.range,
+            )
+        }),
         path,
         kind,
         fq_name,
@@ -404,14 +411,13 @@ pub(super) fn render_reference_site_ref(
 ) -> CodeQueryResultRef {
     let target_path = rel_path_string(site.target.unit.source());
     let target_fq_name = site.target.unit.fq_name();
-    let target_kind = site.target.unit.kind().display_lowercase();
     CodeQueryResultRef::ReferenceSite {
         path: rel_path_string(&site.file),
         range: render_reference_range(analyzer, site, cache),
         target_id: (!detail.is_compact()).then(|| {
             declaration_id(
                 &target_path,
-                target_kind,
+                site.target.identity_kind_label(),
                 &target_fq_name,
                 site.target.range,
             )
@@ -747,10 +753,7 @@ pub(super) fn render_occurrence(
                         .ranges_of(unit)
                         .into_iter()
                         .min_by_key(primary_range_key)
-                        .map(|range| DeclarationValue {
-                            unit: unit.clone(),
-                            range,
-                        })?;
+                        .map(|range| DeclarationValue::new(unit.clone(), range))?;
                     Some(render_declaration(analyzer, &declaration, detail, cache))
                 })
                 .collect(),
@@ -1140,10 +1143,7 @@ fn render_unit_declaration(
         .ranges_of(unit)
         .into_iter()
         .min_by_key(primary_range_key)
-        .map(|range| DeclarationValue {
-            unit: unit.clone(),
-            range,
-        })
+        .map(|range| DeclarationValue::new(unit.clone(), range))
         .map(|declaration| render_declaration(analyzer, &declaration, detail, cache))
 }
 
@@ -1326,7 +1326,7 @@ pub(super) fn render_declaration(
 ) -> CodeQueryDeclaration {
     let path = rel_path_string(declaration.unit.source());
     let fq_name = declaration.unit.fq_name();
-    let kind = declaration.unit.kind().display_lowercase();
+    let kind = declaration.kind_label();
     let full = !detail.is_compact();
     let signature = declaration
         .unit
@@ -1340,7 +1340,14 @@ pub(super) fn render_declaration(
             .then(|| Box::new(matched.records[0].provenance.clone()))
     });
     CodeQueryDeclaration {
-        id: full.then(|| declaration_id(&path, kind, &fq_name, declaration.range)),
+        id: full.then(|| {
+            declaration_id(
+                &path,
+                declaration.identity_kind_label(),
+                &fq_name,
+                declaration.range,
+            )
+        }),
         path,
         language: crate::analyzer::common::language_for_file(declaration.unit.source())
             .config_label(),
@@ -1994,7 +2001,7 @@ pub(super) fn render_receiver_evidence(
     let rendered_declaration_id = declaration.as_ref().map(|declaration| {
         declaration_id(
             &rel_path_string(declaration.unit.source()),
-            declaration.unit.kind().display_lowercase(),
+            declaration.identity_kind_label(),
             &declaration.unit.fq_name(),
             declaration.range,
         )
@@ -2003,7 +2010,7 @@ pub(super) fn render_receiver_evidence(
         let declaration = declaration_value_for_unit(analyzer, factory, fallback);
         declaration_id(
             &rel_path_string(declaration.unit.source()),
-            declaration.unit.kind().display_lowercase(),
+            declaration.identity_kind_label(),
             &declaration.unit.fq_name(),
             declaration.range,
         )
@@ -2024,9 +2031,7 @@ pub(super) fn render_receiver_evidence(
         evidence_kind: receiver_evidence_kind(&value.value),
         declaration_id: rendered_declaration_id,
         declaration_fq_name: declaration.as_ref().map(|value| value.unit.fq_name()),
-        declaration_kind: declaration
-            .as_ref()
-            .map(|value| value.unit.kind().display_lowercase()),
+        declaration_kind: declaration.as_ref().map(DeclarationValue::kind_label),
         factory_id,
         proof,
         completeness,
@@ -2110,14 +2115,14 @@ pub(super) fn declaration_value_for_unit(
     unit: &CodeUnit,
     fallback: Range,
 ) -> DeclarationValue {
-    DeclarationValue {
-        unit: unit.clone(),
-        range: analyzer
+    DeclarationValue::new(
+        unit.clone(),
+        analyzer
             .ranges_of(unit)
             .into_iter()
             .min_by_key(primary_range_key)
             .unwrap_or(fallback),
-    }
+    )
 }
 
 pub(super) fn call_syntax_kind_label(kind: CallSyntaxKind) -> &'static str {

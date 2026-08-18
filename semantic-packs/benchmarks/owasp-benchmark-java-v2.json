@@ -7,8 +7,8 @@
     "expected_results": "expectedresults-1.2.csv"
   },
   "bifrost": {
-    "version": "0.9.0",
-    "commit": "8a93e265f1fae8a5f3cd320ba85f5762267fbe63"
+    "version": "0.9.5",
+    "commit": "76d66ffb7ef119fcf22a417f366d830e702e9b31"
   },
   "scope": {
     "scored_categories": [
@@ -84,26 +84,28 @@
   },
   "run": {
     "cases_scored": 1572,
-    "cases_with_taint_roots": 0,
-    "taint_roots": 0,
-    "findings_total": 0,
+    "cases_with_taint_roots": 1252,
+    "taint_roots": 4414,
+    "findings_total": 652,
     "dependency_jars": 132,
-    "case_limit": null
+    "case_limit": null,
+    "analyzed_files": 2770,
+    "analyzed_source_bytes": 11633213
   },
   "result": {
-    "verdict": "still abstains: no case reached a flag over the taint subset. 819 real and 753 fake cases abstained; 0 cleared. The stack activated but a boundary upstream of a finding still fails closed (see remaining_abstention and category_runs).",
-    "headline_number": "naive Youden J = 0.0000; honest Youden J = undefined over 1572 taint cases. 0 findings, 0 false positives, 0 false greens.",
+    "verdict": "productive: 106 of 819 real taint cases flagged as vulnerable (true positives), 69 of 753 fake cases flagged (false positives), 0 false greens. 713 real and 684 fake cases still abstained (no reliable verdict).",
+    "headline_number": "naive Youden J = 0.0378; honest Youden J = 0.0000 over 1572 taint cases. 652 findings, 69 false positives, 0 false greens.",
     "false_greens": 0,
-    "findings": 0,
-    "real_true_positives": 0,
-    "honest_vs_naive": "naive Youden J = 0.0000 folds every abstention into the negatives; honest Youden J = undefined scores only the 0 cases that reached a reliable verdict and holds out the 1572 that abstained. The gap is the cost of honest abstention.",
+    "findings": 652,
+    "real_true_positives": 106,
+    "honest_vs_naive": "naive Youden J = 0.0378 folds every abstention into the negatives; honest Youden J = 0.0000 scores only the 175 cases that reached a reliable verdict and holds out the 1397 that abstained. The gap is the cost of honest abstention.",
     "remaining_abstention": [
-      "sqli: 504 of 504 cases abstained (272 real, 232 fake); e.g. taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget",
-      "cmdi: 251 of 251 cases abstained (126 real, 125 fake); e.g. taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget",
-      "ldapi: 59 of 59 cases abstained (27 real, 32 fake); e.g. taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget",
-      "pathtraver: 268 of 268 cases abstained (133 real, 135 fake); e.g. taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget",
-      "xpathi: 35 of 35 cases abstained (15 real, 20 fake); e.g. taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget",
-      "xss: 455 of 455 cases abstained (246 real, 209 fake); e.g. taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget"
+      "sqli: 429 of 504 cases abstained (225 real, 204 fake); e.g. taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/helpers/SeparateClassRequest.java:SeparateClassRequest.java.SeparateClassRequest.getTheParameter is unknown",
+      "cmdi: 236 of 251 cases abstained (120 real, 116 fake); e.g. taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/helpers/SeparateClassRequest.java:SeparateClassRequest.java.SeparateClassRequest.getTheParameter is unknown",
+      "ldapi: 45 of 59 cases abstained (19 real, 26 fake); e.g. taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/helpers/LDAPManager.java:LDAPManager.java.LDAPManager.closeDirContext is unknown",
+      "pathtraver: 232 of 268 cases abstained (113 real, 119 fake); e.g. taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/helpers/LDAPManager.java:LDAPManager.java.LDAPManager.closeDirContext is unknown",
+      "xpathi: 23 of 35 cases abstained (10 real, 13 fake); e.g. taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/helpers/SeparateClassRequest.java:SeparateClassRequest.java.SeparateClassRequest.getTheParameter is unknown",
+      "xss: 432 of 455 cases abstained (226 real, 206 fake); e.g. taint request-wide finding or witness budget is exhausted"
     ]
   },
   "scoring_methodology": [
@@ -118,67 +120,215 @@
   ],
   "headline": {
     "note": "Overall Youden over the taint subset, both ways, plus the real-case disposition that carries the honest-completion story.",
-    "overall_naive_youden": 0.0,
-    "overall_honest_youden": null,
+    "overall_naive_youden": 0.0378,
+    "overall_honest_youden": 0.0,
     "real_cases": 819,
-    "real_flagged_true_positive": 0,
+    "real_flagged_true_positive": 106,
     "real_cleared_false_green": 0,
-    "real_abstained_inconclusive": 819
+    "real_abstained_inconclusive": 713
   },
   "category_runs": [
     {
       "category": "sqli",
-      "completion": "Inconclusive { reasons: [PartialDiscovery] }",
-      "findings": 0,
-      "retained_analyses": 0,
+      "completion": "Inconclusive { reasons: [PartialDiscovery, ReportRetentionBudget] }",
+      "termination": null,
+      "findings": 75,
+      "retained_analyses": 320,
       "sample_diagnostics": [
-        "taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget"
-      ]
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/helpers/SeparateClassRequest.java:SeparateClassRequest.java.SeparateClassRequest.getTheParameter is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/helpers/Thing2.java:Thing2.java.Thing2.doSomething is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00008.java:BenchmarkTest00008.java.BenchmarkTest00008.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00018.java:BenchmarkTest00018.java.BenchmarkTest00018.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00024.java:BenchmarkTest00024.java.BenchmarkTest00024.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00027.java:BenchmarkTest00027.java.BenchmarkTest00027.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00032.java:BenchmarkTest00032.java.BenchmarkTest00032.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00034.java:BenchmarkTest00034.java.BenchmarkTest00034.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00037.java:BenchmarkTest00037.java.BenchmarkTest00037.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00100.java:BenchmarkTest00100.java.BenchmarkTest00100.doPost is unsupported (exceptional_control_flow)",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00101.java:BenchmarkTest00101.java.BenchmarkTest00101.doPost is unsupported (exceptional_control_flow)",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00105.java:BenchmarkTest00105.java.BenchmarkTest00105.doPost is unsupported (exceptional_control_flow)"
+      ],
+      "work": {
+        "examined_references": 0,
+        "fact_nodes": 12183,
+        "pipeline_rows": 6014,
+        "scanned_files": 60852,
+        "scanned_source_bytes": 254204390,
+        "taint.propagation_shared_memberships": 0,
+        "taint.propagation_solves": 320,
+        "taint.selector_scans": 22,
+        "taint.semantic_materialized_files": 5912,
+        "taint.semantic_peak_retained_bytes": 146548537,
+        "taint.semantic_peak_row_dimension": 8435140,
+        "taint.semantic_peak_traversal_steps": 247373,
+        "taint.semantic_program_points": 2866136,
+        "taint.semantic_snapshot_materializations": 8859,
+        "taint.semantic_source_bytes": 372665463,
+        "taint.semantic_traversal_steps": 260717
+      }
     },
     {
       "category": "cmdi",
-      "completion": "Inconclusive { reasons: [PartialDiscovery] }",
-      "findings": 0,
-      "retained_analyses": 0,
+      "completion": "Inconclusive { reasons: [PartialDiscovery, ReportRetentionBudget] }",
+      "termination": null,
+      "findings": 15,
+      "retained_analyses": 227,
       "sample_diagnostics": [
-        "taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget"
-      ]
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/helpers/SeparateClassRequest.java:SeparateClassRequest.java.SeparateClassRequest.getTheParameter is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/helpers/Thing2.java:Thing2.java.Thing2.doSomething is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00006.java:BenchmarkTest00006.java.BenchmarkTest00006.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00007.java:BenchmarkTest00007.java.BenchmarkTest00007.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00015.java:BenchmarkTest00015.java.BenchmarkTest00015.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00017.java:BenchmarkTest00017.java.BenchmarkTest00017.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00077.java:BenchmarkTest00077.java.BenchmarkTest00077.doPost is unsupported (exceptional_control_flow)",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00090.java:BenchmarkTest00090.java.BenchmarkTest00090.doPost is unsupported (exceptional_control_flow)",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00091.java:BenchmarkTest00091.java.BenchmarkTest00091.doPost is unsupported (exceptional_control_flow)",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00092.java:BenchmarkTest00092.java.BenchmarkTest00092.doPost is unsupported (exceptional_control_flow)",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00093.java:BenchmarkTest00093.java.BenchmarkTest00093.doPost is unsupported (exceptional_control_flow)",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00158.java:BenchmarkTest00158.java.BenchmarkTest00158.doGet is unknown"
+      ],
+      "work": {
+        "examined_references": 0,
+        "fact_nodes": 11856,
+        "pipeline_rows": 5914,
+        "scanned_files": 49788,
+        "scanned_source_bytes": 207985410,
+        "taint.propagation_shared_memberships": 0,
+        "taint.propagation_solves": 227,
+        "taint.selector_scans": 18,
+        "taint.semantic_materialized_files": 5881,
+        "taint.semantic_peak_retained_bytes": 146276876,
+        "taint.semantic_peak_row_dimension": 8417001,
+        "taint.semantic_peak_traversal_steps": 246012,
+        "taint.semantic_program_points": 2850098,
+        "taint.semantic_snapshot_materializations": 8818,
+        "taint.semantic_source_bytes": 369428046,
+        "taint.semantic_traversal_steps": 259178
+      }
     },
     {
       "category": "ldapi",
-      "completion": "Inconclusive { reasons: [PartialDiscovery] }",
-      "findings": 0,
-      "retained_analyses": 0,
+      "completion": "Inconclusive { reasons: [PartialDiscovery, ReportRetentionBudget] }",
+      "termination": null,
+      "findings": 14,
+      "retained_analyses": 52,
       "sample_diagnostics": [
-        "taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget"
-      ]
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/helpers/LDAPManager.java:LDAPManager.java.LDAPManager.closeDirContext is unknown",
+        "analysis projection rejected: projected witness_steps exceeds the effective report limit of 64"
+      ],
+      "work": {
+        "examined_references": 0,
+        "fact_nodes": 11566,
+        "pipeline_rows": 5783,
+        "scanned_files": 47022,
+        "scanned_source_bytes": 196430665,
+        "taint.propagation_shared_memberships": 0,
+        "taint.propagation_solves": 52,
+        "taint.selector_scans": 17,
+        "taint.semantic_materialized_files": 5790,
+        "taint.semantic_peak_retained_bytes": 145308827,
+        "taint.semantic_peak_row_dimension": 8362696,
+        "taint.semantic_peak_traversal_steps": 244718,
+        "taint.semantic_program_points": 2837099,
+        "taint.semantic_snapshot_materializations": 8702,
+        "taint.semantic_source_bytes": 369694948,
+        "taint.semantic_traversal_steps": 257710
+      }
     },
     {
       "category": "pathtraver",
-      "completion": "Inconclusive { reasons: [PartialDiscovery] }",
-      "findings": 0,
-      "retained_analyses": 0,
+      "completion": "Inconclusive { reasons: [PartialDiscovery, ReportRetentionBudget] }",
+      "termination": null,
+      "findings": 36,
+      "retained_analyses": 1460,
       "sample_diagnostics": [
-        "taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget"
-      ]
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/helpers/LDAPManager.java:LDAPManager.java.LDAPManager.closeDirContext is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/helpers/SeparateClassRequest.java:SeparateClassRequest.java.SeparateClassRequest.SeparateClassRequest is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/helpers/SeparateClassRequest.java:SeparateClassRequest.java.SeparateClassRequest.getTheParameter is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/helpers/Thing2.java:Thing2.java.Thing2.doSomething is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00001.java:BenchmarkTest00001.java.BenchmarkTest00001.doPost is unsupported (exceptional_control_flow)",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00002.java:BenchmarkTest00002.java.BenchmarkTest00002.doPost is unsupported (exceptional_control_flow)",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00003.java:BenchmarkTest00003.java.BenchmarkTest00003.doPost is unsupported (exceptional_control_flow)",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00005.java:BenchmarkTest00005.java.BenchmarkTest00005.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00009.java:BenchmarkTest00009.java.BenchmarkTest00009.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00011.java:BenchmarkTest00011.java.BenchmarkTest00011.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00020.java:BenchmarkTest00020.java.BenchmarkTest00020.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00022.java:BenchmarkTest00022.java.BenchmarkTest00022.doGet is unknown"
+      ],
+      "work": {
+        "examined_references": 0,
+        "fact_nodes": 18352,
+        "pipeline_rows": 9117,
+        "scanned_files": 66384,
+        "scanned_source_bytes": 277313880,
+        "taint.propagation_shared_memberships": 0,
+        "taint.propagation_solves": 1460,
+        "taint.selector_scans": 24,
+        "taint.semantic_materialized_files": 6637,
+        "taint.semantic_peak_retained_bytes": 159599751,
+        "taint.semantic_peak_row_dimension": 9186736,
+        "taint.semantic_peak_traversal_steps": 386156,
+        "taint.semantic_program_points": 3147257,
+        "taint.semantic_snapshot_materializations": 9629,
+        "taint.semantic_source_bytes": 409052132,
+        "taint.semantic_traversal_steps": 401545
+      }
     },
     {
       "category": "xpathi",
-      "completion": "Inconclusive { reasons: [PartialDiscovery] }",
-      "findings": 0,
-      "retained_analyses": 0,
+      "completion": "Inconclusive { reasons: [PartialDiscovery, ReportRetentionBudget] }",
+      "termination": null,
+      "findings": 12,
+      "retained_analyses": 33,
       "sample_diagnostics": [
-        "taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget"
-      ]
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/helpers/SeparateClassRequest.java:SeparateClassRequest.java.SeparateClassRequest.getTheParameter is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/helpers/Thing2.java:Thing2.java.Thing2.doSomething is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00116.java:BenchmarkTest00116.java.BenchmarkTest00116.doPost is unsupported (exceptional_control_flow)",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00117.java:BenchmarkTest00117.java.BenchmarkTest00117.doPost is unsupported (exceptional_control_flow)",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00118.java:BenchmarkTest00118.java.BenchmarkTest00118.doPost is unsupported (exceptional_control_flow)",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00207.java:BenchmarkTest00207.java.BenchmarkTest00207.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00442.java:BenchmarkTest00442.java.BenchmarkTest00442.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00520.java:BenchmarkTest00520.java.BenchmarkTest00520.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00852.java:BenchmarkTest00852.java.BenchmarkTest00852.doGet is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01013.java:BenchmarkTest01013.java.BenchmarkTest01013.doPost is unsupported (exceptional_control_flow)",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01014.java:BenchmarkTest01014.java.BenchmarkTest01014.Test.doSomething is unknown",
+        "taint discovery is incomplete: procedure value-flow snapshot for src/main/java/org/owasp/benchmark/testcode/BenchmarkTest01223.java:BenchmarkTest01223.java.BenchmarkTest01223.Test.doSomething is unknown"
+      ],
+      "work": {
+        "examined_references": 0,
+        "fact_nodes": 11434,
+        "pipeline_rows": 5717,
+        "scanned_files": 47022,
+        "scanned_source_bytes": 196430665,
+        "taint.propagation_shared_memberships": 0,
+        "taint.propagation_solves": 33,
+        "taint.selector_scans": 17,
+        "taint.semantic_materialized_files": 5743,
+        "taint.semantic_peak_retained_bytes": 144548296,
+        "taint.semantic_peak_row_dimension": 8315718,
+        "taint.semantic_peak_traversal_steps": 241329,
+        "taint.semantic_program_points": 2813758,
+        "taint.semantic_snapshot_materializations": 8665,
+        "taint.semantic_source_bytes": 367066885,
+        "taint.semantic_traversal_steps": 254106
+      }
     },
     {
       "category": "xss",
-      "completion": "Inconclusive { reasons: [PartialDiscovery] }",
-      "findings": 0,
-      "retained_analyses": 0,
+      "completion": "Failed { reasons: [InternalInvariant] }",
+      "termination": null,
+      "findings": 500,
+      "retained_analyses": 2322,
       "sample_diagnostics": [
-        "taint selector did not execute completely: program semantics materialization exhausted the shared semantic file or traversal budget"
-      ]
+        "taint request-wide finding or witness budget is exhausted"
+      ],
+      "work": {
+        "examined_references": 0,
+        "fact_nodes": 0,
+        "pipeline_rows": 0,
+        "scanned_files": 0,
+        "scanned_source_bytes": 0
+      }
     }
   ],
   "scoreboard": {
@@ -189,39 +339,39 @@
         "real": 272,
         "fake": 232,
         "naive": {
-          "tp": 0,
-          "fp": 0,
-          "fn": 272,
-          "tn": 232
+          "tp": 47,
+          "fp": 28,
+          "fn": 225,
+          "tn": 204
         },
         "naive_metrics": {
-          "tpr": 0.0,
-          "fpr": 0.0,
-          "youden": 0.0
+          "tpr": 0.1728,
+          "fpr": 0.1207,
+          "youden": 0.0521
         },
         "honest": {
-          "tp": 0,
-          "fp": 0,
+          "tp": 47,
+          "fp": 28,
           "fn": 0,
           "tn": 0
         },
         "honest_metrics": {
-          "tpr": null,
-          "fpr": null,
-          "youden": null
+          "tpr": 1.0,
+          "fpr": 1.0,
+          "youden": 0.0
         },
         "completion": {
           "complete": 0,
           "proven_by_summary": 0,
-          "inconclusive": 0,
-          "not_analyzed": 504
+          "inconclusive": 320,
+          "not_analyzed": 184
         },
-        "real_flagged": 0,
+        "real_flagged": 47,
         "real_cleared": 0,
-        "real_abstained": 272,
-        "fake_flagged": 0,
+        "real_abstained": 225,
+        "fake_flagged": 28,
         "fake_cleared": 0,
-        "fake_abstained": 232,
+        "fake_abstained": 204,
         "false_greens": 0
       },
       {
@@ -230,39 +380,39 @@
         "real": 126,
         "fake": 125,
         "naive": {
-          "tp": 0,
-          "fp": 0,
-          "fn": 126,
-          "tn": 125
+          "tp": 6,
+          "fp": 9,
+          "fn": 120,
+          "tn": 116
         },
         "naive_metrics": {
-          "tpr": 0.0,
-          "fpr": 0.0,
-          "youden": 0.0
+          "tpr": 0.0476,
+          "fpr": 0.072,
+          "youden": -0.0244
         },
         "honest": {
-          "tp": 0,
-          "fp": 0,
+          "tp": 6,
+          "fp": 9,
           "fn": 0,
           "tn": 0
         },
         "honest_metrics": {
-          "tpr": null,
-          "fpr": null,
-          "youden": null
+          "tpr": 1.0,
+          "fpr": 1.0,
+          "youden": 0.0
         },
         "completion": {
           "complete": 0,
           "proven_by_summary": 0,
-          "inconclusive": 0,
-          "not_analyzed": 251
+          "inconclusive": 227,
+          "not_analyzed": 24
         },
-        "real_flagged": 0,
+        "real_flagged": 6,
         "real_cleared": 0,
-        "real_abstained": 126,
-        "fake_flagged": 0,
+        "real_abstained": 120,
+        "fake_flagged": 9,
         "fake_cleared": 0,
-        "fake_abstained": 125,
+        "fake_abstained": 116,
         "false_greens": 0
       },
       {
@@ -271,39 +421,39 @@
         "real": 27,
         "fake": 32,
         "naive": {
-          "tp": 0,
-          "fp": 0,
-          "fn": 27,
-          "tn": 32
+          "tp": 8,
+          "fp": 6,
+          "fn": 19,
+          "tn": 26
         },
         "naive_metrics": {
-          "tpr": 0.0,
-          "fpr": 0.0,
-          "youden": 0.0
+          "tpr": 0.2963,
+          "fpr": 0.1875,
+          "youden": 0.1088
         },
         "honest": {
-          "tp": 0,
-          "fp": 0,
+          "tp": 8,
+          "fp": 6,
           "fn": 0,
           "tn": 0
         },
         "honest_metrics": {
-          "tpr": null,
-          "fpr": null,
-          "youden": null
+          "tpr": 1.0,
+          "fpr": 1.0,
+          "youden": 0.0
         },
         "completion": {
           "complete": 0,
           "proven_by_summary": 0,
-          "inconclusive": 0,
-          "not_analyzed": 59
+          "inconclusive": 52,
+          "not_analyzed": 7
         },
-        "real_flagged": 0,
+        "real_flagged": 8,
         "real_cleared": 0,
-        "real_abstained": 27,
-        "fake_flagged": 0,
+        "real_abstained": 19,
+        "fake_flagged": 6,
         "fake_cleared": 0,
-        "fake_abstained": 32,
+        "fake_abstained": 26,
         "false_greens": 0
       },
       {
@@ -312,39 +462,39 @@
         "real": 133,
         "fake": 135,
         "naive": {
-          "tp": 0,
-          "fp": 0,
-          "fn": 133,
-          "tn": 135
+          "tp": 20,
+          "fp": 16,
+          "fn": 113,
+          "tn": 119
         },
         "naive_metrics": {
-          "tpr": 0.0,
-          "fpr": 0.0,
-          "youden": 0.0
+          "tpr": 0.1504,
+          "fpr": 0.1185,
+          "youden": 0.0319
         },
         "honest": {
-          "tp": 0,
-          "fp": 0,
+          "tp": 20,
+          "fp": 16,
           "fn": 0,
           "tn": 0
         },
         "honest_metrics": {
-          "tpr": null,
-          "fpr": null,
-          "youden": null
+          "tpr": 1.0,
+          "fpr": 1.0,
+          "youden": 0.0
         },
         "completion": {
           "complete": 0,
           "proven_by_summary": 0,
-          "inconclusive": 0,
-          "not_analyzed": 268
+          "inconclusive": 247,
+          "not_analyzed": 21
         },
-        "real_flagged": 0,
+        "real_flagged": 20,
         "real_cleared": 0,
-        "real_abstained": 133,
-        "fake_flagged": 0,
+        "real_abstained": 113,
+        "fake_flagged": 16,
         "fake_cleared": 0,
-        "fake_abstained": 135,
+        "fake_abstained": 119,
         "false_greens": 0
       },
       {
@@ -353,39 +503,39 @@
         "real": 15,
         "fake": 20,
         "naive": {
-          "tp": 0,
-          "fp": 0,
-          "fn": 15,
-          "tn": 20
+          "tp": 5,
+          "fp": 7,
+          "fn": 10,
+          "tn": 13
         },
         "naive_metrics": {
-          "tpr": 0.0,
-          "fpr": 0.0,
-          "youden": 0.0
+          "tpr": 0.3333,
+          "fpr": 0.35,
+          "youden": -0.0167
         },
         "honest": {
-          "tp": 0,
-          "fp": 0,
+          "tp": 5,
+          "fp": 7,
           "fn": 0,
           "tn": 0
         },
         "honest_metrics": {
-          "tpr": null,
-          "fpr": null,
-          "youden": null
+          "tpr": 1.0,
+          "fpr": 1.0,
+          "youden": 0.0
         },
         "completion": {
           "complete": 0,
           "proven_by_summary": 0,
-          "inconclusive": 0,
-          "not_analyzed": 35
+          "inconclusive": 33,
+          "not_analyzed": 2
         },
-        "real_flagged": 0,
+        "real_flagged": 5,
         "real_cleared": 0,
-        "real_abstained": 15,
-        "fake_flagged": 0,
+        "real_abstained": 10,
+        "fake_flagged": 7,
         "fake_cleared": 0,
-        "fake_abstained": 20,
+        "fake_abstained": 13,
         "false_greens": 0
       },
       {
@@ -394,39 +544,39 @@
         "real": 246,
         "fake": 209,
         "naive": {
-          "tp": 0,
-          "fp": 0,
-          "fn": 246,
-          "tn": 209
+          "tp": 20,
+          "fp": 3,
+          "fn": 226,
+          "tn": 206
         },
         "naive_metrics": {
-          "tpr": 0.0,
-          "fpr": 0.0,
-          "youden": 0.0
+          "tpr": 0.0813,
+          "fpr": 0.0144,
+          "youden": 0.0669
         },
         "honest": {
-          "tp": 0,
-          "fp": 0,
+          "tp": 20,
+          "fp": 3,
           "fn": 0,
           "tn": 0
         },
         "honest_metrics": {
-          "tpr": null,
-          "fpr": null,
-          "youden": null
+          "tpr": 1.0,
+          "fpr": 1.0,
+          "youden": 0.0
         },
         "completion": {
           "complete": 0,
           "proven_by_summary": 0,
-          "inconclusive": 0,
-          "not_analyzed": 455
+          "inconclusive": 373,
+          "not_analyzed": 82
         },
-        "real_flagged": 0,
+        "real_flagged": 20,
         "real_cleared": 0,
-        "real_abstained": 246,
-        "fake_flagged": 0,
+        "real_abstained": 226,
+        "fake_flagged": 3,
         "fake_cleared": 0,
-        "fake_abstained": 209,
+        "fake_abstained": 206,
         "false_greens": 0
       }
     ],
@@ -436,39 +586,39 @@
       "real": 819,
       "fake": 753,
       "naive": {
-        "tp": 0,
-        "fp": 0,
-        "fn": 819,
-        "tn": 753
+        "tp": 106,
+        "fp": 69,
+        "fn": 713,
+        "tn": 684
       },
       "naive_metrics": {
-        "tpr": 0.0,
-        "fpr": 0.0,
-        "youden": 0.0
+        "tpr": 0.1294,
+        "fpr": 0.0916,
+        "youden": 0.0378
       },
       "honest": {
-        "tp": 0,
-        "fp": 0,
+        "tp": 106,
+        "fp": 69,
         "fn": 0,
         "tn": 0
       },
       "honest_metrics": {
-        "tpr": null,
-        "fpr": null,
-        "youden": null
+        "tpr": 1.0,
+        "fpr": 1.0,
+        "youden": 0.0
       },
       "completion": {
         "complete": 0,
         "proven_by_summary": 0,
-        "inconclusive": 0,
-        "not_analyzed": 1572
+        "inconclusive": 1252,
+        "not_analyzed": 320
       },
-      "real_flagged": 0,
+      "real_flagged": 106,
       "real_cleared": 0,
-      "real_abstained": 819,
-      "fake_flagged": 0,
+      "real_abstained": 713,
+      "fake_flagged": 69,
       "fake_cleared": 0,
-      "fake_abstained": 753,
+      "fake_abstained": 684,
       "false_greens": 0
     }
   }

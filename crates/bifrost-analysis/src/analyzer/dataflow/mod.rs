@@ -70,7 +70,8 @@ pub(crate) use reusable_summary::{
 };
 pub use summary::{
     ReusableEndSummary, ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryProvider,
-    SummaryPointSeed, SummarySolveInput, solve_with_reusable_end_summaries, solve_with_summaries,
+    SummaryCallCycle, SummaryCalledProcedures, SummaryPointSeed, SummarySolveInput,
+    solve_with_reusable_end_summaries, solve_with_summaries,
 };
 pub use summary_result::{
     SummaryBoundary, SummaryBoundaryKind, SummaryCoverage, SummaryDataflowError,

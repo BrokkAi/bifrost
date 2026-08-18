@@ -12,10 +12,11 @@ use crate::parse::{flow_dialect_blocks_extraction, js_ts_tree_sitter_language_fo
 use crate::providers::JsTsSource;
 use crate::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, JsTsLexicalBindingScope,
-    direct_property_definitions, is_commonjs_require_declarator, is_declaration_identifier,
-    is_lexically_nested_type_declaration, is_object_in_member_expression,
+    declarator_module_value_specifier, direct_pattern_binding, direct_property_definitions,
+    is_declaration_identifier, is_lexically_nested_type_declaration,
+    is_named_function_expression_declaration, is_object_in_member_expression,
     is_property_key_in_member, js_program_is_external_module, nested_type_identifier_parts,
-    pattern_binder_identifiers, slice, static_member_receiver,
+    object_pattern_entries, pattern_binder_identifiers, slice, static_member_receiver,
     typescript_enclosing_enum_initializer,
 };
 use crate::ts_owners::ts_resolve_type_text_to_property_owners;
@@ -24,7 +25,7 @@ use brokk_bifrost_core::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKin
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine,
 };
-use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ExportIndex, UsageHit};
+use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ExportIndex, ImportKind, UsageHit};
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverValue,
 };
@@ -64,15 +65,17 @@ pub fn scan_files_for_seeds(
         .then(|| browser_global_property_shape(target))
         .flatten();
     let target_owner = analyzer.parent_of(target);
-    let target_member = target_owner
-        .as_ref()
-        .is_none_or(|owner| !owner.is_module() && !owner.is_file_scope())
-        .then(|| member_name(target))
-        .flatten();
+    let target_member = (!target.is_file_scope()
+        && target_owner
+            .as_ref()
+            .is_none_or(|owner| !owner.is_module() && !owner.is_file_scope()))
+    .then(|| member_name(target))
+    .flatten();
     let browser_global_object = target_owner
         .is_none()
         .then(|| browser_global_shape.map(|(object, _)| object))
-        .flatten();
+        .flatten()
+        .filter(|_| target_is_unbound_browser_global_property(analyzer, target, language));
     let lookup_only_local_property = language == Language::JavaScript
         && target_owner.is_none()
         && target_member.is_some()
@@ -80,8 +83,14 @@ pub fn scan_files_for_seeds(
         && (!analyzer.declarations(target.source()).contains(target)
             || (target.is_function()
                 && function_target_has_non_program_local_receiver(analyzer, target, language)));
+    // Any ownerless JavaScript member with an exact same-file property
+    // definition can use the lexical local-property route. Some generated
+    // namespace assignments are also exposed on the declaration surface, so
+    // limiting this to lookup-only units drops intermediate receiver reads such
+    // as `proto.ml_metadata.Type` (#944).
     let direct_local_property =
-        lookup_only_local_property || exported_local_property_root.is_some();
+        (language == Language::JavaScript && target_owner.is_none() && target_member.is_some())
+            || exported_local_property_root.is_some();
     let direct_local_property_ranges = direct_local_property.then(|| analyzer.ranges(target));
     // A definition-lookup-only property has no declaration surface and no export,
     // so the only structured route to it from another file is the browser-script
@@ -186,27 +195,15 @@ pub fn scan_files_for_seeds(
         // The global-property model needs this file's bindings too: a reading file
         // that binds the receiver root reads its own object, exactly as it does in
         // the declaring file.
-        let lexical_bindings = (((browser_global_object.is_some() || direct_local_property)
-            && target_self_file)
+        let lexical_bindings = ((browser_global_object.is_some()
+            || (direct_local_property && target_self_file))
             || !global_property_receivers.is_empty()
             || !target_property_receivers.is_empty()
             || script_global_bare_target)
             .then(|| JsTsLexicalBindingIndex::build(root, source_str));
-        // Both remaining same-file models read the declaring file's byte ranges, so
-        // they stay confined to it however the bindings above were built.
-        let browser_global_object = lexical_bindings
-            .as_ref()
-            .filter(|_| target_self_file)
-            .and_then(|lexical_bindings| {
-                unbound_browser_global_property(
-                    analyzer,
-                    target,
-                    root,
-                    source_str,
-                    lexical_bindings,
-                )
-                .map(|(object, _)| object)
-            });
+        // Local-property definitions read the declaring file's byte ranges, so
+        // they stay confined to it. The validated browser-global identity is
+        // workspace-wide and retains each reading file's lexical shadow index.
         let local_property_definitions = lexical_bindings
             .as_ref()
             .filter(|_| target_self_file)
@@ -571,6 +568,31 @@ fn collect_global_property_receivers(
         .collect()
 }
 
+fn target_is_unbound_browser_global_property(
+    analyzer: &dyn CodeUnitIndex,
+    target: &CodeUnit,
+    language: Language,
+) -> bool {
+    let Ok(source) = target.source().read_to_string() else {
+        return false;
+    };
+    let Some(parser_language) = js_ts_tree_sitter_language_for_file(target.source(), language)
+    else {
+        return false;
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&parser_language).is_err() {
+        return false;
+    }
+    let Some(tree) = parser.parse(source.as_str(), None) else {
+        return false;
+    };
+    let root = tree.root_node();
+    let lexical_bindings = JsTsLexicalBindingIndex::build(root, source.as_str());
+    unbound_browser_global_property(analyzer, target, root, source.as_str(), &lexical_bindings)
+        .is_some()
+}
+
 fn collect_local_property_definitions(
     root: Node<'_>,
     source: &str,
@@ -839,6 +861,12 @@ impl ScanCtx<'_> {
             .is_some_and(|bindings| bindings.is_bound_at(name, byte))
     }
 
+    fn is_bare_browser_global_read(&self, name: &str, byte: usize) -> bool {
+        self.browser_global_object.is_some()
+            && self.target_member == Some(name)
+            && !self.lexically_bound_at(name, byte)
+    }
+
     fn binds_target(&self, ident: &str) -> bool {
         if self.is_lexically_shadowed(ident) {
             return false;
@@ -853,6 +881,13 @@ impl ScanCtx<'_> {
         }
         if self.binding_engine.is_shadowed(ident) {
             return false;
+        }
+        if self.target.is_file_scope()
+            && self.edges.iter().any(|edge| {
+                edge.local_name == ident && matches!(edge.kind, ImportEdgeKind::Namespace)
+            })
+        {
+            return true;
         }
         if self
             .edges
@@ -1014,9 +1049,12 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
 
-    if kind == "variable_declarator" && !is_commonjs_require_declarator(node, ctx.source) {
-        register_local_binding(node, ctx);
-        register_declaration(node, ctx);
+    if kind == "variable_declarator" {
+        handle_module_value_destructuring(node, ctx);
+        if !binds_module_value(node, ctx) {
+            register_local_binding(node, ctx);
+            register_declaration(node, ctx);
+        }
     }
     if kind == "for_in_statement" {
         register_for_in_destructuring_bindings(node, ctx);
@@ -1072,9 +1110,9 @@ fn register_scope_binding_shadows(scope: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     if declarator.kind() != "variable_declarator" {
                         continue;
                     }
-                    // CommonJS require bindings resolve through the import
-                    // graph. They must not hide their imported target.
-                    if is_commonjs_require_declarator(declarator, ctx.source) {
+                    // Module-value bindings resolve through the import graph.
+                    // They must not hide their imported target.
+                    if binds_module_value(declarator, ctx) {
                         continue;
                     }
                     if let Some(pattern) = declarator.child_by_field_name("name") {
@@ -1295,6 +1333,25 @@ fn handle_import_statement(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     }
                 }
             }
+            // `import * as Target from "..."`: a file-scope query names the
+            // imported module object itself, so its alias token is the import
+            // binding hit. Member queries continue to resolve the property
+            // token through `namespace_member_matches_target` below (#2305).
+            "namespace_import" if ctx.target.is_file_scope() => {
+                let mut cursor = current.walk();
+                for child in current.named_children(&mut cursor) {
+                    if child.kind() != "identifier" {
+                        continue;
+                    }
+                    let local_name = slice(child, ctx.source);
+                    if ctx.edges.iter().any(|edge| {
+                        edge.local_name == local_name
+                            && matches!(edge.kind, ImportEdgeKind::Namespace)
+                    }) {
+                        record_import_hit(child, ctx);
+                    }
+                }
+            }
             _ => {}
         }
         let mut cursor = current.walk();
@@ -1326,6 +1383,17 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 seed_target_destructuring_bindings(name_node, ctx);
             }
             seed_target_owner_destructuring_binding(name_node, value_node, ctx);
+        } else if expression_iterates_target_owner(value_node, ctx) {
+            // `const [{ texture }] = frames` destructures ONE ELEMENT of the
+            // iterable, which is the same question `for (const { texture } of
+            // frames)` asks and the same answer the forward route reads for
+            // the key (#2039).
+            let mut cursor = name_node.walk();
+            for element in name_node.named_children(&mut cursor) {
+                if element.kind() == "object_pattern" {
+                    seed_target_destructuring_bindings(element, ctx);
+                }
+            }
         }
         return;
     }
@@ -1387,41 +1455,91 @@ fn seed_target_destructuring_bindings(pattern: Node<'_>, ctx: &mut ScanCtx<'_>) 
     let Some(target_member) = ctx.target_member else {
         return;
     };
-    let mut cursor = pattern.walk();
-    for property in pattern.named_children(&mut cursor) {
-        let (key_node, local_node) = match property.kind() {
-            "shorthand_property_identifier_pattern" => (property, property),
-            "pair_pattern" => {
-                let Some(key_node) = property.child_by_field_name("key") else {
-                    continue;
-                };
-                let Some(value_node) = property.child_by_field_name("value") else {
-                    continue;
-                };
-                let Some(local_node) = direct_pattern_binding(value_node) else {
-                    continue;
-                };
-                (key_node, local_node)
-            }
-            "object_assignment_pattern" => {
-                let Some(left) = property.child_by_field_name("left") else {
-                    continue;
-                };
-                let Some(local_node) = direct_pattern_binding(left) else {
-                    continue;
-                };
-                (left, local_node)
-            }
-            _ => continue,
-        };
-        let key = slice(key_node, ctx.source);
-        let local = slice(local_node, ctx.source);
-        if key == target_member && !local.is_empty() {
-            // The pattern key is an immediate field reference. The introduced local is
-            // separately seeded only to carry that field value through later expressions.
-            record_hit(key_node, ctx);
+    // The key is the field reference on its own, whatever the entry binds from
+    // it: a renamed entry can bind a further pattern (`{ texture: { width } }`)
+    // instead of one name, which leaves the key a reference all the same.
+    for entry in object_pattern_entries(pattern) {
+        if slice(entry.key, ctx.source) != target_member {
+            continue;
+        }
+        // The introduced local is separately seeded only to carry that field
+        // value through later expressions.
+        record_hit(entry.key, ctx);
+        if let Some(local) = entry.binder.map(|node| slice(node, ctx.source))
+            && !local.is_empty()
+        {
             ctx.binding_engine
                 .seed_symbol(local.to_string(), TARGET_VALUE_BINDING);
+        }
+    }
+}
+
+/// Whether the declarator's initializer is a module value: a `require` call, or
+/// a call whose explicit type argument names an imported module (#2160).
+///
+/// Such a declarator introduces names the import binder already bound to that
+/// module's exports, so this scan must leave them to the import graph rather
+/// than declare them local shadows that hide their own imported target.
+fn binds_module_value(declarator: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    declarator_module_value_specifier(declarator, ctx.source, &ctx.imports).is_some()
+}
+
+/// A RENAMED destructuring entry over a module value names an export of that
+/// module without binding it, so its key is a read of that export (#2160).
+///
+/// `const { useBaseQuery: originImpl } = await vi.importActual<typeof M>('./m')`
+/// reads `useBaseQuery` off `M`'s export surface and binds the value to
+/// `originImpl`. The identifier walk cannot report the key, because a pattern
+/// key sits in a declaration position; the read is recorded here instead, off
+/// the same declarator the import binder read. #2039 answers that key forward
+/// through the call's type argument, so the inverse has to answer it too or the
+/// census reports a forward-only finding.
+///
+/// A shorthand entry (`const { Client } = require('./lib')`) is left alone: its
+/// one token both names the export and binds the local, and this scan reports a
+/// module binder as a binding rather than a usage. Members are named through
+/// their owner rather than by their own name, so a member target emits nothing
+/// here -- the same rule `handle_import_statement` states for an ESM specifier.
+///
+/// Both halves of the remaining test are needed. The initializer's module
+/// specifier ties the local to the module it destructures, which keeps a
+/// same-named local shadowing an import from claiming the import's edge; the
+/// edge then ties that module to the queried target's file, which this scan
+/// cannot resolve specifiers to on its own.
+fn handle_module_value_destructuring(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if ctx.target_member.is_some() {
+        return;
+    }
+    let Some(pattern) = node.child_by_field_name("name") else {
+        return;
+    };
+    if pattern.kind() != "object_pattern" {
+        return;
+    }
+    let Some(module_specifier) = declarator_module_value_specifier(node, ctx.source, &ctx.imports)
+    else {
+        return;
+    };
+    for entry in object_pattern_entries(pattern) {
+        // A shorthand entry's binder IS its key: one token that names and binds.
+        let Some(binder) = entry.binder.filter(|node| node.id() != entry.key.id()) else {
+            continue;
+        };
+        let local = slice(binder, ctx.source);
+        let imported_name = slice(entry.key, ctx.source);
+        let bound_here = ctx.imports.bindings_for(local).any(|binding| {
+            binding.kind == ImportKind::Named
+                && binding.imported_name.as_deref() == Some(imported_name)
+                && binding.module_specifier == module_specifier
+        });
+        if !bound_here {
+            continue;
+        }
+        if ctx.edges.iter().any(|edge| {
+            edge.local_name == local
+                && matches!(&edge.kind, ImportEdgeKind::Named(exported) if exported == imported_name)
+        }) {
+            record_hit(entry.key, ctx);
         }
     }
 }
@@ -1503,18 +1621,6 @@ fn seed_target_owner_pattern_path(pattern: Node<'_>, owner_path: &[String], ctx:
             seed_target_owner_pattern_path(nested, remaining, ctx);
         }
     }
-}
-
-fn direct_pattern_binding(node: Node<'_>) -> Option<Node<'_>> {
-    let binding = match node.kind() {
-        "assignment_pattern" | "object_assignment_pattern" => node.child_by_field_name("left")?,
-        _ => node,
-    };
-    matches!(
-        binding.kind(),
-        "identifier" | "shorthand_property_identifier_pattern"
-    )
-    .then_some(binding)
 }
 
 fn expression_carries_target_object(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -1934,7 +2040,7 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let binds_target = if node.kind() == "type_identifier" {
         ctx.binds_target_type(text)
     } else {
-        ctx.binds_target(text)
+        ctx.binds_target(text) || ctx.is_bare_browser_global_read(text, node.start_byte())
     };
     if !binds_target {
         return;
@@ -1975,15 +2081,6 @@ fn identifier_is_enclosing_enum_member_reference(
             .ranges(ctx.target)
             .iter()
             .any(|range| range.end_byte <= assignment.start_byte())
-}
-
-fn is_named_function_expression_declaration(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        matches!(parent.kind(), "function_expression" | "generator_function")
-            && parent
-                .child_by_field_name("name")
-                .is_some_and(|name| name.id() == node.id())
-    })
 }
 
 fn handle_export_specifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -2108,6 +2205,17 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 definitions,
             ) {
                 record_hit(property, ctx);
+                return;
+            }
+            // The declaring file can also destructure the property's owner:
+            // `const { cache } = state` binds `cache` to `state.cache`, so
+            // `cache.originalCreateDirectory` reads
+            // `state.cache.originalCreateDirectory` even though the receiver
+            // above spells a different root in a different scope. Only the
+            // structured owner seeds reach here, and the same key destructured
+            // from another root never gets one.
+            if expression_carries_target_object(object, ctx) {
+                record_hit(property, ctx);
             }
             return;
         }
@@ -2141,8 +2249,8 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     // double-counting member targets, so record it here (#1778).
     if ctx.browser_global_object.is_some()
         && simple_identifier_text(object, ctx.source).is_some()
-        && ctx.binds_target(object_text)
-        && !ctx.lexically_bound_at(object_text, object.start_byte())
+        && (ctx.binds_target(object_text)
+            || ctx.is_bare_browser_global_read(object_text, object.start_byte()))
     {
         record_hit(object, ctx);
         return;

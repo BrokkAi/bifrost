@@ -26,7 +26,9 @@ use brokk_bifrost_core::analyzer::structural::callable::{
 use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
 use brokk_bifrost_csharp::graph_support::CSharpSource;
 use brokk_bifrost_csharp::syntax::{
-    CSharpNamedArgumentLabel, csharp_named_argument_label, csharp_using_directive_is_static,
+    CSharpNamedArgumentLabel, csharp_constant_pattern_type_candidate,
+    csharp_implicit_accessor_value, csharp_local_binder_name, csharp_named_argument_label,
+    csharp_nameof_type_candidates, csharp_using_directive_is_static,
     csharp_using_directive_target_node,
 };
 
@@ -574,6 +576,39 @@ fn resolve_csharp_in_session(
             format!("`{}` is a C# statement label, not a reference", site.text),
         );
     }
+    // Two C# roles introduce a binding at the occurrence itself, and no
+    // declaration index publishes either, so the lexical pre-pass that runs
+    // ahead of this resolver cannot answer them and the enclosing-class member
+    // walk below must never see them. Both were already read off the grammar for
+    // the #2059 census taxonomy; forward lookup now consults the same helpers
+    // rather than a parallel spelling test (#2164).
+    //
+    // `value` is the implicit parameter of a `set`, `init`, `add` or `remove`
+    // accessor. SteamKit's generated `public uint value { ... set => __pbn__value
+    // = value; }` bound the read to the property that encloses it; the language
+    // forbids anything else called `value` in that scope (CS0136), so the read is
+    // the parameter and the answer is a local binding.
+    if csharp_implicit_accessor_value(node, source) {
+        return no_definition(
+            LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+            format!(
+                "`{}` is the implicit parameter of a C# write accessor",
+                site.text
+            ),
+        );
+    }
+    // A binder name is the grammar's own `name` field of a tuple element,
+    // pattern, `catch`, `out var`, deconstruction, type-parameter or LINQ
+    // range-variable declaration. `(string Name, object Value)` in StockSharp's
+    // `ReportSource` bound `Name` to the class property of that spelling; the
+    // element's `type` field is the only reference the node carries, and it is
+    // classified as a type before the walk below.
+    if csharp_local_binder_name(node) {
+        return no_definition(
+            DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND,
+            format!("`{}` is not a C# reference site", site.text),
+        );
+    }
 
     match csharp_reference_node(node, definitions) {
         Some(CSharpReferenceNode::Attribute(name)) => {
@@ -665,9 +700,37 @@ fn resolve_csharp_in_session(
                 && structured_receiver_type_names
                     .iter()
                     .any(|name| canonical_builtin_type_identity(name).is_some());
-            let should_try_extensions = !owners.is_empty()
-                || (!structured_receiver_type_names.is_empty() && !unindexed_builtin_receiver);
             let arity = csharp_invocation_arity(name, source, definitions);
+            // What an extension candidate is allowed to answer depends on what
+            // this site can prove about it (#1266).
+            //
+            // When the receiver's own type IS indexed, `csharp_member_outcome`
+            // below searches every ordinary member of it and of its supertypes.
+            // An empty result there IS C#'s extension-precedence rule
+            // discharged: no applicable instance member exists, so an extension
+            // may answer, in a call position or as a method group.
+            //
+            // When the receiver's type is NOT indexed -- `System.Type`,
+            // `JsonSerializerOptions`, a BCL `IEnumerable<T>` -- that proof does
+            // not exist and cannot be obtained. An ordinary instance member of
+            // the same spelling may well be the binding, and a workspace
+            // extension that merely shares the name is a possibility rather than
+            // the answer. The site itself can still supply the OTHER half of
+            // applicability, so an external receiver is admitted only for an
+            // actual invocation, whose argument count the candidate's parameter
+            // list must accept. A bare member access over an external receiver
+            // proves nothing: BootstrapBlazor's `innerType.IsEnum` and
+            // YamlDotNet's `t.IsGenericType` read a `System.Type` PROPERTY, and
+            // answering them with the same-spelled workspace extension METHOD
+            // was a claim the inverse scan -- which has always required a call
+            // arity here -- never made.
+            let should_try_extensions = if owners.is_empty() {
+                !structured_receiver_type_names.is_empty()
+                    && !unindexed_builtin_receiver
+                    && arity.is_some()
+            } else {
+                true
+            };
             let outcome = csharp_member_outcome(
                 analyzer,
                 definitions,
@@ -703,7 +766,6 @@ fn resolve_csharp_in_session(
                         member,
                         arity,
                         explicit_generic_arity,
-                        false,
                         session,
                     ),
                     None => csharp_visible_extension_method_candidates(
@@ -716,37 +778,6 @@ fn resolve_csharp_in_session(
                         member,
                         arity,
                         explicit_generic_arity,
-                        false,
-                    ),
-                };
-                if !extensions.is_empty() {
-                    return candidates_outcome(extensions);
-                }
-                let extensions = match definitions.session() {
-                    Some(session) => csharp_visible_extension_method_candidates_in_session(
-                        csharp,
-                        analyzer,
-                        file,
-                        source,
-                        member_name_node,
-                        &receiver_type_names,
-                        member,
-                        arity,
-                        explicit_generic_arity,
-                        true,
-                        session,
-                    ),
-                    None => csharp_visible_extension_method_candidates(
-                        csharp,
-                        analyzer,
-                        file,
-                        source,
-                        member_name_node,
-                        &receiver_type_names,
-                        member,
-                        arity,
-                        explicit_generic_arity,
-                        true,
                     ),
                 };
                 if !extensions.is_empty() {
@@ -818,6 +849,7 @@ fn resolve_csharp_in_session(
                 definitions,
                 file,
                 source,
+                tree.root_node(),
                 identifier,
             ) {
                 return outcome;
@@ -862,7 +894,7 @@ fn resolve_csharp_in_session(
                             return outcome;
                         }
                     }
-                    if !csharp_identifier_allows_type_fallback(identifier) {
+                    if !csharp_identifier_allows_type_fallback(identifier, source) {
                         return no_definition(
                             "no_indexed_definition",
                             format!("`{text}` did not resolve to an indexed C# member"),
@@ -2770,38 +2802,168 @@ fn csharp_non_constructor_member_candidates(
         .collect()
 }
 
+/// The member an object-initializer label names, which is always a member of
+/// the constructed type and never of the enclosing class.
+///
+/// The constructed type is resolved through the same ladder the constructor
+/// call directly above the initializer already uses. That matters most for a
+/// type nested in an enclosing class: C# makes it visible by its simple name
+/// from a sibling nested type, but the namespace-style walk joins candidate
+/// keys with `.` against a `$`-nested fq segment and never finds it (#1105,
+/// #1801). Resolving the owner with `csharp_logical_visible_type_candidates`
+/// alone therefore found ZERO declarations for StockSharp's `new Actions {
+/// Items = ... }` and ILSpy's `new CheckedUncheckedAnnotation { IsChecked =
+/// ... }`, and then reported that as an ambiguity -- an answer that lists
+/// nothing gives a caller nothing to choose between (#1811).
+///
+/// The two refusals below are now distinct facts. A target type that resolves
+/// to no indexed declaration is unresolved, and the message says which type;
+/// a target type that resolves to several is ambiguous, and the message names
+/// every candidate with its file, the way `csharp_indexed_candidate_honesty_message`
+/// names what it found while declining to pick.
 fn csharp_object_initializer_label_outcome(
     analyzer: &dyn IAnalyzer,
     csharp: &CSharpAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     label: Node<'_>,
 ) -> Option<DefinitionLookupOutcome> {
     let initializer = csharp_object_initializer_for_label(label)?;
+    let member = csharp_node_text(label, source);
     let Some(type_node) = csharp_object_initializer_owner_type_node(initializer) else {
-        return Some(no_definition(
-            "unknown_object_initializer_owner",
-            "C# object initializer target type could not be inferred",
-        ));
+        // A target-typed `new()` whose target type the tree does not write.
+        // The one such target the index can still prove is an assignment's
+        // left side: it types exactly like a receiver, because the type of
+        // `x` in `x = new() { ... }` is the type of `x` in `x.Member`.
+        let Some(target) = csharp_object_creation_assignment_target(initializer) else {
+            return Some(no_definition(
+                "unknown_object_initializer_owner",
+                "C# object initializer target type could not be inferred",
+            ));
+        };
+        let owners =
+            csharp_receiver_types(analyzer, csharp, definitions, file, source, root, target).units;
+        let target_text = csharp_node_text(target, source);
+        return Some(
+            csharp_initializer_member_outcome(analyzer, definitions, owners, member, target_text)
+                .unwrap_or_else(|| {
+                    no_definition(
+                        "unknown_object_initializer_owner",
+                        format!(
+                            "C# object initializer target type could not be inferred from assignment target `{target_text}`"
+                        ),
+                    )
+                }),
+        );
     };
     let type_name = csharp_reference_type_text(type_node, source);
-    let mut owners = csharp_logical_visible_type_candidates(csharp, definitions, file, &type_name);
-    if owners.len() != 1 {
-        return Some(no_definition(
-            "ambiguous_object_initializer_owner",
-            format!("C# object initializer target type `{type_name}` is not uniquely resolved"),
-        ));
-    }
-    let owner = owners.remove(0);
-    Some(csharp_member_outcome(
+    let owners = csharp_constructed_type_candidates(
+        analyzer,
+        csharp,
+        definitions,
+        file,
+        &type_name,
+        type_node.start_byte(),
+    );
+    Some(
+        csharp_initializer_member_outcome(analyzer, definitions, owners, member, &type_name)
+            .unwrap_or_else(|| {
+                no_definition(
+                    "unresolved_object_initializer_owner",
+                    format!(
+                        "C# object initializer target type `{type_name}` did not resolve to an indexed C# type"
+                    ),
+                )
+            }),
+    )
+}
+
+/// Every declaration the constructed type of an object creation can name.
+///
+/// This is the constructor call's own ladder (`resolve_csharp_constructor`,
+/// and the `Type` reference branch above it): a type nested in an enclosing
+/// class first, because C# looks there before the namespace and `using`
+/// scopes, then the lexically enclosing scopes, then the scope-blind visible
+/// walk, and finally the reference read as a fully qualified name.
+fn csharp_constructed_type_candidates(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    reference: &str,
+    byte: usize,
+) -> Vec<CodeUnit> {
+    if let Some(unit) = resolve_csharp_nested_type_in_enclosing_classes(
         analyzer,
         definitions,
-        vec![owner],
-        csharp_node_text(label, source),
-        None,
-        None,
-    ))
+        file,
+        reference,
+        byte,
+    ) {
+        return vec![unit];
+    }
+    if let Some(unit) = resolve_csharp_in_enclosing_scopes(
+        analyzer,
+        definitions,
+        file,
+        reference,
+        byte,
+        CodeUnit::is_class,
+    ) {
+        return vec![unit];
+    }
+    let candidates = csharp_logical_visible_type_candidates(csharp, definitions, file, reference);
+    if !candidates.is_empty() {
+        return candidates;
+    }
+    definitions
+        .fqn(reference)
+        .into_iter()
+        .filter(CodeUnit::is_class)
+        .collect()
+}
+
+/// The label's member on the one constructed type, the ambiguity that names
+/// every candidate, or `None` when the target proved no type at all.
+///
+/// The caller owns the `None` refusal because the two callers cannot prove the
+/// same thing: one has a written type name that resolved to nothing, the other
+/// has an assignment target whose type it could not infer.
+fn csharp_initializer_member_outcome(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    mut owners: Vec<CodeUnit>,
+    member: &str,
+    target: &str,
+) -> Option<DefinitionLookupOutcome> {
+    match owners.len() {
+        0 => None,
+        1 => Some(csharp_member_outcome(
+            analyzer,
+            definitions,
+            vec![owners.remove(0)],
+            member,
+            None,
+            None,
+        )),
+        _ => Some(no_definition(
+            "ambiguous_object_initializer_owner",
+            format!(
+                "C# object initializer target type `{target}` is not uniquely resolved; candidates: {}",
+                owners
+                    .iter()
+                    .map(|owner| format!(
+                        "`{}` ({})",
+                        owner.fq_name(),
+                        rel_path_string(owner.source())
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
+    }
 }
 
 /// Resolve a named-argument label the same way the object-initializer label
@@ -2880,6 +3042,16 @@ fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
         // claim for a field declared in the same class).
         return parent.child_by_field_name("name") != Some(node);
     }
+    if parent.kind() == "property_declaration" {
+        // A property owns its declaration name, its declared type, and the
+        // `value` field that holds its initializer. The name is filtered as a
+        // declaration and the type is classified as a type reference before
+        // this helper runs; the initializer is an ordinary value reference and
+        // routinely names an enclosing constant
+        // (`public int CardinalityLimit { get; set; } = DefaultCardinalityLimit;`,
+        // #2061).
+        return parent.child_by_field_name("value") == Some(node);
+    }
     !matches!(
         parent.kind(),
         "class_declaration"
@@ -2890,17 +3062,60 @@ fn csharp_is_unqualified_member_reference(node: Node<'_>) -> bool {
             | "method_declaration"
             | "local_function_statement"
             | "constructor_declaration"
-            | "property_declaration"
             | "using_directive"
     )
 }
 
-fn csharp_identifier_allows_type_fallback(node: Node<'_>) -> bool {
+/// Whether an unqualified identifier that bound no value may be reinterpreted
+/// as a type name.
+///
+/// Every arm here is a syntactic role that C# lets a *type* fill even though
+/// the grammar parses it as an ordinary expression, so the value-first lookup
+/// running ahead of this check can legitimately come up empty. Roles that admit
+/// only values are absent on purpose: an identifier that reaches this point in
+/// one of them stays unresolved rather than picking up a same-named type
+/// (#2061).
+fn csharp_identifier_allows_type_fallback(node: Node<'_>, source: &str) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    parent.kind() == "member_access_expression"
+    if parent.kind() == "member_access_expression"
         && csharp_member_access_receiver(parent).is_some_and(|receiver| same_node(receiver, node))
+    {
+        return true;
+    }
+    // `x is Structure` parses as a constant pattern because the grammar cannot
+    // tell a type pattern from a constant one; the declaration index decides.
+    // `x is not Structure` nests the same constant pattern under
+    // `negated_pattern`, so the operand's parent is the pattern either way.
+    if csharp_constant_pattern_type_candidate(parent)
+        .is_some_and(|candidate| same_node(candidate, node))
+    {
+        return true;
+    }
+    // `nameof(Structure)` names a type through expression syntax.
+    csharp_nameof_invocation_for_operand(node)
+        .and_then(|invocation| csharp_nameof_type_candidates(invocation, source))
+        .is_some_and(|(operand, _)| same_node(operand, node))
+}
+
+/// The `nameof(...)` invocation whose sole operand is `node`, if any.
+///
+/// The grammar wraps the operand in `argument_list > argument`, and an operand
+/// that is itself parenthesized or a member access is handled by
+/// [`csharp_nameof_type_candidates`], which the caller applies to the
+/// invocation this returns.
+fn csharp_nameof_invocation_for_operand(node: Node<'_>) -> Option<Node<'_>> {
+    let argument = node.parent()?;
+    if argument.kind() != "argument" {
+        return None;
+    }
+    let argument_list = argument.parent()?;
+    if argument_list.kind() != "argument_list" {
+        return None;
+    }
+    let invocation = argument_list.parent()?;
+    (invocation.kind() == "invocation_expression").then_some(invocation)
 }
 
 /// The one C# call-shape applicability check (#1478 M3): the candidates the

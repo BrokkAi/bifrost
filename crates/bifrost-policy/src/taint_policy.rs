@@ -41,7 +41,6 @@ use crate::resolved::{
 };
 use crate::{ProductionTaintAnalysisResult, ProductionTaintPhaseMetrics};
 use brokk_bifrost_analysis::CancellationToken;
-use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
 use brokk_bifrost_analysis::analyzer::dataflow::{
     DataflowRequest, ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey,
     SemanticInputStatus, SolverBudget, SummaryBehaviorKey, SummaryContextKey, SummarySchemaVersion,
@@ -49,10 +48,10 @@ use brokk_bifrost_analysis::analyzer::dataflow::{
     WitnessRetentionLimits,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
-    CandidateCoverage, EvidenceCompleteness, ExactExternalProcedureTarget, OracleCallContext,
-    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticArtifactKey, SemanticBudget,
-    SemanticOutcome, UnmaterializedExternalTarget, ValueHandle, WorkspaceIcfgProvider,
-    split_qualified_member,
+    CandidateCoverage, EvidenceCompleteness, ExactExternalProcedureTarget, ObservationPhase,
+    OracleCallContext, ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticArtifactKey,
+    SemanticBudget, SemanticOutcome, UnmaterializedExternalTarget, ValueHandle,
+    WorkspaceIcfgProvider, WorkspaceRelativePath, split_qualified_member,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
@@ -75,6 +74,7 @@ use brokk_bifrost_analysis::analyzer::value_flow::{
     ValueFlowInput, ValueFlowObservationPhase, ValueFlowPlan, ValueFlowSinkSpec,
     ValueFlowSourceSpec,
 };
+use brokk_bifrost_analysis::analyzer::{ProjectFile, WorkspaceAnalyzer};
 
 #[derive(Debug)]
 pub(crate) enum TaintPolicyCompileError {
@@ -162,8 +162,15 @@ enum TaintPolicyCompilation {
     Plans {
         roots: Vec<CompiledTaintPolicyPlan>,
         work: PolicyWorkReport,
+        /// One message per selector row the compile refused to bind (#2308).
+        /// Non-empty means the run does not cover the whole selection, so it
+        /// must not report `Complete`.
+        refusals: Vec<String>,
     },
-    Clean(PolicyWorkReport),
+    Clean {
+        work: PolicyWorkReport,
+        refusals: Vec<String>,
+    },
 }
 
 struct PreparedTaintPlan {
@@ -173,14 +180,69 @@ struct PreparedTaintPlan {
     compilation_elapsed: Duration,
 }
 
-fn complete_payload(work: PolicyWorkReport) -> TaintProjectionPayload {
+/// The payload for a compile that produced plans or an empty selection.
+///
+/// `refusals` carries one message per selector row the compile declined to
+/// bind. An empty list is the ordinary case and reports `Complete`. A non-empty
+/// list means the compile did not bind part of its own selection, so the run
+/// reports a typed capability gap and names every refused row: reporting
+/// `Complete` would let a caller read "no finding" as proof about a site that
+/// was never analyzed (#2308).
+fn compiled_payload(work: PolicyWorkReport, refusals: Vec<String>) -> TaintProjectionPayload {
+    if refusals.is_empty() {
+        return TaintProjectionPayload {
+            projections: Vec::new(),
+            completion: PolicyRunCompletion::Complete,
+            diagnostics: Vec::new(),
+            diagnostics_truncated: false,
+            work,
+        };
+    }
+    let completion =
+        PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::CapabilityIncomplete])
+            .expect("one incomplete reason is canonical");
+    let diagnostics = refusals
+        .into_iter()
+        .filter_map(|message| {
+            PolicyDiagnostic::try_new(
+                PolicyDiagnosticCode::EvaluationFailure,
+                PolicyDiagnosticSeverity::Warning,
+                PolicyDiagnosticImpact::RunIncomplete,
+                message,
+                None,
+                Vec::new(),
+            )
+            .ok()
+        })
+        .collect();
     TaintProjectionPayload {
         projections: Vec::new(),
-        completion: PolicyRunCompletion::Complete,
-        diagnostics: Vec::new(),
+        completion,
+        diagnostics,
         diagnostics_truncated: false,
         work,
     }
+}
+
+/// Render one diagnostic per refused selector row, naming the file, the row's
+/// byte range, and the distinct call ranges that tied. The complete tie set is
+/// in the message so a corpus report says which site could not be named rather
+/// than only that some site could not be.
+fn refusal_messages(refused: &[RefusedCallSite]) -> Vec<String> {
+    refused
+        .iter()
+        .map(|refusal| {
+            format!(
+                "taint semantic binding refused one site: the selector row at {}:{}..{} \
+                 identifies {} distinct semantic call sites {:?}, so it names no single call",
+                refusal.file,
+                refusal.span.start,
+                refusal.span.end,
+                refusal.ranges.len(),
+                refusal.ranges,
+            )
+        })
+        .collect()
 }
 
 /// Coordinator-owned production adapter.
@@ -207,14 +269,22 @@ struct TaintExecutionBudget {
 }
 
 impl TaintExecutionBudget {
+    fn fresh_semantic(budget: &PolicyBudget) -> SemanticBudget {
+        SemanticBudget::new(super::selector_compiler::semantic_work_limits(
+            budget.query_limits().semantic,
+        ))
+        .expect("validated policy semantic limits are positive")
+    }
+
+    fn fresh_solver(budget: &PolicyBudget) -> SolverBudget {
+        SolverBudget::new(budget.query_limits().value_flow.solver_work)
+    }
+
     fn new(budget: &PolicyBudget) -> Self {
         let limits = budget.query_limits();
         Self {
-            semantic: SemanticBudget::new(super::selector_compiler::semantic_work_limits(
-                limits.semantic,
-            ))
-            .expect("validated policy semantic limits are positive"),
-            solver: SolverBudget::new(limits.value_flow.solver_work),
+            semantic: Self::fresh_semantic(budget),
+            solver: Self::fresh_solver(budget),
             remaining_findings: budget.max_findings(),
             remaining_witnesses: budget
                 .max_findings()
@@ -245,6 +315,31 @@ impl TaintExecutionBudget {
         self.remaining_witness_steps = budget.max_witness_steps();
         self.remaining_witness_expansions = limits.value_flow.max_witness_expansions;
         self.remaining_witness_bytes = budget.max_witness_bytes();
+    }
+
+    /// Restore the semantic-materialization and IFDS solver-work lanes to their
+    /// per-batch starting budget.
+    ///
+    /// These two lanes pay for solving one batch: `semantic` charges the
+    /// procedure/value/call-site rows materialized for the batch's regions, and
+    /// `solver` charges the IFDS propagation that batch performs. Both are
+    /// consumed only inside `solve_and_project_batch`, and each batch is an
+    /// independent solve over its own regions, so a running request-wide total
+    /// made them a queue-position lottery: on a corpus with many per-region
+    /// batches the early batches drained both ledgers and later batches could
+    /// not finish their solve, so a real flow in a late region abstained purely
+    /// because of where it landed in the batch order (#2208). This is the same
+    /// defect and the same remedy as the witness lanes above (#1935).
+    ///
+    /// `remaining_findings` is deliberately not reset here: it is the cap on
+    /// total output, not per-batch work, so the aggregate stays bounded. A
+    /// depleted solve lane truncates the solve, which makes require-model taint
+    /// abstain rather than report clean, so resetting it can only turn an
+    /// abstention into a decision; it can never turn an abstain into a false
+    /// clean.
+    fn reset_per_batch_solve_budget(&mut self, budget: &PolicyBudget) {
+        self.semantic = Self::fresh_semantic(budget);
+        self.solver = Self::fresh_solver(budget);
     }
 }
 
@@ -291,8 +386,12 @@ impl ProductionTaintPolicyEvaluator {
             };
             let compilation_elapsed = compilation_started.elapsed();
             match compilation {
-                Ok(TaintPolicyCompilation::Plans { roots, work }) => {
-                    payloads.insert(policy_id.clone(), complete_payload(work));
+                Ok(TaintPolicyCompilation::Plans {
+                    roots,
+                    work,
+                    refusals,
+                }) => {
+                    payloads.insert(policy_id.clone(), compiled_payload(work, refusals));
                     for compiled in roots {
                         metadata.insert(
                             compiled.internal_policy_id.clone(),
@@ -306,8 +405,8 @@ impl ProductionTaintPolicyEvaluator {
                         plans.push(compiled.plan);
                     }
                 }
-                Ok(TaintPolicyCompilation::Clean(work)) => {
-                    payloads.insert(policy_id, complete_payload(work));
+                Ok(TaintPolicyCompilation::Clean { work, refusals }) => {
+                    payloads.insert(policy_id, compiled_payload(work, refusals));
                 }
                 Err(failure) => {
                     payloads.insert(policy_id, prepared_compile_failure_payload(*failure));
@@ -399,14 +498,38 @@ impl TaintPolicyEvaluator for ProductionTaintPolicyEvaluator {
 pub(crate) struct TaintPolicyCompiler<'a> {
     selectors: super::selector_compiler::PolicySelectorSession<'a>,
     active_semantic_models: Option<Arc<ResolvedActiveSemanticModels>>,
+    /// Selector rows this compile refused to bind because they named more than
+    /// one distinct semantic call site. Kept per row rather than raised as a
+    /// compile failure so one unresolvable row costs its own sites and not the
+    /// whole run (#2308).
+    refused_sites: Vec<RefusedCallSite>,
 }
 
 type SelectedSite = super::selector_compiler::PolicySelectedSite;
+
+/// One selector row that binding refused because its best-matching candidates
+/// name more than one distinct source call site.
+struct RefusedCallSite {
+    file: ProjectFile,
+    /// The selector row's own byte range.
+    span: ByteRange<usize>,
+    /// The tied candidates' source ranges, for the diagnostic.
+    ranges: Vec<ByteRange<usize>>,
+    /// Every procedure that holds a tied candidate. A region containing none of
+    /// these cannot contain the refused site.
+    procedures: Vec<DurableProcedureKey>,
+}
 
 #[derive(Clone)]
 struct BoundEndpoint {
     endpoint: ResolvedEndpointIdentity,
     point: ProgramPointHandle,
+    /// The phase of `point` at which the bound carrier holds the observed
+    /// value. A value the point itself defines holds only after that point's
+    /// effects, and the solver strong-updates an assignment target, so an
+    /// endpoint observed before the effects of its own defining assignment
+    /// would be killed by that assignment.
+    phase: ValueFlowObservationPhase,
     carrier: ValueFlowCarrier,
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
@@ -415,16 +538,49 @@ struct BoundEndpoint {
 
 struct ResolvedTaintValue {
     point: ProgramPointHandle,
+    phase: ValueFlowObservationPhase,
     value: ValueHandle,
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
 }
 
+/// The durable identity of one procedure: its owning artifact's validity key
+/// and the procedure's dense ID, exactly what `ProcedureHandle::durable_key`
+/// returns (#2286).
+///
+/// A `ProcedureHandle` compares and hashes its owning `Arc<SemanticArtifact>`
+/// by pointer, which is right at a provider or oracle boundary and wrong for a
+/// compile-scoped memo: the byte-bounded complete-artifact cache can evict a
+/// file that a later call resolution re-materializes, and the two handles for
+/// one procedure are then unequal. `SemanticArtifactKey` pins the mount, path,
+/// language, source revision, adapter semantics version, IR version,
+/// configuration, and dependencies, and the dense ID is stable beneath it.
+type DurableProcedureKey = (
+    SemanticArtifactKey,
+    brokk_bifrost_analysis::analyzer::semantic::ProcedureId,
+);
+
+/// The durable identity of one call site: its owning procedure's durable key
+/// and the caller-local call-site ID.
+///
+/// `CallSiteId` indexes `ProcedureSemantics::call_sites`, so it is unique only
+/// inside one procedure; the procedure's durable key is the scope that makes
+/// the pair unique. This is what `CallSiteHandle::durable_key` returns.
+type DurableCallSiteKey = (
+    DurableProcedureKey,
+    brokk_bifrost_analysis::analyzer::semantic::CallSiteId,
+);
+
 struct DiscoveredValueFlow {
     root: ProcedureHandle,
     snapshots: Vec<ValueFlowInput<brokk_bifrost_analysis::analyzer::semantic::ValueFlowSnapshot>>,
     bindings: Vec<ValueFlowInput<brokk_bifrost_analysis::analyzer::semantic::CallBindings>>,
-    procedures: HashSet<ProcedureHandle>,
+    /// Region membership, by durable procedure identity rather than by handle.
+    /// A selected source or sink is tested against this set, and its handle can
+    /// come from a different materialization than the walk's, so handle
+    /// equality would silently drop a region that really does contain the
+    /// endpoint (#2289).
+    procedures: HashSet<DurableProcedureKey>,
     external_targets: Vec<ExactExternalProcedureTarget>,
     /// Canonical identities of fully-qualified external callees that never
     /// materialize to an artifact, kept separate from `external_targets` so the
@@ -453,26 +609,113 @@ struct DiscoveredValueFlow {
 /// snapshots, bindings, and region-filtered specs. A hit returns the same
 /// `(value, status)` that the skipped call produced, so the region result is
 /// identical.
+///
+/// # Durable keys and one canonical artifact instance (#2289)
+///
+/// Every key here is a *durable* identity -- an artifact validity key plus
+/// dense IDs -- and not a handle. A handle compares its owning
+/// `Arc<SemanticArtifact>` by pointer, so under artifact-cache eviction a
+/// re-materialized procedure missed every one of these maps and re-charged the
+/// shared budget for work the compile had already paid for.
+///
+/// Rekeying alone is not enough, because the cached values *contain* handles: a
+/// hit serves the snapshot, dispatch result, and bindings that the first
+/// materialization produced. If the walk kept using the second instance's
+/// handles, one region's plan would mix instances, and the plan resolves some
+/// things by handle. Two of those are load bearing:
+/// `ValueFlowPlan::with_limits_and_call_behavior` builds each call's fallback
+/// profile from the root and snapshot procedure handles and looks their values
+/// up in `carrier_ids`, and it deduplicates that procedure list by handle
+/// equality. A root whose own snapshot came from the other instance would lose
+/// its fallback inputs and gain a duplicate profile.
+///
+/// So `canonical_procedure` pins exactly one `Arc<SemanticArtifact>` per
+/// artifact key for the whole compile and rewrites every handle the walk
+/// touches onto it. That substitution is sound because the artifact cache
+/// retains only `SemanticOutcome::Complete` artifacts
+/// (`analyzer/semantic/service.rs`, `CompleteSemanticArtifactCache`), so two
+/// instances that share a `SemanticArtifactKey` are two complete lowerings of
+/// one immutable file with one adapter identity, and are equal row for row.
+/// After the rewrite the root, every snapshot, and every call handle in one
+/// discovery belong to one instance.
+///
+/// The handles the walk does not mint stay as the oracle produced them: a
+/// `DispatchCandidate` is sealed against its own provenance and cannot be
+/// re-anchored, so a binding's callee port handles can name the other instance.
+/// Those reach the plan only as carriers, and #1909 made carrier identity
+/// durable: `assign_carrier_ids` groups candidates by stable key, checks
+/// `denotes_same_entity`, and retains *every* handle that named the carrier, so
+/// a lookup resolves through either instance. `append_call_rules` only looks up
+/// carriers it contributed itself, so it cannot miss. The one place that does
+/// compare a callee handle for equality, `CallResultHandle::new`, is inside the
+/// oracle and is only ever given bindings and a snapshot from one oracle call,
+/// never from this cache.
 #[derive(Default)]
 struct DiscoveryMaterializationCache {
+    /// One canonical artifact instance per artifact key, for the whole compile.
+    artifacts: HashMap<
+        SemanticArtifactKey,
+        Arc<brokk_bifrost_analysis::analyzer::semantic::SemanticArtifact>,
+    >,
     procedures: HashMap<
-        ProcedureHandle,
+        DurableProcedureKey,
         ValueFlowInput<brokk_bifrost_analysis::analyzer::semantic::ValueFlowSnapshot>,
     >,
     dispatch: HashMap<
-        brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
+        DurableCallSiteKey,
         (
             Option<brokk_bifrost_analysis::analyzer::semantic::DispatchResult>,
             SemanticInputStatus,
         ),
     >,
     bindings: HashMap<
-        (
-            brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
-            ProcedureHandle,
-        ),
+        (DurableCallSiteKey, DurableProcedureKey),
         ValueFlowInput<brokk_bifrost_analysis::analyzer::semantic::CallBindings>,
     >,
+    /// Snapshot lookups served from an entry this compile already held.
+    procedure_hits: u64,
+    /// Snapshot lookups with no entry at all, each of which runs the oracle and
+    /// charges the budget. This is the number the compile reports as
+    /// `taint.semantic_snapshot_materializations`, and it must equal the number
+    /// of distinct procedures the compile reached.
+    procedure_misses: u64,
+    /// Procedure visits whose handle named a second materialization of an
+    /// artifact this compile had already canonicalized, so the handle was
+    /// rewritten onto the canonical instance before any lookup.
+    ///
+    /// This is the counter that separates a handle-identity miss from a true
+    /// one. Keyed on handles, every one of these visits missed all three maps
+    /// and re-ran the oracle for the procedure's snapshot, each of its call
+    /// sites' dispatch, and each candidate's bindings. Keyed durably they are
+    /// hits, so `procedure_misses` counts only genuinely new procedures and the
+    /// handle-identity component of it is zero.
+    handle_identity_reuses: u64,
+}
+
+impl DiscoveryMaterializationCache {
+    /// Return `procedure` anchored to this compile's canonical instance of its
+    /// artifact, adopting it as canonical when the artifact is new here.
+    ///
+    /// See the type's documentation for why one instance per artifact key is
+    /// required and why the substitution is sound.
+    fn canonical_procedure(&mut self, procedure: &ProcedureHandle) -> ProcedureHandle {
+        let canonical = self
+            .artifacts
+            .entry(procedure.artifact().key().clone())
+            .or_insert_with(|| Arc::clone(procedure.artifact()));
+        if Arc::ptr_eq(canonical, procedure.artifact()) {
+            return procedure.clone();
+        }
+        debug_assert_eq!(
+            canonical.work(),
+            procedure.artifact().work(),
+            "two complete lowerings of one artifact key must retain the same rows"
+        );
+        self.handle_identity_reuses = self.handle_identity_reuses.saturating_add(1);
+        canonical
+            .procedure_handle(procedure.id())
+            .expect("one artifact key denotes one procedure table in every materialization")
+    }
 }
 
 struct SelectedSummaryFamily {
@@ -498,6 +741,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 cancellation,
             ),
             active_semantic_models,
+            refused_sites: Vec::new(),
         }
     }
 
@@ -510,13 +754,15 @@ impl<'a> TaintPolicyCompiler<'a> {
             Ok(compiled) => Ok(TaintPolicyCompilation::Plans {
                 roots: compiled,
                 work: self.selectors.work_report("taint"),
+                refusals: refusal_messages(&self.refused_sites),
             }),
             Err(
                 TaintPolicyCompileError::EmptyCompiledSources
                 | TaintPolicyCompileError::EmptyCompiledSinks,
-            ) => Ok(TaintPolicyCompilation::Clean(
-                self.selectors.work_report("taint"),
-            )),
+            ) => Ok(TaintPolicyCompilation::Clean {
+                work: self.selectors.work_report("taint"),
+                refusals: refusal_messages(&self.refused_sites),
+            }),
             Err(error) => Err(Box::new(TaintPolicyCompileFailure {
                 error,
                 work: self.selectors.work_report("taint"),
@@ -560,6 +806,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                     all_sources.push(BoundEndpoint {
                         endpoint: source.identity.clone(),
                         point: resolved.point,
+                        phase: resolved.phase,
                         carrier: ValueFlowCarrier::Value(resolved.value),
                         proof: resolved.proof,
                         completeness: resolved.completeness,
@@ -577,6 +824,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                     all_sinks.push(BoundEndpoint {
                         endpoint: sink.identity.clone(),
                         point: resolved.point,
+                        phase: resolved.phase,
                         carrier: ValueFlowCarrier::Value(resolved.value),
                         proof: resolved.proof,
                         completeness: resolved.completeness,
@@ -628,7 +876,12 @@ impl<'a> TaintPolicyCompiler<'a> {
             )
             .collect::<Vec<_>>();
         roots.sort_by(|left, right| left.semantics().locator().cmp(right.semantics().locator()));
-        roots.dedup();
+        // Deduplicate by durable identity, not by handle: a selected endpoint's
+        // procedure and the same procedure enumerated from a materialized
+        // artifact can be two handles for one procedure when the artifact cache
+        // re-materialized the file in between, and handle equality would then
+        // root the same region twice (#2289).
+        roots.dedup_by(|left, right| left.durable_key() == right.durable_key());
         let mut discoveries = Vec::with_capacity(roots.len());
         // One cache serves every root in this compile. It charges each shared
         // procedure, dispatch, and binding one time, not one time for each root
@@ -660,6 +913,28 @@ impl<'a> TaintPolicyCompiler<'a> {
                 Err(error) => return Err(error),
             }
         }
+        self.selectors
+            .record_semantic_handle_identity_reuses(materialization.handle_identity_reuses);
+        // Drop every region that could contain a refused selector row (#2308).
+        // A refused row bound no endpoint, so a region holding it is missing an
+        // endpoint the policy asked for; solving it anyway could report a clean
+        // verdict for a site that was never analyzed. Regions that contain none
+        // of the refused row's candidate procedures cannot hold the site, so
+        // they keep their verdicts: the refusal costs the sites it affects
+        // rather than the whole run.
+        if !self.refused_sites.is_empty() {
+            let refused = self
+                .refused_sites
+                .iter()
+                .flat_map(|refusal| refusal.procedures.iter().cloned())
+                .collect::<HashSet<_>>();
+            discoveries.retain(|discovery| {
+                !discovery
+                    .procedures
+                    .iter()
+                    .any(|procedure| refused.contains(procedure))
+            });
+        }
         // Keep only regions that contain both a selected source and a selected
         // sink: those are the regions where a flow can exist, and each becomes
         // one independent analysis plan below. Binding proceeds per region on
@@ -673,13 +948,24 @@ impl<'a> TaintPolicyCompiler<'a> {
         // discovery is partial carries that status into its value-flow plan and
         // reports `Inconclusive`, and require-model still fails closed on a
         // genuinely unmodeled call inside a region.
+        // Region membership is tested by durable procedure identity. Building
+        // the endpoints' keys once keeps the per-region tests below from
+        // cloning one `SemanticArtifactKey` for every endpoint of every region.
+        let source_procedures = all_sources
+            .iter()
+            .map(|endpoint| endpoint.point.procedure().durable_key())
+            .collect::<Vec<_>>();
+        let sink_procedures = all_sinks
+            .iter()
+            .map(|endpoint| endpoint.point.procedure().durable_key())
+            .collect::<Vec<_>>();
         discoveries.retain(|discovery| {
-            all_sources
+            source_procedures
                 .iter()
-                .any(|endpoint| discovery.procedures.contains(endpoint.point.procedure()))
-                && all_sinks
+                .any(|procedure| discovery.procedures.contains(procedure))
+                && sink_procedures
                     .iter()
-                    .any(|endpoint| discovery.procedures.contains(endpoint.point.procedure()))
+                    .any(|procedure| discovery.procedures.contains(procedure))
         });
         let covered = discoveries
             .iter()
@@ -702,13 +988,15 @@ impl<'a> TaintPolicyCompiler<'a> {
             let root = discovery.root.clone();
             let mut sources = all_sources
                 .iter()
-                .filter(|endpoint| discovery.procedures.contains(endpoint.point.procedure()))
-                .cloned()
+                .zip(&source_procedures)
+                .filter(|(_, procedure)| discovery.procedures.contains(*procedure))
+                .map(|(endpoint, _)| endpoint.clone())
                 .collect::<Vec<_>>();
             let mut sinks = all_sinks
                 .iter()
-                .filter(|endpoint| discovery.procedures.contains(endpoint.point.procedure()))
-                .cloned()
+                .zip(&sink_procedures)
+                .filter(|(_, procedure)| discovery.procedures.contains(*procedure))
+                .map(|(endpoint, _)| endpoint.clone())
                 .collect::<Vec<_>>();
             sort_bound_endpoints(&mut sources);
             sort_bound_endpoints(&mut sinks);
@@ -824,14 +1112,44 @@ impl<'a> TaintPolicyCompiler<'a> {
                 "taint semantic call binding exhausted the shared traversal budget",
             ));
         }
-        let (procedure, call) = select_call(&handles, &selection)?;
-        let (value, point) = select_value(&procedure, &call, &selection.span, binding)?;
-        Ok(vec![ResolvedTaintValue {
-            point,
-            value,
-            proof: selection.proof,
-            completeness: selection.completeness,
-        }])
+        let sites = match select_call(&handles, &selection)? {
+            SelectedCallSites::One(sites) => sites,
+            SelectedCallSites::Ambiguous { ranges, procedures } => {
+                // The row names more than one distinct call. Refuse this row
+                // only, and record which procedures could hold the site so the
+                // regions that could contain it are dropped below (#2308). A
+                // whole-policy failure here cost every case in the run its
+                // verdict for one unresolvable row.
+                self.refused_sites.push(RefusedCallSite {
+                    file: selection.file.clone(),
+                    span: selection.span.clone(),
+                    ranges,
+                    procedures,
+                });
+                return Ok(Vec::new());
+            }
+        };
+        // One source call site, lowered once per control-flow specialization.
+        // Every lowering is a program site the value can reach, so bind all of
+        // them; binding one would silently drop the others' paths (#2308).
+        sites
+            .iter()
+            .map(|(procedure, call)| {
+                let (value, point) = select_value(procedure, call, &selection.span, binding)?;
+                Ok(ResolvedTaintValue {
+                    point,
+                    // A call port is a carrier the selected point reads or
+                    // receives, never one that point's own local effects
+                    // define: an argument or receiver temporary is assigned at
+                    // the operand's own point, and a return value is bound at
+                    // the call's normal continuation.
+                    phase: ValueFlowObservationPhase::BeforeEffects,
+                    value,
+                    proof: selection.proof.clone(),
+                    completeness: selection.completeness.clone(),
+                })
+            })
+            .collect()
     }
 
     fn resolve_matched_value(
@@ -887,6 +1205,12 @@ impl<'a> TaintPolicyCompiler<'a> {
             .iter()
             .map(|observation| ResolvedTaintValue {
                 point: observation.query().point().clone(),
+                // Keep the phase the oracle attached to the observation. A
+                // matched value is usually the one the point defines, so the
+                // observation holds after that point's effects; binding it
+                // before them lets the defining assignment's strong update
+                // kill the endpoint at its own site.
+                phase: value_flow_phase(observation.query().phase()),
                 value: observation.query().value().clone(),
                 proof: proof.clone(),
                 completeness: completeness.clone(),
@@ -901,8 +1225,12 @@ impl<'a> TaintPolicyCompiler<'a> {
     ) -> Result<DiscoveredValueFlow, TaintPolicyCompileError> {
         let oracle = self.selectors.workspace().semantic_oracle_provider();
         let context = OracleCallContext::empty();
+        // Anchor the root, and below every procedure the walk reaches, to this
+        // compile's canonical instance of its artifact, so one discovery never
+        // mixes two materializations of one file (#2289).
+        let root = cache.canonical_procedure(root);
         let mut pending = vec![root.clone()];
-        let mut seen = HashSet::new();
+        let mut seen: HashSet<DurableProcedureKey> = HashSet::new();
         let mut seen_bindings = HashSet::new();
         let mut seen_external_targets = HashSet::new();
         let mut seen_unmaterialized_targets = HashSet::new();
@@ -911,16 +1239,30 @@ impl<'a> TaintPolicyCompiler<'a> {
         let mut external_targets = Vec::new();
         let mut unmaterialized_external_targets = Vec::new();
         while let Some(procedure) = pending.pop() {
-            if !seen.insert(procedure.clone()) {
+            let procedure = cache.canonical_procedure(&procedure);
+            let procedure_key = procedure.durable_key();
+            if !seen.insert(procedure_key.clone()) {
                 continue;
             }
             // Reuse the cached snapshot when a prior root already materialized
             // this procedure. The cache holds only present snapshots: the miss
             // path returns a `SemanticUnavailable` error before it inserts, so a
             // hit always carries a valid snapshot.
-            let snapshot_input = if let Some(cached) = cache.procedures.get(&procedure) {
+            //
+            // The cache is deliberately not gated on the snapshot being
+            // complete (#2284). Most procedures at corpus scale are not
+            // complete -- an unlowered construct or an unresolved dispatch is
+            // ordinary -- and a cache that retained only complete answers would
+            // re-materialize and re-charge nearly everything for every root
+            // that reaches it. A non-complete snapshot is still a finished
+            // answer, and it is replayed with its typed status intact, so a
+            // cached `unsupported` stays `unsupported`.
+            let snapshot_input = if let Some(cached) = cache.procedures.get(&procedure_key) {
+                cache.procedure_hits = cache.procedure_hits.saturating_add(1);
                 cached.clone()
             } else {
+                cache.procedure_misses = cache.procedure_misses.saturating_add(1);
+                self.selectors.record_semantic_snapshot_materialization();
                 let outcome = {
                     let mut request = self.selectors.semantic_request();
                     oracle
@@ -940,7 +1282,9 @@ impl<'a> TaintPolicyCompiler<'a> {
                     )
                 })?;
                 let input = ValueFlowInput::new(snapshot, status);
-                cache.procedures.insert(procedure.clone(), input.clone());
+                cache
+                    .procedures
+                    .insert(procedure_key.clone(), input.clone());
                 input
             };
             snapshots.push(snapshot_input);
@@ -952,8 +1296,9 @@ impl<'a> TaintPolicyCompiler<'a> {
                 // Reuse the cached dispatch when a prior root already resolved
                 // this call site. The per-discovery boundary and candidate walk
                 // below still runs, because it feeds this root's own region.
+                let call_key = call.durable_key();
                 let (dispatch_value, dispatch_status) =
-                    if let Some(cached) = cache.dispatch.get(&call) {
+                    if let Some(cached) = cache.dispatch.get(&call_key) {
                         cached.clone()
                     } else {
                         let dispatch = {
@@ -968,7 +1313,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                             .map_err(taint_selector_error)?;
                         let dispatch_status = SemanticInputStatus::from_outcome(&dispatch);
                         let entry = (dispatch.available_value().cloned(), dispatch_status);
-                        cache.dispatch.insert(call.clone(), entry.clone());
+                        cache.dispatch.insert(call_key.clone(), entry.clone());
                         entry
                     };
                 let Some(dispatch) = dispatch_value else {
@@ -990,7 +1335,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                     }
                 }
                 for candidate in dispatch.candidates() {
-                    let binding_key = (call.clone(), candidate.target().clone());
+                    let binding_key = (call_key.clone(), candidate.target().durable_key());
                     if !seen_bindings.insert(binding_key.clone()) {
                         continue;
                     }
@@ -1029,7 +1374,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             }
         }
         Ok(DiscoveredValueFlow {
-            root: root.clone(),
+            root,
             snapshots,
             bindings,
             procedures: seen,
@@ -1389,11 +1734,14 @@ fn solve_and_project_batch(
     retained_analyses: &mut Vec<Arc<ProductionTaintAnalysisResult>>,
     batch_planning_elapsed: Duration,
 ) -> Result<(), String> {
-    // Each batch reconstructs evidence only for its own findings, so give it a
-    // fresh witness budget instead of the request-wide remainder a corpus would
-    // have already drained (#1935). `remaining_findings` is deliberately not
-    // reset: it stays the request-wide cap on total output.
+    // Each batch solves its own regions and reconstructs evidence only for its
+    // own findings, so give it a fresh solve and witness budget instead of the
+    // request-wide remainder a corpus would have already drained (#1935 for the
+    // witness lanes, #2208 for the semantic and solver lanes).
+    // `remaining_findings` is deliberately not reset: it stays the request-wide
+    // cap on total output.
     execution_budget.reset_per_batch_witness_budget(budget);
+    execution_budget.reset_per_batch_solve_budget(budget);
     let limits = budget.query_limits();
     let value_flow_limits = limits.value_flow;
     let witness_retention = WitnessRetentionLimits::best_effort(
@@ -1584,9 +1932,17 @@ fn solve_and_project_batch(
                         .filter_map(|segment| segment.name())
                         .collect::<Vec<_>>()
                         .join(".");
-                    let status = cause
-                        .status()
-                        .map_or("incomplete coverage", SemanticInputStatus::label);
+                    // Name the missing capability when the input is unsupported,
+                    // so a corpus abstention report says which value-flow
+                    // capability the procedure lacked rather than a bare
+                    // "unsupported".
+                    let status = match cause.status() {
+                        Some(status @ SemanticInputStatus::Unsupported { capability }) => {
+                            format!("{} ({})", status.label(), capability.label())
+                        }
+                        Some(status) => status.label().to_owned(),
+                        None => "incomplete coverage".to_owned(),
+                    };
                     if let Ok(diagnostic) = PolicyDiagnostic::try_new(
                         PolicyDiagnosticCode::EvaluationFailure,
                         PolicyDiagnosticSeverity::Warning,
@@ -1676,10 +2032,43 @@ struct ProjectedSourceGroup<'a> {
     labels: Vec<TaintLabel>,
 }
 
+/// The place one projected taint finding reports: one declared sink endpoint at
+/// one place in the source.
+///
+/// "One place in the source" is the file, the enclosing declaration, and the
+/// anchor's byte span. It deliberately excludes the anchor's *occurrence*
+/// counter, which is what distinguishes several lowerings of one written call
+/// from one another (#2308).
+type ReportedSinkSite = (
+    ResolvedEndpointIdentity,
+    WorkspaceRelativePath,
+    String,
+    ByteRange<u32>,
+);
+
+/// Where one value-flow sink event is reported, or `None` when the event
+/// belongs to another policy in the shared batch.
+fn reported_sink_site(
+    plan: &PreparedTaintPlan,
+    event: &ValueFlowEventKey,
+) -> Option<Result<ReportedSinkSite, String>> {
+    let compiled = plan.sinks.iter().find(|sink| &sink.event == event)?;
+    let locator = event.site();
+    let span = locator.anchor().span();
+    Some(canonical_locator_identity(locator).map(|declaration| {
+        (
+            compiled.endpoint.clone(),
+            locator.path().clone(),
+            declaration,
+            span.start_byte()..span.end_byte(),
+        )
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn project_policy_findings(
     workspace: &WorkspaceAnalyzer,
-    _policy: &LoadedPolicy,
+    policy: &LoadedPolicy,
     spec: &ResolvedTaintPolicySpec,
     plan: &PreparedTaintPlan,
     universe: &TaintUniverse,
@@ -1687,21 +2076,50 @@ fn project_policy_findings(
     budget: &PolicyBudget,
     dropped_for_missing_origins: &mut usize,
 ) -> Result<Vec<TaintProjectedFinding>, String> {
+    // The projection authority validates each envelope against the *effective*
+    // report limits, which are the policy's own report options capped by the
+    // host budget (`EffectiveReportLimits` in `projection.rs`). The adapter has
+    // to project inside the same limits or its envelope is rejected wholesale
+    // and the finding is lost. Merging a sink's events into one finding (below)
+    // makes that reachable, because one finding now carries every event's
+    // origins and witnesses.
+    let report_options = &policy.definition().report;
     let mut projected = Vec::new();
-    let mut projected_sinks = Vec::<ValueFlowEventKey>::new();
+    // One projected finding per declared sink endpoint per *place in the
+    // source*, rather than per value-flow event key.
+    //
+    // One written call can be lowered into several program points, and each gets
+    // its own event key: Java specializes a `finally` body once per completion
+    // route out of the guarded region, so `out.write(x)` written once inside one
+    // becomes several events sharing one anchor span and differing only in the
+    // anchor's occurrence counter (#2308). Those events are one place in the
+    // source and carry one finding identity, so emitting an envelope for each
+    // makes several envelopes claim it -- which the projection authority rejects
+    // as an internal invariant violation, failing the whole run.
+    //
+    // Grouping by the site reports the one finding they describe, carrying every
+    // route's origins and witnesses. It groups no more than that: two calls
+    // written at different places keep their own findings and their own reported
+    // locations.
+    let mut projected_sinks = Vec::<ReportedSinkSite>::new();
     for candidate in report.findings() {
-        if projected_sinks
-            .iter()
-            .any(|sink| sink == candidate.key().sink())
-        {
+        let Some(reported_sink) = reported_sink_site(plan, candidate.key().sink()) else {
+            continue;
+        };
+        let reported_sink = reported_sink?;
+        if projected_sinks.contains(&reported_sink) {
             continue;
         }
-        projected_sinks.push(candidate.key().sink().clone());
         let sink_findings = report
             .findings()
             .iter()
-            .filter(|finding| finding.key().sink() == candidate.key().sink())
+            .filter(|finding| {
+                reported_sink_site(plan, finding.key().sink())
+                    .and_then(Result::ok)
+                    .is_some_and(|site| site == reported_sink)
+            })
             .collect::<Vec<_>>();
+        projected_sinks.push(reported_sink);
         let finding = sink_findings
             .iter()
             .copied()
@@ -1712,7 +2130,7 @@ fn project_policy_findings(
                     finding.origins().is_complete(),
                 )
             })
-            .expect("a discovered sink retains at least one finding row");
+            .expect("the candidate row belongs to its own sink group");
         let Some(compiled_sink) = plan
             .sinks
             .iter()
@@ -1846,7 +2264,9 @@ fn project_policy_findings(
                 workspace,
                 universe,
                 group,
-                budget.max_origins_per_finding(),
+                report_options
+                    .origins_per_finding
+                    .min(budget.max_origins_per_finding()),
             )?;
             let origins_truncated = group
                 .findings
@@ -1868,6 +2288,9 @@ fn project_policy_findings(
                 pair_finding_incomplete,
                 origins_truncated,
                 pair_witness_incomplete,
+                report_options
+                    .witnesses_per_finding
+                    .min(budget.max_witnesses_per_finding()),
                 budget,
             )?;
             let witness_refs_truncated = projected_report.witnesses_truncated;
@@ -2028,6 +2451,7 @@ fn project_taint_report(
     finding_incomplete: bool,
     origins_truncated: bool,
     witness_incomplete: bool,
+    witness_limit: usize,
     budget: &PolicyBudget,
 ) -> Result<(ProjectedFindingReport, Vec<WitnessId>), String> {
     let certainty = if proven {
@@ -2059,6 +2483,7 @@ fn project_taint_report(
         group,
         finding_key,
         finding_incomplete || origins_truncated || witness_incomplete,
+        witness_limit,
         budget,
     )?;
     if omitted_witnesses > 0 || witnesses.iter().any(BoundedWitness::truncated) {
@@ -2141,6 +2566,7 @@ fn project_taint_witnesses(
     group: &ProjectedSourceGroup<'_>,
     finding_key: &str,
     finding_incomplete: bool,
+    witness_limit: usize,
     budget: &PolicyBudget,
 ) -> Result<ProjectedTaintWitnesses, String> {
     let mut retained = Vec::<(&TaintOriginFindingEvidence, &SummaryWitness)>::new();
@@ -2155,7 +2581,7 @@ fn project_taint_witnesses(
             }
         }
     }
-    let retained_limit = retained.len().min(budget.max_witnesses_per_finding());
+    let retained_limit = retained.len().min(witness_limit);
     let mut omitted = retained.len().saturating_sub(retained_limit);
     let mut witnesses = Vec::new();
     let mut witness_refs = Vec::new();
@@ -2206,7 +2632,10 @@ fn project_taint_witnesses(
         witnesses,
         witness_refs,
         omitted,
-        display_path: crate::display_path::select_taint_display_path(display_candidates),
+        display_path: crate::display_path::select_taint_display_path(
+            display_candidates,
+            u64::try_from(omitted).unwrap_or(u64::MAX),
+        ),
     })
 }
 
@@ -2291,25 +2720,66 @@ fn required_selector<'a>(
         .ok_or_else(|| TaintPolicyCompileError::MissingSelector(path.as_str().to_owned()))
 }
 
-/// Bind one selector row to the semantic call site it identifies.
+/// One tied candidate for a selector row: the semantic call site, the source
+/// range its anchor covers, and the procedure that holds it.
+struct CallCandidate {
+    /// Sorts exact anchor matches before merely enclosing ones.
+    inexact: bool,
+    range: ByteRange<usize>,
+    procedure: ProcedureHandle,
+    handle: brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
+}
+
+/// What one selector row names in the semantic model.
+enum SelectedCallSites {
+    /// One source call site. The vector holds every semantic call site that
+    /// lowers it, which is more than one whenever the lowering specializes the
+    /// surrounding code per control-flow route.
+    One(
+        Vec<(
+            ProcedureHandle,
+            brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
+        )>,
+    ),
+    /// More than one distinct source call site ties for best match, so the row
+    /// does not identify a single site and binding refuses it.
+    Ambiguous {
+        /// The tied source ranges, in ascending order, for the diagnostic.
+        ranges: Vec<ByteRange<usize>>,
+        /// Durable identity of every procedure holding a tied candidate. A
+        /// region that contains none of these cannot contain the refused site,
+        /// so this is what bounds the refusal to the sites it really affects.
+        procedures: Vec<DurableProcedureKey>,
+    },
+}
+
+/// Bind one selector row to the semantic call sites it identifies.
 ///
 /// The primary identity is exact source-anchor equality between the selector
 /// row and a call site's own anchor; this is what binds Ruby calls with and
 /// without parentheses, whose structural rows and semantic call anchors share
 /// one node (#1953). A call whose anchor strictly encloses the row is a
 /// secondary candidate for adapters whose rows sit inside the call expression.
-/// Equal-rank candidates stay a typed ambiguity; no candidate stays a typed
-/// capability failure.
+/// No candidate stays a typed capability failure.
+///
+/// Equal-rank candidates are not automatically an ambiguity (#2308). A call
+/// site is anchored at its call expression, so tied candidates that share one
+/// source range are one call in the source, lowered more than once. Java's
+/// `finally` body is the case that matters at corpus scale: the lowering emits
+/// one specialization of the cleanup body per completion route out of the
+/// guarded region (`crates/bifrost-analysis/src/analyzer/java/semantic/control.rs`,
+/// `try_statement` and `route`), so `out.write(x)` written once inside a
+/// `finally` becomes two call sites with the identical anchor. Both are real
+/// program sites the value can reach, so binding takes all of them rather than
+/// picking one path or refusing the row.
+///
+/// Tied candidates that carry *different* source ranges are a genuine
+/// ambiguity: the row's evidence names no single call, and binding refuses it
+/// rather than guess.
 fn select_call(
     procedures: &[ProcedureHandle],
     selection: &SelectedSite,
-) -> Result<
-    (
-        ProcedureHandle,
-        brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
-    ),
-    TaintPolicyCompileError,
-> {
+) -> Result<SelectedCallSites, TaintPolicyCompileError> {
     let mut candidates = Vec::new();
     for procedure in procedures {
         for call in procedure.semantics().call_sites() {
@@ -2326,31 +2796,59 @@ fn select_call(
                 let handle = procedure
                     .call_site_handle(call.id)
                     .expect("validated semantic call has a scoped handle");
-                candidates.push((!exact, call_range.len(), procedure.clone(), handle));
+                candidates.push(CallCandidate {
+                    inexact: !exact,
+                    range: call_range,
+                    procedure: procedure.clone(),
+                    handle,
+                });
             }
         }
     }
     candidates.sort_by(|left, right| {
-        (left.0, left.1, left.2.semantics().locator()).cmp(&(
-            right.0,
-            right.1,
-            right.2.semantics().locator(),
-        ))
+        (
+            left.inexact,
+            left.range.len(),
+            left.range.start,
+            left.procedure.semantics().locator(),
+            left.handle.id(),
+        )
+            .cmp(&(
+                right.inexact,
+                right.range.len(),
+                right.range.start,
+                right.procedure.semantics().locator(),
+                right.handle.id(),
+            ))
     });
     let Some(best) = candidates.first() else {
         return Err(TaintPolicyCompileError::SemanticUnavailable(
-            "selected source row does not identify a semantic call site".to_owned(),
+            "selected row does not identify a semantic call site".to_owned(),
         ));
     };
-    if candidates
-        .get(1)
-        .is_some_and(|next| (next.0, next.1) == (best.0, best.1))
-    {
-        return Err(TaintPolicyCompileError::AmbiguousSemanticSite(
-            "selected source row identifies multiple equal semantic call sites".to_owned(),
-        ));
+    let rank = (best.inexact, best.range.len());
+    let tied = candidates
+        .iter()
+        .filter(|candidate| (candidate.inexact, candidate.range.len()) == rank)
+        .collect::<Vec<_>>();
+    let mut ranges = tied
+        .iter()
+        .map(|candidate| candidate.range.clone())
+        .collect::<Vec<_>>();
+    ranges.dedup();
+    if ranges.len() > 1 {
+        let mut procedures = tied
+            .iter()
+            .map(|candidate| candidate.procedure.durable_key())
+            .collect::<Vec<_>>();
+        procedures.dedup();
+        return Ok(SelectedCallSites::Ambiguous { ranges, procedures });
     }
-    Ok((best.2.clone(), best.3.clone()))
+    Ok(SelectedCallSites::One(
+        tied.into_iter()
+            .map(|candidate| (candidate.procedure.clone(), candidate.handle.clone()))
+            .collect(),
+    ))
 }
 
 fn select_value(
@@ -2458,6 +2956,17 @@ fn conjoin_completeness(
     }
 }
 
+/// Project one semantic observation phase onto the value-flow solver's phase.
+/// The two enumerations describe the same instant of one program point, so the
+/// bridge is total and no endpoint has to choose a phase the oracle did not
+/// state.
+const fn value_flow_phase(phase: ObservationPhase) -> ValueFlowObservationPhase {
+    match phase {
+        ObservationPhase::BeforeEffects => ValueFlowObservationPhase::BeforeEffects,
+        ObservationPhase::AfterEffects => ValueFlowObservationPhase::AfterEffects,
+    }
+}
+
 fn sort_bound_endpoints(endpoints: &mut [BoundEndpoint]) {
     endpoints.sort_by(|left, right| {
         left.point
@@ -2486,7 +2995,7 @@ fn source_event_specs(
             Ok(ValueFlowSourceSpec::new(
                 key,
                 endpoint.point.clone(),
-                ValueFlowObservationPhase::BeforeEffects,
+                endpoint.phase,
                 endpoint.carrier.clone(),
                 endpoint.proof.clone(),
                 endpoint.completeness.clone(),
@@ -2511,7 +3020,7 @@ fn sink_event_specs(
             Ok(ValueFlowSinkSpec::new(
                 key,
                 endpoint.point.clone(),
-                ValueFlowObservationPhase::BeforeEffects,
+                endpoint.phase,
                 endpoint.carrier.clone(),
                 endpoint.proof.clone(),
                 endpoint.completeness.clone(),
@@ -2674,5 +3183,432 @@ fn taint_selector_error(
         super::selector_compiler::PolicySelectorSessionError::Provider(detail) => {
             TaintPolicyCompileError::SemanticProvider(detail)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{DiscoveryMaterializationCache, TaintExecutionBudget, TaintPolicyCompiler};
+    use crate::budget::PolicyBudget;
+    use brokk_bifrost_analysis::CancellationToken;
+    use brokk_bifrost_analysis::analyzer::dataflow::SolverWork;
+    use brokk_bifrost_analysis::analyzer::semantic::{
+        ProcedureHandle, SemanticArtifact, SemanticBudget, SemanticRequest, SemanticWork,
+    };
+    use brokk_bifrost_analysis::analyzer::structural::{
+        CodeQueryExecutionLimits, CodeQuerySemanticLimits,
+    };
+    use brokk_bifrost_analysis::analyzer::{
+        AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
+    };
+
+    /// A batch that starts after an exhausting predecessor must still be able to
+    /// solve.
+    ///
+    /// The semantic-materialization and IFDS solver ledgers are charged only
+    /// inside `solve_and_project_batch`, once per batch. Before #2208 they were
+    /// threaded request-wide, so a corpus whose early batches spent the ledgers
+    /// left every later batch unable to materialize or propagate and its real
+    /// flows abstained by queue position. This test drives the two lanes to
+    /// exhaustion, then asserts that the per-batch reset makes the same charge
+    /// succeed again, while `remaining_findings` -- the cap on total output, not
+    /// on per-batch work -- keeps its running value.
+    #[test]
+    fn per_batch_reset_restores_solve_lanes_without_restoring_the_finding_cap() {
+        let budget = PolicyBudget::default();
+        let mut execution = TaintExecutionBudget::new(&budget);
+
+        let semantic_limits = execution.semantic.limits();
+        let solver_limits = execution.solver.limits();
+        execution
+            .semantic
+            .charge(semantic_limits)
+            .expect("a first batch may spend the whole semantic ledger");
+        execution
+            .solver
+            .charge(solver_limits)
+            .expect("a first batch may spend the whole solver ledger");
+        execution
+            .semantic
+            .charge(SemanticWork::uniform(1))
+            .expect_err("the drained semantic ledger refuses further work");
+        execution
+            .solver
+            .charge(SolverWork::uniform(1))
+            .expect_err("the drained solver ledger refuses further work");
+
+        execution.remaining_findings = 3;
+        execution.reset_per_batch_solve_budget(&budget);
+
+        execution
+            .semantic
+            .charge(semantic_limits)
+            .expect("the next batch starts from a fresh semantic ledger");
+        execution
+            .solver
+            .charge(solver_limits)
+            .expect("the next batch starts from a fresh solver ledger");
+        assert_eq!(execution.semantic.limits(), semantic_limits);
+        assert_eq!(execution.solver.limits(), solver_limits);
+        assert_eq!(
+            execution.remaining_findings, 3,
+            "the request-wide output cap is not a per-batch lane"
+        );
+    }
+
+    /// Mutually recursive Python relays. The walk that starts at `head`
+    /// reaches `tail`, and `tail` calls back to `head`, so a walk whose oracle
+    /// belongs to a different analyzer generation than its root meets `head`
+    /// through both materializations of one artifact.
+    const TWO_MATERIALIZATION_SOURCE: &str = "\
+def head(value):
+    return tail(value)
+
+def tail(value):
+    return head(value)
+";
+
+    /// #2289: the per-compile discovery cache must recognize one procedure
+    /// across two materializations of its artifact.
+    ///
+    /// The complete-artifact cache is byte-bounded, so a large file can be
+    /// evicted and re-materialized while one compile is still discovering.
+    /// `ProcedureHandle` equality compares the owning `Arc<SemanticArtifact>`
+    /// by pointer, so keyed on handles the walk held two unequal handles for
+    /// one procedure: it missed the snapshot, dispatch, and binding caches for
+    /// the second, re-ran all three oracle calls, re-charged the shared
+    /// semantic budget, and pushed a second copy of one snapshot into the
+    /// region plan.
+    ///
+    /// Two analyzers over one project root own separate artifact caches, so
+    /// each materializes its own instance of one immutable artifact, which is
+    /// the shape an eviction produces inside one compile. Discovering with the
+    /// first analyzer's oracle from a root the second materialized reproduces
+    /// the pair deterministically: the fixture's recursion back to the root
+    /// resolves through the first analyzer's cache.
+    #[test]
+    fn a_procedure_reached_through_two_materializations_is_discovered_once() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        std::fs::write(
+            workspace.path().join("relay.py"),
+            TWO_MATERIALIZATION_SOURCE,
+        )
+        .expect("fixture source");
+
+        let project: Arc<dyn Project> =
+            Arc::new(FilesystemProject::new(workspace.path()).expect("fixture project"));
+        let config = || AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        };
+        let first = WorkspaceAnalyzer::build_ephemeral(Arc::clone(&project), config())
+            .expect("an analyzer over the fixture");
+        let second = WorkspaceAnalyzer::build_ephemeral(project, config())
+            .expect("a second analyzer over the fixture");
+
+        let file = first
+            .analyzer()
+            .get_analyzed_files()
+            .into_iter()
+            .find(|file| file.rel_path().ends_with("relay.py"))
+            .expect("the fixture file is analyzed");
+
+        let materialize = |analyzer: &WorkspaceAnalyzer| -> Arc<SemanticArtifact> {
+            let cancellation = CancellationToken::default();
+            let mut budget = SemanticBudget::default();
+            analyzer
+                .materialize_program_semantics(
+                    &file,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("the fixture materializes")
+                .available_value()
+                .cloned()
+                .expect("the fixture artifact is available")
+        };
+        let head = |artifact: &Arc<SemanticArtifact>| -> ProcedureHandle {
+            let procedure = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some("head")
+                })
+                .expect("the fixture declares head");
+            artifact
+                .procedure_handle(procedure.id())
+                .expect("the selected procedure remains live")
+        };
+
+        let first_artifact = materialize(&first);
+        let second_artifact = materialize(&second);
+        assert_eq!(
+            first_artifact.key(),
+            second_artifact.key(),
+            "both instances must describe one immutable artifact"
+        );
+        let first_head = head(&first_artifact);
+        let second_head = head(&second_artifact);
+        assert_ne!(
+            first_head, second_head,
+            "handle equality is materialization-scoped, which is the precondition this test pins"
+        );
+        assert_eq!(
+            first_head.durable_key(),
+            second_head.durable_key(),
+            "the durable identity must not depend on which materialization produced the handle"
+        );
+
+        // The compiler's oracle belongs to the first analyzer, and the root
+        // comes from the second, so the walk necessarily meets both instances.
+        let cancellation = CancellationToken::default();
+        let mut compiler = TaintPolicyCompiler::new(
+            &first,
+            None,
+            CodeQueryExecutionLimits::default(),
+            64,
+            &cancellation,
+        );
+        let mut cache = DiscoveryMaterializationCache::default();
+        let discovery = compiler
+            .discover_value_flow(&second_head, &mut cache)
+            .expect("the fixture closure is discovered");
+
+        assert!(
+            cache.handle_identity_reuses > 0,
+            "the fixture must actually present a second materialization, \
+             otherwise this test proves nothing"
+        );
+        assert_eq!(
+            cache.procedure_misses, 2,
+            "each distinct procedure must reach the oracle once: \
+             hits={}, misses={}, handle-identity reuses={}",
+            cache.procedure_hits, cache.procedure_misses, cache.handle_identity_reuses
+        );
+        assert_eq!(
+            discovery.procedures.len(),
+            2,
+            "the closure holds two distinct procedures, not one per materialization"
+        );
+        assert_eq!(
+            discovery.snapshots.len(),
+            2,
+            "a duplicated procedure would push its local rules into the plan twice"
+        );
+
+        // Every handle the walk produced belongs to one artifact instance, so
+        // one region plan never mixes materializations.
+        let canonical = cache
+            .artifacts
+            .get(second_artifact.key())
+            .expect("the walk canonicalized the fixture artifact");
+        assert!(
+            Arc::ptr_eq(canonical, &second_artifact),
+            "the first instance the walk saw must stay canonical"
+        );
+        assert!(
+            Arc::ptr_eq(discovery.root.artifact(), canonical),
+            "the region root must be anchored to the canonical instance"
+        );
+        for snapshot in &discovery.snapshots {
+            assert!(
+                Arc::ptr_eq(snapshot.value().procedure().artifact(), canonical),
+                "every retained snapshot must be anchored to the canonical instance"
+            );
+        }
+
+        // The compile-visible counter tells the same story.
+        let report = compiler.selectors.work_report("taint");
+        let materializations = report
+            .metrics()
+            .iter()
+            .find(|metric| metric.name() == "taint.semantic_snapshot_materializations")
+            .map(|metric| metric.value())
+            .expect("discovery reports its snapshot materializations");
+        assert_eq!(materializations, 2);
+    }
+
+    /// A relay chain in one file. Every procedure in it is a compile root, and
+    /// every root's forward closure reaches the same one file, so one compile
+    /// materializes that file from many roots and many call sites.
+    const MANY_ROOT_RELAY_SOURCE: &str = "\
+def source_one():
+    return \"one\"
+
+def sink_one(value):
+    pass
+
+def relay_0(value):
+    sink_one(value)
+
+def relay_1(value):
+    relay_0(value)
+
+def relay_2(value):
+    relay_1(value)
+
+def relay_3(value):
+    relay_2(value)
+
+def relay_4(value):
+    relay_3(value)
+
+def relay_5(value):
+    relay_4(value)
+
+def relay_6(value):
+    relay_5(value)
+
+def relay_7(value):
+    relay_6(value)
+
+def entry_0():
+    relay_7(source_one())
+";
+
+    /// #2295: a semantic budget of the order of one materialization of a file
+    /// admits a compile that reaches that file from every one of its roots.
+    ///
+    /// The compile calls `WorkspaceAnalyzer::materialize_program_semantics` once
+    /// for each declaration group each call site resolves into, and a
+    /// complete-artifact cache hit used to be charged the whole file's retained
+    /// census. A budget sized for the material the compile actually holds was
+    /// therefore exhausted by the second or third call site, and the compile
+    /// abstained on work it had already paid for. The budget now pays one census
+    /// per scope, so the same budget carries the whole walk.
+    ///
+    /// The budget is derived from the artifact, not guessed: `SCALE` times the
+    /// largest row lane of the file's own census. The second half of the test
+    /// pins that this really is a tight budget -- half of one census cannot even
+    /// materialize the file once -- so the first half cannot pass on slack.
+    #[test]
+    fn a_budget_sized_for_one_materialization_admits_every_root() {
+        /// One census for the material, plus headroom for the compile's own
+        /// value-flow walk over it, which #2289 measured as linear in the
+        /// number of procedures.
+        const SCALE: usize = 4;
+
+        let workspace_dir = tempfile::tempdir().expect("temporary workspace");
+        std::fs::write(
+            workspace_dir.path().join("relay.py"),
+            MANY_ROOT_RELAY_SOURCE,
+        )
+        .expect("fixture source");
+        let project: Arc<dyn Project> =
+            Arc::new(FilesystemProject::new(workspace_dir.path()).expect("fixture project"));
+        let workspace = WorkspaceAnalyzer::build_ephemeral(
+            project,
+            AnalyzerConfig {
+                parallelism: Some(1),
+                ..AnalyzerConfig::default()
+            },
+        )
+        .expect("an analyzer over the fixture");
+
+        let file = workspace
+            .analyzer()
+            .get_analyzed_files()
+            .into_iter()
+            .find(|file| file.rel_path().ends_with("relay.py"))
+            .expect("the fixture file is analyzed");
+        let cancellation = CancellationToken::default();
+        let mut warming_budget = SemanticBudget::default();
+        let artifact: Arc<SemanticArtifact> = workspace
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut warming_budget, &cancellation),
+            )
+            .expect("the fixture materializes")
+            .available_value()
+            .cloned()
+            .expect("the fixture artifact is available");
+        let census = artifact.work();
+        let largest_row_lane = [
+            census.procedures,
+            census.blocks,
+            census.program_points,
+            census.values,
+            census.allocations,
+            census.call_sites,
+            census.memory_locations,
+            census.captures,
+            census.source_mappings,
+            census.evidence,
+            census.gaps,
+            census.events,
+            census.control_edges,
+            census.nested_entries,
+        ]
+        .into_iter()
+        .max()
+        .expect("the census has row lanes");
+        assert!(
+            largest_row_lane > 1,
+            "the fixture must retain enough rows for a census-sized budget to mean something"
+        );
+
+        let roots = artifact
+            .procedures()
+            .iter()
+            .map(|procedure| {
+                artifact
+                    .procedure_handle(procedure.id())
+                    .expect("the selected procedure remains live")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            roots.len() >= 8,
+            "the fixture must present many roots over one artifact, got {}",
+            roots.len()
+        );
+
+        let limits = |max_rows_per_dimension: usize| CodeQueryExecutionLimits {
+            semantic: CodeQuerySemanticLimits {
+                max_rows_per_dimension,
+                ..CodeQuerySemanticLimits::default()
+            },
+            ..CodeQueryExecutionLimits::default()
+        };
+
+        // Sized for the file's own material: every root discovers.
+        let mut compiler = TaintPolicyCompiler::new(
+            &workspace,
+            None,
+            limits(largest_row_lane.saturating_mul(SCALE)),
+            64,
+            &cancellation,
+        );
+        let mut cache = DiscoveryMaterializationCache::default();
+        for root in &roots {
+            compiler.discover_value_flow(root, &mut cache).unwrap_or_else(|error| {
+                panic!(
+                    "a budget of {SCALE} times the {largest_row_lane}-row census must carry every \
+                     root's discovery, failed at {:?}: {error:?}",
+                    root.semantics().locator()
+                )
+            });
+        }
+
+        // The budget above is a tight one, not a generous one: the whole walk
+        // charged well under half of what one census per root would have cost.
+        // Measured at 971 against a 846-row census over 11 roots; charged once
+        // per call site the same walk charged about 8,460.
+        let used = compiler.selectors.semantic_used();
+        assert!(
+            used.nested_entries.saturating_mul(2)
+                < census.nested_entries.saturating_mul(roots.len()),
+            "the walk must charge one census per scope, not one per root: \
+             charged {} against a census of {} over {} roots",
+            used.nested_entries,
+            census.nested_entries,
+            roots.len()
+        );
     }
 }

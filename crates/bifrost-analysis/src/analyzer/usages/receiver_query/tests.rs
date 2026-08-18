@@ -146,16 +146,25 @@ export function caller(flag: boolean) {
         )
         .expect("workspace semantic gate");
     let gate_work = gate.work();
-    assert!(matches!(
-        gate,
-        SemanticReceiverGate::Available {
-            evidence: SemanticReceiverEvidence::Incomplete {
-                origin: SemanticReceiverIncompleteness::GlobalCapabilitiesWithProvenCandidates,
+    // `Service` declares no constructor, so the unresolved zero-argument
+    // constructor boundary is discharged by its retained allocation and the
+    // points-to answer closes exhaustively. The receiver gate must therefore
+    // reach the direct precise path rather than the legacy compatibility
+    // provider, and must do so inside the unchanged default aggregate budget.
+    assert!(
+        matches!(
+            gate,
+            SemanticReceiverGate::Available {
+                evidence: SemanticReceiverEvidence::ExhaustiveComplete,
                 ..
-            },
-            ..
-        }
-    ));
+            }
+        ),
+        "unexpected gate evidence, work: {gate_work:#?}"
+    );
+    assert!(gate_work.scope_nodes <= ReceiverAnalysisBudget::default().max_scope_nodes);
+    assert!(
+        gate_work.summary_expansions <= ReceiverAnalysisBudget::default().max_summary_expansions
+    );
     let report = service
         .analyze(
             ReceiverQueryOperation::PointsTo,
@@ -210,6 +219,90 @@ export function caller(flag: boolean) {
                 )
         ),
         "{context_disabled:#?}"
+    );
+}
+
+/// A constructor that takes an argument keeps an undischarged call-target
+/// boundary, so the points-to answer stays open while every retained
+/// candidate remains individually proven. The gate must then report
+/// `GlobalCapabilitiesWithProvenCandidates` so the compatibility provider is
+/// still allowed to close the receiver, and it must do so inside the default
+/// aggregate budget.
+#[test]
+fn workspace_factory_provenance_reports_global_capability_openness_with_proven_candidates() {
+    let source = r#"
+class Service {
+  constructor(seed: number) {}
+  run() {}
+}
+
+function makeService() {
+  return new Service(1);
+}
+
+export function caller() {
+  const factory = makeService();
+  factory.run();
+}
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical temp dir");
+    let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
+    file.write(source).expect("write source");
+    let workspace = WorkspaceAnalyzer::build(
+        Arc::new(TestProject::new(root, Language::TypeScript)),
+        AnalyzerConfig::default(),
+    );
+
+    let service = ReceiverQueryService::from_workspace(&workspace);
+    let receiver_range = last_marker_range(source, "factory");
+    let gate = service
+        .semantic_receiver_gate(
+            &file,
+            receiver_range,
+            ReceiverAnalysisBudget::default(),
+            None,
+        )
+        .expect("workspace semantic gate");
+    let gate_work = gate.work();
+    assert!(
+        matches!(
+            gate,
+            SemanticReceiverGate::Available {
+                evidence: SemanticReceiverEvidence::Incomplete {
+                    coverage: CandidateCoverage::Open,
+                    unsupported: None,
+                    origin: SemanticReceiverIncompleteness::GlobalCapabilitiesWithProvenCandidates,
+                },
+                ..
+            }
+        ),
+        "unexpected gate evidence, work: {gate_work:#?}"
+    );
+    assert!(gate_work.scope_nodes <= ReceiverAnalysisBudget::default().max_scope_nodes);
+
+    let report = service
+        .analyze(
+            ReceiverQueryOperation::PointsTo,
+            &file,
+            receiver_range,
+            ReceiverQueryInput::Expression,
+            ReceiverAnalysisBudget::default(),
+            None,
+        )
+        .expect("workspace receiver query");
+    assert!(
+        matches!(
+            &report.analysis,
+            ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(values))
+                if matches!(
+                    values.as_slice(),
+                    [ReceiverValue::FactoryReturn { factory, value }]
+                        if factory.fq_name().ends_with("makeService")
+                            && matches!(value.as_ref(), ReceiverValue::AllocationSite { ty, .. } if ty.fq_name().ends_with("Service"))
+                )
+        ),
+        "{report:#?}"
     );
 }
 

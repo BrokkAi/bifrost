@@ -70,6 +70,34 @@ pub(super) struct PolicySelectorSession<'a> {
     retired_source_bytes: usize,
     retired_materialized_files: usize,
     retired_traversal_steps: usize,
+    // The largest single-region charge each per-region lane saw.  The lane
+    // limits are per region -- `reset_region_semantic_budget` restores them --
+    // so the quantity a lane must exceed for the compile to finish is the peak
+    // one region reaches, not the sum the retired counters above accumulate.
+    // These are the calibration inputs the derived-lane model never had (#1936).
+    peak_row_dimension: usize,
+    peak_retained_bytes: usize,
+    peak_traversal_steps: usize,
+    // How many procedure value-flow snapshots this compile actually built
+    // through the semantic oracle, as opposed to reusing from the per-compile
+    // materialization cache (#2284). The per-region budget resets above hide
+    // this in the program-point total, and the program-point total also mixes
+    // in dispatch, binding, and solve work, so a repeated materialization is
+    // not visible there. This counter is: it must equal the number of distinct
+    // procedures the compile reached, whatever their snapshots' completeness.
+    semantic_snapshot_materializations: u64,
+    // How many procedure visits this compile served on a handle that named a
+    // second materialization of an artifact it had already seen (#2289). Keyed
+    // on handles, each of those visits missed the discovery cache and re-ran
+    // the oracle for the procedure's snapshot, each of its call sites'
+    // dispatch, and each candidate's bindings; keyed durably they are hits. A
+    // non-zero value here means the byte-bounded artifact cache is evicting
+    // files this compile is still walking, which is worth knowing on its own.
+    semantic_handle_identity_reuses: u64,
+    // How many selector entries this compile scanned.  Each scan is granted the
+    // whole-workspace scan allowance (see `remaining_query_limits`), so this is
+    // the multiplier on that allowance the compile actually spent.
+    selector_scans: u64,
 }
 
 impl<'a> PolicySelectorSession<'a> {
@@ -114,7 +142,27 @@ impl<'a> PolicySelectorSession<'a> {
             retired_source_bytes: 0,
             retired_materialized_files: 0,
             retired_traversal_steps: 0,
+            peak_row_dimension: 0,
+            peak_retained_bytes: 0,
+            peak_traversal_steps: 0,
+            semantic_snapshot_materializations: 0,
+            semantic_handle_identity_reuses: 0,
+            selector_scans: 0,
         }
+    }
+
+    /// Record that discovery built one procedure value-flow snapshot through
+    /// the oracle rather than reusing a cached one (#2284).
+    pub(super) fn record_semantic_snapshot_materialization(&mut self) {
+        self.semantic_snapshot_materializations =
+            self.semantic_snapshot_materializations.saturating_add(1);
+    }
+
+    /// Record how many procedure visits this compile served on a handle from a
+    /// second materialization of one artifact (#2289).
+    pub(super) fn record_semantic_handle_identity_reuses(&mut self, reuses: u64) {
+        self.semantic_handle_identity_reuses =
+            self.semantic_handle_identity_reuses.saturating_add(reuses);
     }
 
     /// Reset the semantic and execution budgets to their per-region starting
@@ -145,6 +193,10 @@ impl<'a> PolicySelectorSession<'a> {
         self.retired_traversal_steps = self
             .retired_traversal_steps
             .saturating_add(execution.traversal_steps);
+        let (row_peak, retained_peak, traversal_peak) = self.live_region_peaks();
+        self.peak_row_dimension = self.peak_row_dimension.max(row_peak);
+        self.peak_retained_bytes = self.peak_retained_bytes.max(retained_peak);
+        self.peak_traversal_steps = self.peak_traversal_steps.max(traversal_peak);
 
         self.semantic_budget =
             SemanticBudget::new(semantic_work_limits(self.query_limits.semantic))
@@ -173,6 +225,7 @@ impl<'a> PolicySelectorSession<'a> {
         // still governs honest truncation above it.
         let mut query = selector.query.clone();
         query.limit = self.max_selector_results;
+        self.selector_scans = self.selector_scans.saturating_add(1);
         let detailed = execute_code_query_detailed_eager_index(
             self.workspace.analyzer(),
             &query,
@@ -342,6 +395,7 @@ impl<'a> PolicySelectorSession<'a> {
         // budget resets do not hide the compile's cumulative semantic cost.
         let semantic = self.semantic_budget.used();
         let execution = self.semantic_execution_budget.work();
+        let (live_row_peak, live_retained_peak, live_traversal_peak) = self.live_region_peaks();
         let metrics = [
             (
                 "semantic_materialized_files",
@@ -367,6 +421,35 @@ impl<'a> PolicySelectorSession<'a> {
                 self.retired_program_points
                     .saturating_add(semantic.program_points),
             ),
+            // Each selector entry's subject scan is granted the whole-workspace
+            // scan allowance, so this count is the multiplier on that allowance
+            // the compile spent.  Reporting it keeps the compile's total scan
+            // cost auditable instead of implicit in the entry list.
+            (
+                "selector_scans",
+                PolicyWorkUnit::Count,
+                usize::try_from(self.selector_scans).unwrap_or(usize::MAX),
+            ),
+            // The three per-region lane peaks.  The retired counters above are
+            // sums across regions, which is the compile's total cost but not
+            // what any lane has to admit: the lanes reset per region, so a lane
+            // has to exceed the largest single region's charge.  These are the
+            // numbers the derived-lane model must be calibrated against (#1936).
+            (
+                "semantic_peak_row_dimension",
+                PolicyWorkUnit::Rows,
+                self.peak_row_dimension.max(live_row_peak),
+            ),
+            (
+                "semantic_peak_retained_bytes",
+                PolicyWorkUnit::Bytes,
+                self.peak_retained_bytes.max(live_retained_peak),
+            ),
+            (
+                "semantic_peak_traversal_steps",
+                PolicyWorkUnit::Count,
+                self.peak_traversal_steps.max(live_traversal_peak),
+            ),
         ]
         .into_iter()
         .filter_map(|(name, unit, value)| {
@@ -377,6 +460,35 @@ impl<'a> PolicySelectorSession<'a> {
             )
             .ok()
         })
+        // Reported only by an analysis that materializes value-flow snapshots,
+        // so an analysis that never does is not given a permanent zero (#2284).
+        .chain(
+            (self.semantic_snapshot_materializations > 0)
+                .then(|| {
+                    PolicyWorkMetric::try_new(
+                        format!("{analysis}.semantic_snapshot_materializations"),
+                        PolicyWorkUnit::Count,
+                        self.semantic_snapshot_materializations,
+                    )
+                    .ok()
+                })
+                .flatten(),
+        )
+        // Reported only when artifact-cache pressure actually presented one
+        // procedure through two materializations, so an ordinary compile is
+        // not given a permanent zero (#2289).
+        .chain(
+            (self.semantic_handle_identity_reuses > 0)
+                .then(|| {
+                    PolicyWorkMetric::try_new(
+                        format!("{analysis}.semantic_handle_identity_reuses"),
+                        PolicyWorkUnit::Count,
+                        self.semantic_handle_identity_reuses,
+                    )
+                    .ok()
+                })
+                .flatten(),
+        )
         .collect();
         PolicyWorkReport::try_new(
             self.query_work.scanned_files,
@@ -392,38 +504,34 @@ impl<'a> PolicySelectorSession<'a> {
         .unwrap_or_default()
     }
 
+    /// The current region's charge against each per-region lane, as
+    /// `(largest row dimension, retained bytes, traversal steps)`.
+    ///
+    /// One `max_rows_per_dimension` bounds every row dimension, so the charge
+    /// that lane must exceed is the largest of them, not any single dimension.
+    fn live_region_peaks(&self) -> (usize, usize, usize) {
+        let used = self.semantic_budget.used();
+        let row_peak = SemanticBudgetDimension::ALL
+            .into_iter()
+            .filter(|dimension| {
+                !matches!(
+                    dimension,
+                    SemanticBudgetDimension::SourceBytes | SemanticBudgetDimension::OwnedTextBytes
+                )
+            })
+            .map(|dimension| used.get(dimension))
+            .max()
+            .unwrap_or(0);
+        (
+            row_peak,
+            used.owned_text_bytes,
+            self.semantic_execution_budget.work().traversal_steps,
+        )
+    }
+
     fn remaining_query_limits(
         &self,
     ) -> Result<CodeQueryExecutionLimits, PolicySelectorSessionError> {
-        let remaining = |limit: usize, used: u64| {
-            limit.saturating_sub(usize::try_from(used).unwrap_or(usize::MAX))
-        };
-        let structural = [
-            remaining(
-                self.query_limits.max_scanned_files,
-                self.query_work.scanned_files,
-            ),
-            remaining(
-                self.query_limits.max_scanned_source_bytes,
-                self.query_work.scanned_source_bytes,
-            ),
-            remaining(self.query_limits.max_fact_nodes, self.query_work.fact_nodes),
-            remaining(
-                self.query_limits.max_pipeline_rows,
-                self.query_work.pipeline_rows,
-            ),
-        ];
-        if structural.contains(&0) {
-            return Err(PolicySelectorSessionError::Incomplete {
-                completion: CodeQueryCompletion::Incomplete {
-                    codes: vec![CodeQueryDiagnosticCode::ExecutionBudgetExhausted],
-                },
-                detail: format!(
-                    "{} selectors exhausted the shared structural query budget",
-                    self.analysis
-                ),
-            });
-        }
         let semantic_remaining = self.semantic_budget.remaining();
         let semantic = CodeQuerySemanticLimits {
             max_materialized_files: self
@@ -451,11 +559,32 @@ impl<'a> PolicySelectorSession<'a> {
                 self.analysis
             )));
         }
+        // The structural scan lanes are granted per selector entry, not shared
+        // across the compile.  `PolicyBudget::scaled_for_workspace` sizes them to
+        // one whole-workspace subject scan because that is what one selector
+        // costs: Theta(workspace facts) (#1771).  Deducting each entry's scan
+        // from the next entry's allowance therefore divides one whole-workspace
+        // allowance across every source and sink a policy declares, so the
+        // first entries consume it and the rest cannot run at all.  On OWASP
+        // BenchmarkJava (2766 files, 11.5MB; scaled lane 5532 files, 23.1MB)
+        // the third of the taint policy's nine selector entries was left 639
+        // files and 2.57MB, exhausted mid-scan, and every category abstained
+        // (#1935).  Each entry now gets the whole-workspace allowance; the
+        // compile total stays bounded because `select` runs exactly once per
+        // declared entry and the policy schema bounds those sets (`:entries`
+        // is `SET_256` for sources and for sinks, and the registry bounds
+        // match-directory endpoints at `MAX_REGISTERED_ENDPOINTS`).  The
+        // `selector_scans` metric reports the multiplier this compile actually
+        // used, so the total cost stays auditable rather than implicit.
+        //
+        // `max_pipeline_rows` bounds one query's materialized rows rather than
+        // workspace volume, so it was never a shared quantity either; it is
+        // per-query by construction.
         Ok(CodeQueryExecutionLimits {
-            max_scanned_files: structural[0],
-            max_scanned_source_bytes: structural[1],
-            max_fact_nodes: structural[2],
-            max_pipeline_rows: structural[3],
+            max_scanned_files: self.query_limits.max_scanned_files,
+            max_scanned_source_bytes: self.query_limits.max_scanned_source_bytes,
+            max_fact_nodes: self.query_limits.max_fact_nodes,
+            max_pipeline_rows: self.query_limits.max_pipeline_rows,
             semantic,
             typestate: self.query_limits.typestate,
             value_flow: self.query_limits.value_flow,

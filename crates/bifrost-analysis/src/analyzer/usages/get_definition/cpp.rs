@@ -26,8 +26,9 @@ use brokk_bifrost_cpp::call_match::{
     normalize_cpp_type_name,
 };
 use brokk_bifrost_cpp::graph::resolver::{
-    OrdinaryMacroReferenceResolution, cpp_alias_declaration_target_text, is_c_source_file,
-    same_logical_symbol,
+    OrdinaryMacroReferenceResolution, cpp_alias_declaration_target_text,
+    cpp_member_using_declaration_scopes, cpp_qualified_name_has_scope_suffix, is_c_source_file,
+    recovered_macro_decorated_declarator_type, same_logical_symbol,
 };
 
 pub(crate) const CPP_UNPROVEN_LINK_UNIT_DIAGNOSTIC: &str = "unproven_cpp_link_unit";
@@ -413,6 +414,14 @@ pub(super) fn resolve_cpp<'a>(
             if text.is_empty() {
                 return no_definition("no_reference_text", "C++ identifier is blank");
             }
+            if cpp_active_template_parameter_reference(identifier, ctx.source) {
+                return no_definition(
+                    "unresolved_template_parameter",
+                    format!(
+                        "`{text}` is an active C++ template parameter without an indexed definition"
+                    ),
+                );
+            }
             let bindings = cpp_local_bindings_before(ctx, identifier, identifier.start_byte());
             if bindings.is_shadowed(text) {
                 return no_definition(
@@ -571,7 +580,7 @@ impl CppBoundedProvider<'_> {
             CPP_BOUNDED_AUXILIARY_MAX_SOURCE_BYTES,
             self.session.cancellation(),
         ) {
-            PreparedSyntaxLimitedOutcome::Available(prepared) => {
+            PreparedSyntaxLimitedOutcome::Available(_, prepared) => {
                 self.session.observe_cancellation().then_some(prepared)
             }
             PreparedSyntaxLimitedOutcome::Exceeded(_) => {
@@ -2176,7 +2185,17 @@ fn cpp_type_node_is_value_argument(mut node: Node<'_>) -> bool {
 }
 
 fn cpp_type_node_is_unqualified_name(node: Node<'_>) -> bool {
-    matches!(node.kind(), "type_identifier" | "namespace_identifier")
+    cpp_unqualified_type_name_node(node).is_some()
+}
+
+fn cpp_unqualified_type_name_node(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "type_identifier" | "namespace_identifier" => Some(node),
+        "template_type" => node
+            .child_by_field_name("name")
+            .filter(|name| matches!(name.kind(), "type_identifier" | "namespace_identifier")),
+        _ => None,
+    }
 }
 
 fn cpp_type_node_is_parameter_type(mut node: Node<'_>) -> bool {
@@ -2401,6 +2420,7 @@ fn resolve_cpp_type(
     let dispatch = CppDispatch::new(analyzer);
     let node = cpp_expand_tagged_type_scope_reference(node).unwrap_or(node);
     let text = normalize_cpp_type_text(cpp_node_text(node, source));
+    let recovered_declarator_type = recovered_macro_decorated_declarator_type(node).is_some();
     if text.is_empty() {
         return no_definition("no_reference_text", "C++ type reference is blank");
     }
@@ -2607,7 +2627,29 @@ fn resolve_cpp_type(
             Ok(Some(_)) | Ok(None) => {}
         }
     }
-    if let Some(qualifier) = cpp_focused_type_qualifier(node, source) {
+    if !recovered_declarator_type && let Some(qualifier) = cpp_focused_type_qualifier(node, source)
+    {
+        // A lexical template parameter shadows every same-named workspace type.
+        // Prefer its indexed stand-in when one exists; otherwise report the
+        // same adjudicated local boundary as an unqualified parameter use.
+        if cpp_active_template_parameter_reference(node, source) {
+            if let Some(parameter) = resolve_in_enclosing_scopes(
+                analyzer,
+                file,
+                &qualifier.reference,
+                node.start_byte(),
+                |unit| unit.source() == file && unit.is_field(),
+            ) {
+                return candidates_outcome(vec![parameter]);
+            }
+            return no_definition(
+                "unresolved_template_parameter",
+                format!(
+                    "`{}` is an active C++ template parameter without an indexed definition",
+                    qualifier.reference
+                ),
+            );
+        }
         let namespace = cpp_lexical_namespace(node, source);
         let mut root = node;
         while let Some(parent) = root.parent() {
@@ -2655,22 +2697,44 @@ fn resolve_cpp_type(
                 .collect();
             return candidates_outcome(candidates);
         }
-        // A template type parameter names no indexed type but is lexically
-        // visible inside its own template (cutlass's `OperandLayout::packed`
-        // inside OperandSharedStorage): the enclosing-scope walk finds the
-        // parameter's declaration when it is indexed; without it the
-        // qualifier drew a dishonest include-boundary claim (tier-4
-        // DeepSpeed). The stand-in is restricted to parameter-like hits
-        // (fields, not real types) so a class scope missing the member
-        // stays an ordinary no-definition.
-        if let Some(parameter) = resolve_in_enclosing_scopes(
+        // Namespace declarations are not indexed as CodeUnits, so a focused
+        // qualifier such as `Common` in `Common::Status` cannot resolve on its
+        // own. Resolve the complete structured type path before considering a
+        // dependent template-parameter stand-in for the qualifier.
+        if let Some(unit) = cpp_resolve_qualified_via_enclosing_namespaces(
             analyzer,
             file,
-            &qualifier.reference,
+            &qualifier.qualified_reference,
             node.start_byte(),
-            |unit| unit.source() == file && unit.is_field(),
+            |unit| {
+                cpp_unit_matches_kind(
+                    analyzer,
+                    context.bounded_support(),
+                    unit,
+                    CppTargetKind::Type,
+                ) && visibility.external_type_declaration_visible_at(file, unit, node.start_byte())
+            },
         ) {
-            return candidates_outcome(vec![parameter]);
+            let unit = if unit.is_class() && !cpp_unit_is_type_alias(analyzer, &unit) {
+                let Some(unit) =
+                    visibility.canonical_visible_full_type_unit(&dispatch.source(), file, &unit)
+                else {
+                    return ambiguous_without_candidates(format!(
+                        "`{}` does not have a unique visible canonical C++ type declaration",
+                        qualifier.qualified_reference
+                    ));
+                };
+                unit
+            } else {
+                unit
+            };
+            return candidates_outcome(cpp_selected_type_definition_candidates(
+                analyzer,
+                visibility,
+                file,
+                context.bounded_support(),
+                unit,
+            ));
         }
         if cpp_unresolved_include_boundary(analyzer, file, &qualifier.reference) {
             // gated upstream: the enclosing-scope parameter probe above returned
@@ -2688,6 +2752,30 @@ fn resolve_cpp_type(
                 qualifier.reference
             ),
         );
+    }
+    if recovered_declarator_type {
+        let mut root = node;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        let orphaned_namespace = context
+            .cpp_orphaned_namespace_scopes(file, root, source)
+            .scope_at(node.start_byte())
+            .map(|(_, components)| components.to_vec());
+        if let Some(namespace) = orphaned_namespace {
+            let qualified = format!("::{}::{text}", namespace.join("::"));
+            if let Some(unit) = cpp_resolve_type_unit(analyzer, visibility, file, &qualified)
+                && visibility.external_type_candidate_visible_at(file, &unit, node.start_byte())
+            {
+                return candidates_outcome(cpp_selected_type_definition_candidates(
+                    analyzer,
+                    visibility,
+                    file,
+                    context.bounded_support(),
+                    unit,
+                ));
+            }
+        }
     }
     resolve_cpp_type_without_focused_qualifier(
         analyzer,
@@ -2929,6 +3017,9 @@ fn resolve_cpp_type_without_focused_qualifier(
         }
         .filter(|owner| {
             visibility.external_type_candidate_visible_at(file, owner, node.start_byte())
+        })
+        .and_then(|owner| {
+            visibility.canonical_visible_full_type_unit(&dispatch.source(), file, &owner)
         });
         if let Some(owner) = owner {
             let type_candidates =
@@ -3000,13 +3091,15 @@ fn resolve_cpp_type_without_focused_qualifier(
             // enclosing-scope walk finds the parameter's declaration when
             // it is indexed; without it the qualifier fell through to a
             // dishonest include-boundary claim (tier-4 DeepSpeed).
-            if let Some(parameter) = resolve_in_enclosing_scopes(
-                analyzer,
-                file,
-                &owner_reference,
-                node.start_byte(),
-                |unit| unit.source() == file,
-            ) {
+            if cpp_active_template_parameter_reference(node, source)
+                && let Some(parameter) = resolve_in_enclosing_scopes(
+                    analyzer,
+                    file,
+                    &owner_reference,
+                    node.start_byte(),
+                    |unit| unit.source() == file,
+                )
+            {
                 let candidates = cpp_direct_member_candidates(
                     analyzer,
                     support,
@@ -3142,52 +3235,38 @@ fn resolve_cpp_type_without_focused_qualifier(
     // Prefer a type declared in the lexically enclosing scope (namespace/class)
     // over the scope-blind visibility index, so a bare `Config` inside `namespace B`
     // resolves to `B::Config` rather than a same-named sibling namespace's (#431).
-    if node.kind() == "type_identifier" {
-        match cpp_enclosing_lexical_scope_components(
+    if node.kind() == "type_identifier" || recovered_macro_decorated_declarator_type(node).is_some()
+    {
+        let graph_source = dispatch.source();
+        let lexical_resolution = cpp_resolve_type_components_lexically_at_preserving_alias(
             node,
-            &dispatch.source(),
+            &[text.to_string()],
+            false,
+            &graph_source,
             visibility,
             file,
             source,
-        ) {
-            CppLexicalScopeResolution::Resolved(scope) => {
-                match visibility.resolve_type_components_lexically_for_forward(
-                    &dispatch.source(),
+        );
+        match lexical_resolution {
+            CppLexicalTypeResolution::Resolved { unit, .. }
+                if visibility.external_type_candidate_visible_at(
                     file,
-                    &[text.to_string()],
-                    false,
-                    &scope,
-                ) {
-                    CppLexicalTypeResolution::Resolved { unit, .. }
-                        if visibility.external_type_candidate_visible_at(
-                            file,
-                            &unit,
-                            node.start_byte(),
-                        ) =>
-                    {
-                        return candidates_outcome(cpp_type_definition_candidates(
-                            analyzer, visibility, file, support, unit,
-                        ));
-                    }
-                    CppLexicalTypeResolution::Ambiguous => {
-                        // no candidates: `LexicalTypeResolution::Ambiguous`
-                        // reports the fail-closed verdict without the units.
-                        return ambiguous_without_candidates(format!(
-                            "`{text}` resolves ambiguously in its enclosing C++ class or namespace"
-                        ));
-                    }
-                    CppLexicalTypeResolution::Resolved { .. }
-                    | CppLexicalTypeResolution::Missing => {}
-                }
-            }
-            CppLexicalScopeResolution::Ambiguous => {
-                // no candidates: the ambiguity is in the enclosing scope, so no
-                // member candidate was ever collected.
-                return ambiguous_without_candidates(format!(
-                    "the enclosing C++ owner of `{text}` resolves ambiguously"
+                    &unit,
+                    node.start_byte(),
+                ) =>
+            {
+                return candidates_outcome(cpp_type_definition_candidates(
+                    analyzer, visibility, file, support, unit,
                 ));
             }
-            CppLexicalScopeResolution::Missing => {
+            CppLexicalTypeResolution::Ambiguous => {
+                // no candidates: `LexicalTypeResolution::Ambiguous` reports
+                // the fail-closed verdict without the units.
+                return ambiguous_without_candidates(format!(
+                    "`{text}` resolves ambiguously in its enclosing C++ class or namespace"
+                ));
+            }
+            CppLexicalTypeResolution::Missing => {
                 // A file-scope definition such as
                 // `bool ValueFlow::isLifetimeBorrowed()` has a qualified
                 // namespace owner, but no namespace AST ancestor. The normal
@@ -3197,7 +3276,7 @@ fn resolve_cpp_type_without_focused_qualifier(
                 // otherwise a nested same-named type can win by index order.
                 if let Some(scope) = cpp_out_of_line_namespace_scope(support, source, node) {
                     match visibility.resolve_type_components_lexically_for_forward(
-                        &dispatch.source(),
+                        &graph_source,
                         file,
                         &[text.to_string()],
                         false,
@@ -3226,6 +3305,7 @@ fn resolve_cpp_type_without_focused_qualifier(
                     }
                 }
             }
+            CppLexicalTypeResolution::Resolved { .. } => {}
         }
         // This walk composes the reference onto each enclosing scope prefix and
         // answers the *first* indexed declaration of the composed name. When one
@@ -3344,6 +3424,157 @@ fn cpp_active_template_parameter_reference(node: Node<'_>, source: &str) -> bool
             return true;
         }
         current = parent.parent();
+    }
+    cpp_fragmented_class_template_parameter_reference(node, source, name)
+        || cpp_fragmented_function_template_parameter_reference(node, source, name)
+}
+
+/// Recover a class-template binder when an unmatched namespace-closing macro
+/// makes tree-sitter detach the qualified class specialization from its
+/// `template <...>` head. In this error shape the template head is the class
+/// specifier's immediately preceding `ERROR` sibling. Tree-sitter still keeps
+/// the `template`, angle-bracket, `typename`/`class`, and parameter identifier
+/// children, so the binder remains recoverable without parsing source text.
+fn cpp_fragmented_class_template_parameter_reference(
+    node: Node<'_>,
+    source: &str,
+    name: &str,
+) -> bool {
+    let mut class = node;
+    loop {
+        if matches!(
+            class.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) {
+            break;
+        }
+        let Some(parent) = class.parent() else {
+            return false;
+        };
+        if parent.kind() == "translation_unit" {
+            return false;
+        }
+        class = parent;
+    }
+    let Some(error) = class.prev_named_sibling() else {
+        return false;
+    };
+    if error.kind() != "ERROR" || error.end_byte() > class.start_byte() {
+        return false;
+    }
+
+    let children = (0..error.child_count())
+        .filter_map(|index| error.child(index))
+        .collect::<Vec<_>>();
+    let Some(template_index) = children
+        .iter()
+        .rposition(|child| child.kind() == "template")
+    else {
+        return false;
+    };
+    let Some(open_index) = children[template_index + 1..]
+        .iter()
+        .position(|child| child.kind() == "<")
+        .map(|index| template_index + 1 + index)
+    else {
+        return false;
+    };
+    let Some(close_index) = children[open_index + 1..]
+        .iter()
+        .position(|child| child.kind() == ">")
+        .map(|index| open_index + 1 + index)
+    else {
+        return false;
+    };
+    children[open_index + 1..close_index]
+        .windows(2)
+        .any(|pair| {
+            (matches!(
+                pair[0].kind(),
+                "primitive_type" | "type_identifier" | "placeholder_type_specifier"
+            ) || matches!(cpp_node_text(pair[0], source), "typename" | "class"))
+                && matches!(pair[1].kind(), "identifier" | "type_identifier")
+                && cpp_node_text(pair[1], source) == name
+        })
+}
+
+/// Recover the lexical template binder when preprocessing inside an out-of-line
+/// parameter list makes tree-sitter close the enclosing namespace at the
+/// function body's `}`. In that recovery shape, the function-template head and
+/// its body statements are siblings in the namespace declaration list, while
+/// the namespace's real close is an `ERROR` sibling after the namespace node.
+/// Those three CST facts bound the recovery without interpreting source text.
+fn cpp_fragmented_function_template_parameter_reference(
+    node: Node<'_>,
+    source: &str,
+    name: &str,
+) -> bool {
+    let mut item = node;
+    let declaration_list = loop {
+        let Some(parent) = item.parent() else {
+            return false;
+        };
+        if parent.kind() == "declaration_list" {
+            break parent;
+        }
+        item = parent;
+    };
+    let Some(namespace) = declaration_list.parent() else {
+        return false;
+    };
+    if namespace.kind() != "namespace_definition"
+        || namespace.child_by_field_name("body") != Some(declaration_list)
+    {
+        return false;
+    }
+
+    let mut following = namespace.next_named_sibling();
+    let displaced_namespace_close = loop {
+        let Some(candidate) = following else {
+            break false;
+        };
+        if candidate.kind() == "ERROR"
+            && candidate.child_count() == 1
+            && candidate.child(0).is_some_and(|child| child.kind() == "}")
+        {
+            break true;
+        }
+        following = candidate.next_named_sibling();
+    };
+    if !displaced_namespace_close {
+        return false;
+    }
+
+    let mut preceding = item.prev_named_sibling();
+    while let Some(candidate) = preceding {
+        if candidate.kind() == "template_declaration" {
+            if !candidate.has_error() {
+                return false;
+            }
+            let parameter_matches =
+                candidate
+                    .child_by_field_name("parameters")
+                    .is_some_and(|parameters| {
+                        parameters
+                            .named_children(&mut parameters.walk())
+                            .filter_map(|parameter| cpp_template_parameter_name(parameter, source))
+                            .any(|parameter| parameter == name)
+                    });
+            if !parameter_matches {
+                return false;
+            }
+
+            let mut pending = vec![candidate];
+            while let Some(current) = pending.pop() {
+                if current.kind() == "function_declarator" {
+                    return true;
+                }
+                let mut cursor = current.walk();
+                pending.extend(current.named_children(&mut cursor));
+            }
+            return false;
+        }
+        preceding = candidate.prev_named_sibling();
     }
     false
 }
@@ -3609,6 +3840,7 @@ fn cpp_direct_type_member_candidates(
 
 struct CppFocusedQualifier {
     reference: String,
+    qualified_reference: String,
     identifier: String,
     components: Vec<String>,
     globally_qualified: bool,
@@ -3652,8 +3884,10 @@ fn cpp_focused_type_qualifier(node: Node<'_>, source: &str) -> Option<CppFocused
     scopes.reverse();
     scopes.push(focused);
     let components = scopes.iter().map(|scope| (*scope).to_string()).collect();
+    let qualified_reference = cpp_type_name_components(nested_access, source)?.join("::");
     Some(CppFocusedQualifier {
         reference: scopes.join("::"),
+        qualified_reference,
         identifier: focused.to_string(),
         components,
         globally_qualified,
@@ -3902,9 +4136,7 @@ fn cpp_type_definition_candidates(
     support: &dyn BoundedDefinitionLookup,
     unit: CodeUnit,
 ) -> Vec<CodeUnit> {
-    let mut seen = HashSet::default();
-    let target =
-        cpp_alias_target_unit(analyzer, visibility, file, &unit, &mut seen).unwrap_or(unit);
+    let target = cpp_navigation_type_target(analyzer, visibility, file, unit);
     let mut indexed = support
         .fqn(&target.fq_name())
         .into_iter()
@@ -3987,9 +4219,7 @@ fn cpp_selected_type_definition_candidates(
     support: &dyn BoundedDefinitionLookup,
     unit: CodeUnit,
 ) -> Vec<CodeUnit> {
-    let mut seen = HashSet::default();
-    let target =
-        cpp_alias_target_unit(analyzer, visibility, file, &unit, &mut seen).unwrap_or(unit);
+    let target = cpp_navigation_type_target(analyzer, visibility, file, unit);
     let indexed = support
         .fqn(&target.fq_name())
         .into_iter()
@@ -4003,6 +4233,21 @@ fn cpp_selected_type_definition_candidates(
     } else {
         indexed
     }
+}
+
+fn cpp_navigation_type_target(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    unit: CodeUnit,
+) -> CodeUnit {
+    if !cpp_unit_is_type_alias(analyzer, &unit) {
+        return unit;
+    }
+    let dispatch = CppDispatch::new(analyzer);
+    visibility
+        .canonical_type_unit(&dispatch.source(), file, &unit)
+        .unwrap_or(unit)
 }
 
 fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLookupOutcome {
@@ -4539,7 +4784,9 @@ fn resolve_cpp_construction_type(
         return no_definition("no_reference_text", "C++ constructor type is blank");
     }
 
-    if cpp_type_node_is_unqualified_name(type_node) {
+    if let Some(unqualified_name_node) = cpp_unqualified_type_name_node(type_node) {
+        let unqualified_name =
+            normalize_cpp_type_text(cpp_node_text(unqualified_name_node, ctx.source));
         if let Some(alias_node) = (type_node.kind() == "type_identifier")
             .then(|| cpp_active_block_type_alias_node(type_node, &text, ctx.source))
             .flatten()
@@ -4573,19 +4820,52 @@ fn resolve_cpp_construction_type(
             ctx.file,
             type_node,
             ctx.class_ranges,
-            &text,
+            &unqualified_name,
         );
         if !member_candidates.is_empty() {
+            if type_node.kind() == "template_type"
+                && let Some(unit) =
+                    cpp_choose_canonical_type(ctx.analyzer, member_candidates.clone())
+            {
+                if cpp_unit_is_type_alias(ctx.analyzer, &unit) {
+                    return candidates_outcome(vec![unit]);
+                }
+                let Some(arguments) = cpp_template_reference_arguments(type_node, ctx.source)
+                else {
+                    unreachable!("a template application has template arguments");
+                };
+                return match ctx
+                    .visibility
+                    .resolve_template_arguments(ctx.file, unit, &arguments)
+                {
+                    Ok(unit) => candidates_outcome(cpp_type_definition_candidates(
+                        ctx.analyzer,
+                        ctx.visibility,
+                        ctx.file,
+                        ctx.support,
+                        unit,
+                    )),
+                    Err(error) => {
+                        ambiguous_without_candidates(cpp_template_resolution_message(&text, &error))
+                    }
+                };
+            }
             return candidates_outcome(member_candidates);
         }
         if let Some(unit) = resolve_in_enclosing_scopes(
             ctx.analyzer,
             ctx.file,
-            &text,
+            &unqualified_name,
             type_node.start_byte(),
             |unit| unit.is_class() || cpp_unit_is_type_alias(ctx.analyzer, unit),
         ) {
-            return candidates_outcome(vec![unit]);
+            return candidates_outcome(cpp_type_definition_candidates(
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                ctx.support,
+                unit,
+            ));
         }
     }
 
@@ -5726,21 +6006,7 @@ fn cpp_member_using_declaration_bases(
     let Some(source) = analyzer.get_source(owner, false) else {
         return Vec::new();
     };
-    let Some(tree) = parse_cpp_tree(&source) else {
-        return Vec::new();
-    };
-    let mut scopes: Vec<String> = Vec::new();
-    let mut pending = vec![tree.root_node()];
-    while let Some(node) = pending.pop() {
-        if node.kind() == "using_declaration" {
-            if let Some(scope) = cpp_using_declaration_member_scope(node, &source, member) {
-                scopes.push(scope);
-            }
-            continue;
-        }
-        let mut cursor = node.walk();
-        pending.extend(node.named_children(&mut cursor));
-    }
+    let scopes = cpp_member_using_declaration_scopes(&source, member);
     if scopes.is_empty() {
         return Vec::new();
     }
@@ -5760,33 +6026,6 @@ fn cpp_member_using_declaration_bases(
                 .any(|scope| cpp_qualified_name_has_scope_suffix(&qualified, scope))
         })
         .collect()
-}
-
-/// The `<Base>` scope of a `using <Base>::<member>;` declaration.
-///
-/// `None` for a using-directive (`using namespace X;`), a using-enum, and any
-/// using-declaration that imports some other name: all three leave no scope
-/// once the trailing component is taken off, or leave a trailing component
-/// that is not `member`.
-fn cpp_using_declaration_member_scope(
-    node: Node<'_>,
-    source: &str,
-    member: &str,
-) -> Option<String> {
-    let imported = node.named_child(0)?;
-    let mut components = cpp_type_name_components(imported, source)?;
-    let imported_member = components.pop()?;
-    (imported_member == member && !components.is_empty()).then(|| components.join("::"))
-}
-
-/// Whether the qualified C++ name `qualified` ends with `scope` at a `::`
-/// boundary, so that `ns::Base` is named by both `Base` and `ns::Base` but
-/// never by `seBase`.
-fn cpp_qualified_name_has_scope_suffix(qualified: &str, scope: &str) -> bool {
-    qualified == scope
-        || qualified
-            .strip_suffix(scope)
-            .is_some_and(|prefix| prefix.ends_with("::"))
 }
 
 fn cpp_member_candidates(
@@ -6028,6 +6267,26 @@ fn cpp_inherited_member_candidates(
         let mut bases = Vec::new();
         for owner in &level {
             for base in cpp_direct_base_types(ctx.analyzer, owner) {
+                // A hierarchy edge can retain the first visible declaration
+                // spelling of a base. If that spelling is a forward
+                // declaration, it has no members even when a complete class
+                // spelling is physically visible from the reference file.
+                // Select the longest visible spelling of the same canonical
+                // type before asking it for members (#837).
+                let mut spellings = ctx
+                    .support
+                    .fqn(&base.fq_name())
+                    .into_iter()
+                    .filter(CodeUnit::is_class)
+                    .filter(|candidate| {
+                        candidate == &base
+                            || ctx.visibility.is_physically_visible(ctx.file, candidate)
+                    })
+                    .collect::<Vec<_>>();
+                if !spellings.contains(&base) {
+                    spellings.push(base.clone());
+                }
+                let base = cpp_choose_canonical_type(ctx.analyzer, spellings).unwrap_or(base);
                 if seen.insert(base.fq_name()) {
                     if let Some(state) = member_trace.as_deref_mut() {
                         state
@@ -7175,7 +7434,11 @@ fn cpp_seed_active_path(
     if node.start_byte() >= cutoff_start {
         return;
     }
-    let enters_scope = cpp_local_scope_node(node);
+    let enters_scope = cpp_local_scope_node(node)
+        || matches!(
+            node.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        );
     if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
         return;
     }

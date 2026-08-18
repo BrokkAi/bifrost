@@ -1,7 +1,8 @@
 use crate::declarations::rust_package_name;
 use crate::graph_support::{
     RustFactSource, RustReferenceContext, exact_member, is_rust_enum_declaration,
-    is_rust_export_visible_declaration, is_rust_public_like_declaration, is_rust_trait_declaration,
+    is_rust_enum_variant_declaration, is_rust_export_visible_declaration,
+    is_rust_public_like_declaration, is_rust_trait_declaration,
     is_rust_trait_impl_member_declaration, resolve_imported_export_from_binder_forward,
     resolve_module_files, resolve_module_package, resolve_visible_import_targets_forward,
 };
@@ -915,7 +916,12 @@ pub fn is_member_target(analyzer: &dyn RustFactSource, target: &CodeUnit) -> boo
             // types. A same-FQN module/macro collision can otherwise attach a
             // free item to a macro CodeUnit and incorrectly route it through
             // receiver-based member scanning.
-            parent.is_class() || analyzer.is_type_alias(&parent)
+            parent.is_class()
+                || analyzer.is_type_alias(&parent)
+                || is_rust_enum_variant_declaration(analyzer, &parent)
+                    && analyzer
+                        .parent_of(&parent)
+                        .is_some_and(|owner| is_rust_enum_declaration(analyzer, &owner))
         })
 }
 

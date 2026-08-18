@@ -9,10 +9,9 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
-use bincode::Options;
 use git2::Oid;
 use growable_bloom_filter::GrowableBloom;
 use rusqlite::{
@@ -39,15 +38,16 @@ use brokk_bifrost_core::analyzer::rust_facts::{
 
 use crate::CancellationToken;
 use crate::analyzer::fq_name::{FqName, segment_interner};
-use crate::analyzer::model::MAX_SIGNATURE_METADATA_BLOB_BYTES;
+use crate::analyzer::structural::DeclaredVisibility;
 use crate::analyzer::structural::materialization::{
     MaterializationRecord, MaterializationRecordPayload,
 };
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, CppTemplateMetadata, ImportInfo, Language, PackageAnchor, ProjectFile,
+    CallableArity, CallableLinkage, CodeUnit, CodeUnitType, CppFieldLinkage, CppTemplateMetadata,
+    DispatchExtensibility, ImportInfo, Language, PackageAnchor, ParameterMetadata, ProjectFile,
     Range, RubyMethodDispatchMode, SignatureMetadata, StructuredImportPath,
-    StructuredImportPathKind, StructuredImportScope, SummaryFileProjection,
+    StructuredImportPathKind, StructuredImportScope, StructuredTypeIdentity, SummaryFileProjection,
 };
 use crate::gitblob;
 use crate::hash::{HashMap, HashSet, set_with_capacity};
@@ -56,8 +56,16 @@ pub(crate) use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
 
 const PREPARED_WRITE_IMMEDIATE_RETRIES: usize = 2;
 const STALE_GENERATION_RECLAIM_ROWS: usize = 10_000;
-const MAX_LIMITED_QUERY_ROW_BYTES: usize = MAX_SIGNATURE_METADATA_BLOB_BYTES;
-const MAX_LIMITED_QUERY_AGGREGATE_BYTES: usize = MAX_SIGNATURE_METADATA_BLOB_BYTES;
+/// How many stored bytes one row of a bounded query may materialize, and how
+/// many the whole answer may.
+///
+/// These used to alias the signature-metadata blob cap, which was the same
+/// number for a different reason: that cap was an admission gate on one write,
+/// this is a materialization budget for one read. The schema enforces the write
+/// gate now (see `0023-signature-metadata-columns.sql`), so the read budget
+/// stands on its own.
+const MAX_LIMITED_QUERY_ROW_BYTES: usize = 8 << 20;
+const MAX_LIMITED_QUERY_AGGREGATE_BYTES: usize = 8 << 20;
 
 pub fn analyzer_db_path(workspace_root: &Path) -> PathBuf {
     gitblob::cache_db_path(workspace_root)
@@ -190,7 +198,10 @@ impl SemanticPackActiveSet {
 
 // A completed parse is published atomically with its rows. Hot candidate
 // queries rely on this marker; full count validation remains on hydration and
-// explicit presence checks to quarantine externally corrupted cache rows.
+// explicit verification checks to quarantine externally corrupted cache rows.
+//
+// This is also the read-path membership predicate; see
+// `read_path_parsed_blob_condition`.
 const PARSED_BLOB_COMPLETE_CONDITION: &str = "
 meta.is_complete = 1
 AND EXISTS (
@@ -212,6 +223,18 @@ const EXACT_PATH_SYMBOL_FQN_SQL: &str =
       )
     ORDER BY rel_path, exact_fqn";
 
+/// The full verification predicate: membership, plus a re-count of every fact
+/// table against the counts `blob_meta` recorded.
+///
+/// It costs 14 correlated scalar subqueries per requested key. Keep it on the
+/// paths that exist to verify a cache -- the startup reconcile in
+/// [`StartupCacheValidation::FullIntegrity`] mode, the post-write check in
+/// `insert_blob_meta_tx`, and the explicit `contains_parsed_blob` /
+/// `parsed_blob_keys` presence checks -- and off the read path, which asks the
+/// same question millions of times per cold start. See
+/// [`read_path_parsed_blob_condition`].
+///
+/// [`StartupCacheValidation::FullIntegrity`]: crate::analyzer::tree_sitter_analyzer::StartupCacheValidation::FullIntegrity
 static PARSED_BLOB_INTEGRITY_CONDITION: LazyLock<String> = LazyLock::new(|| {
     let mut condition = "
 meta.is_complete = 1
@@ -284,6 +307,45 @@ AND meta.type_identifier_count = (
     );
     condition
 });
+
+/// Restores the full verification predicate on the read path when set to
+/// `full`. Read once, at first use.
+const STORE_INTEGRITY_ENV: &str = "BIFROST_STORE_INTEGRITY";
+
+fn full_read_path_integrity_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case("full"))
+}
+
+/// The predicate every read-path membership question uses: `is_complete = 1`
+/// plus the active-generation `EXISTS`.
+///
+/// Those two facts are what "this blob has a published parse for the generation
+/// I am asking about" means. The write path already proves the fact-table counts
+/// after every blob write (`insert_blob_meta_tx` fails the write otherwise), and
+/// the epoch salt keeps a row from being read by a build that did not write it,
+/// so re-proving those counts on every read re-verifies a state that cannot
+/// occur. It is not free: the 2026-08-16 firefox measurement priced the full
+/// condition at 56.2 us/key against 4.1 us/key for membership, which is 9.6 s of
+/// a cold start's 171,035-key hydration pass and an order of magnitude worse
+/// with cold pages.
+///
+/// Corruption written outside Bifrost is still caught, one step later:
+/// `hydrate_file_state_conn` re-counts the rows it actually read and returns
+/// `None`, so the file is reparsed and repaired. The verification consumers keep
+/// [`PARSED_BLOB_INTEGRITY_CONDITION`].
+///
+/// [`STORE_INTEGRITY_ENV`] set to `full` puts the full condition back here for
+/// diagnostics.
+fn read_path_parsed_blob_condition() -> &'static str {
+    static CONDITION: OnceLock<&'static str> = OnceLock::new();
+    CONDITION.get_or_init(|| {
+        if full_read_path_integrity_requested(std::env::var_os(STORE_INTEGRITY_ENV).as_deref()) {
+            PARSED_BLOB_INTEGRITY_CONDITION.as_str()
+        } else {
+            PARSED_BLOB_COMPLETE_CONDITION
+        }
+    })
+}
 
 static OPTIONAL_FACT_COUNT_PROJECTION: LazyLock<String> = LazyLock::new(|| {
     let mut projection = OPTIONAL_FACT_DESCRIPTORS
@@ -813,6 +875,38 @@ pub(crate) struct SearchCandidateNameRow {
     pub unit_key: i64,
     pub short_name: String,
     pub content_qualifier: String,
+}
+
+/// One live blob a symbol-search candidate scan may read, together with the
+/// request-scoped facts the literal prefilter needs about it.
+///
+/// The prefilter compares required literals against persisted name columns, but
+/// a pattern is matched against a *hydrated* fully-qualified name whose package
+/// prefix can come from the live path instead. These two fields carry that live
+/// half of the name into SQL: `package_literals` says which of the request's
+/// literals the blob's own path prefixes supply, and `prefilter_exempt` says the
+/// blob's prefixes cannot be enumerated at all, so its declarations must survive
+/// the prefilter unconditionally.
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveSearchBlob {
+    pub(crate) oid: Oid,
+    /// The required literals this blob's path-derived package prefixes contain,
+    /// lowercased and joined with `\n`. A required literal is `[a-z0-9_]` only,
+    /// so no literal can straddle the join.
+    pub(crate) package_literals: String,
+    pub(crate) prefilter_exempt: bool,
+}
+
+impl ActiveSearchBlob {
+    /// A blob no literal prefilter will be applied against, for callers that
+    /// pass no required literals.
+    pub(crate) fn unfiltered(oid: Oid) -> Self {
+        Self {
+            oid,
+            package_literals: String::new(),
+            prefilter_exempt: false,
+        }
+    }
 }
 
 /// A declaration identity that survived pattern matching and therefore earns
@@ -1406,6 +1500,8 @@ impl AnalyzerStore {
         Ok(out)
     }
 
+    /// Verification form of the missing-key question: see
+    /// [`Self::parsed_blob_keys`].
     pub fn missing_parsed_blob_keys(
         &self,
         entries: &[(Oid, String)],
@@ -1421,12 +1517,28 @@ impl AnalyzerStore {
         Ok(out)
     }
 
+    /// The keys a `FullIntegrity` startup reconcile must reparse.
+    ///
+    /// This is the one batched caller that keeps
+    /// [`PARSED_BLOB_INTEGRITY_CONDITION`]: verifying the cache is what the mode
+    /// is for, so a blob whose fact rows were deleted outside Bifrost is
+    /// reported missing here and repaired by a reparse. A service build opts
+    /// into the cheaper published-key check instead; see
+    /// [`Self::missing_published_parsed_blob_keys_at_generations`].
     pub(crate) fn missing_parsed_blob_keys_at_generations(
         &self,
         entries: &[(Oid, String)],
         generations: &HashMap<String, GenerationId>,
     ) -> Result<Vec<(Oid, String)>> {
-        let present = self.parsed_blob_keys_at_generations(entries, generations)?;
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_generation_map(
+            &tx,
+            generations,
+            entries.iter().map(|(_, lang)| lang.as_str()),
+        )?;
+        let present = verified_parsed_blob_keys_conn(&tx, entries)?;
+        tx.commit()?;
         let mut seen = HashSet::default();
         Ok(entries
             .iter()
@@ -1458,16 +1570,20 @@ impl AnalyzerStore {
         Ok(missing)
     }
 
-    /// Return the complete parsed keys from `entries` using chunked set queries.
-    /// This reads blob metadata only; it does not hydrate file state or source.
+    /// Return the verified parsed keys from `entries` using chunked set
+    /// queries. This reads blob metadata only; it does not hydrate file state or
+    /// source. Verification form: every fact-table count is re-proved per key.
     pub fn parsed_blob_keys(&self, entries: &[(Oid, String)]) -> Result<HashSet<(Oid, String)>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
-        let present = parsed_blob_keys_conn(&tx, entries)?;
+        let present = verified_parsed_blob_keys_conn(&tx, entries)?;
         tx.commit()?;
         Ok(present)
     }
 
+    /// Read-path membership for a whole key set at the caller's generations.
+    /// This is the query a workspace listing and a candidate retain run; it uses
+    /// [`read_path_parsed_blob_condition`].
     pub(crate) fn parsed_blob_keys_at_generations(
         &self,
         entries: &[(Oid, String)],
@@ -1503,11 +1619,18 @@ impl AnalyzerStore {
         Ok(exists)
     }
 
+    /// Verification form: one blob's parse, with every fact-table count
+    /// re-proved. Callers that only need to know whether a blob is readable at
+    /// the active generation use
+    /// [`Self::contains_parsed_blob_at_generation`] instead.
     pub fn contains_parsed_blob(&self, oid: Oid, lang: &str) -> Result<bool> {
         let conn = self.read_conn()?;
-        contains_parsed_blob_conn(&conn, oid, lang)
+        contains_parsed_blob_conn(&conn, oid, lang, PARSED_BLOB_INTEGRITY_CONDITION.as_str())
     }
 
+    /// Read-path membership for one blob at the caller's generation. Uses
+    /// [`read_path_parsed_blob_condition`], the same predicate the batched
+    /// hydration query uses.
     pub(crate) fn contains_parsed_blob_at_generation(
         &self,
         oid: Oid,
@@ -1520,7 +1643,7 @@ impl AnalyzerStore {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
-        let exists = contains_parsed_blob_conn(&tx, oid, lang)?;
+        let exists = contains_parsed_blob_conn(&tx, oid, lang, read_path_parsed_blob_condition())?;
         tx.commit()?;
         Ok(exists)
     }
@@ -3158,8 +3281,8 @@ impl AnalyzerStore {
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
-        active_oids: &[Oid],
-        literal_substrings: Option<&[&str]>,
+        active_blobs: &[ActiveSearchBlob],
+        required_literals: Option<&[Vec<String>]>,
         cancellation: Option<&CancellationToken>,
     ) -> Result<LimitedQueryRows<SearchCandidateNameRow>> {
         // Pattern matching is performed after language-specific FQN hydration.
@@ -3182,14 +3305,14 @@ impl AnalyzerStore {
         }
         {
             let _scope = crate::profiling::scope("store.symbol_names.sync_active_oids");
-            sync_active_blob_oids(&tx, active_oids)?;
+            sync_active_blob_oids(&tx, active_blobs)?;
         }
         let rows = {
             let _scope = crate::profiling::scope("store.symbol_names.query_all_languages");
             search_candidate_name_rows_for_langs_conn_cancellable(
                 &tx,
                 langs,
-                literal_substrings,
+                required_literals,
                 cancellation,
             )?
         };
@@ -5276,7 +5399,7 @@ pub(crate) struct PreparedParsedBlob {
     units: Vec<PreparedUnitRow>,
     ranges: Vec<(i64, i64, i64, i64, i64, i64)>,
     signatures: Vec<(i64, i64, String)>,
-    signature_metadata: Vec<(i64, i64, Vec<u8>)>,
+    signature_metadata: Vec<(i64, i64, SignatureMetadataColumns)>,
     cpp_template_metadata: Vec<(i64, Vec<u8>)>,
     supertypes: Vec<(i64, i64, String, String)>,
     children: Vec<(i64, i64, i64)>,
@@ -5744,6 +5867,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
     adapter: &A,
     state: Arc<FileState>,
 ) -> Result<PreparedParsedBlob> {
+    require_complete_file_state(state.as_ref())?;
     let stored_units = collect_stored_units(adapter, state.as_ref());
     let unit_keys: HashMap<CodeUnit, i64> = stored_units
         .iter()
@@ -5811,8 +5935,8 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
             continue;
         };
         for (ordinal, metadata) in entries.iter().enumerate() {
-            let metadata = serialize_signature_metadata_blob(metadata)?;
-            signature_metadata.push((unit_key, usize_to_i64(ordinal)?, metadata));
+            let columns = SignatureMetadataColumns::encode(metadata)?;
+            signature_metadata.push((unit_key, usize_to_i64(ordinal)?, columns));
         }
     }
     let mut cpp_template_metadata = Vec::new();
@@ -5930,6 +6054,13 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
     let string_bytes = saturating_sum([
         unit_string_bytes,
         saturating_sum(signatures.iter().map(|(_, _, text)| text.len())),
+        // Must sum exactly what `signature_metadata_row_bytes_sql` sums: this
+        // number is compared against the SQL payload-cost aggregate.
+        saturating_sum(
+            signature_metadata
+                .iter()
+                .map(|(_, _, columns)| columns.stored_text_bytes()),
+        ),
         saturating_sum(
             supertypes
                 .iter()
@@ -5940,7 +6071,6 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         rust_facts.string_bytes(),
     ]);
     let binary_bytes = saturating_sum([
-        saturating_sum(signature_metadata.iter().map(|(_, _, bytes)| bytes.len())),
         saturating_sum(cpp_template_metadata.iter().map(|(_, bytes)| bytes.len())),
         saturating_sum(scala_exports.iter().map(|(_, _, bytes)| bytes.len())),
         saturating_sum(
@@ -6054,10 +6184,10 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
         }
     );
     insert_rows!(
-        "INSERT OR IGNORE INTO unit_signature_metadata(blob_oid, lang, unit_key, ordinal, metadata) VALUES(?1, ?2, ?3, ?4, ?5)",
+        signature_metadata_insert_sql(),
         &blob.signature_metadata,
         |stmt, row| {
-            stmt.execute(params![oid, lang, row.0, row.1, row.2])?;
+            row.2.insert(&mut stmt, oid, lang, row.0, row.1)?;
         }
     );
     insert_rows!(
@@ -6178,6 +6308,7 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
     adapter: &A,
     state: &FileState,
 ) -> Result<()> {
+    require_complete_file_state(state)?;
     let oid = oid.to_string();
     tx.execute(
         "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2",
@@ -6290,6 +6421,15 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
     };
     insert_blob_meta(tx, &oid, lang, adapter, state, units.len(), side_counts)?;
     update_blob_payload_cost_tx(tx, &oid, lang)?;
+    Ok(())
+}
+
+fn require_complete_file_state(state: &FileState) -> Result<()> {
+    if !state.parse_complete {
+        return Err(StoreError::new(
+            "timed-out file analysis cannot be published as a complete parsed blob",
+        ));
+    }
     Ok(())
 }
 
@@ -6441,19 +6581,20 @@ fn insert_unit_signature_metadata(
     unit_keys: &HashMap<CodeUnit, i64>,
     metadata: &HashMap<CodeUnit, Vec<SignatureMetadata>>,
 ) -> Result<usize> {
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO unit_signature_metadata(
-           blob_oid, lang, unit_key, ordinal, metadata
-         ) VALUES(?1, ?2, ?3, ?4, ?5)",
-    )?;
+    let mut stmt = tx.prepare(signature_metadata_insert_sql())?;
     let mut count = 0;
     for (unit, entries) in metadata {
-        let Some(unit_key) = unit_keys.get(unit) else {
+        let Some(&unit_key) = unit_keys.get(unit) else {
             continue;
         };
         for (ordinal, entry) in entries.iter().enumerate() {
-            let entry = serialize_signature_metadata_blob(entry)?;
-            stmt.execute(params![oid, lang, unit_key, usize_to_i64(ordinal)?, entry,])?;
+            SignatureMetadataColumns::encode(entry)?.insert(
+                &mut stmt,
+                oid,
+                lang,
+                unit_key,
+                usize_to_i64(ordinal)?,
+            )?;
             count += 1;
         }
     }
@@ -6742,9 +6883,9 @@ struct RawSideTableCounts {
 }
 
 type BlobMetaRows = HashMap<String, BlobMetaRow>;
-type SignatureMetadataRow = (i64, Vec<u8>);
+type SignatureMetadataRow = (i64, SignatureMetadata);
 type SignatureMetadataRows = HashMap<String, Vec<SignatureMetadataRow>>;
-type CppTemplateMetadataRows = HashMap<String, Vec<SignatureMetadataRow>>;
+type CppTemplateMetadataRows = HashMap<String, Vec<(i64, Vec<u8>)>>;
 type ScalaExportRows = HashMap<String, Vec<(i64, Vec<u8>)>>;
 type MaterializationRecordRows = HashMap<String, Vec<(Option<i64>, Vec<u8>)>>;
 type RangeRow = (i64, i64, i64, i64, i64);
@@ -6862,6 +7003,7 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
         test_region_units,
         materialization_records,
         parse_errors: None,
+        parse_complete: true,
     };
 
     adapter.synthesize_hydrated_units(file, source, &mut state);
@@ -7148,7 +7290,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             unit_string_map_for_file(supertype_lookup_paths_by_oid.get(&oid_text), &by_key);
         let signatures = unit_string_map_for_file(signatures_by_oid.get(&oid_text), &by_key);
         let signature_metadata =
-            signature_metadata_map_for_file(signature_metadata_by_oid.get(&oid_text), &by_key)?;
+            signature_metadata_map_for_file(signature_metadata_by_oid.get(&oid_text), &by_key);
         let cpp_template_metadata = cpp_template_metadata_map_for_file(
             cpp_template_metadata_by_oid.get(&oid_text),
             &by_key,
@@ -7199,6 +7341,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             test_region_units,
             materialization_records,
             parse_errors: None,
+            parse_complete: true,
         };
 
         if let Some(source) = source {
@@ -7850,17 +7993,12 @@ fn read_signature_metadata_bulk(
             continue;
         }
         let placeholders = chunk_placeholders(chunk);
+        let columns = signature_metadata_value_columns_sql("metadata");
         let sql = format!(
-            "SELECT blob_oid,
-                    unit_key,
-                    CASE
-                        WHEN length(metadata) <= {MAX_SIGNATURE_METADATA_BLOB_BYTES}
-                        THEN metadata
-                        ELSE NULL
-                    END
-             FROM unit_signature_metadata
-             WHERE lang = ? AND blob_oid IN ({placeholders})
-             ORDER BY blob_oid, unit_key, ordinal"
+            "SELECT metadata.blob_oid, metadata.unit_key, {columns}
+             FROM unit_signature_metadata AS metadata
+             WHERE metadata.lang = ? AND metadata.blob_oid IN ({placeholders})
+             ORDER BY metadata.blob_oid, metadata.unit_key, metadata.ordinal"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -7868,14 +8006,12 @@ fn read_signature_metadata_bulk(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, Option<Vec<u8>>>(2)?,
+                signature_metadata_from_row(row, 2)?,
             ))
         })?;
         for row in rows {
             let (oid, key, value) = row?;
-            if let Some(value) = value {
-                out.entry(oid).or_default().push((key, value));
-            }
+            out.entry(oid).or_default().push((key, value));
         }
     }
     Ok(out)
@@ -8060,18 +8196,18 @@ fn unit_string_map_for_file(
 }
 
 fn signature_metadata_map_for_file(
-    rows: Option<&Vec<(i64, Vec<u8>)>>,
+    rows: Option<&Vec<SignatureMetadataRow>>,
     by_key: &HashMap<i64, UnitRow>,
-) -> Result<HashMap<CodeUnit, Vec<SignatureMetadata>>> {
+) -> HashMap<CodeUnit, Vec<SignatureMetadata>> {
     let mut out: HashMap<CodeUnit, Vec<SignatureMetadata>> = HashMap::default();
     for (key, value) in rows.into_iter().flatten() {
         if let Some(unit) = by_key.get(key) {
             out.entry(unit.unit.clone())
                 .or_default()
-                .push(deserialize_signature_metadata_blob(value)?);
+                .push(value.clone());
         }
     }
-    Ok(out)
+    out
 }
 
 fn cpp_template_metadata_map_for_file(
@@ -8285,21 +8421,14 @@ where
 }
 
 fn usage_fact_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageFactRow> {
-    // `fq_segments` occupies index 12; the usage-fact extras follow at 13-15.
-    let metadata_len = row.get::<_, Option<i64>>(14)?;
-    if metadata_len
-        .map(i64_to_usize)
-        .transpose()
-        .map_err(rusqlite_error_from_store)?
-        .is_some_and(|len| len > MAX_SIGNATURE_METADATA_BLOB_BYTES)
-    {
-        return Err(rusqlite_error_from_store(StoreError::new(format!(
-            "signature metadata blob exceeds the {MAX_SIGNATURE_METADATA_BLOB_BYTES}-byte cap"
-        ))));
-    }
+    // `fq_segments` occupies index 12, the unit's first signature text 13, and
+    // the outer-joined signature-metadata columns 14 onward. `label` is NOT
+    // NULL in the table, so a NULL there is the join missing, not a row with
+    // no label.
     let metadata = row
-        .get::<_, Option<Vec<u8>>>(15)?
-        .map(|bytes| deserialize_signature_metadata_blob(&bytes).map_err(rusqlite_error_from_store))
+        .get::<_, Option<String>>(14)?
+        .is_some()
+        .then(|| signature_metadata_from_row(row, 14))
         .transpose()?;
     Ok(UsageFactRow {
         candidate: candidate_row_from_row(row)?,
@@ -8395,37 +8524,83 @@ fn search_candidate_rows_by_lang_conn(
     Ok(rows)
 }
 
-fn search_candidate_name_rows_for_langs_conn_cancellable(
-    conn: &Connection,
-    langs: &[String],
-    literal_substrings: Option<&[&str]>,
-    cancellation: Option<&CancellationToken>,
-) -> Result<LimitedQueryRows<SearchCandidateNameRow>> {
-    if langs.is_empty() {
-        return Ok(LimitedQueryRows::complete(Vec::new(), 0));
+/// The `LIKE` operand that holds when a column contains `literal`, with the
+/// wildcards `LIKE` would otherwise read escaped for `ESCAPE '\'`.
+fn like_contains_pattern(literal: &str) -> String {
+    let mut pattern = String::with_capacity(literal.len() + 2);
+    pattern.push('%');
+    for character in literal.chars() {
+        if matches!(character, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
     }
+    pattern.push('%');
+    pattern
+}
 
+/// The candidate-name projection and the literal prefilter parameters it binds.
+///
+/// The predicate is built here, next to the query it feeds, so a test can pin
+/// both the plan and the parameter order the caller has to bind.
+fn search_candidate_name_rows_sql(
+    langs: &[String],
+    required_literals: Option<&[Vec<String>]>,
+) -> (String, Vec<String>) {
     // No `ORDER BY`: candidates are deduplicated through an ordered map after
     // matching, so the storage order carries no meaning, while sorting the
     // whole declaration projection cost a temp B-tree over every workspace
     // declaration on every request (issue #1199).
-    let literal_parameter_offset = langs.len() + 1;
-    let literal_predicate = literal_substrings
-        .filter(|literals| !literals.is_empty())
-        .map(|literals| {
-            let predicates = (0..literals.len())
-                .map(|index| {
-                    let parameter = literal_parameter_offset + index;
-                    format!(
-                        "(instr(lower(units.short_name), lower(?{parameter})) > 0
-                          OR instr(lower(units.content_qualifier), lower(?{parameter})) > 0
-                          OR instr(lower(coalesce(units.exact_fqn, '')), lower(?{parameter})) > 0
-                          OR instr(lower(coalesce(units.normalized_fqn, '')), lower(?{parameter})) > 0)"
-                    )
+    //
+    // The prefilter is one disjunct per pattern, and one conjunct per literal
+    // that pattern requires, over the three channels the matched name is built
+    // from. It is therefore a superset of the authoritative match, which still
+    // runs over the returned rows. Without it, a batch holding a single regular
+    // expression scanned every declaration in every language index: 86,688 rows
+    // to answer 713 matches on this repository (issue #2316).
+    //
+    // Three channels are enough because a required literal is `[a-z0-9_]` only.
+    // The matched name is the hydrated package prefix joined to the short name
+    // with `.`, so such a literal lies inside one of them, never across the
+    // join; the package prefix is either the persisted `content_qualifier` or
+    // the live path prefix `active.package_literals` reports. `exact_fqn` and
+    // `normalized_fqn` would only repeat that, at the price of the two longest
+    // string comparisons in the row, and they are a snapshot of one path's
+    // hydration rather than this request's.
+    //
+    // `LIKE` rather than `instr(lower(column), ...)`: `LIKE` is ASCII
+    // case-insensitive on its own, which is the case rule the extracted literals
+    // are built for, while `lower()` allocated a folded copy of every column of
+    // every row for every literal.
+    let mut literal_parameters: Vec<String> = Vec::new();
+    let literal_predicate = required_literals
+        .filter(|per_pattern| !per_pattern.is_empty())
+        .map(|per_pattern| {
+            assert!(
+                per_pattern.iter().all(|literals| !literals.is_empty()),
+                "a pattern without a required literal makes the prefilter unconditionally true: {per_pattern:?}"
+            );
+            let disjuncts = per_pattern
+                .iter()
+                .map(|literals| {
+                    let conjuncts = literals
+                        .iter()
+                        .map(|literal| {
+                            literal_parameters.push(like_contains_pattern(literal));
+                            let parameter = langs.len() + literal_parameters.len();
+                            format!(
+                                r"(units.short_name LIKE ?{parameter} ESCAPE '\'
+                                  OR units.content_qualifier LIKE ?{parameter} ESCAPE '\'
+                                  OR active.package_literals LIKE ?{parameter} ESCAPE '\')"
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" AND ");
+                    format!("({conjuncts})")
                 })
                 .collect::<Vec<_>>()
                 .join(" OR ");
-            format!(" AND ({predicates})")
+            format!(" AND (active.prefilter_exempt = 1 OR {disjuncts})")
         })
         .unwrap_or_default();
     let language_parameters = (1..=langs.len())
@@ -8449,11 +8624,24 @@ fn search_candidate_name_rows_for_langs_conn_cancellable(
            AND {PARSED_BLOB_COMPLETE_CONDITION}{literal_predicate}",
         language_parameters.join(", ")
     );
+    (sql, literal_parameters)
+}
+
+fn search_candidate_name_rows_for_langs_conn_cancellable(
+    conn: &Connection,
+    langs: &[String],
+    required_literals: Option<&[Vec<String>]>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<LimitedQueryRows<SearchCandidateNameRow>> {
+    if langs.is_empty() {
+        return Ok(LimitedQueryRows::complete(Vec::new(), 0));
+    }
+    let (sql, literal_parameters) = search_candidate_name_rows_sql(langs, required_literals);
     let mut stmt = conn.prepare_cached(&sql)?;
     let parameters = langs
         .iter()
         .map(String::as_str)
-        .chain(literal_substrings.unwrap_or_default().iter().copied())
+        .chain(literal_parameters.iter().map(String::as_str))
         .collect::<Vec<_>>();
     let mut query = stmt.query(rusqlite::params_from_iter(parameters))?;
     let mut rows = Vec::new();
@@ -8485,37 +8673,44 @@ fn search_candidate_name_rows_for_langs_conn_cancellable(
     }
 }
 
-fn sync_active_blob_oids(conn: &Connection, active_oids: &[Oid]) -> Result<()> {
+fn sync_active_blob_oids(conn: &Connection, active_blobs: &[ActiveSearchBlob]) -> Result<()> {
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS active_blob_oids(
-           blob_oid TEXT PRIMARY KEY
-             CHECK(length(blob_oid) = 40 AND blob_oid NOT GLOB '*[^0-9a-f]*')
+           blob_oid TEXT NOT NULL PRIMARY KEY
+             CHECK(length(blob_oid) = 40 AND blob_oid NOT GLOB '*[^0-9a-f]*'),
+           package_literals TEXT NOT NULL,
+           prefilter_exempt INTEGER NOT NULL CHECK(prefilter_exempt IN (0, 1))
          ) WITHOUT ROWID, STRICT;
          DELETE FROM temp.active_blob_oids;",
     )?;
-    for chunk in active_oids.chunks(400) {
-        let values = std::iter::repeat_n("(?)", chunk.len())
+    for chunk in active_blobs.chunks(300) {
+        let values = std::iter::repeat_n("(?, ?, ?)", chunk.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let sql = format!("INSERT OR IGNORE INTO temp.active_blob_oids(blob_oid) VALUES {values}");
-        let parameters = chunk.iter().map(Oid::to_string).collect::<Vec<_>>();
-        conn.execute(&sql, params_from_iter(parameters.iter()))?;
+        let sql = format!(
+            "INSERT OR IGNORE INTO temp.active_blob_oids(blob_oid, package_literals, prefilter_exempt)
+             VALUES {values}"
+        );
+        let mut statement = conn.prepare_cached(&sql)?;
+        let mut parameters: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 3);
+        for blob in chunk {
+            parameters.push(blob.oid.to_string().into());
+            parameters.push(blob.package_literals.clone().into());
+            parameters.push(i64::from(blob.prefilter_exempt).into());
+        }
+        statement.execute(params_from_iter(parameters))?;
     }
     Ok(())
 }
 
 fn usage_fact_rows_by_lang_conn(conn: &Connection, lang: &str) -> Result<Vec<UsageFactRow>> {
+    let metadata_columns = signature_metadata_value_columns_sql("metadata");
     let sql = format!(
         "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                 units.content_qualifier, units.signature, units.synthetic,
                 units.is_type_alias, units.top_level_ordinal, units.in_declarations,
                 units.in_definition_lookup, units.fq_segments, signature.text,
-                length(metadata.metadata),
-                CASE
-                    WHEN length(metadata.metadata) <= {MAX_SIGNATURE_METADATA_BLOB_BYTES}
-                    THEN metadata.metadata
-                    ELSE NULL
-                END
+                {metadata_columns}
          FROM code_units AS units
          JOIN blob_meta AS meta
            ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
@@ -8897,30 +9092,21 @@ fn read_signature_metadata(
     lang: &str,
     by_key: &HashMap<i64, UnitRow>,
 ) -> Result<HashMap<CodeUnit, Vec<SignatureMetadata>>> {
-    let mut stmt = conn.prepare(
-        "SELECT unit_key,
-                CASE
-                    WHEN length(metadata) <= ?3 THEN metadata
-                    ELSE NULL
-                END
-         FROM unit_signature_metadata
-         WHERE blob_oid = ?1 AND lang = ?2
-         ORDER BY unit_key, ordinal",
-    )?;
-    let rows = stmt.query_map(
-        params![oid, lang, usize_to_i64(MAX_SIGNATURE_METADATA_BLOB_BYTES)?],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
-    )?;
+    let columns = signature_metadata_value_columns_sql("metadata");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT metadata.unit_key, {columns}
+         FROM unit_signature_metadata AS metadata
+         WHERE metadata.blob_oid = ?1 AND metadata.lang = ?2
+         ORDER BY metadata.unit_key, metadata.ordinal"
+    ))?;
+    let rows = stmt.query_map(params![oid, lang], |row| {
+        Ok((row.get::<_, i64>(0)?, signature_metadata_from_row(row, 1)?))
+    })?;
     let mut out: HashMap<CodeUnit, Vec<SignatureMetadata>> = HashMap::default();
     for row in rows {
         let (key, metadata) = row?;
-        let Some(metadata) = metadata else {
-            continue;
-        };
         if let Some(unit) = by_key.get(&key) {
-            out.entry(unit.unit.clone())
-                .or_default()
-                .push(deserialize_signature_metadata_blob(&metadata)?);
+            out.entry(unit.unit.clone()).or_default().push(metadata);
         }
     }
     Ok(out)
@@ -8995,22 +9181,14 @@ fn direct_children_for_unit_limited_conn(
     }
 }
 
-fn signature_metadata_for_unit_limited_conn(
-    conn: &Connection,
-    oid: Oid,
-    lang: &str,
-    unit: &CodeUnit,
-    limit: usize,
-) -> Result<LimitedQueryRows<SignatureMetadata>> {
-    if limit == 0 {
-        return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
-    }
-    let sql = format!(
-        "SELECT length(metadata.metadata),
-                CASE
-                    WHEN length(metadata.metadata) <= ?9 THEN metadata.metadata
-                    ELSE NULL
-                END
+/// The bounded per-unit signature-metadata read. Named so a plan pin can
+/// assert it seeks the table's primary key rather than scanning it.
+fn signature_metadata_for_unit_limited_sql() -> &'static str {
+    static SQL: LazyLock<String> = LazyLock::new(|| {
+        let row_bytes = signature_metadata_row_bytes_sql("metadata");
+        let columns = signature_metadata_value_columns_sql("metadata");
+        format!(
+            "SELECT {row_bytes}, {columns}
          FROM code_units AS units
          JOIN blob_meta AS meta
            ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
@@ -9028,12 +9206,27 @@ fn signature_metadata_for_unit_limited_conn(
            AND {PARSED_BLOB_COMPLETE_CONDITION}
          ORDER BY metadata.ordinal
          LIMIT ?8"
-    );
+        )
+    });
+    SQL.as_str()
+}
+
+fn signature_metadata_for_unit_limited_conn(
+    conn: &Connection,
+    oid: Oid,
+    lang: &str,
+    unit: &CodeUnit,
+    limit: usize,
+) -> Result<LimitedQueryRows<SignatureMetadata>> {
+    if limit == 0 {
+        return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+    }
+    let sql = signature_metadata_for_unit_limited_sql();
     let oid = oid.to_string();
     let kind = code_unit_kind_to_i64(unit.kind());
     let synthetic = bool_to_i64(unit.is_synthetic());
     let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let mut statement = conn.prepare_cached(&sql)?;
+    let mut statement = conn.prepare_cached(sql)?;
     let mut query = statement.query(params![
         oid,
         lang,
@@ -9043,7 +9236,6 @@ fn signature_metadata_for_unit_limited_conn(
         unit.signature(),
         synthetic,
         sql_limit,
-        usize_to_i64(MAX_LIMITED_QUERY_ROW_BYTES)?,
     ])?;
     let mut rows = Vec::new();
     let mut inspected = 0usize;
@@ -9054,10 +9246,7 @@ fn signature_metadata_for_unit_limited_conn(
         if !byte_budget.admit_sqlite_bytes(byte_len)? {
             return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
         }
-        let Some(bytes) = row.get::<_, Option<Vec<u8>>>(1)? else {
-            return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
-        };
-        rows.push(deserialize_signature_metadata_blob(&bytes)?);
+        rows.push(signature_metadata_from_row(row, 1)?);
     }
     drop(query);
     if inspected == limit {
@@ -9646,12 +9835,16 @@ fn current_generation_conn(conn: &Connection, lang: &str) -> Result<GenerationId
     Ok(GenerationId(generation))
 }
 
-fn contains_parsed_blob_conn(conn: &Connection, oid: Oid, lang: &str) -> Result<bool> {
-    let integrity_condition = PARSED_BLOB_INTEGRITY_CONDITION.as_str();
+fn contains_parsed_blob_conn(
+    conn: &Connection,
+    oid: Oid,
+    lang: &str,
+    condition: &str,
+) -> Result<bool> {
     let sql = format!(
         "SELECT 1 FROM blob_meta AS meta
          WHERE meta.blob_oid = ?1 AND meta.lang = ?2
-           AND {integrity_condition}
+           AND {condition}
          LIMIT 1"
     );
     Ok(conn
@@ -9792,7 +9985,14 @@ fn persisted_blob_mutation_cost_fallback_statement(
 }
 
 fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
-    "SELECT
+    // The signature-metadata term is composed rather than written out so that
+    // it cannot drift from `SIGNATURE_METADATA_TEXT_COLUMNS`. The subquery
+    // leaves the table unaliased on purpose: a plan pin asserts
+    // `SEARCH unit_signature_metadata USING PRIMARY KEY`.
+    static SQL: LazyLock<String> = LazyLock::new(|| {
+        let signature_metadata_bytes = signature_metadata_row_bytes_sql("unit_signature_metadata");
+        format!(
+            "SELECT
        1 + CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
          1 + meta.stored_unit_count + meta.range_count + meta.signature_count
            + meta.signature_metadata_count
@@ -9821,7 +10021,7 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
              ) FROM code_units WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(CAST(text AS BLOB))) FROM unit_signatures
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
-           + COALESCE((SELECT SUM(length(metadata)) FROM unit_signature_metadata
+           + COALESCE((SELECT SUM({signature_metadata_bytes}) FROM unit_signature_metadata
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(metadata)) FROM unit_cpp_template_metadata
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
@@ -9848,6 +10048,9 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
      LEFT JOIN blob_meta AS meta
        ON meta.blob_oid = blob.blob_oid AND meta.lang = blob.lang
      WHERE blob.blob_oid = ?1 AND blob.lang = ?2"
+        )
+    });
+    SQL.as_str()
 }
 
 fn insert_blob_payload_cost_tx(
@@ -9883,7 +10086,19 @@ fn padded_pair_arity(len: usize) -> usize {
         .unwrap_or(LADDER[LADDER.len() - 1])
 }
 
+/// Read-path membership for a key set: which of `entries` have a published
+/// parse at the active generation. This is the hydration query.
 fn parsed_blob_keys_conn(
+    conn: &Connection,
+    entries: &[(Oid, String)],
+) -> Result<HashSet<(Oid, String)>> {
+    parsed_blob_keys_conn_with_condition(conn, entries, "", read_path_parsed_blob_condition())
+}
+
+/// The same key set, answered with the full verification predicate. Used by the
+/// startup reconcile that exists to verify the cache and by the explicit
+/// presence checks, not by the read path.
+fn verified_parsed_blob_keys_conn(
     conn: &Connection,
     entries: &[(Oid, String)],
 ) -> Result<HashSet<(Oid, String)>> {
@@ -9964,6 +10179,23 @@ fn sync_requested_parsed_blobs(conn: &Connection, entries: &[(Oid, String)]) -> 
     Ok(())
 }
 
+/// The batched key-membership statement. Kept as one builder so the EXPLAIN
+/// QUERY PLAN pin cannot drift away from the statement the read path runs.
+fn parsed_blob_keys_sql(padded_arity: usize, joins: &str, condition: &str) -> String {
+    let values = std::iter::repeat_n("(?, ?)", padded_arity)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "WITH requested(blob_oid, lang) AS (VALUES {values})
+             SELECT requested.blob_oid, requested.lang
+             FROM requested
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = requested.blob_oid AND meta.lang = requested.lang
+             {joins}
+             WHERE {condition}"
+    )
+}
+
 fn parsed_blob_keys_conn_with_condition(
     conn: &Connection,
     entries: &[(Oid, String)],
@@ -9985,18 +10217,7 @@ fn parsed_blob_keys_conn_with_condition(
         // NULL blob_oid/lang; the inner JOIN drops them, so the matched-key set
         // is unchanged.
         let padded = padded_pair_arity(chunk.len());
-        let values = std::iter::repeat_n("(?, ?)", padded)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "WITH requested(blob_oid, lang) AS (VALUES {values})
-             SELECT requested.blob_oid, requested.lang
-             FROM requested
-             JOIN blob_meta AS meta
-               ON meta.blob_oid = requested.blob_oid AND meta.lang = requested.lang
-             {joins}
-             WHERE {condition}"
-        );
+        let sql = parsed_blob_keys_sql(padded, joins, condition);
         let mut parameters: Vec<Option<String>> = Vec::with_capacity(padded * 2);
         for (oid, lang) in chunk {
             parameters.push(Some(oid.to_string()));
@@ -10286,36 +10507,440 @@ pub(crate) fn hydrate_unit_fq<A: LanguageAdapter>(
     Ok((prefix, package_segment_count))
 }
 
-fn serialize_signature_metadata_blob(value: &SignatureMetadata) -> Result<Vec<u8>> {
-    let serialized_size = usize::try_from(bincode::serialized_size(value).map_err(|err| {
-        StoreError::new(format!("analyzer store serialization size error: {err}"))
-    })?)
-    .map_err(|_| StoreError::new("signature metadata size does not fit in usize"))?;
-    if serialized_size > MAX_SIGNATURE_METADATA_BLOB_BYTES {
-        return Err(StoreError::new(format!(
-            "signature metadata blob requires {serialized_size} bytes, exceeding the \
-             {MAX_SIGNATURE_METADATA_BLOB_BYTES}-byte cap"
-        )));
-    }
-    let bytes = serialize_blob(value)?;
-    debug_assert_eq!(bytes.len(), serialized_size);
-    Ok(bytes)
+/// Every non-key column of `unit_signature_metadata`, in the one order the
+/// writer binds and every reader decodes.
+///
+/// Four queries read this table and two write it. Sharing one order is what
+/// makes positional decoding safe among them: a column added to the schema is
+/// added to this list once, and the encoder and decoder beside it are the only
+/// two places that have to agree about what index it lands on.
+const SIGNATURE_METADATA_VALUE_COLUMNS: [&str; 29] = [
+    "label",
+    "parameters",
+    "return_type_text",
+    "return_type_identity",
+    "underlying_type_identity",
+    "declaration_only",
+    "callable_arity_required",
+    "callable_arity_total",
+    "callable_arity_repeated",
+    "type_parameters",
+    "bare_return_type_parameter",
+    "callable_linkage",
+    "dispatch_extensibility",
+    "extension_receiver_type",
+    "extension_receiver_type_identity",
+    "extension_receiver_is_unconstrained",
+    "field_is_static",
+    "field_is_final",
+    "field_has_initializer",
+    "cpp_field_linkage",
+    "companion_object",
+    "callable_is_static",
+    "callable_is_constructor",
+    "callable_declared_visibility",
+    "callable_modifiers_recorded",
+    "callable_parameter_types",
+    "callable_is_native",
+    "class_like_is_interface",
+    "class_like_is_static",
+];
+
+/// The variable-length subset of the columns above.
+///
+/// Their stored byte lengths are the row's payload cost and the read-side
+/// materialization budget. The flags, the arity integers, and the short enum
+/// spellings are bounded by their own CHECK constraints and are not worth
+/// summing. The Rust accounting in [`SignatureMetadataColumns::stored_text_bytes`]
+/// must sum exactly this set, because a test compares it against the SQL sum.
+const SIGNATURE_METADATA_TEXT_COLUMNS: [&str; 10] = [
+    "label",
+    "parameters",
+    "return_type_text",
+    "return_type_identity",
+    "underlying_type_identity",
+    "type_parameters",
+    "bare_return_type_parameter",
+    "extension_receiver_type",
+    "extension_receiver_type_identity",
+    "callable_parameter_types",
+];
+
+/// The value columns as a SELECT list, each qualified by `qualifier`, which is
+/// the table's name or its alias in the query being built.
+fn signature_metadata_value_columns_sql(qualifier: &str) -> String {
+    SIGNATURE_METADATA_VALUE_COLUMNS
+        .iter()
+        .map(|column| format!("{qualifier}.{column}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-fn deserialize_signature_metadata_blob(bytes: &[u8]) -> Result<SignatureMetadata> {
-    if bytes.len() > MAX_SIGNATURE_METADATA_BLOB_BYTES {
-        return Err(StoreError::new(format!(
-            "signature metadata blob exceeds the {MAX_SIGNATURE_METADATA_BLOB_BYTES}-byte cap"
-        )));
+/// A SQL expression for one row's stored text bytes.
+///
+/// `length()` on a TEXT value counts characters, so every term casts to BLOB
+/// first: the budget is bytes.
+fn signature_metadata_row_bytes_sql(qualifier: &str) -> String {
+    SIGNATURE_METADATA_TEXT_COLUMNS
+        .iter()
+        .map(|column| format!("COALESCE(length(CAST({qualifier}.{column} AS BLOB)), 0)"))
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// A plain INSERT, unlike every sibling side table, which uses
+/// `INSERT OR IGNORE`.
+///
+/// This is the only side table whose columns carry CHECK constraints that can
+/// reject a well-keyed row, and `OR IGNORE` suppresses a CHECK failure exactly
+/// as it suppresses a duplicate key: the row is skipped and the statement
+/// succeeds. That would turn the schema's size cap back into the silent
+/// data-loss it was written to replace. The blob's own row is deleted before
+/// any of this runs, and its cascade empties this table for the blob, so a
+/// duplicate key here is impossible and there is nothing left for `OR IGNORE`
+/// to do but hide a real failure.
+fn signature_metadata_insert_sql() -> &'static str {
+    static SQL: LazyLock<String> = LazyLock::new(|| {
+        let columns = SIGNATURE_METADATA_VALUE_COLUMNS.join(", ");
+        let placeholders = (0..SIGNATURE_METADATA_VALUE_COLUMNS.len())
+            .map(|index| format!("?{}", index + 5))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "INSERT INTO unit_signature_metadata(
+           blob_oid, lang, unit_key, ordinal, {columns}
+         ) VALUES(?1, ?2, ?3, ?4, {placeholders})"
+        )
+    });
+    SQL.as_str()
+}
+
+/// One `unit_signature_metadata` row's non-key columns, already converted to
+/// the SQL types they bind as.
+///
+/// The prepared-write path builds these outside the write transaction so it can
+/// charge a blob's payload cost before it takes the lock; the direct write path
+/// builds them per row. Neither checks the size caps: the schema does, and a
+/// row that violates one fails its INSERT and rolls the whole blob back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignatureMetadataColumns {
+    label: String,
+    parameters: String,
+    return_type_text: Option<String>,
+    return_type_identity: Option<String>,
+    underlying_type_identity: Option<String>,
+    declaration_only: i64,
+    callable_arity_required: Option<i64>,
+    callable_arity_total: Option<i64>,
+    callable_arity_repeated: Option<i64>,
+    type_parameters: String,
+    bare_return_type_parameter: Option<String>,
+    callable_linkage: Option<&'static str>,
+    dispatch_extensibility: Option<&'static str>,
+    extension_receiver_type: Option<String>,
+    extension_receiver_type_identity: Option<String>,
+    extension_receiver_is_unconstrained: i64,
+    field_is_static: i64,
+    field_is_final: i64,
+    field_has_initializer: i64,
+    cpp_field_linkage: Option<&'static str>,
+    companion_object: i64,
+    callable_is_static: i64,
+    callable_is_constructor: i64,
+    callable_declared_visibility: Option<&'static str>,
+    callable_modifiers_recorded: i64,
+    callable_parameter_types: Option<String>,
+    callable_is_native: i64,
+    class_like_is_interface: i64,
+    class_like_is_static: i64,
+}
+
+impl SignatureMetadataColumns {
+    fn encode(value: &SignatureMetadata) -> Result<Self> {
+        let arity = value.callable_arity();
+        Ok(Self {
+            label: value.label().to_string(),
+            parameters: encode_signature_metadata_json("parameters", value.parameters())?,
+            return_type_text: value.return_type_text().map(str::to_string),
+            return_type_identity: value
+                .return_type_identity()
+                .map(|identity| encode_signature_metadata_json("return_type_identity", identity))
+                .transpose()?,
+            underlying_type_identity: value
+                .underlying_type_identity()
+                .map(|identity| {
+                    encode_signature_metadata_json("underlying_type_identity", identity)
+                })
+                .transpose()?,
+            declaration_only: bool_to_i64(value.is_declaration_only()),
+            callable_arity_required: arity
+                .map(|arity| usize_to_i64(arity.required()))
+                .transpose()?,
+            callable_arity_total: arity.map(|arity| usize_to_i64(arity.total())).transpose()?,
+            callable_arity_repeated: arity.map(|arity| bool_to_i64(arity.is_repeated())),
+            type_parameters: encode_signature_metadata_json(
+                "type_parameters",
+                value.type_parameters(),
+            )?,
+            bare_return_type_parameter: value.bare_return_type_parameter().map(str::to_string),
+            callable_linkage: value.callable_linkage().map(CallableLinkage::label),
+            dispatch_extensibility: value
+                .dispatch_extensibility()
+                .map(DispatchExtensibility::label),
+            extension_receiver_type: value.extension_receiver_type().map(str::to_string),
+            extension_receiver_type_identity: value
+                .extension_receiver_type_identity()
+                .map(|identity| {
+                    encode_signature_metadata_json("extension_receiver_type_identity", identity)
+                })
+                .transpose()?,
+            extension_receiver_is_unconstrained: bool_to_i64(
+                value.extension_receiver_is_unconstrained_type_parameter(),
+            ),
+            field_is_static: bool_to_i64(value.field_is_static()),
+            field_is_final: bool_to_i64(value.field_is_final()),
+            field_has_initializer: bool_to_i64(value.field_has_initializer()),
+            cpp_field_linkage: value.cpp_field_linkage().map(CppFieldLinkage::label),
+            companion_object: bool_to_i64(value.is_companion_object()),
+            callable_is_static: bool_to_i64(value.callable_is_static()),
+            callable_is_constructor: bool_to_i64(value.callable_is_constructor()),
+            callable_declared_visibility: value
+                .callable_declared_visibility()
+                .map(DeclaredVisibility::label),
+            callable_modifiers_recorded: bool_to_i64(value.callable_modifiers_recorded()),
+            callable_parameter_types: value
+                .callable_parameter_types()
+                .map(|types| encode_signature_metadata_json("callable_parameter_types", types))
+                .transpose()?,
+            callable_is_native: bool_to_i64(value.callable_is_native()),
+            class_like_is_interface: bool_to_i64(value.class_like_is_interface()),
+            class_like_is_static: bool_to_i64(value.class_like_is_static()),
+        })
     }
-    let byte_limit = u64::try_from(bytes.len())
-        .map_err(|_| StoreError::new("signature metadata blob length does not fit in u64"))?;
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .allow_trailing_bytes()
-        .with_limit(byte_limit)
-        .deserialize(bytes)
-        .map_err(|err| StoreError::new(format!("analyzer store deserialization error: {err}")))
+
+    /// The bytes this row occupies in the columns [`SIGNATURE_METADATA_TEXT_COLUMNS`]
+    /// names, which is what the SQL payload-cost aggregate sums.
+    fn stored_text_bytes(&self) -> usize {
+        saturating_sum([
+            self.label.len(),
+            self.parameters.len(),
+            self.return_type_text.as_ref().map_or(0, String::len),
+            self.return_type_identity.as_ref().map_or(0, String::len),
+            self.underlying_type_identity
+                .as_ref()
+                .map_or(0, String::len),
+            self.type_parameters.len(),
+            self.bare_return_type_parameter
+                .as_ref()
+                .map_or(0, String::len),
+            self.extension_receiver_type.as_ref().map_or(0, String::len),
+            self.extension_receiver_type_identity
+                .as_ref()
+                .map_or(0, String::len),
+            self.callable_parameter_types
+                .as_ref()
+                .map_or(0, String::len),
+        ])
+    }
+
+    fn insert(
+        &self,
+        stmt: &mut rusqlite::Statement<'_>,
+        oid: &str,
+        lang: &str,
+        unit_key: i64,
+        ordinal: i64,
+    ) -> Result<()> {
+        stmt.execute(params![
+            oid,
+            lang,
+            unit_key,
+            ordinal,
+            self.label,
+            self.parameters,
+            self.return_type_text,
+            self.return_type_identity,
+            self.underlying_type_identity,
+            self.declaration_only,
+            self.callable_arity_required,
+            self.callable_arity_total,
+            self.callable_arity_repeated,
+            self.type_parameters,
+            self.bare_return_type_parameter,
+            self.callable_linkage,
+            self.dispatch_extensibility,
+            self.extension_receiver_type,
+            self.extension_receiver_type_identity,
+            self.extension_receiver_is_unconstrained,
+            self.field_is_static,
+            self.field_is_final,
+            self.field_has_initializer,
+            self.cpp_field_linkage,
+            self.companion_object,
+            self.callable_is_static,
+            self.callable_is_constructor,
+            self.callable_declared_visibility,
+            self.callable_modifiers_recorded,
+            self.callable_parameter_types,
+            self.callable_is_native,
+            self.class_like_is_interface,
+            self.class_like_is_static,
+        ])?;
+        Ok(())
+    }
+}
+
+fn encode_signature_metadata_json<T: serde::Serialize + ?Sized>(
+    column: &str,
+    value: &T,
+) -> Result<String> {
+    serde_json::to_string(value).map_err(|err| {
+        StoreError::new(format!(
+            "analyzer store cannot encode signature metadata column {column}: {err}"
+        ))
+    })
+}
+
+fn decode_signature_metadata_json<T: serde::de::DeserializeOwned>(
+    column: &str,
+    text: &str,
+) -> rusqlite::Result<T> {
+    serde_json::from_str(text).map_err(|err| {
+        rusqlite_error_from_store(StoreError::new(format!(
+            "analyzer store cannot decode signature metadata column {column}: {err}"
+        )))
+    })
+}
+
+fn signature_metadata_enum_from_label<T>(
+    column: &str,
+    label: Option<String>,
+    parse: impl Fn(&str) -> Option<T>,
+) -> rusqlite::Result<Option<T>> {
+    label
+        .map(|label| {
+            parse(&label).ok_or_else(|| {
+                rusqlite_error_from_store(StoreError::new(format!(
+                    "analyzer store signature metadata column {column} holds unknown value {label}"
+                )))
+            })
+        })
+        .transpose()
+}
+
+/// Rebuild one [`SignatureMetadata`] from a row whose
+/// [`SIGNATURE_METADATA_VALUE_COLUMNS`] start at index `base`.
+fn signature_metadata_from_row(
+    row: &rusqlite::Row<'_>,
+    base: usize,
+) -> rusqlite::Result<SignatureMetadata> {
+    let flag =
+        |index: usize| -> rusqlite::Result<bool> { Ok(row.get::<_, i64>(base + index)? != 0) };
+    let parameters: Vec<ParameterMetadata> =
+        decode_signature_metadata_json("parameters", &row.get::<_, String>(base + 1)?)?;
+    let mut metadata = SignatureMetadata::new(row.get::<_, String>(base)?, parameters)
+        .with_return_type_text(row.get::<_, Option<String>>(base + 2)?)
+        .with_return_type_identity(signature_metadata_identity_from_row(
+            row,
+            base + 3,
+            "return_type_identity",
+        )?)
+        .with_underlying_type_identity(signature_metadata_identity_from_row(
+            row,
+            base + 4,
+            "underlying_type_identity",
+        )?)
+        .with_declaration_only(flag(5)?)
+        .with_type_parameters(decode_signature_metadata_json(
+            "type_parameters",
+            &row.get::<_, String>(base + 9)?,
+        )?)
+        .with_bare_return_type_parameter(row.get::<_, Option<String>>(base + 10)?)
+        .with_extension_receiver_type(row.get::<_, Option<String>>(base + 13)?)
+        .with_extension_receiver_type_identity(signature_metadata_identity_from_row(
+            row,
+            base + 14,
+            "extension_receiver_type_identity",
+        )?)
+        .with_extension_receiver_is_unconstrained_type_parameter(flag(15)?)
+        .with_field_modifiers(flag(16)?, flag(17)?)
+        .with_field_initializer(flag(18)?)
+        .with_companion_object(flag(20)?)
+        .with_persisted_callable_modifiers(
+            flag(21)?,
+            flag(22)?,
+            signature_metadata_enum_from_label(
+                "callable_declared_visibility",
+                row.get::<_, Option<String>>(base + 23)?,
+                DeclaredVisibility::from_label,
+            )?,
+            flag(24)?,
+        )
+        .with_callable_native(flag(26)?)
+        .with_class_like_interface(flag(27)?)
+        .with_class_like_static(flag(28)?);
+    if let Some(arity) = signature_metadata_arity_from_row(row, base + 6)? {
+        metadata = metadata.with_callable_arity(arity);
+    }
+    if let Some(linkage) = signature_metadata_enum_from_label(
+        "callable_linkage",
+        row.get::<_, Option<String>>(base + 11)?,
+        CallableLinkage::from_label,
+    )? {
+        metadata = metadata.with_callable_linkage(linkage);
+    }
+    if let Some(extensibility) = signature_metadata_enum_from_label(
+        "dispatch_extensibility",
+        row.get::<_, Option<String>>(base + 12)?,
+        DispatchExtensibility::from_label,
+    )? {
+        metadata = metadata.with_dispatch_extensibility(extensibility);
+    }
+    if let Some(linkage) = signature_metadata_enum_from_label(
+        "cpp_field_linkage",
+        row.get::<_, Option<String>>(base + 19)?,
+        CppFieldLinkage::from_label,
+    )? {
+        metadata = metadata.with_cpp_field_linkage(linkage);
+    }
+    if let Some(types) = row.get::<_, Option<String>>(base + 25)? {
+        metadata = metadata.with_callable_parameter_types(decode_signature_metadata_json(
+            "callable_parameter_types",
+            &types,
+        )?);
+    }
+    Ok(metadata)
+}
+
+fn signature_metadata_identity_from_row(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    column: &str,
+) -> rusqlite::Result<Option<StructuredTypeIdentity>> {
+    row.get::<_, Option<String>>(index)?
+        .map(|text| decode_signature_metadata_json(column, &text))
+        .transpose()
+}
+
+/// The arity trio starting at `index`. The schema keeps the three columns all
+/// present or all absent, so a half-present triple is a corrupted store rather
+/// than a case to interpret.
+fn signature_metadata_arity_from_row(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<CallableArity>> {
+    let (Some(required), Some(total), Some(repeated)) = (
+        row.get::<_, Option<i64>>(index)?,
+        row.get::<_, Option<i64>>(index + 1)?,
+        row.get::<_, Option<i64>>(index + 2)?,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(CallableArity::new(
+        i64_to_usize(required).map_err(rusqlite_error_from_store)?,
+        i64_to_usize(total).map_err(rusqlite_error_from_store)?,
+        repeated != 0,
+    )))
 }
 
 fn deserialize_blob<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
@@ -10389,6 +11014,9 @@ mod tests {
     use crate::analyzer::cpp::CppAdapter;
     use crate::analyzer::go::GoAdapter;
     use crate::analyzer::java::JavaAdapter;
+    use crate::analyzer::model::{
+        MAX_SIGNATURE_METADATA_COLUMN_BYTES, StructuredTypeIdentityBuilder, StructuredTypeName,
+    };
     use crate::analyzer::php::PhpAdapter;
     use crate::analyzer::python::PythonAdapter;
     use crate::analyzer::ruby::RubyAdapter;
@@ -10431,28 +11059,238 @@ mod tests {
         assert_eq!(hydrated_package_segment_count, 0);
     }
 
-    #[test]
-    fn signature_metadata_blob_admission_has_a_fixed_byte_cap() {
-        let ordinary = SignatureMetadata::new("fn make() -> Service", Vec::new());
-        assert!(
-            !serialize_signature_metadata_blob(&ordinary)
-                .expect("serialize ordinary metadata")
-                .is_empty()
+    /// One `SignatureMetadata` with every field carrying a non-default value.
+    ///
+    /// The round-trip test below is only as strong as this value is complete:
+    /// a field that stays at its default here would round-trip through a
+    /// column that the encoder never writes and the decoder never reads.
+    fn fully_populated_signature_metadata() -> SignatureMetadata {
+        let named = |path: &str| {
+            StructuredTypeName::new(vec![path.to_string()], vec!["outer".to_string()], true)
+                .expect("structured type name")
+        };
+        let mut builder = StructuredTypeIdentityBuilder::default();
+        let key = builder.named(named("String")).unwrap();
+        let value = builder.named(named("Widget")).unwrap();
+        let map = builder.map(key, value).unwrap();
+        let base = builder.named(named("Registry")).unwrap();
+        let generic = builder.generic(base, vec![map]).unwrap();
+        let return_type_identity = builder.finish(generic).expect("return identity");
+
+        let mut underlying = StructuredTypeIdentityBuilder::default();
+        let element = underlying.named(named("Operation")).unwrap();
+        let pointer = underlying.pointer(element).unwrap();
+        let array = underlying.array(pointer).unwrap();
+        let underlying_type_identity = underlying.finish(array).expect("underlying identity");
+
+        let mut receiver = StructuredTypeIdentityBuilder::default();
+        let receiver_named = receiver.named(named("Receiver")).unwrap();
+        let receiver_slice = receiver.slice(receiver_named).unwrap();
+        let extension_receiver_type_identity = receiver.finish(receiver_slice).expect("receiver");
+
+        SignatureMetadata::new(
+            "fn build(first: String, second: Widget) -> Registry<Map<String, Widget>>",
+            vec![
+                ParameterMetadata::new("first: String", 9, 22),
+                ParameterMetadata::new("second: Widget", 24, 38),
+            ],
+        )
+        .with_return_type_text(Some("Registry<Map<String, Widget>>"))
+        .with_return_type_identity(Some(return_type_identity))
+        .with_underlying_type_identity(Some(underlying_type_identity))
+        .with_declaration_only(true)
+        .with_callable_arity(CallableArity::new(2, 3, true))
+        .with_type_parameters(vec!["T".to_string(), "U".to_string()])
+        .with_bare_return_type_parameter(Some("T"))
+        .with_callable_linkage(CallableLinkage::External)
+        .with_dispatch_extensibility(DispatchExtensibility::Closed)
+        .with_extension_receiver_type(Some("Receiver"))
+        .with_extension_receiver_type_identity(Some(extension_receiver_type_identity))
+        .with_extension_receiver_is_unconstrained_type_parameter(true)
+        .with_field_modifiers(true, true)
+        .with_field_initializer(true)
+        .with_cpp_field_linkage(CppFieldLinkage::InternalUnlessExternalPeer)
+        .with_companion_object(true)
+        .with_callable_modifiers(true, true, DeclaredVisibility::PackagePrivate)
+        .with_callable_parameter_types(vec!["String".to_string(), "Widget".to_string()])
+        .with_callable_native(true)
+        .with_class_like_interface(true)
+        .with_class_like_static(true)
+    }
+
+    /// Write `metadata` as the signature rows of one unit of `file`, then read
+    /// them back through every reader the store has.
+    ///
+    /// Four queries decode this table positionally from one shared column
+    /// list, so a round trip that exercises only one of them proves almost
+    /// nothing about the other three.
+    fn assert_signature_metadata_round_trips<A: LanguageAdapter>(
+        adapter: &A,
+        lang: &str,
+        file: &ProjectFile,
+        metadata: &[SignatureMetadata],
+    ) {
+        let source = file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let mut state = parse_state(adapter, file);
+        let target = state
+            .signature_metadata
+            .iter()
+            .find(|(_, entries)| !entries.is_empty())
+            .map(|(unit, _)| unit.clone())
+            .expect("fixture should produce signature metadata");
+        state.signature_metadata.clear();
+        state
+            .signature_metadata
+            .insert(target.clone(), metadata.to_vec());
+        let state = Arc::new(state);
+
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation = store
+            .ensure_language_epoch_value(lang, "signature-metadata-round-trip")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, lang, generation, adapter, state.as_ref())
+            .unwrap();
+
+        let limited = store
+            .signature_metadata_for_unit_limited(oid, lang, generation, &target, usize::MAX)
+            .unwrap();
+        assert!(limited.complete, "{lang}: bounded read must complete");
+        assert_eq!(limited.rows, metadata, "{lang}: bounded per-unit reader");
+
+        let hydrated = store
+            .hydrate_file_state_with_source(oid, lang, generation, adapter, file, &source)
+            .unwrap()
+            .expect("single-file hydration");
+        assert_eq!(
+            hydrated.signature_metadata.get(&target).map(Vec::as_slice),
+            Some(metadata),
+            "{lang}: single-file hydration reader"
         );
 
-        let oversized =
-            SignatureMetadata::new("x".repeat(MAX_SIGNATURE_METADATA_BLOB_BYTES), Vec::new());
-        assert!(
-            serialize_signature_metadata_blob(&oversized)
-                .expect_err("oversized metadata must fail before allocation")
-                .to_string()
-                .contains("exceeding"),
-            "oversized signature metadata must fail the non-allocating size preflight"
+        let bulk = store
+            .hydrate_file_states(
+                &[(file.clone(), oid)],
+                lang,
+                adapter,
+                &HashMap::from_iter([(file.clone(), source.clone())]),
+            )
+            .unwrap();
+        assert_eq!(
+            bulk.get(file)
+                .expect("bulk hydration")
+                .signature_metadata
+                .get(&target)
+                .map(Vec::as_slice),
+            Some(metadata),
+            "{lang}: bulk hydration reader"
+        );
+
+        // The usage-fact projection outer-joins ordinal 0 only, and only for
+        // units the adapter put in declarations.
+        let usage_row = store
+            .usage_fact_rows_by_lang(lang)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.candidate.short_name == target.short_name())
+            .expect("usage-fact row for the target unit");
+        assert_eq!(
+            usage_row.signature_metadata.as_ref(),
+            metadata.first(),
+            "{lang}: usage-fact projection reader"
         );
     }
 
     #[test]
-    fn bounded_regression_oversized_signature_metadata_cannot_publish_a_complete_blob() {
+    fn signature_metadata_columns_round_trip_through_every_reader() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let populated = fully_populated_signature_metadata();
+        let bare = SignatureMetadata::new("make", Vec::new());
+        let rows = [populated, bare];
+
+        assert_signature_metadata_round_trips(
+            &RubyAdapter,
+            "ruby",
+            &write_file(
+                temp.path(),
+                "factory.rb",
+                "class Factory\n  def make(value)\n    value\n  end\nend\n",
+            ),
+            &rows,
+        );
+        assert_signature_metadata_round_trips(
+            &JavaAdapter,
+            "java",
+            &write_file(
+                temp.path(),
+                "Factory.java",
+                "class Factory { Object make(Object value) { return value; } }\n",
+            ),
+            &rows,
+        );
+    }
+
+    /// Plain SQL over the persisted table answers a question about real parsed
+    /// source, with no Rust decoding step in between.
+    ///
+    /// This is what the promotion bought and the only test that proves it: the
+    /// round-trip test above reads back values it built itself, and would still
+    /// pass if the columns held anything self-consistent. Here a Java field with
+    /// an initializer and a Java field without one are told apart by a `SUM`
+    /// over one column of an on-disk store file, which is precisely what a
+    /// consumer had to decode two million bincode blobs to learn before.
+    #[test]
+    fn a_persisted_java_field_initializer_is_readable_as_plain_sql() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Config.java",
+            "class Config { static final int LIMIT = 7; int unset; }\n",
+        );
+        let source = file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let state = parse_state(&JavaAdapter, &file);
+        let store = AnalyzerStore::open_persistent(
+            &temp
+                .path()
+                .join(brokk_bifrost_core::cache_db::cache_db_file_name()),
+        )
+        .unwrap();
+        let generation = store
+            .ensure_language_epoch_value("java", "field-initializer-observation")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+            .unwrap();
+
+        let conn = store.conn.lock().expect("store mutex");
+        let (rows, initialized, labels): (i64, i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(field_has_initializer), 0),
+                        COALESCE(GROUP_CONCAT(label, ' | '), '')
+                 FROM unit_signature_metadata",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            rows >= 2,
+            "the fixture's two fields must persist signature rows: {labels}"
+        );
+        assert_eq!(
+            initialized, 1,
+            "exactly the initialized field must report one: {labels}"
+        );
+    }
+
+    /// The size cap is a schema CHECK now, not a read-side gate, so an
+    /// oversized row must fail its INSERT and take the whole blob's
+    /// transaction with it. The previous shape of this test corrupted a stored
+    /// blob with `zeroblob` and asserted the readers nulled it out; there is no
+    /// longer a column that can hold such a value.
+    #[test]
+    fn oversized_signature_metadata_is_rejected_by_the_schema_and_publishes_nothing() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
             temp.path(),
@@ -10471,7 +11309,7 @@ mod tests {
         state.signature_metadata.insert(
             target,
             vec![SignatureMetadata::new(
-                "x".repeat(MAX_SIGNATURE_METADATA_BLOB_BYTES),
+                "x".repeat(MAX_SIGNATURE_METADATA_COLUMN_BYTES + 1),
                 Vec::new(),
             )],
         );
@@ -10481,20 +11319,40 @@ mod tests {
             .ensure_language_epoch_value("ruby", "oversized-signature-metadata-write-v1")
             .unwrap();
 
-        let prepare_error = AnalyzerStore::prepare_parsed_blob(
+        let prepared = AnalyzerStore::prepare_parsed_blob(
             oid,
             "ruby",
             generation,
             &RubyAdapter,
             Arc::clone(&state),
         )
-        .expect_err("preparation must reject oversized signature metadata");
-        assert!(prepare_error.to_string().contains("exceeding"));
+        .expect("preparation encodes columns without enforcing the cap");
+        let (outcomes, _) = store.persist_prepared_blobs(
+            vec![prepared],
+            PersistBatchLimits {
+                max_blobs: usize::MAX,
+                max_rows: usize::MAX,
+                max_payload_bytes: usize::MAX,
+            },
+        );
+        let prepared_error = outcomes[0]
+            .error
+            .as_ref()
+            .expect("the prepared write must fail")
+            .to_string();
+        assert!(
+            prepared_error.contains("CHECK constraint failed"),
+            "SQLite must reject the oversized label itself: {prepared_error}"
+        );
 
         let write_error = store
             .write_parsed_blob_at_generation(oid, "ruby", generation, &RubyAdapter, state.as_ref())
-            .expect_err("direct persistence must reject oversized signature metadata");
-        assert!(write_error.to_string().contains("exceeding"));
+            .expect_err("direct persistence must reject oversized signature metadata")
+            .to_string();
+        assert!(
+            write_error.contains("CHECK constraint failed"),
+            "SQLite must reject the oversized label itself: {write_error}"
+        );
         assert!(
             !store
                 .contains_parsed_blob_at_generation(oid, "ruby", generation)
@@ -10503,135 +11361,61 @@ mod tests {
         );
     }
 
+    /// Both signature-metadata readers that join reach their rows through the
+    /// table's own primary key. A full scan here is a per-language table walk
+    /// on a table measured at two million rows.
     #[test]
-    fn resource_bound_oversized_current_epoch_signature_metadata_fails_closed() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let file = write_file(
-            temp.path(),
-            "factory.rb",
-            "class Service\nend\nclass Factory\n  def make(value)\n    Service.new\n  end\nend\n",
-        );
-        let source = file.read_to_string().unwrap();
-        let oid = oid_for(source.as_bytes());
-        let state = parse_state(&RubyAdapter, &file);
-        let target = state
-            .signature_metadata
-            .iter()
-            .find(|(_, metadata)| !metadata.is_empty())
-            .map(|(unit, _)| unit.clone())
-            .expect("fixture should produce signature metadata");
+    fn signature_metadata_readers_seek_the_primary_key() {
         let store = AnalyzerStore::open_in_memory().unwrap();
-        let generation = store
-            .ensure_language_epoch_value("ruby", "oversized-signature-metadata-v1")
-            .unwrap();
-        store
-            .write_parsed_blob_at_generation(oid, "ruby", generation, &RubyAdapter, &state)
-            .unwrap();
-
-        let oversized_len = MAX_SIGNATURE_METADATA_BLOB_BYTES + 1;
-        {
-            let conn = store.conn.lock().unwrap();
-            let unit_key: i64 = conn
-                .query_row(
-                    "SELECT metadata.unit_key
-                     FROM unit_signature_metadata AS metadata
-                     JOIN code_units AS units
-                       ON units.blob_oid = metadata.blob_oid
-                      AND units.lang = metadata.lang
-                     AND units.unit_key = metadata.unit_key
-                     WHERE units.blob_oid = ?1
-                       AND units.lang = 'ruby'
-                       AND units.exact_fqn = ?2
-                       AND units.kind = ?3
-                       AND units.short_name = ?4
-                       AND units.signature IS ?5
-                       AND units.synthetic = ?6
-                     ORDER BY metadata.ordinal
-                     LIMIT 1",
-                    params![
-                        oid.to_string(),
-                        target.fq_name(),
-                        code_unit_kind_to_i64(target.kind()),
-                        target.short_name(),
-                        target.signature(),
-                        bool_to_i64(target.is_synthetic()),
-                    ],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(
-                conn.execute(
-                    "UPDATE unit_signature_metadata
-                     SET metadata = zeroblob(?3)
-                     WHERE blob_oid = ?1
-                       AND lang = 'ruby'
-                       AND unit_key = ?2
-                       AND ordinal = 0",
-                    params![
-                        oid.to_string(),
-                        unit_key,
-                        i64::try_from(oversized_len).unwrap()
-                    ],
-                )
-                .unwrap(),
-                1
-            );
-            assert_eq!(
-                conn.query_row(
-                    "SELECT length(metadata)
-                     FROM unit_signature_metadata
-                     WHERE blob_oid = ?1
-                       AND lang = 'ruby'
-                       AND unit_key = ?2
-                       AND ordinal = 0",
-                    params![oid.to_string(), unit_key],
-                    |row| row.get::<_, usize>(0),
-                )
-                .unwrap(),
-                oversized_len
-            );
-        }
-
-        assert!(
-            store
-                .usage_fact_rows_by_lang("ruby")
-                .unwrap_err()
-                .to_string()
-                .contains("signature metadata blob exceeds"),
-            "usage-fact projection must reject the oversized row without materializing it"
-        );
-        assert!(
-            store
-                .hydrate_file_state_with_source(
-                    oid,
-                    "ruby",
-                    generation,
-                    &RubyAdapter,
-                    &file,
-                    &source,
-                )
+        let conn = store.conn.lock().expect("store mutex");
+        let explain = |sql: &str, parameters: &[&str]| {
+            let mut statement = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare plan");
+            statement
+                .query_map(params_from_iter(parameters.iter().copied()), |row| {
+                    row.get::<_, String>(3)
+                })
                 .unwrap()
-                .is_none(),
-            "full hydration must skip the oversized row and fail its side-table count"
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        let columns = signature_metadata_value_columns_sql("metadata");
+        let batch_plan = explain(
+            &format!(
+                "SELECT metadata.blob_oid, metadata.unit_key, {columns}
+                 FROM unit_signature_metadata AS metadata
+                 WHERE metadata.lang = ? AND metadata.blob_oid IN (?, ?)
+                 ORDER BY metadata.blob_oid, metadata.unit_key, metadata.ordinal"
+            ),
+            &["java", "oid-a", "oid-b"],
         );
         assert!(
-            !store
-                .hydrate_file_states(
-                    &[(file.clone(), oid)],
-                    "ruby",
-                    &RubyAdapter,
-                    &HashMap::from_iter([(file.clone(), source)]),
-                )
-                .unwrap()
-                .contains_key(&file),
-            "bulk hydration must skip the oversized row and fail its side-table count"
+            batch_plan
+                .iter()
+                .any(|detail| detail.contains("SEARCH metadata USING PRIMARY KEY")),
+            "the batch reader must seek the primary key: {batch_plan:#?}"
         );
-        let limited = store
-            .signature_metadata_for_unit_limited(oid, "ruby", generation, &target, usize::MAX)
-            .unwrap();
-        assert!(!limited.complete);
-        assert!(limited.rows.is_empty());
-        assert_eq!(limited.inspected, 1);
+        assert!(
+            batch_plan.iter().all(|detail| !detail.contains("SCAN")),
+            "the batch reader must not scan any table: {batch_plan:#?}"
+        );
+
+        let joined_plan = explain(
+            signature_metadata_for_unit_limited_sql(),
+            &["oid-a", "java", "a.B", "1", "B", "sig", "0", "10"],
+        );
+        assert!(
+            joined_plan
+                .iter()
+                .any(|detail| detail.contains("SEARCH metadata USING PRIMARY KEY")),
+            "the joined reader must seek the primary key: {joined_plan:#?}"
+        );
+        assert!(
+            joined_plan.iter().all(|detail| !detail.contains("SCAN")),
+            "the joined reader must not scan any table: {joined_plan:#?}"
+        );
     }
 
     #[test]
@@ -11678,8 +12462,8 @@ mod tests {
                             .search_candidate_name_rows_for_langs(
                                 &["java".to_string()],
                                 &generations,
-                                &[expected_oid],
-                                Some(&["Service"]),
+                                &[ActiveSearchBlob::unfiltered(expected_oid)],
+                                Some(&[vec!["Service".to_string()]]),
                                 None,
                             )
                             .unwrap();
@@ -11768,8 +12552,11 @@ mod tests {
             .search_candidate_name_rows_for_langs(
                 &languages,
                 &generations,
-                &[java_oid, rust_oid],
-                Some(&["run", "Service"]),
+                &[
+                    ActiveSearchBlob::unfiltered(java_oid),
+                    ActiveSearchBlob::unfiltered(rust_oid),
+                ],
+                Some(&[vec!["run".to_string()], vec!["Service".to_string()]]),
                 None,
             )
             .unwrap();
@@ -11784,6 +12571,163 @@ mod tests {
             rows.rows
                 .iter()
                 .any(|row| row.lang_index == 1 && row.blob_oid == rust_oid)
+        );
+    }
+
+    /// The prefilter must not change how the candidate scan is driven. A
+    /// `LIKE '%literal%'` can never seek an index, so what is pinned here is the
+    /// join order it could have flipped: the live blob set stays the outer table
+    /// and `code_units` stays a primary-key seek from it. The reverse plan --
+    /// scanning `code_units` and probing the temp table -- reads every
+    /// declaration of every language in the database instead of only the live
+    /// ones (issue #2316).
+    #[test]
+    fn search_candidate_name_plan_is_driven_by_the_live_blob_set() {
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        sync_active_blob_oids(&conn, &[]).unwrap();
+        let langs = vec!["rust".to_string(), "python".to_string()];
+        let plan_for = |required_literals: Option<&[Vec<String>]>| {
+            let (sql, literals) = search_candidate_name_rows_sql(&langs, required_literals);
+            let mut statement = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare plan");
+            let parameters = langs
+                .iter()
+                .chain(literals.iter())
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            statement
+                .query_map(params_from_iter(parameters), |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        let unfiltered = plan_for(None);
+        let prefiltered = plan_for(Some(&[
+            vec!["valueflow".to_string()],
+            vec!["taint".to_string()],
+        ]));
+        assert_eq!(
+            unfiltered, prefiltered,
+            "the prefilter must not change the plan"
+        );
+        assert!(
+            prefiltered
+                .iter()
+                .any(|detail| detail.contains("SEARCH active USING PRIMARY KEY")),
+            "the live blob set must be sought, not scanned: {prefiltered:#?}"
+        );
+        assert!(
+            prefiltered
+                .iter()
+                .any(|detail| detail.contains("SEARCH units USING PRIMARY KEY")),
+            "declarations must be sought per live blob: {prefiltered:#?}"
+        );
+        assert!(
+            !prefiltered
+                .iter()
+                .any(|detail| detail.contains("SCAN units")),
+            "the declaration table must never be scanned: {prefiltered:#?}"
+        );
+    }
+
+    /// A literal is matched as text, so the two characters `LIKE` would read as
+    /// wildcards are escaped for `ESCAPE '\'`.
+    #[test]
+    fn like_contains_pattern_escapes_wildcards() {
+        assert_eq!(like_contains_pattern("valueflow"), "%valueflow%");
+        assert_eq!(like_contains_pattern("run_taint"), r"%run\_taint%");
+        assert_eq!(like_contains_pattern(r"a%b_c\d"), r"%a\%b\_c\\d%");
+    }
+
+    /// Issue #2316: the candidate scan is prefiltered by the literals every
+    /// pattern requires, and the two live-name channels a persisted column
+    /// cannot express keep their declarations.
+    #[test]
+    fn active_symbol_candidate_scan_prefilters_on_required_literals() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "demo/AlphaService.java",
+            "package demo; class AlphaService { void run() {} }\nclass BetaWorker { void work() {} }\n",
+        );
+        let oid = oid_for(file.read_to_string().unwrap().as_bytes());
+        let store = AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap();
+        store
+            .write_parsed_blob(oid, "java", &JavaAdapter, &parse_state(&JavaAdapter, &file))
+            .unwrap();
+        let languages = vec!["java".to_string()];
+        let generations = HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]);
+        let scan = |blob: ActiveSearchBlob, literals: Option<&[Vec<String>]>| {
+            store
+                .search_candidate_name_rows_for_langs(
+                    &languages,
+                    &generations,
+                    &[blob],
+                    literals,
+                    None,
+                )
+                .unwrap()
+                .rows
+                .into_iter()
+                .map(|row| row.short_name)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+
+        let all = scan(ActiveSearchBlob::unfiltered(oid), None);
+        assert!(
+            all.contains("AlphaService")
+                && all.contains("BetaWorker")
+                && all.contains("AlphaService.run"),
+            "{all:?}"
+        );
+
+        let beta = scan(
+            ActiveSearchBlob::unfiltered(oid),
+            Some(&[vec!["betaworker".to_string()]]),
+        );
+        assert!(
+            beta.contains("BetaWorker") && !beta.contains("AlphaService"),
+            "a required literal must narrow the scan: {beta:?}"
+        );
+        assert!(beta.len() < all.len(), "{beta:?} vs {all:?}");
+
+        assert!(
+            scan(
+                ActiveSearchBlob::unfiltered(oid),
+                Some(&[vec!["zzz".to_string()]])
+            )
+            .is_empty(),
+            "a literal no name contains must leave nothing to match"
+        );
+
+        // The blob's live path supplies a package prefix no persisted column
+        // spells out, so its declarations survive a literal only that prefix has.
+        assert_eq!(
+            scan(
+                ActiveSearchBlob {
+                    oid,
+                    package_literals: "zzz".to_string(),
+                    prefilter_exempt: false,
+                },
+                Some(&[vec!["zzz".to_string()]])
+            ),
+            all
+        );
+
+        // A blob whose package prefixes cannot be enumerated is never filtered.
+        assert_eq!(
+            scan(
+                ActiveSearchBlob {
+                    oid,
+                    package_literals: String::new(),
+                    prefilter_exempt: true,
+                },
+                Some(&[vec!["zzz".to_string()]])
+            ),
+            all
         );
     }
 
@@ -11907,6 +12851,90 @@ mod tests {
         let changes_after_warm_sync = store.conn.lock().expect("store mutex").total_changes();
 
         assert_eq!(changes_after_warm_sync, changes_after_cold_sync);
+    }
+
+    /// Every table the full verification predicate re-counts. The read-path
+    /// membership plan must name none of them.
+    fn verified_fact_tables() -> Vec<&'static str> {
+        let mut tables = vec![
+            "code_units",
+            "unit_ranges",
+            "unit_signatures",
+            "unit_signature_metadata",
+            "unit_supertypes",
+            "unit_children",
+            "import_statements",
+            "type_identifiers",
+            "blob_optional_fact_manifest",
+        ];
+        tables.extend(
+            OPTIONAL_FACT_DESCRIPTORS
+                .iter()
+                .map(|descriptor| descriptor.table),
+        );
+        tables
+    }
+
+    /// The hydration membership query must seek both keyed tables it names and
+    /// read no fact table at all. A plan that reaches a fact table is the full
+    /// verification predicate leaking back onto the read path, which is what
+    /// charged 56.2 us per key on the firefox cold start.
+    #[test]
+    fn read_path_membership_query_seeks_keys_without_reading_fact_tables() {
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let sql = parsed_blob_keys_sql(2, "", read_path_parsed_blob_condition());
+        let mut statement = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare plan");
+        let parameters = vec![None::<String>; 4];
+        let plan = statement
+            .query_map(params_from_iter(parameters.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("SEARCH meta USING PRIMARY KEY")),
+            "the requested key must seek blob_meta: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("SEARCH active_blob USING PRIMARY KEY")),
+            "the active-generation check must seek blobs: {plan:#?}"
+        );
+        for table in verified_fact_tables() {
+            assert!(
+                !plan.iter().any(|detail| detail.contains(table)),
+                "the read-path plan must not touch {table}: {plan:#?}"
+            );
+        }
+    }
+
+    /// The read path takes membership by default and the full condition only
+    /// when the diagnostic switch asks for it.
+    #[test]
+    fn read_path_predicate_is_membership_unless_the_switch_asks_for_full() {
+        assert_eq!(
+            read_path_parsed_blob_condition(),
+            PARSED_BLOB_COMPLETE_CONDITION
+        );
+        assert!(!full_read_path_integrity_requested(None));
+        assert!(!full_read_path_integrity_requested(Some(
+            std::ffi::OsStr::new("")
+        )));
+        assert!(!full_read_path_integrity_requested(Some(
+            std::ffi::OsStr::new("membership")
+        )));
+        assert!(full_read_path_integrity_requested(Some(
+            std::ffi::OsStr::new("full")
+        )));
+        assert!(full_read_path_integrity_requested(Some(
+            std::ffi::OsStr::new("FULL")
+        )));
     }
 
     #[test]
@@ -12596,6 +13624,310 @@ mod tests {
     }
 
     #[test]
+    fn cpp_namespaced_plain_fragment_boundary_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "types.h",
+            "#define DEPRECATED(message)\n\
+             namespace demo {\n\
+             struct Base {\n\
+             int legacy() const DEPRECATED(\"use replacement\") { return 1; }\n\
+             int replacement() const;\n\
+             };\n\
+             struct Derived : Base {};\n\
+             }\n",
+        );
+        let state = Arc::new(parse_state(&CppAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_epoch = epoch::cpp_epoch_before_namespaced_plain_fragment_boundary();
+        let prior_generation = store
+            .ensure_language_epoch_value("cpp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .unwrap(),
+            vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    #[test]
+    fn cpp_templated_plain_fragment_ownership_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "particle_tile.h",
+            "namespace demo {\n\
+             template <class T> struct ParticleTile {\n\
+             using Alias = T;\n\
+             Alias get() const;\n\
+             };\n\
+             }\n",
+        );
+        let state = Arc::new(parse_state(&CppAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_epoch = epoch::cpp_epoch_before_templated_plain_fragment_ownership();
+        let prior_generation = store
+            .ensure_language_epoch_value("cpp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .unwrap(),
+            vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    #[test]
+    fn cpp_macro_displaced_callable_name_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "real_box.h",
+            "class RealBox {\n\
+             public:\n\
+             [[nodiscard]] AMREX_GPU_HOST_DEVICE\n\
+             Real hi(int dir) const noexcept { return dir; }\n\
+             };\n",
+        );
+        let state = Arc::new(parse_state(&CppAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_epoch = epoch::cpp_epoch_before_macro_displaced_callable_name();
+        let prior_generation = store
+            .ensure_language_epoch_value("cpp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .unwrap(),
+            vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    #[test]
+    fn cpp_explicit_object_arity_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "visitor.h",
+            "struct Visitor {\n\
+             void fail(this auto const& self) {}\n\
+             };\n",
+        );
+        let state = Arc::new(parse_state(&CppAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_epoch = epoch::cpp_epoch_before_explicit_object_callable_arity();
+        let prior_generation = store
+            .ensure_language_epoch_value("cpp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .unwrap(),
+            vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    #[test]
+    fn cpp_macro_template_return_owner_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "ops-inl.h",
+            "template <class T> struct Vec128 {};\n\
+             template <class T> using Vec64 = Vec128<T>;\n\
+             HWY_API Vec64<unsigned> LowerHalf(Vec128<unsigned> value) { return {}; }\n",
+        );
+        let state = Arc::new(parse_state(&CppAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_epoch = epoch::cpp_epoch_before_macro_template_return_free_function_ownership();
+        let prior_generation = store
+            .ensure_language_epoch_value("cpp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .unwrap(),
+            vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    #[test]
+    fn cpp_abstract_reference_declarator_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "refs.h",
+            "struct Sink {\n\
+             void accept(const int&);\n\
+             };\n\
+             auto ref_of(int& value) -> int&;\n",
+        );
+        let state = Arc::new(parse_state(&CppAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_epoch = epoch::cpp_epoch_before_abstract_reference_declarator_identity();
+        let prior_generation = store
+            .ensure_language_epoch_value("cpp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .unwrap(),
+            vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    #[test]
+    fn cpp_structured_parameter_types_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "overloads.h",
+            "template <typename T, ENABLE(T)>\n\
+             T choose(T value) { return value; }\n",
+        );
+        let state = Arc::new(parse_state(&CppAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_epoch = epoch::cpp_epoch_before_structured_callable_parameter_types();
+        let prior_generation = store
+            .ensure_language_epoch_value("cpp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .unwrap(),
+            vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    #[test]
     fn cpp_plain_fragmented_class_sibling_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(
@@ -12830,6 +14162,52 @@ mod tests {
                 .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
                 .unwrap(),
             vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    #[test]
+    fn ts_inline_return_type_members_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        // The Authelia shape of #2159: the members `id` and `label` exist as
+        // declarations only because the inline return type states them, so a
+        // blob written under the prior epoch holds a strictly smaller unit set.
+        let file = write_file(
+            temp.path(),
+            "hooks.ts",
+            "export function useShape(): { id?: string; label?: string } {\n    return build();\n}\n",
+        );
+        let state = Arc::new(parse_state(&TypescriptAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prior_epoch = epoch::typescript_epoch_before_inline_return_type_members();
+        let prior_generation = store
+            .ensure_language_epoch_value("typescript", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "typescript",
+                prior_generation,
+                &TypescriptAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "typescript").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(
+                Language::TypeScript,
+                &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            )
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "typescript").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "typescript".to_string())])
+                .unwrap(),
+            vec![(oid, "typescript".to_string())]
         );
     }
 
@@ -15051,6 +16429,7 @@ mod tests {
             test_region_units: parsed.test_region_units,
             materialization_records: parsed.materialization_records,
             parse_errors: Some(Vec::new()),
+            parse_complete: true,
         }
     }
 

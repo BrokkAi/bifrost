@@ -207,6 +207,7 @@ impl AnalyzerDelegate {
                 crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input(file)
             }
             Self::CSharp(_) => crate::analyzer::csharp::is_csharp_dependency_input(file),
+            Self::Cpp(_) => brokk_bifrost_cpp::compile_context::is_cpp_compile_context_input(file),
             Self::JavaScript(_) | Self::TypeScript(_) => is_js_ts_config_file(file),
             _ => false,
         }
@@ -276,6 +277,114 @@ pub(crate) fn build_language_delegate(
     })
 }
 
+/// Construction state retained by a workspace so an incremental update can
+/// add a delegate for a language that was not present at startup.
+///
+/// A delegate owns a language-specific fork of `store_context.live_paths`, but
+/// all delegates created for one workspace must continue to share the same
+/// store, GC coordinator, liveness source, and analyzer configuration. Keeping
+/// that state here avoids silently rebuilding a newly discovered language with
+/// default configuration or an unrelated in-memory store. The initial build's
+/// progress callback is deliberately absent: it belongs to that one build and
+/// must neither be retained nor receive later incremental-work notifications.
+#[derive(Clone)]
+pub(crate) struct WorkspaceBuildContext {
+    project: Arc<dyn Project>,
+    config: AnalyzerConfig,
+    store_context: AnalyzerStoreContext,
+    requested_languages: Option<BTreeSet<Language>>,
+    revalidate_filesystem_paths: bool,
+}
+
+impl WorkspaceBuildContext {
+    pub(crate) fn new(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        store_context: AnalyzerStoreContext,
+        requested_languages: Option<BTreeSet<Language>>,
+        revalidate_filesystem_paths: bool,
+    ) -> Self {
+        Self {
+            project,
+            config,
+            store_context,
+            requested_languages: requested_languages.filter(|languages| !languages.is_empty()),
+            revalidate_filesystem_paths,
+        }
+    }
+
+    pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        let mut context = self.clone();
+        context.project = project;
+        context
+    }
+
+    pub(crate) fn project(&self) -> &Arc<dyn Project> {
+        &self.project
+    }
+
+    /// The configuration this workspace was built from, which is where
+    /// behavior a host selects (rather than a per-query budget) lives.
+    pub(crate) fn config(&self) -> &AnalyzerConfig {
+        &self.config
+    }
+
+    pub(crate) fn derived_layer_budget_bytes(&self) -> u64 {
+        self.config.memo_cache_budget_bytes() / 8
+    }
+
+    /// The on-disk path of the analyzer store this workspace was built
+    /// against, or `None` when the store lives only in memory.
+    pub(crate) fn store_db_path(&self) -> Option<&std::path::Path> {
+        self.store_context.store.db_path()
+    }
+
+    fn allows_language(&self, language: Language) -> bool {
+        language != Language::None
+            && self
+                .requested_languages
+                .as_ref()
+                .is_none_or(|languages| languages.contains(&language))
+    }
+
+    pub(crate) fn changed_languages(
+        &self,
+        changed_files: &BTreeSet<ProjectFile>,
+    ) -> BTreeSet<Language> {
+        changed_files
+            .iter()
+            .filter(|file| file.exists() || self.project.has_overlay(file))
+            .map(language_for_file)
+            .filter(|language| self.allows_language(*language))
+            .collect()
+    }
+
+    pub(crate) fn project_languages(&self) -> BTreeSet<Language> {
+        self.project
+            .all_files_shared()
+            .expect("failed to list workspace files while refreshing analyzer languages")
+            .iter()
+            .map(language_for_file)
+            .filter(|language| self.allows_language(*language))
+            .collect()
+    }
+
+    pub(crate) fn build_delegate(
+        &self,
+        language: Language,
+    ) -> Result<AnalyzerDelegate, StoreError> {
+        debug_assert!(self.allows_language(language));
+        build_language_delegate(
+            language,
+            Arc::clone(&self.project),
+            self.config.clone(),
+            self.store_context.clone(),
+            None,
+            self.revalidate_filesystem_paths,
+        )
+    }
+}
+
 fn is_js_ts_config_file(file: &ProjectFile) -> bool {
     matches!(
         file.rel_path().file_name().and_then(|name| name.to_str()),
@@ -285,6 +394,7 @@ fn is_js_ts_config_file(file: &ProjectFile) -> bool {
 
 pub struct MultiAnalyzer {
     delegates: BTreeMap<Language, AnalyzerDelegate>,
+    build_context: Option<Arc<WorkspaceBuildContext>>,
     snapshot_caches: Arc<crate::analyzer::AnalyzerSnapshotCaches>,
     derived_layer_budget_bytes: u64,
     query_contexts: Mutex<Vec<Arc<crate::analyzer::AnalyzerQueryContext>>>,
@@ -300,6 +410,7 @@ impl Clone for MultiAnalyzer {
     fn clone(&self) -> Self {
         Self {
             delegates: self.delegates.clone(),
+            build_context: self.build_context.clone(),
             snapshot_caches: Arc::clone(&self.snapshot_caches),
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
@@ -319,8 +430,25 @@ impl MultiAnalyzer {
         delegates: BTreeMap<Language, AnalyzerDelegate>,
         derived_layer_budget_bytes: u64,
     ) -> Self {
+        Self::new_with_build_context(delegates, derived_layer_budget_bytes, None)
+    }
+
+    pub(crate) fn new_for_workspace(
+        delegates: BTreeMap<Language, AnalyzerDelegate>,
+        build_context: Arc<WorkspaceBuildContext>,
+    ) -> Self {
+        let derived_layer_budget_bytes = build_context.derived_layer_budget_bytes();
+        Self::new_with_build_context(delegates, derived_layer_budget_bytes, Some(build_context))
+    }
+
+    fn new_with_build_context(
+        delegates: BTreeMap<Language, AnalyzerDelegate>,
+        derived_layer_budget_bytes: u64,
+        build_context: Option<Arc<WorkspaceBuildContext>>,
+    ) -> Self {
         Self {
             delegates,
+            build_context,
             snapshot_caches: Arc::new(crate::analyzer::AnalyzerSnapshotCaches::new(
                 derived_layer_budget_bytes,
             )),
@@ -340,6 +468,14 @@ impl MultiAnalyzer {
         &self.delegates
     }
 
+    pub(crate) fn workspace_build_context(&self) -> Option<Arc<WorkspaceBuildContext>> {
+        self.build_context.clone()
+    }
+
+    pub(crate) fn build_context(&self) -> Option<&WorkspaceBuildContext> {
+        self.build_context.as_deref()
+    }
+
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         Self {
             delegates: self
@@ -349,6 +485,10 @@ impl MultiAnalyzer {
                     (*language, delegate.clone_with_project(Arc::clone(&project)))
                 })
                 .collect(),
+            build_context: self
+                .build_context
+                .as_ref()
+                .map(|context| Arc::new(context.clone_with_project(project))),
             snapshot_caches: Arc::new(crate::analyzer::AnalyzerSnapshotCaches::new(
                 self.derived_layer_budget_bytes,
             )),
@@ -1085,6 +1225,14 @@ impl IAnalyzer for MultiAnalyzer {
             .for_each(|delegate| delegate.analyzer().invalidate_cached_file_identities());
     }
 
+    /// Every delegate shares one `Liveness`, and so one identity scan, for the
+    /// workspace: the first delegate that has taken it answers for all of them.
+    fn working_tree_identity(&self) -> Option<Arc<crate::gitblob::WorkingTreeIdentity>> {
+        self.delegates
+            .values()
+            .find_map(|delegate| delegate.analyzer().working_tree_identity())
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         let mut contexts = self
             .query_contexts
@@ -1154,12 +1302,42 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let updated: Vec<(Language, AnalyzerDelegate, bool)> = self
-            .delegates
+        let mut delegates = self.delegates.clone();
+        let active_languages = self
+            .build_context
+            .as_ref()
+            .map(|context| context.project_languages());
+        let missing_languages = self
+            .build_context
+            .as_ref()
+            .map(|context| context.changed_languages(changed_files))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|language| !delegates.contains_key(language))
+            .collect::<BTreeSet<_>>();
+        for language in missing_languages.iter().copied() {
+            let delegate = self
+                .build_context
+                .as_ref()
+                .expect("missing languages require a workspace build context")
+                .build_delegate(language)
+                .unwrap_or_else(|error| {
+                    panic!("failed to initialize {language:?} analyzer during update: {error}")
+                });
+            delegates.insert(language, delegate);
+        }
+
+        let updated: Vec<(Language, AnalyzerDelegate, bool)> = delegates
             .iter()
             .collect::<Vec<_>>()
             .into_par_iter()
             .map(|(language, delegate)| {
+                if missing_languages.contains(language) {
+                    // Construction indexed the complete current language
+                    // file set, including this delta. Applying it again is
+                    // redundant and can schedule avoidable store GC work.
+                    return (*language, delegate.clone(), false);
+                }
                 let relevant: BTreeSet<ProjectFile> = changed_files
                     .iter()
                     .filter(|file| delegate.should_receive_changed_file(*language, file))
@@ -1172,13 +1350,24 @@ impl IAnalyzer for MultiAnalyzer {
                 }
             })
             .collect();
-        let any_delegate_changed = updated.iter().any(|(_, _, changed)| *changed);
+        let any_delegate_changed =
+            !missing_languages.is_empty() || updated.iter().any(|(_, _, changed)| *changed);
         let delegates = updated
             .into_iter()
             .map(|(language, delegate, _)| (language, delegate))
-            .collect();
-        if any_delegate_changed {
-            return Self::new_with_derived_layer_budget(delegates, self.derived_layer_budget_bytes);
+            .filter(|(language, _)| {
+                active_languages
+                    .as_ref()
+                    .is_none_or(|active| active.contains(language))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let retired_delegate = delegates.len() < self.delegates.len() + missing_languages.len();
+        if any_delegate_changed || retired_delegate {
+            return Self::new_with_build_context(
+                delegates,
+                self.derived_layer_budget_bytes,
+                self.build_context.clone(),
+            );
         }
         // No delegate saw a relevant change, so every one of them was cloned
         // and kept everything it had built.  Keeping the workspace-level
@@ -1187,6 +1376,7 @@ impl IAnalyzer for MultiAnalyzer {
         // stale can be served through them either way.
         Self {
             delegates,
+            build_context: self.build_context.clone(),
             snapshot_caches: Arc::clone(&self.snapshot_caches),
             derived_layer_budget_bytes: self.derived_layer_budget_bytes,
             query_contexts: Mutex::new(Vec::new()),
@@ -1194,14 +1384,33 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn update_all(&self) -> Self {
-        let delegates = self
-            .delegates
+        let mut delegates = self.delegates.clone();
+        if let Some(context) = &self.build_context {
+            let active_languages = context.project_languages();
+            delegates.retain(|language, _| active_languages.contains(language));
+            for language in active_languages {
+                if let std::collections::btree_map::Entry::Vacant(entry) = delegates.entry(language)
+                {
+                    let delegate = context.build_delegate(language).unwrap_or_else(|error| {
+                        panic!(
+                            "failed to initialize {language:?} analyzer during full update: {error}"
+                        )
+                    });
+                    entry.insert(delegate);
+                }
+            }
+        }
+        let delegates = delegates
             .iter()
             .collect::<Vec<_>>()
             .into_par_iter()
             .map(|(language, delegate)| (*language, delegate.update_all()))
             .collect();
-        Self::new_with_derived_layer_budget(delegates, self.derived_layer_budget_bytes)
+        Self::new_with_build_context(
+            delegates,
+            self.derived_layer_budget_bytes,
+            self.build_context.clone(),
+        )
     }
 
     /// A view over the delegates' own indexes, never a merged copy.

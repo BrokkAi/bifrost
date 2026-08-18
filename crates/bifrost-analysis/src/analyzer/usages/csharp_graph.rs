@@ -24,6 +24,7 @@ pub(in crate::analyzer::usages) use brokk_bifrost_csharp::graph::resolver::{
     method_return_type_fq_name_for_arity as csharp_method_return_type_fq_name_for_arity,
     method_return_type_fq_name_for_arity_in_session as csharp_method_return_type_fq_name_for_arity_in_session,
     node_text as csharp_node_text, object_created_type as csharp_object_created_type,
+    object_creation_assignment_target as csharp_object_creation_assignment_target,
     object_initializer_for_label as csharp_object_initializer_for_label,
     object_initializer_owner_type_node as csharp_object_initializer_owner_type_node,
     reference_type_text as csharp_reference_type_text,
@@ -152,7 +153,6 @@ pub(in crate::analyzer::usages) fn csharp_visible_extension_method_candidates(
     member: &str,
     call_arity: Option<usize>,
     explicit_generic_arity: Option<usize>,
-    fallback_when_inapplicable: bool,
 ) -> Vec<CodeUnit> {
     brokk_bifrost_csharp::graph::resolver::visible_extension_method_candidates(
         csharp,
@@ -164,7 +164,6 @@ pub(in crate::analyzer::usages) fn csharp_visible_extension_method_candidates(
         member,
         call_arity,
         explicit_generic_arity,
-        fallback_when_inapplicable,
     )
 }
 
@@ -179,7 +178,6 @@ pub(in crate::analyzer::usages) fn csharp_visible_extension_method_candidates_in
     member: &str,
     call_arity: Option<usize>,
     explicit_generic_arity: Option<usize>,
-    fallback_when_inapplicable: bool,
     session: &ResolutionSession,
 ) -> Vec<CodeUnit> {
     brokk_bifrost_csharp::graph::resolver::visible_extension_method_candidates_in_session(
@@ -192,7 +190,6 @@ pub(in crate::analyzer::usages) fn csharp_visible_extension_method_candidates_in
         member,
         call_arity,
         explicit_generic_arity,
-        fallback_when_inapplicable,
         session,
     )
 }

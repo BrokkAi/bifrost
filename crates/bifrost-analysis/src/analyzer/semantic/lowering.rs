@@ -514,6 +514,7 @@ pub(crate) fn schedule_c_style_loop<T, W, Initializer, Expression, Statement, Co
     initializers: &[ScheduledControlNode<T>],
     condition: Option<ScheduledControlNode<T>>,
     condition_entry: ProgramPointId,
+    initial_condition_target: ControlTarget,
     body: ScheduledControlNode<T>,
     updates: &[ScheduledControlNode<T>],
     stack: &mut Vec<W>,
@@ -591,7 +592,7 @@ where
         for (index, initializer) in initializers.iter().enumerate().rev() {
             let next = initializers
                 .get(index + 1)
-                .map_or(condition_entry, |next| next.1);
+                .map_or(initial_condition_target.point, |next| next.1);
             stack.push(initializer_work(
                 initializer.0,
                 initializer.1,
@@ -599,8 +600,13 @@ where
                 loop_scope,
             ));
         }
-    } else if entry != condition_entry {
-        session.add_edge(builder, entry, condition_entry, ControlEdgeKind::Normal)?;
+    } else if entry != initial_condition_target.point {
+        session.add_edge(
+            builder,
+            entry,
+            initial_condition_target.point,
+            initial_condition_target.kind,
+        )?;
     }
     Ok(())
 }
@@ -1560,6 +1566,7 @@ mod tests {
             &[(1, *init_one), (2, *init_two)],
             Some((3, *condition)),
             *condition,
+            ControlTarget::normal(*condition),
             (4, *body),
             &[(5, *update_one), (6, *update_two)],
             &mut stack,

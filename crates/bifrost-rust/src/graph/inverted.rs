@@ -38,8 +38,9 @@ use crate::hierarchy::canonical_rust_hierarchy_type;
 use crate::imports::{resolve_rust_import_package_scoped, rust_focused_use_path};
 use crate::lexical_scope::RustLexicalScopeIndex;
 use crate::usage::{
-    RustBindingSeeds, RustReferenceNamespace, usage_binding_seeds, usage_exact_root_for_resolution,
-    usage_local_module_prefix_visible_at, usage_reference_at, usage_root_declaration_matches_at,
+    RustBindingSeeds, RustReferenceNamespace, RustSymbolNamespace, usage_binding_seeds,
+    usage_exact_root_for_resolution, usage_local_module_prefix_visible_at, usage_reference_at,
+    usage_root_declaration_matches_at,
 };
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
@@ -545,22 +546,8 @@ impl RustScan<'_> {
         unit: &CodeUnit,
         namespace: RustReferenceNamespace,
     ) -> bool {
-        match namespace {
-            RustReferenceNamespace::Any => {
-                unit.is_module()
-                    || unit.is_function()
-                    || unit.is_field()
-                    || unit.is_class()
-                    || self.rust.is_type_alias(unit)
-                    || unit.is_macro()
-            }
-            RustReferenceNamespace::Value => unit.is_function() || unit.is_field(),
-            RustReferenceNamespace::Type => unit.is_class() || self.rust.is_type_alias(unit),
-            RustReferenceNamespace::Macro => unit.is_macro(),
-            RustReferenceNamespace::PathPrefix => {
-                unit.is_module() || unit.is_class() || self.rust.is_type_alias(unit)
-            }
-        }
+        RustSymbolNamespace::of(self.rust, unit)
+            .is_some_and(|symbol_namespace| symbol_namespace.accepts(namespace))
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {

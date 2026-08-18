@@ -89,36 +89,36 @@ pub fn try_walk_named_tree_preorder<'tree, Error>(
     include_root: bool,
     mut visit: impl FnMut(Node<'tree>) -> Result<WalkControl, Error>,
 ) -> Result<(), Error> {
-    enum Frame<'tree> {
-        Enter(Node<'tree>, bool),
-        NextChild(Node<'tree>, usize),
-    }
+    let mut cursor = root.walk();
+    let mut is_root = true;
 
-    let mut stack = vec![Frame::Enter(root, true)];
-    while let Some(frame) = stack.pop() {
-        match frame {
-            Frame::Enter(node, is_root) => {
-                if node.is_named() && (include_root || !is_root) {
-                    match visit(node)? {
-                        WalkControl::Continue => {}
-                        WalkControl::SkipChildren => continue,
-                        WalkControl::Break => return Ok(()),
-                    }
-                }
-                stack.push(Frame::NextChild(node, 0));
+    loop {
+        let node = cursor.node();
+        let should_descend = if node.is_named() && (include_root || !is_root) {
+            match visit(node)? {
+                WalkControl::Continue => true,
+                WalkControl::SkipChildren => false,
+                WalkControl::Break => return Ok(()),
             }
-            Frame::NextChild(node, index) => {
-                if index >= node.named_child_count() {
-                    continue;
-                }
-                stack.push(Frame::NextChild(node, index + 1));
-                if let Some(child) = node.named_child(index) {
-                    stack.push(Frame::Enter(child, false));
-                }
+        } else {
+            true
+        };
+
+        if should_descend && cursor.goto_first_child() {
+            is_root = false;
+            continue;
+        }
+
+        loop {
+            if cursor.goto_next_sibling() {
+                is_root = false;
+                break;
+            }
+            if !cursor.goto_parent() {
+                return Ok(());
             }
         }
     }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

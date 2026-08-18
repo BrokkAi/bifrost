@@ -364,7 +364,7 @@ pub(super) fn resolve_go(
                 );
             }
             if let Some(outcome) =
-                go_package_selector_chain_outcome(support, package, source, selector)
+                go_package_selector_chain_outcome(analyzer, support, go, package, source, selector)
             {
                 return outcome;
             }
@@ -401,9 +401,14 @@ pub(super) fn resolve_go(
         let name = go_node_text(selector.focused_node(), source);
         let imports = go_import_paths(support, go, file);
         if let Some(import_path) = imports.get(qualifier) {
-            if let Some(outcome) =
-                go_package_selector_chain_outcome(support, import_path, source, selector)
-            {
+            if let Some(outcome) = go_package_selector_chain_outcome(
+                analyzer,
+                support,
+                go,
+                import_path,
+                source,
+                selector,
+            ) {
                 return outcome;
             }
             if go_internal_import_allowed(&importer_package, import_path)
@@ -1254,17 +1259,165 @@ fn go_package_member_candidates(
 }
 
 fn go_package_selector_chain_outcome(
+    analyzer: &dyn IAnalyzer,
     support: &dyn GoDefinitionProvider,
+    go: &GoAnalyzer,
     package: &str,
     source: &str,
     selector: &GoSelectorDescriptor<'_>,
 ) -> Option<DefinitionLookupOutcome> {
-    if selector.focus_segment != 1 {
+    let first_member = selector.member_name(source, 0)?;
+    let mut candidates = go_package_member_candidates(support, package, first_member);
+    if selector.focus_segment == 1 {
+        return (!candidates.is_empty()).then(|| candidates_outcome(candidates));
+    }
+    if candidates.len() != 1 || !support.scope_step() {
         return None;
     }
-    let member = selector.member_name(source, 0)?;
-    let candidates = go_package_member_candidates(support, package, member);
-    (!candidates.is_empty()).then(|| candidates_outcome(candidates))
+
+    let package_variable = candidates.pop()?;
+    let variable_file = package_variable.source().clone();
+    let variable_source = variable_file.read_to_string().ok()?;
+    let variable_tree = parse_go_tree(&variable_source)?;
+    let variable_root = variable_tree.root_node();
+    let binding = go_package_variable_binding(
+        support,
+        variable_root,
+        &variable_source,
+        package_variable.identifier(),
+    )?;
+    let binding_node = match &binding {
+        GoLocalBinding::Type(node)
+        | GoLocalBinding::Value(node)
+        | GoLocalBinding::RangeElement(node) => *node,
+    };
+    let owner = match binding {
+        GoLocalBinding::Type(type_node) => go_inferred_type_from_node(
+            support,
+            type_node,
+            &variable_file,
+            &variable_source,
+            package,
+        ),
+        GoLocalBinding::Value(value_node) => go_expression_inferred_type(
+            analyzer,
+            support,
+            &variable_file,
+            &variable_source,
+            variable_root,
+            value_node,
+            value_node.start_byte(),
+        ),
+        GoLocalBinding::RangeElement(_) => None,
+    };
+    let Some(mut owner) = owner else {
+        return go_external_import_in_expression(
+            support,
+            go,
+            &variable_file,
+            &variable_source,
+            binding_node,
+        )
+        .map(|import_path| {
+            boundary_unchecked(format!(
+                "`{import_path}` is outside this partial Go workspace analysis"
+            ))
+        });
+    };
+    let Some(mut owner_fqn) = go_resolve_inferred_type_fqn(support, go, &owner) else {
+        return go_external_import_in_expression(
+            support,
+            go,
+            &variable_file,
+            &variable_source,
+            binding_node,
+        )
+        .map(|import_path| {
+            boundary_unchecked(format!(
+                "`{import_path}` is outside this partial Go workspace analysis"
+            ))
+        });
+    };
+
+    for member_node in selector.members.iter().take(selector.focus_segment).skip(1) {
+        if !support.scope_step() {
+            return None;
+        }
+        let member = go_node_text(*member_node, source);
+        let lookup = go_indexed_field_lookup_with_method_set(
+            analyzer,
+            support,
+            &owner_fqn,
+            member,
+            Some(&owner),
+        );
+        match lookup {
+            GoDefinitionMemberLookup::Unique(candidate) => {
+                if *member_node == selector.focused_node() {
+                    return Some(candidates_outcome(vec![candidate]));
+                }
+                owner = go_field_inferred_type_for_receiver(
+                    analyzer, support, &owner, &owner_fqn, member,
+                )?;
+                owner_fqn = go_resolve_inferred_type_fqn(support, go, &owner)?;
+            }
+            GoDefinitionMemberLookup::Ambiguous(candidates) => {
+                return Some(go_ambiguous_selector_outcome(support, member, candidates));
+            }
+            GoDefinitionMemberLookup::Missing => {
+                return Some(no_definition(
+                    "no_indexed_definition",
+                    format!("`{member}` is not indexed for Go type `{owner_fqn}`"),
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn go_package_variable_binding<'tree>(
+    support: &dyn GoDefinitionProvider,
+    root: Node<'tree>,
+    source: &str,
+    name: &str,
+) -> Option<GoLocalBinding<'tree>> {
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if !support.scope_step() {
+            return None;
+        }
+        if child.kind() == "var_declaration"
+            && let Some(binding) = go_var_declaration_binding(support, child, source, name)
+        {
+            return Some(binding);
+        }
+    }
+    None
+}
+
+fn go_external_import_in_expression(
+    support: &dyn GoDefinitionProvider,
+    go: &GoAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    expression: Node<'_>,
+) -> Option<String> {
+    let imports = go_import_paths(support, go, file);
+    let mut stack = vec![expression];
+    while let Some(node) = stack.pop() {
+        if !support.scope_step() {
+            return None;
+        }
+        if matches!(node.kind(), "identifier" | "package_identifier")
+            && let Some(import_path) = imports.get(go_node_text(node, source))
+            && !go.workspace_path_index().package_prefix_exists(import_path)
+        {
+            return Some(import_path.clone());
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    None
 }
 
 fn go_model_package_selector_outcome(

@@ -3,7 +3,9 @@ use crate::analyzer::usages::candidates::find_default_candidates_within;
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{CandidateFileProvider, GraphUsageAnalyzer, UsageScanScope};
+use crate::analyzer::usages::traits::{
+    CandidateFileProvider, GraphUsageAnalyzer, PreparedUsageQuery, UsageScanScope,
+};
 use crate::analyzer::{
     AnalyzerQueryScope, CodeUnit, DescendantIndexScope, IAnalyzer, Language, ProjectFile,
 };
@@ -228,6 +230,25 @@ impl<'a> UsageFinder<'a> {
                 return cancelled_query_result();
             }
         }
+        let prepared = if explicit_provider.is_none() {
+            language_support(language_for_target(target)).and_then(|support| {
+                support.usage_strategy().prepare_usage_query(
+                    analyzer,
+                    overloads,
+                    &candidates,
+                    self.authoritative_scope,
+                    &self.cancellation,
+                )
+            })
+        } else {
+            None
+        };
+        if let Some(prepared) = prepared.as_ref() {
+            candidates.extend(prepared.candidate_files().iter().cloned());
+        }
+        if self.cancellation.is_cancelled() {
+            return cancelled_query_result();
+        }
         // Protected files are everything discovered so far; the supplemental files join
         // only afterwards, so both budgets below drop them before touching anything here.
         let mut protected_candidates = candidates.clone();
@@ -275,6 +296,7 @@ impl<'a> UsageFinder<'a> {
             analyzer,
             overloads,
             &scan_scope,
+            prepared.as_deref(),
             max_usages,
         ) {
             GraphUsageOutcome::Resolved(result) => result,
@@ -462,9 +484,13 @@ fn graph_strategy_find_usages(
     analyzer: &dyn IAnalyzer,
     overloads: &[CodeUnit],
     scan_scope: &UsageScanScope<'_>,
+    prepared: Option<&dyn PreparedUsageQuery>,
     max_usages: usize,
 ) -> GraphUsageOutcome {
-    strategy.find_graph_usages(analyzer, overloads, scan_scope, max_usages)
+    match prepared {
+        Some(prepared) => prepared.find_graph_usages(analyzer, overloads, scan_scope, max_usages),
+        None => strategy.find_graph_usages(analyzer, overloads, scan_scope, max_usages),
+    }
 }
 
 fn graph_find_usages(
@@ -472,6 +498,7 @@ fn graph_find_usages(
     analyzer: &dyn IAnalyzer,
     overloads: &[CodeUnit],
     scan_scope: &UsageScanScope<'_>,
+    prepared: Option<&dyn PreparedUsageQuery>,
     max_usages: usize,
 ) -> GraphUsageOutcome {
     match language_support(language) {
@@ -480,6 +507,7 @@ fn graph_find_usages(
             analyzer,
             overloads,
             scan_scope,
+            prepared,
             max_usages,
         ),
         None => GraphUsageOutcome::terminal_failure(
@@ -739,20 +767,10 @@ mod tests {
             .expect("fixture declares collect_it");
 
         let routed = default_route_candidates(&analyzer, &target);
-        let augmentation = augmentation_of(&analyzer, &target);
-        assert!(augmentation.supplemental.is_empty());
-        let hook_only: HashSet<ProjectFile> = augmentation
-            .protected
-            .difference(&routed)
-            .cloned()
-            .collect();
+        let caller = ProjectFile::new(root, "src/aapp/caller.rs");
         assert!(
-            hook_only
-                .iter()
-                .any(|file| file.rel_path().ends_with("caller.rs")),
-            "the re-export caller must be reachable only through Rust's augmentation: \
-             routed={routed:?} augmented={:?}",
-            augmentation.protected
+            !routed.contains(&caller),
+            "the fixture must require Rust's binding graph: routed={routed:?}"
         );
 
         let result = UsageFinder::new().query(
@@ -767,13 +785,11 @@ mod tests {
             UsageQueryCompletion::CandidateFilesBudgetExhausted
         );
         assert_eq!(result.candidate_files.len(), routed.len());
-        for file in &hook_only {
-            assert!(
-                result.candidate_files.contains(file),
-                "{file:?} was dropped although it is protected: {:?}",
-                result.candidate_files
-            );
-        }
+        assert!(
+            result.candidate_files.contains(&caller),
+            "{caller:?} was dropped although it is protected: {:?}",
+            result.candidate_files
+        );
     }
 
     fn php_composer_fixture() -> (tempfile::TempDir, crate::analyzer::PhpAnalyzer, CodeUnit) {

@@ -1,5 +1,6 @@
 use crate::graph::ast::{
-    declared_names, for_each_var_spec, is_definition_identifier, parameter_names, selector_parts,
+    clause_binding_names, clause_statement_list, declared_names, for_each_var_spec,
+    is_definition_identifier, parameter_names, selector_parts,
 };
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine,
@@ -304,6 +305,27 @@ fn seed_go_bindings_before(
             );
             locals.exit_scope();
             return;
+        }
+        "communication_case" | "type_case" | "default_case" => {
+            if let Some(body) = clause_statement_list(node)
+                && body.start_byte() <= cutoff_start
+                && cutoff_start < body.end_byte()
+            {
+                locals.enter_scope();
+                for name in clause_binding_names(node, source) {
+                    locals.declare_shadow(name);
+                }
+                seed_go_bindings_before(
+                    body,
+                    source,
+                    cutoff_start,
+                    target_name,
+                    locals,
+                    shadowed_at_lookup,
+                );
+                locals.exit_scope();
+                return;
+            }
         }
         "short_var_declaration"
             if node.end_byte() <= cutoff_start && !go_is_top_level_decl(node) =>

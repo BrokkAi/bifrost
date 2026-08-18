@@ -3,7 +3,10 @@
 //! likely dead code and one-call abstractions while skipping inconclusive
 //! cases.
 
-use super::{ReportLines, append_ambiguous_path_notes, resolve_project_files, sanitize_table_cell};
+use super::{
+    ReportLines, append_ambiguous_path_notes, resolve_project_files,
+    resolve_project_files_or_all_analyzed, sanitize_table_cell,
+};
 use crate::analyzer::common::language_for_target;
 use crate::analyzer::languages::{
     DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, EdgePassId,
@@ -107,7 +110,15 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         positive_or(params.max_usages_per_symbol, MAX_USAGES_FOR_SMELL as i32) as usize;
     let usage_cap = requested_usage_cap.min(MAX_USAGES_FOR_SMELL);
 
-    let resolved = resolve_project_files(analyzer.project(), params.file_paths);
+    let has_explicit_file_scope = !params.file_paths.is_empty();
+    let resolved = if params.fq_names.is_empty() {
+        resolve_project_files_or_all_analyzed(analyzer, params.file_paths)
+    } else {
+        // FQ-name-only selection already discovers its definitions through the
+        // analyzer index. Keep an empty path list unbounded instead of first
+        // truncating the workspace to `max_input_files`.
+        resolve_project_files(analyzer.project(), params.file_paths)
+    };
     let ambiguous_paths = resolved.ambiguous_paths.clone();
     let resolved_file_count = resolved.files.len();
     let input_files: Vec<ProjectFile> = resolved.files.into_iter().take(input_file_cap).collect();
@@ -121,6 +132,7 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         &input_files,
         &params.fq_names,
         &selected_file_ids,
+        has_explicit_file_scope,
         candidate_cap,
         &mut skipped,
     );
@@ -302,6 +314,7 @@ fn dead_code_candidates(
     files: &[ProjectFile],
     fq_names: &[String],
     selected_file_ids: &HashSet<PathBuf>,
+    restrict_to_selected_files: bool,
     candidate_cap: usize,
     skipped: &mut Vec<String>,
 ) -> CandidateSelection {
@@ -323,7 +336,7 @@ fn dead_code_candidates(
             }
             let mut matched_any = false;
             for definition in definitions {
-                if !selected_file_ids.is_empty()
+                if restrict_to_selected_files
                     && !selected_file_ids.contains(&canonical_file_identity(definition.source()))
                 {
                     continue;

@@ -5,6 +5,9 @@ use std::time::Duration;
 pub struct AnalyzerConfig {
     pub parallelism: Option<usize>,
     pub memo_cache_budget_bytes: Option<u64>,
+    /// Which class-hierarchy expansions call dispatch may add beyond the
+    /// callee the static types already name.
+    pub dispatch_hierarchy_expansion: DispatchHierarchyExpansion,
     pub rust: RustAnalyzerConfig,
     pub jvm: JvmAnalyzerConfig,
     pub csharp: CSharpAnalyzerConfig,
@@ -13,6 +16,64 @@ pub struct AnalyzerConfig {
     pub python: PythonAnalyzerConfig,
     pub ruby: RubyAnalyzerConfig,
     pub php: PhpAnalyzerConfig,
+}
+
+/// Which class-hierarchy expansions call dispatch may add beyond the callee a
+/// call's static types already name.
+///
+/// "Class-hierarchy expansion" means: after dispatch resolves a call to a
+/// method declaration, also offer the workspace methods that implement or
+/// override that declaration as further things the call could reach. Every
+/// expansion here adds *candidates*, never proven call edges.
+///
+/// Two expansions exist, and only one of them is a policy question.
+///
+/// The declaration that has no body at all -- an interface method or an
+/// abstract method -- is always expanded, and is not represented in this type.
+/// Without expansion there is nothing to analyze at that call, so offering the
+/// implementations cannot widen anything: it is the only way to name code that
+/// runs.
+///
+/// The declaration that *does* have a body is the policy question, and it is
+/// [`Self::concrete_overrides`]. A concrete method that subclasses override can
+/// really dispatch to any of those overrides, but the callee the static types
+/// name is already analyzable, so expanding strictly widens the candidate set
+/// and can only add wrong answers as well as right ones. It is therefore off by
+/// default, and enabling it is a measured decision rather than a default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DispatchHierarchyExpansion {
+    /// Offer the workspace overrides of a *concrete* resolved method as further
+    /// dispatch candidates. Off by default.
+    pub concrete_overrides: bool,
+}
+
+impl DispatchHierarchyExpansion {
+    /// Every expansion that is a policy question turned off: exactly the
+    /// behavior a build has when nothing opts in.
+    pub const OFF: Self = Self {
+        concrete_overrides: false,
+    };
+
+    /// Only the concrete-override expansion turned on.
+    pub const CONCRETE_OVERRIDES: Self = Self {
+        concrete_overrides: true,
+    };
+
+    /// The expansion a production analyzer starts from, read once from the
+    /// process environment.
+    ///
+    /// `BIFROST_CHA_CONCRETE_OVERRIDES` set to anything turns the
+    /// concrete-override expansion on. The value is read once because a corpus
+    /// run constructs analyzers repeatedly and re-reading the environment would
+    /// show up in the measurement the switch exists to take. Tests must set
+    /// [`AnalyzerConfig::dispatch_hierarchy_expansion`] directly instead of
+    /// setting the variable: test threads share one process environment.
+    pub fn from_environment() -> Self {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let concrete_overrides =
+            *ENABLED.get_or_init(|| std::env::var_os("BIFROST_CHA_CONCRETE_OVERRIDES").is_some());
+        Self { concrete_overrides }
+    }
 }
 
 /// Explicit, passive evidence for Composer dependency API-pack ingestion.
@@ -361,6 +422,7 @@ impl Default for AnalyzerConfig {
         Self {
             parallelism: Some(default_parallelism()),
             memo_cache_budget_bytes: Some(256 * 1024 * 1024),
+            dispatch_hierarchy_expansion: DispatchHierarchyExpansion::from_environment(),
             rust: RustAnalyzerConfig::default(),
             jvm: JvmAnalyzerConfig::default(),
             csharp: CSharpAnalyzerConfig::default(),

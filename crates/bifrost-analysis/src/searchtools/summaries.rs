@@ -537,11 +537,13 @@ fn summarize_symbol_targets_with_cancellation(
             break;
         }
         let _target_scope = profiling::scope(format!("summarize_symbol_target[{target}]"));
-        // A slash-bearing target without a source extension is a missing
-        // relative directory or package path, not a useful fuzzy symbol. Do
-        // not build the workspace-wide definition index to prove that a path
-        // typo is not a symbol (#1608: a 399k-row Go index added 20 seconds
-        // to an ordinary directory listing request).
+        // A slash-bearing target can be a canonical symbol. Go import paths
+        // make this shape normal. Give exact structured resolution precedence.
+        // If it does not resolve, treat a target without a source extension as
+        // a missing relative directory or package path. Do not build the
+        // workspace-wide definition index to prove that a path typo is not a
+        // symbol (#1608: a 399k-row Go index added 20 seconds to an ordinary
+        // directory listing request).
         //
         // A file-anchored selector (`src/a.js#Widget`) is also slash-bearing
         // and is not itself an explicit source file target -- the anchor is,
@@ -555,6 +557,25 @@ fn summarize_symbol_targets_with_cancellation(
             split_workspace_definition_selector(analyzer, &target),
             DefinitionSelector::FileAnchored { .. }
         );
+        if !file_anchored && (target.contains('/') || target.contains('\\')) {
+            match resolve_selectable_definitions(analyzer, &target, exact_codeunit_resolution) {
+                SelectableDefinitionResolution::Resolved(code_units) => {
+                    extend_symbol_summaries(
+                        analyzer,
+                        &target,
+                        code_units,
+                        &mut summaries,
+                        &mut not_found,
+                    );
+                    continue;
+                }
+                SelectableDefinitionResolution::Ambiguous(item) => {
+                    ambiguous.push(item);
+                    continue;
+                }
+                SelectableDefinitionResolution::NotFound(_) => {}
+            }
+        }
         if !file_anchored
             && (target.contains('/') || target.contains('\\'))
             && !looks_like_explicit_source_file_target(&target)

@@ -224,7 +224,6 @@ impl CsScan<'_> {
                         name,
                         Some(call_arity),
                         explicit_generic_arity,
-                        false,
                     )
                     .into_iter()
                     .map(|extension| extension.fq_name())

@@ -309,7 +309,7 @@ impl KotlinAnalyzer {
             KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name,
         };
 
-        let external = self.external_declarations(packs);
+        let external = self.external_declarations(packs.clone());
         let package_name = self.inner.package_name_of(file).unwrap_or_default();
         let imports = self.inner.import_info_of(file);
         let scope = KotlinNameScope {
@@ -325,13 +325,6 @@ impl KotlinAnalyzer {
                 .resolve_qualified_name(candidate, &package_name)
                 .is_some()
         };
-        let external_type =
-            |spelling: &str| match resolve_kotlin_type_name(spelling, &scope, declares) {
-                KotlinTypeName::Resolved(fqn) => {
-                    external.resolve_qualified_name(&fqn, &package_name)
-                }
-                KotlinTypeName::Ambiguous | KotlinTypeName::Unresolved => None,
-            };
         match resolve_kotlin_type_name(name, &scope, declares) {
             KotlinTypeName::Resolved(fqn) => {
                 return (BoundaryStatus::ExternalIndexed, Some(fqn));
@@ -344,7 +337,9 @@ impl KotlinAnalyzer {
         // A member spelling leaves the workspace exactly as its owner type
         // does, so the member tier runs where the type tier found nothing
         // (#1900). A member the surface does not declare changes nothing.
-        if let Some(member) = external.resolve_member_spelling(name, &package_name, external_type) {
+        // One ladder answers here and in the resolver's own boundary gate, so
+        // a trace and a definition cannot disagree about a spelling (#2287).
+        if let Some(member) = self.resolve_member_name_with_external(packs, file, name) {
             return (
                 BoundaryStatus::ExternalIndexed,
                 Some(member.fqn().to_owned()),
@@ -358,6 +353,64 @@ impl KotlinAnalyzer {
             return (BoundaryStatus::ExternalDeclaredUnindexed, None);
         }
         (BoundaryStatus::ExternalUnknown, None)
+    }
+
+    /// Resolve `raw_name` in `file` as a member spelling -- a written
+    /// `Owner.member` whose head is a type Kotlin's import ladder reaches
+    /// outside the workspace and whose last segment is a member the external
+    /// declaration surface declares (#1900).
+    ///
+    /// This is the Kotlin counterpart of
+    /// `JavaAnalyzer::resolve_member_name_with_external`, and it is what lets
+    /// Kotlin's own unresolved-receiver paths reach the shared import-boundary
+    /// gate (#2287) instead of dying with a plain miss. The owner runs through
+    /// `resolve_kotlin_type_name`, so an aliased import (`import a.b.C as D`,
+    /// written `D.member`) reaches the same declaration the alias names, and a
+    /// name two star imports both bind stays unresolved rather than guessing.
+    ///
+    /// Only the external surface can answer here: a workspace owner's members
+    /// are indexed, and the resolver either found them or did not.
+    pub(crate) fn resolve_member_name_with_external(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Option<crate::analyzer::jvm::external::JvmExternalMember> {
+        use brokk_bifrost_jvm::kotlin::types::{
+            KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name,
+        };
+
+        let normalized = raw_name.trim();
+        if normalized.is_empty() {
+            return None;
+        }
+        let external = self.external_declarations(packs);
+        if external.is_empty() {
+            return None;
+        }
+        let package_name = self.inner.package_name_of(file).unwrap_or_default();
+        let imports = self.inner.import_info_of(file);
+        let scope = KotlinNameScope {
+            package_name: &package_name,
+            imports: &imports,
+            // A reference spelling arrives without its enclosing declaration;
+            // a file-level scope is the resolution every import tier still
+            // sees, and it is the same scope the trace's evidence tier uses.
+            scope_owners: Vec::new(),
+        };
+        let declares = |candidate: &str| {
+            external
+                .resolve_qualified_name(candidate, &package_name)
+                .is_some()
+        };
+        external.resolve_member_spelling(normalized, &package_name, |owner_spelling| {
+            match resolve_kotlin_type_name(owner_spelling, &scope, declares) {
+                KotlinTypeName::Resolved(fqn) => {
+                    external.resolve_qualified_name(&fqn, &package_name)
+                }
+                KotlinTypeName::Ambiguous | KotlinTypeName::Unresolved => None,
+            }
+        })
     }
 
     /// Row-capped projections for bounded receiver queries (issue #1242).
@@ -622,6 +675,10 @@ impl CodeUnitIndex for KotlinAnalyzer {
 impl IAnalyzer for KotlinAnalyzer {
     fn invalidate_cached_file_identities(&self) {
         self.inner.invalidate_cached_file_identities();
+    }
+
+    fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {
+        self.inner.working_tree_identity()
     }
 
     #[cfg(any(test, feature = "test-support"))]

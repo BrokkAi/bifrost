@@ -149,6 +149,70 @@ pub fn identifiers_in_node(node: Node<'_>, source: &str) -> Vec<String> {
     }
     out
 }
+/// Names introduced for one Go switch/select clause. The caller is responsible
+/// for limiting their scope to the clause's `statement_list`.
+pub fn clause_binding_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let binding_node = match node.kind() {
+        "communication_case" => {
+            let communication = node.child_by_field_name("communication");
+            let Some(receive) = communication.filter(|child| child.kind() == "receive_statement")
+            else {
+                return Vec::new();
+            };
+            if !receive_statement_is_short_declaration(receive) {
+                return Vec::new();
+            }
+            receive.child_by_field_name("left")
+        }
+        "type_case" | "default_case" => node
+            .parent()
+            .filter(|parent| parent.kind() == "type_switch_statement")
+            .and_then(|parent| parent.child_by_field_name("alias")),
+        _ => None,
+    };
+    binding_node
+        .map(|binding| {
+            identifiers_in_node(binding, source)
+                .into_iter()
+                .filter(|name| name != "_")
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn receive_statement_is_short_declaration(node: Node<'_>) -> bool {
+    node.kind() == "receive_statement"
+        && (0..node.child_count())
+            .any(|index| node.child(index).is_some_and(|child| child.kind() == ":="))
+}
+
+pub fn is_clause_binding_identifier(node: Node<'_>) -> bool {
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        match current.kind() {
+            "receive_statement" => {
+                return receive_statement_is_short_declaration(current)
+                    && current.child_by_field_name("left").is_some_and(|left| {
+                        left.start_byte() <= node.start_byte() && node.end_byte() <= left.end_byte()
+                    });
+            }
+            "type_switch_statement" => {
+                return current.child_by_field_name("alias").is_some_and(|alias| {
+                    alias.start_byte() <= node.start_byte() && node.end_byte() <= alias.end_byte()
+                });
+            }
+            "expression_list" => ancestor = current.parent(),
+            _ => return false,
+        }
+    }
+    false
+}
+
+pub fn clause_statement_list(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == "statement_list")
+}
 pub fn is_identifier_node(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
@@ -215,6 +279,9 @@ pub fn is_definition_identifier(node: Node<'_>, _source: &str) -> bool {
         return false;
     };
     if node.kind() == "type_identifier" && is_method_receiver_type(node) {
+        return true;
+    }
+    if is_clause_binding_identifier(node) {
         return true;
     }
     if keyed_element_for_key(node).is_some() {

@@ -2,8 +2,8 @@
 name: bifrost-codebase-search
 description: >-
   Discover symbols, structural code shapes, and files with Bifrost's
-  search_symbols, query_code, find_filenames, list_files, scan_usages_by_location, and
-  most_relevant_files tools, with shell grep for arbitrary text.
+  search_symbols, query_code, scan_usages_by_location, and most_relevant_files
+  tools, with host file search for paths and arbitrary text.
 ---
 
 # Bifrost Codebase Search
@@ -18,10 +18,9 @@ that matches the thing you are looking for.
 | Find a symbol by name | `search_symbols` |
 | Find callers, references, or usages | `scan_usages_by_location` |
 | Find language-neutral code shapes | `query_code` |
-| Find files by path or glob | `find_filenames` |
-| List files under a directory | `list_files` |
 | Expand from seed files to related code | `most_relevant_files` |
-| Find arbitrary text | Host shell with `rg` or another built-in grep/search tool |
+| Find files by path or glob | Host file search such as `rg --files` |
+| Find arbitrary text | Host text search such as `rg` |
 
 ## Tips
 
@@ -38,10 +37,8 @@ that matches the thing you are looking for.
   through exact indexed symbol identities; use `scan_usages_by_location` for a
   location-first lookup or `usage_graph` for the narrower whole-workspace graph. The schema reference
   is https://bifrost.brokk.ai/code-query-json/.
-- Use `find_filenames` for path globs, basename searches, and repository file
-  discovery.
-- Use `list_files` when you need a bounded directory listing that respects the
-  workspace file walker.
+- Use the host's file-search support, such as `rg --files`, for path globs,
+  basename searches, and repository file discovery.
 - Use `most_relevant_files` to broaden context from one known file into related
   source and tests.
 - For log messages, string literals, comments, config keys, or any other text

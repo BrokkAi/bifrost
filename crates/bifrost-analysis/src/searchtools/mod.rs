@@ -434,7 +434,7 @@ pub struct RefreshResult {
     pub declarations: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct ActiveWorkspaceResult {
     pub workspace_path: String,
     /// Whether a usage query would wait for background usage-analysis work.

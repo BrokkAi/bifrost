@@ -2,17 +2,17 @@
   "name": "bifrost-vscode",
   "displayName": "Bifrost: Multi-Language LSP & MCP Server",
   "description": "Tree-sitter-backed code intelligence for definitions, references, symbols, hierarchy, rename, diagnostics, and MCP workflows.",
-  "version": "0.10.2",
+  "version": "0.10.3",
   "bifrost": {
-    "binaryVersion": "0.10.2",
-    "minimumBinaryVersion": "0.10.2",
+    "binaryVersion": "0.10.3",
+    "minimumBinaryVersion": "0.10.3",
     "allowPrerelease": false,
     "archiveSha256": {
-      "aarch64-pc-windows-msvc": "86c2187a36a7dc68882999e16a8664ab6f4dcd93bc205b0761821a06def2b98a",
-      "aarch64-unknown-linux-gnu": "498b3401e9d4c14007f4d1a7e821339f51916137ab9ac3d74ce1e7fb3c4fbaf1",
-      "universal-apple-darwin": "c78b2d588633e4c7d8911af737c1055c88ad0011a70577131c2866d591c43f57",
-      "x86_64-pc-windows-msvc": "22426d19851b4fb639d446b5203bca0a361c2c40ee94d4e2eae29a7dbe801f43",
-      "x86_64-unknown-linux-gnu": "f45f521b26e808c8709367b6107a7e9c736b53b17b6e96a69575cc6a2b316a2c"
+      "aarch64-pc-windows-msvc": "35d03fd4a041366f95b9b0f5f6b72ddf73e1ef671c6c932fb75fd49dda1113bb",
+      "aarch64-unknown-linux-gnu": "5578286a4c82a4f757f24d478bbea135bb68c8c17d2a423885ac5df7c9250ad2",
+      "universal-apple-darwin": "e5a2fdd5c11dd3d4fce6b06f580cadca56439178345402bf565fb3551d86ee85",
+      "x86_64-pc-windows-msvc": "96b7b7769207ff8f5307298fc66d68f0f11b1e672f9cb20e737ef14595926b07",
+      "x86_64-unknown-linux-gnu": "6d1c09bc9c8a40cfce5c347c61ec23e362a5d705fb309eeb45fa1c809a568025"
     }
   },
   "publisher": "brokk",
@@ -270,6 +270,10 @@
         "title": "Bifrost: Open RQL Policy Finding"
       },
       {
+        "command": "bifrost.openRqlPolicyDisplayStep",
+        "title": "Bifrost: Open RQL Policy Display Step"
+      },
+      {
         "command": "bifrost.showRuneIr",
         "title": "Bifrost: Show Rune IR"
       }
@@ -312,6 +316,10 @@
         },
         {
           "command": "bifrost.openRqlPolicyFinding",
+          "when": "false"
+        },
+        {
+          "command": "bifrost.openRqlPolicyDisplayStep",
           "when": "false"
         },
         {

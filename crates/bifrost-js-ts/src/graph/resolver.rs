@@ -732,7 +732,7 @@ pub fn browser_global_property_shape(target: &CodeUnit) -> Option<(&str, &str)> 
         return None;
     }
     let (object, property) = target.short_name().split_once('.')?; // fqname-M4: object/property from the package-less short_name; fq.segments() carry the package prefix, changing this split
-    (object == "window" && !property.is_empty() && !property.contains('.'))
+    (matches!(object, "window" | "globalThis") && !property.is_empty() && !property.contains('.'))
         .then_some((object, property))
 }
 

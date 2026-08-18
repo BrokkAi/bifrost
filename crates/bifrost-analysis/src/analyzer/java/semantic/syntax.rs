@@ -334,6 +334,28 @@ pub(super) fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
         .find(|child| !is_comment_kind(child.kind()))
 }
 
+pub(super) fn catch_parameter_has_precise_type(parameter: Node<'_>) -> bool {
+    let Some(type_node) = parameter.child_by_field_name("type").or_else(|| {
+        named_children(parameter)
+            .into_iter()
+            .find(|child| child.kind() == "catch_type")
+    }) else {
+        return false;
+    };
+    if matches!(
+        type_node.kind(),
+        "type_identifier" | "scoped_type_identifier"
+    ) {
+        return true;
+    }
+    let children = named_children(type_node);
+    children.len() == 1
+        && matches!(
+            children[0].kind(),
+            "type_identifier" | "scoped_type_identifier"
+        )
+}
+
 fn is_comment_kind(kind: &str) -> bool {
     matches!(kind, "line_comment" | "block_comment" | "comment")
 }

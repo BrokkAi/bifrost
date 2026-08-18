@@ -19,10 +19,10 @@ use crate::hierarchy;
 use crate::syntax::{
     CSharpNamedArgumentLabel, csharp_attribute_terminal_name, csharp_attribute_type_names,
     csharp_conditional_member_access, csharp_constant_pattern_type_candidate,
-    csharp_member_access_type_receiver, csharp_member_name, csharp_named_argument_label,
-    csharp_nameof_type_candidates, csharp_relational_generic_call,
-    csharp_relational_generic_call_for_argument, csharp_type_leftmost_identifier,
-    csharp_type_reference_root, csharp_type_terminal_identifier,
+    csharp_implicit_accessor_value, csharp_local_binder_name, csharp_member_access_type_receiver,
+    csharp_member_name, csharp_named_argument_label, csharp_nameof_type_candidates,
+    csharp_relational_generic_call, csharp_relational_generic_call_for_argument,
+    csharp_type_leftmost_identifier, csharp_type_reference_root, csharp_type_terminal_identifier,
     csharp_unqualified_invocation_for_name,
 };
 use brokk_bifrost_core::analyzer::common::is_unparseable_source;
@@ -609,7 +609,6 @@ fn extension_call_resolution(
         &ctx.spec.member_name,
         Some(call_arity),
         explicit_generic_arity,
-        false,
     );
     let resolution = if candidates.contains(&ctx.spec.target) {
         TargetMemberResolution::MatchesTarget
@@ -630,6 +629,15 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if identifier_is_member_access_name(node) {
+        return;
+    }
+    // A binder name and the implicit `value` of a write accessor name a binding
+    // the grammar introduces at the occurrence itself, so neither can be a usage
+    // of the target member however the spellings line up. `is_declaration_name`
+    // answers only for the declarations the analyzer indexes; these are the rest,
+    // and forward lookup refuses the same two roles through the same helpers
+    // (#2164).
+    if csharp_local_binder_name(node) || csharp_implicit_accessor_value(node, ctx.source) {
         return;
     }
     match ctx.spec.kind {

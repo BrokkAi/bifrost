@@ -4,9 +4,9 @@
 //! it materializes one procedure's value-flow snapshot on demand and one call's
 //! bindings on demand, and it returns the same [`SemanticOutcome`] the oracle
 //! returns. [`WorkspaceValueFlowProvider`] delegates to
-//! [`WorkspaceSemanticOracle`] and caches each *complete* result in a bounded,
+//! [`WorkspaceSemanticOracle`] and retains each result in a bounded,
 //! content-keyed [`CompleteValueCache`]. A second query over an unchanged
-//! procedure reuses the snapshot without recharging the semantic budget, and a
+//! procedure reuses the answer without recharging the semantic budget, and a
 //! source edit yields a different content key so the stale entry falls out of
 //! the bounded cache.
 //!
@@ -14,19 +14,89 @@
 //! the taint solve, or the compile yet; a later Stage C step routes the solve
 //! through this provider.
 //!
-//! ## Cache keys are content addressed
+//! ## Non-complete verdicts are retained too (#2284, #2289)
 //!
-//! A snapshot key is `(SemanticArtifactKey.fingerprint(), ProcedureId)`. The
-//! fingerprint is a SHA-256 over every validity input of the artifact,
-//! including the exact source content, so a source edit produces a different
-//! key. A bindings key adds the call-site identity and the dispatch target
-//! identity, because bindings are specific to one `(call, candidate)` pair.
+//! What each cache retains is the oracle's whole published *verdict*, not just
+//! a complete value. A procedure or a call that the oracle reports as
+//! `Unsupported`, `Unknown`, `Unproven`, or `Ambiguous` is an answer that is
+//! finished and reproducible, so it is retained with its typed incompleteness
+//! and replayed unchanged. Before this, only `Complete` was retained, so every
+//! procedure with an unlowered construct or an unresolved dispatch was
+//! re-materialized -- and re-charged against the shared semantic budget -- on
+//! every touch. A cached `unsupported` answer stays `unsupported`; honesty is
+//! unaffected because the retained outcome is the same value the skipped oracle
+//! call would return. #2284 did this for snapshots; #2289 did it for bindings,
+//! after establishing that the binding key covers every input (below).
 //!
-//! The oracle's `procedure_relations` computes the retained relations from the
-//! procedure's own semantics; the [`OracleCallContext`] only labels the
-//! snapshot's provenance owner and does not change the relation content. The
-//! demand-taint path always queries with the empty context, so keying on
-//! procedure identity alone is exact for that path.
+//! ## Cache keys cover every verdict input
+//!
+//! A snapshot key is
+//! `(SemanticArtifactKey.fingerprint(), ProcedureId, OracleLimits, OracleCallContext)`.
+//! The artifact fingerprint is a SHA-256 over every validity input of the
+//! artifact -- mount, path, language, exact source revision, adapter semantics
+//! version, IR version, configuration fingerprint, and dependency fingerprint --
+//! so a source edit produces a different key.
+//!
+//! That is the complete input set of
+//! [`WorkspaceSemanticOracle::procedure_relations`], and it is complete for a
+//! reason worth stating: every language adapter declares its semantic artifact
+//! with `DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies")`, so
+//! one artifact's `ProcedureSemantics`, gaps, and capability table are a pure
+//! function of one file's content plus the adapter and configuration identity
+//! already in the key. Cross-artifact dispatch resolution is a *different*
+//! oracle call (`resolve_call`) and does not feed a snapshot verdict, so no
+//! workspace-wide state, activated pack, or class-hierarchy expansion setting
+//! can change one. `OracleLimits` can turn a snapshot into `Unproven` by
+//! truncating retained relations, so it is part of the key. The
+//! [`OracleCallContext`] labels the snapshot's provenance owner, so it is part
+//! of the key as well.
+//!
+//! The two inputs the key does *not* cover are the request's semantic budget
+//! and its cancellation token. Neither needs covering, because neither can
+//! reach a retained entry: exhausting the budget or cancelling produces
+//! `SemanticOutcome::ExceededBudget` or `SemanticOutcome::Cancelled`, and
+//! `memoizable_outcome` retains neither. Budget-caused incompleteness is
+//! therefore excluded from the memo by construction rather than by a key
+//! dimension, so a later touch with more budget still runs the oracle and can
+//! still reach a better answer.
+//!
+//! ### The binding key (#2289)
+//!
+//! A bindings key is
+//! `(caller artifact fingerprint, caller ProcedureId, CallSiteId, target
+//! artifact fingerprint, target ProcedureId, candidate proof, candidate
+//! completeness, OracleCallContext, OracleLimits)`.
+//!
+//! Read `WorkspaceSemanticOracle::call_bindings`
+//! (`analyzer/semantic/workspace_oracle/value_flow.rs`) top to bottom and it
+//! reads exactly six things. The caller's `ProcedureSemantics` -- its gaps, its
+//! call row at `call.id()`, and its values -- which the first three dimensions
+//! pin. The callee's `ProcedureSemantics` -- its gaps, formals, receiver, and
+//! exit ports -- which the next two pin. The `OracleCallContext`, which becomes
+//! the retained bindings' context and which the argument-location contract
+//! checks against. `self.limits()`, which decides through `BindingBuild::
+//! can_retain` whether the answer is `Truncated`, and `Truncated` is published
+//! as `Unproven`, so limits are a genuine verdict input. And the request's
+//! budget and cancellation, excluded by construction as above.
+//!
+//! The sixth thing is the `DispatchCandidate`, and it is worth being exact
+//! about. The candidate's `proof()` and `completeness()` do **not** feed the
+//! verdict: the published outcome is decided from `interrupted`, from
+//! `coverage` (which comes from `build.truncated` and `build.open`), from
+//! `build.has_unproven_relation`, and from `build.gap_quality`, and the
+//! candidate reaches none of them. It is consumed only as
+//! `candidate.target()`, and then handed to `materialize_call_bindings`, which
+//! stores it whole in the retained `CallBindings`. So those two fields are in
+//! the key not because the verdict depends on them but because the retained
+//! *value* does, and a memo must replay the value it was asked for.
+//!
+//! The candidate's `provenance()` is in the retained value too and is not in
+//! the key, because it cannot be: an `OracleRelationHandle` compares and hashes
+//! its arena `Arc` by pointer, which is query-local by design (see
+//! `OracleRelationHandle::arena_identity`). This is the same property the
+//! snapshot memo already has -- a `ValueFlowSnapshot` carries its own arena --
+//! and it is why relation arenas are documented as query-local rather than
+//! durable identities.
 
 use std::fmt;
 use std::mem::size_of;
@@ -36,10 +106,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::analyzer::complete_value_cache::{CompleteValueAcquisition, CompleteValueCache};
 use crate::analyzer::semantic::{
-    CallBinding, CallBindings, CallSiteHandle, CallSiteId, DispatchCandidate, OracleCallContext,
-    ProcedureHandle, ProcedureId, SemanticOutcome, SemanticProviderError, SemanticRequest,
-    SemanticWork, StableDigest, ValueFlowOracle, ValueFlowRelation, ValueFlowSnapshot,
-    WorkspaceSemanticOracle,
+    CallBinding, CallBindings, CallSiteHandle, CallSiteId, DispatchCandidate, EvidenceCompleteness,
+    OracleCallContext, OracleLimits, ProcedureHandle, ProcedureId, ProofStatus, SemanticOutcome,
+    SemanticProviderError, SemanticRequest, SemanticWork, StableDigest, ValueFlowOracle,
+    ValueFlowRelation, ValueFlowSnapshot, WorkspaceSemanticOracle,
 };
 
 /// Default bound on the retained bytes of one value-flow sub-cache. This
@@ -70,26 +140,115 @@ pub trait ValueFlowProvider {
     ) -> Result<SemanticOutcome<CallBindings>, SemanticProviderError>;
 }
 
-/// Content-addressed identity of one procedure-local value-flow snapshot.
+/// Content-addressed identity of one procedure-local value-flow snapshot
+/// verdict.
+///
+/// These four dimensions are every input
+/// [`WorkspaceSemanticOracle::procedure_relations`] reads apart from the
+/// request's budget and cancellation token, and those two can only produce an
+/// outcome this cache never retains. See the module documentation for the
+/// argument in full.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct SnapshotKey {
     artifact: StableDigest,
     procedure: ProcedureId,
+    limits: OracleLimits,
+    context: OracleCallContext,
 }
 
 impl SnapshotKey {
-    fn for_procedure(procedure: &ProcedureHandle) -> Self {
+    fn for_query(
+        procedure: &ProcedureHandle,
+        context: &OracleCallContext,
+        limits: OracleLimits,
+    ) -> Self {
         Self {
             artifact: procedure.artifact().key().fingerprint(),
             procedure: procedure.id(),
+            limits,
+            context: context.clone(),
         }
     }
 }
 
-/// Content-addressed identity of one `(call, candidate)` binding set. The
-/// caller and the dispatch target are each pinned by their artifact content
+/// The snapshot verdict this cache retains, with its semantic work zeroed
+/// because the flight that built it already charged that work.
+///
+/// Retaining the whole [`SemanticOutcome`] rather than a bare snapshot is what
+/// lets a non-complete answer be replayed without losing the typed
+/// incompleteness that makes it honest (#2284).
+type MemoizedSnapshot = SemanticOutcome<ValueFlowSnapshot>;
+
+/// The binding verdict this cache retains, on the same terms as
+/// [`MemoizedSnapshot`] (#2289).
+type MemoizedBindings = SemanticOutcome<CallBindings>;
+
+/// Which published outcomes are safe to retain, and in what form.
+///
+/// `Complete`, `Ambiguous`, `Unknown`, `Unsupported`, and `Unproven` are
+/// finished verdicts: the oracle ran to the end of the procedure or the call
+/// and reported what it found, so a later touch with the same key reproduces
+/// exactly this answer.
+///
+/// `ExceededBudget` and `Cancelled` are not verdicts about the procedure or the
+/// call at all. They report that *this* request ran out of budget or was
+/// interrupted, which is a property of the request rather than of the artifact.
+/// Retaining one would freeze a transient shortfall into an authoritative
+/// answer and deny a later, better-funded touch the chance to succeed -- with
+/// the per-region budget reset in `TaintPolicyCompiler::compile_inner`, a later
+/// region really can afford work an earlier region could not. Returning `None`
+/// for them keeps them out of the cache and out of every follower's answer.
+///
+/// A value-less `Unknown` or `Unsupported` carries nothing worth replaying, so
+/// it is not retained either.
+///
+/// One function serves both sub-caches because the rule is a property of
+/// [`SemanticOutcome`] rather than of the value inside it.
+fn memoizable_outcome<T: Clone>(outcome: &SemanticOutcome<T>) -> Option<SemanticOutcome<T>> {
+    let work = SemanticWork::default();
+    match outcome {
+        SemanticOutcome::Complete { value, .. } => Some(SemanticOutcome::Complete {
+            value: value.clone(),
+            work,
+        }),
+        SemanticOutcome::Ambiguous { candidates, .. } => Some(SemanticOutcome::Ambiguous {
+            candidates: candidates.clone(),
+            work,
+        }),
+        SemanticOutcome::Unproven { partial, .. } => Some(SemanticOutcome::Unproven {
+            partial: partial.clone(),
+            work,
+        }),
+        SemanticOutcome::Unknown {
+            partial: Some(partial),
+            ..
+        } => Some(SemanticOutcome::Unknown {
+            partial: Some(partial.clone()),
+            work,
+        }),
+        SemanticOutcome::Unsupported {
+            capability,
+            partial: Some(partial),
+            ..
+        } => Some(SemanticOutcome::Unsupported {
+            capability: *capability,
+            partial: Some(partial.clone()),
+            work,
+        }),
+        SemanticOutcome::Unknown { partial: None, .. }
+        | SemanticOutcome::Unsupported { partial: None, .. }
+        | SemanticOutcome::ExceededBudget { .. }
+        | SemanticOutcome::Cancelled { .. } => None,
+    }
+}
+
+/// Content-addressed identity of one `(call, candidate)` binding verdict.
+///
+/// The caller and the dispatch target are each pinned by their artifact content
 /// fingerprint and procedure identity, and the call site is pinned by its
-/// caller-local identity.
+/// caller-local identity. The candidate's own `proof` and `completeness` are
+/// pinned too, then the call context and the oracle limits. See
+/// `call_bindings` below for why each of those is here.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct BindingsKey {
     caller_artifact: StableDigest,
@@ -97,10 +256,19 @@ struct BindingsKey {
     call_site: CallSiteId,
     target_artifact: StableDigest,
     target_procedure: ProcedureId,
+    candidate_proof: ProofStatus,
+    candidate_completeness: EvidenceCompleteness,
+    context: OracleCallContext,
+    limits: OracleLimits,
 }
 
 impl BindingsKey {
-    fn for_call(call: &CallSiteHandle, candidate: &DispatchCandidate) -> Self {
+    fn for_query(
+        call: &CallSiteHandle,
+        candidate: &DispatchCandidate,
+        context: &OracleCallContext,
+        limits: OracleLimits,
+    ) -> Self {
         let caller = call.procedure();
         let target = candidate.target();
         Self {
@@ -109,30 +277,34 @@ impl BindingsKey {
             call_site: call.id(),
             target_artifact: target.artifact().key().fingerprint(),
             target_procedure: target.id(),
+            candidate_proof: candidate.proof().clone(),
+            candidate_completeness: candidate.completeness().clone(),
+            context: context.clone(),
+            limits,
         }
     }
 }
 
-/// Conservative structural byte weight of one retained snapshot. The shared
-/// provenance arena is `Arc`-shared across relations, so this counts the owned
-/// relation rows without double counting the arena.
-fn weigh_snapshot(_key: &SnapshotKey, snapshot: &Arc<ValueFlowSnapshot>) -> u32 {
-    let relations = snapshot
-        .relations()
-        .len()
+/// Conservative structural byte weight of one retained snapshot verdict. The
+/// shared provenance arena is `Arc`-shared across relations, so this counts the
+/// owned relation rows without double counting the arena.
+fn weigh_snapshot(_key: &SnapshotKey, outcome: &Arc<MemoizedSnapshot>) -> u32 {
+    let relations = outcome
+        .available_value()
+        .map_or(0, |snapshot| snapshot.relations().len())
         .saturating_mul(size_of::<ValueFlowRelation>());
-    size_of::<ValueFlowSnapshot>()
+    size_of::<MemoizedSnapshot>()
         .saturating_add(relations)
         .min(u32::MAX as usize) as u32
 }
 
-/// Conservative structural byte weight of one retained binding set.
-fn weigh_bindings(_key: &BindingsKey, bindings: &Arc<CallBindings>) -> u32 {
-    let rows = bindings
-        .bindings()
-        .len()
+/// Conservative structural byte weight of one retained binding verdict.
+fn weigh_bindings(_key: &BindingsKey, outcome: &Arc<MemoizedBindings>) -> u32 {
+    let rows = outcome
+        .available_value()
+        .map_or(0, |bindings| bindings.bindings().len())
         .saturating_mul(size_of::<CallBinding>());
-    size_of::<CallBindings>()
+    size_of::<MemoizedBindings>()
         .saturating_add(rows)
         .min(u32::MAX as usize) as u32
 }
@@ -145,14 +317,14 @@ struct ValueFlowCacheStats {
     binding_misses: AtomicU64,
 }
 
-/// Generation-independent, bounded, content-keyed cache of complete value-flow
-/// snapshots and call bindings. Cloning shares the underlying entries and
-/// counters, so the same cache can back one provider per analyzer generation
-/// and reuse unchanged procedures across generations and queries.
+/// Generation-independent, bounded, content-keyed cache of value-flow snapshot
+/// verdicts and complete call bindings. Cloning shares the underlying entries
+/// and counters, so the same cache can back one provider per analyzer
+/// generation and reuse unchanged procedures across generations and queries.
 #[derive(Clone)]
 pub struct ValueFlowCache {
-    snapshots: CompleteValueCache<SnapshotKey, ValueFlowSnapshot>,
-    bindings: CompleteValueCache<BindingsKey, CallBindings>,
+    snapshots: CompleteValueCache<SnapshotKey, MemoizedSnapshot>,
+    bindings: CompleteValueCache<BindingsKey, MemoizedBindings>,
     stats: Arc<ValueFlowCacheStats>,
 }
 
@@ -249,7 +421,7 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
         context: &OracleCallContext,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<ValueFlowSnapshot>, SemanticProviderError> {
-        let key = SnapshotKey::for_procedure(procedure);
+        let key = SnapshotKey::for_query(procedure, context, *self.oracle.limits());
         let (acquisition, _wait) = self.cache.snapshots.acquire(&key, request.cancellation);
         match acquisition {
             CompleteValueAcquisition::Cached { value } => {
@@ -258,11 +430,9 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                     .snapshot_hits
                     .fetch_add(1, Ordering::Relaxed);
                 // A ready entry charged its semantic work on the flight that
-                // built it. Reusing it owns no new semantic work.
-                Ok(SemanticOutcome::Complete {
-                    value: (*value).clone(),
-                    work: SemanticWork::default(),
-                })
+                // built it, and it already carries the exact verdict that
+                // flight published. Replaying it owns no new semantic work.
+                Ok((*value).clone())
             }
             CompleteValueAcquisition::Leader { permit } => {
                 self.cache
@@ -272,11 +442,12 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                 let outcome = self
                     .oracle
                     .procedure_relations(procedure, context, request)?;
-                // Only a complete snapshot is retained. Dropping the permit on
-                // any other outcome wakes followers to retry, so incomplete
-                // results never enter the ready cache.
-                if let SemanticOutcome::Complete { value, .. } = &outcome {
-                    permit.publish_complete(Arc::new(value.clone()));
+                // A finished verdict is retained whether or not it is complete
+                // (#2284). Dropping the permit on a budget-exhausted or
+                // cancelled outcome wakes followers to retry, so a shortfall of
+                // this request never enters the ready cache.
+                if let Some(memoized) = memoizable_outcome(&outcome) {
+                    permit.publish_complete(Arc::new(memoized));
                 }
                 Ok(outcome)
             }
@@ -297,7 +468,7 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
         context: &OracleCallContext,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<CallBindings>, SemanticProviderError> {
-        let key = BindingsKey::for_call(call, candidate);
+        let key = BindingsKey::for_query(call, candidate, context, *self.oracle.limits());
         let (acquisition, _wait) = self.cache.bindings.acquire(&key, request.cancellation);
         match acquisition {
             CompleteValueAcquisition::Cached { value } => {
@@ -305,10 +476,10 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                     .stats
                     .binding_hits
                     .fetch_add(1, Ordering::Relaxed);
-                Ok(SemanticOutcome::Complete {
-                    value: (*value).clone(),
-                    work: SemanticWork::default(),
-                })
+                // A ready entry charged its semantic work on the flight that
+                // built it, and it already carries the exact verdict that
+                // flight published. Replaying it owns no new semantic work.
+                Ok((*value).clone())
             }
             CompleteValueAcquisition::Leader { permit } => {
                 self.cache
@@ -318,8 +489,10 @@ impl ValueFlowProvider for WorkspaceValueFlowProvider<'_> {
                 let outcome = self
                     .oracle
                     .call_bindings(call, candidate, context, request)?;
-                if let SemanticOutcome::Complete { value, .. } = &outcome {
-                    permit.publish_complete(Arc::new(value.clone()));
+                // A finished binding verdict is retained whether or not it is
+                // complete, on the same terms as a snapshot (#2289).
+                if let Some(memoized) = memoizable_outcome(&outcome) {
+                    permit.publish_complete(Arc::new(memoized));
                 }
                 Ok(outcome)
             }

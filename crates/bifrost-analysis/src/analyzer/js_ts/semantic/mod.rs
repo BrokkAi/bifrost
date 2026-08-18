@@ -18,8 +18,8 @@ use brokk_bifrost_js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, compute_import_binder,
 };
 
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v9";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v10";
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v12";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v13";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -347,6 +347,7 @@ struct LoweringContext<'tree, 'targets> {
     lexical_bindings: &'targets JsTsLexicalBindingIndex,
     session: ProcedureLoweringSession<'targets>,
     expression_values: HashMap<usize, ValueId>,
+    constant_index_values: HashMap<u64, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
     receiver: Option<ValueId>,
@@ -354,7 +355,11 @@ struct LoweringContext<'tree, 'targets> {
     procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
     abruptness: HashMap<usize, bool>,
     cleanups: Vec<CleanupRegion<'tree>>,
+    catch_binders: HashMap<ProgramPointId, ValueId>,
+    catch_binder_scopes: HashMap<ValueId, (usize, usize)>,
     plain_object_locals: HashMap<ValueId, PlainObjectLocal>,
+    plain_object_fields: HashMap<ValueId, HashMap<Box<str>, SemanticLocator>>,
+    array_locals: HashMap<ValueId, ArrayLocal>,
 }
 
 struct LocalBinding {
@@ -363,17 +368,31 @@ struct LocalBinding {
     value: ValueId,
 }
 
-/// A local whose value is a plain object literal for the binding's whole
-/// extent: the initializer is a plain literal, and every use of the name in
-/// the procedure is a non-`__proto__` member-access base outside call-callee
-/// position, so no alias, capture, rebind, or prototype mutation exists that
-/// could install an accessor or a proxy behind a later property access.
+/// A local whose value is a proven allocation for the binding's whole extent:
+/// the initializer is a supported literal or built-in allocation, and every
+/// use of the name in the procedure is a non-`__proto__` member-access base
+/// outside call-callee position, so no alias, capture, rebind, or prototype
+/// mutation exists that could install an accessor or a proxy behind a later
+/// property access.
+#[derive(Clone, Copy)]
 struct PlainObjectLocal {
+    /// The local value assigned by the proven allocation declaration. Aliases
+    /// retain this root so their field locators remain identical.
+    root: ValueId,
     /// Node id of the declaration statement's parent. A property access is
     /// established only when this node is among its ancestors, so control
     /// cannot reach the access without first executing the declarator.
     declaration_parent: usize,
     /// End byte of the declarator; accesses before it may observe the
     /// binding uninitialized.
+    available_after: usize,
+}
+
+/// A local binding whose value is a non-escaping array literal allocation.
+/// The allocation root is shared by direct declaration aliases, so indexed
+/// accesses through those aliases retain one identity only while the root is
+/// proven not to be rebound, captured, or used through another operation.
+struct ArrayLocal {
+    declaration_parent: usize,
     available_after: usize,
 }

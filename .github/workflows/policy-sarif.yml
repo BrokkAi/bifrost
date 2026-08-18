@@ -24,9 +24,25 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Cache Bifrost build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: policy-sarif
+
+      - name: Build the policy runner
+        run: cargo build --locked --bin bifrost
+
       - name: Scan with the built-in pack
         uses: ./.github/actions/policy-scan
         with:
-          version: v0.9.1
+          version: local
           category: bifrost-code-smells
           diff-base: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          # The private source repository does not have GitHub Code Security enabled.
+          # The scan still gates here; the projected public repository uploads SARIF.
+          upload: ${{ !github.event.repository.private }}

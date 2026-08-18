@@ -16,11 +16,45 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{fmt, path::PathBuf, sync::Arc};
 
+/// Where a workspace's analyzer store lives for the lifetime of one open.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionPersistenceMode {
+    /// An in-memory store discarded when the workspace drops. The default, so
+    /// existing consumers keep their behavior.
+    #[default]
+    Ephemeral,
+    /// The engine's persistent store (`.bifrost/cache` at the primary
+    /// repository root), so extracted facts survive reopen and are shared
+    /// with other sessions and linked worktrees of the same checkout.
+    Persisted,
+}
+
+/// Evidence of the persistence decision one open actually made.
+///
+/// `engaged` reports what the built store is, not what the caller asked for:
+/// the engine degrades a persisted request to an in-memory store when the
+/// project offers no persistence root, and that degradation must be visible
+/// as data rather than inferred from timing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionStoreReport {
+    pub requested: ExtensionPersistenceMode,
+    pub engaged: ExtensionPersistenceMode,
+    /// The on-disk store the workspace answers from, present exactly when
+    /// `engaged` is [`ExtensionPersistenceMode::Persisted`]. For a linked
+    /// worktree this is the primary checkout's shared database.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_db: Option<Box<str>>,
+    /// Degradation record; empty whenever `engaged` matches `requested`.
+    pub diagnostics: Box<[ExtensionDiagnostic]>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExtensionWorkspaceOptions {
     pub roots: Vec<PathBuf>,
     pub analyzer_config: AnalyzerConfig,
     pub limits: ExtensionLimits,
+    pub persistence: ExtensionPersistenceMode,
 }
 impl ExtensionWorkspaceOptions {
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -28,7 +62,13 @@ impl ExtensionWorkspaceOptions {
             roots: vec![root.into()],
             analyzer_config: AnalyzerConfig::default(),
             limits: ExtensionLimits::default(),
+            persistence: ExtensionPersistenceMode::default(),
         }
+    }
+    /// Opt this open into the engine's persistent store.
+    pub fn persisted(mut self) -> Self {
+        self.persistence = ExtensionPersistenceMode::Persisted;
+        self
     }
 }
 
@@ -37,6 +77,12 @@ pub enum ExtensionWorkspaceError {
     InvalidRoots(Box<str>),
     Project(Box<str>),
     Analyzer(Box<str>),
+    /// A requested persistent store could not be opened (permissions, a
+    /// corrupt database, ...). Deliberately not a silent fallback to the
+    /// in-memory store: every other persisted entry point propagates this,
+    /// and answering from a cold store while reporting persistence would
+    /// misstate the evidence.
+    Store(Box<str>),
 }
 impl fmt::Display for ExtensionWorkspaceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -68,11 +114,21 @@ pub enum CapabilitySupport {
     Partial,
     Unsupported,
 }
+impl CapabilitySupport {
+    const fn unsupported() -> Self {
+        Self::Unsupported
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LanguageCapabilityReport {
     pub language: Box<str>,
     pub control_flow: CapabilitySupport,
     pub value_dependence: CapabilitySupport,
+    /// Typestate is not reachable from this surface yet; the explicit
+    /// `Unsupported` row lets extensions distinguish "unsupported here"
+    /// from "does not exist" (issue #2328).
+    #[serde(default = "CapabilitySupport::unsupported")]
+    pub typestate: CapabilitySupport,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationCapability {
@@ -91,11 +147,20 @@ pub struct ExtensionWorkspaceDescription {
     pub api: ExtensionApiVersion,
     pub generation: WorkspaceGeneration,
     pub capabilities: ExtensionCapabilityReport,
+    pub store: ExtensionStoreReport,
+    /// Workspace files excluded from analysis at open time (for example
+    /// binary content, which cannot enter the UTF-8 source overlay). Recorded
+    /// so an extension can distinguish "present but not analyzed" from
+    /// "absent"; an empty slice means every listed file was acquired.
+    #[serde(default)]
+    pub open_diagnostics: Box<[ExtensionDiagnostic]>,
 }
 
 pub struct ExtensionWorkspace {
     generation: WorkspaceGeneration,
     capabilities: ExtensionCapabilityReport,
+    store: ExtensionStoreReport,
+    open_diagnostics: Box<[ExtensionDiagnostic]>,
     analyzer: WorkspaceAnalyzer,
 }
 
@@ -121,10 +186,25 @@ impl ExtensionWorkspace {
             Arc::clone(&filesystem),
             options.limits.values().source_bytes as usize,
         );
+        let mut open_diagnostics = Vec::new();
         for file in files.iter() {
-            let source = filesystem.read_source(file).map_err(|error| {
-                ExtensionWorkspaceError::Project(error.to_string().into_boxed_str())
-            })?;
+            let source = match filesystem.read_source(file) {
+                Ok(source) => source,
+                // Real repositories routinely carry binary assets, and binary
+                // content cannot enter the UTF-8 source overlay. Skip the file
+                // and record the skip instead of aborting the open: the
+                // incompleteness stays visible in the description rather than
+                // becoming a silent absence (#2329).
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    open_diagnostics.push(unsupported_content_diagnostic(file));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(ExtensionWorkspaceError::Project(
+                        error.to_string().into_boxed_str(),
+                    ));
+                }
+            };
             if !frozen.set(file.abs_path(), source) {
                 return Err(ExtensionWorkspaceError::Project(
                     format!(
@@ -136,11 +216,50 @@ impl ExtensionWorkspace {
             }
         }
         let project: Arc<dyn Project> = Arc::new(frozen.snapshot());
-        let analyzer = WorkspaceAnalyzer::build_ephemeral(
-            Arc::clone(&project),
-            options.analyzer_config.clone(),
-        )
-        .map_err(|error| ExtensionWorkspaceError::Analyzer(error.to_string().into_boxed_str()))?;
+        let analyzer = match options.persistence {
+            ExtensionPersistenceMode::Ephemeral => WorkspaceAnalyzer::build_ephemeral(
+                Arc::clone(&project),
+                options.analyzer_config.clone(),
+            )
+            .map_err(|error| {
+                ExtensionWorkspaceError::Analyzer(error.to_string().into_boxed_str())
+            })?,
+            ExtensionPersistenceMode::Persisted => WorkspaceAnalyzer::build_persisted(
+                Arc::clone(&project),
+                options.analyzer_config.clone(),
+            )
+            .map_err(|error| ExtensionWorkspaceError::Store(error.to_string().into_boxed_str()))?,
+        };
+        // Report the store the build actually produced rather than echoing the
+        // request: a persisted request against a project with no persistence
+        // root degrades to the in-memory store inside the engine, and that
+        // decision must surface here as data.
+        let store = match (options.persistence, analyzer.persisted_store_path()) {
+            (requested, Some(path)) => ExtensionStoreReport {
+                requested,
+                engaged: ExtensionPersistenceMode::Persisted,
+                cache_db: Some(path.to_string_lossy().into_owned().into_boxed_str()),
+                diagnostics: Box::new([]),
+            },
+            (ExtensionPersistenceMode::Persisted, None) => ExtensionStoreReport {
+                requested: ExtensionPersistenceMode::Persisted,
+                engaged: ExtensionPersistenceMode::Ephemeral,
+                cache_db: None,
+                diagnostics: Box::new([ExtensionDiagnostic {
+                    code: "store.persistence_unavailable".into(),
+                    message: "workspace offers no persistence root; \
+                              the engine degraded to an in-memory store"
+                        .into(),
+                    source: None,
+                }]),
+            },
+            (ExtensionPersistenceMode::Ephemeral, None) => ExtensionStoreReport {
+                requested: ExtensionPersistenceMode::Ephemeral,
+                engaged: ExtensionPersistenceMode::Ephemeral,
+                cache_db: None,
+                diagnostics: Box::new([]),
+            },
+        };
         let generation = generation_for(&analyzer, &options.analyzer_config)?;
         let languages = analyzer
             .analyzer()
@@ -152,6 +271,7 @@ impl ExtensionWorkspace {
                     .into_boxed_str(),
                 control_flow: CapabilitySupport::Complete,
                 value_dependence: CapabilitySupport::Partial,
+                typestate: CapabilitySupport::Unsupported,
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -174,12 +294,24 @@ impl ExtensionWorkspace {
                     stability: ApiStability::Experimental { since_minor: 0 },
                     support: CapabilitySupport::Partial,
                 },
+                // Typestate machinery exists in the engine but has no route on
+                // this surface yet. Advertising the operation as `Unsupported`
+                // (rather than omitting it) lets extensions distinguish
+                // "unsupported here" from "does not exist". Design:
+                // .agents/docs/extension-typestate-design-2026-08.md.
+                OperationCapability {
+                    id: capability("experimental.semantic.typestate"),
+                    stability: ApiStability::Experimental { since_minor: 0 },
+                    support: CapabilitySupport::Unsupported,
+                },
             ]
             .into_boxed_slice(),
         };
         Ok(Self {
             generation,
             capabilities,
+            store,
+            open_diagnostics: open_diagnostics.into_boxed_slice(),
             analyzer,
         })
     }
@@ -189,11 +321,22 @@ impl ExtensionWorkspace {
     pub fn capabilities(&self) -> &ExtensionCapabilityReport {
         &self.capabilities
     }
+    pub fn store(&self) -> &ExtensionStoreReport {
+        &self.store
+    }
+    /// Diagnostics recorded while acquiring workspace source at open time
+    /// (currently: files skipped for non-UTF-8 content). Empty when every
+    /// listed file was acquired.
+    pub fn open_diagnostics(&self) -> &[ExtensionDiagnostic] {
+        &self.open_diagnostics
+    }
     pub fn describe(&self) -> ExtensionWorkspaceDescription {
         ExtensionWorkspaceDescription {
             api: EXTENSION_API_VERSION,
             generation: self.generation.clone(),
             capabilities: self.capabilities.clone(),
+            store: self.store.clone(),
+            open_diagnostics: self.open_diagnostics.clone(),
         }
     }
     fn validate(
@@ -713,15 +856,47 @@ fn generation_for(
     {
         hasher.update([0]);
         hasher.update(file.rel_path().to_string_lossy().as_bytes());
-        let source = project.read_source_snapshot(file).map_err(|error| {
-            ExtensionWorkspaceError::Project(error.to_string().into_boxed_str())
-        })?;
         hasher.update([0]);
-        hasher.update(source.source().as_bytes());
+        match project.read_source_snapshot(file) {
+            Ok(source) => hasher.update(source.source().as_bytes()),
+            // A file skipped at open time for binary content still exists in
+            // the workspace. Its path plus a fixed marker participate in the
+            // generation so adding, removing, or renaming such a file changes
+            // the generation even though its content is never analyzed.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                hasher.update(b"<unsupported-file-content>");
+            }
+            Err(error) => {
+                return Err(ExtensionWorkspaceError::Project(
+                    error.to_string().into_boxed_str(),
+                ));
+            }
+        }
     }
     Ok(WorkspaceGeneration::new(
         StableDigest::parse(format!("{:x}", hasher.finalize())).expect("SHA-256 is canonical"),
     ))
+}
+/// Diagnostic for a workspace file skipped at open time because its content
+/// is not valid UTF-8 (binary assets, mixed-encoding files). The span is
+/// omitted only when the file's own path cannot be expressed as a normalized
+/// relative path; the message always names the file.
+fn unsupported_content_diagnostic(file: &ProjectFile) -> ExtensionDiagnostic {
+    // Separator-normalized on every platform: `NormalizedRelativePath` rejects
+    // backslashes outright, so a raw Windows `rel_path` would lose the span,
+    // and the message must name the same slash-form path clients see in spans.
+    let rel_path = brokk_bifrost_analysis::path_utils::rel_path_string(file);
+    ExtensionDiagnostic {
+        code: "workspace.unsupported_file_content".into(),
+        message: format!("skipped non-UTF-8 file: {rel_path}").into_boxed_str(),
+        source: NormalizedRelativePath::new(&rel_path)
+            .ok()
+            .map(|path| SourceSpan {
+                path,
+                start_utf8_byte: 0,
+                end_utf8_byte: 0,
+            }),
+    }
 }
 fn capability(value: &str) -> ExtensionCapabilityId {
     ExtensionCapabilityId::new(value).expect("static capability is valid")
@@ -819,4 +994,128 @@ impl<'de> Deserialize<'de> for StructuralRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StructuralResult {
     pub items: Box<[Value]>,
+}
+
+// Persistence tests live here rather than in `tests/extension/` because the
+// reuse evidence (extraction/hydration counters) sits on the deliberately
+// private `analyzer` field.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_analysis::analyzer::structural::StructuralSearchProvider;
+    use std::path::Path;
+
+    const SOURCE: &str = "export function answer() { return 42; }\n";
+
+    fn write_project(root: &Path) {
+        std::fs::write(root.join("app.ts"), SOURCE).unwrap();
+    }
+
+    fn open(root: &Path, persisted: bool) -> ExtensionWorkspace {
+        let options = ExtensionWorkspaceOptions::new(root);
+        let options = if persisted {
+            options.persisted()
+        } else {
+            options
+        };
+        ExtensionWorkspace::open(options).unwrap()
+    }
+
+    fn provider(workspace: &ExtensionWorkspace) -> &dyn StructuralSearchProvider {
+        workspace.analyzer.analyzer().structural_search_providers()[0]
+    }
+
+    fn commit_all(repo: &git2::Repository) {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let signature = git2::Signature::now("bifrost-test", "test@example.invalid").unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn default_open_stays_ephemeral_and_reports_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_project(&root);
+        let workspace = open(&root, false);
+        let store = workspace.store();
+        assert_eq!(store.requested, ExtensionPersistenceMode::Ephemeral);
+        assert_eq!(store.engaged, ExtensionPersistenceMode::Ephemeral);
+        assert!(store.cache_db.is_none());
+        assert!(store.diagnostics.is_empty());
+        assert_eq!(&workspace.describe().store, store);
+        assert!(
+            !root.join(".bifrost").exists(),
+            "an ephemeral open must not create an on-disk cache"
+        );
+    }
+
+    #[test]
+    fn persisted_open_populates_a_cache_the_reopen_hydrates_from() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_project(&root);
+        let file = ProjectFile::new(root.clone(), "app.ts");
+
+        let first = open(&root, true);
+        let store = first.store().clone();
+        assert_eq!(store.requested, ExtensionPersistenceMode::Persisted);
+        assert_eq!(store.engaged, ExtensionPersistenceMode::Persisted);
+        assert!(store.diagnostics.is_empty());
+        let cache_db =
+            Path::new(store.cache_db.as_deref().expect("engaged store has a path")).to_path_buf();
+        assert!(cache_db.starts_with(root.join(".bifrost/cache")));
+        assert!(cache_db.exists(), "the reported store must exist on disk");
+        let facts = provider(&first).structural_facts(&file).unwrap();
+        assert_eq!(facts.source(), SOURCE);
+        let generation = first.generation().clone();
+        drop(first);
+
+        // Reuse evidence is counter-based, not timing-based: the reopened
+        // provider must answer from a hydrated snapshot without a single
+        // parse-and-normalize extraction.
+        let second = open(&root, true);
+        assert_eq!(second.generation(), &generation);
+        assert_eq!(second.store(), &store);
+        let provider = provider(&second);
+        let hydrated_before = provider.structural_hydration_count();
+        let facts = provider.structural_facts(&file).unwrap();
+        assert_eq!(facts.source(), SOURCE);
+        assert_eq!(
+            provider.structural_extraction_count(),
+            0,
+            "a persisted reopen must reuse the populated cache, not re-extract"
+        );
+        assert_eq!(provider.structural_hydration_count(), hydrated_before + 1);
+    }
+
+    #[test]
+    fn linked_worktree_engages_the_primary_checkouts_shared_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_root = temp.path().join("primary");
+        std::fs::create_dir(&primary_root).unwrap();
+        let repo = git2::Repository::init(&primary_root).unwrap();
+        write_project(&primary_root);
+        commit_all(&repo);
+        let linked_root = temp.path().join("linked");
+        repo.worktree("linked", &linked_root, None).unwrap();
+
+        let primary = open(&primary_root.canonicalize().unwrap(), true);
+        let linked = open(&linked_root.canonicalize().unwrap(), true);
+        assert_eq!(linked.store().engaged, ExtensionPersistenceMode::Persisted);
+        assert_eq!(
+            linked.store().cache_db,
+            primary.store().cache_db,
+            "a linked worktree must engage the primary checkout's shared cache"
+        );
+        assert!(
+            !linked_root.join(".bifrost").exists(),
+            "a linked worktree must not fork a private cache"
+        );
+    }
 }

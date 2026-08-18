@@ -1,5 +1,9 @@
 # Contributing
 
+## Contribution Policy
+
+Bifrost no longer accepts pull requests. We accept open source contributions only through [GitHub Issues](https://github.com/BrokkAi/bifrost/issues) and [GitHub Discussions](https://github.com/BrokkAi/bifrost/discussions). Please use those channels to report bugs, propose improvements, share use cases, or discuss potential changes.
+
 ## Development Setup
 
 Rust build:
@@ -128,8 +132,8 @@ That script updates these committed version fields and compatibility bounds:
 - the exclusive Bifrost compatibility upper bound in shipped semantic-pack
   specifications and Bifrost-owned framework, golden, and sanitizer foundry
   sources; other pack metadata and lower bounds remain unchanged
+- `plugins/bifrost-agent/plugin.json`
 - `plugins/bifrost-agent/.claude-plugin/plugin.json`
-- `plugins/bifrost-agent/.codex-plugin/plugin.json`
 - `plugins/bifrost-agent/.cursor-plugin/plugin.json`
 - `plugins/bifrost-agent/plugin.json`
 - `.cursor-plugin/marketplace.json`
@@ -144,10 +148,7 @@ That script updates these committed version fields and compatibility bounds:
 The package and README entries keep the published Pi artifact and its install
 instructions on the Cargo version. The Codex and Claude marketplace files are
 also part of the plugin surface, but
-currently do not carry version fields:
-
-- `.agents/plugins/marketplace.json`
-- `.claude-plugin/marketplace.json`
+currently do not carry version fields.
 
 The VS Code extension and bundled agent plugin also share the preferred,
 minimum, and prerelease compatibility fields and pin the preferred Bifrost
@@ -180,11 +181,18 @@ To cut a release:
    candidate and any subsequent stabilization fixes are preserved remotely.
    Do not merge the moving `master` tip into the RC branch during stabilization;
    bring over only changes that are deliberately required for the release.
-3. On the RC branch, bump `[workspace.package].version` in `Cargo.toml`, run the
+3. Regenerate the tracked projection inventory from the frozen RC commit, using
+   the checked-in inventory as its baseline. Review every new or mode-changed
+   path left with a `review` decision, record each explicit `public` or
+   `private` approval, and inspect the inventory diff before cutting the tag.
+   Private-only paths and other private additions remain outside the public
+   projection. Do not proceed while the inventory is unreviewed or the
+   projection reports an unclassified source path.
+4. On the RC branch, bump `[workspace.package].version` in `Cargo.toml`, run the
    version-sync command above, and review the generated metadata. Release
    workflows generate the Rust dependency report from the tagged `Cargo.lock`;
    it is not committed.
-4. If agents, launcher files, MCP config, or plugin manifests changed, validate
+5. If agents, launcher files, MCP config, or plugin manifests changed, validate
    the plugin bundles:
 
    ```bash
@@ -194,12 +202,12 @@ To cut a release:
    node --test plugins/bifrost-agent/test/*.test.mjs
    ```
 
-  `check-agent-plugins-v1.mjs` checks the portable root files, the Codex
-  package adapter, and the Cursor adapter. `check-codex-plugin-manifest.mjs`
-  checks the portable package, Codex, Claude, Cursor, and Pi adapters, the
-  Cursor marketplace versions, and the release metadata. Run both after
+   `check-agent-plugins-v1.mjs` checks the portable root `plugin.json` and
+   `mcp.json`. `check-codex-plugin-manifest.mjs` checks the portable package,
+   Claude, Cursor, and Pi adapters, the Cursor marketplace versions, and the
+   release metadata. Run both after
    the release metadata has been prepared for the version being validated.
-5. Before you create the final tag, treat the RC commit as green only after its
+6. Before you create the final tag, treat the RC commit as green only after its
    required branch checks and these release-specific checks pass:
 
    ```bash
@@ -237,13 +245,13 @@ To cut a release:
    release. Do not tag the RC commit only because its ordinary branch CI is
    green. Confirm that each release-only promotion gate has an equivalent
    pre-tag check, and run it on the frozen RC commit.
-6. Sync the release version projection and every stabilization fix from the RC
+7. Sync the release version projection and every stabilization fix from the RC
    branch back to `master`. An RC-only fix is not complete until its equivalent
    has landed on `master`; use a cherry-pick or an equivalent focused commit and
    resolve any conflicts against current `master` deliberately. Changes that
    land on `master` after the branch point remain outside the release unless
    they are explicitly selected for the RC branch.
-7. After the RC branch is frozen and validated, tag the validated RC commit -
+8. After the RC branch is frozen and validated, tag the validated RC commit -
    not the current `master` tip - and push the tag:
 
    ```bash
@@ -263,47 +271,6 @@ publishes `@brokkai/bifrost` only after all platform versions are visible from
 npm. This npm CLI package is separate from the `@brokk/bifrost-agent` Pi
 package. The npm workflow uses the `npm-publish` environment and npm trusted
 publishing. It does not use a stored npm token.
-
-### Post-release agent-plugin smoke
-
-After the GitHub Release exposes the agent-plugin archive and the platform
-Bifrost archives plus their `.sha256` sidecars, run the consumer smoke from a
-clean checkout using the exact published version:
-
-```bash
-node scripts/smoke-published-agent-plugin.mjs --version 0.10.1
-```
-
-The command downloads `bifrost-agent-v<version>.tar.gz` away from the checkout,
-extracts it, and creates a fresh launcher cache. It then prepares the preferred
-binary with path lookup disabled (therefore exercising the published archive
-and checksum sidecar), runs `doctor` in exact-version mode, and makes an actual
-MCP `list_policies` call through both the published Codex and Claude adapter
-configs. It also checks the exact release tag's Codex and Claude marketplace
-entries, so a missing public marketplace cannot hide behind a valid package
-archive. It does not modify Codex or Claude configuration, start a model
-session, or require host API credentials. The smoke runs for the current
-platform; run it on each supported release platform when platform-specific
-archive coverage is required. The two MCP calls exercise the exact host
-adapter launch configurations without pretending to validate a host's current
-user session; after a pass, a fresh Codex/Claude task can be used for any
-credentialed model-level check.
-
-For a release asset downloaded separately, pass it explicitly:
-
-```bash
-node scripts/smoke-published-agent-plugin.mjs \
-  --version 0.10.1 \
-  --archive /path/to/bifrost-agent-v0.10.1.tar.gz \
-  --keep-temp
-```
-
-`--keep-temp` preserves the isolated archive, extracted package, launcher
-cache, and workspace for diagnosis. A checksum failure means the published
-release metadata and sidecar do not describe the same archive; an adapter
-failure means the plugin is present but its MCP server was not callable. Treat
-either result as a release incident and do not claim that the policy-checking
-skill is usable until a fresh run reports both adapter calls passed.
 
 `publish-crate.yml` and `build-wheels.yml` are reusable children of that parent
 workflow; they are not independently dispatchable. Wheel publication runs as
@@ -371,12 +338,12 @@ workflow in the same change. Publish the crate through a separate bootstrap
 change before the next version release. Configure its trusted publisher during
 that bootstrap.
 
-`brokk-bifrost-cpp`, `brokk-bifrost-csharp`, `brokk-bifrost-go`,
-`brokk-bifrost-js-ts`, `brokk-bifrost-jvm`, `brokk-bifrost-php`,
-`brokk-bifrost-python`, `brokk-bifrost-ruby` and `brokk-bifrost-rust` are new
-packages that still await that bootstrap publication. `brokk-bifrost-rql` also
-awaits its bootstrap publication. Trusted publishing cannot create a new crate, so
-each one's first version must be uploaded with a scoped crates.io API token
+All 19 packages in this inventory have now been bootstrapped on crates.io. The
+language crates and `brokk-bifrost-rql` are published through `0.10.2`, and the
+latest publication entry for each inventory package carries
+`trustpub_data.repository` set to `BrokkAi/bifrost`. For any future package,
+retain the bootstrap policy above: trusted publishing cannot create a new
+crate, so the first version must be uploaded with a scoped crates.io API token
 from a clean, reviewed commit. Then set the crate owners and configure the
 trusted publisher per the checklist above, and verify that configuration
 before you tag.
@@ -403,6 +370,47 @@ succeeds. After recovery, confirm both workflows are green. Also confirm the
 root npm package and all platform packages expose the released version. The
 release summary records completed and pending publication targets, including
 the VS Code release attachment and Marketplace publication separately.
+
+### Readiness handoff and recovery
+
+Use one explicit handoff from source projection to release publication:
+
+1. Project the reviewed private source commit to public `master`, then wait for
+   public CI to validate that projection.
+2. Dispatch `Release readiness` from the public repository with the exact
+   public commit, release version, and independently observed public head.
+   Select the run whose inputs and `preflight` output match those values; do
+   not use the latest run merely because it is latest.
+3. Inspect the retained `release-qualification.json` manifest and its recorded
+   file digests, release inventory, commit, version, and workflow run. Treat
+   that single qualification bundle as the evidence for the handoff.
+4. Only after that inspection, separately create and authorize the public
+   `vX.Y.Z` tag on the qualified public commit. Projection does not create a
+   tag, dispatch `Release`, or publish an artifact.
+5. After promotion, invoke the post-release smoke workflow with that exact tag
+   (through its reusable call or manual dispatch), then monitor registry and
+   marketplace visibility and rerun only the failed smoke jobs when a target
+   is still propagating.
+
+Readiness artifacts are retained for 14 days. Use GitHub Actions **Re-run
+failed jobs** on the same readiness run while its artifacts remain available.
+If the qualification artifact has expired, dispatch a new readiness run with
+the same exact inputs and inspect its new manifest from the beginning. Never
+mix artifacts, manifests, or evidence from different runs, commits, versions,
+or attempts into one release decision.
+
+Readiness has read-only permissions and cannot substitute for publisher
+authentication. Crates.io trusted publishing, PyPI, npm, and marketplace
+credentials are available only to the separately protected public release
+workflow and its configured environments; a green readiness run is not
+evidence that those publisher identities are configured or that publication
+has occurred. A release retry must use the publisher's existing protected
+authentication and the already qualified artifact; it must not upload a new
+artifact for the same version.
+
+The workflows do not currently claim a fixed duration or speed improvement
+from caching. Any timing target must be measured and recorded by a completed
+rehearsal; it must not be inferred from configuration alone.
 
 To announce a published GitHub Release in Discord, set the
 `DISCORD_RELEASE_WEBHOOK_URL` repository Actions secret to the target channel's

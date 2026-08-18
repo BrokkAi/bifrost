@@ -601,13 +601,13 @@ fn apply_fallback_policy(
     if candidates.is_empty() && !analyzer.is_empty() {
         return find_text();
     }
-    if should_union_text_candidates(target) {
+    if should_union_text_candidates(target, analyzer) {
         candidates.extend(find_text());
     }
     candidates
 }
 
-fn should_union_text_candidates(target: &CodeUnit) -> bool {
+fn should_union_text_candidates(target: &CodeUnit, analyzer: &dyn IAnalyzer) -> bool {
     let language = language_for_target(target);
     let member = target.short_name().contains('.');
     (language == Language::Python && (target.is_function() || target.is_field()) && member)
@@ -637,6 +637,37 @@ fn should_union_text_candidates(target: &CodeUnit) -> bool {
         // terminal stable owner name to admit those files as candidates; the
         // Scala graph still proves the exact object and callable role.
         || scala_companion_syntax_candidate_identifier(target).is_some()
+        || is_java_enum_member(target, analyzer)
+}
+
+/// Whether `target` is a member declared in a Java `enum` body.
+///
+/// JLS 14.11 lets a case label on an enum-typed switch spell a constant as a
+/// bare simple name: no import, no qualifier, no other mention of the enum
+/// anywhere in the reading file. The import graph therefore has no edge to
+/// follow from the enum to that reader, and the graph result is not empty
+/// either -- the enum's own package always supplies candidates -- so the
+/// empty-result fallback never runs and the label site is never offered to the
+/// scanner (#2180).
+///
+/// Text search only *selects files that spell the constant*. The Java scanner
+/// still types the switch selector and proves the label against it before it
+/// claims a hit (`java/graph/resolver.rs`), so a local variable, a parameter or
+/// an `int` switch that happens to share the spelling stays unclaimed.
+///
+/// [`IAnalyzer::declaration_syntax_kind`] answers with the *enclosing type
+/// declaration*, so this admits an ordinary instance field written in an enum
+/// body as well as a constant. Separating the two would cost a second parse to
+/// read the declaration node's own kind; the over-inclusion is bounded by one
+/// enum's field count, so it is not worth that.
+///
+/// The rule is Java-only on purpose. A Kotlin `when` branch and a Scala pattern
+/// match both spell an enum entry through a name their import graphs already
+/// carry, so neither language has this blind spot.
+fn is_java_enum_member(target: &CodeUnit, analyzer: &dyn IAnalyzer) -> bool {
+    language_for_target(target) == Language::Java
+        && target.is_field()
+        && analyzer.declaration_syntax_kind(target) == Some("enum_declaration")
 }
 
 fn scala_companion_syntax_candidate_identifier(target: &CodeUnit) -> Option<&str> {

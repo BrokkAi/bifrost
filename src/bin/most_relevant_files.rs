@@ -30,7 +30,7 @@ fn run() -> Result<(), String> {
         env::current_dir().map_err(|err| format!("Failed to get current directory: {err}"))?;
     let mut seed_file_paths = Vec::new();
     let mut recency_half_life = None;
-    let mut ranking_mode = MostRelevantFilesRankingMode::HistoryImports;
+    let mut ranking_mode = MostRelevantFilesRankingMode::default();
     let mut exclude_tests = false;
     let mut history_only = false;
 
@@ -50,7 +50,7 @@ fn run() -> Result<(), String> {
             }
             "--ranking-mode" => {
                 let value = args.next().ok_or_else(|| {
-                    "--ranking-mode requires history_imports, usage_graph, or usage_graph_exact"
+                    "--ranking-mode requires cascade, history_imports, usage_graph, or usage_graph_exact"
                         .to_string()
                 })?;
                 ranking_mode = parse_ranking_mode(&value)?;
@@ -172,18 +172,19 @@ fn parse_recency_half_life(value: &str) -> Result<Option<f64>, String> {
 
 fn parse_ranking_mode(value: &str) -> Result<MostRelevantFilesRankingMode, String> {
     match value {
+        "cascade" => Ok(MostRelevantFilesRankingMode::Cascade),
         "history_imports" => Ok(MostRelevantFilesRankingMode::HistoryImports),
         "usage_graph" => Ok(MostRelevantFilesRankingMode::UsageGraph),
         "usage_graph_exact" => Ok(MostRelevantFilesRankingMode::UsageGraphExact),
         _ => Err(format!(
-            "Invalid --ranking-mode value {value:?}; expected history_imports, usage_graph, or usage_graph_exact"
+            "Invalid --ranking-mode value {value:?}; expected cascade, history_imports, usage_graph, or usage_graph_exact"
         )),
     }
 }
 
 fn print_help() {
     println!(
-        "Usage: most_relevant_files [--root PROJECT_ROOT] [--recency-half-life COMMITS|none] [--ranking-mode history_imports|usage_graph|usage_graph_exact] [--history-only] [--exclude-tests] <seed-file>...\n\
+        "Usage: most_relevant_files [--root PROJECT_ROOT] [--recency-half-life COMMITS|none] [--ranking-mode cascade|history_imports|usage_graph|usage_graph_exact] [--history-only] [--exclude-tests] <seed-file>...\n\
          \n\
          Each line is `path<TAB>test-kind`, where the kind is test, test_support, production, or ambiguous.\n\
          --history-only ranks by Git co-change and skips import-graph expansion.\n\
@@ -197,6 +198,14 @@ mod tests {
 
     #[test]
     fn parses_ranking_modes() {
+        assert_eq!(
+            parse_ranking_mode("cascade").unwrap(),
+            MostRelevantFilesRankingMode::Cascade
+        );
+        assert_eq!(
+            MostRelevantFilesRankingMode::Cascade,
+            MostRelevantFilesRankingMode::default()
+        );
         assert_eq!(
             parse_ranking_mode("history_imports").unwrap(),
             MostRelevantFilesRankingMode::HistoryImports

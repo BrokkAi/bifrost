@@ -9,6 +9,8 @@ import readline from "node:readline";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
+import { toolInventoryFromMarkdown, unavailableSkillTools } from "./skill-tool-contract.mjs";
+
 const execFileAsync = promisify(execFile);
 const codexHandshake = JSON.parse(
   await fs.readFile(
@@ -25,15 +27,18 @@ const binaryPath = options.binaryPath
   : null;
 await assertEmptyCache(cacheDir);
 
-const codexLaunch = await resolveCodexPluginLaunch(pluginDir);
+const portableLaunch = await resolvePortablePluginLaunch(pluginDir);
+const claudeLaunch = await resolveClaudePluginLaunch(pluginDir);
 
-await smokeLaunch("Codex Agent Plugins adapter", codexLaunch, path.join(cacheDir, "codex"));
+await smokeLaunch("portable Agent Plugins v1 package", portableLaunch, path.join(cacheDir, "portable"), true);
 console.log(
-  `Codex Agent Plugins adapter passed launcher resolution, the recorded Codex ${recordedCodexVersion} ` +
+  `Portable Agent Plugins v1 package passed launcher resolution, the recorded Codex ${recordedCodexVersion} ` +
   "handshake replay, and the MCP roots smoke."
 );
+await smokeLaunch("Claude Code plugin package", claudeLaunch, path.join(cacheDir, "claude"), false);
+console.log("Claude Code plugin package passed MCP roots and list_policies smoke.");
 
-async function smokeLaunch(label, launch, launcherCacheDir) {
+async function smokeLaunch(label, launch, launcherCacheDir, includeCodexSandbox) {
   await assertEmptyCache(launcherCacheDir);
   const launcherEnv = {
     ...process.env,
@@ -41,12 +46,15 @@ async function smokeLaunch(label, launch, launcherCacheDir) {
     BIFROST_LAUNCHER_ALLOW_PATH: "0",
     BIFROST_LAUNCHER_AUTO_INSTALL: binaryPath ? "0" : "1",
     BIFROST_LAUNCHER_CACHE_DIR: launcherCacheDir,
+    CLAUDE_PLUGIN_ROOT: pluginDir,
   };
 
   await prepare(launch.command, os.tmpdir(), launcherEnv, binaryPath ? "explicit" : "installed");
-  await withDisposableSmokeWorkspace((workspace) =>
-    assertCodexSandboxWorkspaceBinding(launch, workspace, launcherEnv)
-  );
+  if (includeCodexSandbox) {
+    await withDisposableSmokeWorkspace((workspace) =>
+      assertCodexSandboxWorkspaceBinding(launch, workspace, launcherEnv)
+    );
+  }
   await withDisposableSmokeWorkspace((workspace) =>
     assertMcpRootsWorkspaceBinding(launch, workspace, launcherEnv)
   );
@@ -138,42 +146,21 @@ async function resolvePortablePluginLaunch(pluginRoot) {
   return { command, cwd: pluginRoot, args: server.args, manifestPath, mcpConfigPath };
 }
 
-async function resolveCodexPluginLaunch(pluginRoot) {
-  const manifestPath = path.join(pluginRoot, ".codex-plugin", "plugin.json");
-  const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
-  assert.equal(
-    manifest.name,
-    "brokk",
-    `${manifestPath} must use Codex's stable package name`
-  );
-  assert.equal(
-    manifest.mcpServers,
-    "./.mcp.json",
-    `${manifestPath} must select Codex's package adapter`
-  );
-  const mcpConfigPath = path.join(pluginRoot, ".mcp.json");
+async function resolveClaudePluginLaunch(pluginRoot) {
+  const manifestPath = path.join(pluginRoot, ".claude-plugin", "plugin.json");
+  const mcpConfigPath = path.join(pluginRoot, "claude-mcp.json");
   const mcpConfig = JSON.parse(await fs.readFile(mcpConfigPath, "utf8"));
   const server = mcpConfig.mcpServers?.bifrost;
   assert.ok(server, `${mcpConfigPath} must define the bifrost MCP server`);
   assert.equal(
     server.command,
-    "./bin/bifrost-launcher.mjs",
-    `${mcpConfigPath} must resolve the package-local launcher`
+    "${CLAUDE_PLUGIN_ROOT}/bin/bifrost-launcher.mjs",
+    `${mcpConfigPath} must resolve the package-local launcher through Claude's plugin root`
   );
-  assert.equal(server.cwd, ".", `${mcpConfigPath} must resolve cwd from the package root`);
   assert.deepEqual(server.args, ["--mcp", "symbol|extended"]);
-  assert.equal(server.startup_timeout_sec, 180);
-  assert.equal(server.tool_timeout_sec, 300);
-  const installedPackageRoot = path.resolve(pluginRoot, server.cwd);
-  const command = path.resolve(installedPackageRoot, server.command);
+  const command = path.join(pluginRoot, "bin", "bifrost-launcher.mjs");
   await fs.access(command);
-  return {
-    command,
-    cwd: pluginRoot,
-    args: server.args,
-    manifestPath,
-    mcpConfigPath,
-  };
+  return { command, cwd: pluginRoot, args: server.args, manifestPath, mcpConfigPath };
 }
 
 async function assertEmptyCache(directory) {
@@ -264,6 +251,7 @@ async function assertCodexSandboxWorkspaceBinding(codexLaunch, workspaceRoot, en
     });
     const tools = toolList.result?.tools;
     assert.ok(Array.isArray(tools), "MCP tools/list did not return a tools array");
+    await assertPortableSkillToolContract(codexLaunch.cwd, tools);
     assert.ok(tools.some((tool) => tool.name === "search_symbols"), "MCP tools/list did not advertise search_symbols");
     assert.ok(tools.some((tool) => tool.name === "get_summaries"), "MCP tools/list did not advertise get_summaries");
     assert.ok(tools.some((tool) => tool.name === "get_symbol_sources"), "MCP tools/list did not advertise get_symbol_sources");
@@ -447,6 +435,42 @@ async function assertNoPluginWorkspaceCache(pluginCwd) {
     fs.readdir(analyzerCacheDir(pluginCwd)),
     { code: "ENOENT" },
     "Packaged MCP launch wrote analyzer storage under the plugin directory"
+  );
+}
+
+async function assertPortableSkillToolContract(pluginRoot, tools) {
+  const advertisedToolNames = new Set(tools.map((tool) => tool.name));
+  const skillsRoot = path.join(pluginRoot, "skills");
+  const skillDirectories = (await fs.readdir(skillsRoot, { withFileTypes: true }))
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+  assert.ok(skillDirectories.length > 0, `Packaged plugin has no portable skills under ${skillsRoot}`);
+
+  const skillContracts = [];
+  for (const skillDirectory of skillDirectories) {
+    const skillPath = path.join(skillsRoot, skillDirectory, "SKILL.md");
+    const skill = await fs.readFile(skillPath, "utf8");
+    const skillToolNames = toolInventoryFromMarkdown(skill);
+    skillContracts.push({ skillPath, skillToolNames });
+  }
+
+  const missingInventories = skillContracts
+    .filter(({ skillToolNames }) => skillToolNames.length === 0)
+    .map(({ skillPath }) => skillPath);
+  assert.deepEqual(
+    missingInventories,
+    [],
+    `Portable skills must declare Bifrost MCP tools in a Markdown table with a Tool column: ${JSON.stringify(missingInventories)}`
+  );
+
+  const unavailableReferences = skillContracts.flatMap(({ skillPath, skillToolNames }) =>
+    unavailableSkillTools(skillToolNames, advertisedToolNames).map((toolName) => ({ skillPath, toolName }))
+  );
+  assert.deepEqual(
+    unavailableReferences,
+    [],
+    `Portable skills advertise tools absent from the packaged MCP server: ${JSON.stringify(unavailableReferences)}`
   );
 }
 

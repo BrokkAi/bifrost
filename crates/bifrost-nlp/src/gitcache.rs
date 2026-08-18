@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
+use brokk_bifrost_analysis::gitblob::WorkingTreeIdentity;
 use git2::{
     AttrCheckFlags, AttrValue, Config, DiffOptions, ErrorCode, Index, ObjectType, Oid, Repository,
 };
@@ -27,9 +28,22 @@ pub fn is_git_repo(root: &Path) -> bool {
     brokk_bifrost_analysis::gitblob::is_git_repo(root)
 }
 
+/// Identity for every path of a whole-worktree build.
+///
+/// `shared_scan` is the analyzer's repository-wide Git identity scan when it
+/// has already taken one for this worktree. Reusing it is the point: the
+/// analyzer reads the Git index and diffs the working tree at startup, and
+/// re-deriving the same 401,804 index entries here cost firefox another 4.1 s
+/// immediately afterwards. Reuse changes no verdict. The scan supplies the
+/// same two facts this walk derived for itself -- the recorded index OID and
+/// whether the path was clean -- and it re-checks each file's current size and
+/// mtime against the index entry before it serves an OID, which is how an edit
+/// made between the scan and this call is caught. The content-transform verdict
+/// stays here, batched, because that is this walk's own rule.
 pub fn working_tree_oids(
     repo: &Repository,
     rel_paths: &[String],
+    shared_scan: Option<&WorkingTreeIdentity>,
 ) -> Result<HashMap<String, String>> {
     let started = Instant::now();
     let workdir = repo
@@ -39,49 +53,85 @@ pub fn working_tree_oids(
     // Bifrost keeps this repository open while another process can run Git.
     // Reload the index so newly staged content gets its current index OID.
     index.read(true).map_err(|err| err.to_string())?;
-    let dirty = dirty_worktree_paths(repo, &index, None)?;
-    let index_oids: HashMap<String, Oid> = index
+    let scanned = match shared_scan {
+        Some(scan) => CleanIndexOids::Shared(scan),
+        None => CleanIndexOids::Own {
+            dirty: dirty_worktree_paths(repo, &index, None)?,
+            index_oids: index
+                .iter()
+                .map(|entry| {
+                    let path = String::from_utf8(entry.path).map_err(|err| {
+                        format!("non-UTF-8 git index path while building semantic cache: {err}")
+                    })?;
+                    Ok((path, entry.id))
+                })
+                .collect::<Result<_>>()?,
+        },
+    };
+    // Only a clean tracked path can serve an index OID, so resolve them all
+    // first: the ones that have one are exactly the ones that need an
+    // attribute verdict, and the batch answers them together.
+    let clean_index_oids: Vec<Option<Oid>> = rel_paths
         .iter()
-        .map(|entry| {
-            let path = String::from_utf8(entry.path).map_err(|err| {
-                format!("non-UTF-8 git index path while building semantic cache: {err}")
-            })?;
-            Ok((path, entry.id))
-        })
-        .collect::<Result<_>>()?;
-    let mut transforms = ContentTransformProbe::new(repo, &index, workdir);
-    // Only a clean tracked path can serve an index OID, so only such a path
-    // needs an attribute verdict. Ask about all of them at once.
+        .map(|rel| scanned.clean_index_oid(workdir, rel))
+        .collect();
     let clean_tracked: Vec<&str> = rel_paths
         .iter()
-        .filter(|rel| !dirty.contains(*rel) && index_oids.contains_key(*rel))
-        .map(String::as_str)
+        .zip(&clean_index_oids)
+        .filter(|(_, oid)| oid.is_some())
+        .map(|(rel, _)| rel.as_str())
         .collect();
+    let mut transforms = ContentTransformProbe::new(repo, &index, workdir);
     let transformed = transforms.resolve(&clean_tracked)?;
     let mut out = HashMap::with_capacity(rel_paths.len());
     let mut hashed = 0usize;
-    for rel in rel_paths {
-        let use_worktree =
-            dirty.contains(rel) || !index_oids.contains_key(rel) || transformed.contains(rel);
-        let oid = if use_worktree {
-            hashed += 1;
-            hash_working_file(workdir, rel)?
-        } else {
-            *index_oids
-                .get(rel)
-                .expect("tracked clean semantic path has an index OID")
+    for (rel, clean_index_oid) in rel_paths.iter().zip(clean_index_oids) {
+        let oid = match clean_index_oid {
+            Some(oid) if !transformed.contains(rel) => oid,
+            _ => {
+                hashed += 1;
+                hash_working_file(workdir, rel)?
+            }
         };
         out.insert(rel.clone(), oid.to_string());
     }
     eprintln!(
-        "bifrost semantic identities: files={}; index={}; hashed={hashed}; attr_paths={}; attr_lookups={}; time={:?}",
+        "bifrost semantic identities: files={}; index={}; hashed={hashed}; shared_scan={}; attr_paths={}; attr_lookups={}; time={:?}",
         rel_paths.len(),
         rel_paths.len() - hashed,
+        shared_scan.is_some(),
         transforms.asked,
         transforms.lookups,
         started.elapsed()
     );
     Ok(out)
+}
+
+/// Where a whole-worktree walk gets each path's clean index OID: the analyzer's
+/// shared scan, or the index and dirty-tree scan this walk took itself.
+enum CleanIndexOids<'a> {
+    Shared(&'a WorkingTreeIdentity),
+    Own {
+        dirty: HashSet<String>,
+        index_oids: HashMap<String, Oid>,
+    },
+}
+
+impl CleanIndexOids<'_> {
+    /// The index OID `rel` can serve, or `None` when its visible working bytes
+    /// are its identity. A content transform can still take the OID away; that
+    /// verdict is the caller's.
+    fn clean_index_oid(&self, workdir: &Path, rel: &str) -> Option<Oid> {
+        match self {
+            Self::Shared(scan) => scan.stat_clean_index_oid(rel, &workdir.join(rel)),
+            Self::Own { dirty, index_oids } => {
+                if dirty.contains(rel) {
+                    return None;
+                }
+                index_oids.get(rel).copied()
+            }
+        }
+    }
 }
 
 pub fn working_tree_oids_targeted(
@@ -514,7 +564,7 @@ mod tests {
             .unwrap()
             .id;
         assert_eq!(
-            working_tree_oids(&repo, std::slice::from_ref(&path)).unwrap()[&path],
+            working_tree_oids(&repo, std::slice::from_ref(&path), None).unwrap()[&path],
             index_oid.to_string()
         );
 
@@ -535,7 +585,7 @@ mod tests {
         std::fs::write(temp.path().join("tracked.rs"), "fn dirty() {}\n").unwrap();
         std::fs::write(temp.path().join("new.rs"), "fn new_file() {}\n").unwrap();
         let paths = ["tracked.rs".to_string(), "new.rs".to_string()];
-        let resolved = working_tree_oids(&repo, &paths).unwrap();
+        let resolved = working_tree_oids(&repo, &paths, None).unwrap();
 
         for path in paths {
             assert_eq!(
@@ -545,6 +595,67 @@ mod tests {
                     .to_string()
             );
         }
+    }
+
+    /// Reusing the analyzer's scan must not change a single verdict, whatever
+    /// state a path is in: clean tracked, staged, dirty, or untracked.
+    #[test]
+    fn the_shared_scan_resolves_the_same_identities_as_its_own_scan() {
+        let (temp, repo) = init_repo();
+        std::fs::write(temp.path().join("dirty.rs"), "fn committed() {}\n").unwrap();
+        run_git(temp.path(), ["add", "dirty.rs"]);
+        run_git(temp.path(), ["commit", "-m", "second"]);
+        std::fs::write(temp.path().join("dirty.rs"), "fn edited() {}\n").unwrap();
+        std::fs::write(temp.path().join("staged.rs"), "fn staged() {}\n").unwrap();
+        run_git(temp.path(), ["add", "staged.rs"]);
+        std::fs::write(temp.path().join("untracked.rs"), "fn loose() {}\n").unwrap();
+        let paths = [
+            "tracked.rs".to_string(),
+            "staged.rs".to_string(),
+            "dirty.rs".to_string(),
+            "untracked.rs".to_string(),
+        ];
+
+        let scan = brokk_bifrost_analysis::gitblob::working_tree_identity(&repo).unwrap();
+        assert_eq!(
+            working_tree_oids(&repo, &paths, Some(&scan)).unwrap(),
+            working_tree_oids(&repo, &paths, None).unwrap()
+        );
+    }
+
+    /// The shared scan describes the instant it ran, so a file edited after it
+    /// must still resolve to its visible working bytes. `stat_clean_index_oid`
+    /// re-checks the file against the stat the index recorded, which is what
+    /// makes that true.
+    #[test]
+    fn an_edit_after_the_shared_scan_uses_the_working_bytes() {
+        let (temp, repo) = init_repo();
+        let path = "tracked.rs".to_string();
+        let scan = brokk_bifrost_analysis::gitblob::working_tree_identity(&repo).unwrap();
+        let index_oid = repo
+            .index()
+            .unwrap()
+            .get_path(Path::new(&path), 0)
+            .unwrap()
+            .id;
+        assert_eq!(
+            working_tree_oids(&repo, std::slice::from_ref(&path), Some(&scan)).unwrap()[&path],
+            index_oid.to_string(),
+            "an unedited clean path serves the scan's index OID"
+        );
+
+        // A size change is detected whatever the filesystem's mtime resolution.
+        std::fs::write(
+            temp.path().join(&path),
+            "fn first() {}\nfn appended_after_the_scan() {}\n",
+        )
+        .unwrap();
+        let edited_oid = Oid::hash_file(ObjectType::Blob, temp.path().join(&path)).unwrap();
+        assert_ne!(edited_oid, index_oid);
+        assert_eq!(
+            working_tree_oids(&repo, std::slice::from_ref(&path), Some(&scan)).unwrap()[&path],
+            edited_oid.to_string()
+        );
     }
 
     #[test]
@@ -732,7 +843,7 @@ mod tests {
         let working_oid = Oid::hash_file(ObjectType::Blob, temp.path().join(&path)).unwrap();
         assert_ne!(working_oid, index_oid);
         assert_eq!(
-            working_tree_oids(&repo, std::slice::from_ref(&path)).unwrap()[&path],
+            working_tree_oids(&repo, std::slice::from_ref(&path), None).unwrap()[&path],
             working_oid.to_string()
         );
     }

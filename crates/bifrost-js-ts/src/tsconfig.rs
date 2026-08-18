@@ -1,5 +1,7 @@
-//! Resolution of TypeScript/JavaScript `tsconfig.json` (and `jsconfig.json`) path
-//! aliases (`compilerOptions.baseUrl` + `compilerOptions.paths`).
+//! Resolution of the non-relative module specifiers a JS/TS workspace writes:
+//! `tsconfig.json` (and `jsconfig.json`) path aliases
+//! (`compilerOptions.baseUrl` + `compilerOptions.paths`), and the names the
+//! workspace's own npm packages carry.
 //!
 //! `scan_usages` and the JS/TS import graph follow *relative* specifiers (`./`, `../`)
 //! out of the box, but real monorepos import almost everything through aliases like
@@ -15,12 +17,20 @@
 //! are resolved relative to `baseUrl` (or to the declaring config's directory when
 //! `baseUrl` is absent), longest matching prefix wins, and a pattern may map to several
 //! roots tried in order.
+//!
+//! An alias map does not cover a monorepo's other non-relative form: a bare
+//! specifier that names one of the workspace's own packages
+//! (`@tanstack/react-query`). That one is answered from
+//! [`crate::workspace_packages`], whose index this resolver builds once, on
+//! demand, from the workspace listing it was constructed over.
 
+use crate::workspace_packages::WorkspacePackageIndex;
 use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::path_normalization::NormalizePath;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Config file names consulted when walking up from an importing file, in priority
 /// order. `tsconfig.json` wins over `jsconfig.json` when both sit in the same directory.
@@ -35,19 +45,28 @@ const MAX_EXTENDS_DEPTH: usize = 16;
 /// keeps a hostile DAG from fanning out into exponential reads.
 const MAX_CONFIG_READS: u32 = 256;
 
-/// Resolves alias specifiers for one repository root, caching parsed configs so the
-/// hot import-resolution loop parses each `tsconfig.json` at most once. Cheap to
-/// construct (`new` just stores the root); all filesystem work is lazy.
+/// Resolves non-relative specifiers for one repository root, caching parsed configs
+/// so the hot import-resolution loop parses each `tsconfig.json` at most once, and
+/// caching the workspace package index so it reads each `package.json` at most once.
+/// Cheap to construct (`new` just stores the project handle); all filesystem work is
+/// lazy.
 pub struct AliasResolver {
     root: PathBuf,
     /// Symlink-resolved `root`, used to contain `extends` targets to the repo. Falls back
     /// to `root` when canonicalization fails (e.g. the root was deleted out from under us).
     canonical_root: PathBuf,
+    /// The workspace this resolver answers for. Held rather than listed eagerly so
+    /// constructing a resolver never forces a workspace walk; the listing is the
+    /// project's own cached one, so the index inherits its ignore rules.
+    project: Arc<dyn Project>,
     /// `directory of importing file` → nearest governing config file (if any).
     nearest: Mutex<HashMap<PathBuf, Option<PathBuf>>>,
     /// `config file path` → its fully-resolved alias map (extends already followed).
     /// `None` means the file was unreadable/unparseable or declared no usable `paths`.
     maps: Mutex<HashMap<PathBuf, Arc<Option<AliasMap>>>>,
+    /// The workspace's own npm packages, built on the first bare specifier that no
+    /// alias claims.
+    packages: OnceLock<Arc<WorkspacePackageIndex>>,
 }
 
 /// Hard cap on a config file's size before we read it. Real `tsconfig.json`/`jsconfig.json`
@@ -78,14 +97,16 @@ enum Pattern {
 }
 
 impl AliasResolver {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        let root = root.into();
+    pub fn new(project: Arc<dyn Project>) -> Self {
+        let root = project.root().to_path_buf();
         let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
         Self {
             root,
             canonical_root,
+            project,
             nearest: Mutex::new(HashMap::default()),
             maps: Mutex::new(HashMap::default()),
+            packages: OnceLock::new(),
         }
     }
 
@@ -117,6 +138,42 @@ impl AliasResolver {
             bases.push(relative.to_path_buf());
         }
         bases
+    }
+
+    /// Candidate entry paths (relative to the repo root) for a bare `specifier`
+    /// that names one of the workspace's own npm packages, in the order the
+    /// package's manifest offers them. Empty when the specifier names no
+    /// workspace package -- which is how an external npm dependency keeps
+    /// failing closed -- and empty when the specifier carries a subpath.
+    ///
+    /// A subpath (`@scope/pkg/deep`) is refused rather than guessed: answering
+    /// it means resolving the package's `exports` subpath map, including its
+    /// pattern forms, and no workspace reference in the corpus needs one. The
+    /// boundary is pinned by a test so a later change is a deliberate one.
+    pub fn workspace_package_bases(&self, specifier: &str) -> Vec<PathBuf> {
+        let Some((package_name, subpath)) =
+            crate::imports::npm_package_of_module_specifier(specifier)
+        else {
+            return Vec::new();
+        };
+        if subpath.is_some() {
+            return Vec::new();
+        }
+        self.workspace_packages().entry_bases(package_name).to_vec()
+    }
+
+    /// The workspace package index, built once per resolver on first use.
+    fn workspace_packages(&self) -> &WorkspacePackageIndex {
+        self.packages.get_or_init(|| {
+            let index = match self.project.all_files_shared() {
+                Ok(files) => WorkspacePackageIndex::build(&self.root, &files),
+                // A workspace that cannot be listed has no readable manifests
+                // either; the empty index leaves every bare specifier external,
+                // which is the behavior that predates this index.
+                Err(_) => WorkspacePackageIndex::default(),
+            };
+            Arc::new(index)
+        })
     }
 
     /// Nearest `tsconfig.json`/`jsconfig.json` governing `source_file`, walking up from
@@ -608,7 +665,10 @@ mod tests {
     }
 
     fn resolver_for(root: &Path) -> AliasResolver {
-        AliasResolver::new(root.to_path_buf())
+        AliasResolver::new(Arc::new(
+            brokk_bifrost_core::analyzer::project::FilesystemProject::new(root)
+                .expect("temporary alias-resolution root is a directory"),
+        ))
     }
 
     fn deliver_in(root: &Path) -> ProjectFile {

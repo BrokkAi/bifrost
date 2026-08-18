@@ -1,0 +1,1047 @@
+name: Release readiness
+
+on:
+  workflow_dispatch:
+    inputs:
+      public_commit:
+        description: Exact 40-character public commit to qualify
+        required: true
+        type: string
+      version:
+        description: Release version without the v prefix
+        required: true
+        type: string
+      expected_public_head:
+        description: Independently observed public master head expected by preflight
+        required: true
+        type: string
+      private_commit:
+        description: Optional private source commit recorded from the projection ledger
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: release-readiness-${{ inputs.public_commit }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  BIN_NAME: bifrost
+  ANDROID_API: '21'
+  PUBLIC_REPOSITORY: BrokkAi/bifrost
+
+jobs:
+  preflight:
+    name: preflight exact public commit
+    if: ${{ github.repository == 'BrokkAi/bifrost' && github.event.repository.private == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      commit: ${{ steps.identity.outputs.commit }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Checkout requested public commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.public_commit }}
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Verify exact commit, public head, and absent tag
+        id: identity
+        shell: bash
+        env:
+          PUBLIC_COMMIT: ${{ inputs.public_commit }}
+          EXPECTED_PUBLIC_HEAD: ${{ inputs.expected_public_head }}
+          PRIVATE_COMMIT: ${{ inputs.private_commit }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$PUBLIC_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_PUBLIC_HEAD" =~ ^[0-9a-f]{40}$ ]]
+          if [[ -n "$PRIVATE_COMMIT" ]]; then
+            [[ "$PRIVATE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          fi
+          test "$(git rev-parse HEAD)" = "$PUBLIC_COMMIT"
+          public_head="$(git ls-remote origin refs/heads/master | awk '{print $1}')"
+          test -n "$public_head"
+          test "$public_head" = "$EXPECTED_PUBLIC_HEAD"
+          set +e
+          tag_refs="$(git ls-remote --exit-code --tags origin "refs/tags/v${RELEASE_VERSION}" 2>&1)"
+          tag_status=$?
+          set -e
+          case "$tag_status" in
+            0)
+              echo "Release tag v${RELEASE_VERSION} already exists; readiness must precede tagging." >&2
+              exit 1
+              ;;
+            2)
+              test -z "$tag_refs"
+              ;;
+            *)
+              echo "Unable to prove release tag v${RELEASE_VERSION} is absent:" >&2
+              echo "$tag_refs" >&2
+              exit 1
+              ;;
+          esac
+          echo "commit=$PUBLIC_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - name: Validate synchronized release version
+        id: release
+        env:
+          RELEASE_TAG: v${{ inputs.version }}
+        run: node scripts/release-version.mjs check --tag "$RELEASE_TAG" --github-output "$GITHUB_OUTPUT"
+
+      - name: Audit workflow action pins
+        run: bash scripts/check-github-actions-security.sh
+
+  notices:
+    name: generate Rust notices
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+
+      # The key is bound to the exact public commit. Readiness never restores
+      # a cache produced by a different candidate or private source tree.
+      - name: Cache Cargo dependencies for notices
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-notices
+
+      - name: Install pinned cargo-about
+        run: cargo install --locked cargo-about --version 0.9.1 --features cli
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Generate Rust notice report
+        run: scripts/generate-rust-third-party-notices.sh dist/THIRD_PARTY_LICENSES.html
+
+      - name: Upload notice report
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: rust-third-party-licenses
+          path: dist/THIRD_PARTY_LICENSES.html
+          if-no-files-found: error
+          retention-days: 14
+
+  crate-package:
+    name: package exact crates
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+
+      # Keep package preparation isolated to this exact public commit.
+      - name: Cache Cargo dependencies for crate packages
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-crate-package
+
+      - name: Verify package contents and build exact archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/check-workspace-packages.sh
+          packages=(
+            brokk-bifrost-core brokk-bifrost-cpp brokk-bifrost-csharp
+            brokk-bifrost-go brokk-bifrost-js-ts brokk-bifrost-jvm
+            brokk-bifrost-php brokk-bifrost-python brokk-bifrost-ruby
+            brokk-bifrost-rust brokk-bifrost-rql brokk-bifrost-analysis
+            brokk-bifrost-nlp brokk-bifrost-policy brokk-bifrost-semantic-packs
+            brokk-bifrost-runtime brokk-bifrost-mcp brokk-bifrost-lsp
+            brokk-bifrost
+          )
+          patch_args=(
+            --config 'patch.crates-io.brokk-bifrost-core.path="crates/bifrost-core"'
+            --config 'patch.crates-io.brokk-bifrost-cpp.path="crates/bifrost-cpp"'
+            --config 'patch.crates-io.brokk-bifrost-csharp.path="crates/bifrost-csharp"'
+            --config 'patch.crates-io.brokk-bifrost-go.path="crates/bifrost-go"'
+            --config 'patch.crates-io.brokk-bifrost-js-ts.path="crates/bifrost-js-ts"'
+            --config 'patch.crates-io.brokk-bifrost-jvm.path="crates/bifrost-jvm"'
+            --config 'patch.crates-io.brokk-bifrost-php.path="crates/bifrost-php"'
+            --config 'patch.crates-io.brokk-bifrost-python.path="crates/bifrost-python"'
+            --config 'patch.crates-io.brokk-bifrost-ruby.path="crates/bifrost-ruby"'
+            --config 'patch.crates-io.brokk-bifrost-rust.path="crates/bifrost-rust"'
+            --config 'patch.crates-io.brokk-bifrost-rql.path="crates/bifrost-rql"'
+            --config 'patch.crates-io.brokk-bifrost-analysis.path="crates/bifrost-analysis"'
+            --config 'patch.crates-io.brokk-bifrost-nlp.path="crates/bifrost-nlp"'
+            --config 'patch.crates-io.brokk-bifrost-policy.path="crates/bifrost-policy"'
+            --config 'patch.crates-io.brokk-bifrost-semantic-packs.path="crates/bifrost-semantic-packs"'
+            --config 'patch.crates-io.brokk-bifrost-runtime.path="crates/bifrost-runtime"'
+            --config 'patch.crates-io.brokk-bifrost-mcp.path="crates/bifrost-mcp"'
+            --config 'patch.crates-io.brokk-bifrost-lsp.path="crates/bifrost-lsp"'
+          )
+          mkdir -p dist
+          metadata="${RUNNER_TEMP}/cargo-metadata.json"
+          badges="${RUNNER_TEMP}/crate-badges.json"
+          cargo metadata --format-version 1 --no-deps > "$metadata"
+          printf '{}\n' > "$badges"
+          for package in "${packages[@]}"; do
+            CARGO_TARGET_DIR="${RUNNER_TEMP}/crate-target" cargo package \
+              --quiet --locked --allow-dirty --no-verify --package "$package" \
+              --manifest-path Cargo.toml "${patch_args[@]}"
+            archive="${RUNNER_TEMP}/crate-target/package/${package}-${RELEASE_VERSION}.crate"
+            test -f "$archive"
+            cp "$archive" dist/
+            sha256sum "$archive" > "dist/$(basename "$archive").sha256"
+            node scripts/generate-crate-publish-metadata.mjs \
+              --cargo-metadata-file "$metadata" \
+              --package "$package" \
+              --version "$RELEASE_VERSION" \
+              --badges-file "$badges" \
+              --output-file "dist/$(basename "$archive").metadata.json"
+            test "$(jq -r '.name // empty' "dist/$(basename "$archive").metadata.json")" = "$package"
+            test "$(jq -r '.vers // empty' "dist/$(basename "$archive").metadata.json")" = "$RELEASE_VERSION"
+            jq -e '.deps | type == "array"' "dist/$(basename "$archive").metadata.json" >/dev/null
+          done
+
+      - name: Upload exact crate archives and metadata
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: crate-packages
+          path: |
+            dist/*.crate
+            dist/*.crate.sha256
+            dist/*.crate.metadata.json
+          if-no-files-found: error
+          retention-days: 14
+
+  semantic-pack-bundle:
+    name: generate semantic packs
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+
+      # Keep semantic-pack build inputs isolated to this exact public commit;
+      # no private projection or NLP model cache is involved.
+      - name: Cache Cargo dependencies for semantic packs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-semantic-packs
+
+      - name: Generate and verify semantic-pack bundle
+        shell: bash
+        run: bash scripts/build-pinned-jvm-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs" "${RUNNER_TEMP}"
+      - name: Package semantic-pack bundle
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          mv "${RUNNER_TEMP}/bifrost-semantic-packs/measurements.json" "dist/bifrost-semantic-packs-${RELEASE_TAG}-measurements.json"
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -C "${RUNNER_TEMP}" -cf - bifrost-semantic-packs | gzip -n > "dist/bifrost-semantic-packs-${RELEASE_TAG}.tar.gz"
+          (cd dist && sha256sum "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz" > "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz.sha256")
+      - name: Upload semantic-pack bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bifrost-semantic-packs
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/*-measurements.json
+          if-no-files-found: error
+          retention-days: 14
+
+  build:
+    name: build binary (${{ matrix.target }})
+    needs: [preflight, notices]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            rust_targets: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: x86_64-unknown-linux-musl
+            rust_targets: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            rust_targets: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            archive: tar.gz
+          - target: aarch64-linux-android
+            rust_targets: aarch64-linux-android
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: universal-apple-darwin
+            rust_targets: x86_64-apple-darwin aarch64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            rust_targets: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+          - target: aarch64-pc-windows-msvc
+            rust_targets: aarch64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Download Rust notice report
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: rust-third-party-licenses
+          path: licenses
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+      # The exact public commit is part of the cache namespace. This avoids
+      # restoring build state across candidate refs or private/public edges.
+      - name: Cache Cargo dependencies for binary build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-build-${{ matrix.target }}
+      - name: Install Rust targets
+        shell: bash
+        run: rustup target add ${{ matrix.rust_targets }}
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y musl-tools
+      - name: Set up Android NDK
+        if: matrix.target == 'aarch64-linux-android'
+        id: setup-ndk
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
+        with:
+          ndk-version: r27d
+          add-to-path: false
+      - name: Configure Android toolchain
+        if: matrix.target == 'aarch64-linux-android'
+        shell: bash
+        run: |
+          toolchain_bin="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          api="${ANDROID_API}"
+          {
+            echo "CC_aarch64_linux_android=${toolchain_bin}/aarch64-linux-android${api}-clang"
+            echo "CXX_aarch64_linux_android=${toolchain_bin}/aarch64-linux-android${api}-clang++"
+            echo "AR_aarch64_linux_android=${toolchain_bin}/llvm-ar"
+            echo "RANLIB_aarch64_linux_android=${toolchain_bin}/llvm-ranlib"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${toolchain_bin}/aarch64-linux-android${api}-clang"
+          } >> "$GITHUB_ENV"
+      - name: Build binary
+        if: matrix.target != 'universal-apple-darwin'
+        run: cargo build --release --locked --bin "$BIN_NAME" --target "${{ matrix.target }}"
+      - name: Build macOS universal binary
+        if: matrix.target == 'universal-apple-darwin'
+        shell: bash
+        run: |
+          cargo build --release --locked --bin "$BIN_NAME" --target x86_64-apple-darwin
+          cargo build --release --locked --bin "$BIN_NAME" --target aarch64-apple-darwin
+          mkdir -p "target/${{ matrix.target }}/release"
+          lipo -create "target/x86_64-apple-darwin/release/${BIN_NAME}" "target/aarch64-apple-darwin/release/${BIN_NAME}" -output "target/${{ matrix.target }}/release/${BIN_NAME}"
+      - name: Stage Unix archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          stage="${BIN_NAME}-${RELEASE_TAG}-${{ matrix.target }}"
+          mkdir -p "dist/${stage}"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/${stage}/"
+          cp LICENSE.md README.md licenses/GPL-3.0.md licenses/LGPL-3.0.md licenses/THIRD_PARTY_LICENSES.html licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "dist/${stage}/"
+          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+          (cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
+      - name: Stage Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          $stage = "${env:BIN_NAME}-${env:RELEASE_TAG}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path "dist/$stage" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" "dist/$stage/"
+          Copy-Item LICENSE.md, README.md, licenses/GPL-3.0.md, licenses/LGPL-3.0.md, licenses/THIRD_PARTY_LICENSES.html, licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt "dist/$stage/"
+          Compress-Archive -Path "dist/$stage" -DestinationPath "dist/$stage.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/$stage.zip").Hash.ToLower()
+          [System.IO.File]::WriteAllText((Join-Path $PWD "dist/$stage.zip.sha256"), "$hash  $stage.zip`n")
+      - name: Upload exact binary archive
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bifrost-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  python-wheels:
+    name: build Python wheel (${{ matrix.target }})
+    needs: [preflight, notices]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            kind: linux
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            kind: linux
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            kind: macos
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            kind: macos
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            kind: windows
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Download Rust notice report
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: rust-third-party-licenses
+          path: licenses
+      - name: Install Rust toolchain for wheel cache
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+          targets: ${{ matrix.target }}
+      - name: Cache Cargo dependencies for Python wheel
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-python-${{ matrix.target }}
+      - name: Build Python wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        env:
+          CFLAGS: ${{ matrix.kind == 'linux' && '-D_BSD_SOURCE' || '' }}
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
+          args: --release --locked --out dist
+          rust-toolchain: '1.96.0'
+      - name: Upload exact Python wheel
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+  uv-wheels:
+    name: build uv CLI wheel (${{ matrix.target }})
+    needs: [preflight, notices]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            kind: linux
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            kind: linux
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            kind: macos
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            kind: macos
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            kind: windows
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Download Rust notice report
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: rust-third-party-licenses
+          path: licenses
+      - name: Install Rust toolchain for wheel cache
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.96.0
+          targets: ${{ matrix.target }}
+      - name: Cache Cargo dependencies for uv wheel
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-uv-${{ matrix.target }}
+      - name: Prepare uv CLI license files
+        run: node scripts/prepare-uv-cli-package.mjs
+      - name: Build uv CLI wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        env:
+          CFLAGS: ${{ matrix.kind == 'linux' && '-D_BSD_SOURCE' || '' }}
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
+          args: --release --locked --out dist
+          rust-toolchain: '1.96.0'
+          working-directory: packaging/bifrost-cli
+      - name: Upload exact uv CLI wheel
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: cli-wheels-${{ matrix.target }}
+          path: packaging/bifrost-cli/dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+  sdist:
+    name: build Python source distribution
+    needs: [preflight, notices]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Download Rust notice report
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: rust-third-party-licenses
+          path: licenses
+      - name: Build exact source distribution
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: sdist
+          args: --out dist
+      - name: Upload exact source distribution
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  wheel-verify:
+    name: verify wheel and sdist versions
+    needs: [preflight, python-wheels, uv-wheels, sdist]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: '*wheels-*'
+          path: dist
+          merge-multiple: true
+      - name: Download source distribution
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: sdist
+          path: dist
+      - name: Verify exact distribution versions and counts
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          artifacts=(dist/*.whl dist/*.tar.gz)
+          test "${#artifacts[@]}" -gt 0
+          for artifact in "${artifacts[@]}"; do
+            case "$(basename "$artifact")" in
+              *-"${EXPECTED_VERSION}"-*|*-"${EXPECTED_VERSION}".tar.gz) ;;
+              *) echo "Unexpected distribution version: $artifact" >&2; exit 1 ;;
+            esac
+          done
+          python_wheels=(dist/brokk_bifrost_searchtools-*.whl)
+          cli_wheels=(dist/brokk_bifrost-*.whl)
+          sdists=(dist/brokk_bifrost_searchtools-*.tar.gz)
+          test "${#python_wheels[@]}" -eq 5
+          test "${#cli_wheels[@]}" -eq 5
+          test "${#sdists[@]}" -eq 1
+
+  agent-plugin-package:
+    name: package agent plugin
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Download binary artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: bifrost-*
+          path: dist
+          merge-multiple: true
+      - name: Prepare agent plugin release metadata
+        run: >
+          node scripts/prepare-vscode-extension-manifest.mjs
+          --version "${{ needs.preflight.outputs.version }}"
+          --plugin-release plugins/bifrost-agent/bifrost-release.json
+          --dist dist
+      - name: Test agent plugin launcher
+        run: node --test plugins/bifrost-agent/test/launcher.test.mjs
+      - name: Validate agent plugin manifests
+        run: node scripts/check-codex-plugin-manifest.mjs
+      - name: Package exact agent plugin archive
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          package_root="${RUNNER_TEMP}/bifrost-agent-package"
+          mkdir -p "$package_root" dist
+          cp -R plugins/bifrost-agent "$package_root/bifrost-agent"
+          cp LICENSE.md "$package_root/bifrost-agent/"
+          tar -C "$package_root" -czf "dist/bifrost-agent-${RELEASE_TAG}.tar.gz" bifrost-agent
+          sha256sum "dist/bifrost-agent-${RELEASE_TAG}.tar.gz" > "dist/bifrost-agent-${RELEASE_TAG}.tar.gz.sha256"
+      - name: Upload exact agent plugin archive
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bifrost-agent-package
+          path: |
+            dist/bifrost-agent-*.tar.gz
+            dist/bifrost-agent-*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  agent-plugin-smoke:
+    name: prepublish Codex and Claude list_policies smoke
+    needs: [preflight, build, agent-plugin-package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Download exact Linux binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: bifrost-x86_64-unknown-linux-gnu
+          path: ${{ runner.temp }}/bifrost-linux-release
+      - name: Download exact agent plugin
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: bifrost-agent-package
+          path: ${{ runner.temp }}/bifrost-agent-release
+      - name: Extract exact staged inputs
+        id: staged
+        shell: bash
+        env:
+          BINARY_DIR: ${{ runner.temp }}/bifrost-linux-release
+          PLUGIN_DIR: ${{ runner.temp }}/bifrost-agent-release
+        run: |
+          set -euo pipefail
+          archive="$(find "$BINARY_DIR" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          test -n "$archive"
+          tar -C "$BINARY_DIR" -xzf "$archive"
+          binary="$(find "$BINARY_DIR" -type f -name "$BIN_NAME" -print -quit)"
+          test -n "$binary"
+          chmod +x "$binary"
+          plugin_archive="$(find "$PLUGIN_DIR" -maxdepth 1 -type f -name 'bifrost-agent-*.tar.gz' -print -quit)"
+          test -n "$plugin_archive"
+          tar -C "$PLUGIN_DIR" -xzf "$plugin_archive"
+          echo "binary=$binary" >> "$GITHUB_OUTPUT"
+          echo "plugin=$PLUGIN_DIR/bifrost-agent" >> "$GITHUB_OUTPUT"
+      - name: Run real Codex and Claude list_policies smoke
+        shell: bash
+        run: >
+          node scripts/smoke-agent-plugin-release.mjs
+          --plugin-dir "${{ steps.staged.outputs.plugin }}"
+          --cache-dir "${RUNNER_TEMP}/bifrost-agent-smoke-cache"
+          --binary-path "${{ steps.staged.outputs.binary }}"
+
+  policy-scan-smoke:
+    name: smoke policy scan with staged binary
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Download exact Linux binary
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: bifrost-x86_64-unknown-linux-gnu
+          path: ${{ runner.temp }}/bifrost-linux-release
+      - name: Stage exact binary
+        shell: bash
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/bifrost-linux-release
+        run: |
+          set -euo pipefail
+          archive="$(find "$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          test -n "$archive"
+          tar -C "$ARTIFACT_DIR" -xzf "$archive"
+          binary="$(find "$ARTIFACT_DIR" -type f -name "$BIN_NAME" -print -quit)"
+          test -n "$binary"
+          mkdir -p target/release
+          cp "$binary" target/release/$BIN_NAME
+          chmod +x target/release/$BIN_NAME
+      - name: Scan repository with staged binary
+        uses: ./.github/actions/policy-scan
+        with:
+          version: local
+          upload: 'false'
+          cache: 'false'
+          fail-on: never
+
+  pi-package:
+    name: package Pi archive
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Download exact build artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: bifrost-*
+          path: dist
+          merge-multiple: true
+      - name: Prepare Pi metadata
+        run: >
+          node scripts/prepare-vscode-extension-manifest.mjs
+          --version "${{ needs.preflight.outputs.version }}"
+          --plugin-release plugins/bifrost-agent/bifrost-release.json
+          --dist dist
+      - name: Install Pi package dependencies
+        run: npm ci --ignore-scripts
+        working-directory: plugins/bifrost-agent
+      - name: Test and check Pi package
+        run: |
+          npm test
+          npm run check
+          npm run test:packed
+        working-directory: plugins/bifrost-agent
+      - name: Package exact Pi archive
+        run: npm pack --pack-destination ../../dist
+        working-directory: plugins/bifrost-agent
+      - name: Upload exact Pi archive
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: pi-package
+          path: dist/brokk-bifrost-agent-*.tgz
+          if-no-files-found: error
+          retention-days: 14
+
+  vscode-package:
+    name: package VSIX
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Download exact build artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: bifrost-*
+          path: dist
+          merge-multiple: true
+      - name: Prepare VSIX metadata
+        run: >
+          node scripts/prepare-vscode-extension-manifest.mjs
+          --version "${{ needs.preflight.outputs.version }}"
+          --manifest editors/vscode/package.json
+          --plugin-release plugins/bifrost-agent/bifrost-release.json
+          --dist dist
+      - name: Install VS Code extension dependencies
+        run: npm ci --ignore-scripts
+        working-directory: editors/vscode
+      - name: Test agent plugin launcher
+        run: node --test plugins/bifrost-agent/test/launcher.test.mjs
+      - name: Validate agent plugin manifest
+        run: node scripts/check-codex-plugin-manifest.mjs
+      - name: Test VS Code extension
+        run: npm test
+        working-directory: editors/vscode
+      - name: Package exact VSIX
+        run: npx --no-install vsce package --out "../../dist/bifrost-vscode-${{ needs.preflight.outputs.tag }}.vsix"
+        working-directory: editors/vscode
+      - name: Upload exact VSIX
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: vscode-package
+          path: dist/*.vsix
+          if-no-files-found: error
+          retention-days: 14
+
+  npm-package:
+    name: package npm release archives
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Download exact binary archives and checksums
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: bifrost-*
+          path: release-assets
+          merge-multiple: true
+      - name: Test npm packaging code
+        run: npm test --prefix npm
+      - name: Build exact npm tarballs from qualified assets
+        run: >-
+          npm run package-release --prefix npm --
+          --release-tag "${{ needs.preflight.outputs.tag }}"
+          --assets release-assets
+      - name: Inspect npm tarballs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tarball in npm/dist/*.tgz; do
+            if tar -tzf "$tarball" | grep -E '(^|/)([.]npmrc|[.]git|id_rsa|credentials)($|/)'; then
+              echo "unexpected sensitive path in $tarball" >&2
+              exit 1
+            fi
+          done
+      - name: Smoke exact Linux npm installation
+        run: npm run test-release --prefix npm -- --dist dist --release-tag "${{ needs.preflight.outputs.tag }}"
+      - name: Upload exact npm tarballs
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: npm-tarballs-${{ needs.preflight.outputs.tag }}
+          path: npm/dist/*.tgz
+          if-no-files-found: error
+          retention-days: 14
+
+  qualification:
+    name: assemble and verify commit/version qualification bundle
+    needs:
+      - preflight
+      - notices
+      - crate-package
+      - semantic-pack-bundle
+      - build
+      - python-wheels
+      - uv-wheels
+      - sdist
+      - wheel-verify
+      - agent-plugin-package
+      - agent-plugin-smoke
+      - policy-scan-smoke
+      - pi-package
+      - vscode-package
+      - npm-package
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Download all intermediate qualification artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          # Do not feed a previously uploaded final bundle back into a
+          # rerun of this aggregate job: manifest generation is intentionally
+          # refusal-based when its output already exists.
+          pattern: '!release-qualification-*'
+          path: qualification-bundle
+          merge-multiple: true
+      - name: Verify expected release inventory is present
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find qualification-bundle -type f -name '*.crate' | wc -l | tr -d ' ')" -eq 19
+          test "$(find qualification-bundle -type f -name '*.crate.metadata.json' | wc -l | tr -d ' ')" -eq 19
+          test "$(find qualification-bundle -type f -name '*.whl' | wc -l | tr -d ' ')" -eq 10
+          test "$(find qualification-bundle -type f -name '*.vsix' | wc -l | tr -d ' ')" -eq 1
+          test "$(find qualification-bundle -type f -name '*.tgz' | wc -l | tr -d ' ')" -gt 0
+          test "$(find qualification-bundle -type f -name '*.sha256' | wc -l | tr -d ' ')" -ge 8
+          test -f qualification-bundle/THIRD_PARTY_LICENSES.html
+      - name: Write qualification identity
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          PUBLIC_COMMIT: ${{ needs.preflight.outputs.commit }}
+          PRIVATE_COMMIT: ${{ inputs.private_commit }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const identity = {
+              release: { version: process.env.RELEASE_VERSION, tag: process.env.RELEASE_TAG },
+              source: {
+                repository: process.env.PUBLIC_REPOSITORY,
+                publicCommit: process.env.PUBLIC_COMMIT,
+                ...(process.env.PRIVATE_COMMIT ? { privateCommit: process.env.PRIVATE_COMMIT } : {}),
+              },
+              qualification: {
+                workflow: "release-readiness.yml",
+                runId: Number(process.env.RUN_ID),
+                runAttempt: Number(process.env.RUN_ATTEMPT),
+              },
+            };
+            fs.writeFileSync(`${process.env.RUNNER_TEMP}/qualification-identity.json`, `${JSON.stringify(identity)}\n`);
+          '
+      - name: Generate deterministic qualification manifest
+        env:
+          BUNDLE_DIR: ${{ github.workspace }}/qualification-bundle
+          IDENTITY_FILE: ${{ runner.temp }}/qualification-identity.json
+          MANIFEST_FILE: ${{ github.workspace }}/qualification-bundle/release-qualification.json
+        run: node scripts/release-qualification.mjs manifest --bundle "$BUNDLE_DIR" --identity "$IDENTITY_FILE" --output "$MANIFEST_FILE"
+      - name: Verify every qualified byte and identity
+        env:
+          BUNDLE_DIR: ${{ github.workspace }}/qualification-bundle
+          MANIFEST_FILE: ${{ github.workspace }}/qualification-bundle/release-qualification.json
+          PUBLIC_COMMIT: ${{ needs.preflight.outputs.commit }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+        run: >-
+          node scripts/release-qualification.mjs verify
+          --bundle "$BUNDLE_DIR"
+          --manifest "$MANIFEST_FILE"
+          --repository "$PUBLIC_REPOSITORY"
+          --commit "$PUBLIC_COMMIT"
+          --version "$RELEASE_VERSION"
+          --run-id "${{ github.run_id }}"
+      - name: Upload immutable qualification bundle
+        id: qualification-upload
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-qualification-${{ needs.preflight.outputs.commit }}-v${{ needs.preflight.outputs.version }}
+          path: qualification-bundle
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - name: Record qualification identity and artifact digest
+        env:
+          QUALIFICATION_ARTIFACT_ID: ${{ steps.qualification-upload.outputs.artifact-id }}
+          QUALIFICATION_ARTIFACT_DIGEST: ${{ steps.qualification-upload.outputs.artifact-digest }}
+          QUALIFICATION_ARTIFACT_URL: ${{ steps.qualification-upload.outputs.artifact-url }}
+        run: |
+          manifest_digest="$(sha256sum qualification-bundle/release-qualification.json | awk '{print $1}')"
+          {
+            echo "### Release readiness qualification"
+            echo "- Repository: $PUBLIC_REPOSITORY"
+            echo "- Commit: ${{ needs.preflight.outputs.commit }}"
+            echo "- Version: ${{ needs.preflight.outputs.version }}"
+            echo "- Workflow run: ${{ github.run_id }} (attempt ${{ github.run_attempt }})"
+            echo "- Workflow URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- Artifact ID: $QUALIFICATION_ARTIFACT_ID"
+            echo "- Artifact digest: $QUALIFICATION_ARTIFACT_DIGEST"
+            echo "- Artifact URL: $QUALIFICATION_ARTIFACT_URL"
+            echo "- Manifest digest: $manifest_digest"
+            echo "- Manifest: qualification-bundle/release-qualification.json"
+          } >> "$GITHUB_STEP_SUMMARY"

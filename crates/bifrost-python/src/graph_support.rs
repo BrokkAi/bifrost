@@ -428,6 +428,26 @@ pub fn import_bindings_from_imports(
                     continue;
                 };
                 if wildcard {
+                    // A glob import introduces each public declaration as a
+                    // real local binding. Expand it from the structured module
+                    // declarations so constructor and receiver inference can
+                    // resolve the same names Python places in the namespace.
+                    bindings.extend(
+                        public_declarations_in_module(python, &resolved_module)
+                            .into_iter()
+                            .map(|declaration| {
+                                let name = declaration.identifier().to_string();
+                                (
+                                    name.clone(),
+                                    ImportBinding {
+                                        module_specifier: resolved_module.clone(),
+                                        namespace_imported_module: None,
+                                        kind: ImportKind::Named,
+                                        imported_name: Some(name),
+                                    },
+                                )
+                            }),
+                    );
                     continue;
                 }
                 // Non-wildcard from-imports always populate `identifier`

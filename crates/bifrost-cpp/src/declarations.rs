@@ -158,13 +158,53 @@ fn cpp_lexical_namespace_name(node: Node<'_>, source: &str) -> Option<String> {
     Some(components.join("::"))
 }
 
-/// Structured name for a class-like unit: the enclosing namespace's `Package`
-/// segments followed by the `$`-joined nested-class `Type` chain in `short_name`.
-fn cpp_class_fq(package_name: &str, short_name: &str) -> FqName {
-    let mut fq = FqName::new();
-    cpp_push_package(&mut fq, package_name);
-    cpp_push_type_chain(&mut fq, short_name);
-    fq
+/// Nested-class `$` join for short names. An anonymous parent class (empty
+/// short_name) contributes no segment: the FqName bridge drops empty
+/// components, so a bare `parent$child` join would desync `short_name` from
+/// the fq and trip the package/short boundary assert in
+/// `CodeUnit::with_signature_and_fq` (#2140).
+fn cpp_join_nested_short(parent_short: &str, name: &str) -> String {
+    if parent_short.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent_short}${name}")
+    }
+}
+
+/// Member `.` join for short names; same anonymous-parent guard as
+/// [`cpp_join_nested_short`] (#2140).
+fn cpp_join_member_short(parent_short: &str, name: &str) -> String {
+    if parent_short.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent_short}.{name}")
+    }
+}
+
+/// Structural fq for a leaf declaration: the parent unit's fq plus this
+/// declaration's own name as one segment (or the package segments plus the
+/// name when parentless). Never re-splits the legacy `$`/`.`-joined short
+/// chain, so a literal `$` inside a source identifier (Cython template
+/// substitution points, gcc `$`-identifiers) survives instead of corrupting
+/// the chain and tripping the package/short boundary assert (#2140).
+fn cpp_leaf_fq(
+    package_name: &str,
+    parent: Option<&CodeUnit>,
+    name: &str,
+    kind_if_nested: SegmentKind,
+    kind_if_top: SegmentKind,
+) -> FqName {
+    if let Some(parent) = parent {
+        parent
+            .fq()
+            .clone()
+            .with_pushed(cpp_segment(name, kind_if_nested))
+    } else {
+        let mut fq = FqName::new();
+        cpp_push_package(&mut fq, package_name);
+        fq.push(cpp_segment(name, kind_if_top));
+        fq
+    }
 }
 
 /// Structured name for a member unit (function, field, enumerator). The
@@ -226,12 +266,7 @@ struct CppNodeWork<'tree> {
 /// still pushed and fully drained before the cursor resumes (stack LIFO
 /// order), preserving the original left-to-right visitation order.
 struct CppSiblingsWork<'tree> {
-    parent: Node<'tree>,
-    next_index: usize,
-    /// Named-child index to stop before (`usize::MAX` = drain the parent).
-    /// Bounded ranges re-own a swallowed region's head and tail with
-    /// different scopes (issue #1524).
-    end_index: usize,
+    children: std::vec::IntoIter<Node<'tree>>,
     scope: ScopeInfo,
 }
 
@@ -248,6 +283,15 @@ fn class_like_name(node: Node<'_>, source: &str) -> Option<String> {
             parent.kind(),
             "declaration" | "field_declaration" | "function_definition"
         )
+        // A class_specifier carrying its own body proves the grammar name is
+        // the real class name: a sibling declarator then declares an object
+        // (`class X {} x;`), never a displaced class name. The gate matters
+        // when the class name is itself an all-caps token (`X`, `API`) --
+        // without it the export-macro re-read below steals the object
+        // declarator's name for the class (#2283). The genuine export-macro
+        // shapes leave the class_specifier bodyless, the same invariant
+        // recover_malformed_exported_multiple_base_class already gates on.
+        && cpp_body_node(node).is_none()
         && node
             .child_by_field_name("name")
             .map(|name_node| {
@@ -340,6 +384,12 @@ struct FragmentedExportBody {
     class_range: Range,
 }
 
+struct DisplacedFragmentNamespaceBoundary<'tree> {
+    class_close: Node<'tree>,
+    class_semicolon: Node<'tree>,
+    namespace_items: Vec<Node<'tree>>,
+}
+
 /// Result of validating a reparsed fragmented class body.  A complete tree can
 /// safely consume the whole region.  A partial tree may contain only the exact
 /// class-named constructor that tree-sitter merged into an access label; its
@@ -359,7 +409,7 @@ fn recover_exported_class_declaration<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<RecoveredExportedClass<'tree>> {
-    if let Some(recovered) = recover_malformed_exported_multiple_base_class(node, source) {
+    if let Some(recovered) = recover_malformed_exported_base_class(node, source) {
         return Some(recovered);
     }
 
@@ -393,7 +443,7 @@ fn recover_exported_class_declaration<'tree>(
     })
 }
 
-fn recover_malformed_exported_multiple_base_class<'tree>(
+fn recover_malformed_exported_base_class<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<RecoveredExportedClass<'tree>> {
@@ -419,7 +469,7 @@ fn recover_malformed_exported_multiple_base_class<'tree>(
     {
         return None;
     }
-    let displaced = named.next()?;
+    let displaced = named.find(|child| child.kind() != "attribute_declaration")?;
     if displaced.kind() != "ERROR" {
         return None;
     }
@@ -441,11 +491,6 @@ fn recover_malformed_exported_multiple_base_class<'tree>(
         return None;
     }
 
-    let mut declarator_cursor = node.walk();
-    let direct_declarators = node.children_by_field_name("declarator", &mut declarator_cursor);
-    if direct_declarators.count() < 2 {
-        return None;
-    }
     if remaining[..remaining.len() - 1]
         .iter()
         .any(|child| match child.kind() {
@@ -513,7 +558,7 @@ fn fragmented_export_body_region(
     let mut sibling = node.next_named_sibling();
     let displaced_close = loop {
         let Some(current) = sibling else {
-            break displaced_fragment_close_at_namespace_boundary(node, body, source)?;
+            break displaced_fragment_namespace_boundary(node, body, source)?.class_close;
         };
         if cpp_is_stray_close_brace(current, source) {
             break current;
@@ -543,8 +588,21 @@ fn fragmented_export_function_body_region(
     node: Node<'_>,
     body: Node<'_>,
     source: &str,
+    displaced_namespace: Option<&DisplacedFragmentNamespaceBoundary<'_>>,
 ) -> Option<FragmentedExportBody> {
     let reparse_start = body.start_byte().checked_add(1)?;
+    if let Some(boundary) = displaced_namespace {
+        return Some(FragmentedExportBody {
+            reparse_start,
+            reparse_end: boundary.class_close.start_byte(),
+            class_range: Range {
+                start_byte: node.start_byte(),
+                end_byte: boundary.class_semicolon.end_byte(),
+                start_line: node.start_position().row + 1,
+                end_line: boundary.class_semicolon.end_position().row + 1,
+            },
+        });
+    }
     let siblings = cpp_following_named_siblings(node, source);
     let boundary = fragmented_export_sibling_class_boundary(node, source);
     let boundary_index = boundary.and_then(|boundary| {
@@ -555,12 +613,23 @@ fn fragmented_export_function_body_region(
     let siblings = &siblings[..boundary_index.unwrap_or(siblings.len())];
     let mut sibling_index = 0;
     // A complete recovered class's synthetic wrapper is immediately followed
-    // by its displaced semicolon (comments may sit between the body and that
-    // semicolon). Only scan for a later stray close when real member siblings
-    // intervene; otherwise every earlier complete class would borrow the next
-    // malformed class's close and claim its members.
+    // by its displaced semicolon (comments and a trailing attribute macro --
+    // `} GTEST_ATTRIBUTE_UNUSED_;`, a bare-identifier expression statement --
+    // may sit between the body and that semicolon). Only scan for a later
+    // stray close when real member siblings intervene; otherwise every earlier
+    // complete class would borrow the next malformed class's close and claim
+    // its members. The trailing-attribute case is the gtest shape: the scan
+    // borrowed a close ~1900 lines later and re-owned a following
+    // `namespace testing { namespace internal {` block as class members,
+    // doubling the package path ("testing::internal::testing::internal") and
+    // mis-nesting DeathTest under ScopedTrace, tripping the package/short
+    // boundary assert (#2297).
     while let Some(current) = siblings.get(sibling_index).copied() {
         if current.kind() == "comment" {
+            sibling_index += 1;
+            continue;
+        }
+        if is_trailing_attribute_macro_sibling(current) {
             sibling_index += 1;
             continue;
         }
@@ -639,6 +708,22 @@ fn fragmented_export_sibling_class_boundary<'tree>(
         })
 }
 
+/// A trailing attribute macro after a recovered class's closing brace, spelled
+/// as a bare-identifier expression statement (`GTEST_ATTRIBUTE_UNUSED_`). A
+/// bare identifier is never a class member (members need a type), so this
+/// sibling can only be the class's own tail (#2297).
+fn is_trailing_attribute_macro_sibling(node: Node<'_>) -> bool {
+    if node.kind() != "expression_statement" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let mut children = node.named_children(&mut cursor);
+    children
+        .next()
+        .is_some_and(|child| child.kind() == "identifier")
+        && children.next().is_none()
+}
+
 /// Find a lone closing-brace ERROR below a scattered sibling.  A malformed
 /// export-class wrapper can place the class close inside an access-label node,
 /// so direct-sibling checks alone miss the boundary.  Walk named CST children
@@ -712,10 +797,13 @@ fn cpp_fragment_sibling_is_class_member(node: Node<'_>, class_end: usize, source
 /// export-class recovery above. All boundaries come from tree-sitter nodes: the
 /// direct class tokens establish nesting depth and the displaced close nodes
 /// terminate it.
-fn fragmented_plain_class_body(
-    node: Node<'_>,
+fn fragmented_plain_class_body<'tree>(
+    node: Node<'tree>,
     source: &str,
-) -> Option<(String, FragmentedExportBody)> {
+) -> Option<(Node<'tree>, String, FragmentedExportBody)> {
+    if let Some(recovered) = fragmented_plain_class_declaration_body(node, source) {
+        return Some(recovered);
+    }
     if node.kind() != "ERROR" {
         return None;
     }
@@ -755,6 +843,7 @@ fn fragmented_plain_class_body(
                     return None;
                 }
                 return Some((
+                    node,
                     name,
                     FragmentedExportBody {
                         reparse_start: open.end_byte(),
@@ -774,11 +863,169 @@ fn fragmented_plain_class_body(
     None
 }
 
-fn displaced_fragment_close_at_namespace_boundary<'tree>(
-    declaration: Node<'tree>,
-    body: Node<'tree>,
+pub(crate) fn recovered_fragmented_plain_class_has_body(
+    node: Node<'_>,
     source: &str,
-) -> Option<Node<'tree>> {
+    expected_name: &str,
+    expected_range: &Range,
+) -> bool {
+    fragmented_plain_class_body(node, source).is_some_and(|(_, name, fragmented)| {
+        name == expected_name
+            && fragmented.class_range.start_byte == expected_range.start_byte
+            && fragmented.class_range.end_byte == expected_range.end_byte
+    })
+}
+
+/// Recover a plain class whose parser-visible body ends inside a malformed
+/// inline member. Tree-sitter then attaches either the next real member
+/// declarator or the unfinished `else` branch directly to the outer function
+/// definition and leaves the class's actual `};` among later siblings. Those
+/// structured continuations and the close/semicolon siblings establish the
+/// complete body envelope without interpreting source text.
+fn fragmented_plain_class_declaration_body<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, String, FragmentedExportBody)> {
+    if !matches!(node.kind(), "declaration" | "function_definition") || !node.has_error() {
+        return None;
+    }
+    let class_node = node.child_by_field_name("type")?;
+    if !matches!(
+        class_node.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier"
+    ) {
+        return None;
+    }
+    let name_node = class_node.child_by_field_name("name")?;
+    let name = normalize_cpp_whitespace(node_text(name_node, source));
+    if name.is_empty() || cpp_export_macro_token(&name) {
+        return None;
+    }
+    let body = cpp_body_node(class_node)?;
+    if body.kind() != "field_declaration_list" {
+        return None;
+    }
+    let displaced_member = if let Some(declarator) = extract_function_declarator(node) {
+        if declarator.start_byte() < class_node.end_byte() {
+            return None;
+        }
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).any(|child| {
+            if child.kind() != "ERROR"
+                || child.start_byte() < class_node.end_byte()
+                || child.end_byte() > declarator.start_byte()
+            {
+                return false;
+            }
+            let mut cursor = child.walk();
+            let components = child.named_children(&mut cursor).collect::<Vec<_>>();
+            let Some((return_type, attributes)) = components.split_last() else {
+                return false;
+            };
+            matches!(
+                return_type.kind(),
+                "identifier"
+                    | "type_identifier"
+                    | "primitive_type"
+                    | "decltype"
+                    | "placeholder_type_specifier"
+            ) && !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(*return_type, source)))
+                && attributes.iter().all(|attribute| {
+                    matches!(attribute.kind(), "identifier" | "type_identifier")
+                        && cpp_export_macro_token(&normalize_cpp_whitespace(node_text(
+                            *attribute, source,
+                        )))
+                })
+        })
+    } else {
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        matches!(children.as_slice(), [candidate_class, continuation, continuation_body]
+            if same_node(*candidate_class, class_node)
+                && continuation.kind() == "identifier"
+                && node_text(*continuation, source) == "else"
+                && continuation_body.kind() == "compound_statement"
+                && continuation_body.child(0).is_some_and(|open| open.kind() == "{")
+                && continuation_body
+                    .child(continuation_body.child_count().saturating_sub(1))
+                    .is_some_and(|close| close.kind() == "}" && !close.is_missing()))
+    };
+    if !displaced_member {
+        return None;
+    }
+    let open = body
+        .children(&mut body.walk())
+        .find(|child| child.kind() == "{")?;
+    let siblings = cpp_following_named_siblings(node, source);
+    let ordinary_boundary =
+        siblings
+            .iter()
+            .copied()
+            .enumerate()
+            .find_map(|(close_index, close)| {
+                cpp_is_stray_close_brace(close, source)
+                    .then(|| {
+                        siblings
+                            .get(close_index + 1)
+                            .copied()
+                            .filter(|semicolon| cpp_is_stray_semicolon(*semicolon, source))
+                            .map(|semicolon| (close, semicolon))
+                    })
+                    .flatten()
+            });
+    let (close, semicolon) =
+        if let Some(boundary) = displaced_fragment_namespace_geometry(node, source) {
+            (boundary.class_close, boundary.class_semicolon)
+        } else {
+            ordinary_boundary?
+        };
+    if open.end_byte() >= close.start_byte() {
+        return None;
+    }
+    Some((
+        class_node,
+        name,
+        FragmentedExportBody {
+            reparse_start: open.end_byte(),
+            reparse_end: close.start_byte(),
+            class_range: Range {
+                start_byte: class_node.start_byte(),
+                end_byte: semicolon.end_byte(),
+                start_line: class_node.start_position().row + 1,
+                end_line: semicolon.end_position().row + 1,
+            },
+        },
+    ))
+}
+
+fn displaced_export_function_namespace_shape<'tree>(
+    declaration: Node<'tree>,
+    source: &str,
+) -> Option<DisplacedFragmentNamespaceBoundary<'tree>> {
+    let mut nested = Vec::new();
+    for index in (0..declaration.named_child_count()).rev() {
+        nested.push(declaration.named_child(index)?);
+    }
+    while let Some(current) = nested.pop() {
+        // A recovered export class nested in this class can consume the first
+        // parser-visible namespace close itself. In that shape the existing
+        // later-class boundary logic already distinguishes the nested and
+        // namespace-sibling owners; do not mistake the nested close for this
+        // class's terminator.
+        if recover_exported_class_function_definition(current, source).is_some() {
+            return None;
+        }
+        for index in (0..current.named_child_count()).rev() {
+            nested.push(current.named_child(index)?);
+        }
+    }
+    let mut same_envelope_sibling = declaration.next_named_sibling();
+    while let Some(current) = same_envelope_sibling {
+        if recover_exported_class_function_definition(current, source).is_some() {
+            return None;
+        }
+        same_envelope_sibling = current.next_named_sibling();
+    }
     let declaration_list = declaration.parent()?;
     if declaration_list.kind() != "declaration_list" {
         return None;
@@ -796,13 +1043,121 @@ fn displaced_fragment_close_at_namespace_boundary<'tree>(
     {
         return None;
     }
-    let displaced_namespace_close = trailing_semicolon.next_named_sibling()?;
-    if !cpp_is_stray_close_brace(displaced_namespace_close, source) {
+    // A chain of malformed export classes can consume one parser-visible
+    // namespace close per class. Walk through the enclosing sibling levels so
+    // the later real namespace close remains the structural boundary; a
+    // direct next-sibling walk stops at the first collapsed namespace and
+    // incorrectly makes its intervening items members of this class.
+    let siblings = cpp_following_named_siblings(namespace, source);
+    let trailing_index = siblings
+        .iter()
+        .position(|candidate| same_node(*candidate, trailing_semicolon))?;
+    if siblings.get(trailing_index + 1).is_some_and(|candidate| {
+        recover_exported_class_function_definition(*candidate, source).is_some()
+    }) {
+        // Consecutive recovered classes already have an exact sibling-class
+        // boundary. Preserve that established path, including nested export
+        // classes, instead of interpreting the first class close as a
+        // collapsed namespace boundary.
         return None;
     }
+    let mut namespace_items = Vec::new();
+    let mut nested_fragment_end = 0;
+    for current in siblings.into_iter().skip(trailing_index + 1) {
+        if current.start_byte() >= nested_fragment_end && cpp_is_stray_close_brace(current, source)
+        {
+            return Some(DisplacedFragmentNamespaceBoundary {
+                class_close,
+                class_semicolon: trailing_semicolon,
+                namespace_items,
+            });
+        }
+        if current.start_byte() >= nested_fragment_end
+            && let Some((_, _, fragmented)) = fragmented_plain_class_body(current, source)
+        {
+            nested_fragment_end = fragmented.class_range.end_byte;
+        } else if current.start_byte() >= nested_fragment_end
+            && recover_exported_class_function_definition(current, source).is_some()
+            && let Some(body) = cpp_body_node(current)
+            && let Some(fragmented) =
+                fragmented_export_function_body_region(current, body, source, None)
+        {
+            nested_fragment_end = fragmented.class_range.end_byte;
+        }
+        namespace_items.push(current);
+    }
+    None
+}
+
+fn displaced_fragment_namespace_boundary<'tree>(
+    declaration: Node<'tree>,
+    body: Node<'tree>,
+    source: &str,
+) -> Option<DisplacedFragmentNamespaceBoundary<'tree>> {
+    let boundary = displaced_fragment_namespace_geometry(declaration, source)?;
     let reparse_start = body.start_byte() + 1;
-    let tree = cpp_reparse_region_items(source, reparse_start, class_close.start_byte())?;
-    cpp_reparsed_members_are_indexable(tree.root_node(), source).then_some(class_close)
+    let tree = cpp_reparse_region_items(source, reparse_start, boundary.class_close.start_byte())?;
+    cpp_reparsed_members_are_indexable(tree.root_node(), source).then_some(boundary)
+}
+
+/// Recover the class/namespace brace geometry for a declaration whose class
+/// close tree-sitter consumed as the enclosing namespace close. This proof is
+/// independent of whether every member in the class body can be reparsed: the
+/// ordinary-tree fallback can still re-own bounded sibling declarations when
+/// an unknown macro makes the complete body reparse unsafe.
+fn displaced_fragment_namespace_geometry<'tree>(
+    declaration: Node<'tree>,
+    source: &str,
+) -> Option<DisplacedFragmentNamespaceBoundary<'tree>> {
+    // A templated class's malformed function wrapper remains beneath the
+    // template node even though its later members have escaped to the
+    // enclosing declaration list. Lift only that exact declaration child.
+    let envelope = declaration
+        .parent()
+        .filter(|parent| {
+            parent.kind() == "template_declaration"
+                && last_named_child(*parent).is_some_and(|child| same_node(child, declaration))
+        })
+        .unwrap_or(declaration);
+    let declaration_list = envelope.parent()?;
+    if declaration_list.kind() != "declaration_list" {
+        return None;
+    }
+    let namespace = declaration_list.parent()?;
+    if namespace.kind() != "namespace_definition"
+        || namespace.child_by_field_name("body") != Some(declaration_list)
+    {
+        return None;
+    }
+    let class_close = direct_close_brace(declaration_list)?;
+    let trailing_semicolon = namespace.next_named_sibling()?;
+    if trailing_semicolon.kind() != "expression_statement"
+        || trailing_semicolon.named_child_count() != 0
+    {
+        return None;
+    }
+    let mut namespace_items = Vec::new();
+    let mut sibling = trailing_semicolon.next_named_sibling();
+    let mut nested_fragment_end = 0;
+    loop {
+        let current = sibling?;
+        if current.start_byte() >= nested_fragment_end && cpp_is_stray_close_brace(current, source)
+        {
+            break;
+        }
+        if current.start_byte() >= nested_fragment_end
+            && let Some((_, _, fragmented)) = fragmented_plain_class_body(current, source)
+        {
+            nested_fragment_end = fragmented.class_range.end_byte;
+        }
+        namespace_items.push(current);
+        sibling = current.next_named_sibling();
+    }
+    Some(DisplacedFragmentNamespaceBoundary {
+        class_close,
+        class_semicolon: trailing_semicolon,
+        namespace_items,
+    })
 }
 
 /// The direct `}` child of a node, real or MISSING (a MISSING brace is zero-width).
@@ -891,6 +1246,18 @@ fn displaced_exported_class_name(node: Node<'_>, source: &str) -> Option<String>
                     return None;
                 }
                 let candidate = normalize_cpp_whitespace(node_text(child, source));
+                if candidate.is_empty() || cpp_export_macro_token(&candidate) {
+                    return None;
+                }
+                name = Some(candidate);
+            }
+            "template_function" | "template_type" if child.is_named() => {
+                if name.is_some() {
+                    return None;
+                }
+                let candidate = child
+                    .child_by_field_name("name")
+                    .and_then(|name| direct_identifier_name(name, source))?;
                 if candidate.is_empty() || cpp_export_macro_token(&candidate) {
                     return None;
                 }
@@ -1078,6 +1445,44 @@ fn recover_exported_class_function_definition<'tree>(
         return None;
     }
     class_identifier_before_body(node, source).map(|name| (node, name, None))
+}
+
+/// Whether `node` is the base type displaced into the declarator field of an
+/// export-macro class that tree-sitter represented as a declaration or
+/// function definition.
+///
+/// Declaration extraction already recovers this exact malformed envelope as a
+/// class and records the declarator as its base. Reference extraction must use
+/// the same structural fact instead of treating the node as a function name.
+pub fn is_recovered_exported_class_base_type_node(node: Node<'_>, source: &str) -> bool {
+    if !matches!(
+        node.kind(),
+        "qualified_identifier" | "scoped_type_identifier" | "template_type"
+    ) {
+        return false;
+    }
+    if let Some(function) = node.parent().filter(|parent| {
+        parent.kind() == "function_definition"
+            && parent
+                .child_by_field_name("declarator")
+                .is_some_and(|declarator| same_node(declarator, node))
+    }) {
+        return recover_exported_class_function_definition(function, source)
+            .is_some_and(|(_, _, raw_supertypes)| raw_supertypes.is_some());
+    }
+    let Some(initializer) = node.parent().filter(|parent| {
+        parent.kind() == "init_declarator"
+            && parent
+                .child_by_field_name("declarator")
+                .is_some_and(|declarator| same_node(declarator, node))
+    }) else {
+        return false;
+    };
+    initializer
+        .parent()
+        .filter(|parent| parent.kind() == "declaration")
+        .and_then(|declaration| recover_exported_class_declaration(declaration, source))
+        .is_some_and(|recovered| recovered.raw_supertypes.is_some())
 }
 
 /// Recover the class item from a region reparse that still carries the
@@ -1431,12 +1836,27 @@ fn push_cpp_container_work<'tree>(
     scope: ScopeInfo,
     stack: &mut Vec<CppWork<'tree>>,
 ) {
-    stack.push(CppWork::Siblings(CppSiblingsWork {
-        parent: node,
-        next_index: 0,
-        end_index: usize::MAX,
-        scope,
-    }));
+    push_cpp_sibling_range(node, 0, usize::MAX, scope, stack);
+}
+
+/// Materialize one selected named-child range with a tree-sitter cursor. The
+/// cursor advances linearly across the parent's concrete children; repeatedly
+/// asking for `named_child(index)` is quadratic on very wide generated nodes.
+fn push_cpp_sibling_range<'tree>(
+    parent: Node<'tree>,
+    start_index: usize,
+    end_index: usize,
+    scope: ScopeInfo,
+    stack: &mut Vec<CppWork<'tree>>,
+) {
+    let mut cursor = parent.walk();
+    let children = parent
+        .named_children(&mut cursor)
+        .skip(start_index)
+        .take(end_index.saturating_sub(start_index))
+        .collect::<Vec<_>>()
+        .into_iter();
+    stack.push(CppWork::Siblings(CppSiblingsWork { children, scope }));
 }
 
 /// Advance a `Siblings` cursor by one child: dispatch the current child under
@@ -1447,27 +1867,20 @@ fn push_cpp_container_work<'tree>(
 /// child's subtree fully drains (LIFO) before the next sibling is visited,
 /// preserving left-to-right order.
 fn advance_cpp_siblings<'tree>(
-    siblings: CppSiblingsWork<'tree>,
+    mut siblings: CppSiblingsWork<'tree>,
     source: &str,
     stack: &mut Vec<CppWork<'tree>>,
 ) {
-    if siblings.next_index >= siblings.end_index {
-        return;
-    }
-    let Some(child) = siblings.parent.named_child(siblings.next_index) else {
+    let Some(child) = siblings.children.next() else {
         return;
     };
     let current_scope = siblings.scope.clone();
-    let mut next_scope = siblings.scope;
     if let Some(namespace) = cpp_using_namespace_target(child, source) {
-        next_scope.visible_using_namespaces.push(namespace);
+        siblings.scope.visible_using_namespaces.push(namespace);
     }
-    stack.push(CppWork::Siblings(CppSiblingsWork {
-        parent: siblings.parent,
-        next_index: siblings.next_index + 1,
-        end_index: siblings.end_index,
-        scope: next_scope,
-    }));
+    if !siblings.children.as_slice().is_empty() {
+        stack.push(CppWork::Siblings(siblings));
+    }
     stack.push(CppWork::Node(CppNodeWork {
         node: child,
         scope: current_scope,
@@ -1492,7 +1905,22 @@ fn cpp_using_namespace_target(node: Node<'_>, source: &str) -> Option<String> {
         return None;
     }
     let target = node.named_child(0)?;
-    let text = normalize_cpp_whitespace(node_text(target, source));
+    // A leading `::` is the explicit-global marker, not part of the namespace
+    // path (`using namespace ::std::chrono;`). Drop that AST token before
+    // reading the target text, the same boundary `cpp_raw_namespace_name_components`
+    // keeps: storing the marker verbatim desynced the legacy package string from
+    // the FqName bridge, which splits on `::` and drops the empty leading
+    // component, tripping the package/short boundary assert when a bare-owner
+    // out-of-line definition borrowed the directive's namespace (#1093 path).
+    let start = target
+        .child(0)
+        .filter(|child| !child.is_named() && child.kind() == "::")
+        .map_or(target.start_byte(), |marker| marker.end_byte());
+    let text = normalize_cpp_whitespace(
+        source
+            .get(start..target.end_byte())
+            .expect("using-directive target covers one source range"),
+    );
     (!text.is_empty()).then_some(text)
 }
 
@@ -1825,16 +2253,27 @@ impl<'a> CppVisitor<'a> {
             self.visit_node(node, &recovered_scope, stack);
             return;
         }
-        if let Some((name, fragmented)) = fragmented_plain_class_body(node, self.source) {
+        if let Some((class_node, name, fragmented)) = fragmented_plain_class_body(node, self.source)
+        {
+            let displaced_namespace_items =
+                displaced_fragment_namespace_geometry(node, self.source)
+                    .map(|boundary| boundary.namespace_items)
+                    .unwrap_or_default();
             let outcome = self.reparse_fragmented_export_class_members(&fragmented, &name);
             let mut class_stack = Vec::new();
+            // When the full body cannot be safely reparsed, the original class
+            // node still proves ownership for its parser-visible prefix.
+            let parser_visible_body =
+                (!matches!(&outcome, Some(FragmentedExportMembers::Complete(_))))
+                    .then(|| cpp_body_node(class_node))
+                    .flatten();
             let class_unit = self.visit_named_class_like_shape(
-                node,
+                class_node,
                 name,
-                None,
+                parser_visible_body,
                 true,
                 Some(fragmented.class_range),
-                Some(extract_cpp_supertypes(node, self.source)),
+                Some(extract_cpp_supertypes(class_node, self.source)),
                 scope,
                 &mut class_stack,
             );
@@ -1862,8 +2301,9 @@ impl<'a> CppVisitor<'a> {
                 // sibling nodes under it. They retain their original parser
                 // nodes and exact ranges; the close boundary comes solely from
                 // `fragmented_plain_class_body`.
-                let mut sibling = node.next_named_sibling();
-                while let Some(candidate) = sibling {
+                // Template wrappers put the escaped members beside the
+                // template rather than beside its malformed declaration.
+                for candidate in cpp_following_named_siblings(node, self.source) {
                     if candidate.start_byte() >= fragmented.reparse_end {
                         break;
                     }
@@ -1875,8 +2315,11 @@ impl<'a> CppVisitor<'a> {
                         self.recovered_class_sibling_scopes
                             .insert(candidate.id(), member_scope.clone());
                     }
-                    sibling = candidate.next_named_sibling();
                 }
+            }
+            for item in displaced_namespace_items {
+                self.recovered_class_sibling_scopes
+                    .insert(item.id(), scope.clone());
             }
             stack.extend(class_stack);
             return;
@@ -2029,6 +2472,7 @@ impl<'a> CppVisitor<'a> {
             // sentinel predicate does not match.
             "ERROR" => {
                 if !self.visit_sentinel_macro_region(node, scope, stack) {
+                    self.visit_macro_swallowed_function_declarations(node, scope);
                     stack.push(CppWork::Container(CppContainer {
                         node,
                         scope: scope.clone(),
@@ -2065,9 +2509,9 @@ impl<'a> CppVisitor<'a> {
                 // recording the openers covers every branch.
                 if matches!(kind, "preproc_if" | "preproc_ifdef" | "preproc_ifndef") {
                     let mut range = cpp_declaration_range(node);
-                    if let Some(terminator) = cpp_displaced_preprocessor_terminator(node) {
-                        range.end_byte = terminator.end_byte();
-                        range.end_line = terminator.end_position().row + 1;
+                    if let Some(boundary) = cpp_displaced_preprocessor_boundary(node) {
+                        range.end_byte = boundary.end_byte;
+                        range.end_line = boundary.end_line;
                     }
                     self.parsed.record_materialization(
                         MaterializationRecord::ConfigurationConditional { range },
@@ -2080,6 +2524,68 @@ impl<'a> CppVisitor<'a> {
             }
             _ => {}
         }
+    }
+
+    fn visit_macro_swallowed_function_declarations(
+        &mut self,
+        envelope: Node<'_>,
+        scope: &ScopeInfo,
+    ) {
+        if !cpp_macro_swallowed_declaration_envelope(envelope, self.source)
+            || envelope.kind() == "ERROR"
+                && envelope
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "ERROR")
+        {
+            return;
+        }
+        let mut stack = (0..envelope.named_child_count())
+            .filter_map(|index| envelope.named_child(index))
+            .collect::<Vec<_>>();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "function_declarator" {
+                self.visit_error_swallowed_function_declaration(node, scope);
+            }
+            for index in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+
+    fn visit_error_swallowed_function_declaration(
+        &mut self,
+        node: Node<'_>,
+        scope: &ScopeInfo,
+    ) -> bool {
+        let Some((start, end)) = cpp_error_swallowed_function_declaration_range(node) else {
+            return false;
+        };
+        let Some(tree) = cpp_reparse_region_items(self.source, start, end) else {
+            return false;
+        };
+        let root = tree.root_node();
+        let mut cursor = root.walk();
+        let declarations = root
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() != "comment")
+            .collect::<Vec<_>>();
+        let [declaration] = declarations.as_slice() else {
+            return false;
+        };
+        if declaration.kind() != "declaration"
+            || declaration.has_error()
+            || declaration.start_byte() != start
+            || declaration.end_byte() != end
+        {
+            return false;
+        }
+        let recovery = cpp_recovery_window(self.source, start, end);
+        self.record_recovered_declarations(recovery, |visitor| {
+            visitor.run_container_work(root, scope.clone());
+        });
+        true
     }
 
     fn visit_namespace<'tree>(
@@ -2146,7 +2652,14 @@ impl<'a> CppVisitor<'a> {
         let namespace_scope = ScopeInfo {
             package_name,
             module,
-            class_unit: scope.class_unit.clone(),
+            // C++ never nests a namespace inside a class, so a surviving
+            // class_unit here is always recovery bleed: a malformed-region
+            // boundary upstream mis-scoped this namespace block. Keeping the
+            // owner would mint the namespace's declarations as class members
+            // under a re-appended package, desyncing the fq boundary assert
+            // (#2306). Dropping it is identity-neutral for valid code, where
+            // class_unit is always empty at a namespace definition.
+            class_unit: None,
             template_signature: scope.template_signature.clone(),
             template_metadata: scope.template_metadata.clone(),
             declarations_are_fields: false,
@@ -2169,6 +2682,9 @@ impl<'a> CppVisitor<'a> {
         let Some(name) = class_like_name(node, self.source) else {
             return;
         };
+        let name = qualified_class_name_chain(node, self.source, scope)
+            .map(|chain| chain.join("$"))
+            .unwrap_or(name);
         self.visit_named_class_like(node, name, scope, stack);
     }
 
@@ -2221,11 +2737,45 @@ impl<'a> CppVisitor<'a> {
         );
         let scope = &recovered_scope;
         let short_name = if let Some(parent) = &scope.class_unit {
-            format!("{}${name}", parent.short_name())
+            cpp_join_nested_short(parent.short_name(), &name)
         } else {
-            name
+            name.clone()
         };
-        let fq = cpp_class_fq(&scope.package_name, &short_name);
+        // A top-level out-of-line qualified class definition (`struct
+        // Outer::Inner { ... }` inside its namespace, #2246) carries its
+        // nesting chain as the `$`-joined display name; push one Type/Nested
+        // segment per class so segment-pop owner navigation keeps working.
+        // Every other leaf name stays opaque so a literal `$` in a source
+        // identifier never crosses the split/join boundary (#2140).
+        let qualified_chain = if scope.class_unit.is_none() {
+            qualified_class_name_chain(declaration_node, self.source, scope)
+                .filter(|chain| chain.join("$") == name)
+        } else {
+            None
+        };
+        let fq = if let Some(chain) = qualified_chain {
+            let mut fq = FqName::new();
+            cpp_push_package(&mut fq, &scope.package_name);
+            let mut first = true;
+            for component in chain {
+                let kind = if first {
+                    SegmentKind::Type
+                } else {
+                    SegmentKind::Nested
+                };
+                fq.push(cpp_segment(&component, kind));
+                first = false;
+            }
+            fq
+        } else {
+            cpp_leaf_fq(
+                &scope.package_name,
+                scope.class_unit.as_ref(),
+                &name,
+                SegmentKind::Nested,
+                SegmentKind::Type,
+            )
+        };
         let code_unit = CodeUnit::with_signature_and_fq(
             self.file.clone(),
             CodeUnitType::Class,
@@ -2274,7 +2824,7 @@ impl<'a> CppVisitor<'a> {
         );
         if let Some(metadata) = &scope.template_metadata {
             let primary_short_name = if let Some(parent) = &scope.class_unit {
-                format!("{}${}", parent.short_name(), metadata.primary_name)
+                cpp_join_nested_short(parent.short_name(), &metadata.primary_name)
             } else {
                 metadata.primary_name.clone()
             };
@@ -2309,8 +2859,7 @@ impl<'a> CppVisitor<'a> {
             // compound_statement children, whose direct fields are declarations.
             nested_scope.recovered_specialization_member_scope =
                 scope.template_metadata.as_ref().is_some_and(|metadata| {
-                    declaration_node.kind() == "function_definition"
-                        && !metadata.specialization_arguments.is_empty()
+                    declaration_node.kind() == "function_definition" && metadata.is_specialization()
                 });
             nested_scope.declarations_are_fields =
                 is_recovered_exported_class_container(declaration_node, self.source)
@@ -2323,18 +2872,14 @@ impl<'a> CppVisitor<'a> {
                 // first and re-own only the structured tail with the outer
                 // scope. The tail is pushed first because the work stack is
                 // LIFO.
-                stack.push(CppWork::Siblings(CppSiblingsWork {
-                    parent: body,
-                    next_index: displaced.split_index,
-                    end_index: usize::MAX,
-                    scope: scope.clone(),
-                }));
-                stack.push(CppWork::Siblings(CppSiblingsWork {
-                    parent: body,
-                    next_index: 0,
-                    end_index: displaced.split_index,
-                    scope: nested_scope,
-                }));
+                push_cpp_sibling_range(
+                    body,
+                    displaced.split_index,
+                    usize::MAX,
+                    scope.clone(),
+                    stack,
+                );
+                push_cpp_sibling_range(body, 0, displaced.split_index, nested_scope, stack);
             } else {
                 stack.push(CppWork::Container(CppContainer {
                     node: body,
@@ -2353,11 +2898,19 @@ impl<'a> CppVisitor<'a> {
 
     fn has_enum_enumerator_units(&self, parent: &CodeUnit) -> bool {
         let prefix = format!("{}.", parent.short_name());
+        let parent_short = parent.short_name();
         self.parsed.declarations().iter().any(|unit| {
             unit.kind() == CodeUnitType::Field
                 && unit.source() == parent.source()
                 && unit.package_name() == parent.package_name()
-                && unit.short_name().starts_with(&prefix)
+                && if parent_short.is_empty() {
+                    // Anonymous enum/union parent: its enumerators carry bare
+                    // short names (#2140), so presence means any ownerless
+                    // field in this file.
+                    !unit.short_name().contains(['.', '$'])
+                } else {
+                    unit.short_name().starts_with(&prefix)
+                }
         })
     }
 
@@ -2377,7 +2930,7 @@ impl<'a> CppVisitor<'a> {
                 self.file.clone(),
                 CodeUnitType::Field,
                 scope.package_name.clone(),
-                format!("{}.{}", parent.short_name(), name),
+                cpp_join_member_short(parent.short_name(), &name),
                 parent
                     .fq()
                     .clone()
@@ -2430,7 +2983,7 @@ impl<'a> CppVisitor<'a> {
                 self.file.clone(),
                 CodeUnitType::Field,
                 scope.package_name.clone(),
-                format!("{}.{}", parent.short_name(), name),
+                cpp_join_member_short(parent.short_name(), name),
                 parent
                     .fq()
                     .clone()
@@ -2464,12 +3017,23 @@ impl<'a> CppVisitor<'a> {
         if self.visit_sentinel_macro_region(node, scope, stack) {
             return;
         }
+        if node.has_error() {
+            self.visit_macro_swallowed_function_declarations(node, scope);
+        }
         if let Some((class_node, name, raw_supertypes)) =
             recover_exported_class_function_definition(node, self.source)
         {
             let body = cpp_body_node(class_node);
-            let fragmented = cpp_body_node(node)
-                .and_then(|body| fragmented_export_function_body_region(node, body, self.source));
+            let displaced_namespace = cpp_body_node(node)
+                .and_then(|_| displaced_export_function_namespace_shape(node, self.source));
+            let fragmented = cpp_body_node(node).and_then(|body| {
+                fragmented_export_function_body_region(
+                    node,
+                    body,
+                    self.source,
+                    displaced_namespace.as_ref(),
+                )
+            });
             // The recovery tuple's first node is the class-like type when the
             // parser exposes one, but the synthetic wrapper owns the compound
             // statement that contains the truncated class body. Use the
@@ -2589,6 +3153,12 @@ impl<'a> CppVisitor<'a> {
                         );
                     }
                 }
+                if let Some(boundary) = displaced_namespace {
+                    for item in boundary.namespace_items {
+                        self.recovered_class_sibling_scopes
+                            .insert(item.id(), scope.clone());
+                    }
+                }
                 stack.extend(class_stack);
                 return;
             }
@@ -2631,18 +3201,14 @@ impl<'a> CppVisitor<'a> {
                     let seeded = stack.pop();
                     match seeded {
                         Some(CppWork::Container(container)) => {
-                            stack.push(CppWork::Siblings(CppSiblingsWork {
-                                parent: body,
-                                next_index: split,
-                                end_index: usize::MAX,
-                                scope: scope.clone(),
-                            }));
-                            stack.push(CppWork::Siblings(CppSiblingsWork {
-                                parent: body,
-                                next_index: 0,
-                                end_index: split,
-                                scope: container.scope,
-                            }));
+                            push_cpp_sibling_range(
+                                body,
+                                split,
+                                usize::MAX,
+                                scope.clone(),
+                                &mut stack,
+                            );
+                            push_cpp_sibling_range(body, 0, split, container.scope, &mut stack);
                         }
                         // visit_named_class_like_shape always seeds exactly
                         // one Container when a body is present.
@@ -2676,8 +3242,14 @@ impl<'a> CppVisitor<'a> {
             self.visit_malformed_function_definition_container(node, scope, stack);
             return;
         };
-        let Some(mut function) = extract_function_info(function_declarator, self.source, scope)
-        else {
+        let function = if let Some((_, callable_name)) =
+            cpp_macro_displaced_callable_parts(function_declarator, self.source)
+        {
+            extract_function_info_from_name(function_declarator, callable_name, self.source, scope)
+        } else {
+            extract_function_info(function_declarator, self.source, scope)
+        };
+        let Some(mut function) = function else {
             self.visit_malformed_function_definition_container(node, scope, stack);
             return;
         };
@@ -3032,11 +3604,6 @@ impl<'a> CppVisitor<'a> {
                 class_scope.template_metadata =
                     cpp_template_metadata(template_node, fragmented.class_node, self.source);
             }
-            let raw_supertypes = matches!(
-                fragmented.class_node.kind(),
-                "class_specifier" | "struct_specifier"
-            )
-            .then(|| extract_cpp_supertypes(fragmented.class_node, self.source));
             if let Some(outcome) = self
                 .reparse_fragmented_export_class_members(&fragmented.fragmented, &fragmented.name)
             {
@@ -3047,10 +3614,15 @@ impl<'a> CppVisitor<'a> {
                     None,
                     true,
                     Some(fragmented.fragmented.class_range),
-                    raw_supertypes,
+                    fragmented.raw_supertypes.clone(),
                     &class_scope,
                     &mut class_stack,
                 );
+                self.parsed
+                    .record_materialization(MaterializationRecord::RecoveredDeclaration {
+                        recovery: fragmented.fragmented.class_range,
+                        unit: class_unit.clone(),
+                    });
                 if self.visit_fragmented_export_class_members(outcome, class_unit, &class_scope) {
                     self.consumed_fragment_regions.push((
                         fragmented.consumed_start,
@@ -3410,15 +3982,25 @@ impl<'a> CppVisitor<'a> {
         let Some(name) = extract_variable_name(declarator, self.source) else {
             return;
         };
-        let short_name = if in_class_body {
+        let parent = if in_class_body {
             let Some(parent) = &scope.class_unit else {
                 return;
             };
-            format!("{}.{}", parent.short_name(), name)
+            Some(parent)
         } else {
-            name
+            None
         };
-        let fq = cpp_member_fq(&scope.package_name, &short_name);
+        let short_name = match parent {
+            Some(parent) => cpp_join_member_short(parent.short_name(), &name),
+            None => name.clone(),
+        };
+        let fq = cpp_leaf_fq(
+            &scope.package_name,
+            parent,
+            &name,
+            SegmentKind::Member,
+            SegmentKind::Member,
+        );
         let code_unit = CodeUnit::new_fq(
             self.file.clone(),
             CodeUnitType::Field,
@@ -3573,11 +4155,17 @@ impl<'a> CppVisitor<'a> {
                 continue;
             }
             let short_name = if let Some(parent) = &scope.class_unit {
-                format!("{}${alias_name}", parent.short_name())
+                cpp_join_nested_short(parent.short_name(), &alias_name)
             } else {
-                alias_name
+                alias_name.clone()
             };
-            let fq = cpp_class_fq(&scope.package_name, &short_name);
+            let fq = cpp_leaf_fq(
+                &scope.package_name,
+                scope.class_unit.as_ref(),
+                &alias_name,
+                SegmentKind::Nested,
+                SegmentKind::Type,
+            );
             let code_unit = CodeUnit::with_signature_and_fq(
                 self.file.clone(),
                 CodeUnitType::Class,
@@ -3919,10 +4507,20 @@ fn extract_function_info(
     scope: &ScopeInfo,
 ) -> Option<FunctionInfo> {
     let parameters_node = declarator.child_by_field_name("parameters")?;
-    let parameters_text = cpp_parameter_signature(parameters_node, source);
     let declarator_name_node = declarator
         .child_by_field_name("declarator")
         .or_else(|| parameters_node.prev_named_sibling())?;
+    extract_function_info_from_name(declarator, declarator_name_node, source, scope)
+}
+
+fn extract_function_info_from_name(
+    declarator: Node<'_>,
+    declarator_name_node: Node<'_>,
+    source: &str,
+    scope: &ScopeInfo,
+) -> Option<FunctionInfo> {
+    let parameters_node = declarator.child_by_field_name("parameters")?;
+    let parameters_text = cpp_parameter_signature(parameters_node, source);
     let recovered_specialization_member = scope
         .recovered_specialization_member_scope
         .then(|| {
@@ -3970,6 +4568,82 @@ fn extract_function_info(
         name,
         signature,
     })
+}
+
+/// Recover the semantic return type and callable name when a declaration macro
+/// occupies a function definition's `type` field. Tree-sitter either exposes a
+/// scalar return as the declarator's apparent name and the callable as the sole
+/// identifier in an `ERROR`, or joins a template return and callable into a
+/// qualified identifier with a missing `::`. Both shapes retain the complete
+/// parameter list and body; a concrete separator remains an out-of-line member.
+fn cpp_macro_displaced_callable_parts<'tree>(
+    function_declarator: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, Node<'tree>)> {
+    let definition = function_declarator.parent()?;
+    if definition.kind() != "function_definition"
+        || definition.child_by_field_name("declarator") != Some(function_declarator)
+        || definition
+            .child_by_field_name("body")
+            .is_none_or(|body| body.kind() != "compound_statement")
+    {
+        return None;
+    }
+    let macro_type = definition.child_by_field_name("type")?;
+    if macro_type.kind() != "type_identifier"
+        || !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(macro_type, source)))
+    {
+        return None;
+    }
+
+    let apparent_return_type = function_declarator.child_by_field_name("declarator")?;
+    if apparent_return_type.kind() == "qualified_identifier"
+        && let (Some(return_type), Some(callable_name)) = (
+            apparent_return_type.child_by_field_name("scope"),
+            apparent_return_type.child_by_field_name("name"),
+        )
+        && return_type.kind() == "template_type"
+        && matches!(callable_name.kind(), "identifier" | "field_identifier")
+        && (0..apparent_return_type.child_count())
+            .filter_map(|index| apparent_return_type.child(index))
+            .any(|child| child.kind() == "::" && child.is_missing())
+        && !normalize_cpp_whitespace(node_text(return_type, source)).is_empty()
+        && !normalize_cpp_whitespace(node_text(callable_name, source)).is_empty()
+    {
+        return Some((return_type, callable_name));
+    }
+    if !matches!(
+        apparent_return_type.kind(),
+        "identifier" | "field_identifier" | "type_identifier"
+    ) || normalize_cpp_whitespace(node_text(apparent_return_type, source)).is_empty()
+    {
+        return None;
+    }
+    let parameters = function_declarator.child_by_field_name("parameters")?;
+    let mut cursor = function_declarator.walk();
+    let between = function_declarator
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment")
+        .filter(|child| {
+            child.start_byte() >= apparent_return_type.end_byte()
+                && child.end_byte() <= parameters.start_byte()
+                && !same_node(*child, apparent_return_type)
+                && !same_node(*child, parameters)
+        })
+        .collect::<Vec<_>>();
+    let [name_error] = between.as_slice() else {
+        return None;
+    };
+    if name_error.kind() != "ERROR" || name_error.named_child_count() != 1 {
+        return None;
+    }
+    let callable_name = name_error.named_child(0)?;
+    if !matches!(callable_name.kind(), "identifier" | "field_identifier")
+        || normalize_cpp_whitespace(node_text(callable_name, source)).is_empty()
+    {
+        return None;
+    }
+    Some((apparent_return_type, callable_name))
 }
 
 /// The part of a `function_declarator` after its parameter list that belongs to
@@ -4394,17 +5068,55 @@ struct CppQualifiedNameComponent {
     is_template_id: bool,
 }
 
-fn split_structured_templated_cpp_name(
-    declarator_name: Node<'_>,
+/// Canonical nested-class chain for an out-of-line class definition written
+/// inside its namespace, such as `struct Outer::Inner { ... }`, as one
+/// component per class (`["Outer", "Inner"]`).
+///
+/// The enclosing namespace fixes the namespace/class boundary: after an
+/// optional redundant spelling of that namespace, every component belongs to
+/// the class chain. File-scope qualified class names remain untouched because
+/// syntax alone cannot distinguish `namespace::Class` from `Outer::Inner`.
+///
+/// The components stay structured (rather than being `$`-joined here) so the
+/// fq construction can push one Type/Nested segment per class; the `$`-joined
+/// short-name display form is derived at the call sites that need it.
+fn qualified_class_name_chain(
+    class_node: Node<'_>,
     source: &str,
     scope: &ScopeInfo,
-) -> Option<(Option<String>, String, String)> {
-    if declarator_name.kind() != "qualified_identifier" {
+) -> Option<Vec<String>> {
+    if scope.package_name.is_empty() || scope.class_unit.is_some() {
+        return None;
+    }
+    let name = class_node.child_by_field_name("name")?;
+    let (components, explicitly_global) = structured_cpp_qualified_components(name, source)?;
+    if explicitly_global
+        || components.len() < 2
+        || components.iter().any(|component| component.is_template_id)
+    {
+        return None;
+    }
+    let names = components
+        .iter()
+        .map(|component| component.name.as_str())
+        .collect::<Vec<_>>();
+    let class_chain = strip_redundant_namespace_prefix(&names, &scope.package_name);
+    if class_chain.is_empty() {
+        return None;
+    }
+    Some(class_chain.iter().map(|name| name.to_string()).collect())
+}
+
+fn structured_cpp_qualified_components(
+    qualified_name: Node<'_>,
+    source: &str,
+) -> Option<(Vec<CppQualifiedNameComponent>, bool)> {
+    if qualified_name.kind() != "qualified_identifier" {
         return None;
     }
 
     let mut components = Vec::new();
-    let mut current = declarator_name;
+    let mut current = qualified_name;
     let mut explicitly_global = false;
     loop {
         if current.kind() == "qualified_identifier" {
@@ -4421,6 +5133,16 @@ fn split_structured_templated_cpp_name(
             break;
         }
     }
+    Some((components, explicitly_global))
+}
+
+fn split_structured_templated_cpp_name(
+    declarator_name: Node<'_>,
+    source: &str,
+    scope: &ScopeInfo,
+) -> Option<(Option<String>, String, String)> {
+    let (mut components, explicitly_global) =
+        structured_cpp_qualified_components(declarator_name, source)?;
 
     let terminal = components.pop()?;
     let owner_start = components
@@ -5247,6 +5969,141 @@ pub fn cpp_displaced_preprocessor_terminator<'tree>(
     displaced
 }
 
+/// The effective end of a conditional whose real terminator tree-sitter
+/// displaced into declaration recovery.
+///
+/// Most damaged conditionals retain a concrete `#endif` token below an
+/// `ERROR`; [`cpp_displaced_preprocessor_terminator`] supplies that exact
+/// boundary. A preprocessor family that selects the middle of a declaration
+/// can lose the directive tokens entirely. In that shape tree-sitter leaves
+/// the declaration's `typedef` token as the sole child of the immediately
+/// preceding top-level `ERROR`, and puts a multiline `ERROR` plus the trailing
+/// declarator name inside the conditional's first declaration. The declaration
+/// end is then the smallest structured boundary that contains the whole split
+/// declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CppDisplacedPreprocessorBoundary {
+    pub end_byte: usize,
+    pub end_line: usize,
+}
+
+pub fn cpp_displaced_preprocessor_boundary(
+    conditional: Node<'_>,
+) -> Option<CppDisplacedPreprocessorBoundary> {
+    if let Some(terminator) = displaced_declaration_prefix_terminator(conditional) {
+        return Some(CppDisplacedPreprocessorBoundary {
+            end_byte: terminator.end_byte(),
+            end_line: terminator.end_position().row + 1,
+        });
+    }
+    if let Some(declaration) = displaced_split_declaration(conditional) {
+        return Some(CppDisplacedPreprocessorBoundary {
+            end_byte: declaration.end_byte(),
+            end_line: declaration.end_position().row + 1,
+        });
+    }
+    if let Some(terminator) = cpp_displaced_preprocessor_terminator(conditional) {
+        return Some(CppDisplacedPreprocessorBoundary {
+            end_byte: terminator.end_byte(),
+            end_line: terminator.end_position().row + 1,
+        });
+    }
+    None
+}
+
+fn displaced_declaration_prefix_terminator<'tree>(conditional: Node<'tree>) -> Option<Node<'tree>> {
+    if !conditional.has_error() || conditional.child_by_field_name("alternative").is_some() {
+        return None;
+    }
+    let mut cursor = conditional.walk();
+    let declarations = conditional
+        .named_children(&mut cursor)
+        .filter(|child| matches!(child.kind(), "declaration" | "function_definition"))
+        .collect::<Vec<_>>();
+    let declaration = *declarations.first()?;
+    if declaration.end_byte() >= conditional.end_byte() || declarations.len() < 2 {
+        return None;
+    }
+    let declarator_start = declaration.child_by_field_name("declarator")?.start_byte();
+    let mut terminator = None;
+    let mut stack = (0..declaration.child_count())
+        .filter_map(|index| declaration.child(index))
+        .filter(|child| child.start_byte() < declarator_start)
+        .map(|child| (child, false))
+        .collect::<Vec<_>>();
+    while let Some((node, inside_error)) = stack.pop() {
+        let inside_error = inside_error || node.kind() == "ERROR";
+        if inside_error && node.kind() == "#endif" && !node.is_missing() {
+            terminator = Some(node);
+            continue;
+        }
+        for index in 0..node.child_count() {
+            if let Some(child) = node.child(index)
+                && child.start_byte() < declarator_start
+            {
+                stack.push((child, inside_error));
+            }
+        }
+    }
+    terminator
+}
+
+fn displaced_split_declaration<'tree>(conditional: Node<'tree>) -> Option<Node<'tree>> {
+    if !conditional.has_error()
+        || conditional.child_by_field_name("alternative").is_some()
+        || conditional
+            .prev_named_sibling()
+            .filter(|sibling| {
+                sibling.kind() == "ERROR"
+                    && sibling.child_count() == 1
+                    && sibling
+                        .child(0)
+                        .is_some_and(|child| child.kind() == "typedef")
+            })
+            .filter(|sibling| sibling.end_position().row + 1 == conditional.start_position().row)
+            .is_none()
+    {
+        return None;
+    }
+    let mut cursor = conditional.walk();
+    let children = conditional.named_children(&mut cursor).collect::<Vec<_>>();
+    let declaration_index = children
+        .iter()
+        .position(|child| child.kind() == "declaration" && child.has_error())?;
+    let declaration = children[declaration_index];
+    if !children
+        .iter()
+        .skip(declaration_index + 1)
+        .any(|child| child.end_byte() > declaration.end_byte())
+    {
+        return None;
+    }
+    let declarator = declaration.child_by_field_name("declarator")?;
+    let mut error_end = None;
+    let mut names = Vec::new();
+    let mut stack = vec![declarator];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "ERROR" && node.end_position().row > node.start_position().row {
+            error_end =
+                Some(error_end.map_or(node.end_byte(), |end: usize| end.max(node.end_byte())));
+            continue;
+        }
+        if matches!(node.kind(), "identifier" | "type_identifier") {
+            names.push(node.start_byte());
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    let error_end = error_end?;
+    names
+        .into_iter()
+        .any(|start| start >= error_end)
+        .then_some(declaration)
+}
+
 fn displaced_fragmented_class_terminator(parent: Node<'_>, error_index: usize) -> bool {
     let Some(error) = parent.child(error_index) else {
         return false;
@@ -5429,6 +6286,15 @@ fn recover_fragmented_partial_specialization<'tree>(
                 class_terminator = Some(child);
                 break;
             }
+            // A namespace can never be a class member: reaching one before the
+            // terminator proves the class's true close was swallowed upstream
+            // and this scan has crossed into the enclosing scope, so the
+            // recovery cannot be bounded -- continuing re-owns the namespace
+            // block (and its template specializations) as class members under
+            // a re-appended package, desyncing the fq boundary (#2306).
+            if found_template && child.kind() == "namespace_definition" {
+                return None;
+            }
             if found_template && child.is_named() {
                 member_siblings.push(child);
             }
@@ -5535,9 +6401,25 @@ fn cpp_template_metadata(
     let mut parameter_names = Vec::new();
     let mut cursor = parameters_node.walk();
     for parameter in parameters_node.named_children(&mut cursor) {
-        let Some(name) = cpp_template_parameter_name(parameter, source) else {
+        if !matches!(
+            parameter.kind(),
+            "type_parameter_declaration"
+                | "optional_type_parameter_declaration"
+                | "variadic_type_parameter_declaration"
+                | "template_template_parameter_declaration"
+                | "parameter_declaration"
+                | "optional_parameter_declaration"
+                | "variadic_parameter_declaration"
+        ) {
             continue;
-        };
+        }
+        let index = parameter_nodes.len();
+        // An unnamed parameter still contributes template arity and kind. Use
+        // an impossible C++ identifier so positional reconciliation can bind
+        // it without making source expressions refer to a name that was not
+        // written.
+        let name = cpp_template_parameter_name(parameter, source)
+            .unwrap_or_else(|| format!("<anonymous:{index}>"));
         parameter_names.push(name);
         parameter_nodes.push(parameter);
     }
@@ -5773,7 +6655,7 @@ pub fn cpp_template_term(
         match next {
             Work::Visit(current) => {
                 let text = normalize_cpp_whitespace(node_text(current, source));
-                if parameter_names.contains(&text) {
+                if cpp_template_term_leaf_is_parameter(current, &text, parameter_names) {
                     terms.push(CppTemplateTerm::Parameter(text));
                     continue;
                 }
@@ -5822,6 +6704,23 @@ pub fn cpp_template_term(
         }
     }
     terms.pop().expect("template term traversal emits one root")
+}
+
+fn cpp_template_term_leaf_is_parameter(
+    node: Node<'_>,
+    text: &str,
+    parameter_names: &[String],
+) -> bool {
+    if !parameter_names.iter().any(|parameter| parameter == text) {
+        return false;
+    }
+    !node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+        ) && parent.child_by_field_name("scope").is_some()
+            && parent.child_by_field_name("name") == Some(node)
+    })
 }
 
 fn enclosing_cpp_declaration_node(mut node: Node<'_>) -> Option<Node<'_>> {
@@ -5876,6 +6775,7 @@ fn cpp_signature_metadata(
         );
     };
     let callable_arity = cpp_callable_arity(parameters_node, source);
+    let callable_parameter_types = cpp_callable_parameter_types(parameters_node, source);
     let parameter_text = normalize_cpp_whitespace(node_text(parameters_node, source));
     let search_from = cpp_signature_search_start(&signature, function_declarator, source);
     let Some(relative_start) = signature
@@ -5885,6 +6785,7 @@ fn cpp_signature_metadata(
         return enrich(
             SignatureMetadata::new(signature, Vec::new())
                 .with_callable_arity(callable_arity)
+                .with_callable_parameter_types(callable_parameter_types)
                 .with_return_type_text(return_type_text)
                 .with_return_type_identity(return_type_identity),
         );
@@ -5910,6 +6811,7 @@ fn cpp_signature_metadata(
     enrich(
         SignatureMetadata::new(signature, parameters)
             .with_callable_arity(callable_arity)
+            .with_callable_parameter_types(callable_parameter_types)
             .with_return_type_text(return_type_text)
             .with_return_type_identity(return_type_identity),
     )
@@ -5977,6 +6879,10 @@ fn cpp_callable_return_type_identity(
         return None;
     }
     let lexical_scope = cpp_callable_lexical_scope(function_declarator, source);
+    if let Some((return_type, _)) = cpp_macro_displaced_callable_parts(function_declarator, source)
+    {
+        return cpp_structured_type_identity(return_type, source, &lexical_scope);
+    }
     let mut cursor = function_declarator.walk();
     if let Some(trailing) = function_declarator
         .named_children(&mut cursor)
@@ -6108,6 +7014,7 @@ fn cpp_structured_type_identity(
                 | "scoped_identifier"
                 | "scoped_type_identifier"
                 | "type_identifier"
+                | "field_identifier"
                 | "identifier"
                 | "namespace_identifier"
                 | "primitive_type" => {
@@ -6178,7 +7085,9 @@ fn cpp_structured_declarator_wrappers(node: Node<'_>) -> Vec<CppStructuredTypeWr
             "pointer_declarator" | "abstract_pointer_declarator" => {
                 wrappers.push(CppStructuredTypeWrapper::Pointer)
             }
-            "reference_declarator" => wrappers.push(CppStructuredTypeWrapper::Reference),
+            "reference_declarator" | "abstract_reference_declarator" => {
+                wrappers.push(CppStructuredTypeWrapper::Reference)
+            }
             "array_declarator" | "abstract_array_declarator" => {
                 wrappers.push(CppStructuredTypeWrapper::Array)
             }
@@ -6363,6 +7272,11 @@ fn cpp_callable_return_type_text(function_declarator: Node<'_>, source: &str) ->
     if cpp_callable_is_structural_constructor(function_declarator, source) {
         return None;
     }
+    if let Some((return_type, _)) = cpp_macro_displaced_callable_parts(function_declarator, source)
+    {
+        let text = normalize_cpp_whitespace(node_text(return_type, source));
+        return (!text.is_empty()).then_some(text);
+    }
     let mut cursor = function_declarator.walk();
     if let Some(trailing) = function_declarator
         .named_children(&mut cursor)
@@ -6433,6 +7347,9 @@ fn cpp_callable_arity(parameters_node: Node<'_>, source: &str) -> CallableArity 
     for child in parameters_node.children(&mut cursor) {
         match child.kind() {
             "parameter_declaration" => {
+                if cpp_parameter_is_explicit_object(child, source) {
+                    continue;
+                }
                 if child.child_by_field_name("declarator").is_none()
                     && child
                         .child_by_field_name("type")
@@ -6451,6 +7368,148 @@ fn cpp_callable_arity(parameters_node: Node<'_>, source: &str) -> CallableArity 
         }
     }
     CallableArity::new(required, total, repeated)
+}
+
+fn cpp_parameter_is_explicit_object(parameter: Node<'_>, source: &str) -> bool {
+    parameter
+        .child_by_field_name("type")
+        .filter(|type_node| type_node.kind() == "placeholder_type_specifier")
+        .and_then(|type_node| type_node.child_by_field_name("constraint"))
+        .is_some_and(|constraint| {
+            constraint.kind() == "type_identifier" && node_text(constraint, source).trim() == "this"
+        })
+}
+
+/// One entry of a callable's invocation parameter list.
+///
+/// The list excludes an explicit object parameter and a lone `void`, so its
+/// length is the callable's invocation arity. Every derivation of a parameter
+/// type - the rendered spelling used for overload discrimination and the
+/// structured identity used by dependency-pack production - starts from this
+/// same sequence, so the two can never disagree about which parameters exist.
+#[derive(Clone, Copy)]
+enum CppParameterSlot<'tree> {
+    Declared(Node<'tree>),
+    Ellipsis,
+}
+
+fn cpp_callable_parameter_slots<'tree>(
+    parameters_node: Node<'tree>,
+    source: &str,
+) -> Vec<CppParameterSlot<'tree>> {
+    let mut slots = Vec::new();
+    let mut cursor = parameters_node.walk();
+    for parameter in parameters_node.children(&mut cursor) {
+        match parameter.kind() {
+            "parameter_declaration" | "optional_parameter_declaration" => {
+                if cpp_parameter_is_explicit_object(parameter, source)
+                    || (parameter.child_by_field_name("declarator").is_none()
+                        && parameter
+                            .child_by_field_name("type")
+                            .is_some_and(|type_node| node_text(type_node, source).trim() == "void"))
+                {
+                    continue;
+                }
+                slots.push(CppParameterSlot::Declared(parameter));
+            }
+            "variadic_parameter" | "variadic_parameter_declaration" | "..." => {
+                slots.push(CppParameterSlot::Ellipsis);
+            }
+            _ => {}
+        }
+    }
+    slots
+}
+
+fn cpp_callable_parameter_types(parameters_node: Node<'_>, source: &str) -> Vec<String> {
+    cpp_callable_parameter_slots(parameters_node, source)
+        .into_iter()
+        .map(|slot| match slot {
+            CppParameterSlot::Declared(parameter) => cpp_parameter_type(parameter, source),
+            CppParameterSlot::Ellipsis => "...".to_string(),
+        })
+        .collect()
+}
+
+/// One callable parameter's parser-derived type.
+///
+/// A rendered spelling such as `const T&` is a source text, not a type name. A
+/// consumer that must publish a type into a structured model - a semantic-pack
+/// type reference, for example - reads this instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CppParameterType {
+    /// The written type reduced to a structured identity. C++ cv-qualifiers
+    /// have no place in that model and are not represented.
+    Structured(StructuredTypeIdentity),
+    /// A `...` pack, which declares no parameter type at all.
+    Ellipsis,
+    /// A written type with no structured reduction, such as a macro-obscured,
+    /// `decltype`-computed, or function-pointer parameter.
+    Unstructured,
+}
+
+/// The structured type of each invocation parameter, in declaration order.
+///
+/// The result is index-parallel with the rendered
+/// [`SignatureMetadata::callable_parameter_types`] spellings of the same
+/// callable.
+pub fn cpp_callable_parameter_type_identities(
+    function_declarator: Node<'_>,
+    source: &str,
+) -> Vec<CppParameterType> {
+    let Some(parameters_node) = function_declarator.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    let lexical_scope = cpp_callable_lexical_scope(function_declarator, source);
+    cpp_callable_parameter_slots(parameters_node, source)
+        .into_iter()
+        .map(|slot| match slot {
+            CppParameterSlot::Ellipsis => CppParameterType::Ellipsis,
+            CppParameterSlot::Declared(parameter) => {
+                cpp_parameter_type_identity(parameter, source, &lexical_scope)
+                    .map_or(CppParameterType::Unstructured, CppParameterType::Structured)
+            }
+        })
+        .collect()
+}
+
+fn cpp_parameter_type_identity(
+    parameter: Node<'_>,
+    source: &str,
+    lexical_scope: &[String],
+) -> Option<StructuredTypeIdentity> {
+    let type_node = parameter.child_by_field_name("type")?;
+    let mut identity = cpp_structured_type_identity(type_node, source, lexical_scope)?;
+    if let Some(declarator) = cpp_parameter_declarator(parameter) {
+        for wrapper in cpp_structured_declarator_wrappers(declarator)
+            .into_iter()
+            .rev()
+        {
+            identity = cpp_wrap_structured_type(identity, wrapper)?;
+        }
+    }
+    Some(identity)
+}
+
+/// The callable declarator of the declaration that covers `start_byte`.
+///
+/// A consumer that holds a declaration's recorded byte position rather than its
+/// syntax node - external header extraction, for instance - uses this to reach
+/// the same `function_declarator` the declaration walk read.
+pub fn cpp_function_declarator_at(root: Node<'_>, start_byte: usize) -> Option<Node<'_>> {
+    let mut current = root.descendant_for_byte_range(start_byte, start_byte)?;
+    loop {
+        if matches!(
+            current.kind(),
+            "declaration" | "field_declaration" | "function_definition"
+        ) && let Some(declarator) = current
+            .child_by_field_name("declarator")
+            .and_then(extract_function_declarator)
+        {
+            return Some(declarator);
+        }
+        current = current.parent()?;
+    }
 }
 
 fn cpp_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
@@ -6939,8 +7998,15 @@ struct CppSentinelFragmentedClassTail<'tree> {
     class_node: Node<'tree>,
     template_node: Option<Node<'tree>>,
     name: String,
+    raw_supertypes: Option<Vec<String>>,
     fragmented: FragmentedExportBody,
     consumed_start: usize,
+}
+
+struct CppSentinelFragmentedClassErrorPrefix<'tree> {
+    name: String,
+    open: Node<'tree>,
+    raw_supertypes: Option<Vec<String>>,
 }
 
 struct CppSentinelDirectBodyClassRegion {
@@ -6981,6 +8047,35 @@ fn cpp_sentinel_body_class_candidate<'tree>(
         }
     })?;
     Some((class_node, Some(child)))
+}
+
+/// Recognize the direct `ERROR(class, name, "{", members...)` prefix left in a
+/// namespace-sentinel body when a later member macro ends the bogus sentinel
+/// function before the real class close. The anonymous class/open tokens and
+/// direct identifier are the structural proof; a retained direct close would
+/// be an ordinary malformed class rather than the fragmented tail handled here.
+fn cpp_sentinel_fragmented_class_error_prefix<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<CppSentinelFragmentedClassErrorPrefix<'tree>> {
+    let name = malformed_class_error_owner_name(node, source)?;
+    let mut cursor = node.walk();
+    let children = node.children(&mut cursor).collect::<Vec<_>>();
+    let keyword = children.first()?;
+    let open_index = children.iter().position(|child| child.kind() == "{")?;
+    if children[open_index + 1..]
+        .iter()
+        .any(|child| child.kind() == "}")
+    {
+        return None;
+    }
+    let raw_supertypes =
+        matches!(keyword.kind(), "class" | "struct").then(|| extract_cpp_supertypes(node, source));
+    Some(CppSentinelFragmentedClassErrorPrefix {
+        name,
+        open: children[open_index],
+        raw_supertypes,
+    })
 }
 
 fn cpp_sentinel_direct_body_class_candidate<'tree>(
@@ -7141,8 +8236,9 @@ fn cpp_sentinel_macro_body_class_region(
 /// the root's direct tokens must end in `namespace`, an identifier, and `{`;
 /// the malformed function must begin with an all-caps type, then an ERROR whose
 /// sole identifier is `namespace`, followed by the inner namespace identifier
-/// and a compound body; and that body must contain complete named class
-/// specifiers.  A text reparse cannot prove any of those ownership boundaries.
+/// and a compound body; and that body must contain a complete named class or a
+/// structurally fragmented class prefix. A text reparse cannot prove any of
+/// those ownership boundaries.
 fn cpp_nested_namespace_sentinel<'tree>(
     node: Node<'tree>,
     source: &str,
@@ -7229,22 +8325,114 @@ fn cpp_nested_namespace_sentinel<'tree>(
     namespace_components.push(inner_name);
 
     let mut cursor = body.walk();
-    let classes = body
-        .named_children(&mut cursor)
-        .filter_map(cpp_sentinel_body_class_candidate)
-        .filter(|(child, _)| {
-            cpp_body_node(*child).is_some()
-                && class_like_name(*child, source)
+    let has_complete_class = body.named_children(&mut cursor).any(|child| {
+        cpp_sentinel_body_class_candidate(child).is_some_and(|(class_node, _)| {
+            cpp_body_node(class_node).is_some()
+                && class_like_name(class_node, source)
                     .is_some_and(|name| !name.is_empty() && !cpp_export_macro_token(&name))
         })
-        .collect::<Vec<_>>();
-    if classes.is_empty() {
+    });
+    if !has_complete_class && cpp_sentinel_fragmented_class_tail(function, *body, source).is_none()
+    {
         return None;
     }
 
     Some(CppNestedNamespaceSentinel {
         function,
         body: *body,
+        namespace_components,
+    })
+}
+
+/// Recognize a namespace-begin sentinel directly beneath the translation unit.
+///
+/// Tree-sitter reduces `BEGIN_NS namespace a::b { ... }` to a malformed
+/// function whose type is the sentinel, whose declarator is the structured
+/// qualified name `namespace::a::b`, and whose body contains the namespace
+/// items. Declaration indexing already reparses this bounded region. The
+/// inverse scanner retains the original tree, so recover the same namespace
+/// components from the declarator fields for its lexical-scope metadata.
+fn cpp_root_namespace_sentinel<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<CppNestedNamespaceSentinel<'tree>> {
+    if node.kind() != "function_definition"
+        || !node.has_error()
+        || node.parent()?.kind() != "translation_unit"
+    {
+        return None;
+    }
+    let first_type = node.child_by_field_name("type")?;
+    let sentinel = normalize_cpp_whitespace(node_text(first_type, source));
+    if first_type.kind() != "type_identifier"
+        || sentinel.is_empty()
+        || !cpp_export_macro_token(&sentinel)
+    {
+        return None;
+    }
+    let declarator = node.child_by_field_name("declarator")?;
+    let body = node.child_by_field_name("body")?;
+    if declarator.kind() != "qualified_identifier" || body.kind() != "compound_statement" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let named = node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment")
+        .collect::<Vec<_>>();
+    let [named_type, named_declarator, named_body] = named.as_slice() else {
+        return None;
+    };
+    if !same_node(*named_type, first_type)
+        || !same_node(*named_declarator, declarator)
+        || !same_node(*named_body, body)
+    {
+        return None;
+    }
+    let mut declarator_components = Vec::new();
+    let mut valid_components = true;
+    walk_named_tree_preorder(declarator, true, |component| {
+        if !matches!(
+            component.kind(),
+            "identifier" | "namespace_identifier" | "type_identifier"
+        ) {
+            return WalkControl::Continue;
+        }
+        let Some(component) = canonical_cpp_qualified_component(component, source) else {
+            valid_components = false;
+            return WalkControl::Break;
+        };
+        declarator_components.push(component.name);
+        WalkControl::SkipChildren
+    });
+    if !valid_components || declarator_components.first().map(String::as_str) != Some("namespace") {
+        return None;
+    }
+    declarator_components.remove(0);
+    let namespace_components = declarator_components;
+    if namespace_components.is_empty()
+        || namespace_components
+            .iter()
+            .any(|component| component.is_empty() || cpp_export_macro_token(component))
+    {
+        return None;
+    }
+
+    let mut cursor = body.walk();
+    let has_complete_class = body.named_children(&mut cursor).any(|child| {
+        cpp_sentinel_body_class_candidate(child).is_some_and(|(class_node, _)| {
+            cpp_body_node(class_node).is_some()
+                && class_like_name(class_node, source)
+                    .is_some_and(|name| !name.is_empty() && !cpp_export_macro_token(&name))
+        })
+    });
+    if !has_complete_class && cpp_sentinel_fragmented_class_tail(node, body, source).is_none() {
+        return None;
+    }
+
+    Some(CppNestedNamespaceSentinel {
+        function: node,
+        body,
         namespace_components,
     })
 }
@@ -7265,27 +8453,53 @@ fn cpp_sentinel_fragmented_class_tail<'tree>(
     let mut cursor = body.walk();
     let candidates = body
         .named_children(&mut cursor)
-        .filter_map(cpp_sentinel_body_class_candidate)
-        .filter(|(class_node, _)| cpp_body_node(*class_node).is_some() && class_node.has_error())
+        .filter_map(|child| {
+            if let Some((class_node, template_node)) = cpp_sentinel_body_class_candidate(child) {
+                let class_body = cpp_body_node(class_node)?;
+                if !class_node.has_error() {
+                    return None;
+                }
+                let name = class_like_name(class_node, source)?;
+                let raw_supertypes =
+                    matches!(class_node.kind(), "class_specifier" | "struct_specifier")
+                        .then(|| extract_cpp_supertypes(class_node, source));
+                return Some((
+                    class_node,
+                    template_node,
+                    name,
+                    class_body,
+                    class_body.start_byte().checked_add(1)?,
+                    raw_supertypes,
+                ));
+            }
+            let prefix = cpp_sentinel_fragmented_class_error_prefix(child, source)?;
+            Some((
+                child,
+                None,
+                prefix.name,
+                prefix.open,
+                prefix.open.end_byte(),
+                prefix.raw_supertypes,
+            ))
+        })
         .collect::<Vec<_>>();
-    let [(class_node, template_node)] = candidates.as_slice() else {
+    let [(class_node, template_node, name, class_body, reparse_start, raw_supertypes)] =
+        candidates.as_slice()
+    else {
         return None;
     };
-    let name = class_like_name(*class_node, source)?;
-    if name.is_empty() || cpp_export_macro_token(&name) {
+    if name.is_empty() || cpp_export_macro_token(name) {
         return None;
     }
-    let class_body = cpp_body_node(*class_node)?;
 
     let (close, semicolon) =
-        cpp_sentinel_fragment_boundary(function, *class_node, class_body, source)?;
+        cpp_sentinel_fragment_boundary(function, *class_node, *class_body, source)?;
 
-    let reparse_start = class_body.start_byte().checked_add(1)?;
     let reparse_end = close.start_byte();
-    if reparse_start >= reparse_end {
+    if *reparse_start >= reparse_end {
         return None;
     }
-    let tree = cpp_reparse_region_items(source, reparse_start, reparse_end)?;
+    let tree = cpp_reparse_region_items(source, *reparse_start, reparse_end)?;
     if !cpp_reparsed_members_are_indexable(tree.root_node(), source) {
         return None;
     }
@@ -7300,9 +8514,10 @@ fn cpp_sentinel_fragmented_class_tail<'tree>(
     Some(CppSentinelFragmentedClassTail {
         class_node: *class_node,
         template_node: *template_node,
-        name,
+        name: name.clone(),
+        raw_supertypes: raw_supertypes.clone(),
         fragmented: FragmentedExportBody {
-            reparse_start,
+            reparse_start: *reparse_start,
             reparse_end,
             class_range,
         },
@@ -7328,7 +8543,9 @@ pub fn cpp_sentinel_recovered_classes(
     let mut recovered_classes: Vec<CppSentinelRecoveredClass> = Vec::new();
     let mut stack = vec![root];
     while let Some(current) = stack.pop() {
-        if let Some(recovered) = cpp_nested_namespace_sentinel(current, source) {
+        if let Some(recovered) = cpp_nested_namespace_sentinel(current, source)
+            .or_else(|| cpp_root_namespace_sentinel(current, source))
+        {
             let namespace_components = cpp_sentinel_recovered_namespace_components(
                 recovered.function,
                 &recovered.namespace_components,
@@ -7364,6 +8581,12 @@ pub fn cpp_sentinel_recovered_classes(
                     cpp_declaration_range(template_node.unwrap_or(class_node))
                 };
                 class_candidates.push((class_range, name));
+            }
+            if let Some(fragmented) = fragmented
+                .as_ref()
+                .filter(|tail| tail.class_node.kind() == "ERROR")
+            {
+                class_candidates.push((fragmented.fragmented.class_range, fragmented.name.clone()));
             }
 
             let mut owner_ranges =
@@ -8059,6 +9282,31 @@ fn cpp_sentinel_macro_class_region(
         }
         found
     };
+    // A stray `};` sibling is this class's close only when the bounded reparse
+    // agrees the first body-bearing class ENDS there. When the malformed
+    // envelope swallowed the class's true close, the scan can promote a much
+    // later scope's close instead -- in protobuf-generated headers
+    // (wazuh__wazuh's *.pb.h) the `PROTOBUF_NAMESPACE_CLOSE` sentinel before
+    // `struct TableStruct_*` paired with the first message class's `};`, making
+    // the recovered "class body" span whole `namespace {}` blocks and minting
+    // namespace-scope classes as nested members of the recovered class, which
+    // tripped the package/short boundary assert in CodeUnit::with_signature_and_fq
+    // (#2275). On disagreement, fall through to the suffix-reparse boundary
+    // below, which derives the close from the class node's own balanced body
+    // range.
+    let sibling_close = sibling_close.filter(|&(close_start, close_end, _)| {
+        let Some(tree) = cpp_reparse_region_items(source, reparse_start, close_end) else {
+            return false;
+        };
+        let template_node = cpp_sentinel_reparsed_leading_template(tree.root_node());
+        let Some(reparsed_class) =
+            cpp_sentinel_reparsed_class(tree.root_node(), template_node, source)
+        else {
+            return false;
+        };
+        let body = reparsed_class.body;
+        body.start_byte() == body_open_start && body.end_byte() == close_start + 1
+    });
     let (class_close_start, class_close_end, class_close_line) =
         if let Some((class_close_start, class_close_end, class_close_line)) = sibling_close {
             (class_close_start, class_close_end, class_close_line)
@@ -8531,7 +9779,7 @@ pub fn recovered_macro_return_type_node<'tree>(
 /// definition for dependent calls such as `OperandLayout::packed`. Walk the AST
 /// ancestors instead of interpreting source text so nested templates and
 /// parser-recovered regions retain their real lexical scopes.
-fn cpp_active_template_type_parameter(node: Node<'_>, name: &str, source: &str) -> bool {
+pub(crate) fn cpp_active_template_type_parameter(node: Node<'_>, name: &str, source: &str) -> bool {
     let mut ancestor = node.parent();
     while let Some(current) = ancestor {
         if current.kind() == "template_declaration"
@@ -8558,6 +9806,51 @@ fn cpp_active_template_type_parameter(node: Node<'_>, name: &str, source: &str) 
 /// `parse_rust_region_tree` technique.
 fn cpp_reparse_region_items(source: &str, start: usize, end: usize) -> Option<Tree> {
     parse_source_region(&tree_sitter_cpp::LANGUAGE.into(), source, start, end)
+}
+
+fn cpp_error_swallowed_function_declaration_range(node: Node<'_>) -> Option<(usize, usize)> {
+    if node.kind() != "function_declarator" || node.parent()?.kind() != "ERROR" {
+        return None;
+    }
+    let semicolon = node.next_sibling()?;
+    if semicolon.kind() != ";" || semicolon.is_missing() {
+        return None;
+    }
+    let row = node.start_position().row;
+    let mut start = node.start_byte();
+    let mut sibling = node.prev_sibling();
+    while let Some(previous) = sibling.filter(|previous| previous.start_position().row == row) {
+        if previous.kind() == ";" {
+            break;
+        }
+        start = previous.start_byte();
+        sibling = previous.prev_sibling();
+    }
+    (start < node.start_byte()).then_some((start, semicolon.end_byte()))
+}
+
+fn cpp_macro_swallowed_declaration_envelope(node: Node<'_>, source: &str) -> bool {
+    if !node.has_error() || !matches!(node.kind(), "ERROR" | "function_definition") {
+        return false;
+    }
+    if node.kind() == "function_definition" && node.child_by_field_name("type").is_some() {
+        return false;
+    }
+    let Some(declarator) = (if node.kind() == "function_definition" {
+        node.child_by_field_name("declarator")
+            .and_then(extract_function_declarator)
+    } else {
+        node.named_child(0)
+            .filter(|child| child.kind() == "function_declarator")
+    }) else {
+        return false;
+    };
+    let Some(name) = cpp_function_declarator_name_node(declarator) else {
+        return false;
+    };
+    declarator.start_byte() == node.start_byte()
+        && name.kind() == "identifier"
+        && cpp_export_macro_token(&normalize_cpp_whitespace(node_text(name, source)))
 }
 
 /// Reparse a fragmented class-body interior while preserving its original byte
@@ -9153,6 +10446,59 @@ fn cpp_reparsed_template_macro_prefix_parameter<'tree>(
         .then_some(parameter_name)
 }
 
+/// Recognize the alternate constraint-macro prefix where tree-sitter retains
+/// the complete qualified constraint as a fourth child instead of moving it
+/// into the following function. Keep the gate tied to a two-type template
+/// constraint that names the declared type parameter.
+fn cpp_reparsed_template_macro_constraint_prefix_parameter<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if node.kind() != "ERROR" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let named = node.named_children(&mut cursor).collect::<Vec<_>>();
+    let [parameter, macro_name, message, constraint] = named.as_slice() else {
+        return None;
+    };
+    let parameter_name = parameter.named_child(0)?;
+    let constraint_scope = constraint.child_by_field_name("scope")?;
+    let constraint_template = constraint.child_by_field_name("name")?;
+    let constraint_arguments = constraint_template.child_by_field_name("arguments")?;
+    let mut argument_cursor = constraint_arguments.walk();
+    let constraint_types = constraint_arguments
+        .named_children(&mut argument_cursor)
+        .collect::<Vec<_>>();
+    if parameter.kind() != "type_parameter_declaration"
+        || parameter_name.kind() != "type_identifier"
+        || macro_name.kind() != "type_identifier"
+        || !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(*macro_name, source)))
+        || message.kind() != "string_literal"
+        || constraint.kind() != "qualified_identifier"
+        || constraint_scope.kind() != "namespace_identifier"
+        || !matches!(
+            constraint_template.kind(),
+            "template_function" | "template_type"
+        )
+        || !matches!(constraint_types.as_slice(), [left, right]
+            if left.kind() == "type_descriptor" && right.kind() == "type_descriptor")
+        || constraint_arguments.has_error()
+    {
+        return None;
+    }
+    let parameter_text = node_text(parameter_name, source);
+    let mut stack = constraint_types;
+    while let Some(current) = stack.pop() {
+        if current.kind() == "type_identifier" && node_text(current, source) == parameter_text {
+            return Some(parameter_name);
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    None
+}
+
 fn cpp_reparsed_template_macro_companion_is_indexable(
     node: Node<'_>,
     parameter_name: Node<'_>,
@@ -9295,6 +10641,41 @@ fn cpp_reparsed_template_macro_constructor_companion_is_indexable(
     cpp_reparsed_template_macro_constructor_declarator(node, parameter_name, source).is_some()
 }
 
+fn cpp_reparsed_template_macro_function_companion_is_indexable(
+    node: Node<'_>,
+    parameter_name: Node<'_>,
+    source: &str,
+) -> bool {
+    if node.has_error() || cpp_reparsed_member_function_body(node).is_none() {
+        return false;
+    }
+    let Some(return_type) = node.child_by_field_name("type") else {
+        return false;
+    };
+    let Some(function_declarator) = node
+        .child_by_field_name("declarator")
+        .and_then(extract_function_declarator)
+    else {
+        return false;
+    };
+    if cpp_function_declarator_name_node(function_declarator).is_none()
+        || !cpp_reparsed_member_return_type_is_indexable(return_type, source)
+    {
+        return false;
+    }
+    let Some(parameters) = function_declarator.child_by_field_name("parameters") else {
+        return false;
+    };
+    let parameter_text = node_text(parameter_name, source);
+    parameters
+        .named_children(&mut parameters.walk())
+        .any(|parameter| {
+            parameter
+                .child_by_field_name("type")
+                .is_some_and(|parameter_type| node_text(parameter_type, source) == parameter_text)
+        })
+}
+
 fn cpp_reparsed_constraint_macro_error(node: Node<'_>, source: &str) -> bool {
     if node.kind() != "ERROR" {
         return false;
@@ -9342,16 +10723,27 @@ fn cpp_recovered_template_macro_constructor<'tree>(
 }
 
 fn cpp_reparsed_template_macro_prefix_is_indexable(node: Node<'_>, source: &str) -> bool {
-    let Some(parameter_name) = cpp_reparsed_template_macro_prefix_parameter(node, source) else {
+    if let Some(parameter_name) = cpp_reparsed_template_macro_prefix_parameter(node, source) {
+        return cpp_next_non_comment_named_sibling(node).is_some_and(|function| {
+            cpp_reparsed_template_macro_companion_is_indexable(function, parameter_name, source)
+                || cpp_reparsed_template_macro_constructor_companion_is_indexable(
+                    function,
+                    parameter_name,
+                    source,
+                )
+        });
+    }
+    let Some(parameter_name) =
+        cpp_reparsed_template_macro_constraint_prefix_parameter(node, source)
+    else {
         return false;
     };
     cpp_next_non_comment_named_sibling(node).is_some_and(|function| {
-        cpp_reparsed_template_macro_companion_is_indexable(function, parameter_name, source)
-            || cpp_reparsed_template_macro_constructor_companion_is_indexable(
-                function,
-                parameter_name,
-                source,
-            )
+        cpp_reparsed_template_macro_function_companion_is_indexable(
+            function,
+            parameter_name,
+            source,
+        )
     })
 }
 
@@ -9373,6 +10765,71 @@ fn cpp_reparsed_member_function_is_indexable(node: Node<'_>, source: &str) -> bo
         || cpp_recovered_template_macro_constructor(node, source).is_some()
 }
 
+/// Recognize the three top-level nodes produced when an unknown attribute
+/// macro separates an inline member's declarator from its body in a reparsed
+/// class interior: an errorful declaration with a missing semicolon, the macro
+/// call expression, and the complete compound body. Their adjacency and exact
+/// structured shapes prove one recoverable member envelope; arbitrary calls or
+/// blocks do not pass this gate.
+fn cpp_reparsed_macro_attribute_member_sequence(
+    children: &[Node<'_>],
+    index: usize,
+    source: &str,
+) -> bool {
+    let Some(prefix) = children.get(index).copied() else {
+        return false;
+    };
+    let declaration = if prefix.kind() == "labeled_statement" {
+        prefix
+            .named_child(prefix.named_child_count().saturating_sub(1))
+            .filter(|child| child.kind() == "declaration")
+    } else {
+        (prefix.kind() == "declaration").then_some(prefix)
+    };
+    let Some(declaration) = declaration else {
+        return false;
+    };
+    if !declaration.has_error()
+        || declaration
+            .child_by_field_name("declarator")
+            .and_then(extract_function_declarator)
+            .and_then(cpp_function_declarator_name_node)
+            .is_none()
+    {
+        return false;
+    }
+    let Some(attribute_statement) = children.get(index + 1).copied() else {
+        return false;
+    };
+    let Some(attribute_call) = (attribute_statement.kind() == "expression_statement")
+        .then(|| attribute_statement.named_child(0))
+        .flatten()
+        .filter(|child| child.kind() == "call_expression")
+    else {
+        return false;
+    };
+    let Some(attribute_name) = attribute_call
+        .child_by_field_name("function")
+        .filter(|function| function.kind() == "identifier")
+        .map(|function| normalize_cpp_whitespace(node_text(function, source)))
+    else {
+        return false;
+    };
+    if !cpp_export_macro_token(&attribute_name) {
+        return false;
+    }
+    let Some(body) = children.get(index + 2).copied() else {
+        return false;
+    };
+    body.kind() == "compound_statement"
+        && body.child(0).is_some_and(|open| open.kind() == "{")
+        && body
+            .child(body.child_count().saturating_sub(1))
+            .is_some_and(|close| close.kind() == "}" && !close.is_missing())
+        && declaration.end_byte() <= attribute_statement.start_byte()
+        && attribute_statement.end_byte() <= body.start_byte()
+}
+
 fn cpp_reparsed_members_are_indexable(root: Node<'_>, source: &str) -> bool {
     let mut cursor = root.walk();
     let children = root.named_children(&mut cursor).collect::<Vec<_>>();
@@ -9380,7 +10837,12 @@ fn cpp_reparsed_members_are_indexable(root: Node<'_>, source: &str) -> bool {
     let mut index = 0;
     while index < children.len() {
         let child = children[index];
-        if let Some((_, fragmented)) = fragmented_plain_class_body(child, source) {
+        if cpp_reparsed_macro_attribute_member_sequence(&children, index, source) {
+            saw_member = true;
+            index += 3;
+            continue;
+        }
+        if let Some((_, _, fragmented)) = fragmented_plain_class_body(child, source) {
             let Some(tree) = cpp_reparse_fragmented_class_body(
                 source,
                 fragmented.reparse_start,
@@ -9636,6 +11098,40 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
         let file = ProjectFile::new(std::env::temp_dir(), name);
         parse_cpp_file(&file, source, &tree)
+    }
+
+    #[test]
+    fn identifies_export_macro_class_base_displaced_into_declarator() {
+        let source = r#"#define PROJECT_API_
+namespace project {
+namespace internal {
+template <typename T>
+class Base {};
+}
+template <typename T>
+class Wrapper;
+template <>
+class PROJECT_API_ [[nodiscard]] Wrapper<int> : public internal::Base<int> {};
+}
+"#;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let start = source.find("internal::Base<int>").expect("base");
+        let mut base = tree
+            .root_node()
+            .descendant_for_byte_range(start, start + 8)
+            .expect("base syntax");
+        while base.kind() != "qualified_identifier" {
+            base = base.parent().expect("qualified base ancestor");
+        }
+        assert!(
+            is_recovered_exported_class_base_type_node(base, source),
+            "{}",
+            tree.root_node().to_sexp()
+        );
     }
 
     #[test]
@@ -10930,7 +12426,7 @@ struct Analyzer {
             .named_children(&mut root.walk())
             .find(|child| child.kind() == "ERROR")
             .expect("fragmented Analyzer prefix");
-        let (outer_name, outer_fragment) = fragmented_plain_class_body(outer, source)
+        let (_, outer_name, outer_fragment) = fragmented_plain_class_body(outer, source)
             .expect("structured Analyzer fragment boundary");
         assert_eq!(outer_name, "Analyzer");
         let outer_tree = cpp_reparse_fragmented_class_body(
@@ -10944,7 +12440,7 @@ struct Analyzer {
             .named_children(&mut outer_root.walk())
             .find(|child| child.kind() == "ERROR")
             .expect("fragmented Action prefix");
-        let (action_name, action_fragment) = fragmented_plain_class_body(action_prefix, source)
+        let (_, action_name, action_fragment) = fragmented_plain_class_body(action_prefix, source)
             .expect("structured Action fragment boundary");
         assert_eq!(action_name, "Action");
         let action_tree = cpp_reparse_fragmented_class_body(
@@ -11170,17 +12666,20 @@ int value(1) ABSL_ATTRIBUTE_LIFETIME_BOUND
     fn sentinel_scope_prefers_deeper_fragmented_class_over_outer_shadow() {
         let source = r#"namespace absl {
 ABSL_NAMESPACE_BEGIN namespace container_internal {
-template <class Policy>
-class raw_hash_set {
+
+class raw_hash_set : public Base {
  public:
-  T operator->() const { return &operator*(); }
-  template <bool do_destroy>
+  using value_type = int;
+
+  template <class U,
+            REQUIRES("U must be convertible to int", std::is_convertible<U, int>)>
+  void insert(U value) { (void)value; }
+
   struct InsertSlot {
     raw_hash_set& s;
-    int invoke();
   };
-  int tail;
 };
+
 }
 ABSL_NAMESPACE_END
 }"#;
@@ -11189,13 +12688,64 @@ ABSL_NAMESPACE_END
             .set_language(&tree_sitter_cpp::LANGUAGE.into())
             .unwrap();
         let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let outer_namespace = root
+            .named_children(&mut root.walk())
+            .find(|child| child.kind() == "namespace_definition")
+            .expect("outer absl namespace");
+        let declaration_list = outer_namespace
+            .child_by_field_name("body")
+            .expect("outer namespace body");
+        let sentinel_function = declaration_list
+            .named_children(&mut declaration_list.walk())
+            .find(|child| child.kind() == "function_definition")
+            .expect("malformed namespace sentinel function");
+        let sentinel = cpp_nested_namespace_sentinel(sentinel_function, source)
+            .expect("structured nested namespace sentinel");
+        let fragmented =
+            cpp_sentinel_fragmented_class_tail(sentinel.function, sentinel.body, source)
+                .expect("fragmented raw_hash_set class");
+        assert_eq!(fragmented.class_node.kind(), "ERROR");
+        assert_eq!(fragmented.name, "raw_hash_set");
+        assert_eq!(fragmented.raw_supertypes, Some(vec!["Base".to_string()]));
+
+        let outer_scope =
+            cpp_sentinel_recovered_namespace_components(sentinel.function, &[], source);
+        let mut outer_siblings = Vec::new();
+        push_cpp_sentinel_sibling_classes(
+            &mut outer_siblings,
+            declaration_list,
+            sentinel.function,
+            &outer_scope,
+            source,
+        );
+        let [outer_shadow] = outer_siblings.as_slice() else {
+            panic!("expected exactly one apparent outer sibling: {outer_siblings:#?}");
+        };
+        assert_eq!(outer_shadow.namespace_scope_components, vec!["absl"]);
+        assert_eq!(outer_shadow.scope_components, vec!["absl", "InsertSlot"]);
+
         let field = "    raw_hash_set& s;";
         let start = source.find(field).expect("InsertSlot field") + 4;
-        let node = tree
-            .root_node()
+        let node = root
             .descendant_for_byte_range(start, start + "raw_hash_set".len())
             .expect("raw_hash_set type node");
-        let recovered = cpp_sentinel_recovered_classes(tree.root_node(), source);
+        let recovered = cpp_sentinel_recovered_classes(root, source);
+        let [deep_class] = recovered.as_slice() else {
+            panic!("outer shadow must be removed in favor of one deep class: {recovered:#?}");
+        };
+        assert_eq!(
+            deep_class.namespace_scope_components,
+            vec!["absl", "container_internal"]
+        );
+        assert_eq!(
+            deep_class.scope_components,
+            vec!["absl", "container_internal", "raw_hash_set"]
+        );
+        assert!(
+            deep_class.class_range.start_byte <= outer_shadow.class_range.start_byte
+                && deep_class.class_range.end_byte >= outer_shadow.class_range.end_byte
+        );
 
         assert_eq!(
             cpp_sentinel_recovered_scope_for_node(node, source, &recovered),
@@ -11205,6 +12755,33 @@ ABSL_NAMESPACE_END
                 "raw_hash_set".to_string(),
                 "InsertSlot".to_string(),
             ])
+        );
+
+        let file = ProjectFile::new(std::env::temp_dir(), "raw-hash-set-sentinel.h");
+        let parsed = parse_cpp_file(&file, source, &tree);
+        let raw_hash_set = parsed
+            .declarations()
+            .iter()
+            .find(|unit| unit.is_class() && unit.short_name() == "raw_hash_set")
+            .expect("recovered raw_hash_set class");
+        assert_eq!(
+            raw_hash_set.fq_name(),
+            "absl::container_internal.raw_hash_set",
+            "the recovered declaration must publish under the deeper sentinel namespace"
+        );
+        assert_eq!(
+            parsed.raw_supertypes.get(raw_hash_set),
+            Some(&vec!["Base".to_string()]),
+            "the structured base clause on the fragmented ERROR prefix must survive publication"
+        );
+        assert!(
+            parsed.materialization_records.iter().any(|record| matches!(
+                record,
+                MaterializationRecord::RecoveredDeclaration { recovery, unit }
+                    if unit == raw_hash_set && *recovery == deep_class.class_range
+            )),
+            "the reconstructed class must publish recovered-declaration provenance: {:#?}",
+            parsed.materialization_records
         );
     }
 
@@ -11512,6 +13089,54 @@ typename broken<T>::value_type broken<T>::method() {
     }
 
     #[test]
+    fn callable_parameter_types_come_from_the_ast_parameter_list() {
+        let source = r#"
+template <typename T, ENABLE_BYTES(T)>
+Vec256<T> DupOdd(Vec256<T> value) { return value; }
+
+struct Visitor {
+  void fail(this auto const& self) {}
+};
+"#;
+        let parsed = parse_cpp_declarations(source, "structured-parameter-types.cpp");
+        let dup_odd = parsed
+            .declarations()
+            .iter()
+            .find(|unit| unit.is_function() && unit.fq_name() == "DupOdd")
+            .expect("DupOdd declaration");
+        assert_eq!(
+            dup_odd.signature(),
+            Some("<typename T, ENABLE_BYTES(T)>(Vec256<T>)")
+        );
+        assert_eq!(
+            parsed
+                .signature_metadata
+                .get(dup_odd)
+                .and_then(|metadata| metadata.first())
+                .and_then(SignatureMetadata::callable_parameter_types),
+            Some(["Vec256<T>".to_string()].as_slice())
+        );
+
+        let fail = parsed
+            .declarations()
+            .iter()
+            .find(|unit| unit.is_function() && unit.fq_name() == "Visitor.fail")
+            .expect("explicit-object member");
+        assert_eq!(fail.signature(), Some("(const this auto &)"));
+        let metadata = parsed
+            .signature_metadata
+            .get(fail)
+            .and_then(|metadata| metadata.first())
+            .expect("explicit-object signature metadata");
+        assert_eq!(metadata.callable_parameter_types(), Some([].as_slice()));
+        assert!(
+            metadata
+                .callable_arity()
+                .is_some_and(|arity| arity.accepts(0))
+        );
+    }
+
+    #[test]
     fn trailing_qualifiers_survive_parameter_list_whitespace() {
         // #1827: the trailing `const`/`noexcept`/ref-qualifier belongs to the
         // declarator's structure, so an out-of-line definition that spells its
@@ -11550,6 +13175,100 @@ bool Widget::ref_multiline(int settings,
         assert_eq!(
             vec!["(int, int) &&".to_string()],
             identity_signatures(&parsed, "Widget.ref_multiline")
+        );
+    }
+
+    #[test]
+    fn macro_fragmented_plain_class_keeps_following_member_signature() {
+        let source = r#"
+struct CString {};
+class CMessage {
+public:
+  CString GetParams(unsigned int index, unsigned int length = -1) const
+      ZNC_MSG_DEPRECATED("Use GetParamsColon() instead") {
+    return GetParamsColon(index, length);
+  }
+  CString GetParamsColon(unsigned int index, unsigned int length = -1) const;
+};
+CString CMessage::GetParamsColon(unsigned int index, unsigned int length) const {
+  return {};
+}
+"#;
+        let parsed = parse_cpp_declarations(source, "macro-fragmented-signature.cpp");
+        assert_eq!(
+            vec!["(unsigned int, unsigned int) const".to_string()],
+            identity_signatures(&parsed, "CMessage.GetParamsColon")
+        );
+    }
+
+    #[test]
+    fn namespaced_macro_fragment_keeps_prefix_members_and_following_classes() {
+        let source = r#"
+#pragma once
+#define DEMO_DEPRECATED(message)
+namespace demo {
+struct Base {
+    static int aligned(int value) { return value; }
+    int legacy(int value) const
+        DEMO_DEPRECATED("use replacement()") { return value; }
+    int replacement() const;
+    void run(int value);
+};
+struct OtherBase {
+    void run(int value);
+    static int aligned(int value) { return value; }
+};
+struct Derived : Base {};
+struct Override : Base {
+    void run(int value);
+    static int aligned(int value) { return value; }
+};
+struct RecoveredOverride : Base {
+    int legacy(int value) const
+        DEMO_DEPRECATED("use replacement()") { return value; }
+    void run(int value);
+};
+struct Hidden : Base {
+    void run(int first, int second);
+    static int aligned(int first, int second) { return first + second; }
+};
+struct Ambiguous : Base, OtherBase {};
+}
+struct Global {};
+"#;
+        let parsed = parse_cpp_declarations(source, "namespaced-macro-fragment.cpp");
+        let declarations = parsed.declarations();
+        let fq_names = declarations
+            .iter()
+            .map(|unit| unit.fq_name())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for expected in [
+            "demo.Base",
+            "demo.Base.aligned",
+            "demo.Base.legacy",
+            "demo.Base.replacement",
+            "demo.Base.run",
+            "demo.Derived",
+            "demo.OtherBase",
+            "demo.Override",
+            "demo.RecoveredOverride",
+            "demo.Hidden",
+            "demo.Ambiguous",
+            "Global",
+        ] {
+            assert!(
+                fq_names.contains(expected),
+                "missing {expected} from namespaced macro fragment: {declarations:#?}"
+            );
+        }
+        assert!(
+            !fq_names.contains("Derived"),
+            "following class escaped its namespace: {declarations:#?}"
+        );
+        assert!(
+            !fq_names.contains("demo.Global"),
+            "global class crossed the recovered namespace boundary: {declarations:#?}"
         );
     }
 

@@ -1725,7 +1725,7 @@ fn php_prepared_syntax_bounded(
         PHP_BOUNDED_AUXILIARY_MAX_SOURCE_BYTES,
         session.cancellation(),
     ) {
-        PreparedSyntaxLimitedOutcome::Available(prepared) => {
+        PreparedSyntaxLimitedOutcome::Available(_, prepared) => {
             session.observe_cancellation().then_some(prepared)
         }
         PreparedSyntaxLimitedOutcome::Exceeded(_) => {

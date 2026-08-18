@@ -189,13 +189,15 @@ fn resolve_js_ts_type(
     }
 
     let imports = compute_jsts_import_binder(source, tree);
-    let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
+    // The analyzer's shared resolver, so this route reuses its warm config and
+    // workspace-package memos instead of building cold ones per call.
+    let aliases = host.alias_resolver().as_ref();
 
     if let Some(type_node) = type_reference_node(node)
         && let Some(type_name) = type_reference_name(type_node, source)
     {
         return resolve_declared_type_name(
-            host, support, file, language, &imports, &aliases, type_name,
+            host, support, file, language, &imports, aliases, type_name,
         );
     }
 
@@ -206,7 +208,7 @@ fn resolve_js_ts_type(
             file,
             source,
             &imports,
-            &aliases,
+            aliases,
             type_node,
             TypeLookupTargetKind::ValueExpression,
         );
@@ -222,7 +224,7 @@ fn resolve_js_ts_type(
             file,
             language,
             &imports,
-            &aliases,
+            aliases,
             &callee_name,
             true,
         );
@@ -247,7 +249,7 @@ fn resolve_js_ts_type(
             source,
             tree.root_node(),
             &imports,
-            &aliases,
+            aliases,
             receiver,
             site.focus_start_byte,
         );
@@ -265,7 +267,7 @@ fn resolve_js_ts_type(
                 file,
                 source,
                 &imports,
-                &aliases,
+                aliases,
                 type_node,
                 TypeLookupTargetKind::ValueExpression,
             );
@@ -285,7 +287,7 @@ fn resolve_js_ts_type(
             file,
             source,
             &imports,
-            &aliases,
+            aliases,
             type_node,
             TypeLookupTargetKind::ValueExpression,
         );

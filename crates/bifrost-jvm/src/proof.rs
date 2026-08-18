@@ -26,12 +26,17 @@
 //! # Member surfaces
 //!
 //! [`brokk_bifrost_core::analyzer::model::SemanticDiagnosticDomain::MemberSurface`]
-//! has no JVM producer. The jar-backed index stores a type's name, package,
-//! kind, visibility and origin artifact and nothing else -- it discards the
-//! member tables it parses out of `.class` entries -- so no JVM surface can
-//! prove a *member* absent from a complete owner. All three collectors below
-//! therefore diagnose written type and term names only, and none constructs a
-//! `MemberSurface` domain. See this crate's `#1619` decision log entry.
+//! has no JVM producer. Both external surfaces now carry member declarations
+//! (#1900) -- the jar-backed index keeps the member tables it parses out of
+//! `.class` entries, and an activated pack publishes declaration facts -- but
+//! carrying a declaration is not the same as claiming completeness. A jar index
+//! is built from whatever artifacts were resolvable on disk and drops whatever
+//! its bounded read refused; a pack declares only what its producer emitted.
+//! Neither therefore lets a *member* be proved absent from a complete owner:
+//! both answer a written member name positively and stay silent otherwise. All
+//! three collectors below diagnose written type and term names only, and none
+//! constructs a `MemberSurface` domain. See this crate's `#1619` decision log
+//! entry.
 
 use brokk_bifrost_core::analyzer::Range;
 use brokk_bifrost_core::analyzer::model::{

@@ -921,6 +921,10 @@ impl IAnalyzer for CSharpAnalyzer {
         self.inner.invalidate_cached_file_identities();
     }
 
+    fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {
+        self.inner.working_tree_identity()
+    }
+
     /// Build the assembly-backed external declaration index off the request
     /// path.
     ///

@@ -99,6 +99,14 @@ pub fn scan_js_ts_target_usages(
         target.short_name(),
         owner_seed_allowed,
     );
+    if target.is_file_scope() {
+        // A namespace import binds the imported module object, not one named
+        // export. Give that object query a file-identity seed: namespace-edge
+        // matching uses the file and deliberately ignores the empty name,
+        // while named/default edges cannot match it. This also narrows the scan
+        // to actual importers instead of walking every candidate file (#2305).
+        seeds.insert((target.source().clone(), String::new()));
+    }
     if let Some(binding) = &exported_local_property {
         seeds.extend(
             binding

@@ -376,11 +376,13 @@ pub fn resolve_js_ts_import_paths(
 }
 
 /// Resolve a module specifier to project files. Relative specifiers (`"./foo"`) resolve
-/// against the importing file's directory; non-relative specifiers are matched against
-/// the importing file's governing `tsconfig.json`/`jsconfig.json` path aliases via
-/// `aliases` (when supplied). Bare package specifiers that match no alias are still
-/// ignored — `package.json` `exports`/`main` resolution remains out of scope. Shared with
-/// the JS/TS export-usage graph so both resolvers stay in lock-step.
+/// against the importing file's directory. A non-relative specifier is matched first
+/// against the importing file's governing `tsconfig.json`/`jsconfig.json` path aliases,
+/// then, when no alias resolves it, against the names the workspace's own npm packages
+/// declare in their `package.json` — so `@tanstack/react-query` inside the TanStack
+/// monorepo reaches `packages/react-query/src/index.ts`. A bare specifier that names no
+/// workspace package is an external dependency and still resolves to nothing. Shared
+/// with the JS/TS export-usage graph so both resolvers stay in lock-step.
 pub fn resolve_js_ts_module_specifier(
     source_file: &ProjectFile,
     module_specifier: &str,
@@ -389,12 +391,20 @@ pub fn resolve_js_ts_module_specifier(
 ) -> Vec<ProjectFile> {
     let exts = language.extensions();
     if !module_specifier.starts_with('.') {
-        // Non-relative: try tsconfig path aliases. Each candidate base is tried in TS
-        // precedence order; the first that resolves to a real file wins.
+        // Non-relative: try tsconfig path aliases, then workspace package names.
+        // Aliases keep precedence — a repository that spells an alias for a
+        // package name means the alias — and each candidate base is tried in
+        // order, so the first that resolves to a real file wins. A matching
+        // alias that resolves to nothing falls through to the package map, the
+        // way an unresolved `paths` entry falls through to node resolution.
         let Some(aliases) = aliases else {
             return Vec::new();
         };
-        for base in aliases.candidate_bases(source_file, module_specifier) {
+        let bases = aliases
+            .candidate_bases(source_file, module_specifier)
+            .into_iter()
+            .chain(aliases.workspace_package_bases(module_specifier));
+        for base in bases {
             let mut candidates = Vec::new();
             collect_candidate_paths(source_file.root(), &base, language, exts, &mut candidates);
             if !candidates.is_empty() {

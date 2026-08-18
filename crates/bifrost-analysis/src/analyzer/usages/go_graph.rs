@@ -30,8 +30,10 @@ pub(in crate::analyzer::usages) use brokk_bifrost_go::graph::reference::{
     go_selector_descriptor_with_scope, resolve_go_reference_with_namespaces,
 };
 use brokk_bifrost_go::graph::resolver::{
-    GoEdgeIndex, GoGraphSource, GoProjectGraph, TargetSpec, build_go_edge_index, build_go_graph,
+    GoEdgeIndex, GoGraphSource, GoProjectGraph, TargetSpec, build_go_edge_index,
+    build_go_graph_with_edge_index,
 };
+use std::sync::Arc;
 
 pub(crate) use brokk_bifrost_go::graph::go_implicit_entry_point;
 pub(crate) use brokk_bifrost_go::graph::resolver::{go_simple_type_name, go_type_name_parts};
@@ -162,16 +164,15 @@ impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
         // while retaining/scanning only the requested candidate trees. The
         // complete file inventory lets the Go crate discover that dependency
         // closure without parsing unrelated packages.
-        let resolution_files = analyzed_files_for_language(analyzer, Language::Go);
+        let edge_index = self.go.usage_edge_index();
         union_candidate_usages(overloads, max_usages, |target| {
             // The graph is seeded from the candidate's own file, so a target
             // group holding declarations in different packages (#1779) builds
             // one graph per candidate.
-            let graph = build_go_graph(
-                go_graph_source(self.go),
+            let graph = build_go_graph_with_edge_index(
+                Arc::clone(&edge_index),
                 candidate_files,
-                &resolution_files,
-                target.source(),
+                target,
                 scan_scope.cancellation(),
             );
             if scan_scope.is_cancelled() {

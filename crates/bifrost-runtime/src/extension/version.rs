@@ -106,7 +106,11 @@ pub fn negotiate_extension_api(
             supported: EXTENSION_API_VERSION.minor,
         });
     }
-    let supported = ["structural.query", "experimental.semantic.control_flow"];
+    let supported = [
+        "structural.query",
+        "experimental.semantic.control_flow",
+        "experimental.semantic.value_dependence",
+    ];
     let mut seen = std::collections::BTreeSet::new();
     for capability in &requested.required_capabilities {
         if !seen.insert(capability.clone()) {
@@ -132,6 +136,36 @@ mod tests {
     #[test]
     fn accepts_current_version() {
         assert!(negotiate_extension_api(&ExtensionCompatibility::default()).is_ok());
+    }
+    #[test]
+    fn accepts_every_served_capability() {
+        let required = [
+            "structural.query",
+            "experimental.semantic.control_flow",
+            "experimental.semantic.value_dependence",
+        ]
+        .map(|id| ExtensionCapabilityId::new(id).unwrap());
+        let request = ExtensionCompatibility {
+            required_capabilities: required.clone().into(),
+            ..Default::default()
+        };
+        let negotiated = negotiate_extension_api(&request).unwrap();
+        assert_eq!(negotiated.capabilities.as_ref(), required.as_slice());
+    }
+    #[test]
+    fn rejects_unknown_capability() {
+        let request = ExtensionCompatibility {
+            required_capabilities: Box::new([ExtensionCapabilityId::new(
+                "experimental.semantic.unknown",
+            )
+            .unwrap()]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            negotiate_extension_api(&request),
+            Err(ExtensionCompatibilityError::MissingCapability(id))
+                if id.as_str() == "experimental.semantic.unknown"
+        ));
     }
     #[test]
     fn rejects_unknown_major() {

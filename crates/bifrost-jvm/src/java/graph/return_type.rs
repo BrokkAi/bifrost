@@ -69,6 +69,25 @@ where
     )
 }
 
+/// The method declarations `owner` writes that a call of `name` with `arity`
+/// arguments can bind to.
+///
+/// One reading of "this type answers this call" serves both the return-type
+/// question and the hierarchy walk that decides which type answers it, so a
+/// level the walk skips can never be a level whose return type is then read.
+pub fn java_call_answering_units<C>(owner: &str, name: &str, arity: usize, ctx: &C) -> Vec<CodeUnit>
+where
+    C: JavaReturnTypeContext + ?Sized,
+{
+    ctx.java()
+        .usage_definitions()
+        .fqn(&format!("{owner}.{name}"))
+        .iter()
+        .filter(|unit| unit.is_function() && java_callable_arity(ctx.java(), unit).accepts(arity))
+        .cloned()
+        .collect()
+}
+
 pub fn method_return_type_for_owner_fqn<C>(
     owner: &str,
     name: &str,
@@ -78,15 +97,7 @@ pub fn method_return_type_for_owner_fqn<C>(
 where
     C: JavaReturnTypeContext + ?Sized,
 {
-    let fqn = format!("{owner}.{name}");
-    let units = ctx
-        .java()
-        .usage_definitions()
-        .fqn(&fqn)
-        .iter()
-        .filter(|unit| unit.is_function() && java_callable_arity(ctx.java(), unit).accepts(arity))
-        .cloned()
-        .collect::<Vec<_>>();
+    let units = java_call_answering_units(owner, name, arity, ctx);
     if units.is_empty() {
         return ReceiverAnalysisOutcome::Unknown;
     }
@@ -163,15 +174,7 @@ pub fn method_anonymous_return_type_for_owner_fqn<C>(
 where
     C: JavaReturnTypeContext + ?Sized,
 {
-    let fqn = format!("{owner}.{name}");
-    let units = ctx
-        .java()
-        .usage_definitions()
-        .fqn(&fqn)
-        .iter()
-        .filter(|unit| unit.is_function() && java_callable_arity(ctx.java(), unit).accepts(arity))
-        .cloned()
-        .collect::<Vec<_>>();
+    let units = java_call_answering_units(owner, name, arity, ctx);
     (!units.is_empty()).then(|| {
         merge_receiver_type_outcomes(
             units
@@ -416,10 +419,130 @@ pub fn java_lexical_type_from_node(
     let Some(declaration) = graph.index.enclosing_code_unit(file, &range) else {
         return LexicalTypeResolution::NotFound;
     };
+    match java_local_type_from_node(java, file, node, &declaration, &components) {
+        LexicalTypeResolution::NotFound => {}
+        resolution => return resolution,
+    }
     java_lexical_type_from_declaration(java, &declaration, &components)
 }
 
-fn java_lexical_type_from_declaration(
+fn java_local_type_from_node(
+    java: &dyn JavaSource,
+    file: &ProjectFile,
+    node: Node<'_>,
+    declaration: &CodeUnit,
+    components: &[String],
+) -> LexicalTypeResolution {
+    let Some(first_component) = components.first() else {
+        return LexicalTypeResolution::NotFound;
+    };
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+
+    let mut scope = Some(declaration.clone());
+    let mut visited = brokk_bifrost_core::hash::HashSet::default();
+    while let Some(owner) = scope {
+        if !visited.insert(owner.clone()) {
+            return LexicalTypeResolution::Blocked;
+        }
+        scope = java.parent_of(&owner);
+        if owner.is_module() {
+            break;
+        }
+        if owner.is_class() {
+            continue;
+        }
+
+        let candidates = java
+            .direct_children_in_file(&owner)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.is_class()
+                    && candidate.identifier() == first_component
+                    && candidate.source() == file
+                    && java_local_type_visible_at(java, candidate, root, node.start_byte())
+            })
+            .collect::<Vec<_>>();
+        let mut candidates = candidates.into_iter();
+        let Some(mut binding) = candidates.next() else {
+            continue;
+        };
+        if candidates.next().is_some() {
+            return LexicalTypeResolution::Blocked;
+        }
+
+        for component in &components[1..] {
+            let nested = java
+                .direct_children_in_file(&binding)
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.is_class()
+                        && candidate.identifier() == component
+                        && candidate.source() == file
+                })
+                .collect::<Vec<_>>();
+            let mut nested = nested.into_iter();
+            let Some(next) = nested.next() else {
+                return LexicalTypeResolution::Blocked;
+            };
+            if nested.next().is_some() {
+                return LexicalTypeResolution::Blocked;
+            }
+            binding = next;
+        }
+        return LexicalTypeResolution::Resolved(binding);
+    }
+    LexicalTypeResolution::NotFound
+}
+
+fn java_local_type_visible_at(
+    java: &dyn JavaSource,
+    candidate: &CodeUnit,
+    root: Node<'_>,
+    byte: usize,
+) -> bool {
+    java.ranges(candidate).into_iter().any(|range| {
+        if range.start_byte >= byte {
+            return false;
+        }
+        let Some(declaration) = root.descendant_for_byte_range(range.start_byte, range.end_byte)
+        else {
+            return false;
+        };
+        java_local_type_scope_contains(declaration, byte)
+    })
+}
+
+pub fn java_local_type_scope_contains(mut declaration: Node<'_>, byte: usize) -> bool {
+    loop {
+        if is_java_local_type_scope_node(declaration.kind()) {
+            return declaration.start_byte() <= byte && byte < declaration.end_byte();
+        }
+        let Some(parent) = declaration.parent() else {
+            return false;
+        };
+        declaration = parent;
+    }
+}
+
+pub fn is_java_local_type_scope_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration"
+            | "block"
+            | "lambda_expression"
+            | "catch_clause"
+            | "enhanced_for_statement"
+            | "for_statement"
+            | "try_with_resources_statement"
+    )
+}
+
+pub fn java_lexical_type_from_declaration(
     java: &dyn JavaSource,
     declaration: &CodeUnit,
     components: &[String],

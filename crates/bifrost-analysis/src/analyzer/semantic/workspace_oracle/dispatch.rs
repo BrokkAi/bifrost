@@ -4,6 +4,7 @@
 //! reach into the usage-graph dispatch resolver directly.
 
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -23,7 +24,7 @@ use crate::analyzer::semantic::{
     StableDigest, UnmaterializedExternalTarget, WorkspaceMountId, WorkspaceRelativePath,
     split_qualified_member, unmaterialized_external_mount, unmaterialized_external_path,
 };
-use crate::analyzer::structural::resolution::BoundaryStatus;
+use crate::analyzer::structural::resolution::{BoundaryStatus, MethodFamilyRelation};
 use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
 use crate::analyzer::usages::{
     CallDispatchBoundaryKind, CallDispatchTarget, CallRelationLimits, CallRelationService,
@@ -32,7 +33,7 @@ use crate::analyzer::usages::{
 use crate::analyzer::{
     CodeUnit, CodeUnitType, IAnalyzer, LanguageDialect, ProjectFile, Range, WorkspaceAnalyzer,
 };
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 
 /// Source-scoped callable identity used only while resolving dispatch. The
 /// location-first resolver may return both a C/C++ declaration and a related
@@ -263,8 +264,17 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
             .iter()
             .map(|boundary| low_level_boundary(boundary, call_language, Some(semantic_call)))
             .collect::<Vec<_>>();
-        let mut target_groups =
-            dispatch_target_groups(self.workspace.analyzer(), lookup.targets).into_iter();
+        let mut target_groups = VecDeque::from(dispatch_target_groups(
+            self.workspace.analyzer(),
+            lookup.targets,
+        ));
+        // Every declaration this call has already queued, so a class-hierarchy
+        // expansion (below) can never queue the same implementor twice and two
+        // interfaces that declare the same member cannot loop.
+        let mut queued_declarations = target_groups
+            .iter()
+            .map(|group| group.representative.clone())
+            .collect::<HashSet<CodeUnit>>();
         let mut candidate_indexes = HashMap::<ProcedureHandle, usize>::default();
         let mut final_candidates_truncated = false;
         let mut cancelled_targets_truncated = false;
@@ -283,13 +293,13 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
             HashMap::default();
         let mut staged_request = request.staged(&mut staged_budget);
 
-        while let Some(group) = target_groups.next() {
+        while let Some(group) = target_groups.pop_front() {
             if request.cancellation.is_cancelled() {
                 cancelled_targets_truncated |= append_cancelled_target_boundaries(
                     self.workspace.analyzer(),
                     &candidates,
                     &mut boundaries,
-                    std::iter::once(group).chain(target_groups.by_ref()),
+                    std::iter::once(group).chain(target_groups.drain(..)),
                     self.limits,
                     call_dispatch_gap,
                     procedure_call_gap,
@@ -302,7 +312,7 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                     self.workspace.analyzer(),
                     &candidates,
                     &mut boundaries,
-                    std::iter::once(group).chain(target_groups.by_ref()),
+                    std::iter::once(group).chain(target_groups.drain(..)),
                     self.limits,
                     call_dispatch_gap,
                     procedure_call_gap,
@@ -319,6 +329,11 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                 UsageProof::Unproven => DispatchQuality::Unproven,
             };
             let mut failure_quality = DispatchQuality::Complete;
+            // Whether the declaration's own file was materialized completely.
+            // Only then does "no procedure matched this declaration" mean "this
+            // declaration has no body", which is the condition the
+            // class-hierarchy expansion below is scoped to.
+            let mut complete_materialization = false;
             let definition = group.representative.clone();
             let outcome = if let Some(outcome) = materialized_files.get(definition.source()) {
                 outcome.clone()
@@ -346,6 +361,7 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                     );
                     matched_any |= has_match;
                     final_candidates_truncated |= truncated;
+                    complete_materialization = true;
                 }
                 SemanticOutcome::Ambiguous {
                     candidates: value, ..
@@ -497,6 +513,48 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
             if matched_any {
                 materialization_quality =
                     merge_dispatch_quality(materialization_quality, matched_quality);
+                // The declaration's file materialized completely and did
+                // publish a body for it: this callee is a concrete method. A
+                // subclass may still override it, in which case the code that
+                // runs at this call site is the override rather than the body
+                // just retained. Offering those overrides is the second, wider
+                // class-hierarchy lever (#2277): unlike the body-less case in
+                // the other arm of this branch, there is already something
+                // analyzable here, so this strictly widens the candidate set
+                // and is off unless a host asked for it.
+                //
+                // The retained concrete candidate keeps its own proof. The
+                // overrides enter as `Unproven`, exactly like the implementors
+                // of a body-less declaration, so the answer says "the callee
+                // the types name runs, and these overrides could run instead"
+                // and never claims a proven edge to an override.
+                if complete_materialization && self.hierarchy_expansion().concrete_overrides {
+                    if staged_request.charge_execution_traversal(1) {
+                        if let Some(overrides) = virtual_dispatch_implementor_targets(
+                            self.workspace.analyzer(),
+                            &group.representative,
+                            request.cancellation,
+                        ) {
+                            for overriding in overrides {
+                                if queued_declarations.insert(overriding.clone()) {
+                                    target_groups.push_back(DispatchTargetGroup {
+                                        representative: overriding,
+                                        proof: UsageProof::Unproven,
+                                    });
+                                }
+                            }
+                        }
+                    } else {
+                        // The expansion could not be charged, so the target set
+                        // is knowingly short of the overrides that could run.
+                        // Say so instead of answering as if the hierarchy had
+                        // been consulted.
+                        materialization_quality = merge_dispatch_quality(
+                            materialization_quality,
+                            DispatchQuality::Truncated,
+                        );
+                    }
+                }
             } else if interruption.is_none() {
                 let target =
                     locator_for_definition(self.workspace.analyzer(), &group.representative)?;
@@ -525,6 +583,41 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                 };
                 materialization_quality =
                     merge_dispatch_quality(materialization_quality, missing_quality);
+                // The declaration's own file was analyzed completely and still
+                // published no body for it, so this callee is an interface or
+                // abstract member and the code that runs is in the workspace
+                // types below it (#2205). Queue those implementors as further
+                // dispatch targets. They stay `Unproven`, and the boundary
+                // pushed just above stays with them, so the answer says "the
+                // named callee has no body, and these are the members that
+                // could run" rather than claiming a resolved edge.
+                if complete_materialization {
+                    if staged_request.charge_execution_traversal(1) {
+                        if let Some(implementors) = virtual_dispatch_implementor_targets(
+                            self.workspace.analyzer(),
+                            &group.representative,
+                            request.cancellation,
+                        ) {
+                            for implementor in implementors {
+                                if queued_declarations.insert(implementor.clone()) {
+                                    target_groups.push_back(DispatchTargetGroup {
+                                        representative: implementor,
+                                        proof: UsageProof::Unproven,
+                                    });
+                                }
+                            }
+                        }
+                    } else {
+                        // The expansion this body-less callee needs could not be
+                        // charged, so the target set is knowingly short of the
+                        // members that could run. Say so instead of answering as
+                        // if the hierarchy had been consulted.
+                        materialization_quality = merge_dispatch_quality(
+                            materialization_quality,
+                            DispatchQuality::Truncated,
+                        );
+                    }
+                }
             }
 
             if let Some(interruption) = interruption {
@@ -534,7 +627,7 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                         self.workspace.analyzer(),
                         &candidates,
                         &mut boundaries,
-                        current.into_iter().chain(target_groups.by_ref()),
+                        current.into_iter().chain(target_groups.drain(..)),
                         self.limits,
                         call_dispatch_gap,
                         procedure_call_gap,
@@ -718,6 +811,119 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
         };
         dispatch_outcome(result, quality, reported_work)
     }
+}
+
+/// The workspace members that implement or override a body-less callee
+/// declaration: class-hierarchy analysis for virtual dispatch (#2205).
+///
+/// A call written against an interface, or against an abstract method, names a
+/// declaration that has no body. Dispatch resolves the call to that declaration,
+/// materializes its file, finds no procedure, and stops. The value-flow snapshot
+/// of the enclosing procedure is then reported unknown and require-model taint
+/// abstains -- even though the code that actually runs is in the same workspace,
+/// in the classes below the declared type. This function supplies those classes'
+/// members so the flow can continue through one of them.
+///
+/// Three properties make this honest rather than a guess.
+///
+/// It is *scoped*. The caller only asks after the declaration's own file
+/// materialized completely, so "no member family" is a fact about the hierarchy
+/// rather than about how far materialization got. Two callers ask, and they are
+/// scoped differently.
+///
+/// The first is the body-less case: the file published no procedure for the
+/// declaration, which is exactly the interface-method and abstract-method case
+/// (#2205). Without expansion there is no code to analyze at all, so this
+/// caller always asks.
+///
+/// The second is the concrete case: the file did publish a body, and the
+/// question is whether a subclass override could run instead (#2277). That
+/// strictly widens a candidate set which already names analyzable code, so this
+/// caller asks only when the workspace's
+/// [`crate::analyzer::DispatchHierarchyExpansion::concrete_overrides`] is on.
+///
+/// A `native` method is excluded from both: its body is outside every source
+/// this workspace can read, which is a boundary fact rather than a hierarchy
+/// question, and the declaration records it.
+///
+/// It is *exact*. The edges come from the member-family capability
+/// ([`crate::analyzer::usages::MemberFamilyProvider`], #1477), which derives
+/// `implemented_by` and `overridden_by` by bounded inversion over the same
+/// forward `implements`/`overrides` relation an analyzer proves from a
+/// declaration and its owner's hierarchy. Nothing is matched by fully-qualified
+/// name or by rendered signature text. An answer that is not `proven` yields no
+/// targets at all, so an inheritance cycle, an unrecorded modifier, or an
+/// unresolved overload set leaves the call exactly as unresolved as it was.
+///
+/// It is *bounded*. The family walk carries its own shared visit budget and the
+/// caller's cancellation token, and the caller charges the expansion against the
+/// request's traversal allowance before asking.
+///
+/// The result is a set of *candidates*, never proven edges. The caller queues
+/// them with [`UsageProof::Unproven`] and keeps the unmaterialized boundary for
+/// the declaration itself, so an implementor the analyzer cannot materialize
+/// still surfaces as its own honest diagnostic beside any flow that completes
+/// through a sibling implementor.
+///
+/// `None` means the question does not apply to this declaration or the language
+/// states no member family; it is not an empty answer about the hierarchy.
+///
+/// Set `BIFROST_DEBUG_CHA=1` to print one line per expansion, which is how the
+/// resolution was measured at corpus scale.
+fn virtual_dispatch_implementor_targets(
+    analyzer: &dyn IAnalyzer,
+    declaration: &CodeUnit,
+    cancellation: &CancellationToken,
+) -> Option<Vec<CodeUnit>> {
+    if !declaration.is_function() {
+        return None;
+    }
+    let metadata = analyzer.signature_metadata(declaration);
+    if metadata
+        .iter()
+        .any(|entry| entry.callable_modifiers_recorded() && entry.callable_is_native())
+    {
+        return None;
+    }
+    let provider = analyzer.member_family_provider()?;
+    let answer = provider.member_family(declaration, Some(cancellation));
+    // An unproven family answers nothing about the hierarchy, so it contributes
+    // no target: the call stays exactly as unresolved as it already was.
+    let targets = if answer.is_proven() {
+        answer
+            .edges
+            .iter()
+            .filter(|edge| {
+                matches!(
+                    edge.relation,
+                    MethodFamilyRelation::ImplementedBy | MethodFamilyRelation::OverriddenBy
+                )
+            })
+            .map(|edge| edge.target.clone())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if debug_cha_enabled() {
+        eprintln!(
+            "virtual_dispatch_implementor_targets {} proven={} outcome={:?} reason={:?} implemented_by={}",
+            declaration.fq_name(),
+            answer.is_proven(),
+            answer.outcome,
+            answer.reason,
+            targets.len()
+        );
+    }
+    Some(targets)
+}
+
+/// Whether `BIFROST_DEBUG_CHA` asks for the class-hierarchy dispatch trace.
+/// Read once: the trace is a development aid, and re-reading the environment on
+/// every call site of a corpus run would dominate the measurement it exists to
+/// take.
+fn debug_cha_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BIFROST_DEBUG_CHA").is_some())
 }
 
 fn closed_dispatch_discharges_gap(candidates: &[DispatchCandidate], gap: &SemanticGap) -> bool {
@@ -2495,6 +2701,138 @@ mod tests {
         oracle
             .resolve_call(call, &mut SemanticRequest::new(&mut budget, &cancellation))
             .expect("external dispatch should run")
+    }
+
+    /// A concrete base method, one subclass that overrides it, and a call
+    /// written against the base type. Each member lives in its own file so a
+    /// retained candidate can be named by the file it came from.
+    const CONCRETE_OVERRIDE_FILES: [(&str, &str); 3] = [
+        (
+            "overrides/BaseHandler.java",
+            "package overrides;\n\npublic class BaseHandler {\n    public String handle(String input) {\n        return \"constant\";\n    }\n}\n",
+        ),
+        (
+            "overrides/PassthroughHandler.java",
+            "package overrides;\n\npublic class PassthroughHandler extends BaseHandler {\n    @Override\n    public String handle(String input) {\n        return input;\n    }\n}\n",
+        ),
+        (
+            "overrides/Caller.java",
+            "package overrides;\n\npublic class Caller {\n    public String run(BaseHandler handler, String param) {\n        return handler.handle(param);\n    }\n}\n",
+        ),
+    ];
+
+    /// Resolve the single call in `overrides/Caller.java` with an explicitly
+    /// stated class-hierarchy expansion, and report the workspace-relative file
+    /// each retained candidate came from together with its proof status.
+    ///
+    /// The expansion is passed in rather than read from the environment because
+    /// both settings have to be exercised in one test binary, and the
+    /// `BIFROST_CHA_CONCRETE_OVERRIDES` variable is read once per process.
+    fn concrete_override_dispatch_candidates(
+        expansion: crate::analyzer::DispatchHierarchyExpansion,
+    ) -> Vec<(String, ProofStatus)> {
+        let fixture = AnalyzerFixture::new_for_language(Language::Java, &CONCRETE_OVERRIDE_FILES);
+        let file = ProjectFile::new(fixture.project_root(), "overrides/Caller.java");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("Java semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("Java semantic artifact");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| !procedure.call_sites().is_empty())
+            .expect("the calling procedure");
+        let call = artifact
+            .procedure_handle(procedure.id())
+            .and_then(|procedure| {
+                procedure.call_site_handle(procedure.semantics().call_sites()[0].id)
+            })
+            .expect("scoped call handle");
+        let oracle = WorkspaceSemanticOracle::with_limits_and_expansion(
+            &fixture.analyzer,
+            OracleLimits::default(),
+            expansion,
+        );
+        let outcome = oracle
+            .resolve_call(&call, &mut SemanticRequest::new(&mut budget, &cancellation))
+            .expect("concrete override dispatch should run");
+        let result = outcome
+            .available_value()
+            .expect("dispatch retained a result");
+        let mut named = result
+            .candidates()
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate
+                        .target()
+                        .semantics()
+                        .locator()
+                        .path()
+                        .as_str()
+                        .to_owned(),
+                    candidate.proof().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        named.sort_by(|left, right| left.0.cmp(&right.0));
+        named
+    }
+
+    /// #2277, off: the call resolves to the concrete base method and stops
+    /// there. The override is real code that could run, and dispatch does not
+    /// offer it, which is exactly the behavior the opt-in exists to change.
+    #[test]
+    fn a_concrete_call_retains_only_its_static_target_by_default() {
+        let candidates =
+            concrete_override_dispatch_candidates(crate::analyzer::DispatchHierarchyExpansion::OFF);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["overrides/BaseHandler.java"],
+            "the default must retain the static target and nothing else: {candidates:?}"
+        );
+    }
+
+    /// #2277, on: the override joins the candidate set, and it joins it as an
+    /// unproven candidate while the static target keeps its own proof. This is
+    /// the honesty contract stated as a fact about the retained set rather than
+    /// as a consequence downstream.
+    #[test]
+    fn an_enabled_concrete_override_joins_the_set_as_an_unproven_candidate() {
+        let candidates = concrete_override_dispatch_candidates(
+            crate::analyzer::DispatchHierarchyExpansion::CONCRETE_OVERRIDES,
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "overrides/BaseHandler.java",
+                "overrides/PassthroughHandler.java",
+            ],
+            "the enabled expansion must add the override: {candidates:?}"
+        );
+        assert_eq!(
+            candidates[0].1,
+            ProofStatus::Proven,
+            "the statically resolved concrete target keeps its own proof: {candidates:?}"
+        );
+        assert!(
+            matches!(candidates[1].1, ProofStatus::Unproven(_)),
+            "an expanded override is a candidate, never a proven edge: {candidates:?}"
+        );
     }
 
     /// #1599: a boundary outcome is only as complete as its refined external

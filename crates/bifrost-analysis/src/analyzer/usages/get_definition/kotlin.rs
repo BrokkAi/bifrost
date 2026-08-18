@@ -1657,11 +1657,42 @@ fn kotlin_bare_value_outcome(
             "ambiguous_kotlin_type",
             format!("`{name}` is bound to different owners by more than one Kotlin star import"),
         ),
-        KotlinTypeName::Unresolved => no_definition(
-            "no_indexed_definition",
-            format!("`{name}` is not indexed as a Kotlin definition"),
-        ),
+        KotlinTypeName::Unresolved => {
+            let unresolved = format!("`{name}` is not indexed as a Kotlin definition");
+            // The receiver-position caret: `Collections` in `Collections.sort`
+            // is a bare name here, and the member it qualifies is what decides
+            // whether the pair left the workspace (#2287). A name in any other
+            // position has no member to ask about and keeps its plain miss.
+            match kotlin_qualified_member_of_receiver(ctx, node) {
+                Some(member) => kotlin_unresolved_receiver_outcome(
+                    ctx,
+                    node,
+                    member,
+                    "no_indexed_definition",
+                    unresolved,
+                ),
+                None => no_definition("no_indexed_definition", unresolved),
+            }
+        }
     }
+}
+
+/// The member `node` qualifies, when `node` is the receiver of a Kotlin
+/// navigation expression: `sort` for the `Collections` of `Collections.sort`.
+///
+/// Only the receiver answers. The member itself sits inside the
+/// `navigation_suffix` and is routed by [`kotlin_member_outcome`] instead, and
+/// a name that qualifies nothing has no member spelling at all.
+fn kotlin_qualified_member_of_receiver<'a>(ctx: &KotlinCtx<'a>, node: Node<'_>) -> Option<&'a str> {
+    let navigation = node
+        .parent()
+        .filter(|parent| parent.kind() == "navigation_expression")?;
+    let children = named_children(navigation);
+    let (suffix, rest) = children.split_last()?;
+    if rest.first()?.id() != node.id() || suffix.kind() != "navigation_suffix" {
+        return None;
+    }
+    Some(ctx.text(first_named_child_of_kind(*suffix, "simple_identifier")?))
 }
 
 /// Resolve the label of a named argument to the callable that declares a
@@ -1841,13 +1872,118 @@ fn kotlin_member_outcome(
             ),
         );
     }
-    no_definition(
+    kotlin_unresolved_receiver_outcome(
+        ctx,
+        receiver_node,
+        member,
         "receiver_type_unknown",
         format!(
             "the receiver of `{member}` is a Kotlin `{}` expression whose type is not proven",
             receiver_node.kind()
         ),
     )
+}
+
+/// What a Kotlin member access reports when its receiver is not a type this
+/// workspace indexes (#2287).
+///
+/// A receiver whose written spelling resolves to an *external* type, on which
+/// the shared JVM external declaration surface declares `member`, is a
+/// reference the workspace cannot index rather than one nothing declares. That
+/// is the import boundary the resolver actually crossed, and reporting it is
+/// what lets the trace name the external declaration the reference landed on.
+/// This is the same seam `java_unresolved_receiver_outcome` uses, through the
+/// same [`gated_boundary`] and the same member surface; only the owner ladder
+/// is Kotlin's, so an aliased import reaches the declaration its alias names.
+///
+/// Anything else keeps the plain unresolved-receiver miss, so a receiver of
+/// unknown type and a member no surface declares are both unchanged.
+fn kotlin_unresolved_receiver_outcome(
+    ctx: &KotlinCtx<'_>,
+    receiver: Node<'_>,
+    member: &str,
+    unresolved_kind: &str,
+    unresolved_message: String,
+) -> DefinitionLookupOutcome {
+    let Some(spelling) = kotlin_external_member_spelling(ctx, receiver, member) else {
+        return no_definition(unresolved_kind, unresolved_message);
+    };
+    let declared = resolve_analyzer::<KotlinAnalyzer>(ctx.analyzer).and_then(|kotlin| {
+        ctx.session.query_optional(|| {
+            kotlin.resolve_member_name_with_external(ctx.overlay.clone(), ctx.file, &spelling)
+        })
+    });
+    // gated upstream is *not* claimed here: the closure below is the workspace
+    // check itself. The surface reads only jar-indexed and pack-declared
+    // owners, never a workspace declaration, so a name it answers is by
+    // construction outside this workspace.
+    gated_boundary(
+        || declared.is_none(),
+        format!(
+            "`{spelling}` appears to cross a Kotlin import boundary not indexed in this workspace"
+        ),
+        unresolved_kind,
+        unresolved_message,
+    )
+}
+
+/// The written `Owner.member` name a Kotlin member access spells, when the
+/// receiver is a name and nothing else.
+///
+/// Only a *name path* may be re-read as a type spelling. A receiver that is a
+/// call, a literal, `this`, or any other value expression names no type, and a
+/// bare name a local `val`, `var`, or parameter binds is a value even when it
+/// happens to share a short name with a dependency type -- so both answer
+/// nothing here and leave the reference exactly as unresolved as it was.
+fn kotlin_external_member_spelling(
+    ctx: &KotlinCtx<'_>,
+    receiver: Node<'_>,
+    member: &str,
+) -> Option<String> {
+    if member.is_empty() {
+        return None;
+    }
+    let (head, path) = kotlin_receiver_name_path(ctx, receiver)?;
+    if kotlin_local_binding(head, ctx.source, ctx.text(head)).is_some() {
+        return None;
+    }
+    Some(format!("{path}.{member}"))
+}
+
+/// The dotted name a Kotlin receiver expression spells, and the identifier its
+/// first segment is: `Collections`, `C` for an aliased import, or
+/// `java.util.Collections` for a written qualified name.
+///
+/// The walk is iterative and capped at [`MAX_RECEIVER_DEPTH`] segments for the
+/// same reason [`kotlin_receiver`] is capped: a pathological chain must not
+/// turn one request into an unbounded traversal.
+fn kotlin_receiver_name_path<'tree>(
+    ctx: &KotlinCtx<'_>,
+    receiver: Node<'tree>,
+) -> Option<(Node<'tree>, String)> {
+    let mut segments: Vec<&str> = Vec::new();
+    let mut current = receiver;
+    for _ in 0..=MAX_RECEIVER_DEPTH {
+        match current.kind() {
+            "simple_identifier" => {
+                segments.push(ctx.text(current));
+                segments.reverse();
+                return Some((current, segments.join(".")));
+            }
+            "navigation_expression" => {
+                let children = named_children(current);
+                let (suffix, rest) = children.split_last()?;
+                let next = *rest.first()?;
+                if suffix.kind() != "navigation_suffix" {
+                    return None;
+                }
+                segments.push(ctx.text(first_named_child_of_kind(*suffix, "simple_identifier")?));
+                current = next;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn nominal_type_name(reference: &TypeRef) -> Option<&str> {

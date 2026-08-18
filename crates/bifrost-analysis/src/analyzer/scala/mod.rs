@@ -496,45 +496,17 @@ impl ScalaAnalyzer {
         file: &ProjectFile,
         name: &str,
     ) -> (BoundaryStatus, Option<String>) {
-        let external = self.external_declarations(packs);
+        let external = self.external_declarations(packs.clone());
         let package_name = self.inner.package_name_of(file).unwrap_or_default();
-        let indexed = |ty: crate::analyzer::jvm::external::JvmExternalType| {
-            (BoundaryStatus::ExternalIndexed, Some(ty.fqn().to_owned()))
-        };
-        let external_type = |spelling: &str| {
-            if spelling.contains('.')
-                && let Some(ty) = external.resolve_qualified_name(spelling, &package_name)
-            {
-                return Some(ty);
-            }
-            if let Some(ty) = external.resolve_java_lang(spelling) {
-                return Some(ty);
-            }
-            for import in self.inner.import_info_of(file) {
-                let Some(path) = scala_import_path(&import) else {
-                    continue;
-                };
-                if import.is_wildcard {
-                    if let Some(ty) =
-                        external.resolve_wildcard_import(&path, spelling, &package_name)
-                    {
-                        return Some(ty);
-                    }
-                } else if import.local_name() == Some(spelling)
-                    && let Some(ty) = external.resolve_explicit_import(&path, &package_name)
-                {
-                    return Some(ty);
-                }
-            }
-            external.resolve_same_package(&package_name, spelling)
-        };
-        if let Some(ty) = external_type(name) {
-            return indexed(ty);
+        if let Some(ty) = self.external_type_spelling(&external, file, &package_name, name) {
+            return (BoundaryStatus::ExternalIndexed, Some(ty.fqn().to_owned()));
         }
         // A member spelling leaves the workspace exactly as its owner type
         // does, so the member tier runs where the type tier found nothing
         // (#1900). A member the surface does not declare changes nothing.
-        if let Some(member) = external.resolve_member_spelling(name, &package_name, external_type) {
+        // One ladder answers here and in the resolver's own boundary gate, so
+        // a trace and a definition cannot disagree about a spelling (#2287).
+        if let Some(member) = self.resolve_member_name_with_external(packs, file, name) {
             return (
                 BoundaryStatus::ExternalIndexed,
                 Some(member.fqn().to_owned()),
@@ -548,6 +520,81 @@ impl ScalaAnalyzer {
             return (BoundaryStatus::ExternalDeclaredUnindexed, None);
         }
         (BoundaryStatus::ExternalUnknown, None)
+    }
+
+    /// The external type a written Scala type spelling names, read through the
+    /// external tiers of [`ScalaSource::simple_type_proof`]: a written
+    /// qualified name, `java.lang`, the file's explicit and wildcard imports,
+    /// and the file's own package, in that order.
+    ///
+    /// Kept as one function because both the trace's boundary evidence and the
+    /// resolver's own member gate must reach a type spelling the same way; two
+    /// copies of this ladder would let a trace and a definition disagree.
+    fn external_type_spelling(
+        &self,
+        external: &JvmExternalDeclarations<'_>,
+        file: &ProjectFile,
+        package_name: &str,
+        spelling: &str,
+    ) -> Option<crate::analyzer::jvm::external::JvmExternalType> {
+        if spelling.contains('.')
+            && let Some(ty) = external.resolve_qualified_name(spelling, package_name)
+        {
+            return Some(ty);
+        }
+        if let Some(ty) = external.resolve_java_lang(spelling) {
+            return Some(ty);
+        }
+        for import in self.inner.import_info_of(file) {
+            let Some(path) = scala_import_path(&import) else {
+                continue;
+            };
+            if import.is_wildcard {
+                if let Some(ty) = external.resolve_wildcard_import(&path, spelling, package_name) {
+                    return Some(ty);
+                }
+            } else if import.local_name() == Some(spelling)
+                && let Some(ty) = external.resolve_explicit_import(&path, package_name)
+            {
+                return Some(ty);
+            }
+        }
+        external.resolve_same_package(package_name, spelling)
+    }
+
+    /// Resolve `raw_name` in `file` as a member spelling -- a written
+    /// `Owner.member` whose head is a type Scala's import ladder reaches
+    /// outside the workspace and whose last segment is a member the external
+    /// declaration surface declares (#1900).
+    ///
+    /// This is the Scala counterpart of
+    /// `JavaAnalyzer::resolve_member_name_with_external`, and it is what lets
+    /// Scala's own unresolved-receiver paths reach the shared import-boundary
+    /// gate (#2287) instead of dying with a plain miss. The owner runs through
+    /// [`Self::external_type_spelling`], so a renaming import
+    /// (`import a.b.{C => D}`, written `D.member`) reaches the declaration its
+    /// local name binds.
+    ///
+    /// Only the external surface can answer here: a workspace owner's members
+    /// are indexed, and the resolver either found them or did not.
+    pub(crate) fn resolve_member_name_with_external(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Option<crate::analyzer::jvm::external::JvmExternalMember> {
+        let normalized = raw_name.trim();
+        if normalized.is_empty() {
+            return None;
+        }
+        let external = self.external_declarations(packs);
+        if external.is_empty() {
+            return None;
+        }
+        let package_name = self.inner.package_name_of(file).unwrap_or_default();
+        external.resolve_member_spelling(normalized, &package_name, |owner_spelling| {
+            self.external_type_spelling(&external, file, &package_name, owner_spelling)
+        })
     }
 
     /// Whether a bare Scala type name is declared in `file` itself or anywhere
@@ -1203,6 +1250,10 @@ impl IAnalyzer for ScalaAnalyzer {
 
     fn invalidate_cached_file_identities(&self) {
         self.inner.invalidate_cached_file_identities();
+    }
+
+    fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {
+        self.inner.working_tree_identity()
     }
 
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {

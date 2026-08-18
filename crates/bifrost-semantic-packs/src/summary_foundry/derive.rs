@@ -27,11 +27,12 @@ use brokk_bifrost_analysis::analyzer::dataflow::{
     DataflowRequest, SemanticInputStatus, SolverBudget, SolverTermination, UnmodeledCallBehavior,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
-    CallBindings, CancellationToken, DeclarationLocator, DeclarationSegmentKind,
+    CallBindings, CallSiteId, CancellationToken, DeclarationLocator, DeclarationSegmentKind,
     DispatchBoundaryKind, DispatchOracle, EvidenceCompleteness, OracleCallContext, ProcedureHandle,
-    ProcedureKind, ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus,
-    SemanticBudget, SemanticLocator, SemanticRequest, SemanticValueKind, ValueFlowOracle,
-    ValueFlowRelation, ValueFlowRelationKind, ValueFlowSnapshot,
+    ProcedureId, ProcedureKind, ProcedurePortHandle, ProgramPointHandle, ProgramPointId,
+    ProofStatus, SemanticArtifactKey, SemanticBudget, SemanticLocator, SemanticRequest,
+    SemanticValueKind, ValueFlowOracle, ValueFlowRelation, ValueFlowRelationKind,
+    ValueFlowSnapshot,
 };
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     AuthoredSummaryExitKind, AuthoredSummaryInput, AuthoredSummaryOutput, AuthoredSummaryTransfer,
@@ -670,13 +671,33 @@ fn discover_closure(
     let oracle = analyzer.semantic_oracle_provider();
     let context = OracleCallContext::empty();
     let mut pending = vec![root.clone()];
-    let mut seen: HashSet<ProcedureHandle> = HashSet::new();
-    let mut seen_bindings = BTreeSet::new();
+    // The walk must recognize one procedure across two materializations of its
+    // artifact. The complete-artifact cache is byte-bounded, so a large file
+    // can be evicted and re-materialized while this closure is still being
+    // discovered, and `ProcedureHandle` equality compares the owning
+    // `Arc<SemanticArtifact>` by pointer. Keyed on the handle, the walk
+    // re-entered such a procedure once per instance: it paid for the relations
+    // again and pushed a second copy of the same snapshot, whose local rules
+    // then appeared twice in the plan the derivation solves.
+    let mut seen: HashSet<(SemanticArtifactKey, ProcedureId)> = HashSet::new();
+    // One binding is asked for once per calling procedure, call site, and
+    // callee. `CallSiteId` indexes its own procedure's dense call-site table,
+    // so it names a call site only beneath the procedure that owns it: the
+    // first call site of every procedure is `CallSiteId(0)`. Without the
+    // caller, two callers in one closure whose call sites share an index and a
+    // callee produce one key, and the second caller's bindings are dropped
+    // from the plan. That is missing derived output, stated silently.
+    let mut seen_bindings: HashSet<(
+        (SemanticArtifactKey, ProcedureId),
+        CallSiteId,
+        SemanticLocator,
+    )> = HashSet::new();
     let mut snapshots = Vec::new();
     let mut bindings = Vec::new();
     let mut root_snapshot = None;
     while let Some(procedure) = pending.pop() {
-        if !seen.insert(procedure.clone()) {
+        let procedure_key = procedure.durable_key();
+        if !seen.insert(procedure_key.clone()) {
             continue;
         }
         if seen.len() > limits.max_closure_procedures {
@@ -735,7 +756,11 @@ fn discover_closure(
                 boundaries.insert(classify_boundary(declarations, &boundary.kind));
             }
             for candidate in dispatch.candidates() {
-                let key = (call.id(), candidate.target().semantics().locator().clone());
+                let key = (
+                    procedure_key.clone(),
+                    call.id(),
+                    candidate.target().semantics().locator().clone(),
+                );
                 if !seen_bindings.insert(key) {
                     continue;
                 }
@@ -1164,6 +1189,262 @@ mod tests {
         assert!(qualified.is_qualified());
         assert_eq!(qualified.input.port, "parameter[0]");
         assert!(!qualified.output.is_qualified());
+    }
+
+    /// #2286: the closure walk must recognize one procedure across two
+    /// materializations of its artifact.
+    ///
+    /// The complete-artifact cache is byte-bounded, so a large file can be
+    /// evicted and re-materialized while one closure is still being
+    /// discovered. `ProcedureHandle` equality compares the owning
+    /// `Arc<SemanticArtifact>` by pointer, so the walk then held two unequal
+    /// handles for one procedure and walked it once per instance: it paid for
+    /// the relations again and pushed a second copy of one snapshot, whose
+    /// local rules appeared twice in the plan.
+    ///
+    /// Two analyzers over one project root own separate artifact caches, so
+    /// each materializes its own instance of one immutable artifact. Walking
+    /// with the first analyzer from a root the second materialized reproduces
+    /// the pair deterministically: the fixture's recursion back to the root
+    /// resolves through the first analyzer's cache.
+    #[test]
+    fn a_procedure_reached_through_two_materializations_is_walked_once() {
+        use brokk_bifrost_analysis::analyzer::semantic::SemanticArtifact;
+
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        std::fs::create_dir_all(workspace.path().join("probe")).expect("package directory");
+        std::fs::write(
+            workspace.path().join("probe/Relay.java"),
+            concat!(
+                "package probe;\n",
+                "public final class Relay {\n",
+                "    public static String head(String value) {\n",
+                "        return value == null ? value : tail(value);\n",
+                "    }\n",
+                "    public static String tail(String value) {\n",
+                "        return value.isEmpty() ? head(value) : value;\n",
+                "    }\n",
+                "}\n",
+            ),
+        )
+        .expect("fixture source");
+
+        let project: Arc<dyn Project> =
+            Arc::new(FilesystemProject::new(workspace.path()).expect("fixture project"));
+        let config = || AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        };
+        let first = WorkspaceAnalyzer::build_ephemeral(Arc::clone(&project), config())
+            .expect("an analyzer over the fixture");
+        let second = WorkspaceAnalyzer::build_ephemeral(project, config())
+            .expect("a second analyzer over the fixture");
+
+        let files = first.analyzer().get_analyzed_files();
+        let file = files
+            .into_iter()
+            .find(|file| file.rel_path().ends_with("Relay.java"))
+            .expect("the fixture file is analyzed");
+        let declarations = DeclarationIndex::build(&first, std::slice::from_ref(&file));
+
+        let materialize = |analyzer: &WorkspaceAnalyzer| -> Arc<SemanticArtifact> {
+            let cancellation = CancellationToken::default();
+            let mut budget = SemanticBudget::default();
+            analyzer
+                .materialize_program_semantics(
+                    &file,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("the fixture materializes")
+                .available_value()
+                .cloned()
+                .expect("the fixture artifact is available")
+        };
+        let head = |artifact: &Arc<SemanticArtifact>| -> ProcedureHandle {
+            let procedure = artifact
+                .procedures()
+                .iter()
+                .find(|procedure| member_name(procedure.locator()) == "head")
+                .expect("the fixture declares head");
+            artifact
+                .procedure_handle(procedure.id())
+                .expect("the selected procedure remains live")
+        };
+
+        let first_artifact = materialize(&first);
+        let second_artifact = materialize(&second);
+        assert_eq!(
+            first_artifact.key(),
+            second_artifact.key(),
+            "both instances must describe one immutable artifact"
+        );
+        let first_head = head(&first_artifact);
+        let second_head = head(&second_artifact);
+        assert_ne!(
+            first_head, second_head,
+            "handle equality is materialization-scoped, which is the precondition this test pins"
+        );
+        assert_eq!(
+            first_head.durable_key(),
+            second_head.durable_key(),
+            "the durable identity must not depend on which materialization produced the handle"
+        );
+
+        let cancellation = CancellationToken::default();
+        let mut semantic_budget = SemanticBudget::default();
+        let mut boundaries = BTreeSet::new();
+        let closure = discover_closure(
+            &first,
+            &second_head,
+            &declarations,
+            DerivationLimits::default(),
+            &mut semantic_budget,
+            &cancellation,
+            &mut boundaries,
+        );
+
+        let walked = closure
+            .snapshots
+            .iter()
+            .map(|input| input.value().procedure().durable_key())
+            .collect::<Vec<_>>();
+        let mut distinct = walked.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            walked.len(),
+            distinct.len(),
+            "each procedure must contribute one snapshot, saw {} snapshots for {} procedures",
+            walked.len(),
+            distinct.len()
+        );
+        assert_eq!(
+            walked.len(),
+            2,
+            "the fixture's two procedures must both be walked"
+        );
+        assert_eq!(closure.procedures, 2, "boundaries: {boundaries:?}");
+        assert!(
+            closure.root_snapshot.is_some(),
+            "the walk must record the root's own snapshot"
+        );
+    }
+
+    /// #2290: the closure walk must ask for one binding per calling procedure,
+    /// not per call-site index.
+    ///
+    /// `CallSiteId` indexes its owning procedure's own dense call-site table,
+    /// so the first call site of every procedure is `CallSiteId(0)`. Keyed on
+    /// `(CallSiteId, callee locator)` alone, `left` and `right` below produce
+    /// one key -- both reach `relay` from their own call site 0 -- and the
+    /// second one walked loses its bindings, so `root`'s plan has no rule
+    /// carrying a value through that caller.
+    #[test]
+    fn two_callers_that_share_a_call_site_index_and_callee_both_bind() {
+        use brokk_bifrost_analysis::analyzer::semantic::SemanticArtifact;
+
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        std::fs::create_dir_all(workspace.path().join("probe")).expect("package directory");
+        std::fs::write(
+            workspace.path().join("probe/Fan.java"),
+            concat!(
+                "package probe;\n",
+                "public final class Fan {\n",
+                "    public static String root(String value) {\n",
+                "        String carried = left(value);\n",
+                "        return right(carried);\n",
+                "    }\n",
+                "    public static String left(String value) {\n",
+                "        return relay(value);\n",
+                "    }\n",
+                "    public static String right(String value) {\n",
+                "        return relay(value);\n",
+                "    }\n",
+                "    public static String relay(String value) {\n",
+                "        return value;\n",
+                "    }\n",
+                "}\n",
+            ),
+        )
+        .expect("fixture source");
+
+        let project: Arc<dyn Project> =
+            Arc::new(FilesystemProject::new(workspace.path()).expect("fixture project"));
+        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("an analyzer over the fixture");
+        let files = analyzer.analyzer().get_analyzed_files();
+        let file = files
+            .into_iter()
+            .find(|file| file.rel_path().ends_with("Fan.java"))
+            .expect("the fixture file is analyzed");
+        let declarations = DeclarationIndex::build(&analyzer, std::slice::from_ref(&file));
+
+        let cancellation = CancellationToken::default();
+        let mut semantic_budget = SemanticBudget::default();
+        let artifact: Arc<SemanticArtifact> = analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut semantic_budget, &cancellation),
+            )
+            .expect("the fixture materializes")
+            .available_value()
+            .cloned()
+            .expect("the fixture artifact is available");
+        let root_procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| member_name(procedure.locator()) == "root")
+            .expect("the fixture declares root");
+        let root = artifact
+            .procedure_handle(root_procedure.id())
+            .expect("the selected procedure remains live");
+
+        let mut boundaries = BTreeSet::new();
+        let closure = discover_closure(
+            &analyzer,
+            &root,
+            &declarations,
+            DerivationLimits::default(),
+            &mut semantic_budget,
+            &cancellation,
+            &mut boundaries,
+        );
+
+        let mut bound = closure
+            .bindings
+            .iter()
+            .map(|input| {
+                let call_bindings = input.value();
+                (
+                    member_name(call_bindings.call().procedure().semantics().locator()),
+                    call_bindings.call().id().index(),
+                    member_name(call_bindings.callee().semantics().locator()),
+                )
+            })
+            .collect::<Vec<_>>();
+        bound.sort();
+        // `left` and `right` both hold call-site index 0 here, which is the
+        // collision this test exists for, and both must appear.
+        assert_eq!(
+            bound,
+            vec![
+                ("left".to_owned(), 0, "relay".to_owned()),
+                ("right".to_owned(), 0, "relay".to_owned()),
+                ("root".to_owned(), 0, "left".to_owned()),
+                ("root".to_owned(), 1, "right".to_owned()),
+            ],
+            "boundaries: {boundaries:?}"
+        );
+
+        // The dropped binding is missing derived output, not only a missing
+        // input: without `left`'s bindings the parameter never reaches the
+        // return through the two-hop chain.
+        let run = derive_jvm_summaries(workspace.path(), DerivationLimits::default())
+            .expect("the fixture derives");
+        assert_eq!(
+            entry_for(&run, "root(String)").rendered_transfers(),
+            vec!["parameter[0]->normal_return@normal".to_owned()]
+        );
     }
 
     #[test]

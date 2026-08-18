@@ -8,7 +8,7 @@ use crate::analyzer::ProjectFile;
 use crate::cancellation::CancellationToken;
 
 use super::capabilities::SemanticCapability;
-use super::ids::SemanticArtifactKey;
+use super::ids::{SemanticArtifactKey, StableDigest};
 use super::ir::{SemanticArtifact, SemanticIrError};
 use crate::analyzer::work_budget::{BudgetLedger, WorkBudgetExceeded, define_work_dimensions};
 
@@ -69,9 +69,24 @@ impl SemanticWork {
 }
 
 /// A positive finite set of semantic materialization limits and its used work.
+///
+/// The budget also records which semantic artifacts it has already paid the
+/// full retained-row census for. One artifact is lowered once and then shared
+/// through the process-wide complete-artifact cache, so charging its whole
+/// census again on every cache hit charges one performed piece of work many
+/// times over. A consumer that reaches one file from many call sites was
+/// therefore charged the file's census once per call site (#2295). The set is
+/// scoped to this budget value: creating a fresh budget -- which is how every
+/// per-region and per-batch reset works -- starts an empty set, so a reset
+/// scope pays the census again for the material it newly pulls in.
+///
+/// `Arc` here is copy-on-write, not sharing. Cloning a budget to stage a charge
+/// must be cheap, and a staged budget that is discarded must roll the set back
+/// with the numbers; `Arc::make_mut` gives both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticBudget {
     ledger: BudgetLedger<SemanticWork>,
+    charged_artifacts: Arc<HashSet<StableDigest>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +166,7 @@ impl SemanticBudget {
         }
         Ok(Self {
             ledger: BudgetLedger::new(limits, SemanticWork::default()),
+            charged_artifacts: Arc::new(HashSet::new()),
         })
     }
 
@@ -178,6 +194,27 @@ impl SemanticBudget {
     /// Atomically charge work; a failed charge leaves the budget unchanged.
     pub fn charge(&mut self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
         self.ledger.charge(work).map_err(Into::into)
+    }
+
+    /// Whether this budget has already been charged one artifact's full
+    /// retained-row census.
+    pub(crate) fn has_charged_artifact(&self, artifact: StableDigest) -> bool {
+        self.charged_artifacts.contains(&artifact)
+    }
+
+    /// Record that this budget has paid one artifact's full retained-row
+    /// census, so a later cache hit on the same artifact is charged as the
+    /// lookup it is.
+    pub(crate) fn record_charged_artifact(&mut self, artifact: StableDigest) {
+        if self.charged_artifacts.contains(&artifact) {
+            return;
+        }
+        Arc::make_mut(&mut self.charged_artifacts).insert(artifact);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn charged_artifact_count(&self) -> usize {
+        self.charged_artifacts.len()
     }
 }
 

@@ -8,8 +8,9 @@ use crate::analyzer::dataflow::{
     DataflowRequest, PathQuality, PathQualityFrontier, ProcedureSummaryKey, ReusableEndSummary,
     ReusableProcedureSummary, ReusableReachedFact, ReusableSummaryProvider,
     SemanticProcedureSummary, SemanticSummarySetValidationError, SolverTermination,
-    SummaryDependencyKey, SummaryExitKind, SummaryRecursiveGroupKey,
-    canonicalize_semantic_summary_items, validate_recursive_summary_batch,
+    SummaryCallCycle, SummaryCalledProcedures, SummaryDependencyKey, SummaryExitKind,
+    SummaryRecursiveGroupKey, canonicalize_semantic_summary_items,
+    validate_recursive_summary_batch,
 };
 use crate::analyzer::semantic::{
     DeclarationLocator, IcfgProvider, ProcedureHandle, ReturnTransferKind, SemanticArtifactKey,
@@ -1349,6 +1350,7 @@ impl ReusableSummaryProvider<TypestateFact> for ProtocolSummaryOracle<'_, '_> {
     fn summary_for(
         &mut self,
         procedure: &ProcedureHandle,
+        root: &ProcedureHandle,
         entry_fact: TypestateFact,
         request: &mut DataflowRequest<'_>,
     ) -> Result<Option<ReusableProcedureSummary<TypestateFact>>, SolverTermination> {
@@ -1357,6 +1359,18 @@ impl ReusableSummaryProvider<TypestateFact> for ProtocolSummaryOracle<'_, '_> {
         }
         let Some(semantic) = self.semantic_summaries.unique_summary_for(procedure) else {
             return Ok(None);
+        };
+        // #2285. Protocol summaries are published for whole call cycles at
+        // once, so the repository really can answer for a callee that calls
+        // back into the procedure this solve is rooted at. Report that and let
+        // the solver refuse the summary and solve the body. Without the root's
+        // own semantic summary there is nothing to compare, so report the
+        // cycle: refusing reuse costs recomputation, and a wrong answer here
+        // costs a fact.
+        let call_cycle = match self.semantic_summaries.unique_summary_for(root) {
+            Some(root_semantic) => semantic.key().call_cycle_with_root(root_semantic.key()),
+            None if semantic.key().recursive_group().is_some() => SummaryCallCycle::IncludesRoot,
+            None => SummaryCallCycle::ExcludesRoot,
         };
         let Some(binding_contract) = self.binding_contracts.get(semantic.key()).copied() else {
             return Ok(None);
@@ -1482,6 +1496,19 @@ impl ReusableSummaryProvider<TypestateFact> for ProtocolSummaryOracle<'_, '_> {
         Ok(Some(ReusableProcedureSummary {
             exits: exits.into_boxed_slice(),
             reached: reached.into_boxed_slice(),
+            call_cycle,
+            // #2296. A protocol summary is offered only for a procedure that
+            // holds a binding contract, and `build_binding_contracts` above
+            // grants one only to a procedure whose semantic summary has no
+            // dependencies -- a leaf -- or to a validated recursive group whose
+            // members all name one another. A leaf calls no analyzed procedure,
+            // and a validated group names every member, so in both cases the
+            // contract already covers everything the summarized body can call.
+            // `typestate_client::mutual_recursive_protocol_summaries_project_and_reuse_atomically`
+            // and the published-summary count asserted in the same file pin
+            // that restriction; relaxing it means computing this the way
+            // `TaintSummaryOracle::called_procedures` does.
+            called_procedures: SummaryCalledProcedures::CoveredByContract,
         }))
     }
 }

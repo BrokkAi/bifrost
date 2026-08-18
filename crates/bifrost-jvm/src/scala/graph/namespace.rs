@@ -46,11 +46,18 @@ pub fn scala_qualified_type_root(mut node: Node<'_>) -> Node<'_> {
 /// local type binding which deliberately has no indexed `CodeUnit`, while
 /// `Ambiguous` preserves two or more distinct physical declarations instead
 /// of collapsing them through their shared rendered fqn.
+///
+/// `Ambiguous` carries the competing declarations themselves (#2167). The
+/// resolver computed them to decide it could not choose, so an answer that
+/// drops them is strictly less useful than what the resolver knew. The list is
+/// empty in exactly one case: the tie was inherited from a supertype whose own
+/// NAME is ambiguous, so this level never held a declaration of the name being
+/// resolved and there is nothing about that name to report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScalaTypeNamespaceResolution {
     NoMatch,
     Resolved(CodeUnit),
-    Ambiguous,
+    Ambiguous(Vec<CodeUnit>),
     AuthoritativeMiss,
 }
 
@@ -121,15 +128,17 @@ where
             [declaration] => {
                 return ScalaTypeNamespaceResolution::Resolved(declaration.clone());
             }
-            [_, _, ..] => return ScalaTypeNamespaceResolution::Ambiguous,
+            [_, _, ..] => return ScalaTypeNamespaceResolution::Ambiguous(direct),
             [] => {}
         }
 
         let mut level = match direct_ancestors(&owner) {
             ScalaDirectAncestorResolution::Resolved(ancestors)
             | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
+            // no contenders: the tie is the SUPERTYPE name's, not this name's,
+            // so no declaration of `name` was ever in hand here (#2167).
             ScalaDirectAncestorResolution::Ambiguous => {
-                return ScalaTypeNamespaceResolution::Ambiguous;
+                return ScalaTypeNamespaceResolution::Ambiguous(Vec::new());
             }
         };
         let mut seen = HashSet::from_iter([owner]);
@@ -155,8 +164,11 @@ where
                 [declaration] => {
                     return ScalaTypeNamespaceResolution::Resolved(declaration.clone());
                 }
-                [_, _, ..] => return ScalaTypeNamespaceResolution::Ambiguous,
-                [] if next_is_ambiguous => return ScalaTypeNamespaceResolution::Ambiguous,
+                [_, _, ..] => return ScalaTypeNamespaceResolution::Ambiguous(matches),
+                // no contenders: see the direct-ancestor arm above.
+                [] if next_is_ambiguous => {
+                    return ScalaTypeNamespaceResolution::Ambiguous(Vec::new());
+                }
                 [] => level = next,
             }
         }

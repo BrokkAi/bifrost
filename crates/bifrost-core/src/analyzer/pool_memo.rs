@@ -246,7 +246,28 @@ impl<T> PoolSafeMemo<T> {
             pool_independent: true,
         };
 
-        let built = Arc::new(dedicated_build_pool().install(build));
+        let on_dedicated_pool = ON_DEDICATED_BUILD_POOL.with(Cell::get);
+        let built = Arc::new(if on_dedicated_pool {
+            // A re-entrant builder is already running on the pool that owns its
+            // parallel work. Running inline preserves the duplicate-build
+            // escape hatch described by `parking_is_safe`.
+            build()
+        } else if rayon::current_thread_index().is_some() {
+            // `ThreadPool::install` called directly from a worker of another
+            // pool lets that worker service its original pool while it waits.
+            // A stolen job can re-enter this memo and then wait on the builder
+            // lower in the same stack. Put the cross-pool install on a scoped
+            // OS thread so the global worker truly parks instead of stealing
+            // another request that can wait on itself.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| dedicated_build_pool().install(build))
+                    .join()
+                    .expect("dedicated index build thread panicked")
+            })
+        } else {
+            dedicated_build_pool().install(build)
+        });
 
         let mut state = self.state.lock().expect("pool memo poisoned");
         if let Some(existing) = state.value.as_ref() {
@@ -916,6 +937,53 @@ mod tests {
         let waited = worker.join().expect("worker thread should finish");
         assert!(Arc::ptr_eq(&warmed, &waited));
         assert_eq!(*waited, 7);
+    }
+
+    /// A worker waiting for another pool's `install` may service work from its
+    /// own pool. If that stolen job reaches the same memo, it waits on the
+    /// builder lower in its own stack forever. The dedicated build must park
+    /// the global worker without cross-pool work stealing.
+    #[test]
+    fn dedicated_build_from_global_worker_does_not_steal_a_reentrant_caller() {
+        use rayon::prelude::*;
+        use std::time::Duration;
+
+        let memo = Arc::new(PoolSafeMemo::new());
+        let builds = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel();
+        let worker_memo = Arc::clone(&memo);
+        let worker_builds = Arc::clone(&builds);
+        let worker = thread::spawn(move || {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("rayon pool");
+            let values = pool.install(|| {
+                rayon::join(
+                    || {
+                        worker_memo.get_or_build_on_dedicated_pool(|| {
+                            worker_builds.fetch_add(1, Ordering::SeqCst);
+                            (0..1024usize).into_par_iter().sum::<usize>()
+                        })
+                    },
+                    || {
+                        worker_memo.get_or_build_on_dedicated_pool(|| {
+                            worker_builds.fetch_add(1, Ordering::SeqCst);
+                            0
+                        })
+                    },
+                )
+            });
+            tx.send(Arc::ptr_eq(&values.0, &values.1))
+                .expect("send result");
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("cross-pool memo build deadlocked")
+        );
+        worker.join().expect("worker should finish");
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
     }
 
     /// The workers of the dedicated pool are the build's own parallelism, so

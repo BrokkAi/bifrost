@@ -13,14 +13,18 @@ use crate::analyzer::semantic_model::{
     HierarchyFact, HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, NameSelector,
     Parameter, Producer, Provenance, ReceiverFact, ResolvedDependency, ResolvedDependencyArtifact,
     Safety, SemanticModelActivationEvidence, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef,
-    Visibility, member_declaration_id, type_declaration_id,
+    Visibility, WildcardVariance, member_declaration_id, type_declaration_id,
 };
 use crate::analyzer::semantic_model::{SemanticModelCompleteness, SemanticModelOverlay};
 use crate::analyzer::structural::BoundaryStatus;
 use crate::analyzer::{Language, Project};
 use crate::hash::HashMap;
+use brokk_bifrost_core::analyzer::model::{
+    StructuredTypeIdentity, StructuredTypeNodeId, StructuredTypeNodeView,
+};
 use brokk_bifrost_cpp::compile_context::CppCompileContexts;
 use brokk_bifrost_cpp::compile_context::CppExternalIncludeResolution;
+use brokk_bifrost_cpp::declarations::CppParameterType;
 use brokk_bifrost_cpp::external_declarations::{
     CppExternalDeclarationCompleteness, CppExternalDeclarationLimits, CppExternalMemberKind,
     CppExternalVisibility, external_angle_include_paths, external_angle_include_paths_from_root,
@@ -465,20 +469,33 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 );
                 continue;
             };
-            let parameter_types = record
+            let parameters = record
                 .parameter_types
                 .unwrap_or_default()
                 .into_iter()
-                .map(named_type)
+                .map(|parameter| match parameter {
+                    CppParameterType::Structured(identity) => {
+                        (pack_type_ref(&identity).unwrap_or_else(unknown_type), false)
+                    }
+                    CppParameterType::Ellipsis => (unknown_type(), true),
+                    CppParameterType::Unstructured => (unknown_type(), false),
+                })
                 .collect::<Vec<_>>();
-            let return_type = record.return_type.map(named_type);
+            let parameter_types = parameters
+                .iter()
+                .map(|(r#type, _)| r#type.clone())
+                .collect::<Vec<_>>();
+            let parameter_variadics = parameters
+                .iter()
+                .map(|(_, variadic)| *variadic)
+                .collect::<Vec<_>>();
+            let return_type = record.return_type.as_ref().and_then(pack_type_ref);
             let member_kind = match record.kind {
                 CppExternalMemberKind::Function if record.is_constructor => MemberKind::Constructor,
                 CppExternalMemberKind::Function => MemberKind::Method,
                 CppExternalMemberKind::Field => MemberKind::Field,
                 CppExternalMemberKind::Macro => MemberKind::Macro,
             };
-            let parameter_variadics = vec![false; parameter_types.len()];
             let id = member_declaration_id(MemberIdentity {
                 owner_id,
                 kind: member_kind,
@@ -492,14 +509,13 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
             });
             let signature = (record.kind == CppExternalMemberKind::Function).then(|| Signature {
                 type_parameters: Vec::new(),
-                parameters: parameter_types
-                    .iter()
-                    .cloned()
-                    .map(|r#type| Parameter {
+                parameters: parameters
+                    .into_iter()
+                    .map(|(r#type, variadic)| Parameter {
                         name: None,
                         r#type,
                         optional: false,
-                        variadic: false,
+                        variadic,
                     })
                     .collect(),
                 returns: return_type,
@@ -788,6 +804,134 @@ fn named_type(name: String) -> TypeRef {
     }
 }
 
+/// The pack type reference for a type the header extractor could not reduce to
+/// a structured identity, and for a `...` pack, which has no type at all.
+///
+/// An unbounded wildcard is the model's own way to say "some type": it keeps
+/// the parameter's position, and therefore the callable's arity and identity,
+/// without inventing a type name that no declaration spells.
+fn unknown_type() -> TypeRef {
+    TypeRef::Wildcard {
+        variance: WildcardVariance::Any,
+        bound: None,
+    }
+}
+
+/// Translate a parser-derived structured type into a pack type reference.
+///
+/// The two models line up node for node except in one place: C++ cv-qualifiers
+/// are not part of either model, so `const T&` is published as a reference to
+/// `T`, exactly as the rustdoc producer publishes `&mut T` and the C# producer
+/// publishes an `in` parameter. A nominal name is published as the path the
+/// declaration writes, joined by `.` like every other name in a pack; the
+/// structured name's lexical scope is deliberately not folded in, because a
+/// pack name asserts an identity and prefixing an enclosing scope onto an
+/// unqualified spelling would assert one the header never proved.
+fn pack_type_ref(identity: &StructuredTypeIdentity) -> Option<TypeRef> {
+    enum Work {
+        Visit(StructuredTypeNodeId),
+        Pointer,
+        ByRef,
+        Array,
+        Slice,
+        Map,
+        Generic { argument_count: usize },
+    }
+
+    // A structured arena may share one child among several parents, while a
+    // pack type reference is a tree. Expanding sharing is bounded work here
+    // rather than unbounded materialization: a type past the bound is reported
+    // as unknown instead of being expanded.
+    const MAX_TRANSLATION_STEPS: usize = 8_192;
+
+    let mut work = vec![Work::Visit(identity.root_id())];
+    let mut values: Vec<TypeRef> = Vec::new();
+    let mut steps = 0usize;
+    while let Some(next) = work.pop() {
+        steps += 1;
+        if steps > MAX_TRANSLATION_STEPS {
+            return None;
+        }
+        match next {
+            Work::Visit(id) => match identity.view(id)? {
+                StructuredTypeNodeView::Named(name) => {
+                    let name = name.path().join(".");
+                    debug_assert!(
+                        !name.is_empty() && !name.chars().any(char::is_whitespace),
+                        "structured type name components are parser identifiers: {name:?}"
+                    );
+                    values.push(named_type(name));
+                }
+                StructuredTypeNodeView::Pointer(inner) => {
+                    work.push(Work::Pointer);
+                    work.push(Work::Visit(inner));
+                }
+                StructuredTypeNodeView::Reference(inner) => {
+                    work.push(Work::ByRef);
+                    work.push(Work::Visit(inner));
+                }
+                StructuredTypeNodeView::Array(inner) => {
+                    work.push(Work::Array);
+                    work.push(Work::Visit(inner));
+                }
+                StructuredTypeNodeView::Slice(inner) => {
+                    work.push(Work::Slice);
+                    work.push(Work::Visit(inner));
+                }
+                StructuredTypeNodeView::Map { key, value } => {
+                    work.push(Work::Map);
+                    work.push(Work::Visit(value));
+                    work.push(Work::Visit(key));
+                }
+                StructuredTypeNodeView::Generic { base, arguments } => {
+                    work.push(Work::Generic {
+                        argument_count: arguments.len(),
+                    });
+                    for argument in arguments.iter().rev() {
+                        work.push(Work::Visit(*argument));
+                    }
+                    work.push(Work::Visit(base));
+                }
+            },
+            Work::Pointer => {
+                let element = Box::new(values.pop()?);
+                values.push(TypeRef::Pointer { element });
+            }
+            Work::ByRef => {
+                let element = Box::new(values.pop()?);
+                values.push(TypeRef::ByRef { element });
+            }
+            Work::Array => {
+                let element = Box::new(values.pop()?);
+                values.push(TypeRef::Array { element });
+            }
+            Work::Slice => {
+                let element = Box::new(values.pop()?);
+                values.push(TypeRef::Slice { element });
+            }
+            Work::Map => {
+                let value = Box::new(values.pop()?);
+                let key = Box::new(values.pop()?);
+                values.push(TypeRef::Map { key, value });
+            }
+            Work::Generic { argument_count } => {
+                let start = values.len().checked_sub(argument_count)?;
+                let arguments = values.split_off(start);
+                let TypeRef::Named { name, nullable, .. } = values.pop()? else {
+                    // Only a nominal type can carry pack type arguments.
+                    return None;
+                };
+                values.push(TypeRef::Named {
+                    name,
+                    arguments,
+                    nullable,
+                });
+            }
+        }
+    }
+    (values.len() == 1).then(|| values.pop()).flatten()
+}
+
 fn stable_path(path: &Path) -> String {
     path.components()
         .filter_map(|component| match component {
@@ -801,11 +945,12 @@ fn stable_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::semantic_model::CompilerOptions;
     use crate::analyzer::semantic_model::{
         AuthoredPayload, CatalogOptions, ResolvedDependencyArtifactInput,
         SemanticModelActivationControl, SemanticModelActivationRequest, SemanticModelControlAction,
         SemanticModelControlScope, SemanticModelPackSelector, SemanticModelRuntimeLimits,
-        SemanticModelRuntimeOutcome, SemanticPackCatalog, read_exact_source_set,
+        SemanticModelRuntimeOutcome, SemanticPackCatalog, compile_pack, read_exact_source_set,
     };
     use crate::analyzer::usages::get_definition::DefinitionLookupRequest;
     use crate::analyzer::usages::get_definition::trace::{
@@ -881,6 +1026,167 @@ mod tests {
             members
                 .iter()
                 .any(|fact| fact.owner == vector.id && fact.name == "push_back")
+        );
+    }
+
+    /// The pack type model carries a type's identity and shape, never a source
+    /// spelling: a parameter written `const T&` must reach the pack as a
+    /// reference to `T`, and the pack must validate.
+    #[test]
+    fn produced_header_pack_publishes_structured_parameter_types() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/main.cpp")
+            .write("#include <vector>\n")
+            .expect("source");
+        ProjectFile::new(root.clone(), "fake/include/vector")
+            .write(concat!(
+                "namespace ns { class Widget; }\n",
+                "namespace std {\n",
+                "class string;\n",
+                "template <typename T> class vector {\n",
+                "public:\n",
+                "  void push_back(const T& value);\n",
+                "  void assign(const std::string& name, ns::Widget* widget);\n",
+                "  void nest(const vector<int>& other);\n",
+                "  void insert(int index);\n",
+                "  void insert(const T& value);\n",
+                "  void log(const char* format, ...);\n",
+                "};\n",
+                "}\n",
+            ))
+            .expect("header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
+            .expect("database");
+        let project = TestProject::new(root, Language::Cpp);
+        let discovery = resolve_cpp_semantic_pack_dependencies(
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+        let [dependency] = discovery.dependencies.as_slice() else {
+            panic!("one C++ include-root dependency: {discovery:#?}");
+        };
+        let ResolvedDependencyArtifactInput::SourceSet {
+            root,
+            relative_paths,
+        } = &dependency.artifacts[0].input
+        else {
+            panic!("C++ dependency uses a source set");
+        };
+        let exact = read_exact_source_set(
+            root,
+            relative_paths,
+            DependencyPackLimits::default().max_source_files_per_artifact,
+            DependencyPackLimits::default().max_source_path_depth,
+            &ArtifactProducerLimits::default(),
+        )
+        .expect("exact source set");
+        let production = CppDependencyPackAdapter.produce(
+            dependency,
+            &[ExactDependencyArtifact::from_exact(
+                DependencyArtifactRole::Declarations,
+                ExternalArtifactKind::CppHeaderSourceSet,
+                None,
+                exact,
+            )],
+            &ArtifactProducerLimits::default(),
+            None,
+        );
+        let pack = production.pack.expect("C++ pack");
+        if let Err(diagnostics) = compile_pack(&pack, &CompilerOptions::default()) {
+            panic!("the produced pack must validate: {diagnostics:#?}");
+        }
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload
+        else {
+            panic!("declaration facts");
+        };
+        let vector = types
+            .iter()
+            .find(|fact| fact.name == "std.vector")
+            .expect("vector type");
+        let parameters = |name: &str, arity: usize| {
+            members
+                .iter()
+                .filter(|fact| fact.owner == vector.id && fact.name == name)
+                .filter_map(|fact| fact.signature.as_ref())
+                .find(|signature| signature.parameters.len() == arity)
+                .unwrap_or_else(|| panic!("`{name}` with {arity} parameters: {members:#?}"))
+                .parameters
+                .clone()
+        };
+        let by_reference = |element: TypeRef| Parameter {
+            name: None,
+            r#type: TypeRef::ByRef {
+                element: Box::new(element),
+            },
+            optional: false,
+            variadic: false,
+        };
+
+        assert_eq!(
+            vec![by_reference(named_type("T".to_owned()))],
+            parameters("push_back", 1),
+            "a `const T&` parameter is a reference to `T`, not the text `const T&`"
+        );
+        assert_eq!(
+            vec![
+                by_reference(named_type("std.string".to_owned())),
+                Parameter {
+                    name: None,
+                    r#type: TypeRef::Pointer {
+                        element: Box::new(named_type("ns.Widget".to_owned())),
+                    },
+                    optional: false,
+                    variadic: false,
+                },
+            ],
+            parameters("assign", 2),
+            "qualification and pointer shape survive"
+        );
+        assert_eq!(
+            vec![by_reference(TypeRef::Named {
+                name: "vector".to_owned(),
+                arguments: vec![named_type("int".to_owned())],
+                nullable: false,
+            })],
+            parameters("nest", 1),
+            "type arguments survive"
+        );
+        assert_eq!(
+            vec![
+                Parameter {
+                    name: None,
+                    r#type: TypeRef::Pointer {
+                        element: Box::new(named_type("char".to_owned())),
+                    },
+                    optional: false,
+                    variadic: false,
+                },
+                Parameter {
+                    name: None,
+                    r#type: TypeRef::Wildcard {
+                        variance: WildcardVariance::Any,
+                        bound: None,
+                    },
+                    optional: false,
+                    variadic: true,
+                },
+            ],
+            parameters("log", 2),
+            "a `...` pack keeps its position without inventing a type name"
+        );
+
+        let insert_ids = members
+            .iter()
+            .filter(|fact| fact.owner == vector.id && fact.name == "insert")
+            .map(|fact| fact.id.clone())
+            .collect::<crate::hash::HashSet<_>>();
+        assert_eq!(
+            2,
+            insert_ids.len(),
+            "parameter types discriminate two `insert` overloads: {members:#?}"
         );
     }
 

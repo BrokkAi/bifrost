@@ -75,7 +75,7 @@ const EMBEDDED_POLICY_SOURCES: &[(&str, &str)] = &[
 
 static BUILT_IN_CATALOG: OnceLock<BuiltInPolicyCatalog> = OnceLock::new();
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BuiltInPolicyPackManifest {
     pub schema_version: u32,
@@ -86,7 +86,7 @@ pub struct BuiltInPolicyPackManifest {
     pub policies: Vec<BuiltInPolicyManifestEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BuiltInPolicyManifestEntry {
     pub path: String,

@@ -51,6 +51,16 @@ impl LanguageAdapter for GoAdapter {
         canonical_go_package_name(file, content_qualifier)
     }
 
+    /// Go import paths are not enumerable from the path alone: an external test
+    /// package appends the declared `_test` suffix to a path-derived base, and a
+    /// module-less file folds the declared package name into that base. Either
+    /// produces a prefix that neither the path nor the persisted qualifier
+    /// contains as a substring, so Go declarations are never dropped by the
+    /// symbol-search prefilter.
+    fn prefilter_path_package(&self, _file: &ProjectFile) -> Option<String> {
+        None
+    }
+
     fn default_package_anchor(&self) -> Option<crate::analyzer::PackageAnchor> {
         Some(crate::analyzer::PackageAnchor::OwnModule { pop: 0 })
     }

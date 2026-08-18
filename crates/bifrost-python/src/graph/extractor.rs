@@ -556,6 +556,14 @@ impl ScanCtx<'_> {
     }
 
     fn module_binding_targets_query(&self, ident: &str, node: Node<'_>) -> bool {
+        // A member receiver must bind the owner symbol itself. A namespace
+        // import only binds the module that contains the owner; treating that
+        // module as the owner conflates `from pkg import child` (the
+        // `pkg.child` module) with a same-named `child` class exported by that
+        // module. Top-level targets still accept either binding kind below.
+        if self.target_member.is_some() {
+            return self.module_binding_targets_symbol(ident, node);
+        }
         if let Some(matches) = self.function_import_binding_targets_query(ident, node) {
             return matches;
         }
@@ -591,7 +599,12 @@ impl ScanCtx<'_> {
         let candidates = resolve_fqn_candidates(self.python, &binding.qualified_name, |name| {
             self.graph.index.definitions(name).collect()
         });
-        Some(candidates.iter().any(|candidate| candidate == self.target))
+        let imported_target = self.target_owner.as_ref().unwrap_or(self.target);
+        Some(
+            candidates
+                .iter()
+                .any(|candidate| candidate == imported_target),
+        )
     }
 
     fn module_binding_matches_query(
@@ -659,36 +672,38 @@ impl ScanCtx<'_> {
     }
 
     fn receiver_type_matches_target(&self, raw_type: &str) -> bool {
-        if receiver_annotation_matches_target(
-            raw_type,
-            self.edges,
-            self.target_short,
-            self.target_self_file,
-        ) {
-            return true;
-        }
-
         let Some(target_owner) = self.target_owner.as_ref() else {
             return false;
         };
-        let Some(receiver_type) = resolve_receiver_type(
+        if let Some(receiver_type) = resolve_receiver_type(
             self.graph,
             self.python,
             self.file,
             raw_type,
             self.target_self_file,
-        ) else {
-            return false;
-        };
-        if &receiver_type == target_owner {
-            return true;
+        ) {
+            if &receiver_type == target_owner {
+                return true;
+            }
+            return self
+                .graph
+                .hierarchy
+                .map(|provider| provider.get_ancestors(&receiver_type))
+                .unwrap_or_default()
+                .into_iter()
+                .any(|ancestor| ancestor == *target_owner);
         }
-        self.graph
-            .hierarchy
-            .map(|provider| provider.get_ancestors(&receiver_type))
-            .unwrap_or_default()
-            .into_iter()
-            .any(|ancestor| ancestor == *target_owner)
+
+        // Preserve the annotation-edge/name fallback only when structured
+        // resolution has no answer. When it identifies a concrete owner, even
+        // a negative answer is authoritative: otherwise identically named
+        // vendored package copies widen into one another.
+        receiver_annotation_matches_target(
+            raw_type,
+            self.edges,
+            self.target_short,
+            self.target_self_file,
+        )
     }
 }
 
@@ -796,6 +811,19 @@ fn handle_annotation_reference_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) 
     ) else {
         return false;
     };
+
+    // Method annotations are part of the surrounding class declaration. A
+    // qualifier such as `types.Handler` therefore uses the class field
+    // `types` when that field was defined earlier in the class body, even
+    // though resolving the complete annotation yields `Handler`.
+    if node.kind() == "attribute"
+        && ctx.target.is_field()
+        && let Some(root) = leftmost_identifier(node)
+        && ctx.target_member == Some(slice(root, ctx.source))
+        && ctx.node_directly_in_owner_class_body(root)
+    {
+        record_hit(root, ctx);
+    }
 
     if (ctx.target.is_class() || ctx.target.is_field() || ctx.target_member.is_none())
         && candidates.iter().all(|candidate| *candidate == *ctx.target)
@@ -1273,7 +1301,16 @@ pub fn call_result_types(
         .collect::<Vec<_>>();
     let mut classes = Vec::new();
     for callable in callables.into_iter().filter(CodeUnit::is_function) {
-        let Some(raw_type) = callable_return_type_name(graph, python, &callable) else {
+        let raw_type = callable_return_type_name(graph, python, &callable).or_else(|| {
+            if callable.source() != file {
+                return None;
+            }
+            let prepared = python.prepared_syntax(file)?;
+            let key = factory_function_key(graph, &callable);
+            collect_factory_return_types_from_root(prepared.tree().root_node(), prepared.source())
+                .remove(&key)
+        });
+        let Some(raw_type) = raw_type else {
             continue;
         };
         if let Some(class) =
@@ -1511,9 +1548,24 @@ fn imported_module_bindings(
         .iter()
         .filter(|event| event.visible_from <= cutoff)
         .collect();
+    // Unaliased dotted imports sharing a root are cumulative in Python:
+    // `import pkg.a; import pkg.b` leaves both attributes on `pkg`. Only a
+    // binding of this local to some other value cuts off those earlier module
+    // imports.
     let start = visible
         .iter()
-        .rposition(|event| !event.conditional)
+        .rposition(|event| {
+            if event.conditional {
+                return false;
+            }
+            match &event.kind {
+                ModuleBindingEventKind::ImportModule {
+                    module,
+                    consumed_attributes,
+                } => *consumed_attributes == 0 && module != root_text,
+                ModuleBindingEventKind::FromImport { .. } | ModuleBindingEventKind::Other => true,
+            }
+        })
         .unwrap_or(0);
     let mut modules = visible[start..]
         .iter()
@@ -1521,10 +1573,14 @@ fn imported_module_bindings(
             ModuleBindingEventKind::ImportModule {
                 module,
                 consumed_attributes,
-            } => Some(ImportedModuleBinding {
-                module: module.clone(),
-                consumed_attributes: *consumed_attributes,
-            }),
+            } => {
+                let mut segments = parse_symbol_path(Language::Python, module);
+                segments.truncate(segments.len().saturating_sub(*consumed_attributes));
+                Some(ImportedModuleBinding {
+                    module: segments.join("."),
+                    consumed_attributes: 0,
+                })
+            }
             ModuleBindingEventKind::FromImport {
                 module,
                 imported_name,
@@ -2218,6 +2274,15 @@ fn callable_return_type_name_in_tree(
     })
 }
 
+fn factory_function_key(graph: &PythonGraphSource<'_>, callable: &CodeUnit) -> String {
+    graph
+        .index
+        .parent_of(callable)
+        .filter(CodeUnit::is_class)
+        .map(|owner| format!("{}.{}", owner.identifier(), callable.identifier()))
+        .unwrap_or_else(|| callable.identifier().to_string())
+}
+
 fn first_function_definition(root: Node<'_>) -> Option<Node<'_>> {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
@@ -2746,6 +2811,7 @@ fn non_empty_node_text(node: Node<'_>, source: &str) -> Option<String> {
 
 fn collect_factory_return_types_from_root(root: Node<'_>, source: &str) -> HashMap<String, String> {
     let mut returns = HashMap::default();
+    let mut functions = Vec::new();
     let mut stack = vec![(root, None::<String>)];
     while let Some((node, class_name)) = stack.pop() {
         match node.kind() {
@@ -2760,16 +2826,40 @@ fn collect_factory_return_types_from_root(root: Node<'_>, source: &str) -> HashM
                 if let Some(name) = node
                     .child_by_field_name("name")
                     .and_then(|name| non_empty_node_text(name, source))
-                    && let Some(return_type) = factory_return_type(node, source)
                 {
                     let key = class_name
                         .as_ref()
                         .map(|class| format!("{class}.{name}"))
                         .unwrap_or(name);
-                    returns.insert(key, return_type);
+                    if let Some(return_type) = factory_return_type(node, source) {
+                        returns.insert(key.clone(), return_type);
+                    }
+                    functions.push((key, class_name, node));
                 }
             }
             _ => push_factory_index_children(node, class_name, &mut stack),
+        }
+    }
+    // A factory can delegate one branch to another local factory and construct
+    // the same class directly on another branch. Canonicalize those AST-derived
+    // return callees to a stable terminal type before deciding the branches
+    // conflict. Iteration is bounded by the number of functions; cycles retain
+    // the conservative raw result instead of recursing.
+    for _ in 0..functions.len() {
+        let mut changed = false;
+        for (key, class_name, function) in &functions {
+            let Some(return_type) =
+                factory_return_type_with_known(*function, source, class_name.as_deref(), &returns)
+            else {
+                continue;
+            };
+            if returns.get(key) != Some(&return_type) {
+                returns.insert(key.clone(), return_type);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
     returns
@@ -2791,6 +2881,15 @@ fn push_factory_index_children<'tree>(
 }
 
 fn factory_return_type(function: Node<'_>, source: &str) -> Option<String> {
+    factory_return_type_with_known(function, source, None, &HashMap::default())
+}
+
+fn factory_return_type_with_known(
+    function: Node<'_>,
+    source: &str,
+    current_class: Option<&str>,
+    known: &HashMap<String, String>,
+) -> Option<String> {
     if let Some(return_type) = function.child_by_field_name("return_type") {
         return receiver_type_from_annotation_node(return_type, source);
     }
@@ -2811,7 +2910,10 @@ fn factory_return_type(function: Node<'_>, source: &str) -> Option<String> {
                 .and_then(|value| returned_receiver_type(value, source))
             {
                 Some(returned_type) => {
-                    candidates.insert(returned_type);
+                    candidates.insert(
+                        canonical_factory_return(&returned_type, current_class, known)
+                            .unwrap_or(returned_type),
+                    );
                 }
                 None => saw_unknown_return = true,
             }
@@ -2827,6 +2929,22 @@ fn factory_return_type(function: Node<'_>, source: &str) -> Option<String> {
     (candidates.len() == 1)
         .then(|| candidates.into_iter().next())
         .flatten()
+}
+
+fn canonical_factory_return(
+    raw: &str,
+    current_class: Option<&str>,
+    known: &HashMap<String, String>,
+) -> Option<String> {
+    let mut current = raw;
+    let mut seen = HashSet::default();
+    while let Some(next) = factory_return_type_for_callee(current, current_class, known) {
+        if !seen.insert(current.to_string()) {
+            return None;
+        }
+        current = next;
+    }
+    Some(current.to_string())
 }
 
 /// Return the runtime class named by a structured Python return annotation.

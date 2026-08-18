@@ -1325,10 +1325,11 @@ mod boundary_evidence_tests {
         jar.finish().expect("finish jar");
     }
 
-    /// A JVM analyzer config whose external realm is exactly the given source
-    /// jar: dependency discovery and JDK discovery stay off so the index reads
-    /// nothing but the fixture's own artifact.
-    fn jvm_config_with_source_jar(jar: Option<PathBuf>) -> AnalyzerConfig {
+    /// A JVM analyzer config whose external realm is exactly the given jar --
+    /// a source jar or a class jar, whichever the caller wrote: dependency
+    /// discovery and JDK discovery stay off so the index reads nothing but the
+    /// fixture's own artifact.
+    fn jvm_config_with_artifact_jar(jar: Option<PathBuf>) -> AnalyzerConfig {
         use crate::analyzer::{
             JvmAnalyzerConfig, JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode,
             JvmExternalArtifact, JvmExternalDependencies, JvmStandardLibraryDiscoveryConfig,
@@ -1523,7 +1524,7 @@ mod boundary_evidence_tests {
                     "com/acme/Gadget.scala",
                     b"package com.acme\nclass Gadget\n",
                 );
-                jvm_config_with_source_jar(Some(jar))
+                jvm_config_with_artifact_jar(Some(jar))
             },
         );
         let (_, trace) = fixture.trace("Gadget = null");
@@ -1543,7 +1544,7 @@ mod boundary_evidence_tests {
             Language::Scala,
             "app/Caller.scala",
             SCALA_BOUNDARY_SOURCE,
-            |_| jvm_config_with_source_jar(None),
+            |_| jvm_config_with_artifact_jar(None),
         );
         fixture.workspace.retain_dependency_discovery_evidence(
             &[Language::Scala],
@@ -1674,7 +1675,7 @@ mod boundary_evidence_tests {
                     "com/acme/Gadget.kt",
                     b"package com.acme\nclass Gadget\n",
                 );
-                jvm_config_with_source_jar(Some(jar))
+                jvm_config_with_artifact_jar(Some(jar))
             },
         );
         let (_, trace) = fixture.trace("Gadget? = null");
@@ -1694,7 +1695,7 @@ mod boundary_evidence_tests {
             Language::Kotlin,
             "app/Caller.kt",
             KOTLIN_BOUNDARY_SOURCE,
-            |_| jvm_config_with_source_jar(None),
+            |_| jvm_config_with_artifact_jar(None),
         );
         let (_, trace) = fixture.trace("Gadget? = null");
         assert!(
@@ -1934,7 +1935,7 @@ mod boundary_evidence_tests {
             Language::Java,
             "app/Caller.java",
             JVM_PACK_JAVA_SOURCE,
-            |_| jvm_config_with_source_jar(None),
+            |_| jvm_config_with_artifact_jar(None),
         );
         let pack = jdk_collections_pack(serde_json::json!([]));
         activate_fixture_pack(
@@ -1976,7 +1977,7 @@ mod boundary_evidence_tests {
             Language::Java,
             "app/Caller.java",
             JVM_PACK_JAVA_SOURCE,
-            |_| jvm_config_with_source_jar(None),
+            |_| jvm_config_with_artifact_jar(None),
         );
         let (_, trace) = fixture.trace("Collections helper");
         let routes = external_routes(&trace);
@@ -1997,7 +1998,7 @@ mod boundary_evidence_tests {
             Language::Kotlin,
             "app/Caller.kt",
             JVM_PACK_KOTLIN_SOURCE,
-            |_| jvm_config_with_source_jar(None),
+            |_| jvm_config_with_artifact_jar(None),
         );
         let pack = jdk_collections_pack(serde_json::json!([]));
         activate_fixture_pack(
@@ -2029,7 +2030,7 @@ mod boundary_evidence_tests {
             Language::Java,
             "app/Caller.java",
             JVM_PACK_JAVA_SOURCE,
-            |_| jvm_config_with_source_jar(None),
+            |_| jvm_config_with_artifact_jar(None),
         );
         let type_id = type_declaration_id(TypeIdentity {
             ecosystem: "composer",
@@ -2070,7 +2071,7 @@ mod boundary_evidence_tests {
             Language::Java,
             "app/Caller.java",
             JVM_PACK_JAVA_SOURCE,
-            |_| jvm_config_with_source_jar(None),
+            |_| jvm_config_with_artifact_jar(None),
         );
         let pack = jdk_collections_pack(serde_json::json!([]));
         activate_fixture_pack(
@@ -2120,7 +2121,7 @@ mod boundary_evidence_tests {
             Language::Java,
             "app/Caller.java",
             JVM_PACK_JAVA_MEMBER_SOURCE,
-            |_| jvm_config_with_source_jar(None),
+            |_| jvm_config_with_artifact_jar(None),
         );
         activate_fixture_pack(
             &fixture,
@@ -2199,7 +2200,7 @@ mod boundary_evidence_tests {
             Language::Java,
             "app/Caller.java",
             JVM_PACK_JAVA_MEMBER_SOURCE,
-            |_| jvm_config_with_source_jar(None),
+            |_| jvm_config_with_artifact_jar(None),
         );
         activate_fixture_pack(
             &fixture,
@@ -2231,6 +2232,183 @@ mod boundary_evidence_tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // The artifact half of the same member surface: jar-indexed owners (#1900).
+    // -----------------------------------------------------------------------
+
+    /// One file whose calls spell members of a type a *class jar* declares.
+    /// `register` is declared on the owner itself, `reset` is inherited from
+    /// its base class in the same jar, and `absent` is the near miss no class
+    /// file declares.
+    const JVM_ARTIFACT_JAVA_MEMBER_SOURCE: &str = concat!(
+        "package app;\n",
+        "\n",
+        "import com.example.probe.Registry;\n",
+        "\n",
+        "class Caller {\n",
+        "  void run() {\n",
+        "    Registry.register(\"x\");\n",
+        "    Registry.reset();\n",
+        "    Registry.absent();\n",
+        "  }\n",
+        "}\n",
+    );
+
+    /// A class JAR declaring `com.example.probe.Registry extends
+    /// com.example.probe.BaseRegistry`, written without a JDK so the test runs
+    /// everywhere.
+    fn write_probe_class_jar(path: &Path) {
+        use crate::analyzer::jvm::external::{
+            TestClassFile, TestClassMethod, write_test_class_jar,
+        };
+
+        write_test_class_jar(
+            path,
+            &[
+                TestClassFile {
+                    internal_name: "com/example/probe/Registry",
+                    super_internal_name: "com/example/probe/BaseRegistry",
+                    methods: &[TestClassMethod {
+                        name: "register",
+                        descriptor: "(Ljava/lang/String;)V",
+                        is_static: true,
+                    }],
+                    private_nested: false,
+                },
+                TestClassFile {
+                    internal_name: "com/example/probe/BaseRegistry",
+                    super_internal_name: "java/lang/Object",
+                    methods: &[TestClassMethod {
+                        name: "reset",
+                        descriptor: "()V",
+                        is_static: true,
+                    }],
+                    private_nested: false,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn a_java_member_of_a_class_jar_type_reports_external_indexed() {
+        // #1900 acceptance for the artifact half: no pack is activated at all.
+        // The jar on disk declares `com.example.probe.Registry` *and* the
+        // members its class files carry, and the whole written name
+        // `Registry.register` reaches the member declaration from both of the
+        // sites that spell it -- the same conclusion the pack half reaches, on
+        // the same route, through the same one lookup.
+        let jars = tempfile::tempdir().expect("jar dir");
+        let jar = jars.path().join("probe.jar");
+        write_probe_class_jar(&jar);
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_ARTIFACT_JAVA_MEMBER_SOURCE,
+            |_| jvm_config_with_artifact_jar(Some(jar.clone())),
+        );
+
+        // Receiver position: the caret is on `Registry`, and the reference site
+        // spans the whole `Registry.register` spelling.
+        let (_, trace) = fixture.trace("Registry.register");
+        let routes = external_routes(&trace);
+        assert!(
+            routes.iter().all(|(boundary, target)| {
+                *boundary == BoundaryStatus::ExternalIndexed
+                    && target.as_deref() == Some("com.example.probe.Registry.register")
+            }),
+            "the indexed class jar declares the `register` member: {routes:?}"
+        );
+
+        // Member position: the caret is on `register`, whose receiver names a
+        // type this workspace does not index.
+        let (outcome, trace) = fixture.trace("register(\"x\")");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "the member is declared past a boundary, not absent: {:?}",
+            outcome.diagnostics
+        );
+        let selected: Vec<_> = trace
+            .candidates
+            .iter()
+            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
+            .collect();
+        assert!(
+            !selected.is_empty()
+                && selected
+                    .iter()
+                    .all(|row| row.is_selected() && row.tier == Some(PrecedenceTier::ExternalRoot)),
+            "a named external member is the selection: {selected:?}"
+        );
+
+        // Inherited: `reset` is declared on the base class in the same jar, and
+        // the reported target names where it is declared rather than where it
+        // was written.
+        let (_, trace) = fixture.trace("Registry.reset");
+        let routes = external_routes(&trace);
+        assert!(
+            routes.iter().all(|(boundary, target)| {
+                *boundary == BoundaryStatus::ExternalIndexed
+                    && target.as_deref() == Some("com.example.probe.BaseRegistry.reset")
+            }),
+            "an inherited member answers where it is declared: {routes:?}"
+        );
+
+        // Boundary honesty on the same owner: no class file declares `absent`,
+        // so the spelling keeps the status it had. The owner is decided, which
+        // is why the route exists at all, and nothing upgrades it.
+        let (_, trace) = fixture.trace("Registry.absent");
+        let routes = external_routes(&trace);
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
+            "a member no class file declares must not be upgraded: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn a_class_jar_the_index_could_not_read_proves_nothing_about_its_members() {
+        // The honesty rule #1900 names, on the artifact half: a jar the bounded
+        // read could not open declares nothing, so every member spelling on it
+        // stays unknown. This is the artifact counterpart of "a pack that
+        // declares no members proves nothing about them", and it is what
+        // separates "the member is not there" from "nothing read the class file
+        // that would say".
+        let jars = tempfile::tempdir().expect("jar dir");
+        let jar = jars.path().join("probe.jar");
+        std::fs::write(&jar, b"not a zip archive at all").expect("write the corrupt jar");
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_ARTIFACT_JAVA_MEMBER_SOURCE,
+            |_| jvm_config_with_artifact_jar(Some(jar.clone())),
+        );
+
+        let (_, trace) = fixture.trace("Registry.register");
+        let routes = route_rows(&trace);
+        assert!(
+            routes.iter().all(
+                |(boundary, target)| *boundary != BoundaryStatus::ExternalIndexed
+                    && target.is_none()
+            ),
+            "an unread jar names no member: {routes:?}"
+        );
+
+        let (outcome, trace) = fixture.trace("register(\"x\")");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::NoDefinition,
+            "an unread jar's member is not a proven boundary crossing: {:?}",
+            outcome.diagnostics
+        );
+        assert!(
+            route_rows(&trace).is_empty(),
+            "nothing declares the member, so no route out of the workspace: {:?}",
+            trace.candidates
+        );
+    }
+
     #[test]
     fn the_shared_surface_answers_a_kotlin_and_a_scala_member_spelling() {
         // Java, Kotlin and Scala share one classpath and therefore one external
@@ -2238,13 +2416,8 @@ mod boundary_evidence_tests {
         // `language: java` answers a member spelling written in any of them,
         // each resolved through its own language's import ladder for the owner.
         //
-        // This asserts at the boundary-evidence seam rather than end to end,
-        // because neither Kotlin's nor Scala's resolver routes a
-        // receiver-position `Collections.sort` to its import-boundary gate at
-        // all: both report a plain miss (`no_indexed_definition`,
-        // `receiver_type_unknown`) with no route out of the workspace. That is
-        // a gate gap in those two resolvers, not a gap in the member surface,
-        // and Java's end-to-end tests above cover the resolver half.
+        // This asserts at the boundary-evidence seam; the two tests below carry
+        // the same claim end to end through each resolver's own boundary gate.
         const KOTLIN_MEMBER_SOURCE: &str = concat!(
             "package app\n",
             "import java.util.Collections\n",
@@ -2264,7 +2437,7 @@ mod boundary_evidence_tests {
             Language::Kotlin,
             "app/Caller.kt",
             KOTLIN_MEMBER_SOURCE,
-            |_| jvm_config_with_source_jar(None),
+            |_| jvm_config_with_artifact_jar(None),
         );
         activate_fixture_pack(
             &kotlin,
@@ -2294,7 +2467,7 @@ mod boundary_evidence_tests {
             Language::Scala,
             "app/Caller.scala",
             SCALA_MEMBER_SOURCE,
-            |_| jvm_config_with_source_jar(None),
+            |_| jvm_config_with_artifact_jar(None),
         );
         activate_fixture_pack(
             &scala,
@@ -2319,5 +2492,366 @@ mod boundary_evidence_tests {
             ),
             "Scala's import ladder reaches the pack-declared member"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Kotlin and Scala reach the same gate through their own resolvers (#2287).
+    // -----------------------------------------------------------------------
+
+    /// A Kotlin caller of a member whose owner lives in a dependency JAR.
+    const JVM_ARTIFACT_KOTLIN_MEMBER_SOURCE: &str = concat!(
+        "package app\n",
+        "import com.example.probe.Registry\n",
+        "class Caller {\n",
+        "  fun run() { Registry.register(\"x\") }\n",
+        "}\n",
+    );
+
+    /// The same caller written in Scala. The owner is named through a wildcard
+    /// import rather than an explicit one on purpose: an explicit Scala import
+    /// whose target is unindexed already draws a boundary of its own, so a
+    /// wildcard is the shape where the member surface is the only thing that
+    /// can carry the claim.
+    const JVM_ARTIFACT_SCALA_MEMBER_SOURCE: &str = concat!(
+        "package app\n",
+        "import com.example.probe.*\n",
+        "class Caller {\n",
+        "  def run(): Unit = Registry.register(\"x\")\n",
+        "}\n",
+    );
+
+    /// A class JAR declaring `com.example.probe.Registry` and *no members at
+    /// all*. The owner type is indexed exactly as it is in
+    /// [`write_probe_class_jar`]; only the member surface differs, which is
+    /// what makes the paired runs a discriminator about the member rather than
+    /// about the type or about the JAR merely existing.
+    fn write_memberless_probe_class_jar(path: &Path) {
+        use crate::analyzer::jvm::external::{TestClassFile, write_test_class_jar};
+
+        write_test_class_jar(
+            path,
+            &[TestClassFile {
+                internal_name: "com/example/probe/Registry",
+                super_internal_name: "java/lang/Object",
+                methods: &[],
+                private_nested: false,
+            }],
+        );
+    }
+
+    /// What one caret over the written `Registry.register` spelling answered.
+    struct MemberSpellingAnswer {
+        status: DefinitionLookupStatus,
+        routes: Vec<(BoundaryStatus, Option<String>)>,
+    }
+
+    /// The answers a receiver-position caret and a member-position caret each
+    /// produce for the one written `Registry.register` spelling.
+    fn member_spelling_answers(fixture: &BoundaryFixture) -> Vec<MemberSpellingAnswer> {
+        ["Registry.register", "register(\"x\")"]
+            .into_iter()
+            .map(|needle| {
+                let (outcome, trace) = fixture.trace(needle);
+                MemberSpellingAnswer {
+                    status: outcome.status,
+                    routes: route_rows(&trace),
+                }
+            })
+            .collect()
+    }
+
+    /// The #1900 acceptance shape, reproduced for Kotlin (#2287): three paired
+    /// runs over one workspace whose only difference is what the JAR declares.
+    ///
+    /// Before this change both carets died inside Kotlin's own
+    /// unresolved-receiver path (`no_indexed_definition` on the receiver,
+    /// `receiver_type_unknown` on the member) and no trace carried a route out
+    /// of the workspace at all, so nothing downstream could tell an external
+    /// member from an absent one.
+    #[test]
+    fn a_kotlin_member_of_a_class_jar_type_concludes_only_when_the_jar_declared_it() {
+        let jars = tempfile::tempdir().expect("jar dir");
+
+        // The JAR declares `register`: both carets report the boundary they
+        // crossed, and the route names the exact external declaration.
+        let declared = jars.path().join("declared.jar");
+        write_probe_class_jar(&declared);
+        let fixture = BoundaryFixture::with_config(
+            Language::Kotlin,
+            "app/Caller.kt",
+            JVM_ARTIFACT_KOTLIN_MEMBER_SOURCE,
+            |_| jvm_config_with_artifact_jar(Some(declared.clone())),
+        );
+        for answer in member_spelling_answers(&fixture) {
+            assert_eq!(
+                answer.status,
+                DefinitionLookupStatus::UnresolvableImportBoundary,
+                "the member is declared past a boundary, not absent"
+            );
+            assert!(
+                !answer.routes.is_empty()
+                    && answer.routes.iter().all(|(boundary, target)| {
+                        *boundary == BoundaryStatus::ExternalIndexed
+                            && target.as_deref() == Some("com.example.probe.Registry.register")
+                    }),
+                "the indexed class jar declares the `register` member: {:?}",
+                answer.routes
+            );
+        }
+        let (_, trace) = fixture.trace("Registry.register");
+        let selected: Vec<_> = trace
+            .candidates
+            .iter()
+            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
+            .collect();
+        assert!(
+            !selected.is_empty()
+                && selected
+                    .iter()
+                    .all(|row| row.is_selected() && row.tier == Some(PrecedenceTier::ExternalRoot)),
+            "a named external member is the selection: {selected:?}"
+        );
+
+        // No JAR anywhere: nothing read a class file, so the spelling stays
+        // unknown and no route is drawn.
+        let absent = BoundaryFixture::with_config(
+            Language::Kotlin,
+            "app/Caller.kt",
+            JVM_ARTIFACT_KOTLIN_MEMBER_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+        for answer in member_spelling_answers(&absent) {
+            assert_eq!(
+                answer.status,
+                DefinitionLookupStatus::NoDefinition,
+                "with no jar the member spelling is not a proven boundary crossing"
+            );
+            assert!(
+                answer.routes.is_empty(),
+                "nothing declares the member, so no route out of the workspace: {:?}",
+                answer.routes
+            );
+        }
+
+        // The discriminator that names the *member*: the same owner type,
+        // still indexed, whose class file declares no members. The conclusion
+        // above therefore rests on `register` having been read.
+        let memberless = jars.path().join("memberless.jar");
+        write_memberless_probe_class_jar(&memberless);
+        let type_only = BoundaryFixture::with_config(
+            Language::Kotlin,
+            "app/Caller.kt",
+            JVM_ARTIFACT_KOTLIN_MEMBER_SOURCE,
+            |_| jvm_config_with_artifact_jar(Some(memberless.clone())),
+        );
+        for answer in member_spelling_answers(&type_only) {
+            assert_eq!(
+                answer.status,
+                DefinitionLookupStatus::NoDefinition,
+                "an indexed owner that declares no members proves nothing about them"
+            );
+            assert!(
+                answer.routes.is_empty(),
+                "a member no class file declares must not be upgraded: {:?}",
+                answer.routes
+            );
+        }
+    }
+
+    /// The same three paired runs for Scala (#2287).
+    ///
+    /// Before this change the receiver caret reported `no_indexed_definition`
+    /// and the member caret `unsupported_scala_receiver`, with no route out of
+    /// the workspace on either.
+    #[test]
+    fn a_scala_member_of_a_class_jar_type_concludes_only_when_the_jar_declared_it() {
+        let jars = tempfile::tempdir().expect("jar dir");
+
+        let declared = jars.path().join("declared.jar");
+        write_probe_class_jar(&declared);
+        let fixture = BoundaryFixture::with_config(
+            Language::Scala,
+            "app/Caller.scala",
+            JVM_ARTIFACT_SCALA_MEMBER_SOURCE,
+            |_| jvm_config_with_artifact_jar(Some(declared.clone())),
+        );
+        for answer in member_spelling_answers(&fixture) {
+            assert_eq!(
+                answer.status,
+                DefinitionLookupStatus::UnresolvableImportBoundary,
+                "the member is declared past a boundary, not absent"
+            );
+            assert!(
+                !answer.routes.is_empty()
+                    && answer.routes.iter().all(|(boundary, target)| {
+                        *boundary == BoundaryStatus::ExternalIndexed
+                            && target.as_deref() == Some("com.example.probe.Registry.register")
+                    }),
+                "the indexed class jar declares the `register` member: {:?}",
+                answer.routes
+            );
+        }
+        let (_, trace) = fixture.trace("Registry.register");
+        let selected: Vec<_> = trace
+            .candidates
+            .iter()
+            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
+            .collect();
+        assert!(
+            !selected.is_empty()
+                && selected
+                    .iter()
+                    .all(|row| row.is_selected() && row.tier == Some(PrecedenceTier::ExternalRoot)),
+            "a named external member is the selection: {selected:?}"
+        );
+
+        let absent = BoundaryFixture::with_config(
+            Language::Scala,
+            "app/Caller.scala",
+            JVM_ARTIFACT_SCALA_MEMBER_SOURCE,
+            |_| jvm_config_with_artifact_jar(None),
+        );
+        for answer in member_spelling_answers(&absent) {
+            assert_eq!(
+                answer.status,
+                DefinitionLookupStatus::NoDefinition,
+                "with no jar the member spelling is not a proven boundary crossing"
+            );
+            assert!(
+                answer.routes.is_empty(),
+                "nothing declares the member, so no route out of the workspace: {:?}",
+                answer.routes
+            );
+        }
+
+        let memberless = jars.path().join("memberless.jar");
+        write_memberless_probe_class_jar(&memberless);
+        let type_only = BoundaryFixture::with_config(
+            Language::Scala,
+            "app/Caller.scala",
+            JVM_ARTIFACT_SCALA_MEMBER_SOURCE,
+            |_| jvm_config_with_artifact_jar(Some(memberless.clone())),
+        );
+        for answer in member_spelling_answers(&type_only) {
+            assert_eq!(
+                answer.status,
+                DefinitionLookupStatus::NoDefinition,
+                "an indexed owner that declares no members proves nothing about them"
+            );
+            assert!(
+                answer.routes.is_empty(),
+                "a member no class file declares must not be upgraded: {:?}",
+                answer.routes
+            );
+        }
+    }
+
+    /// The pack half of the same claim, once per language (#2287): an activated
+    /// declaration-facts pack and no artifact anywhere on disk.
+    ///
+    /// Scala names the owner through an *explicit* import here, which is the
+    /// shape whose unindexed-import verdict already drew a boundary of its own
+    /// before this change. The route it drew named nothing, so the pair below
+    /// is still the member discriminator: with the member declared the route is
+    /// selected and names `java.util.Collections.sort`; with an emptied members
+    /// array the same run keeps a route that names nothing and is not selected.
+    #[test]
+    fn a_kotlin_and_a_scala_member_of_a_pack_declared_type_report_external_indexed() {
+        const KOTLIN_MEMBER_SOURCE: &str = concat!(
+            "package app\n",
+            "import java.util.Collections\n",
+            "class Caller {\n",
+            "  fun order(names: MutableList<String>) { Collections.sort(names) }\n",
+            "}\n",
+        );
+        const SCALA_MEMBER_SOURCE: &str = concat!(
+            "package app\n",
+            "import java.util.Collections\n",
+            "class Caller {\n",
+            "  def order(names: java.util.List[String]): Unit = Collections.sort(names)\n",
+            "}\n",
+        );
+
+        for (language, path, source) in [
+            (Language::Kotlin, "app/Caller.kt", KOTLIN_MEMBER_SOURCE),
+            (Language::Scala, "app/Caller.scala", SCALA_MEMBER_SOURCE),
+        ] {
+            let declared = BoundaryFixture::with_config(language, path, source, |_| {
+                jvm_config_with_artifact_jar(None)
+            });
+            activate_fixture_pack(
+                &declared,
+                "fixture.jdk",
+                &jdk_collections_pack(collections_sort_member()),
+                activation_evidence("java", "jdk", "java.base"),
+            );
+            for needle in ["Collections.sort", "sort(names)"] {
+                let (outcome, trace) = declared.trace(needle);
+                assert_eq!(
+                    outcome.status,
+                    DefinitionLookupStatus::UnresolvableImportBoundary,
+                    "{language:?} {needle:?}: the pack declares the member, so the \
+                     reference crossed a boundary: {:?}",
+                    outcome.diagnostics
+                );
+                let routes = external_routes(&trace);
+                assert!(
+                    routes.iter().all(|(boundary, target)| {
+                        *boundary == BoundaryStatus::ExternalIndexed
+                            && target.as_deref() == Some("java.util.Collections.sort")
+                    }),
+                    "{language:?} {needle:?}: the activated pack declares `sort`: {routes:?}"
+                );
+                let selected: Vec<_> = trace
+                    .candidates
+                    .iter()
+                    .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
+                    .collect();
+                assert!(
+                    selected.iter().all(|row| {
+                        row.is_selected() && row.tier == Some(PrecedenceTier::ExternalRoot)
+                    }),
+                    "{language:?} {needle:?}: a named external member is the \
+                     selection: {selected:?}"
+                );
+            }
+
+            // The same pack with an emptied `members` array: the owner type is
+            // still declared and still activated, and every member spelling on
+            // it stays exactly as unknown as it was before activation.
+            let type_only = BoundaryFixture::with_config(language, path, source, |_| {
+                jvm_config_with_artifact_jar(None)
+            });
+            activate_fixture_pack(
+                &type_only,
+                "fixture.jdk",
+                &jdk_collections_pack(serde_json::json!([])),
+                activation_evidence("java", "jdk", "java.base"),
+            );
+            for needle in ["Collections.sort", "sort(names)"] {
+                let (_, trace) = type_only.trace(needle);
+                assert!(
+                    route_rows(&trace).iter().all(|(boundary, target)| {
+                        *boundary != BoundaryStatus::ExternalIndexed && target.is_none()
+                    }),
+                    "{language:?} {needle:?}: a pack with no members decides no \
+                     member: {:?}",
+                    route_rows(&trace)
+                );
+                assert!(
+                    trace
+                        .candidates
+                        .iter()
+                        .filter(|row| matches!(
+                            row.candidate,
+                            TraceCandidateRef::ExternalRoute { .. }
+                        ))
+                        .all(|row| !row.is_selected()),
+                    "{language:?} {needle:?}: nothing named the member, so nothing \
+                     was selected: {:?}",
+                    trace.candidates
+                );
+            }
+        }
     }
 }

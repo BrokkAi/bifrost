@@ -51,3 +51,4 @@ pub mod ts_owners;
 pub mod tsconfig;
 pub mod type_text;
 pub mod typescript;
+pub mod workspace_packages;

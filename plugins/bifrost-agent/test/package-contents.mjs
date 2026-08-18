@@ -55,8 +55,6 @@ const requiredFiles = [
   "bin/bifrost-launcher.mjs",
   "bin/bifrost-launcher.d.mts",
   "bifrost-release.json",
-  ".codex-plugin/plugin.json",
-  ".mcp.json",
   "plugin.json",
   "mcp.json",
   "extensions/bifrost.ts",

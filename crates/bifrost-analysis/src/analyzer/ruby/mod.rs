@@ -432,6 +432,10 @@ impl IAnalyzer for RubyAnalyzer {
         self.inner.invalidate_cached_file_identities();
     }
 
+    fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {
+        self.inner.working_tree_identity()
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.begin_query(context);
     }

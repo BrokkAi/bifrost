@@ -454,6 +454,10 @@ impl ScalaQueryTargetCatalog {
                     spec.owner_name.clone(),
                     companion_query_surface_name(spec),
                     Some(spec.target.identifier().to_string()),
+                    // A constructor is also written `C.apply(..)`: the synthetic
+                    // companion apply of a case class is this same declaration,
+                    // so the scan must visit `apply` terminals for it.
+                    (spec.kind == TargetKind::Constructor).then(|| "apply".to_string()),
                 ]
             })
             .flatten()

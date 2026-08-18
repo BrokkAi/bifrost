@@ -12,11 +12,14 @@ publish = true
 name = "brokk_bifrost_policy"
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.2" }
-brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.10.2" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.3" }
+brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.10.3" }
 cap-std = { version = "4.0.2", default-features = false }
 chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
 cvss = { version = "2.2.0", default-features = false, features = ["std", "v3", "v4"] }
+# The built-in policy pack manifest is the `list_policies` MCP result, and that
+# tool advertises a generated JSON Schema `outputSchema`.
+schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.8"
@@ -24,7 +27,7 @@ tree-sitter = "0.25.10"
 url = { version = "2.5.8", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.2", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.3", features = ["test-support"] }
 tempfile = "3.23.0"
 
 # Unix: the RQLP directory loader's symlink/permission tests inspect raw modes.

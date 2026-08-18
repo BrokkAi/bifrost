@@ -1,9 +1,8 @@
 # Bifrost Agent Plugin
 
-This directory implements the Agent Plugins v1 package for Bifrost. Codex uses
-its package adapter, while the root package files remain the portable Agent
-Plugins v1 fallback. Pi, Claude Code, and Cursor also use this directory with
-their host adapters. Every host reuses the same launcher and pinned release
+This directory implements the Agent Plugins v1 package for Bifrost. Codex can
+use the root package files. Pi, Claude Code, and Cursor also use this directory
+with their host adapters. Every host reuses the same launcher and pinned release
 metadata. The npm package `@brokk/bifrost-agent` contains the Pi extension.
 
 None of these distributions bundles the Bifrost binary. The launcher resolves a
@@ -18,9 +17,8 @@ namespace-qualified install names.
 
 Claude Code starts
 `${CLAUDE_PLUGIN_ROOT}/bin/bifrost-launcher.mjs --mcp "symbol|extended"` from
-the host-specific `claude-mcp.json`. Codex selects
-`.codex-plugin/plugin.json`, which points to `.mcp.json` and resolves the same
-launcher from the installed package root.
+the host-specific `claude-mcp.json`. Codex starts the same launcher through
+the portable root `mcp.json`.
 
 ## Portable Agent Plugins v1 Package
 
@@ -30,8 +28,7 @@ The package root contains the portable Agent Plugins v1 files:
 - `mcp.json` gives the portable Bifrost stdio server.
 - `skills/` contains portable skill directories.
 
-Codex uses `.codex-plugin/plugin.json` and `.mcp.json`; the root files remain
-the portable fallback. Claude Code uses
+Codex uses these root files without an adapter. Claude Code uses
 `.claude-plugin/plugin.json` and
 `claude-mcp.json`. Cursor uses `.cursor-plugin/plugin.json` and
 `cursor-mcp.json` because Cursor needs `${CURSOR_PLUGIN_ROOT}` and timeout
@@ -149,7 +146,7 @@ pi install "$(pwd)"
 After `@brokk/bifrost-agent` is published to npm, install a pinned release with:
 
 ```bash
-pi install npm:@brokk/bifrost-agent@0.10.2
+pi install npm:@brokk/bifrost-agent@0.10.3
 ```
 
 Run `/bifrost` in Pi's interactive TUI to configure Bifrost for the current

@@ -153,6 +153,40 @@ pub(crate) fn call_target_refinement_call(
     }
 }
 
+/// Whether an unresolved call-target gap belongs to a zero-argument object
+/// allocation whose constructor body is not materialized. The allocation
+/// effect itself gives heap flow a complete identity; constructor dispatch is
+/// retained as a structured gap but does not invalidate that identity.
+pub(crate) fn constructor_call_gap_is_discharged(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    gap: &crate::analyzer::semantic::SemanticGap,
+) -> bool {
+    let Some(call) =
+        call_target_refinement_call(semantics, gap).and_then(|call| semantics.call_site(call))
+    else {
+        return false;
+    };
+    allocation_call_is_dischargeable(semantics, call)
+}
+
+/// Whether a call's retained allocation result makes an unresolved
+/// zero-argument constructor boundary fully modeled for value flow.
+pub(crate) fn allocation_call_is_dischargeable(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    call: &crate::analyzer::semantic::SemanticCallSite,
+) -> bool {
+    if !call.arguments.is_empty() {
+        return false;
+    }
+    let Some(result) = call.result else {
+        return false;
+    };
+    semantics
+        .allocations()
+        .iter()
+        .any(|allocation| allocation.result == result)
+}
+
 /// Whether a call-target refinement gap is discharged directly by the
 /// adapter's own statically proven `declared_targets` (#1952). A refinement
 /// gap on a call the adapter could not prove stays relevant here; the plan
@@ -322,9 +356,10 @@ fn location_value_reads(location: &MemoryLocationKind) -> usize {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoadOrigin {
     Unique(MemoryLocationId),
+    Value(ValueId),
     Ambiguous,
 }
 
@@ -377,26 +412,43 @@ fn memory_load_origins(
                 events: 1,
                 ..SemanticWork::default()
             })?;
-            let SemanticEffect::MemoryLoad {
-                location, result, ..
-            } = event.effect
-            else {
-                continue;
+            let origin = match event.effect {
+                SemanticEffect::Assignment { target, value }
+                | SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    target,
+                    source: value,
+                } => {
+                    charge(SemanticWork {
+                        values: 2,
+                        nested_entries: 1,
+                        ..SemanticWork::default()
+                    })?;
+                    Some((target, LoadOrigin::Value(value)))
+                }
+                SemanticEffect::MemoryLoad {
+                    location, result, ..
+                } => {
+                    charge(SemanticWork {
+                        values: 1,
+                        memory_locations: 1,
+                        nested_entries: 1,
+                        ..SemanticWork::default()
+                    })?;
+                    Some((result, LoadOrigin::Unique(location)))
+                }
+                _ => None,
             };
-            charge(SemanticWork {
-                values: 1,
-                memory_locations: 1,
-                nested_entries: 1,
-                ..SemanticWork::default()
-            })?;
-            origins
-                .entry(result)
-                .and_modify(|origin| {
-                    if !matches!(origin, LoadOrigin::Unique(existing) if *existing == location) {
-                        *origin = LoadOrigin::Ambiguous;
-                    }
-                })
-                .or_insert(LoadOrigin::Unique(location));
+            if let Some((value, origin)) = origin {
+                origins
+                    .entry(value)
+                    .and_modify(|existing| {
+                        if *existing != origin {
+                            *existing = LoadOrigin::Ambiguous;
+                        }
+                    })
+                    .or_insert(origin);
+            }
         }
     }
     Ok(origins)
@@ -425,10 +477,11 @@ fn resolve_access_path<'location>(
 ) -> Result<AccessPathResolution, SemanticProviderError> {
     let mut current = location;
     let mut visited = HashSet::new();
+    let mut visited_values = HashSet::new();
     let mut selectors = VecDeque::new();
     let mut summarized = false;
 
-    let root = loop {
+    let root = 'locations: loop {
         if cancellation.is_cancelled() {
             return Ok(AccessPathResolution::Interrupted(Interruption::Cancelled));
         }
@@ -481,14 +534,26 @@ fn resolve_access_path<'location>(
             }
         };
 
-        match load_origins.get(&base) {
-            Some(LoadOrigin::Unique(next)) if !visited.contains(next) => current = *next,
-            Some(LoadOrigin::Unique(_)) | Some(LoadOrigin::Ambiguous) => {
-                summarized = true;
-                break AccessPathRootDraft::Value(base);
+        let mut root_value = base;
+        let root = loop {
+            match load_origins.get(&root_value) {
+                Some(LoadOrigin::Value(next)) if visited_values.insert(root_value) => {
+                    root_value = *next;
+                }
+                Some(LoadOrigin::Unique(next)) if !visited.contains(next) => {
+                    current = *next;
+                    continue 'locations;
+                }
+                Some(LoadOrigin::Value(_))
+                | Some(LoadOrigin::Unique(_))
+                | Some(LoadOrigin::Ambiguous) => {
+                    summarized = true;
+                    break AccessPathRootDraft::Value(root_value);
+                }
+                None => break AccessPathRootDraft::Value(root_value),
             }
-            None => break AccessPathRootDraft::Value(base),
-        }
+        };
+        break root;
     };
 
     Ok(AccessPathResolution::Resolved(AccessPathDraft {
@@ -502,17 +567,21 @@ fn resolve_access_path<'location>(
     }))
 }
 
-/// Whether a bounded location names an exact index selector. Two mentions of
-/// the same source index produce distinct index values, so exact-index
-/// equality across accesses is not value-proven; relations through such a
-/// location keep partial completeness (#1952) instead of letting a run claim
-/// a complete negative over an unproven index join.
-fn location_has_exact_index(location: &AbstractLocation) -> bool {
-    location
-        .path()
-        .selectors()
-        .iter()
-        .any(|selector| matches!(selector, AccessSelector::Index(IndexSelector::Exact(_))))
+/// Whether a bounded location names a non-constant exact index selector.
+/// Constant index values are canonicalized by language lowering, while a
+/// dynamic index remains an unproven join even when its expression value is
+/// reused across accesses.
+fn location_has_unproven_exact_index(location: &AbstractLocation) -> bool {
+    location.path().selectors().iter().any(|selector| {
+        let AccessSelector::Index(IndexSelector::Exact(index)) = selector else {
+            return false;
+        };
+        !index
+            .procedure()
+            .semantics()
+            .value(index.id())
+            .is_some_and(|value| matches!(value.kind, SemanticValueKind::Constant))
+    })
 }
 
 fn materialize_abstract_location(
@@ -1005,6 +1074,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 }
                 let relevant = gap_impacts_value_flow(gap)
                     && !declared_proven_target_discharges_gap(procedure.semantics(), gap)
+                    && !constructor_call_gap_is_discharged(procedure.semantics(), gap)
                     && !implicit_abort_gap_is_discharged(gap, abort_user_code);
                 open |= relevant;
                 if relevant {
@@ -1306,7 +1376,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                                 .expect("memory loads resolve an access path"),
                             *self.limits(),
                         )?;
-                        exact_index |= location_has_exact_index(&location);
+                        exact_index |= location_has_unproven_exact_index(&location);
                         (
                             ValueFlowRelationKind::MemoryLoad,
                             ValueFlowEndpoint::Location(Box::new(location)),
@@ -1322,7 +1392,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                                 .expect("memory stores resolve an access path"),
                             *self.limits(),
                         )?;
-                        exact_index |= location_has_exact_index(&location);
+                        exact_index |= location_has_unproven_exact_index(&location);
                         (
                             ValueFlowRelationKind::MemoryStore,
                             ValueFlowEndpoint::Value(value_handle(procedure, *value)?),

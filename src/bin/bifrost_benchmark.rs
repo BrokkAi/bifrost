@@ -1,0 +1,706 @@
+use brokk_bifrost::benchmark::{
+    BenchmarkCompareReport, BenchmarkManifest, BenchmarkProfile, BenchmarkRunReport,
+    BenchmarkScenario, ManifestLanguage, RunRequest, run_benchmark,
+};
+use chrono::Utc;
+use serde::Serialize;
+use std::env;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), String> {
+    let mut args = env::args().skip(1);
+    let mut manifest_path = PathBuf::from("benchmark/targets.toml");
+
+    let Some(command) = args.next() else {
+        print_help();
+        return Err("missing subcommand".to_string());
+    };
+
+    match command.as_str() {
+        "validate" => {
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--manifest" => {
+                        let value = args
+                            .next()
+                            .ok_or_else(|| "--manifest requires a path".to_string())?;
+                        manifest_path = value.into();
+                    }
+                    "--help" | "-h" => {
+                        print_validate_help();
+                        return Ok(());
+                    }
+                    other => return Err(format!("unknown validate argument: {other}")),
+                }
+            }
+            validate_manifest(manifest_path)
+        }
+        "run" => {
+            let mut selected_repo = None;
+            let mut selected_scenario = None;
+            let mut output_dir = None;
+            let mut max_files = None;
+            let mut profile = false;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--manifest" => {
+                        let value = args
+                            .next()
+                            .ok_or_else(|| "--manifest requires a path".to_string())?;
+                        manifest_path = value.into();
+                    }
+                    "--repo" => {
+                        selected_repo = Some(
+                            args.next()
+                                .ok_or_else(|| "--repo requires a repo name".to_string())?,
+                        );
+                    }
+                    "--scenario" => {
+                        let value = args
+                            .next()
+                            .ok_or_else(|| "--scenario requires a scenario name".to_string())?;
+                        let parsed: BenchmarkScenario =
+                            serde_json::from_value(serde_json::Value::String(value.clone()))
+                                .map_err(|_| format!("unknown scenario name `{value}`"))?;
+                        selected_scenario = Some(parsed);
+                    }
+                    "--output" => {
+                        output_dir =
+                            Some(PathBuf::from(args.next().ok_or_else(|| {
+                                "--output requires a directory path".to_string()
+                            })?));
+                    }
+                    "--max-files" => {
+                        let value = args
+                            .next()
+                            .ok_or_else(|| "--max-files requires a positive integer".to_string())?;
+                        let parsed = value.parse::<usize>().map_err(|_| {
+                            format!("--max-files expects a positive integer, got `{value}`")
+                        })?;
+                        if parsed == 0 {
+                            return Err("--max-files must be greater than zero".to_string());
+                        }
+                        max_files = Some(parsed);
+                    }
+                    "--profile" => profile = true,
+                    "--help" | "-h" => {
+                        print_run_help();
+                        return Ok(());
+                    }
+                    other => return Err(format!("unknown run argument: {other}")),
+                }
+            }
+            validate_query_code_access_mode()?;
+            run_manifest(
+                manifest_path,
+                selected_repo,
+                selected_scenario,
+                output_dir,
+                max_files,
+                profile,
+            )
+        }
+        "compare" => {
+            let mut baseline_path = None;
+            let mut candidate_path = None;
+            let mut output_path = None;
+            let mut strict = false;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--baseline" => {
+                        baseline_path = Some(PathBuf::from(
+                            args.next()
+                                .ok_or_else(|| "--baseline requires a path".to_string())?,
+                        ));
+                    }
+                    "--candidate" => {
+                        candidate_path = Some(PathBuf::from(
+                            args.next()
+                                .ok_or_else(|| "--candidate requires a path".to_string())?,
+                        ));
+                    }
+                    "--output" => {
+                        output_path =
+                            Some(PathBuf::from(args.next().ok_or_else(|| {
+                                "--output requires a file path".to_string()
+                            })?));
+                    }
+                    "--strict" => strict = true,
+                    "--help" | "-h" => {
+                        print_compare_help();
+                        return Ok(());
+                    }
+                    other => return Err(format!("unknown compare argument: {other}")),
+                }
+            }
+            compare_reports(
+                baseline_path.ok_or_else(|| "--baseline is required".to_string())?,
+                candidate_path.ok_or_else(|| "--candidate is required".to_string())?,
+                output_path,
+                strict,
+            )
+        }
+        "rollout" => {
+            let mut fixture_id = None;
+            let mut fixture_root = None;
+            let mut fixture_revision = None;
+            let mut configuration_id = "default-analyzer-config".to_string();
+            let mut max_files = None;
+            let mut markdown_path = None;
+            let mut artifact_path = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--fixture-id" => {
+                        fixture_id = Some(
+                            args.next()
+                                .ok_or_else(|| "--fixture-id requires a name".to_string())?,
+                        );
+                    }
+                    "--fixture-root" => {
+                        fixture_root =
+                            Some(PathBuf::from(args.next().ok_or_else(|| {
+                                "--fixture-root requires a path".to_string()
+                            })?));
+                    }
+                    "--fixture-revision" => {
+                        fixture_revision =
+                            Some(args.next().ok_or_else(|| {
+                                "--fixture-revision requires a value".to_string()
+                            })?);
+                    }
+                    "--configuration-id" => {
+                        configuration_id = args
+                            .next()
+                            .ok_or_else(|| "--configuration-id requires a name".to_string())?;
+                    }
+                    "--max-files" => {
+                        let value = args
+                            .next()
+                            .ok_or_else(|| "--max-files requires a positive integer".to_string())?;
+                        let parsed = value.parse::<usize>().map_err(|_| {
+                            format!("--max-files expects a positive integer, got `{value}`")
+                        })?;
+                        if parsed == 0 {
+                            return Err("--max-files must be greater than zero".to_string());
+                        }
+                        max_files = Some(parsed);
+                    }
+                    "--output" => {
+                        markdown_path =
+                            Some(PathBuf::from(args.next().ok_or_else(|| {
+                                "--output requires a file path".to_string()
+                            })?));
+                    }
+                    "--artifact" => {
+                        artifact_path =
+                            Some(PathBuf::from(args.next().ok_or_else(|| {
+                                "--artifact requires a file path".to_string()
+                            })?));
+                    }
+                    "--help" | "-h" => {
+                        print_rollout_help();
+                        return Ok(());
+                    }
+                    other => return Err(format!("unknown rollout argument: {other}")),
+                }
+            }
+            run_rollout(
+                fixture_id.ok_or_else(|| "--fixture-id is required".to_string())?,
+                fixture_root.ok_or_else(|| "--fixture-root is required".to_string())?,
+                fixture_revision,
+                configuration_id,
+                max_files,
+                markdown_path,
+                artifact_path,
+            )
+        }
+        "--help" | "-h" => {
+            print_help();
+            Ok(())
+        }
+        other => Err(format!("unknown subcommand: {other}")),
+    }
+}
+
+/// Measure one semantic-diagnostic rollout against a pinned offline fixture
+/// and render its markdown report (#1628). Sets no threshold: it produces the
+/// numbers a team reviews before enabling unrecognized-symbol diagnostics by
+/// default.
+#[cfg(feature = "release-tooling")]
+#[allow(clippy::too_many_arguments)]
+fn run_rollout(
+    fixture_id: String,
+    fixture_root: PathBuf,
+    fixture_revision: Option<String>,
+    configuration_id: String,
+    max_files: Option<usize>,
+    markdown_path: Option<PathBuf>,
+    artifact_path: Option<PathBuf>,
+) -> Result<(), String> {
+    use brokk_bifrost::benchmark::semantic_diagnostic_rollout::{
+        aggregate_semantic_diagnostic_rollout, render_semantic_diagnostic_rollout_markdown,
+    };
+    use brokk_bifrost::benchmark::{
+        SemanticDiagnosticRolloutRequest, measure_semantic_diagnostic_rollout,
+    };
+
+    let (bifrost_revision, bifrost_dirty) = git_revision(Path::new(env!("CARGO_MANIFEST_DIR")))
+        .ok_or_else(|| "could not read the Bifrost revision from git".to_string())?;
+    let fixture_revision = match fixture_revision {
+        Some(revision) => revision,
+        // An in-repo fixture is pinned by the commit that contains it.
+        None => bifrost_revision.clone(),
+    };
+    let request = SemanticDiagnosticRolloutRequest {
+        bifrost_revision,
+        bifrost_dirty,
+        fixture_id,
+        fixture_revision,
+        fixture_root,
+        configuration_id,
+        max_files,
+    };
+    let artifact = measure_semantic_diagnostic_rollout(&request)?;
+    let aggregate = aggregate_semantic_diagnostic_rollout(std::slice::from_ref(&artifact))
+        .map_err(|error| format!("rollout artifact is invalid: {error}"))?;
+    let markdown = render_semantic_diagnostic_rollout_markdown(&aggregate);
+
+    if let Some(path) = artifact_path {
+        let encoded = serde_json::to_string_pretty(&artifact)
+            .map_err(|error| format!("failed to encode the rollout artifact: {error}"))?;
+        std::fs::write(&path, encoded)
+            .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+    }
+    match markdown_path {
+        Some(path) => std::fs::write(&path, &markdown)
+            .map_err(|error| format!("failed to write {}: {error}", path.display()))?,
+        None => print!("{markdown}"),
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "release-tooling"))]
+#[allow(clippy::too_many_arguments)]
+fn run_rollout(
+    _fixture_id: String,
+    _fixture_root: PathBuf,
+    _fixture_revision: Option<String>,
+    _configuration_id: String,
+    _max_files: Option<usize>,
+    _markdown_path: Option<PathBuf>,
+    _artifact_path: Option<PathBuf>,
+) -> Result<(), String> {
+    Err("the rollout subcommand needs `--features release-tooling`".to_string())
+}
+
+/// The repository revision and whether the working tree carries changes.
+/// Reported separately so a rollout artifact records a dirty measurement as
+/// dirty rather than inventing a synthetic revision for it.
+#[cfg(feature = "release-tooling")]
+fn git_revision(repo_root: &Path) -> Option<(String, bool)> {
+    let revision = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    if !revision.status.success() {
+        return None;
+    }
+    let revision = String::from_utf8(revision.stdout).ok()?.trim().to_string();
+    if revision.is_empty() {
+        return None;
+    }
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    Some((revision, !status.stdout.is_empty()))
+}
+
+fn validate_query_code_access_mode() -> Result<(), String> {
+    let Some(value) = env::var_os("BIFROST_BENCHMARK_QUERY_CODE_ACCESS") else {
+        return Ok(());
+    };
+    match value.to_str() {
+        Some("auto" | "scan_only") => Ok(()),
+        _ => Err(format!(
+            "BIFROST_BENCHMARK_QUERY_CODE_ACCESS must be `auto` or `scan_only`, got `{}`",
+            value.to_string_lossy()
+        )),
+    }
+}
+
+fn validate_manifest(path: PathBuf) -> Result<(), String> {
+    let manifest = BenchmarkManifest::load_from_path(&path)
+        .map_err(|err| format!("failed to load `{}`: {err}", path.display()))?;
+    let covered_languages = manifest
+        .covered_languages()
+        .into_iter()
+        .map(ManifestLanguage::label)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let covered_scenarios = manifest
+        .covered_scenarios()
+        .into_iter()
+        .map(BenchmarkScenario::label)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    println!("validated {} repos", manifest.repos.len());
+    println!("manifest: {}", path.display());
+    println!("covered languages: {covered_languages}");
+    println!("covered scenarios: {covered_scenarios}");
+
+    Ok(())
+}
+
+fn run_manifest(
+    manifest_path: PathBuf,
+    selected_repo: Option<String>,
+    selected_scenario: Option<BenchmarkScenario>,
+    output_dir_override: Option<PathBuf>,
+    max_files: Option<usize>,
+    profile: bool,
+) -> Result<(), String> {
+    let manifest = BenchmarkManifest::load_from_path(&manifest_path)
+        .map_err(|err| format!("failed to load `{}`: {err}", manifest_path.display()))?;
+    let manifest_dir = manifest_root(&manifest_path)?;
+    let repo_cache_dir = resolve_from_manifest_root(&manifest_dir, &manifest.repo_cache_dir);
+    let output_dir = output_dir_override
+        .map(|path| resolve_from_manifest_root(&manifest_dir, &path))
+        .unwrap_or_else(|| resolve_from_manifest_root(&manifest_dir, &manifest.output_dir));
+    std::fs::create_dir_all(&output_dir).map_err(|err| {
+        format!(
+            "failed to create output dir `{}`: {err}",
+            output_dir.display()
+        )
+    })?;
+    let profile = profile.then(|| {
+        let profile_run_id = benchmark_profile_run_id();
+        BenchmarkProfile {
+            output_dir: output_dir.join("profiles").join(&profile_run_id),
+            report_path_prefix: PathBuf::from("profiles").join(profile_run_id),
+        }
+    });
+
+    let report = run_benchmark(
+        &manifest,
+        &RunRequest {
+            manifest_path: manifest_path.clone(),
+            repo_cache_dir,
+            selected_repo,
+            selected_scenario,
+            max_files,
+            profile,
+        },
+    )?;
+    let report_path = output_dir.join(format!("run-{}.json", Utc::now().format("%Y%m%dT%H%M%SZ")));
+    write_report(&report, &report_path)?;
+    print_run_summary(&report, &report_path);
+    if report.has_failures() {
+        return Err(format!(
+            "benchmark run recorded {} failed scenario(s); report: {}",
+            report.failed_scenarios_count(),
+            report_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn benchmark_profile_run_id() -> String {
+    static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}-{}-{sequence}",
+        Utc::now().format("%Y%m%dT%H%M%S%6fZ"),
+        std::process::id()
+    )
+}
+
+fn compare_reports(
+    baseline_path: PathBuf,
+    candidate_path: PathBuf,
+    output_path: Option<PathBuf>,
+    strict: bool,
+) -> Result<(), String> {
+    let baseline = load_report(&baseline_path)?;
+    let candidate = load_report(&candidate_path)?;
+    if baseline.max_files.is_some() || candidate.max_files.is_some() {
+        return Err(
+            "subset benchmark reports (--max-files) cannot be compared with baseline reports"
+                .to_string(),
+        );
+    }
+    let comparison = BenchmarkCompareReport::from_reports(&baseline, &candidate);
+
+    if let Some(path) = output_path {
+        write_json(&comparison, &path, "compare report")?;
+        println!("wrote {}", path.display());
+    }
+
+    print_compare_summary(&comparison);
+
+    if strict && comparison.has_actionable_regressions {
+        return Err(format!(
+            "benchmark compare recorded {} regression(s)",
+            comparison.actionable_regression_count
+        ));
+    }
+
+    Ok(())
+}
+
+fn manifest_root(manifest_path: &Path) -> Result<PathBuf, String> {
+    let absolute = if manifest_path.is_absolute() {
+        manifest_path.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|err| format!("failed to resolve current directory: {err}"))?
+            .join(manifest_path)
+    };
+    absolute
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("manifest path has no parent: {}", manifest_path.display()))
+}
+
+fn resolve_from_manifest_root(manifest_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        manifest_root.join(path)
+    }
+}
+
+fn write_report(report: &BenchmarkRunReport, report_path: &Path) -> Result<(), String> {
+    write_json(report, report_path, "report")
+}
+
+fn write_json<T: Serialize>(value: &T, path: &Path, label: &str) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|err| format!("failed to serialize {label}: {err}"))?;
+    std::fs::write(path, json)
+        .map_err(|err| format!("failed to write {label} `{}`: {err}", path.display()))
+}
+
+fn load_report(path: &Path) -> Result<BenchmarkRunReport, String> {
+    let json = std::fs::read_to_string(path)
+        .map_err(|err| format!("failed to read report `{}`: {err}", path.display()))?;
+    serde_json::from_str(&json)
+        .map_err(|err| format!("failed to parse report `{}`: {err}", path.display()))
+}
+
+fn print_run_summary(report: &BenchmarkRunReport, report_path: &Path) {
+    if let Some(max_files) = report.max_files {
+        println!("subset max_files={max_files}");
+    }
+    for repo in &report.repos {
+        match repo.subset_max_files {
+            Some(max_files) => println!(
+                "repo {} subset={} workspace={}",
+                repo.name,
+                max_files,
+                repo.workspace_path.display()
+            ),
+            None => println!("repo {}", repo.name),
+        }
+        for scenario in &repo.scenarios {
+            let status = if scenario.success { "ok" } else { "failed" };
+            let case_suffix = scenario
+                .case_id
+                .as_deref()
+                .map(|case_id| format!("/{case_id}"))
+                .unwrap_or_default();
+            match scenario.p50_ms.or(scenario.median_ms) {
+                Some(p50) => {
+                    println!(
+                        "  {}{case_suffix}: {status} p50={p50:.1} ms{}{}{}{}",
+                        scenario.name.label(),
+                        scenario
+                            .p95_ms
+                            .map(|p95| format!(" p95={p95:.1} ms"))
+                            .unwrap_or_default(),
+                        scenario
+                            .latency_budget_ms
+                            .map(|budget| format!(" budget={budget:.1} ms"))
+                            .unwrap_or_default(),
+                        scenario
+                            .first_duration_ms
+                            .map(|first| format!(" first={first:.1} ms"))
+                            .unwrap_or_default(),
+                        if scenario.bounded_incomplete_iterations > 0 {
+                            format!(
+                                " bounded_incomplete={}",
+                                scenario.bounded_incomplete_iterations
+                            )
+                        } else {
+                            String::new()
+                        }
+                    );
+                }
+                None => {
+                    println!("  {}{case_suffix}: {status}", scenario.name.label());
+                }
+            }
+            if let Some(message) = &scenario.failure_message {
+                println!("    failure: {message}");
+            }
+            if let Some(fairness) = &scenario.mcp_fairness {
+                println!(
+                    "    fairness: light_p95={:.1} ms cancellation_p95={:.1} ms",
+                    fairness.light_request_p95_ms.unwrap_or_default(),
+                    fairness.cancellation_p95_ms.unwrap_or_default()
+                );
+            }
+            for phase in &scenario.transport_phases {
+                println!(
+                    "    phase {}[{}]: p50={:.1} ms p95={:.1} ms",
+                    phase.phase,
+                    phase.tool,
+                    phase.p50_ms.unwrap_or_default(),
+                    phase.p95_ms.unwrap_or_default()
+                );
+            }
+            if let Some(dominant) = &scenario.dominant_phase {
+                println!("    dominant phase: {dominant}");
+            }
+        }
+    }
+    println!("wrote {}", report_path.display());
+}
+
+fn print_compare_summary(report: &BenchmarkCompareReport) {
+    if report.has_regressions {
+        println!("regressions detected: {}", report.regression_count);
+    } else {
+        println!("no regressions over threshold");
+    }
+    println!("compared {} scenarios", report.compared_scenarios_count);
+    println!(
+        "threshold: {:.1}% and {:.1} ms absolute floor",
+        report.thresholds.relative_pct, report.thresholds.absolute_ms
+    );
+    if let Some(environment_variance) = &report.environment_variance {
+        println!(
+            "suspected environment variance: {}",
+            environment_variance.detail
+        );
+    }
+    if report.improvement_count > 0 {
+        println!("improvements: {}", report.improvement_count);
+    }
+    if report.missing_candidate_count > 0 {
+        println!(
+            "missing candidate scenarios: {}",
+            report.missing_candidate_count
+        );
+    }
+    if report.new_candidate_count > 0 {
+        println!("new candidate scenarios: {}", report.new_candidate_count);
+    }
+
+    for scenario in &report.scenarios {
+        if matches!(
+            scenario.outcome,
+            brokk_bifrost::benchmark::ScenarioCompareOutcome::Unchanged
+        ) {
+            continue;
+        }
+        let detail = scenario.detail.as_deref().unwrap_or("state changed");
+        let case_suffix = scenario
+            .case_id
+            .as_deref()
+            .map(|case_id| format!("/{case_id}"))
+            .unwrap_or_default();
+        match scenario.delta_ms {
+            Some(delta_ms) => match scenario.delta_pct {
+                Some(delta_pct) => println!(
+                    "  {} {}{case_suffix} {:?}: {:?} delta={delta_ms:.1} ms ({delta_pct:.1}%) ({detail})",
+                    scenario.repo_name,
+                    scenario.scenario.label(),
+                    scenario.transport,
+                    scenario.outcome
+                ),
+                None => println!(
+                    "  {} {}{case_suffix} {:?}: {:?} delta={delta_ms:.1} ms ({detail})",
+                    scenario.repo_name,
+                    scenario.scenario.label(),
+                    scenario.transport,
+                    scenario.outcome
+                ),
+            },
+            None => println!(
+                "  {} {}{case_suffix} {:?}: {:?} ({detail})",
+                scenario.repo_name,
+                scenario.scenario.label(),
+                scenario.transport,
+                scenario.outcome
+            ),
+        }
+    }
+}
+
+fn print_help() {
+    println!("Usage: bifrost_benchmark <subcommand> [options]");
+    println!("Subcommands:");
+    println!("  validate [--manifest PATH]");
+    println!(
+        "  run [--manifest PATH] [--repo NAME] [--scenario NAME] [--output DIR] [--max-files N] [--profile]"
+    );
+    println!("  compare --baseline PATH --candidate PATH [--output PATH] [--strict]");
+    println!(
+        "  rollout --fixture-id NAME --fixture-root PATH [--fixture-revision REV] [--configuration-id NAME] [--max-files N] [--output PATH] [--artifact PATH]"
+    );
+}
+
+fn print_rollout_help() {
+    println!(
+        "Usage: bifrost_benchmark rollout --fixture-id NAME --fixture-root PATH [--fixture-revision REV] [--configuration-id NAME] [--max-files N] [--output PATH] [--artifact PATH]"
+    );
+    println!("  Needs `--features release-tooling`.");
+    println!("  Measures cold and warm dependency-pack activation and per-file");
+    println!("  unrecognized-symbol diagnostics against a pinned offline fixture,");
+    println!("  then validates and renders the rollout report. Sets no threshold.");
+}
+
+fn print_validate_help() {
+    println!("Usage: bifrost_benchmark validate [--manifest PATH]");
+}
+
+fn print_run_help() {
+    println!(
+        "Usage: bifrost_benchmark run [--manifest PATH] [--repo NAME] [--scenario NAME] [--output DIR] [--max-files N] [--profile]"
+    );
+    println!(
+        "  BIFROST_BENCHMARK_QUERY_CODE_ACCESS=auto|scan_only selects the query_code reference access path"
+    );
+}
+
+fn print_compare_help() {
+    println!(
+        "Usage: bifrost_benchmark compare --baseline PATH --candidate PATH [--output PATH] [--strict]"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::benchmark_profile_run_id;
+
+    #[test]
+    fn benchmark_profile_run_ids_are_unique_within_a_process() {
+        assert_ne!(benchmark_profile_run_id(), benchmark_profile_run_id());
+    }
+}

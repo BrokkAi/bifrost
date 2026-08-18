@@ -13,6 +13,13 @@ Use Bifrost's `list_policies` and `run_policy` MCP tools to check the active
 workspace. Prefer one combined MCP run so built-in and repository policies use
 the same immutable analyzer snapshot and produce one canonical report.
 
+## Tools
+
+| Tool | Purpose |
+|---|---|
+| `list_policies` | Discover built-in packs, categories, policy IDs, and metadata |
+| `run_policy` | Evaluate built-in or repository policies against one analyzer snapshot |
+
 ## Confirm the tool surface
 
 Both tools belong to Bifrost's `extended` toolset. Before claiming that a
@@ -59,10 +66,11 @@ unknown pack, category, or policy IDs are invalid.
 
 Repository policy files are explicit workspace-relative `.rqlp` roots. First
 follow the repository's `AGENTS.md` or policy documentation for the canonical
-root list. If discovery is needed, use `find_filenames` for candidate `.rqlp`
-files, then distinguish executable policies from reusable endpoint or query
-dependencies before invoking `run_policy`. Do not assume every file under
-`.bifrost/policies/` is an executable root, and do not pass globs.
+root list. If discovery is needed, use the host's file-search support, such as
+`rg --files -g '*.rqlp'`, then distinguish executable policies from reusable
+endpoint or query dependencies before invoking `run_policy`. Do not assume
+every file under `.bifrost/policies/` is an executable root, and do not pass
+globs.
 
 ## Run the check
 

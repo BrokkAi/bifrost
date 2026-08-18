@@ -1495,6 +1495,32 @@ fn visit_rust_field(
         .with_return_type_identity(rust_enum_variant_owner_identity(node, source))
         .with_dispatch_extensibility(DispatchExtensibility::Closed),
     );
+
+    // A struct-like enum variant owns its named fields just as a struct owns
+    // its fields. Keep the variant's existing value-namespace identity and
+    // publish the named children beneath it (`Enum.Variant.field`). Tuple
+    // variants have positional fields and deliberately remain fieldless here.
+    if node.kind() == "enum_variant"
+        && let Some(body) = node.child_by_field_name("body")
+        && body.kind() == "field_declaration_list"
+    {
+        for index in 0..body.named_child_count() {
+            let Some(field) = body.named_child(index) else {
+                continue;
+            };
+            if field.kind() == "field_declaration" {
+                visit_rust_field(
+                    file,
+                    source,
+                    field,
+                    Some(&code_unit),
+                    package_name,
+                    in_test_region,
+                    parsed,
+                );
+            }
+        }
+    }
     Some(code_unit)
 }
 
@@ -2054,7 +2080,31 @@ fn rust_signature_metadata(signature: String, node: Node<'_>, source: &str) -> S
             Some(ParameterMetadata::new(label, start_byte, end_byte))
         })
         .collect();
-    SignatureMetadata::new(signature, parameters).with_dispatch_extensibility(dispatch)
+    let metadata =
+        SignatureMetadata::new(signature, parameters).with_dispatch_extensibility(dispatch);
+    match rust_callable_parameter_type_spellings(parameters_node, source) {
+        Some(parameter_types) => metadata.with_callable_parameter_types(parameter_types),
+        None => metadata,
+    }
+}
+
+fn rust_callable_parameter_type_spellings(
+    parameters: Node<'_>,
+    source: &str,
+) -> Option<Vec<String>> {
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .filter(|parameter| parameter.kind() != "attribute_item")
+        .map(|parameter| {
+            if parameter.kind() != "parameter" {
+                return None;
+            }
+            let type_node = parameter.child_by_field_name("type")?;
+            let spelling = rust_node_text(type_node, source).trim();
+            (!spelling.is_empty()).then(|| spelling.to_string())
+        })
+        .collect()
 }
 
 fn rust_callable_dispatch_extensibility(node: Node<'_>) -> DispatchExtensibility {

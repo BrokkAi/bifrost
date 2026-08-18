@@ -8,6 +8,7 @@ use crate::analyzer::dataflow::{
 };
 use crate::analyzer::semantic::{
     EvidenceCompleteness, IcfgEdgeKind, IcfgProvider, ProcedureHandle, ProofStatus, SemanticBudget,
+    ValueFlowRelationKind,
 };
 use crate::analyzer::value_flow::{ValueFlowCarrierId, ValueFlowObservationPhase, ValueFlowSinkId};
 
@@ -521,7 +522,10 @@ impl<'plan> TaintFlowProblem<'plan> {
         point: &crate::analyzer::semantic::ProgramPointHandle,
         active: &mut Vec<ActiveTaint>,
     ) {
-        for (source, target, complete) in self.plan.value_flow().local_rule_views(point) {
+        for (source, target, kind, complete) in self.plan.value_flow().local_rule_views(point) {
+            if kind == ValueFlowRelationKind::Assignment && source != target {
+                active.retain(|flow| flow.carrier != target);
+            }
             let generated = active
                 .iter()
                 .filter(|flow| flow.carrier == source)
@@ -685,7 +689,7 @@ impl<'plan> TaintFlowProblem<'plan> {
         }
         self.apply_phase(point, ValueFlowObservationPhase::BeforeEffects, &mut active);
         if phase == ValueFlowObservationPhase::AfterEffects {
-            for (source, target, complete) in self.plan.value_flow().local_rule_views(point) {
+            for (source, target, kind, complete) in self.plan.value_flow().local_rule_views(point) {
                 if request.cancellation.is_cancelled() {
                     return Err(SolverTermination::Cancelled);
                 }
@@ -694,6 +698,9 @@ impl<'plan> TaintFlowProblem<'plan> {
                     ..SolverWork::default()
                 }) {
                     return Err(termination);
+                }
+                if kind == ValueFlowRelationKind::Assignment && source != target {
+                    active.retain(|flow| flow.carrier != target);
                 }
                 let remaining = max_candidates.saturating_sub(active.len());
                 let generated = active

@@ -47,6 +47,7 @@ pub(crate) use brokk_bifrost_go::declarations;
 pub(crate) use brokk_bifrost_go::declarations::{
     determine_go_package_name, go_structured_type_identity_bounded,
 };
+use brokk_bifrost_go::graph::resolver::{GoEdgeIndex, GoGraphSource, build_go_edge_index};
 use brokk_bifrost_go::hierarchy::GoHierarchyIndex;
 pub(crate) use brokk_bifrost_go::packages;
 pub(crate) use brokk_bifrost_go::packages::GO_MODULE_SCOPE_SEGMENT;
@@ -245,6 +246,33 @@ impl GoAnalyzer {
     #[doc(hidden)]
     pub fn workspace_path_index_build_count_for_test(&self) -> usize {
         self.memo_caches.workspace_path_index_build_count()
+    }
+
+    pub(crate) fn usage_edge_index(&self) -> Arc<GoEdgeIndex> {
+        let files: Vec<_> = self
+            .get_analyzed_files()
+            .into_iter()
+            .filter(|file| file_language(file) == Language::Go)
+            .collect();
+        let source = GoGraphSource {
+            index: self,
+            imports: self,
+            type_aliases: self,
+            workspace_paths: self.workspace_path_index(),
+        };
+        self.memo_caches
+            .usage_edge_index
+            .get_or_build_on_dedicated_pool(|| {
+                self.memo_caches
+                    .usage_edge_index_build_count
+                    .fetch_add(1, Ordering::Relaxed);
+                build_go_edge_index(source, &files).unwrap_or_default()
+            })
+    }
+
+    #[doc(hidden)]
+    pub fn usage_edge_index_build_count_for_test(&self) -> usize {
+        self.memo_caches.usage_edge_index_build_count()
     }
 
     pub(crate) fn package_clause_names(&self) -> &crate::hash::HashMap<ProjectFile, String> {
@@ -551,6 +579,10 @@ impl IAnalyzer for GoAnalyzer {
 
     fn invalidate_cached_file_identities(&self) {
         self.inner.invalidate_cached_file_identities();
+    }
+
+    fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {
+        self.inner.working_tree_identity()
     }
 
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {

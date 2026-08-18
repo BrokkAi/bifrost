@@ -1808,7 +1808,7 @@ impl RetainedSize for PolicyPackDecision {
 
 /// Top-level audit of the document-driven pack activation for one evaluation
 /// (#1868). Present only when a `.bifrost/packs.json` document configured
-/// activation, so a run without one keeps its exact schema-version-3 shape.
+/// activation, so a run without one keeps its exact schema-version-4 shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicyPackActivationReview {
     document_path: String,
@@ -1879,7 +1879,7 @@ impl RetainedSize for PolicyPackActivationReview {
 /// The optional top-level reviews a report attaches when the matching input
 /// (a diff base, a workspace packs document, or a baseline document) is
 /// present. Each review stays additive: a report without any of them keeps
-/// its exact schema-version-3 shape (#1880, #1868, #1881).
+/// its exact schema-version-4 shape (#1880, #1868, #1881).
 ///
 /// Folding the three into one collection gives them a single retained-size
 /// accounting site (the `RetainedSize` impl below) instead of a bespoke
@@ -1943,7 +1943,7 @@ pub struct PolicyReportDocument {
 }
 
 impl PolicyReportDocument {
-    pub const SCHEMA_VERSION: u32 = 3;
+    pub const SCHEMA_VERSION: u32 = 4;
 
     #[cfg(test)]
     pub(crate) fn try_new(
@@ -2123,7 +2123,7 @@ impl Serialize for PolicyReportDocument {
     {
         // The `diff`, `packs`, and `baseline` fields are additive and
         // serialized only when present, so a report without them keeps its
-        // exact schema-version-3 shape.
+        // exact schema-version-4 shape.
         let field_count = 11 + self.reviews.present_count();
         let mut state = serializer.serialize_struct("PolicyReportDocument", field_count)?;
         state.serialize_field("schema_version", &self.schema_version)?;
@@ -4007,7 +4007,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_preflights_skeletons_and_emits_schema_three_document() {
+    fn builder_preflights_skeletons_and_emits_schema_four_document() {
         let per_policy = super::super::budget::PolicyBudget::builder()
             .with_max_retained_report_bytes(1024)
             .unwrap()
@@ -4029,7 +4029,7 @@ mod tests {
         let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 1).unwrap();
         builder.register_policy(descriptor, run).unwrap();
         let document = builder.finish().unwrap();
-        assert_eq!(document.schema_version(), 3);
+        assert_eq!(document.schema_version(), 4);
         assert_eq!(document.rules().len(), 1);
         assert_eq!(document.runs().len(), 1);
         assert_eq!(
@@ -4038,7 +4038,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(&document).unwrap()["schema_version"],
-            3
+            4
         );
         assert_eq!(
             serde_json::to_value(&document).unwrap()["rules"][0]["analysis_type"],
@@ -4047,7 +4047,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_three_report_exposes_bounded_deadline_execution_metadata() {
+    fn schema_four_report_exposes_bounded_deadline_execution_metadata() {
         let first = PolicyId::new("test.first").unwrap();
         let second = PolicyId::new("test.second").unwrap();
         let execution = PolicyExecutionMetadata::try_new(
@@ -4068,7 +4068,7 @@ mod tests {
         let document = builder.finish().unwrap();
 
         let json = serde_json::to_value(&document).unwrap();
-        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["schema_version"], 4);
         assert_eq!(json["execution"]["termination"], "deadline_exceeded");
         assert_eq!(json["execution"]["terminal_stage"], "workspace_snapshot");
         assert_eq!(
@@ -4822,7 +4822,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Retained bytes of an empty schema-version-3 document (no reviews, no
+    /// Retained bytes of an empty schema-version-4 document (no reviews, no
     /// policies, default execution metadata): the base every `set_*` review
     /// method charges a new review's bytes on top of.
     fn empty_document_retained_bytes() -> usize {

@@ -1,10 +1,11 @@
-use crate::analyzer::rust::usage_binding_seeds;
-use crate::analyzer::rust::usage_candidate_files_while;
+use crate::analyzer::rust::{
+    RustBindingSeeds, usage_binding_seeds_while, usage_candidate_files_from_binding_seeds_while,
+};
 mod extractor;
 mod hits;
 mod inverted;
 mod resolver;
-use crate::analyzer::usages::traits::GraphUsageAnalyzer;
+use crate::analyzer::usages::traits::{GraphUsageAnalyzer, PreparedUsageQuery};
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
@@ -13,12 +14,13 @@ use crate::analyzer::usages::outcome::{
     CandidateUsageHits, GraphFailureReason, GraphUsageOutcome, union_candidate_usages,
 };
 use crate::analyzer::usages::rust_graph::extractor::{
-    effective_scan_files, scan_files_for_member_target, scan_files_for_target,
+    effective_scan_files, effective_scan_files_from_prepared_candidates,
+    scan_files_for_member_target, scan_files_for_target,
 };
 use crate::analyzer::usages::rust_graph::resolver::infer_graph_seeds_while;
 use crate::analyzer::usages::rust_graph::resolver::{
-    RustGraphSeedKind, canonical_usage_target, infer_graph_seeds, is_graph_visible_member_target,
-    is_member_target, local_impl_target_importer_files_while, trait_member_for_impl_member,
+    RustGraphSeedKind, canonical_usage_target, is_graph_visible_member_target, is_member_target,
+    local_impl_target_importer_files_while, trait_member_for_impl_member,
     unresolved_external_frontier_specifiers,
 };
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
@@ -68,29 +70,182 @@ where
     Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
 }
 
-pub(crate) fn rust_usage_candidate_files(
-    analyzer: &dyn IAnalyzer,
-    target: &CodeUnit,
-    cancellation: &CancellationToken,
-) -> HashSet<ProjectFile> {
-    let _scope = crate::profiling::scope("RustQueryResolver::candidate_files");
-    let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
-        return HashSet::default();
-    };
-    let roots = {
-        let _scope = crate::profiling::scope("RustQueryResolver::candidate_seeds");
-        let Some(seeds) = infer_graph_seeds_while(rust, target, &|| !cancellation.is_cancelled())
-        else {
-            return HashSet::default();
-        };
-        seeds.roots
-    };
-    let _scope = crate::profiling::scope("RustQueryResolver::usage_candidates");
-    usage_candidate_files_while(rust, &roots, &|| !cancellation.is_cancelled()).unwrap_or_default()
-}
-
 /// The strategy name every Rust usage diagnostic reports.
 const RUST_STRATEGY: &str = "RustExportUsageGraphStrategy";
+
+struct PreparedRustTargetReady {
+    member: bool,
+    graph_visible: bool,
+    kind: RustGraphSeedKind,
+    seeds: RustBindingSeeds,
+    protected_files: HashSet<ProjectFile>,
+    planned_files: HashSet<ProjectFile>,
+}
+
+struct PreparedRustTarget {
+    target: CodeUnit,
+    ready: Option<PreparedRustTargetReady>,
+}
+
+/// Request-local Rust resolver state built before generic candidate admission.
+///
+/// `candidate_files` is the complete pre-budget universe for the finder path.
+/// `targets` retains the binding seeds that semantic execution would otherwise
+/// reconstruct after admission.
+pub(crate) struct PreparedRustUsageQuery {
+    candidate_files: HashSet<ProjectFile>,
+    targets: Vec<PreparedRustTarget>,
+    enforce_admitted_scope: bool,
+}
+
+impl PreparedRustUsageQuery {
+    pub(crate) fn candidate_files(&self) -> &HashSet<ProjectFile> {
+        &self.candidate_files
+    }
+
+    fn prepare(
+        rust: &RustAnalyzer,
+        overloads: &[CodeUnit],
+        supplied_candidates: &HashSet<ProjectFile>,
+        authoritative: bool,
+        include_finder_augmentation: bool,
+        cancellation: &CancellationToken,
+    ) -> Option<Self> {
+        let keep_going = || !cancellation.is_cancelled();
+        let mut canonical_targets = Vec::with_capacity(overloads.len());
+        for overload in overloads {
+            let canonical = canonical_usage_target(rust, overload);
+            if !canonical_targets.contains(&canonical) {
+                canonical_targets.push(canonical);
+            }
+        }
+
+        let mut candidate_files = supplied_candidates.clone();
+        let mut targets = Vec::with_capacity(canonical_targets.len());
+        for target in canonical_targets {
+            let member = is_member_target(rust, &target);
+            let seed_result = {
+                let _scope = crate::profiling::scope("rust_graph::seed_inference");
+                infer_graph_seeds_while(rust, &target, &keep_going)?
+            };
+            if seed_result.roots.is_empty() {
+                targets.push(PreparedRustTarget {
+                    target,
+                    ready: None,
+                });
+                continue;
+            }
+            let seeds = {
+                let _scope = crate::profiling::scope("rust_graph::binding_seed_discovery");
+                rust.note_usage_binding_seed_preparation();
+                usage_binding_seeds_while(rust, &seed_result.roots, &keep_going)?
+            };
+            crate::profiling::note_with(|| {
+                format!(
+                    "rust_graph seed roots={} candidate_names={}",
+                    seed_result.roots.len(),
+                    seeds.candidate_names().count()
+                )
+            });
+            let graph_visible = !member || is_graph_visible_member_target(rust, &target);
+            let protected_files = if include_finder_augmentation {
+                let _scope = crate::profiling::scope("RustQueryResolver::usage_candidates");
+                usage_candidate_files_from_binding_seeds_while(rust, &seeds, &keep_going)?
+            } else {
+                HashSet::default()
+            };
+            candidate_files.extend(protected_files.iter().cloned());
+            targets.push(PreparedRustTarget {
+                target,
+                ready: Some(PreparedRustTargetReady {
+                    member,
+                    graph_visible,
+                    kind: seed_result.kind,
+                    seeds,
+                    protected_files,
+                    planned_files: HashSet::default(),
+                }),
+            });
+        }
+
+        // The outer finder admits the union, but each overload keeps its own
+        // protected closure. Letting one overload inherit another's importers
+        // makes every semantic scan wider without improving soundness.
+        let mut graph_candidates = HashSet::default();
+        for prepared in &mut targets {
+            let Some(PreparedRustTargetReady {
+                member,
+                graph_visible,
+                kind,
+                seeds,
+                protected_files,
+                planned_files,
+            }) = &mut prepared.ready
+            else {
+                continue;
+            };
+            if *member && *kind == RustGraphSeedKind::Export && !*graph_visible && !authoritative {
+                continue;
+            }
+            let mut planning_candidates = supplied_candidates.clone();
+            planning_candidates.extend(std::mem::take(protected_files));
+            let planning_scope = UsageScanScope::with_cancellation(
+                &planning_candidates,
+                authoritative,
+                cancellation,
+            );
+            let mut target_files = if include_finder_augmentation {
+                effective_scan_files_from_prepared_candidates(
+                    rust,
+                    &planning_scope,
+                    &prepared.target,
+                    seeds,
+                )
+            } else {
+                effective_scan_files(rust, &planning_scope, &prepared.target, seeds)
+            };
+            if *kind == RustGraphSeedKind::LocalDeclaration {
+                target_files.extend(local_impl_target_importer_files_while(
+                    rust,
+                    &prepared.target,
+                    &keep_going,
+                )?);
+            }
+            keep_going().then_some(())?;
+            graph_candidates.extend(target_files.iter().cloned());
+            *planned_files = target_files;
+        }
+        candidate_files.extend(graph_candidates);
+
+        Some(Self {
+            candidate_files,
+            targets,
+            enforce_admitted_scope: include_finder_augmentation,
+        })
+    }
+}
+
+impl PreparedUsageQuery for PreparedRustUsageQuery {
+    fn candidate_files(&self) -> &HashSet<ProjectFile> {
+        &self.candidate_files
+    }
+
+    fn find_graph_usages(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        scan_scope: &UsageScanScope<'_>,
+        max_usages: usize,
+    ) -> GraphUsageOutcome {
+        let Some(target) = overloads.first() else {
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+        };
+        assert_eq!(language_for_target(target), Language::Rust);
+        let resolver = RustQueryResolver::try_new(analyzer)
+            .expect("prepared Rust usage query requires a Rust analyzer");
+        resolver.find_prepared_usages(analyzer, self, scan_scope, max_usages)
+    }
+}
 
 pub(crate) struct RustQueryResolver<'a> {
     rust: &'a RustAnalyzer,
@@ -110,55 +265,81 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        let rust = self.rust;
-        // Canonicalize first, then scan each distinct candidate: forward
-        // resolution can hand the query several declarations of one path (#1779),
-        // and two of them can canonicalize onto the same declaration.
-        let mut candidates: Vec<CodeUnit> = Vec::with_capacity(overloads.len());
-        for overload in overloads {
-            let canonical = canonical_usage_target(rust, overload);
-            if !candidates.contains(&canonical) {
-                candidates.push(canonical);
-            }
+        let fallback_cancellation = CancellationToken::default();
+        let cancellation = scan_scope.cancellation().unwrap_or(&fallback_cancellation);
+        let Some(prepared) = PreparedRustUsageQuery::prepare(
+            self.rust,
+            overloads,
+            scan_scope.candidate_files(),
+            scan_scope.is_authoritative(),
+            false,
+            cancellation,
+        ) else {
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+        };
+        if let Some(cancellation) = scan_scope.cancellation() {
+            let expanded_scope = UsageScanScope::with_cancellation(
+                prepared.candidate_files(),
+                scan_scope.is_authoritative(),
+                cancellation,
+            );
+            self.find_prepared_usages(analyzer, &prepared, &expanded_scope, max_usages)
+        } else {
+            let expanded_scope =
+                UsageScanScope::new(prepared.candidate_files(), scan_scope.is_authoritative());
+            self.find_prepared_usages(analyzer, &prepared, &expanded_scope, max_usages)
         }
+    }
+}
 
+impl RustQueryResolver<'_> {
+    fn find_prepared_usages(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        prepared: &PreparedRustUsageQuery,
+        scan_scope: &UsageScanScope<'_>,
+        max_usages: usize,
+    ) -> GraphUsageOutcome {
+        let rust = self.rust;
+        let candidates: Vec<_> = prepared
+            .targets
+            .iter()
+            .map(|prepared| prepared.target.clone())
+            .collect();
         union_candidate_usages(&candidates, max_usages, |target| {
-            let (hits, unproven_hits) = if is_member_target(rust, target) {
-                let seed_result = {
-                    let _scope = crate::profiling::scope("rust_graph::seed_inference");
-                    infer_graph_seeds(rust, target)
-                };
-                if seed_result.roots.is_empty() {
-                    return Err(GraphFailureReason::NoGraphSeed("no graph seed resolved")
-                        .diagnostic(target.fq_name(), RUST_STRATEGY));
-                }
-                let seeds = {
-                    let _scope = crate::profiling::scope("rust_graph::binding_seed_discovery");
-                    usage_binding_seeds(rust, &seed_result.roots)
-                };
-                crate::profiling::note_with(|| {
-                    format!(
-                        "rust_graph seed roots={} candidate_names={}",
-                        seed_result.roots.len(),
-                        seeds.candidate_names().count()
-                    )
-                });
-                let graph_visible = is_graph_visible_member_target(rust, target);
+            let prepared_target = prepared
+                .targets
+                .iter()
+                .find(|prepared| &prepared.target == target)
+                .expect("prepared Rust target must have retained state");
+            let Some(PreparedRustTargetReady {
+                member,
+                graph_visible,
+                kind,
+                seeds,
+                protected_files: _,
+                planned_files,
+            }) = &prepared_target.ready
+            else {
+                return Err(GraphFailureReason::NoGraphSeed("no graph seed resolved")
+                    .diagnostic(target.fq_name(), RUST_STRATEGY));
+            };
+            let scan_files = if prepared.enforce_admitted_scope {
+                planned_files
+                    .intersection(scan_scope.candidate_files())
+                    .cloned()
+                    .collect()
+            } else {
+                planned_files.clone()
+            };
+
+            let (hits, unproven_hits) = if *member {
                 let private_authoritative_scope = scan_scope.is_authoritative();
-                if seed_result.kind == RustGraphSeedKind::Export
-                    && !graph_visible
+                if *kind == RustGraphSeedKind::Export
+                    && !*graph_visible
                     && !private_authoritative_scope
                 {
                     return Ok(CandidateUsageHits::default());
-                }
-                let mut scan_files = effective_scan_files(rust, scan_scope, target, &seeds);
-                if seed_result.kind == RustGraphSeedKind::LocalDeclaration {
-                    scan_files.extend(
-                        local_impl_target_importer_files_while(rust, target, &|| {
-                            !scan_scope.is_cancelled()
-                        })
-                        .unwrap_or_default(),
-                    );
                 }
                 let scan_target = trait_member_for_impl_member(rust, target);
                 let scan_target = scan_target.as_ref().unwrap_or(target);
@@ -173,41 +354,13 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                 );
                 (result.hits, result.unproven_hits)
             } else {
-                let seed_result = {
-                    let _scope = crate::profiling::scope("rust_graph::seed_inference");
-                    infer_graph_seeds(rust, target)
-                };
-                if seed_result.roots.is_empty() {
-                    return Err(GraphFailureReason::NoGraphSeed("no graph seed resolved")
-                        .diagnostic(target.fq_name(), RUST_STRATEGY));
-                }
-                let seeds = {
-                    let _scope = crate::profiling::scope("rust_graph::binding_seed_discovery");
-                    usage_binding_seeds(rust, &seed_result.roots)
-                };
-                crate::profiling::note_with(|| {
-                    format!(
-                        "rust_graph seed roots={} candidate_names={}",
-                        seed_result.roots.len(),
-                        seeds.candidate_names().count()
-                    )
-                });
-                let mut scan_files = effective_scan_files(rust, scan_scope, target, &seeds);
-                if seed_result.kind == RustGraphSeedKind::LocalDeclaration {
-                    scan_files.extend(
-                        local_impl_target_importer_files_while(rust, target, &|| {
-                            !scan_scope.is_cancelled()
-                        })
-                        .unwrap_or_default(),
-                    );
-                }
                 (
                     scan_files_for_target(
                         analyzer,
                         rust,
                         scan_files,
                         target,
-                        Some(&seeds),
+                        Some(seeds),
                         scan_scope.cancellation(),
                         max_usages,
                     ),
@@ -312,6 +465,30 @@ impl RustExportUsageGraphStrategy {
 }
 
 impl GraphUsageAnalyzer for RustExportUsageGraphStrategy {
+    fn prepare_usage_query(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        candidate_files: &HashSet<ProjectFile>,
+        authoritative: bool,
+        cancellation: &CancellationToken,
+    ) -> Option<Box<dyn PreparedUsageQuery>> {
+        let target = overloads.first()?;
+        if language_for_target(target) != Language::Rust {
+            return None;
+        }
+        let resolver = RustQueryResolver::try_new(analyzer)?;
+        PreparedRustUsageQuery::prepare(
+            resolver.rust,
+            overloads,
+            candidate_files,
+            authoritative,
+            true,
+            cancellation,
+        )
+        .map(|prepared| Box::new(prepared) as Box<dyn PreparedUsageQuery>)
+    }
+
     fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -549,6 +726,79 @@ mod tests {
     }
 
     #[test]
+    fn prepared_overloads_keep_target_local_scan_plans() {
+        let files = vec![
+            (
+                "Cargo.toml".to_string(),
+                "[workspace]\nmembers = [\"alpha\", \"beta\"]\nresolver = \"2\"\n".to_string(),
+            ),
+            (
+                "alpha/Cargo.toml".to_string(),
+                "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    .to_string(),
+            ),
+            (
+                "alpha/src/lib.rs".to_string(),
+                "pub mod caller;\npub fn target_alpha() {}\n".to_string(),
+            ),
+            (
+                "alpha/src/caller.rs".to_string(),
+                "use crate::target_alpha;\npub fn call() { target_alpha(); }\n".to_string(),
+            ),
+            (
+                "beta/Cargo.toml".to_string(),
+                "[package]\nname = \"beta\"\nversion = \"0.1.0\"\nedition = \"2021\"\n".to_string(),
+            ),
+            (
+                "beta/src/lib.rs".to_string(),
+                "pub mod caller;\npub fn target_beta() {}\n".to_string(),
+            ),
+            (
+                "beta/src/caller.rs".to_string(),
+                "use crate::target_beta;\npub fn call() { target_beta(); }\n".to_string(),
+            ),
+        ];
+        let fixture = fixture_for(&files);
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let root = fixture.project_root();
+        let alpha_file = ProjectFile::new(root.clone(), "alpha/src/lib.rs");
+        let alpha_caller = ProjectFile::new(root.clone(), "alpha/src/caller.rs");
+        let beta_file = ProjectFile::new(root.clone(), "beta/src/lib.rs");
+        let beta_caller = ProjectFile::new(root, "beta/src/caller.rs");
+        let alpha = declaration_named(&analyzer, &alpha_file, "target_alpha");
+        let beta = declaration_named(&analyzer, &beta_file, "target_beta");
+
+        let prepared = PreparedRustUsageQuery::prepare(
+            &analyzer,
+            &[alpha.clone(), beta.clone()],
+            &HashSet::default(),
+            false,
+            true,
+            &CancellationToken::new(),
+        )
+        .expect("prepared overload query");
+        let alpha_plan = prepared
+            .targets
+            .iter()
+            .find(|target| target.target == alpha)
+            .and_then(|target| target.ready.as_ref())
+            .expect("alpha plan");
+        let beta_plan = prepared
+            .targets
+            .iter()
+            .find(|target| target.target == beta)
+            .and_then(|target| target.ready.as_ref())
+            .expect("beta plan");
+
+        assert!(alpha_plan.planned_files.contains(&alpha_caller));
+        assert!(!alpha_plan.planned_files.contains(&beta_caller));
+        assert!(beta_plan.planned_files.contains(&beta_caller));
+        assert!(!beta_plan.planned_files.contains(&alpha_caller));
+        assert!(prepared.candidate_files().contains(&alpha_caller));
+        assert!(prepared.candidate_files().contains(&beta_caller));
+    }
+
+    #[test]
     fn cancelled_cold_candidate_discovery_does_not_publish_partial_index() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -571,8 +821,16 @@ mod tests {
 
         let cancellation = CancellationToken::cancel_after_checks_for_test(12);
         assert!(
-            rust_usage_candidate_files(&analyzer, &target, &cancellation).is_empty(),
-            "cancelled cold discovery must not return partial candidates"
+            PreparedRustUsageQuery::prepare(
+                &analyzer,
+                std::slice::from_ref(&target),
+                &HashSet::default(),
+                false,
+                true,
+                &cancellation,
+            )
+            .is_none(),
+            "cancelled cold preparation must not return a partial plan"
         );
         assert!(cancellation.is_cancelled());
         // Cargo routes are the whole-workspace structure a cold discovery has
@@ -582,8 +840,16 @@ mod tests {
         // anything about this path.
         assert!(!analyzer.cargo_routes_ready_for_test());
 
-        let candidates = rust_usage_candidate_files(&analyzer, &target, &CancellationToken::new());
-        assert!(candidates.contains(&source));
+        let prepared = PreparedRustUsageQuery::prepare(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &HashSet::default(),
+            false,
+            true,
+            &CancellationToken::new(),
+        )
+        .expect("uncancelled preparation");
+        assert!(prepared.candidate_files().contains(&source));
         assert!(analyzer.cargo_routes_ready_for_test());
     }
 }

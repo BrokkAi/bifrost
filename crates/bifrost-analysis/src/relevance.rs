@@ -23,7 +23,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const ALPHA: f64 = 0.85;
@@ -36,6 +37,10 @@ const MAX_ITERS: usize = 75;
 const PAGE_RANK_SCORE_TOLERANCE: f64 = 1.0e-6;
 const IMPORT_DEPTH: usize = 2;
 const COMMITS_TO_PROCESS: usize = 1_000;
+/// How deep the cascade reads the file-level co-edit ranking. The campaign that
+/// measured the tiers fed them exactly this many co-edit results, and a file
+/// ranked past it lands in the directory-affinity tier instead.
+const CASCADE_COEDIT_DEPTH: usize = 50;
 /// How often a pending `git` child is checked against the caller's cancellation
 /// token. The wait is otherwise idle, so this only bounds how long an expired
 /// request budget keeps a doomed subprocess alive.
@@ -103,7 +108,13 @@ struct FileRelevance {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MostRelevantFilesRankingMode {
+    /// Priority tiers over mirror, stem, co-edit, directory and import
+    /// evidence. The default because it is the one that was measured: 41.0
+    /// percent recall@10 against 24.7 percent for a directory-plus-popularity
+    /// baseline and 29.1 percent for `HistoryImports` over 8,346 leave-one-out
+    /// cases in 18 repositories (`.agents/docs/coedit-retrieval-eval-2026-08-14.md`).
     #[default]
+    Cascade,
     HistoryImports,
     UsageGraph,
     UsageGraphExact,
@@ -256,6 +267,226 @@ pub(crate) fn most_relevant_project_files_history_only(
     (results, status)
 }
 
+/// Rank files related to `seeds` with the co-edit cascade.
+///
+/// The cascade is a priority order over evidence, not a weighted blend: see
+/// `cascade` for the tiers and for the offline measurement behind them. This
+/// function's job is to gather what those tiers read -- the workspace's
+/// analyzable files, the commit window, the depth-1 import neighbourhood -- and
+/// to say which of them were actually available.
+///
+/// Every input degrades independently. A repository with no history (a shallow
+/// clone, a squashed mirror, a fresh `git init`) contributes no co-edit
+/// ranking, no popularity and no directory affinity, and the mirror, stem and
+/// directory tiers still rank from paths alone. A workspace with no import
+/// analysis loses the two import tiers the same way. That is the whole reason
+/// this ranking replaces the history-only one: the co-edit leg answers nothing
+/// at all in those repositories.
+pub(crate) fn most_relevant_project_files_cascade(
+    analyzer: &dyn IAnalyzer,
+    seeds: &[(ProjectFile, f64)],
+    top_k: usize,
+    half_life: Option<f64>,
+    cancellation: &CancellationToken,
+) -> MostRelevantProjectFilesOutcome {
+    let _scope = profiling::scope("relevance::most_relevant_project_files_cascade");
+    if top_k == 0 {
+        return MostRelevantProjectFilesOutcome::Complete(Vec::new());
+    }
+    if cancellation.is_cancelled() {
+        return MostRelevantProjectFilesOutcome::Cancelled;
+    }
+
+    let seed_weights = seed_weight_map(seeds);
+    if seed_weights.is_empty() {
+        return MostRelevantProjectFilesOutcome::Complete(Vec::new());
+    }
+    let seed_files: HashSet<ProjectFile> = seed_weights.keys().cloned().collect();
+
+    let universe = cascade_universe(analyzer);
+    if universe.is_empty() {
+        return MostRelevantProjectFilesOutcome::Complete(Vec::new());
+    }
+    let history = cascade_history_evidence(
+        analyzer,
+        &universe,
+        &seed_weights,
+        top_k.max(CASCADE_COEDIT_DEPTH),
+        half_life,
+        cancellation,
+    );
+    if history.status == HistoryRankingStatus::Cancelled {
+        return MostRelevantProjectFilesOutcome::Cancelled;
+    }
+    let neighbours = import_neighbourhood(analyzer, &seed_files);
+    if cancellation.is_cancelled() {
+        return MostRelevantProjectFilesOutcome::Cancelled;
+    }
+
+    let ranked = cascade::cascade_ranking(
+        cascade::CascadeEvidence {
+            universe: &universe,
+            seeds: &seed_files,
+            coedit: &history.coedit,
+            neighbours: &neighbours,
+            popularity: &history.popularity,
+            dir_stats: &history.dir_stats,
+        },
+        top_k,
+    );
+    match history.status {
+        HistoryRankingStatus::Complete => MostRelevantProjectFilesOutcome::Complete(ranked),
+        HistoryRankingStatus::HistoryUnavailable => {
+            MostRelevantProjectFilesOutcome::HistoryUnavailable(ranked)
+        }
+        HistoryRankingStatus::Cancelled => MostRelevantProjectFilesOutcome::Cancelled,
+    }
+}
+
+/// Every file the workspace can rank: its analyzable source files.
+///
+/// One listing covers every language, because a path's extension already
+/// decides which language owns it. The listing is the project's own, so it is
+/// the same set the rest of the tools talk about, ignore rules included.
+fn cascade_universe(analyzer: &dyn IAnalyzer) -> Vec<ProjectFile> {
+    let _scope = profiling::scope("relevance::cascade_universe");
+    let project = analyzer.project();
+    let languages = project.analyzer_languages();
+    let Ok(listing) = project.all_files_shared() else {
+        return Vec::new();
+    };
+    listing
+        .iter()
+        .filter(|file| languages.contains(&file.language()))
+        .cloned()
+        .collect()
+}
+
+/// The depth-1 import neighbourhood of the seeds, both directions.
+///
+/// Deliberately not the ranked import graph `related_files_by_imports` builds:
+/// that one expands two levels and resolves every reverse importer, which costs
+/// minutes in large Java workspaces. The cascade only asks whether a file is
+/// adjacent to a seed, and adjacency is one lookup per seed.
+fn import_neighbourhood(
+    analyzer: &dyn IAnalyzer,
+    seeds: &HashSet<ProjectFile>,
+) -> HashSet<ProjectFile> {
+    let _scope = profiling::scope("relevance::cascade_import_neighbourhood");
+    let mut neighbours = HashSet::default();
+    let Some(provider) = analyzer.import_analysis_provider() else {
+        return neighbours;
+    };
+    for seed in seeds {
+        neighbours.extend(
+            provider
+                .imported_code_units_of(seed)
+                .iter()
+                .map(|code_unit| code_unit.source().clone()),
+        );
+        neighbours.extend(provider.referencing_files_of(seed));
+    }
+    neighbours
+}
+
+/// What one walk of the commit window tells the cascade.
+struct CascadeHistoryEvidence {
+    coedit: Vec<ProjectFile>,
+    popularity: HashMap<ProjectFile, u32>,
+    dir_stats: cascade::DirCoChangeStats,
+    status: HistoryRankingStatus,
+}
+
+impl CascadeHistoryEvidence {
+    fn none(status: HistoryRankingStatus) -> Self {
+        Self {
+            coedit: Vec::new(),
+            popularity: HashMap::default(),
+            dir_stats: cascade::DirCoChangeStats::default(),
+            status,
+        }
+    }
+}
+
+/// Walk the commit window once and derive all three history signals from it:
+/// the file-level co-edit ranking, how often each file changed, and which
+/// directories change together.
+fn cascade_history_evidence(
+    analyzer: &dyn IAnalyzer,
+    universe: &[ProjectFile],
+    seed_weights: &HashMap<ProjectFile, f64>,
+    coedit_depth: usize,
+    half_life: Option<f64>,
+    cancellation: &CancellationToken,
+) -> CascadeHistoryEvidence {
+    let _scope = profiling::scope("relevance::cascade_history_evidence");
+    reset_git_counters();
+    let Some(repo) = GitProjectContext::discover(analyzer.project().root()) else {
+        return CascadeHistoryEvidence::none(HistoryRankingStatus::HistoryUnavailable);
+    };
+    let Some(head_tree) = repo.head_tree() else {
+        return CascadeHistoryEvidence::none(HistoryRankingStatus::HistoryUnavailable);
+    };
+    let changes = match repo.recent_commit_changes_for_request(COMMITS_TO_PROCESS, cancellation) {
+        Ok(Some(changes)) => changes,
+        // The walk was killed by the caller's budget, or this clone cannot
+        // serve it locally at all. Either way the path tiers still rank.
+        Ok(None) | Err(_) => {
+            return CascadeHistoryEvidence::none(if cancellation.is_cancelled() {
+                HistoryRankingStatus::Cancelled
+            } else {
+                HistoryRankingStatus::HistoryUnavailable
+            });
+        }
+    };
+    let Some(commit_files) = canonical_commit_files(&repo, changes, cancellation) else {
+        return CascadeHistoryEvidence::none(HistoryRankingStatus::Cancelled);
+    };
+
+    let ranked: HashSet<&ProjectFile> = universe.iter().collect();
+    let mut popularity: HashMap<ProjectFile, u32> = HashMap::default();
+    let mut dir_stats = cascade::DirCoChangeStats::default();
+    for changed_files in &commit_files {
+        if cancellation.is_cancelled() {
+            return CascadeHistoryEvidence::none(HistoryRankingStatus::Cancelled);
+        }
+        let mut directories = BTreeSet::new();
+        for file in changed_files.iter().filter(|file| ranked.contains(file)) {
+            *popularity.entry(file.clone()).or_insert(0) += 1;
+            directories.insert(file.parent());
+        }
+        dir_stats.record_commit(&directories);
+    }
+
+    // The co-edit leg only scores a file that co-occurred with a seed, so a
+    // seed the current tree does not hold can contribute nothing.
+    let coedit = if seed_weights
+        .keys()
+        .any(|seed| repo.is_tracked_in_tree(seed, &head_tree))
+    {
+        let (scored, status) = score_git_co_change(
+            &commit_files,
+            seed_weights,
+            coedit_depth,
+            half_life,
+            cancellation,
+        );
+        if status == HistoryRankingStatus::Cancelled {
+            return CascadeHistoryEvidence::none(HistoryRankingStatus::Cancelled);
+        }
+        scored.into_iter().map(|scored| scored.file).collect()
+    } else {
+        Vec::new()
+    };
+
+    CascadeHistoryEvidence {
+        coedit,
+        popularity,
+        dir_stats,
+        status: HistoryRankingStatus::Complete,
+    }
+}
+
 pub(crate) fn most_relevant_project_files_with_ranking_mode_and_cancellation(
     analyzer: &dyn IAnalyzer,
     seeds: &[(ProjectFile, f64)],
@@ -267,6 +498,15 @@ pub(crate) fn most_relevant_project_files_with_ranking_mode_and_cancellation(
     let _scope = profiling::scope("relevance::most_relevant_project_files_with_ranking_mode");
     if cancellation.is_cancelled() {
         return MostRelevantProjectFilesOutcome::Cancelled;
+    }
+    if ranking_mode == MostRelevantFilesRankingMode::Cascade {
+        return most_relevant_project_files_cascade(
+            analyzer,
+            seeds,
+            top_k,
+            half_life,
+            cancellation,
+        );
     }
     if ranking_mode == MostRelevantFilesRankingMode::HistoryImports {
         let (files, history_status) = most_relevant_project_files_with_half_life(
@@ -299,7 +539,9 @@ pub(crate) fn most_relevant_project_files_with_ranking_mode_and_cancellation(
     let graph_kind = match ranking_mode {
         MostRelevantFilesRankingMode::UsageGraph => WorkspaceUsageGraphKind::File,
         MostRelevantFilesRankingMode::UsageGraphExact => WorkspaceUsageGraphKind::Exact,
-        MostRelevantFilesRankingMode::HistoryImports => unreachable!("handled above"),
+        MostRelevantFilesRankingMode::Cascade | MostRelevantFilesRankingMode::HistoryImports => {
+            unreachable!("handled above")
+        }
     };
     let usage_candidates =
         match related_files_by_usage(analyzer, &seed_weights, top_k, graph_kind, cancellation) {
@@ -711,7 +953,13 @@ pub(crate) fn most_important_project_files_with_cancellation(
     let (changes, history_status) = if cancellation.is_some() {
         match repo.cached_recent_commit_changes(COMMITS_TO_PROCESS) {
             Ok(Some(changes)) => (changes, HistoryRankingStatus::Complete),
-            Ok(None) | Err(_) => (Vec::new(), HistoryRankingStatus::HistoryUnavailable),
+            Ok(None) | Err(_) => {
+                // This request still reports the truthful incomplete ranking; the fill it
+                // could not afford runs on its own thread so the next one has history
+                // (issue #2327).
+                repo.schedule_background_history_warm();
+                (Vec::new(), HistoryRankingStatus::HistoryUnavailable)
+            }
         }
     } else {
         let Ok(Some(changes)) =
@@ -1355,86 +1603,134 @@ fn related_files_by_git(
         return Ok((Vec::new(), HistoryRankingStatus::Complete));
     }
 
-    let mut file_doc_freq: HashMap<ProjectFile, usize> = HashMap::default();
-    let mut joint_mass: HashMap<(ProjectFile, ProjectFile), f64> = HashMap::default();
-    let mut seed_mass: HashMap<ProjectFile, f64> = HashMap::default();
-    let mut canonicalizer = RenameCanonicalizer::default();
-    let find_commit_ms = 0.0;
-    let change_ms = 0.0;
-    let mut canonicalize_ms = 0.0;
-    let mut processed_commits = 0usize;
+    let Some(commit_files) = canonical_commit_files(&repo, changes, cancellation) else {
+        return Ok((Vec::new(), HistoryRankingStatus::Cancelled));
+    };
+    Ok(score_git_co_change(
+        &commit_files,
+        seed_weights,
+        k,
+        half_life,
+        cancellation,
+    ))
+}
 
-    let baseline_commit_count = changes.len() as f64;
-    {
-        let _scope = profiling::scope("relevance::git.score_commits");
-        for (index, change) in changes.into_iter().enumerate() {
-            if cancellation.is_cancelled() {
-                return Ok((Vec::new(), HistoryRankingStatus::Cancelled));
-            }
-            let started = Instant::now();
-            canonicalizer.record_renames(&change.renames);
-            let changed_files: BTreeSet<_> = change
+/// Resolve each commit in the window to the workspace files it changed.
+///
+/// Renames are canonicalized in walk order, so an older pre-rename commit is
+/// never seen before the later rename edge that rewrites it. The result is
+/// shared: the co-edit scorer and the cascade's popularity and directory
+/// statistics all read the same window rather than each walking it again.
+///
+/// Returns `None` when the caller's budget expired mid-walk.
+fn canonical_commit_files(
+    repo: &GitProjectContext,
+    changes: Vec<CommitChange>,
+    cancellation: &CancellationToken,
+) -> Option<Vec<BTreeSet<ProjectFile>>> {
+    let _scope = profiling::scope("relevance::git.canonicalize_commits");
+    let mut canonicalizer = RenameCanonicalizer::default();
+    let mut canonicalize_ms = 0.0;
+    let mut commit_files = Vec::with_capacity(changes.len());
+    for change in changes {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let started = Instant::now();
+        canonicalizer.record_renames(&change.renames);
+        commit_files.push(
+            change
                 .paths
                 .iter()
                 .map(|path| canonicalizer.canonicalize(path))
                 .filter_map(|path| repo.repo_path_to_project_file(&path))
-                .collect();
-            canonicalize_ms += started.elapsed().as_secs_f64() * 1000.0;
-            processed_commits += 1;
-            if profiling::enabled() && processed_commits.is_multiple_of(5) {
-                profiling::note(format!(
-                    "relevance::git.score_commits progress processed_commits={} find_commit_ms={:.1} change_ms={:.1} canonicalize_ms={:.1} {}",
-                    processed_commits,
-                    find_commit_ms,
-                    change_ms,
-                    canonicalize_ms,
-                    git_counters_note()
-                ));
-            }
-            if changed_files.is_empty() {
-                continue;
-            }
-
-            for file in &changed_files {
-                *file_doc_freq.entry(file.clone()).or_insert(0) += 1;
-            }
-
-            let seeds_in_commit: Vec<_> = changed_files
-                .iter()
-                .filter(|file| seed_weights.contains_key(*file))
-                .cloned()
-                .collect();
-            if seeds_in_commit.is_empty() {
-                continue;
-            }
-
-            let commit_weight = commit_age_weight(index, half_life);
-            for seed in &seeds_in_commit {
-                *seed_mass.entry(seed.clone()).or_insert(0.0) += commit_weight;
-            }
-
-            let commit_pair_mass = commit_weight / changed_files.len() as f64;
-            for seed in &seeds_in_commit {
-                for target in &changed_files {
-                    if seed_weights.contains_key(target) {
-                        continue;
-                    }
-                    *joint_mass
-                        .entry((seed.clone(), target.clone()))
-                        .or_insert(0.0) += commit_pair_mass;
-                }
-            }
+                .collect::<BTreeSet<_>>(),
+        );
+        canonicalize_ms += started.elapsed().as_secs_f64() * 1000.0;
+        if profiling::enabled() && commit_files.len().is_multiple_of(5) {
+            profiling::note(format!(
+                "relevance::git.canonicalize_commits progress processed_commits={} canonicalize_ms={:.1} {}",
+                commit_files.len(),
+                canonicalize_ms,
+                git_counters_note()
+            ));
         }
     }
     if profiling::enabled() {
         profiling::note(format!(
-            "relevance::git.score_commits processed_commits={processed_commits} find_commit_ms={find_commit_ms:.1} change_ms={change_ms:.1} canonicalize_ms={canonicalize_ms:.1}"
+            "relevance::git.canonicalize_commits processed_commits={} canonicalize_ms={canonicalize_ms:.1}",
+            commit_files.len()
         ));
     }
     note_git_counters();
+    Some(commit_files)
+}
+
+fn score_git_co_change(
+    commit_files: &[BTreeSet<ProjectFile>],
+    seed_weights: &HashMap<ProjectFile, f64>,
+    k: usize,
+    half_life: Option<f64>,
+    cancellation: &CancellationToken,
+) -> (Vec<FileRelevance>, HistoryRankingStatus) {
+    let _scope = profiling::scope("relevance::git.score_commits");
+    let mut file_doc_freq: HashMap<ProjectFile, usize> = HashMap::default();
+    let mut joint_mass: HashMap<(ProjectFile, ProjectFile), f64> = HashMap::default();
+    let mut seed_mass: HashMap<ProjectFile, f64> = HashMap::default();
+    let mut commits_with_tracked_churn = 0usize;
+
+    let baseline_commit_count = commit_files.len() as f64;
+    for (index, changed_files) in commit_files.iter().enumerate() {
+        if cancellation.is_cancelled() {
+            return (Vec::new(), HistoryRankingStatus::Cancelled);
+        }
+        if changed_files.is_empty() {
+            continue;
+        }
+        commits_with_tracked_churn += 1;
+
+        for file in changed_files {
+            *file_doc_freq.entry(file.clone()).or_insert(0) += 1;
+        }
+
+        let seeds_in_commit: Vec<_> = changed_files
+            .iter()
+            .filter(|file| seed_weights.contains_key(*file))
+            .cloned()
+            .collect();
+        if seeds_in_commit.is_empty() {
+            continue;
+        }
+
+        let commit_weight = commit_age_weight(index, half_life);
+        for seed in &seeds_in_commit {
+            *seed_mass.entry(seed.clone()).or_insert(0.0) += commit_weight;
+        }
+
+        let commit_pair_mass = commit_weight / changed_files.len() as f64;
+        for seed in &seeds_in_commit {
+            for target in changed_files {
+                if seed_weights.contains_key(target) {
+                    continue;
+                }
+                *joint_mass
+                    .entry((seed.clone(), target.clone()))
+                    .or_insert(0.0) += commit_pair_mass;
+            }
+        }
+    }
+
+    // A single contributing commit carries no co-occurrence information: every
+    // file in it co-occurs with every other file exactly once, so the scores
+    // only restate that one snapshot. A squashed mirror or a fresh repository
+    // looks like this. The walk itself succeeded, so this is `Complete` with no
+    // signal rather than unavailable history.
+    if commits_with_tracked_churn < 2 {
+        return (Vec::new(), HistoryRankingStatus::Complete);
+    }
 
     if joint_mass.is_empty() {
-        return Ok((Vec::new(), HistoryRankingStatus::Complete));
+        return (Vec::new(), HistoryRankingStatus::Complete);
     }
 
     let mut scores = HashMap::default();
@@ -1456,13 +1752,31 @@ fn related_files_by_git(
         }
     }
 
+    // A uniform score vector longer than `k` cannot be truncated into a
+    // ranking: the `k` survivors are whichever paths the tie-break happens to
+    // sort first, an arbitrary subset rather than evidence. N identical
+    // snapshot commits produce exactly this. A tie set that fits inside `k` is
+    // kept, because then every file that co-changed with the seeds is returned
+    // and the caller sees the whole tie rather than a slice of it.
+    //
+    // The tolerance is relative because per-target accumulation walks the
+    // joint-mass map in hash order and float addition is not associative, so
+    // equal sums can differ in the last bits.
+    if scores.len() > k {
+        let max = scores.values().copied().fold(f64::NEG_INFINITY, f64::max);
+        let min = scores.values().copied().fold(f64::INFINITY, f64::min);
+        if max - min <= 1e-9 * max {
+            return (Vec::new(), HistoryRankingStatus::Complete);
+        }
+    }
+
     let mut ranked = scores
         .into_iter()
         .map(|(file, score)| FileRelevance { file, score })
         .collect::<Vec<_>>();
     ranked.sort_by(compare_file_relevance);
     ranked.truncate(k);
-    Ok((ranked, HistoryRankingStatus::Complete))
+    (ranked, HistoryRankingStatus::Complete)
 }
 
 struct GitCommandOutput {
@@ -1571,6 +1885,12 @@ struct RepoCommitChangeCache {
     /// GIT_REV_LIST_SPAWNS counter is shared across concurrently-running tests and is
     /// observability-only).
     recent_oid_fills: AtomicUsize,
+    /// True while a background history warm holds this repo root (issue #2327). One warm at
+    /// a time: a burst of cold-cache requests would otherwise launch one `git rev-list` walk
+    /// each, all filling the same HEAD-keyed entry. `warm_idle` publishes the release, so a
+    /// test can wait for a scheduled warm instead of sleeping.
+    warm_in_flight: Mutex<bool>,
+    warm_idle: Condvar,
 }
 
 struct CachedRecentOids {
@@ -1594,8 +1914,107 @@ impl RepoCommitChangeCache {
             fill_commits_scanned: AtomicUsize::new(0),
             recent_oids: Mutex::new(None),
             recent_oid_fills: AtomicUsize::new(0),
+            warm_in_flight: Mutex::new(false),
+            warm_idle: Condvar::new(),
         }
     }
+
+    /// Become the single background history warm for this repo root, or `None` when one is
+    /// already in flight. The returned claim is released when it drops, including while a
+    /// panic unwinds, so a failed warm never wedges the next one.
+    fn claim_history_warm(self: &Arc<Self>, repo_root: PathBuf) -> Option<HistoryWarmClaim> {
+        let mut in_flight = self.warm_in_flight.lock().expect("history warm mutex");
+        if *in_flight {
+            return None;
+        }
+        *in_flight = true;
+        Some(HistoryWarmClaim {
+            cache: Arc::clone(self),
+            repo_root,
+        })
+    }
+
+    #[cfg(test)]
+    fn history_warm_in_flight(&self) -> bool {
+        *self.warm_in_flight.lock().expect("history warm mutex")
+    }
+
+    /// Block until no background history warm holds this repo root. Test-only: production
+    /// code schedules a warm and never waits for it.
+    #[cfg(test)]
+    fn wait_for_history_warm(&self) {
+        let in_flight = self.warm_in_flight.lock().expect("history warm mutex");
+        let (in_flight, timeout) = self
+            .warm_idle
+            .wait_timeout_while(in_flight, Duration::from_secs(60), |in_flight| *in_flight)
+            .expect("history warm mutex poisoned while waiting for idle");
+        assert!(
+            !timeout.timed_out(),
+            "background commit-history warm did not complete"
+        );
+        assert!(!*in_flight);
+    }
+}
+
+/// The exclusive right to fill one repository's commit-history cache in the background.
+///
+/// Held for the whole walk so a second schedule for the same repo root is dropped rather
+/// than duplicating it (issue #2327), and released on drop so the next cold hit -- a moved
+/// HEAD, or a walk that failed -- can schedule the following warm.
+struct HistoryWarmClaim {
+    cache: Arc<RepoCommitChangeCache>,
+    repo_root: PathBuf,
+}
+
+impl Drop for HistoryWarmClaim {
+    fn drop(&mut self) {
+        *self
+            .cache
+            .warm_in_flight
+            .lock()
+            .expect("history warm mutex") = false;
+        self.cache.warm_idle.notify_all();
+    }
+}
+
+const HISTORY_WARM_THREAD_NAME: &str = "bifrost-history-warm";
+
+/// Fill the commit-history cache of the repository containing `project_root` on a background
+/// thread, and return that thread's handle at once.
+///
+/// Every interactive navigation tool carries a cancellation token, so its ranking reads the
+/// cache through `cached_recent_commit_changes`, which reports a cold cache rather than
+/// starting an uninterruptible Git subprocess inside the request. Nothing else fills the
+/// cache for a session that only navigates, so without this warm such a session ranks without
+/// the history tier for its whole life (issue #2327). The walk takes seconds on a large
+/// repository; running it here keeps it off every request path.
+///
+/// A caller that wants to observe the warm joins the handle. Production callers drop it: the
+/// warm reports its own failures, and nothing waits for history.
+pub fn spawn_commit_history_warm(project_root: PathBuf) -> std::io::Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(HISTORY_WARM_THREAD_NAME.to_string())
+        .spawn(move || {
+            let Some(context) = GitProjectContext::discover(&project_root) else {
+                return;
+            };
+            let Some(claim) = context.claim_background_history_warm() else {
+                return;
+            };
+            context.fill_history_cache(claim);
+        })
+}
+
+/// Body of a warm whose claim was taken before the thread started: rediscover the repository
+/// here, because `git2::Repository` is not `Send` and so cannot be handed over from the
+/// scheduling thread.
+fn fill_history_cache_from_project_root(project_root: &Path, claim: HistoryWarmClaim) {
+    let Some(context) = GitProjectContext::discover(project_root) else {
+        // The repository disappeared between the schedule and this thread. Dropping the claim
+        // is the whole recovery: the next cold hit schedules again.
+        return;
+    };
+    context.fill_history_cache(claim);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1747,6 +2166,10 @@ impl GitProjectContext {
     /// `min(total_commits, limit)`, not `limit` itself. Without the second clause, any repo with
     /// fewer than `limit` total first-parent commits could never satisfy `oids.len() >= limit`
     /// and would report cold forever, even after a fill had captured its entire history.
+    ///
+    /// This method only reads. Filling is the caller's business, off the request path: see
+    /// `schedule_background_history_warm`, which every cold hit here goes on to schedule so the
+    /// degraded ranking lasts one request rather than the whole session (issue #2327).
     fn cached_recent_commit_changes(
         &self,
         limit: usize,
@@ -1791,6 +2214,64 @@ impl GitProjectContext {
             return self.cached_recent_commit_changes(limit);
         }
         self.recent_commit_changes(limit, cancellation)
+    }
+
+    /// Whether a background history warm may run for this clone, and the claim that makes it
+    /// the only one in flight. `None` when a warm already holds this repo root, or when the
+    /// clone resolves missing objects through a network promisor remote: filling that history
+    /// is unbounded network work whoever waits for it, so the partial-clone guard of issue
+    /// #1373 applies to a background walk exactly as it does to a budgeted request.
+    fn claim_background_history_warm(&self) -> Option<HistoryWarmClaim> {
+        if self.has_network_promisor_remote() {
+            return None;
+        }
+        repo_commit_change_cache(&self.repo_root).claim_history_warm(self.repo_root.clone())
+    }
+
+    /// Schedule the history fill that an interactive request must not perform itself.
+    ///
+    /// A cold hit on `cached_recent_commit_changes` is also the staleness signal: the entry is
+    /// keyed by the peeled HEAD oid, so a new commit, checkout, or reset misses it. Either way
+    /// the request keeps the truthful incomplete ranking it already computed; the walk runs on
+    /// its own thread so the next request finds history warm (issue #2327).
+    fn schedule_background_history_warm(&self) {
+        let Some(claim) = self.claim_background_history_warm() else {
+            return;
+        };
+        let project_root = self.project_root.clone();
+        // Spawn failure drops the claim along with the closure, leaving the next cold hit free
+        // to schedule again. Either way this request's ranking is already decided.
+        if let Err(error) = std::thread::Builder::new()
+            .name(HISTORY_WARM_THREAD_NAME.to_string())
+            .spawn(move || fill_history_cache_from_project_root(&project_root, claim))
+        {
+            eprintln!(
+                "bifrost failed to spawn a commit-history warm thread for {}: {error}",
+                self.repo_root.display()
+            );
+        }
+    }
+
+    /// Run the `git rev-list` and `git log` walk that fills this repository's commit-history
+    /// cache, on the calling thread. Never call this from a request path: it passes an
+    /// uncancelled token, so no budget can interrupt it.
+    ///
+    /// `claim` proves the caller is the single background warm for this repo root; it is
+    /// dropped here, when the walk is done.
+    fn fill_history_cache(&self, claim: HistoryWarmClaim) {
+        debug_assert_eq!(
+            self.repo_root, claim.repo_root,
+            "a history warm claim belongs to the repository it was taken for"
+        );
+        let _scope = profiling::scope("relevance::background_history_warm");
+        let filled = self.recent_commit_changes(COMMITS_TO_PROCESS, &CancellationToken::default());
+        drop(claim);
+        if let Err(error) = filled {
+            eprintln!(
+                "bifrost commit-history warm for {} failed: {error}",
+                self.repo_root.display()
+            );
+        }
     }
 
     fn recent_commit_changes_with_cache(
@@ -2025,8 +2506,20 @@ impl GitProjectContext {
         Ok(Some(self.parse_git_log_name_status(&output.stdout)))
     }
 
+    /// The first parent of `oid`, but only when that parent object is present
+    /// locally.
+    ///
+    /// A commit header records its parent ids whether or not this clone holds
+    /// those objects. At a shallow-clone boundary the parent is named and
+    /// absent, and `git log <missing>..<newest>` aborts with "fatal: Invalid
+    /// revision range", which fails the whole history walk. Reporting `None`
+    /// sends the caller to its `--root <newest>` form, which walks the
+    /// truncated history this clone does hold. libgit2 does not resolve missing
+    /// objects through a promisor remote, so probing the parent is local work
+    /// and never a network fetch.
     fn first_parent_oid(&self, oid: Oid) -> Option<Oid> {
-        self.repo.find_commit(oid).ok()?.parent_ids().next()
+        let parent = self.repo.find_commit(oid).ok()?.parent_ids().next()?;
+        self.repo.find_commit(parent).is_ok().then_some(parent)
     }
 
     /// Whether this repository resolves missing objects through a promisor
@@ -2392,6 +2885,8 @@ fn compare_file_relevance(left: &FileRelevance, right: &FileRelevance) -> std::c
         .then_with(|| normalized_rel_path(&left.file).cmp(&normalized_rel_path(&right.file)))
 }
 
+mod cascade;
+
 #[cfg(test)]
 mod weight_benchmark;
 
@@ -2414,8 +2909,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
     use std::time::Instant;
     use tempfile::TempDir;
 
@@ -2484,6 +2979,80 @@ mod tests {
 
     fn java_analyzer(root: &Path) -> JavaAnalyzer {
         JavaAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Java))
+    }
+
+    fn rust_analyzer(root: &Path) -> RustAnalyzer {
+        RustAnalyzer::from_project(TestProject::new(root.to_path_buf(), Language::Rust))
+    }
+
+    /// The shallow-mirror case: one snapshot commit, which carries no
+    /// co-occurrence information at all, so the co-edit leg correctly declines
+    /// to rank. The cascade reads the same repository and still pairs the seed
+    /// with its mirror, its directory and the directory that changed with it.
+    #[test]
+    fn cascade_ranks_from_paths_where_one_snapshot_commit_leaves_co_edit_nothing() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        write_file(root, "src/parser/lexer.rs", "pub fn lex() {}\n");
+        write_file(root, "tests/parser/lexer.rs", "#[test]\nfn lexes() {}\n");
+        write_file(root, "src/parser/emitter.rs", "pub fn emit() {}\n");
+        write_file(root, "src/net/client.rs", "pub fn get() {}\n");
+        let repo = Repository::init(root).unwrap();
+        commit_paths(
+            &repo,
+            "import the whole tree",
+            &[
+                "src/parser/lexer.rs",
+                "tests/parser/lexer.rs",
+                "src/parser/emitter.rs",
+                "src/net/client.rs",
+            ],
+            &[],
+        );
+
+        let analyzer = rust_analyzer(root);
+        let seeds = [(
+            ProjectFile::new(root.to_path_buf(), "src/parser/lexer.rs"),
+            1.0,
+        )];
+        let uncancelled = crate::CancellationToken::default();
+
+        let (history_only, status) = super::most_relevant_project_files_history_only(
+            &analyzer,
+            &seeds,
+            5,
+            Some(DEFAULT_RECENCY_HALF_LIFE),
+            &uncancelled,
+        );
+        assert!(history_only.is_empty(), "{history_only:?}");
+        assert_eq!(super::HistoryRankingStatus::Complete, status);
+
+        let ranked = match super::most_relevant_project_files_cascade(
+            &analyzer,
+            &seeds,
+            5,
+            Some(DEFAULT_RECENCY_HALF_LIFE),
+            &uncancelled,
+        ) {
+            super::MostRelevantProjectFilesOutcome::Complete(files) => files,
+            super::MostRelevantProjectFilesOutcome::HistoryUnavailable(files) => {
+                panic!("history should be available here, ranked {files:?}")
+            }
+            super::MostRelevantProjectFilesOutcome::Cancelled => {
+                panic!("an uncancelled token cannot cancel the cascade")
+            }
+        };
+        assert_eq!(
+            vec![
+                "tests/parser/lexer.rs",
+                "src/parser/emitter.rs",
+                "src/net/client.rs",
+            ],
+            ranked
+                .iter()
+                .map(super::normalized_rel_path)
+                .collect::<Vec<_>>()
+        );
     }
 
     fn commit_paths(repo: &Repository, message: &str, add: &[&str], remove: &[&str]) {
@@ -3283,6 +3852,165 @@ mod tests {
         assert!(candidates.is_empty(), "{candidates:?}");
     }
 
+    /// One background history warm per repository root. A burst of cold-cache requests would
+    /// otherwise launch one `git rev-list` walk each, all filling the same HEAD-keyed entry
+    /// (issue #2327). The fake filler below stands in for that walk so the dedup is observed
+    /// without any Git process, and the barrier keeps the second schedule inside the first
+    /// warm's lifetime instead of racing it.
+    #[test]
+    fn issue_2327_a_second_history_warm_is_dropped_while_one_is_in_flight() {
+        let cache = Arc::new(RepoCommitChangeCache::new(8));
+        let repo_root = Path::new("/bifrost-history-warm-test-root").to_path_buf();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Barrier::new(2));
+
+        let warm = {
+            let cache = Arc::clone(&cache);
+            let repo_root = repo_root.clone();
+            let runs = Arc::clone(&runs);
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                let claim = cache
+                    .claim_history_warm(repo_root)
+                    .expect("the first schedule claims the warm");
+                runs.fetch_add(1, Ordering::Relaxed);
+                gate.wait();
+                gate.wait();
+                drop(claim);
+            })
+        };
+
+        gate.wait();
+        assert!(cache.history_warm_in_flight());
+        assert!(
+            cache.claim_history_warm(repo_root.clone()).is_none(),
+            "a schedule arriving during a warm must be dropped, not run a second walk"
+        );
+        assert_eq!(1, runs.load(Ordering::Relaxed));
+
+        gate.wait();
+        warm.join().expect("the fake warm thread");
+        assert!(!cache.history_warm_in_flight());
+        // A later cold hit -- HEAD moved, or the walk failed -- warms again.
+        assert!(cache.claim_history_warm(repo_root).is_some());
+    }
+
+    /// A cancellable ranking on a cold cache tells the truth now and fixes itself for later:
+    /// the request reports `HistoryUnavailable` without starting a Git subprocess, and the
+    /// fill it could not afford runs on its own thread, so the next identical request ranks
+    /// with the history tier (issue #2327).
+    #[test]
+    fn issue_2327_a_cold_cancellable_ranking_warms_history_in_the_background() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        cochanging_seed_and_target_repo(root);
+        let repo_root = root.canonicalize().unwrap();
+        clear_repo_root_cache_for_project(root);
+        clear_repo_commit_change_cache_for_root(&repo_root);
+
+        let analyzer = java_analyzer(root);
+        let candidates = [
+            ProjectFile::new(root.to_path_buf(), "Seed.java"),
+            ProjectFile::new(root.to_path_buf(), "Target.java"),
+        ];
+        let cancellation = crate::CancellationToken::default();
+
+        let (ranked, status) = super::most_important_project_files_with_cancellation(
+            &analyzer,
+            &candidates,
+            candidates.len(),
+            Some(&cancellation),
+        );
+        assert_eq!(super::HistoryRankingStatus::HistoryUnavailable, status);
+        assert!(ranked.is_empty(), "{ranked:?}");
+
+        // The claim is taken on this thread before the warm thread starts, so the wait cannot
+        // miss a warm that is still being scheduled.
+        let cache = repo_commit_change_cache(&repo_root);
+        cache.wait_for_history_warm();
+        assert!(
+            git_context(root)
+                .cached_recent_commit_changes(super::COMMITS_TO_PROCESS)
+                .unwrap()
+                .is_some(),
+            "the background warm must leave the cache readable by the warm-only path"
+        );
+
+        let (ranked, status) = super::most_important_project_files_with_cancellation(
+            &analyzer,
+            &candidates,
+            candidates.len(),
+            Some(&cancellation),
+        );
+        assert_eq!(super::HistoryRankingStatus::Complete, status);
+        assert!(!ranked.is_empty(), "{ranked:?}");
+    }
+
+    /// The startup warm fills a cold cache from its own thread, which is what a session that
+    /// only calls cancellable navigation tools depends on (issue #2327).
+    #[test]
+    fn issue_2327_the_startup_history_warm_fills_a_cold_cache() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        cochanging_seed_and_target_repo(root);
+        let repo_root = root.canonicalize().unwrap();
+        clear_repo_root_cache_for_project(root);
+        clear_repo_commit_change_cache_for_root(&repo_root);
+
+        super::spawn_commit_history_warm(root.to_path_buf())
+            .expect("spawn the startup commit-history warm")
+            .join()
+            .expect("the startup commit-history warm thread");
+
+        assert!(
+            git_context(root)
+                .cached_recent_commit_changes(super::COMMITS_TO_PROCESS)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!repo_commit_change_cache(&repo_root).history_warm_in_flight());
+    }
+
+    /// The partial-clone guard of issue #1373 covers the background warm too: filling a
+    /// network promisor clone's history is unbounded network work whoever waits for it, so a
+    /// cold hit on such a repository must schedule nothing at all.
+    #[test]
+    fn issue_2327_a_network_partial_clone_never_schedules_a_background_warm() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let repo = cochanging_seed_and_target_repo(root);
+        // The marker `git clone --filter=blob:none` writes for its promisor remote.
+        repo.remote("origin", "https://example.invalid/repo.git")
+            .unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("remote.origin.promisor", true)
+            .unwrap();
+        let repo_root = root.canonicalize().unwrap();
+        clear_repo_root_cache_for_project(root);
+        clear_repo_commit_change_cache_for_root(&repo_root);
+
+        let analyzer = java_analyzer(root);
+        let candidates = [ProjectFile::new(root.to_path_buf(), "Seed.java")];
+        let cancellation = crate::CancellationToken::default();
+        let (ranked, status) = super::most_important_project_files_with_cancellation(
+            &analyzer,
+            &candidates,
+            candidates.len(),
+            Some(&cancellation),
+        );
+
+        assert_eq!(super::HistoryRankingStatus::HistoryUnavailable, status);
+        assert!(ranked.is_empty(), "{ranked:?}");
+        let cache = repo_commit_change_cache(&repo_root);
+        assert!(
+            !cache.history_warm_in_flight(),
+            "a network partial clone must not be warmed in the background"
+        );
+        assert_eq!(0, cache.recent_oid_fills.load(Ordering::Relaxed));
+        assert_eq!(0, cache.fill_commits_scanned.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn half_life_none_reproduces_legacy_uniform_scores_exactly() {
         let temp = TempDir::new().unwrap();
@@ -3816,7 +4544,15 @@ mod tests {
             &[],
             1,
         );
+        // Every commit after the first has to change file contents, not only
+        // re-add the same blobs. A commit whose tree equals its parent's has an
+        // empty diff, so this history would collapse to one contributing commit
+        // and the co-change guard would suppress the ranking this test compares.
+        write_file(root, "Seed.java", "public class Seed { int step = 2; }");
+        write_file(root, "Target.java", "public class Target { int step = 2; }");
         commit_paths_at(&repo, "seed+target", &["Seed.java", "Target.java"], &[], 2);
+        write_file(root, "Seed.java", "public class Seed { int step = 3; }");
+        write_file(root, "Helper.java", "public class Helper { int step = 3; }");
         commit_paths_at(&repo, "seed+helper", &["Seed.java", "Helper.java"], &[], 3);
 
         let analyzer = java_analyzer(root);

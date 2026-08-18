@@ -35,6 +35,7 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         lexical_bindings,
         session,
         expression_values: HashMap::default(),
+        constant_index_values: HashMap::default(),
         parameters: HashMap::default(),
         locals: HashMap::default(),
         receiver: None,
@@ -42,12 +43,17 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         procedure_targets,
         abruptness: HashMap::default(),
         cleanups: Vec::new(),
+        catch_binders: HashMap::default(),
+        catch_binder_scopes: HashMap::default(),
         plain_object_locals: HashMap::default(),
+        plain_object_fields: HashMap::default(),
+        array_locals: HashMap::default(),
     };
     context.emit_procedure_inputs(&mut builder, spec)?;
     context.emit_captured_receiver(&mut builder, entry, spec, capture_binding_expected)?;
     context.emit_local_bindings(&mut builder, spec.body)?;
     context.collect_plain_object_locals(&mut builder, spec.body)?;
+    context.collect_array_locals(&mut builder, spec.body)?;
     if spec.properties.is_generator {
         context.add_gap(
             &mut builder,
@@ -276,13 +282,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let object = required_field(left, "object")?;
             let property = required_field(left, "property")?;
             let base = self.expression_value(builder, object, expression_value_kind(object))?;
+            let member = self.plain_object_member_locator(object, property)?;
             let location = self.session.add_memory_location(
                 builder,
                 terminal,
-                MemoryLocationKind::Field {
-                    base,
-                    member: self.memory_member_locator(property)?,
-                },
+                MemoryLocationKind::Field { base, member },
             )?;
             // A field store on an established plain object local creates or
             // rewrites a data property of the local literal; its identity
@@ -304,8 +308,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let object = required_field(left, "object")?;
             let index = required_field(left, "index")?;
             let base = self.expression_value(builder, object, expression_value_kind(object))?;
-            let index_value =
-                self.expression_value(builder, index, expression_value_kind(index))?;
+            let index_value = self.index_value(builder, index)?;
+            let established_array_base = self.established_array_base(left, object, index);
             let location = self.session.add_memory_location(
                 builder,
                 terminal,
@@ -314,6 +318,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     index: Some(index_value),
                 },
             )?;
+            if !established_array_base {
+                self.add_index_identity_gap(builder, terminal, location)?;
+                self.implicit_exception_gap(builder, terminal, left)?;
+            }
             self.append_effect(
                 builder,
                 terminal,
@@ -453,6 +461,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), TsLoweringError> {
+        if let Some(value) = boolean_literal_condition(node) {
+            return if value {
+                self.edge(builder, entry, when_true)
+            } else {
+                self.edge(builder, entry, when_false)
+            };
+        }
         match (node.kind(), short_circuit_operator(node)) {
             ("binary_expression", Some("&&")) => {
                 let left = required_field(node, "left")?;
@@ -685,12 +700,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )
             }
             "throw_statement" => {
-                let terminal = if let Some(value_node) = node
+                if let Some(value_node) = node
                     .child_by_field_name("argument")
                     .or_else(|| first_named_child(node))
                 {
                     let point = self.point(builder, node, Vec::new())?;
+                    let expression = self.expression_value(
+                        builder,
+                        value_node,
+                        expression_value_kind(value_node),
+                    )?;
                     let value = self.value(builder, point, SemanticValueKind::Exception)?;
+                    self.transfer_plain_object_identity_from_node(value_node, value);
+                    self.append_effect(
+                        builder,
+                        point,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Local,
+                            source: expression,
+                            target: value,
+                        },
+                    )?;
                     self.append_effect(
                         builder,
                         point,
@@ -702,12 +732,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         next: EdgeTarget::normal(point),
                         scope,
                     });
-                    point
+                    self.abrupt_throw(builder, point, scope, value, stack)
                 } else {
                     self.append_effect(builder, entry, SemanticEffect::Throw { value: None })?;
-                    entry
-                };
-                self.abrupt(builder, terminal, scope, CompletionKind::Throw, None, stack)
+                    self.abrupt(builder, entry, scope, CompletionKind::Throw, None, stack)
+                }
             }
             "break_statement" | "continue_statement" => {
                 let label = node
@@ -963,6 +992,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.emit_lexical_input_flow(builder, node, entry, result)?;
         }
         match node.kind() {
+            "new_expression"
+                if self.is_proven_error_constructor(node)
+                    && self.is_statically_nothrow_error_constructor(node) =>
+            {
+                self.error_constructor_expression(builder, node, entry, next, scope, stack)
+            }
             "call_expression" | "new_expression" => {
                 self.call_expression(builder, node, entry, next, scope, chain_skip, stack)
             }
@@ -1087,10 +1122,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     // Parentheses end a continuous optional chain. The nested
                     // expression may start a new chain whose skip target is
                     // this wrapper's normal continuation.
+                    let terminal = self.point(builder, node, Vec::new())?;
+                    let inner =
+                        self.expression_value(builder, value, expression_value_kind(value))?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Local,
+                            source: inner,
+                            target: result,
+                        },
+                    )?;
+                    self.edge(builder, terminal, next)?;
                     stack.push(Work::Expression {
                         node: value,
                         entry,
-                        next,
+                        next: EdgeTarget::normal(terminal),
                         scope,
                     });
                     Ok(())
@@ -1163,13 +1211,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     stack,
                 )
             }
-            "object" => {
+            "object" | "array" => {
                 // The literal's creation completes after its members
                 // evaluate, so the allocation sits on a terminal point the
                 // member expressions flow into.
                 let terminal = self.point(builder, node, Vec::new())?;
+                let allocation_kind = if node.kind() == "array" {
+                    AllocationKind::Array
+                } else {
+                    AllocationKind::Object
+                };
                 self.session
-                    .add_allocation(builder, terminal, result, AllocationKind::Object)?;
+                    .add_allocation(builder, terminal, result, allocation_kind)?;
                 self.edge(builder, terminal, next)?;
                 let children = named_children(node)
                     .into_iter()
@@ -1187,7 +1240,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             "augmented_assignment_expression"
             | "update_expression"
             | "sequence_expression"
-            | "array"
             | "pair"
             | "spread_element"
             | "template_string"
@@ -1288,16 +1340,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // A field read on an established plain object local resolves to a
         // data property of the local literal: no accessor, proxy trap, or
         // unresolved field identity remains, so neither gap applies.
+        let index = (node.kind() == "subscript_expression")
+            .then(|| required_field(node, "index"))
+            .transpose()?;
         let established_plain_base =
             node.kind() == "member_expression" && self.established_plain_object_base(node, object);
-        if !established_plain_base {
+        let established_array_base =
+            index.is_some_and(|index| self.established_array_base(node, object, index));
+        if !established_plain_base && !established_array_base {
             self.implicit_exception_gap(builder, access, node)?;
         }
         if node.kind() == "subscript_expression" {
-            let index = required_field(node, "index")?;
+            let index = index.expect("subscript expressions have an index field");
             let base = self.expression_value(builder, object, expression_value_kind(object))?;
-            let index_value =
-                self.expression_value(builder, index, expression_value_kind(index))?;
+            let index_value = self.index_value(builder, index)?;
             let result = self.expression_value(builder, node, expression_value_kind(node))?;
             let location = self.session.add_memory_location(
                 builder,
@@ -1316,17 +1372,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     result,
                 },
             )?;
+            if !established_array_base {
+                self.add_index_identity_gap(builder, access, location)?;
+            }
         } else {
             let property = required_field(node, "property")?;
             let base = self.expression_value(builder, object, expression_value_kind(object))?;
             let result = self.expression_value(builder, node, expression_value_kind(node))?;
+            let member = self.plain_object_member_locator(object, property)?;
             let location = self.session.add_memory_location(
                 builder,
                 access,
-                MemoryLocationKind::Field {
-                    base,
-                    member: self.memory_member_locator(property)?,
-                },
+                MemoryLocationKind::Field { base, member },
             )?;
             if !established_plain_base {
                 self.add_field_identity_gap(builder, access, location)?;
@@ -1343,9 +1400,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
         self.edge(builder, access, next)?;
 
-        let index = (node.kind() == "subscript_expression")
-            .then(|| required_field(node, "index"))
-            .transpose()?;
         let after_object = if node.child_by_field_name("optional_chain").is_some()
             || has_child_kind(node, "optional_chain")
         {
@@ -1555,6 +1609,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             None => self.point(builder, node, Vec::new())?,
         };
         let body_entry = self.point(builder, body, Vec::new())?;
+        let initial_condition_target = condition
+            .zip(increment)
+            .filter(|(condition, increment)| {
+                counted_for_starts_true(self.prepared.source(), initializer, *condition, *increment)
+            })
+            .map_or(EdgeTarget::normal(condition_entry), |_| {
+                EdgeTarget::normal(body_entry)
+            });
         let increment_entry = increment
             .map(|increment| self.point(builder, increment, Vec::new()))
             .transpose()?;
@@ -1622,14 +1684,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 stack.push(Work::Statement {
                     node: initializer,
                     entry,
-                    next: EdgeTarget::normal(condition_entry),
+                    next: initial_condition_target,
                     scope: loop_scope,
                 });
             } else {
                 stack.push(Work::Expression {
                     node: initializer,
                     entry,
-                    next: EdgeTarget::normal(condition_entry),
+                    next: initial_condition_target,
                     scope: loop_scope,
                 });
             }
@@ -1913,7 +1975,32 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let catch_entry = catch_body
             .map(|body| self.point(builder, body, Vec::new()))
             .transpose()?;
+        let catch_binder = handler
+            .map(|handler| self.catch_binder_value(builder, handler))
+            .transpose()?
+            .flatten();
         let try_scope = if let Some(catch_entry) = catch_entry {
+            if handler
+                .and_then(|handler| handler.child_by_field_name("parameter"))
+                .is_some()
+                && catch_binder.is_none()
+            {
+                self.add_gap(
+                    builder,
+                    catch_entry,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::ExceptionalControlFlow,
+                    SemanticGapKind::Unsupported,
+                    "destructured or unresolved catch binders are not yet lowered with payload identity",
+                )?;
+            }
+            if let Some(binder) = catch_binder {
+                self.catch_binders.insert(catch_entry, binder);
+                if let Some(catch_body) = catch_body {
+                    self.catch_binder_scopes
+                        .insert(binder, (catch_body.id(), catch_body.start_byte()));
+                }
+            }
             builder.push_scope(
                 Some(cleanup_scope),
                 ScopeBinding::Handler { entry: catch_entry },
@@ -1961,6 +2048,43 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             });
         }
         Ok(())
+    }
+
+    fn catch_binder_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        handler: Node<'tree>,
+    ) -> Result<Option<ValueId>, TsLoweringError> {
+        let Some(parameter) = handler.child_by_field_name("parameter") else {
+            return Ok(None);
+        };
+        if parameter.kind() != "identifier" {
+            return Ok(None);
+        }
+        let Some(name) = node_text(self.prepared.source(), parameter) else {
+            return Ok(None);
+        };
+        let binding_ranges = self
+            .lexical_bindings
+            .binding_identifier_ranges_at(name, parameter.start_byte());
+        if !binding_ranges.iter().any(|range| {
+            range.start_byte == parameter.start_byte() && range.end_byte == parameter.end_byte()
+        }) {
+            return Ok(None);
+        }
+        let metadata = self.mapping(builder, parameter)?;
+        let value =
+            self.session
+                .add_value_with_metadata(builder, metadata, SemanticValueKind::Local)?;
+        self.locals
+            .entry(name.into())
+            .or_default()
+            .push(LocalBinding {
+                scope_start: handler.start_byte(),
+                scope_end: handler.end_byte(),
+                value,
+            });
+        Ok(Some(value))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2190,6 +2314,52 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.push_chain_expression(stack, function, entry, function_next, scope, chain_skip);
             Ok(())
         }
+    }
+
+    fn error_constructor_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), TsLoweringError> {
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        let terminal = self.point(builder, node, Vec::new())?;
+        self.session
+            .add_allocation(builder, terminal, result, AllocationKind::Object)?;
+        self.edge(builder, terminal, next)?;
+
+        let arguments = node
+            .child_by_field_name("arguments")
+            .map(named_children)
+            .unwrap_or_default();
+        let entries = arguments
+            .iter()
+            .map(|argument| self.point(builder, *argument, Vec::new()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for index in (0..arguments.len()).rev() {
+            stack.push(Work::Expression {
+                node: arguments[index],
+                entry: entries[index],
+                next: entries
+                    .get(index + 1)
+                    .copied()
+                    .map(EdgeTarget::normal)
+                    .unwrap_or_else(|| EdgeTarget::normal(terminal)),
+                scope,
+            });
+        }
+        self.edge(
+            builder,
+            entry,
+            entries
+                .first()
+                .copied()
+                .map(EdgeTarget::normal)
+                .unwrap_or_else(|| EdgeTarget::normal(terminal)),
+        )
     }
 
     fn await_expression(
@@ -2605,6 +2775,40 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.route(builder, from, &route, stack)
     }
 
+    fn abrupt_throw(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        from: ProgramPointId,
+        scope: ScopeFrameId,
+        value: ValueId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), TsLoweringError> {
+        let Some(route) =
+            builder.resolve_completion(scope, &CompletionRequest::new(CompletionKind::Throw, None))
+        else {
+            return Err(TsLoweringError::Invalid(
+                "throw completion has no matching structured continuation".into(),
+            ));
+        };
+        if let Some(target) = self
+            .catch_binders
+            .get(&route.destination().target())
+            .copied()
+        {
+            self.transfer_plain_object_identity(value, target);
+            self.append_effect(
+                builder,
+                from,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    source: value,
+                    target,
+                },
+            )?;
+        }
+        self.route(builder, from, &route, stack)
+    }
+
     fn route(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -2678,4 +2882,92 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.session
             .add_edge(builder, source_point, target.point, target.kind)
     }
+}
+
+pub(super) fn counted_for_starts_true(
+    source: &str,
+    initializer: Option<Node<'_>>,
+    condition: Node<'_>,
+    increment: Node<'_>,
+) -> bool {
+    let Some(initializer) = initializer else {
+        return false;
+    };
+    if !matches!(
+        initializer.kind(),
+        "lexical_declaration" | "variable_declaration"
+    ) {
+        return false;
+    }
+    let declarators = named_children(initializer)
+        .into_iter()
+        .filter(|child| child.kind() == "variable_declarator")
+        .collect::<Vec<_>>();
+    let [declarator] = declarators.as_slice() else {
+        return false;
+    };
+    let declarator = *declarator;
+    let Some(name) = declarator.child_by_field_name("name") else {
+        return false;
+    };
+    let Some(value) = declarator.child_by_field_name("value") else {
+        return false;
+    };
+    if name.kind() != "identifier" {
+        return false;
+    }
+    let Some(start) = numeric_literal_value(source, value) else {
+        return false;
+    };
+
+    if condition.kind() != "binary_expression"
+        || condition
+            .child_by_field_name("operator")
+            .is_none_or(|operator| operator.kind() != "<")
+    {
+        return false;
+    }
+    let Some(left) = condition.child_by_field_name("left") else {
+        return false;
+    };
+    let Some(right) = condition.child_by_field_name("right") else {
+        return false;
+    };
+    if left.kind() != "identifier" || node_text(source, left) != node_text(source, name) {
+        return false;
+    }
+    let Some(limit) = numeric_literal_value(source, right) else {
+        return false;
+    };
+
+    if increment.kind() != "update_expression"
+        || increment
+            .child_by_field_name("operator")
+            .is_none_or(|operator| operator.kind() != "++")
+    {
+        return false;
+    }
+    let Some(argument) = increment.child_by_field_name("argument") else {
+        return false;
+    };
+    if argument.kind() != "identifier" || node_text(source, argument) != node_text(source, name) {
+        return false;
+    }
+
+    start.is_finite() && limit.is_finite() && start < limit
+}
+
+pub(super) fn boolean_literal_condition(node: Node<'_>) -> Option<bool> {
+    match node.kind() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn numeric_literal_value(source: &str, node: Node<'_>) -> Option<f64> {
+    (node.kind() == "number")
+        .then(|| node_text(source, node))
+        .flatten()
+        .and_then(|text| text.parse::<f64>().ok())
 }

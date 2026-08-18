@@ -1813,10 +1813,12 @@ fn assemble_taint_projection_batch(
         );
         let display_path = report.display_path;
         debug_assert!(display_path.as_ref().is_none_or(|path| {
-            report
-                .witnesses
-                .iter()
-                .any(|witness| witness.id() == path.witness_id())
+            path.witness_ids().iter().all(|witness_id| {
+                report
+                    .witnesses
+                    .iter()
+                    .any(|witness| witness.id() == witness_id)
+            })
         }));
         let finding = PolicyFinding::try_new(
             metadata.id.clone(),

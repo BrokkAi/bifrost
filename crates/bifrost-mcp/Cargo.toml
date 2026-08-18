@@ -17,11 +17,11 @@ default = []
 nlp = ["dep:brokk-bifrost-nlp"]
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.2" }
-brokk-bifrost-nlp = { path = "../bifrost-nlp", version = "=0.10.2", optional = true }
-brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.10.2" }
-brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.10.2" }
-brokk-bifrost-runtime = { path = "../bifrost-runtime", version = "=0.10.2" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.3" }
+brokk-bifrost-nlp = { path = "../bifrost-nlp", version = "=0.10.3", optional = true }
+brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.10.3" }
+brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.10.3" }
+brokk-bifrost-runtime = { path = "../bifrost-runtime", version = "=0.10.3" }
 git2 = { version = "0.20.2", default-features = false }
 glob = "0.3.3"
 notify = "6.1.1"
@@ -30,12 +30,16 @@ notify = "6.1.1"
 # features are off deliberately: `macros`/`schemars` exist to generate tool
 # schemas from Rust types, and Bifrost's tool schemas are hand-written JSON
 # built by mcp_registry, so pulling them in would add build weight for nothing.
+# Tool *output* schemas are generated rather than hand-written, but they come
+# from the `schemars` crate applied directly to the result structs in
+# `output_schemas.rs`, not from rmcp's derive machinery.
 # Pinned exactly, not by caret. `ordered_transport.rs` depends on the serve
 # loop pulling one message at a time from `Transport::receive` -- documented on
 # the trait as sequential, but the security rule Bifrost builds on it would
 # break silently, with no compile error, if a future 3.x prefetched or
 # pipelined receives. Re-verify that property when raising this.
 rmcp = { version = "=3.0.1", default-features = false, features = ["server", "transport-io"] }
+schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 semver = "1.0.28"
@@ -53,6 +57,17 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 url = { version = "2.5.8", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.2", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.3", features = ["test-support"] }
+# Two test suites need a real JSON Schema validator: the contract suite
+# validates real `structuredContent` against the `outputSchema` the server
+# advertised on the wire, and `mcp_wire_schema` validates every recorded
+# JSON-RPC message against the official MCP spec schema for the negotiated
+# revision. Same requirement as the root package's dev-dependency (the SARIF
+# draft-4 check); this workspace has no `[workspace.dependencies]` table to
+# inherit from. Default features are off: the checked-in schemas are
+# self-contained single documents, so the external `$ref` resolvers
+# (HTTP/file) would only add weight and network reachability to tests that
+# must judge bytes offline.
+jsonschema = { version = "0.48.0", default-features = false }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 tempfile = "3.23.0"

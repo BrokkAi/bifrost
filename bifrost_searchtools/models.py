@@ -7,7 +7,7 @@ from typing import Any, ClassVar, Literal, cast, get_args
 
 CodeQueryExecutionMode = Literal["results", "explain", "profile"]
 MostRelevantFilesRankingModeValue = Literal[
-    "history_imports", "usage_graph", "usage_graph_exact"
+    "cascade", "history_imports", "usage_graph", "usage_graph_exact"
 ]
 MostRelevantFilesIncompleteReasonValue = Literal["cancelled", "time_budget"]
 TestFileKindValue = Literal["test", "test_support", "production", "ambiguous"]
@@ -5163,7 +5163,7 @@ class MostRelevantFilesResult:
     not_found: list[str]
     duplicates: list[str]
     complete: bool = True
-    ranking_mode_used: MostRelevantFilesRankingModeValue = "history_imports"
+    ranking_mode_used: MostRelevantFilesRankingModeValue = "cascade"
     incomplete_reason: MostRelevantFilesIncompleteReasonValue | None = None
     render_line_numbers: bool = True
     rendered_text: str | None = None
@@ -5178,7 +5178,7 @@ class MostRelevantFilesResult:
             duplicates=list(data.get("duplicates", [])),
             complete=_strict_bool(data, "complete", True),
             ranking_mode_used=_most_relevant_files_ranking_mode(
-                data.get("ranking_mode_used", "history_imports")
+                data.get("ranking_mode_used", "cascade")
             ),
             incomplete_reason=_most_relevant_files_incomplete_reason(
                 data.get("incomplete_reason")

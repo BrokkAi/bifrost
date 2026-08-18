@@ -531,6 +531,17 @@ pub struct SummaryMetrics {
     pub reusable_summary_hits: usize,
     /// Callee entry contexts for which the cross-query oracle had no artifact.
     pub reusable_summary_misses: usize,
+    /// Reusable artifacts refused because the summarized callee sits in a call
+    /// cycle, so replaying it could elide a call back into the solve root
+    /// (#2285). Each refusal falls back to solving the callee body.
+    pub reusable_summary_cycle_refusals: usize,
+    /// Reusable artifacts refused because the provider could not state that the
+    /// summary's validity contract covers every analyzed procedure the
+    /// summarized body calls (#2296). Replaying such a summary would skip a
+    /// subtree whose state the summary's own construction never recorded, so
+    /// the run could report a completeness a fresh solve would not. Each
+    /// refusal falls back to solving the callee body.
+    pub reusable_summary_called_procedure_refusals: usize,
     /// Query-visible internal observations restored from reusable artifacts.
     pub reusable_observations: usize,
 }

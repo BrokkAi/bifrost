@@ -24,8 +24,9 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
 use crate::graph::ast::{
-    SELF_RECEIVER_TOKEN, for_each_var_spec, is_definition_identifier, is_identifier_node,
-    is_method_receiver_parameter, lhs_identifier_slots, parameter_names,
+    SELF_RECEIVER_TOKEN, clause_binding_names, clause_statement_list, for_each_var_spec,
+    is_definition_identifier, is_identifier_node, is_method_receiver_parameter,
+    lhs_identifier_slots, parameter_names, receive_statement_is_short_declaration,
     receiver_symbol_from_qualifier, rhs_expressions, selector_parts, type_ref_from_node,
     var_spec_names,
 };
@@ -186,6 +187,22 @@ fn scan_node(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &mut LocalInference
             locals.exit_scope();
             return;
         }
+        "type_switch_statement" => {
+            scan_type_switch(node, ctx, locals);
+            return;
+        }
+        "communication_case" | "type_case" | "default_case" => {
+            scan_clause(node, ctx, locals);
+            return;
+        }
+        "function_type" | "method_elem" => {
+            // Signature binders have no body in which they can be referenced.
+            // Scan every parameter/result type before considering any names so
+            // a parameter named like an import cannot shadow that import in its
+            // own type or leak into the enclosing file/interface scope.
+            scan_callable_header(node, ctx, locals);
+            return;
+        }
         "parameter_declaration" => {
             if let Some(type_node) = node.child_by_field_name("type") {
                 scan_node(type_node, ctx, locals);
@@ -221,6 +238,46 @@ fn scan_node(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &mut LocalInference
         _ => {}
     }
     scan_children(node, ctx, locals);
+}
+
+fn scan_type_switch(
+    node: Node<'_>,
+    ctx: &mut FileScan<'_>,
+    locals: &mut LocalInferenceEngine<String>,
+) {
+    let alias = node.child_by_field_name("alias");
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if alias != Some(child) {
+            scan_node(child, ctx, locals);
+        }
+    }
+}
+
+fn scan_clause(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &mut LocalInferenceEngine<String>) {
+    let body = clause_statement_list(node);
+    let communication = node.child_by_field_name("communication");
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if body == Some(child) {
+            continue;
+        }
+        if communication == Some(child) && receive_statement_is_short_declaration(child) {
+            if let Some(right) = child.child_by_field_name("right") {
+                scan_node(right, ctx, locals);
+            }
+        } else {
+            scan_node(child, ctx, locals);
+        }
+    }
+    if let Some(body) = body {
+        locals.enter_scope();
+        for name in clause_binding_names(node, ctx.source) {
+            locals.declare_shadow(name);
+        }
+        scan_node(body, ctx, locals);
+        locals.exit_scope();
+    }
 }
 
 fn scan_var_spec_before_binding(

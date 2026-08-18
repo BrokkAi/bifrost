@@ -165,6 +165,52 @@ impl WorkingTreeIdentity {
     /// ignored, and since-edited paths return `None`; their identity is the
     /// hash of the visible working bytes.
     pub fn clean_index_oid(&self, repo: &Repository, rel: &str, abs_path: &Path) -> Option<Oid> {
+        let (tracked, file_size) = self.stat_clean_entry(rel, abs_path)?;
+
+        if self
+            .verified_clean_paths
+            .lock()
+            .expect("working-tree identity verification mutex poisoned")
+            .contains(rel)
+        {
+            return Some(tracked.oid);
+        }
+
+        // Git can keep a transformed worktree clean while the index OID still
+        // names the canonical blob. Hash those bytes instead of serving the
+        // canonical OID. A line-ending conversion changes the worktree size,
+        // while other filters need the attribute guard below.
+        if canonical_blob_size(repo, tracked.oid) != Some(file_size)
+            || has_content_transform(repo, Path::new(rel))
+        {
+            return None;
+        }
+        self.verified_clean_paths
+            .lock()
+            .expect("working-tree identity verification mutex poisoned")
+            .insert(rel.to_string());
+        Some(tracked.oid)
+    }
+
+    /// The index OID this scan recorded for `rel` when the path was clean at
+    /// scan time and the file at `abs_path` still carries the size and mtime
+    /// the index entry cached.
+    ///
+    /// This is [`Self::clean_index_oid`] without its per-path content-transform
+    /// verdict, so the caller owes that verdict itself. Take this form only when
+    /// answering transforms for a whole path set at once is the point: the
+    /// semantic identity walk batches them through one `git check-attr` process
+    /// because libgit2 answered Firefox's paths one at a time in 55.3 s of CPU
+    /// (issue #1904). Every other caller wants `clean_index_oid`.
+    pub fn stat_clean_index_oid(&self, rel: &str, abs_path: &Path) -> Option<Oid> {
+        self.stat_clean_entry(rel, abs_path)
+            .map(|(tracked, _)| tracked.oid)
+    }
+
+    /// The tracked entry for `rel` and the current file size, when the scan saw
+    /// the path clean and the file still carries the recorded stat. One
+    /// `metadata` call serves both callers above.
+    fn stat_clean_entry(&self, rel: &str, abs_path: &Path) -> Option<(&TrackedIdentity, u64)> {
         if self.dirty.contains(rel) {
             return None;
         }
@@ -186,30 +232,7 @@ impl WorkingTreeIdentity {
         if tracked.mtime_nanoseconds != 0 && modified.subsec_nanos() != tracked.mtime_nanoseconds {
             return None;
         }
-
-        if self
-            .verified_clean_paths
-            .lock()
-            .expect("working-tree identity verification mutex poisoned")
-            .contains(rel)
-        {
-            return Some(tracked.oid);
-        }
-
-        // Git can keep a transformed worktree clean while the index OID still
-        // names the canonical blob. Hash those bytes instead of serving the
-        // canonical OID. A line-ending conversion changes the worktree size,
-        // while other filters need the attribute guard below.
-        if canonical_blob_size(repo, tracked.oid) != Some(metadata.len())
-            || has_content_transform(repo, Path::new(rel))
-        {
-            return None;
-        }
-        self.verified_clean_paths
-            .lock()
-            .expect("working-tree identity verification mutex poisoned")
-            .insert(rel.to_string());
-        Some(tracked.oid)
+        Some((tracked, metadata.len()))
     }
 }
 

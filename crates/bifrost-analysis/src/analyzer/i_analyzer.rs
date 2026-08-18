@@ -10,6 +10,7 @@ use crate::analyzer::{
     UsageFactsIndex, metrics_from_declarations,
 };
 use crate::cancellation::CancellationToken;
+use crate::gitblob;
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 pub(crate) use brokk_bifrost_core::analyzer::code_unit_index::default_parent_fq_name;
 pub use brokk_bifrost_core::analyzer::query_batch::QueryBatch;
@@ -40,6 +41,14 @@ pub struct SearchSymbolPatternBatch {
     patterns: Vec<String>,
     auto_quote: bool,
     compiled: Option<CompiledSymbolPatterns>,
+    /// One required-literal set per *compiled* pattern, in the same order, set
+    /// only when every compiled pattern contributed at least one literal.
+    ///
+    /// A batch is prefiltered in SQL as `OR` over patterns of `AND` over that
+    /// pattern's literals, so a single pattern without a required literal makes
+    /// the whole disjunction unconditionally true and is stored as `None`
+    /// instead.
+    required_literals: Option<Vec<Vec<String>>>,
     complete: bool,
 }
 
@@ -51,17 +60,22 @@ impl SearchSymbolPatternBatch {
     ) -> Self {
         let mut compiled_patterns = Vec::new();
         let mut compiled_regexes = Vec::new();
+        let mut required_literals = Vec::new();
         for pattern in &patterns {
             if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
                 return Self {
                     patterns,
                     auto_quote,
                     compiled: None,
+                    required_literals: None,
                     complete: false,
                 };
             }
             let pattern = normalize_search_pattern(pattern, auto_quote);
             if let Ok(compiled) = RegexBuilder::new(&pattern).case_insensitive(true).build() {
+                // Extract from the normalized pattern, which is the exact text
+                // the authoritative matcher compiled.
+                required_literals.push(required_storage_literals(&pattern));
                 compiled_patterns.push(pattern);
                 compiled_regexes.push(compiled);
             }
@@ -72,9 +86,15 @@ impl SearchSymbolPatternBatch {
                 patterns,
                 auto_quote,
                 compiled: None,
+                required_literals: None,
                 complete: false,
             };
         }
+        let required_literals = (!required_literals.is_empty()
+            && required_literals
+                .iter()
+                .all(|literals| !literals.is_empty()))
+        .then_some(required_literals);
         let compiled = if compiled_patterns.is_empty() {
             None
         } else {
@@ -90,6 +110,7 @@ impl SearchSymbolPatternBatch {
             patterns,
             auto_quote,
             compiled,
+            required_literals,
             complete: true,
         }
     }
@@ -116,21 +137,293 @@ impl SearchSymbolPatternBatch {
         }
     }
 
-    /// Return one safe storage substring for every pattern, or `None` when any
-    /// pattern needs complete regular-expression matching. Plain ASCII
-    /// identifiers are literal under the search-symbol regex contract.
-    pub(crate) fn literal_ascii_substrings(&self) -> Option<Vec<&str>> {
-        self.patterns
-            .iter()
-            .map(|pattern| {
-                (!pattern.is_empty()
-                    && pattern
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
-                .then_some(pattern.as_str())
-            })
-            .collect()
+    /// Return the per-pattern required-literal sets that a storage prefilter can
+    /// be built from, or `None` when at least one pattern in the batch has no
+    /// required literal at all.
+    ///
+    /// Every returned set is non-empty, and every literal in a set occurs in
+    /// each name the corresponding pattern matches, so the prefilter stays a
+    /// strict superset of the authoritative regular-expression match.
+    pub(crate) fn required_storage_literals(&self) -> Option<&[Vec<String>]> {
+        self.required_literals.as_deref()
     }
+}
+
+/// Bound on the literals kept for one pattern. Each literal is required, so
+/// dropping some only widens the prefilter, and a pattern like `a.b.c.d.e.f`
+/// would otherwise spend more per row on single-character `LIKE` probes than
+/// the scan it replaces.
+const MAX_LITERALS_PER_PATTERN: usize = 4;
+
+/// Extract the ASCII substrings that every name matching `pattern` must
+/// contain, in the charset the persisted name projection can be searched with.
+///
+/// The walk is over the parsed regular expression (`regex-syntax`'s HIR), not
+/// over the pattern text: a literal is collected only from HIR positions that
+/// every match has to traverse, so the result is a sound prefilter and the
+/// regular expression stays authoritative. An empty result means "no prefilter".
+///
+/// Two deliberate restrictions:
+///
+/// * Only `[A-Za-z0-9_]` bytes join a literal; anything else (including `.`)
+///   ends the run. This is the charset the pure-literal pushdown this replaces
+///   already assumed, and it is what keeps a literal inside one name segment:
+///   the fully-qualified name a pattern is matched against is the hydrated
+///   package prefix joined to the short name with `.`, so a run without `.`
+///   cannot straddle that join and is visible in one of the three channels the
+///   storage prefilter probes.
+/// * Case is left to SQLite's `LIKE`, which folds ASCII only. That is a
+///   superset of a case-sensitive match and of `(?i)` over ASCII. A name that
+///   reaches an extracted ASCII letter only through non-ASCII Unicode case
+///   folding (U+212A KELVIN SIGN, U+017F LATIN SMALL LETTER LONG S) is not
+///   covered, exactly as it was not covered before this change.
+fn required_storage_literals(pattern: &str) -> Vec<String> {
+    let Ok(hir) = regex_syntax::Parser::new().parse(pattern) else {
+        return Vec::new();
+    };
+    reduce_literals(hir_literals(&hir).into_required())
+}
+
+/// What one HIR node forces every string it matches to contain.
+#[derive(Debug, Default)]
+struct RequiredLiterals {
+    /// Set when the node matches exactly one string and that string is entirely
+    /// in the storage charset. Concatenation can then extend it, which is what
+    /// recovers `Solver` from the per-character classes a `(?i)` group parses to.
+    exact: Option<String>,
+    /// Storage-charset substrings that every match of the node contains.
+    substrings: Vec<String>,
+}
+
+impl RequiredLiterals {
+    fn exact(text: String) -> Self {
+        Self {
+            exact: Some(text),
+            substrings: Vec::new(),
+        }
+    }
+
+    fn into_required(mut self) -> Vec<String> {
+        if let Some(text) = self.exact.take().filter(|text| !text.is_empty()) {
+            self.substrings.push(text);
+        }
+        self.substrings
+    }
+}
+
+/// Post-order HIR walk with an explicit stack: regex nesting is bounded by the
+/// parser's nest limit, but the analyzer walks every tree iteratively.
+fn hir_literals(hir: &regex_syntax::hir::Hir) -> RequiredLiterals {
+    use regex_syntax::hir::HirKind;
+
+    enum Step<'a> {
+        Visit(&'a regex_syntax::hir::Hir),
+        /// Combine the last `usize` results on the result stack.
+        Concat(usize),
+        Alternate(usize),
+        /// A repetition that must run at least once; a `min == 0` repetition
+        /// requires nothing and never reaches the result stack.
+        RepeatAtLeastOnce,
+    }
+
+    let mut work = vec![Step::Visit(hir)];
+    let mut results: Vec<RequiredLiterals> = Vec::new();
+    while let Some(step) = work.pop() {
+        match step {
+            Step::Visit(node) => match node.kind() {
+                // A zero-width assertion neither contributes a literal nor
+                // separates its neighbours: the text around it stays adjacent.
+                HirKind::Empty | HirKind::Look(_) => {
+                    results.push(RequiredLiterals::exact(String::new()));
+                }
+                HirKind::Literal(literal) => results.push(literal_node_literals(&literal.0)),
+                HirKind::Class(class) => results.push(class_node_literals(class)),
+                HirKind::Capture(capture) => work.push(Step::Visit(capture.sub.as_ref())),
+                HirKind::Repetition(repetition) => {
+                    if repetition.min == 0 {
+                        results.push(RequiredLiterals::default());
+                    } else {
+                        work.push(Step::RepeatAtLeastOnce);
+                        work.push(Step::Visit(repetition.sub.as_ref()));
+                    }
+                }
+                HirKind::Concat(subs) => {
+                    work.push(Step::Concat(subs.len()));
+                    work.extend(subs.iter().rev().map(Step::Visit));
+                }
+                HirKind::Alternation(subs) => {
+                    work.push(Step::Alternate(subs.len()));
+                    work.extend(subs.iter().rev().map(Step::Visit));
+                }
+            },
+            Step::RepeatAtLeastOnce => {
+                // The node matches its child at least once, so the child's
+                // literals are required; the repeat count is unknown, so the
+                // child's exact text cannot be extended by a neighbour.
+                let child = results.pop().expect("repetition child result");
+                results.push(RequiredLiterals {
+                    exact: None,
+                    substrings: child.into_required(),
+                });
+            }
+            Step::Concat(len) => {
+                let children = results.split_off(results.len() - len);
+                results.push(concat_literals(children));
+            }
+            Step::Alternate(len) => {
+                let children = results.split_off(results.len() - len);
+                results.push(alternation_literals(children));
+            }
+        }
+    }
+    results.pop().expect("one result per parsed pattern")
+}
+
+fn concat_literals(children: Vec<RequiredLiterals>) -> RequiredLiterals {
+    let mut run = String::new();
+    let mut substrings = Vec::new();
+    let mut every_child_exact = true;
+    for child in children {
+        match child.exact {
+            Some(text) => run.push_str(&text),
+            None => {
+                every_child_exact = false;
+                if !run.is_empty() {
+                    substrings.push(std::mem::take(&mut run));
+                }
+                substrings.extend(child.substrings);
+            }
+        }
+    }
+    if every_child_exact {
+        RequiredLiterals::exact(run)
+    } else {
+        if !run.is_empty() {
+            substrings.push(run);
+        }
+        RequiredLiterals {
+            exact: None,
+            substrings,
+        }
+    }
+}
+
+/// An alternation requires only what every branch requires, compared as whole
+/// literals: `(?:FooBar|FooBaz)` yields nothing rather than the common `Foo`,
+/// because a shared prefix is not what the branch results carry.
+fn alternation_literals(children: Vec<RequiredLiterals>) -> RequiredLiterals {
+    let mut branches = children.into_iter();
+    let Some(first) = branches.next() else {
+        return RequiredLiterals::default();
+    };
+    let exact = first.exact.clone();
+    let mut shared = first.into_required();
+    let mut same_exact = exact.is_some();
+    for branch in branches {
+        same_exact &= branch.exact == exact;
+        let required = branch.into_required();
+        shared.retain(|literal| required.contains(literal));
+    }
+    if same_exact {
+        RequiredLiterals::exact(exact.unwrap_or_default())
+    } else {
+        RequiredLiterals {
+            exact: None,
+            substrings: shared,
+        }
+    }
+}
+
+fn literal_node_literals(bytes: &[u8]) -> RequiredLiterals {
+    if bytes.iter().all(|byte| is_storage_byte(*byte)) {
+        return RequiredLiterals::exact(storage_run(bytes));
+    }
+    RequiredLiterals {
+        exact: None,
+        substrings: bytes
+            .split(|byte| !is_storage_byte(*byte))
+            .filter(|run| !run.is_empty())
+            .map(storage_run)
+            .collect(),
+    }
+}
+
+/// A class contributes a literal character only when it denotes exactly one
+/// storage character, or exactly one storage letter's two ASCII cases -- the
+/// shape `(?i)x` translates to. Non-ASCII members are ignored per the ASCII
+/// case rule documented on `required_storage_literals`.
+fn class_node_literals(class: &regex_syntax::hir::Class) -> RequiredLiterals {
+    use regex_syntax::hir::Class;
+
+    let mut ascii = Vec::new();
+    let mut push = |start: u32, end: u32| {
+        for scalar in start..=end.min(0x7f) {
+            let byte = u8::try_from(scalar).expect("ASCII scalar fits one byte");
+            if ascii.len() <= 2 {
+                ascii.push(byte);
+            }
+        }
+    };
+    match class {
+        Class::Unicode(class) => {
+            for range in class.ranges() {
+                push(u32::from(range.start()), u32::from(range.end()));
+            }
+        }
+        Class::Bytes(class) => {
+            for range in class.ranges() {
+                push(u32::from(range.start()), u32::from(range.end()));
+            }
+        }
+    }
+    let single = match ascii.as_slice() {
+        [byte] => Some(*byte),
+        [upper, lower] if upper.is_ascii_uppercase() && *lower == upper.to_ascii_lowercase() => {
+            Some(*lower)
+        }
+        _ => None,
+    };
+    single
+        .filter(|byte| is_storage_byte(*byte))
+        .map_or_else(RequiredLiterals::default, |byte| {
+            RequiredLiterals::exact(storage_run(&[byte]))
+        })
+}
+
+/// Keep the literals that carry selectivity: compare case-insensitively (the
+/// prefilter does), drop a literal another kept literal already contains, and
+/// keep the longest few.
+fn reduce_literals(literals: Vec<String>) -> Vec<String> {
+    let mut literals = literals
+        .into_iter()
+        .map(|mut literal| {
+            literal.make_ascii_lowercase();
+            literal
+        })
+        .collect::<Vec<_>>();
+    literals.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    let mut kept: Vec<String> = Vec::new();
+    for literal in literals {
+        if kept.len() == MAX_LITERALS_PER_PATTERN {
+            break;
+        }
+        if !kept.iter().any(|longer| longer.contains(&literal)) {
+            kept.push(literal);
+        }
+    }
+    kept
+}
+
+fn is_storage_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn storage_run(bytes: &[u8]) -> String {
+    debug_assert!(
+        bytes.iter().all(|byte| is_storage_byte(*byte)),
+        "storage runs are ASCII by construction: {bytes:?}"
+    );
+    bytes.iter().map(|byte| char::from(*byte)).collect()
 }
 
 fn normalize_search_pattern(pattern: &str, auto_quote: bool) -> String {
@@ -426,6 +719,21 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// Drop any cached bulk working-tree identities before an explicit
     /// from-disk rebuild. Implementations without such a cache do nothing.
     fn invalidate_cached_file_identities(&self) {}
+
+    /// The repository-wide Git identity scan this analyzer already took for its
+    /// workspace, when it has one.
+    ///
+    /// A host that must derive its own content identities for the same worktree
+    /// -- the semantic indexer does, because the semantic cache keys on the
+    /// bytes Git shows rather than on the bytes tree-sitter parsed -- takes this
+    /// instead of re-reading the Git index and re-diffing the working tree. On
+    /// firefox that duplicate read cost 4.1 s over 401,804 index entries at cold
+    /// start, immediately after the analyzer had scanned the same entries.
+    ///
+    /// `None` means no scan is available and the caller must take its own.
+    fn working_tree_identity(&self) -> Option<Arc<gitblob::WorkingTreeIdentity>> {
+        None
+    }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self
     where
@@ -1317,5 +1625,171 @@ fn autocomplete_rank(code_unit: &CodeUnit) -> usize {
         crate::analyzer::CodeUnitType::Macro => 3,
         crate::analyzer::CodeUnitType::Module => 4,
         crate::analyzer::CodeUnitType::FileScope => 5,
+    }
+}
+
+#[cfg(test)]
+mod required_literal_tests {
+    use super::{SearchSymbolPatternBatch, required_storage_literals};
+
+    /// Longest first, then alphabetical, which is the order the prefilter emits.
+    fn literals(pattern: &str) -> Vec<String> {
+        required_storage_literals(pattern)
+    }
+
+    #[test]
+    fn a_plain_identifier_is_its_own_required_literal() {
+        assert_eq!(
+            literals("ProductionTaintPolicyEvaluator"),
+            vec!["productiontaintpolicyevaluator".to_string()]
+        );
+    }
+
+    /// The three shapes from issue #2316: a wildcard between literals leaves
+    /// every literal required.
+    #[test]
+    fn wildcards_between_literals_keep_every_literal() {
+        assert_eq!(
+            literals("Java.*Value.*Flow"),
+            vec!["value".to_string(), "flow".to_string(), "java".to_string()]
+        );
+        assert_eq!(
+            literals(".*Taint.*Solver.*"),
+            vec!["solver".to_string(), "taint".to_string()]
+        );
+        assert_eq!(literals(".*ValueFlow.*"), vec!["valueflow".to_string()]);
+    }
+
+    #[test]
+    fn an_optional_group_contributes_nothing() {
+        assert_eq!(literals("Foo(Bar)?"), vec!["foo".to_string()]);
+        assert_eq!(literals("Foo(Bar)*"), vec!["foo".to_string()]);
+        assert_eq!(
+            literals("Foo(Bar)+"),
+            vec!["bar".to_string(), "foo".to_string()]
+        );
+        assert_eq!(
+            literals("Foo(?:Bar){2,4}"),
+            vec!["bar".to_string(), "foo".to_string()]
+        );
+    }
+
+    /// An alternation is required only where every branch requires the same
+    /// literal, so a differing branch yields nothing rather than a wrong filter.
+    #[test]
+    fn an_alternation_requires_only_what_every_branch_requires() {
+        assert!(literals("Foo|Bar").is_empty());
+        assert_eq!(literals("Search(Foo|Bar)"), vec!["search".to_string()]);
+        assert_eq!(literals("(?:Solver|Solver)"), vec!["solver".to_string()]);
+    }
+
+    /// An escaped metacharacter is a literal character, but it is not in the
+    /// storage charset, so it ends the run instead of joining it.
+    #[test]
+    fn a_non_charset_character_splits_the_run_instead_of_joining_it() {
+        assert_eq!(
+            literals(r"Foo\.Bar"),
+            vec!["bar".to_string(), "foo".to_string()]
+        );
+        assert_eq!(literals(r"Foo\$"), vec!["foo".to_string()]);
+        // Each side of the split stays required on its own.
+        assert_eq!(literals(r"a\-b"), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn case_insensitive_groups_recover_their_letters() {
+        assert_eq!(literals("(?i)Solver"), vec!["solver".to_string()]);
+        assert_eq!(
+            literals("(?i)Value.*Flow"),
+            vec!["value".to_string(), "flow".to_string()]
+        );
+        // A class that is not one letter's two cases contributes nothing itself,
+        // and separates the literals around it.
+        assert_eq!(
+            literals("Sol[vw]er"),
+            vec!["sol".to_string(), "er".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_pattern_without_a_required_literal_yields_none() {
+        for pattern in [".*", r"\w+", "^$", "[A-Za-z]+", ".", "(a|b)+"] {
+            assert!(
+                literals(pattern).is_empty(),
+                "{pattern} must not produce a prefilter literal: {:?}",
+                literals(pattern)
+            );
+        }
+    }
+
+    #[test]
+    fn a_literal_another_literal_contains_is_dropped() {
+        assert_eq!(literals("Foo.*FooBar"), vec!["foobar".to_string()]);
+    }
+
+    /// The literal count per pattern is bounded, and dropping a required literal
+    /// only widens the prefilter.
+    #[test]
+    fn the_literal_set_is_bounded() {
+        assert_eq!(
+            literals("aa.*bb.*cc.*dd.*ee"),
+            vec![
+                "aa".to_string(),
+                "bb".to_string(),
+                "cc".to_string(),
+                "dd".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mixed_batch_prefilters_every_pattern_separately() {
+        let batch = SearchSymbolPatternBatch::compile(
+            vec![
+                "Java.*Value.*Flow".to_string(),
+                "ProductionTaintPolicyEvaluator".to_string(),
+                ".*Taint.*Solver.*".to_string(),
+                ".*ValueFlow.*".to_string(),
+            ],
+            false,
+            None,
+        );
+
+        assert_eq!(
+            batch.required_storage_literals(),
+            Some(
+                [
+                    vec!["value".to_string(), "flow".to_string(), "java".to_string()],
+                    vec!["productiontaintpolicyevaluator".to_string()],
+                    vec!["solver".to_string(), "taint".to_string()],
+                    vec!["valueflow".to_string()],
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    /// One pattern without a required literal voids the batch's prefilter: an
+    /// unconditionally true disjunct would filter nothing anyway, and emitting
+    /// the others would drop rows that pattern matches.
+    #[test]
+    fn one_unfilterable_pattern_voids_the_batch_prefilter() {
+        let batch = SearchSymbolPatternBatch::compile(
+            vec!["ValueFlow".to_string(), ".*".to_string()],
+            false,
+            None,
+        );
+        assert_eq!(batch.required_storage_literals(), None);
+    }
+
+    /// `auto_quote` wraps a pattern in wildcards, which leaves the quoted
+    /// identifier required.
+    #[test]
+    fn auto_quoted_patterns_keep_their_identifier_literal() {
+        let batch = SearchSymbolPatternBatch::compile(vec!["ValueFlow".to_string()], true, None);
+        assert_eq!(
+            batch.required_storage_literals(),
+            Some([vec!["valueflow".to_string()]].as_slice())
+        );
     }
 }

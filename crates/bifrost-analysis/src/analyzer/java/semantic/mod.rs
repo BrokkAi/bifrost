@@ -17,9 +17,9 @@ use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
 use crate::analyzer::{JavaAnalyzer, Language, ProjectFile, Range};
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v5";
+const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v6";
 
 impl_program_semantics_provider!(JavaAnalyzer, JavaSemanticLowerer);
 
@@ -299,6 +299,11 @@ struct LoweringContext<'tree, 'targets> {
     prepared: &'tree PreparedSyntaxTree,
     session: ProcedureLoweringSession<'targets>,
     expression_values: HashMap<usize, ValueId>,
+    constant_index_values: HashMap<Box<str>, ValueId>,
+    field_declaration_anchors: HashMap<(Box<str>, Box<str>), Option<SourceAnchor>>,
+    local_types: HashMap<ValueId, Box<str>>,
+    non_null_values: HashSet<ValueId>,
+    catch_binders: HashMap<ProgramPointId, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
     receiver: Option<ValueId>,

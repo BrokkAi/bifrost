@@ -3,6 +3,9 @@
 use std::mem::size_of;
 use std::sync::Arc;
 
+use git2::Oid;
+use moka::sync::Cache;
+
 use crate::analyzer::complete_value_cache::{
     CompleteValueAcquisition, CompleteValueCache, CompleteValueWait,
 };
@@ -64,6 +67,18 @@ impl CompleteSemanticArtifactCache {
         self.inner.acquire(key, cancellation)
     }
 
+    /// Look one already-published artifact up without reserving a flight.
+    ///
+    /// A caller that has not read the file cannot lead a lowering, so it must
+    /// not take a permit: it asks only whether the artifact is already there.
+    fn get_ready(
+        &self,
+        key: &SemanticArtifactKey,
+        cancellation: &super::CancellationToken,
+    ) -> Option<Arc<SemanticArtifact>> {
+        self.inner.get_ready(key, cancellation)
+    }
+
     #[cfg(test)]
     fn len(&self) -> u64 {
         self.inner.len_for_test()
@@ -72,6 +87,52 @@ impl CompleteSemanticArtifactCache {
     #[cfg(test)]
     fn waiting_count(&self) -> usize {
         self.inner.waiting_count_for_test()
+    }
+}
+
+/// How many derived content digests one analyzer retains.
+///
+/// One entry is a 20-byte blob identity, a 32-byte digest, and moka's per-entry
+/// bookkeeping. Entries are fixed size, so bounding the count bounds the bytes:
+/// this cap is on the order of a few megabytes, well under the artifact cache
+/// beside it, and it is a bound rather than a target.
+const SOURCE_CONTENT_IDENTITY_MEMO_ENTRIES: u64 = 32_768;
+
+/// Content digests already derived from one exact source snapshot, keyed by
+/// that snapshot's blob identity.
+///
+/// The mapping is a pure function of content. Both sides are taken from one
+/// atomic snapshot: the key is the git blob identity of exactly the bytes the
+/// value digests. An entry therefore cannot become stale, and two files with
+/// identical content share one entry. The freshness question lives entirely on
+/// the lookup side, in the caller's proof that a file's current content still
+/// has that blob identity -- see `TreeSitterAnalyzer::stat_paired_live_oid`.
+///
+/// Bounded like the artifact cache beside it, and shared by clones of one
+/// analyzer for the same reason: the digests are content-addressed, so sharing
+/// them across analyzer snapshots is always correct.
+#[derive(Clone)]
+pub(crate) struct SourceContentIdentityMemo {
+    entries: Cache<Oid, ContentIdentity>,
+}
+
+impl Default for SourceContentIdentityMemo {
+    fn default() -> Self {
+        Self {
+            entries: Cache::builder()
+                .max_capacity(SOURCE_CONTENT_IDENTITY_MEMO_ENTRIES)
+                .build(),
+        }
+    }
+}
+
+impl SourceContentIdentityMemo {
+    fn get(&self, source: Oid) -> Option<ContentIdentity> {
+        self.entries.get(&source)
+    }
+
+    fn record(&self, source: Oid, content: ContentIdentity) {
+        self.entries.insert(source, content);
     }
 }
 
@@ -202,8 +263,9 @@ pub(crate) fn current_artifact_source_with_lowerer<A: LanguageAdapter>(
     max_source_bytes: usize,
 ) -> Result<Option<super::SemanticArtifactSourceSnapshot>, SemanticProviderError> {
     validate_semantic_file(analyzer, file)?;
-    let snapshot = match analyzer.source_snapshot_limited(file, max_source_bytes) {
-        Ok(Some(snapshot)) => snapshot,
+    let (source_identity, snapshot) = match analyzer.source_snapshot_limited(file, max_source_bytes)
+    {
+        Ok(Some(resolved)) => resolved,
         Ok(None) => {
             return Err(SemanticProviderError::source_access(format!(
                 "could not capture the current source snapshot for `{file}`"
@@ -216,10 +278,23 @@ pub(crate) fn current_artifact_source_with_lowerer<A: LanguageAdapter>(
         ProjectSourceOrigin::Overlay(revision) => Some(revision),
     };
     let source = snapshot.into_source();
-    let key = semantic_artifact_key(
+    // Identity of exactly these bytes, hashed once per distinct content rather
+    // than once per freshness check: this path runs for every call site the
+    // dispatch oracle resolves, and re-hashing a file it has already hashed is
+    // the residual #2295 named.
+    let digests = analyzer.semantic_source_digests();
+    let content = match digests.get(source_identity) {
+        Some(content) => content,
+        None => {
+            let content = ContentIdentity::hash_bytes(source.as_bytes());
+            digests.record(source_identity, content);
+            content
+        }
+    };
+    let key = semantic_artifact_key_from_content(
         file,
         LanguageDialect::for_path(analyzer.adapter().language(), file.rel_path()),
-        &source,
+        content,
         overlay_revision,
         lowerer.identity(),
     )?;
@@ -259,9 +334,18 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
 
     validate_semantic_file(analyzer, file)?;
 
+    // A repeat touch of an unchanged file must not read and hash it again.
+    // This is the only path that can answer before the source is read, so it
+    // is also the only one that can charge a lookup rather than a file.
+    if let Some(artifact) = served_from_unchanged_source(analyzer, cache, lowerer, file, request)? {
+        let staged_budget = request.budget.clone();
+        return publish_cached(artifact, SemanticWork::default(), staged_budget, request);
+    }
+
     let max_source_bytes = request.budget.remaining().source_bytes;
-    let prepared = match analyzer.prepared_syntax_limited(file, max_source_bytes) {
-        Ok(Some(prepared)) => prepared,
+    let (source_identity, prepared) = match analyzer.prepared_syntax_limited(file, max_source_bytes)
+    {
+        Ok(Some(resolved)) => resolved,
         Ok(None) => {
             return Err(SemanticProviderError::source_access(format!(
                 "could not prepare the current source snapshot for `{file}`"
@@ -308,7 +392,14 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
     }
 
     let identity = lowerer.identity();
-    let key = semantic_artifact_key_for_prepared(file, &prepared, identity)?;
+    // The one derivation that hashes the source, and the one place that pays
+    // for it. Recording the digest against the blob identity of exactly these
+    // bytes is what lets the next touch of this content skip both.
+    let content = ContentIdentity::hash_bytes(prepared.source().as_bytes());
+    analyzer
+        .semantic_source_digests()
+        .record(source_identity, content);
+    let key = semantic_artifact_key_for_prepared(file, &prepared, content, identity)?;
     let (acquisition, _cache_wait) = cache.acquire(&key, request.cancellation);
     let permit = match acquisition {
         CompleteValueAcquisition::Cached { value: artifact } => {
@@ -364,18 +455,52 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
     outcome
 }
 
+/// What one repeat cache hit actually performs: derive the artifact key, look
+/// it up, and clone an `Arc`.
+///
+/// It is deliberately non-zero. A budget scope that only ever hits the cache
+/// must still run out, and the traversal lane that would otherwise bound such a
+/// loop lives on [`super::SemanticExecutionBudget`], which is optional: the
+/// taint solve path and the summary foundry pass a request without one. The
+/// `nested_entries` lane is the existing home for a bounded traversal step that
+/// no retained row represents (see `ProcedureCfgBuilder::descend_nested_entry`).
+const fn repeat_materialization_work() -> SemanticWork {
+    SemanticWork {
+        nested_entries: 1,
+        ..SemanticWork::uniform(0)
+    }
+}
+
+/// Charge one complete-artifact cache hit.
+///
+/// The first hit in this budget scope pays the artifact's whole retained-row
+/// census, because that scope has not yet paid for the material it is about to
+/// hold and walk. Every later hit on the same artifact pays
+/// [`repeat_materialization_work`], because the lowering it would otherwise be
+/// charged for has already been paid for in this scope and is not performed
+/// again (#2295).
 fn publish_cached(
     artifact: Arc<SemanticArtifact>,
     source_work: SemanticWork,
     mut staged_budget: super::SemanticBudget,
     request: &mut SemanticRequest<'_>,
 ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError> {
-    if let Err(exceeded) = staged_budget.charge(artifact.work()) {
+    let fingerprint = artifact.key().fingerprint();
+    let repeat = staged_budget.has_charged_artifact(fingerprint);
+    let charge = if repeat {
+        repeat_materialization_work()
+    } else {
+        artifact.work()
+    };
+    if let Err(exceeded) = staged_budget.charge(charge) {
         return Ok(SemanticOutcome::ExceededBudget {
             partial: None,
             exceeded,
             work: source_work.component_max(artifact.work()),
         });
+    }
+    if !repeat {
+        staged_budget.record_charged_artifact(fingerprint);
     }
     let work = source_work.component_max(artifact.work());
     if request.cancellation.is_cancelled() {
@@ -391,9 +516,50 @@ fn publish_cached(
     })
 }
 
+/// Serve one already-lowered artifact for a file whose content the workspace
+/// can identify without reading it.
+///
+/// Three facts have to line up, and any one of them missing falls through to
+/// the ordinary read-and-lower path rather than guessing:
+///
+/// 1. the workspace has a stat-paired blob identity for the file, which is its
+///    proof that the file's content is unchanged since it recorded that
+///    identity (`stat_paired_live_oid` refuses overlays and unstamped entries);
+/// 2. the content digest for that blob identity has already been derived, so
+///    the artifact key can be rebuilt without hashing the file;
+/// 3. the complete-artifact cache already holds that exact key.
+///
+/// Everything in the key other than the content digest is derived the same way
+/// `current_artifact_source_with_lowerer` derives it, from the path and the
+/// lowerer's identity, so a stale adapter, configuration, dependency, or IR
+/// version cannot be served: it produces a different key, which misses.
+fn served_from_unchanged_source<A: LanguageAdapter>(
+    analyzer: &TreeSitterAnalyzer<A>,
+    cache: &CompleteSemanticArtifactCache,
+    lowerer: &dyn ProgramSemanticsLowerer,
+    file: &ProjectFile,
+    request: &SemanticRequest<'_>,
+) -> Result<Option<Arc<SemanticArtifact>>, SemanticProviderError> {
+    let Some(source_identity) = analyzer.stat_paired_live_oid(file) else {
+        return Ok(None);
+    };
+    let Some(content) = analyzer.semantic_source_digests().get(source_identity) else {
+        return Ok(None);
+    };
+    let key = semantic_artifact_key_from_content(
+        file,
+        LanguageDialect::for_path(analyzer.adapter().language(), file.rel_path()),
+        content,
+        None,
+        lowerer.identity(),
+    )?;
+    Ok(cache.get_ready(&key, request.cancellation))
+}
+
 fn semantic_artifact_key_for_prepared(
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
+    content: ContentIdentity,
     identity: SemanticAdapterIdentity,
 ) -> Result<SemanticArtifactKey, SemanticProviderError> {
     let overlay_revision = match prepared.origin() {
@@ -404,25 +570,24 @@ fn semantic_artifact_key_for_prepared(
             )
         })?),
     };
-    semantic_artifact_key(
+    semantic_artifact_key_from_content(
         file,
         prepared.dialect(),
-        prepared.source(),
+        content,
         overlay_revision,
         identity,
     )
 }
 
-fn semantic_artifact_key(
+fn semantic_artifact_key_from_content(
     file: &ProjectFile,
     dialect: LanguageDialect,
-    source: &str,
+    content: ContentIdentity,
     overlay_revision: Option<OverlayRevision>,
     identity: SemanticAdapterIdentity,
 ) -> Result<SemanticArtifactKey, SemanticProviderError> {
     let path = WorkspaceRelativePath::try_from_path(file.rel_path())
         .map_err(|error| SemanticProviderError::invalid_identity(error.to_string()))?;
-    let content = ContentIdentity::hash_bytes(source.as_bytes());
     let revision = match overlay_revision {
         None => SourceRevision::Disk { content },
         Some(revision) => SourceRevision::Overlay {
@@ -511,6 +676,11 @@ fn publish_lowered(
                     work: total_work,
                 });
             }
+            // Only a complete lowering is retained by the artifact cache, so
+            // only a complete lowering can be hit later in this scope. A
+            // partial one is lowered and charged again on its next touch,
+            // which is honest: that work really is performed again (#2295).
+            staged_budget.record_charged_artifact(artifact.key().fingerprint());
             *request.budget = staged_budget;
             Ok(SemanticOutcome::Complete {
                 work: total_work,
@@ -939,16 +1109,37 @@ mod tests {
         }
     }
 
+    /// A budget that read the file pays exactly that file once, plus the whole
+    /// retained census of the artifact it now holds.
     fn assert_source_and_artifact_charged(
         budget: &SemanticBudget,
         file: &ProjectFile,
         artifact: &SemanticArtifact,
     ) {
-        let mut retained = budget.used();
-        assert_eq!(
-            retained.source_bytes,
-            file.read_to_string().expect("fixture source").len()
+        assert_census_charged(
+            budget,
+            file.read_to_string().expect("fixture source").len(),
+            artifact,
         );
+    }
+
+    /// A budget served an artifact for a source the workspace already
+    /// identified pays the census -- it holds and walks that material -- and no
+    /// source bytes at all, because it neither read nor hashed the file.
+    fn assert_artifact_charged_without_reading(
+        budget: &SemanticBudget,
+        artifact: &SemanticArtifact,
+    ) {
+        assert_census_charged(budget, 0, artifact);
+    }
+
+    fn assert_census_charged(
+        budget: &SemanticBudget,
+        source_bytes: usize,
+        artifact: &SemanticArtifact,
+    ) {
+        let mut retained = budget.used();
+        assert_eq!(retained.source_bytes, source_bytes);
         retained.source_bytes = 0;
         assert_eq!(retained, artifact.work());
     }
@@ -1171,9 +1362,289 @@ mod tests {
             panic!("cached complete artifact")
         };
         assert!(Arc::ptr_eq(&first, &second));
-        assert_source_and_artifact_charged(&second_budget, &file, &second);
+        // Re-derived: the second request is charged the artifact's census
+        // again, because it holds that material too, but not the file's bytes.
+        // The first request already derived this content's identity, and the
+        // workspace can prove the file has not changed since, so the second
+        // request neither reads nor hashes it.
+        assert_artifact_charged_without_reading(&second_budget, &second);
         assert_eq!(lowerer.calls(), 1);
         assert_eq!(cache.len(), 1);
+    }
+
+    /// One artifact's retained census, plus room for `repeats` repeat lookups
+    /// and for exactly one read of the source.
+    ///
+    /// One read's worth of `source_bytes` is deliberate and is what makes the
+    /// repeat-charge claim below falsifiable: a second charged read of this
+    /// file would exceed the budget rather than pass unnoticed.
+    ///
+    /// Every limit must be positive, so a census dimension the fixture never
+    /// uses still gets one row of headroom; that headroom is far below one
+    /// extra census, which is what this test's fail-before depends on.
+    fn budget_for_one_census(
+        census: SemanticWork,
+        source_bytes: usize,
+        repeats: usize,
+    ) -> SemanticBudget {
+        let lane = |value: usize| value.max(1);
+        SemanticBudget::new(SemanticWork {
+            source_bytes: source_bytes.max(1),
+            procedures: lane(census.procedures),
+            blocks: lane(census.blocks),
+            program_points: lane(census.program_points),
+            values: lane(census.values),
+            allocations: lane(census.allocations),
+            call_sites: lane(census.call_sites),
+            memory_locations: lane(census.memory_locations),
+            captures: lane(census.captures),
+            source_mappings: lane(census.source_mappings),
+            evidence: lane(census.evidence),
+            gaps: lane(census.gaps),
+            events: lane(census.events),
+            control_edges: lane(census.control_edges),
+            nested_entries: lane(census.nested_entries).saturating_add(repeats),
+            owned_text_bytes: lane(census.owned_text_bytes),
+        })
+        .expect("every limit is positive")
+    }
+
+    /// #2295: one budget pays one artifact's retained census once, however many
+    /// complete-artifact cache hits it serves.
+    ///
+    /// `DispatchOracle::resolve_call` materializes a callee's file once for each
+    /// declaration group it resolves, so a request that reaches one file from
+    /// many call sites used to be charged that file's whole census once per call
+    /// site even though the file was lowered once. A budget sized for the
+    /// material the request actually holds then aborted a request that had
+    /// performed no new work. Each repeat now pays
+    /// `repeat_materialization_work`, which is what a repeat performs: derive
+    /// the key, look it up, clone an `Arc`.
+    #[test]
+    fn one_budget_charges_one_artifact_census_once_however_many_cache_hits() {
+        const REPEATS: usize = 8;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let source = "function target(value: number): number { return value; }\n\
+             export function main(): number { return target(1); }\n";
+        let file = write_file(&root, "src/calls.ts", source);
+        let analyzer = analyzer(&root);
+        let cache = CompleteSemanticArtifactCache::default();
+        let lowerer = crate::analyzer::js_ts::semantic::JsTsSemanticLowerer::typescript();
+
+        // Lower once against its own budget, so every materialization below is
+        // a cache hit and the census is known exactly.
+        let mut warming_budget = SemanticBudget::default();
+        let SemanticOutcome::Complete {
+            value: artifact, ..
+        } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut warming_budget,
+            &super::super::CancellationToken::default(),
+        )
+        else {
+            panic!("the fixture must lower completely")
+        };
+        let census = artifact.work();
+        assert!(
+            census.program_points > 1,
+            "the fixture must retain enough rows for one census to be measurable: {census:?}"
+        );
+
+        let mut budget = budget_for_one_census(census, source.len(), REPEATS);
+        for hit in 0..=REPEATS {
+            let outcome = materialize(
+                &analyzer,
+                &cache,
+                &lowerer,
+                &file,
+                &mut budget,
+                &super::super::CancellationToken::default(),
+            );
+            let SemanticOutcome::Complete { value, .. } = outcome else {
+                panic!(
+                    "cache hit {hit} must not exhaust a budget sized for one census: {outcome:?}"
+                )
+            };
+            assert!(Arc::ptr_eq(&value, &artifact));
+        }
+
+        let used = budget.used();
+        assert_eq!(
+            used.program_points, census.program_points,
+            "the census is charged once, not once per hit"
+        );
+        assert_eq!(used.values, census.values);
+        assert_eq!(
+            used.nested_entries,
+            census.nested_entries + REPEATS,
+            "each repeat hit charges exactly one traversal step"
+        );
+        assert_eq!(
+            used.source_bytes, 0,
+            "no call re-read or re-hashed a source whose content the workspace \
+             had already identified"
+        );
+        assert_eq!(
+            budget.charged_artifact_count(),
+            1,
+            "one artifact key was charged in this scope"
+        );
+    }
+
+    /// An edited file derives a fresh key and is paid for again.
+    ///
+    /// This is the soundness half of the derivation memo. The memo is keyed by
+    /// the blob identity of exactly the bytes it digested, so an entry cannot
+    /// describe any other content; and the path that uses it first asks the
+    /// workspace to re-confirm that identity against the file's current stat.
+    /// An edit therefore cannot be served the old artifact: the stat no longer
+    /// matches the recorded one, the memo is never consulted, and the ordinary
+    /// read derives the new content's key and pays for its bytes.
+    #[test]
+    fn an_edited_source_derives_a_fresh_key_and_pays_for_its_bytes_again() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let before = "export function main(): number { return 1; }\n";
+        let after = "export function main(): number { return 1; }\n\
+             export function second(): number { return 2; }\n";
+        let file = write_file(&root, "src/edited.ts", before);
+        let analyzer = analyzer(&root);
+        let cache = CompleteSemanticArtifactCache::default();
+        let lowerer = crate::analyzer::js_ts::semantic::JsTsSemanticLowerer::typescript();
+
+        let mut first_budget = SemanticBudget::default();
+        let SemanticOutcome::Complete { value: first, .. } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut first_budget,
+            &super::super::CancellationToken::default(),
+        ) else {
+            panic!("the fixture must lower completely")
+        };
+        assert_eq!(
+            first_budget.used().source_bytes,
+            before.len(),
+            "the request that lowered the file pays its bytes once"
+        );
+
+        // Unchanged: served without reading, which is the behaviour the edit
+        // below has to defeat.
+        let mut unchanged_budget = SemanticBudget::default();
+        let SemanticOutcome::Complete { value: served, .. } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut unchanged_budget,
+            &super::super::CancellationToken::default(),
+        ) else {
+            panic!("an unchanged source must still serve a complete artifact")
+        };
+        assert!(Arc::ptr_eq(&first, &served));
+        assert_artifact_charged_without_reading(&unchanged_budget, &served);
+
+        file.write(after).expect("rewrite fixture");
+
+        let mut edited_budget = SemanticBudget::default();
+        let SemanticOutcome::Complete { value: edited, .. } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut edited_budget,
+            &super::super::CancellationToken::default(),
+        ) else {
+            panic!("the edited fixture must lower completely")
+        };
+        assert_ne!(
+            first.key(),
+            edited.key(),
+            "an edited source must derive a fresh artifact key"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &edited),
+            "an edited source must not be served the previous artifact"
+        );
+        assert_eq!(
+            edited.procedures().len(),
+            2,
+            "the edited artifact must describe the edited file"
+        );
+        assert_eq!(
+            edited_budget.used().source_bytes,
+            after.len(),
+            "the request that re-read and re-hashed the edited file pays its bytes"
+        );
+    }
+
+    /// A fresh budget is a fresh scope: it pays the census again.
+    ///
+    /// This is what keeps the change coherent with the per-region reset in
+    /// `PolicySelectorSession::reset_region_semantic_budget` and the per-batch
+    /// reset in `TaintExecutionBudget::reset_per_batch_solve_budget`. Both
+    /// replace the budget value, so both start a scope that pays again for the
+    /// material it newly pulls in.
+    #[test]
+    fn a_fresh_budget_pays_the_census_again() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let file = write_file(
+            &root,
+            "src/calls.ts",
+            "export function main(): number { return 1; }\n",
+        );
+        let analyzer = analyzer(&root);
+        let cache = CompleteSemanticArtifactCache::default();
+        let lowerer = crate::analyzer::js_ts::semantic::JsTsSemanticLowerer::typescript();
+
+        // The lowering budget is deliberately not compared against the census:
+        // lowering also charges bounded traversal steps that no retained row
+        // represents, so it costs more than the artifact it produces.
+        let mut lowering_budget = SemanticBudget::default();
+        let SemanticOutcome::Complete {
+            value: artifact, ..
+        } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut lowering_budget,
+            &super::super::CancellationToken::default(),
+        )
+        else {
+            panic!("the fixture must lower completely")
+        };
+
+        for scope in 0..3 {
+            let mut budget = SemanticBudget::default();
+            assert!(
+                materialize(
+                    &analyzer,
+                    &cache,
+                    &lowerer,
+                    &file,
+                    &mut budget,
+                    &super::super::CancellationToken::default(),
+                )
+                .is_complete()
+            );
+            // Re-derived: every fresh scope still pays the census, which is
+            // what this test is about. It no longer pays the file's bytes,
+            // because the lowering scope above already derived this content's
+            // identity and no scope after it reads the file.
+            assert_artifact_charged_without_reading(&budget, &artifact);
+            assert_eq!(
+                budget.charged_artifact_count(),
+                1,
+                "scope {scope} pays for the artifact it holds"
+            );
+        }
     }
 
     #[test]

@@ -14,7 +14,8 @@
 //! tasks may wait here.
 
 use std::hash::Hash;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use moka::sync::Cache;
@@ -23,6 +24,14 @@ use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
 
 const CANCELLATION_POLL: Duration = Duration::from_millis(10);
+
+/// How many keys the live-instance registry tracks before it drops the entries
+/// whose value is gone.
+///
+/// An entry is one key and one `Weak`, so the registry costs a small multiple
+/// of the ready cache's key set even at this bound; the sweep is a single
+/// retain over a map this size and runs only when a publication crosses it.
+const LIVE_REGISTRY_SWEEP_KEYS: usize = 8_192;
 
 /// Time spent following already-running same-key materializations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -69,6 +78,8 @@ where
 {
     entries: Cache<K, Arc<V>>,
     in_flight: Arc<Mutex<HashMap<K, Arc<InFlightMaterialization<V>>>>>,
+    live: Arc<Mutex<HashMap<K, Weak<V>>>>,
+    revivals: Arc<AtomicU64>,
 }
 
 impl<K, V> Clone for CompleteValueCache<K, V>
@@ -79,6 +90,8 @@ where
         Self {
             entries: self.entries.clone(),
             in_flight: Arc::clone(&self.in_flight),
+            live: Arc::clone(&self.live),
+            revivals: Arc::clone(&self.revivals),
         }
     }
 }
@@ -98,7 +111,40 @@ where
                 .weigher(move |key, value| weigher(key, value).max(1))
                 .build(),
             in_flight: Arc::new(Mutex::new(HashMap::default())),
+            live: Arc::new(Mutex::new(HashMap::default())),
+            revivals: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// The instance this cache already published for `key`, when the value is
+    /// still referenced somewhere and the ready cache has only evicted it.
+    ///
+    /// A value published here is complete and immutable, and `K` is its whole
+    /// validity identity, so the live instance is exactly what a rebuild would
+    /// produce -- except that a rebuild would produce a *second* instance.
+    /// Consumers that identify a value's parts by allocation identity (a
+    /// `ProcedureHandle` compares its owning `Arc<SemanticArtifact>` by
+    /// pointer) then hold two identities for one entity, and a lookup keyed on
+    /// one misses the other: #2307 measured require-model taint losing real
+    /// findings this way, because a region's plan was built from the instance
+    /// discovery saw and the solve re-materialized the file the byte-bounded
+    /// cache had since evicted. Reusing the live instance keeps one identity
+    /// per validity key for as long as anyone holds it, and also skips the
+    /// rebuild.
+    ///
+    /// The registry holds `Weak` references only, so it never extends a
+    /// value's lifetime and the weight bound on `entries` still governs
+    /// retention.
+    fn revive(&self, key: &K) -> Option<Arc<V>> {
+        let value = self
+            .live
+            .lock()
+            .expect("complete-value live-instance map mutex poisoned")
+            .get(key)
+            .and_then(Weak::upgrade)?;
+        self.entries.insert(key.clone(), Arc::clone(&value));
+        self.revivals.fetch_add(1, Ordering::Relaxed);
+        Some(value)
     }
 
     /// Return a ready value, reserve leadership, or follow the current leader.
@@ -118,6 +164,9 @@ where
             if let Some(value) = self.entries.get(key) {
                 return (CompleteValueAcquisition::Cached { value }, wait);
             }
+            if let Some(value) = self.revive(key) {
+                return (CompleteValueAcquisition::Cached { value }, wait);
+            }
 
             let (ready, flight, is_leader) = {
                 let mut in_flight = self
@@ -127,7 +176,7 @@ where
 
                 // Close the race between the optimistic ready lookup above and
                 // a previous leader publishing and removing its flight.
-                if let Some(value) = self.entries.get(key) {
+                if let Some(value) = self.entries.get(key).or_else(|| self.revive(key)) {
                     (Some(value), None, false)
                 } else {
                     match in_flight.get(key) {
@@ -153,6 +202,7 @@ where
                             flight,
                             entries: self.entries.clone(),
                             in_flight: Arc::clone(&self.in_flight),
+                            live: Arc::clone(&self.live),
                         },
                     },
                     wait,
@@ -181,14 +231,32 @@ where
     /// This supports physical planners that may reuse an index for a narrow
     /// request but must not construct the whole-workspace value for it.
     pub(crate) fn get_ready(&self, key: &K, cancellation: &CancellationToken) -> Option<Arc<V>> {
-        (!cancellation.is_cancelled())
-            .then(|| self.entries.get(key))
-            .flatten()
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        self.entries.get(key).or_else(|| self.revive(key))
+    }
+
+    /// Ready-cache misses that a still-live instance answered instead of a
+    /// rebuild. Non-zero means the weight bound is evicting values the process
+    /// is still using.
+    #[cfg(test)]
+    pub(crate) fn revivals_for_test(&self) -> u64 {
+        self.revivals.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
     pub(crate) fn insert_complete_for_test(&self, key: K, value: Arc<V>) {
         self.entries.insert(key, value);
+    }
+
+    /// Drop one key from the weight-bounded ready cache, exactly as the bound
+    /// does at scale, without depending on the admission policy's choice of
+    /// victim.
+    #[cfg(test)]
+    pub(crate) fn evict_for_test(&self, key: &K) {
+        self.entries.invalidate(key);
+        self.entries.run_pending_tasks();
     }
 
     #[cfg(test)]
@@ -282,6 +350,7 @@ where
     flight: Arc<InFlightMaterialization<V>>,
     entries: Cache<K, Arc<V>>,
     in_flight: Arc<Mutex<HashMap<K, Arc<InFlightMaterialization<V>>>>>,
+    live: Arc<Mutex<HashMap<K, Weak<V>>>>,
 }
 
 impl<K, V> CompleteValuePermit<K, V>
@@ -292,6 +361,16 @@ where
     /// Retain and hand off one complete immutable value, then wake followers.
     pub(crate) fn publish_complete(self, value: Arc<V>) {
         self.entries.insert(self.key.clone(), Arc::clone(&value));
+        {
+            let mut live = self
+                .live
+                .lock()
+                .expect("complete-value live-instance map mutex poisoned");
+            live.insert(self.key.clone(), Arc::downgrade(&value));
+            if live.len() > LIVE_REGISTRY_SWEEP_KEYS {
+                live.retain(|_, weak| weak.strong_count() > 0);
+            }
+        }
         self.flight
             .state
             .lock()
@@ -570,6 +649,68 @@ mod tests {
         };
         assert!(Arc::ptr_eq(&built, &value));
         assert_eq!(cache.len_for_test(), 0);
+    }
+
+    /// #2307: eviction must not split one validity key into two instances.
+    ///
+    /// A holder that still references an evicted value and a caller that asks
+    /// for the same key must get the same allocation. Consumers identify a
+    /// value's parts by allocation identity -- a `ProcedureHandle` compares its
+    /// owning artifact `Arc` by pointer -- so a second instance silently breaks
+    /// every lookup that crosses the two, which is how require-model taint lost
+    /// real findings at corpus scale.
+    #[test]
+    fn an_evicted_value_that_is_still_referenced_is_reused_rather_than_rebuilt() {
+        let cache = cache(1, 1);
+        let cancellation = CancellationToken::default();
+        let key = "held".to_string();
+
+        let (CompleteValueAcquisition::Leader { permit }, _) = cache.acquire(&key, &cancellation)
+        else {
+            panic!("a new key must lead")
+        };
+        let held = Arc::new(11);
+        permit.publish_complete(Arc::clone(&held));
+
+        // Evict `key` from the weight-bounded ready cache while the caller
+        // above still holds its value.
+        cache.evict_for_test(&key);
+        assert_eq!(cache.len_for_test(), 0);
+
+        let (acquisition, _) = cache.acquire(&key, &cancellation);
+        let CompleteValueAcquisition::Cached { value } = acquisition else {
+            panic!("an evicted but still-referenced value must not be rebuilt")
+        };
+        assert!(
+            Arc::ptr_eq(&held, &value),
+            "one validity key must denote one live instance"
+        );
+        assert_eq!(cache.revivals_for_test(), 1);
+    }
+
+    /// The registry holds weak references only: once the last holder drops the
+    /// value, the key rebuilds exactly as it did before.
+    #[test]
+    fn a_dropped_value_is_rebuilt_rather_than_revived() {
+        let cache = cache(1, 1);
+        let cancellation = CancellationToken::default();
+        let key = "dropped".to_string();
+
+        let (CompleteValueAcquisition::Leader { permit }, _) = cache.acquire(&key, &cancellation)
+        else {
+            panic!("a new key must lead")
+        };
+        permit.publish_complete(Arc::new(33));
+        cache.evict_for_test(&key);
+
+        assert!(
+            matches!(
+                cache.acquire(&key, &cancellation).0,
+                CompleteValueAcquisition::Leader { .. }
+            ),
+            "a value nobody holds must be rebuilt, not resurrected"
+        );
+        assert_eq!(cache.revivals_for_test(), 0);
     }
 
     #[test]

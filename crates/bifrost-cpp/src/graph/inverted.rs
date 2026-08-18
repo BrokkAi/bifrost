@@ -43,12 +43,14 @@ use crate::graph::resolver::{
     cpp_template_reference_arguments, cpp_type_name_components, declarator_name_node,
     designated_initializer_owner, extract_variable_name, first_type_child, function_terminal_node,
     has_ancestor_kind, infer_cpp_initializer_binding, infer_cpp_initializer_type, is_c_source_file,
-    is_declaration_name, is_declarator_node, is_globally_qualified_cpp_name, is_nested_type_node,
-    normalize_type_text, out_of_line_destructor_type_reference,
-    out_of_line_member_definition_owner, parameter_belongs_to_callable_scope,
-    qualified_owner_components, recovered_macro_decorated_type_node,
-    resolve_declaring_member_owner, same_logical_symbol, same_visible_symbol,
-    type_reference_hit_node,
+    is_cpp_template_argument_type_leaf, is_declaration_name, is_declarator_node,
+    is_globally_qualified_cpp_name, is_nested_type_node,
+    is_recovered_qualified_friend_class_type_reference, normalize_type_text,
+    out_of_line_destructor_type_reference, out_of_line_member_definition_owner,
+    parameter_belongs_to_callable_scope, qualified_owner_components,
+    recovered_macro_decorated_type_node, recovered_relational_template_member_call,
+    resolve_declaring_callable_owner, resolve_declaring_member_owner, same_logical_symbol,
+    same_visible_symbol, type_reference_hit_node,
 };
 use crate::graph::syntax::qualified_callable_value;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
@@ -218,6 +220,10 @@ fn record_reference(
         record_recovered_macro_return_type_reference(return_type, ctx);
         return;
     }
+    if let Some(call) = recovered_relational_template_member_call(node) {
+        record_recovered_relational_template_member_call(call, ctx, bindings);
+        return;
+    }
     if node.kind() == "using_declaration" {
         let (resolution, type_node) =
             if let Some(type_node) = using_enum_declaration_type_node(node) {
@@ -259,6 +265,7 @@ fn record_reference(
     }
     if matches!(node.kind(), "qualified_identifier" | "scoped_identifier")
         && is_declaration_name(node)
+        && !is_recovered_qualified_friend_class_type_reference(node, ctx.source)
         && let Some(owners) = out_of_line_member_definition_owner(
             &ctx.analyzer,
             ctx.visibility,
@@ -311,13 +318,15 @@ fn record_reference(
         "namespace_identifier"
             if let Some((type_node, _)) = recovered_macro_decorated_type_node(node) =>
         {
-            record_recovered_macro_decorated_type_reference(node, type_node, ctx, bindings);
+            record_recovered_macro_decorated_type_reference(node, type_node, ctx);
         }
         // A type reference (`Foo x`, base class, `new Foo()`'s type child) resolves
         // to the class. `new Foo()` reaches its type via this case (its type child
         // is itself one of these nodes), so there is no separate construction case.
         "type_identifier" | "qualified_identifier" | "scoped_type_identifier" | "template_type" => {
-            if is_declaration_name(node) {
+            if is_declaration_name(node)
+                && !is_recovered_qualified_friend_class_type_reference(node, ctx.source)
+            {
                 if let Some(owners) = out_of_line_member_definition_owner(
                     &ctx.analyzer,
                     ctx.visibility,
@@ -336,7 +345,7 @@ fn record_reference(
                 }
                 return;
             }
-            if is_nested_type_node(node) && !is_template_argument_type_leaf(node) {
+            if is_nested_type_node(node) && !is_cpp_template_argument_type_leaf(node) {
                 record_nested_type_terminal_reference(node, ctx);
                 return;
             }
@@ -385,11 +394,51 @@ fn record_reference(
                     return;
                 }
             }
-            record_type_reference(node, ctx, bindings);
+            record_type_reference(node, ctx);
         }
         "call_expression" => record_call(node, ctx, bindings),
         _ => {}
     }
+}
+
+fn record_recovered_relational_template_member_call(
+    call: crate::graph::resolver::RecoveredRelationalTemplateMemberCall<'_>,
+    ctx: &mut CppScan<'_>,
+    bindings: &LocalInferenceEngine<CodeUnit>,
+) {
+    let name = node_text(call.member, ctx.source);
+    let Some(receiver_owner) = receiver_type_unit(call.receiver, ctx, bindings, 32) else {
+        ctx.record_unproven(name, call.member);
+        return;
+    };
+    let owner = match resolve_declaring_member_owner_cached(ctx, &receiver_owner, name) {
+        EnclosingMemberOwnerResolution::Owner(owner) => owner,
+        EnclosingMemberOwnerResolution::Ambiguous => {
+            ctx.record_unproven(name, call.member);
+            return;
+        }
+        EnclosingMemberOwnerResolution::Missing => return,
+    };
+    let VisibleMemberResolution::Callable(callables) = ctx
+        .visibility
+        .visible_member_for_owner_name(ctx.file, &owner, name)
+    else {
+        return;
+    };
+    let mut candidates = callables.into_iter().filter(|candidate| {
+        cpp_callable_arity(&ctx.analyzer, candidate).accepts(call.arity)
+            && ctx
+                .visibility
+                .callable_is_template_declaration(&ctx.analyzer, candidate)
+    });
+    let Some(candidate) = candidates.next() else {
+        return;
+    };
+    if candidates.next().is_some() {
+        ctx.record_unproven(name, call.member);
+        return;
+    }
+    ctx.record(candidate.fq_name(), call.member);
 }
 
 fn record_recovered_macro_return_type_reference(return_type: Node<'_>, ctx: &mut CppScan<'_>) {
@@ -442,32 +491,7 @@ fn record_recovered_macro_return_type_reference(return_type: Node<'_>, ctx: &mut
 /// outer template-id is recorded separately, but these leaves can name class
 /// aliases (for example `expected<T, error_type>`) and therefore need their
 /// own inverse edge as well.
-fn is_template_argument_type_leaf(node: Node<'_>) -> bool {
-    let Some(type_descriptor) = node.parent() else {
-        return false;
-    };
-    if type_descriptor.kind() != "type_descriptor"
-        || type_descriptor.child_by_field_name("type") != Some(node)
-    {
-        return false;
-    }
-    let Some(arguments) = type_descriptor.parent() else {
-        return false;
-    };
-    if arguments.kind() != "template_argument_list" {
-        return false;
-    }
-    arguments.parent().is_some_and(|parent| {
-        matches!(parent.kind(), "template_type" | "template_function")
-            && parent.child_by_field_name("arguments") == Some(arguments)
-    })
-}
-
-fn record_type_reference(
-    node: Node<'_>,
-    ctx: &mut CppScan<'_>,
-    bindings: &LocalInferenceEngine<CodeUnit>,
-) {
+fn record_type_reference(node: Node<'_>, ctx: &mut CppScan<'_>) {
     let ordinary_resolution = resolve_type_node_lexically(
         node,
         &ctx.analyzer,
@@ -484,11 +508,20 @@ fn record_type_reference(
     };
     let resolution = resolve_inverted_type_node(node, ctx, resolution);
     match resolution {
-        LexicalTypeResolution::Resolved { unit, .. } => ctx.record(
-            unit.fq_name(),
-            type_reference_hit_node(node, ctx.file, ctx.source, bindings),
-        ),
-        LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {}
+        LexicalTypeResolution::Resolved { unit, .. } => {
+            ctx.record(unit.fq_name(), type_reference_hit_node(node))
+        }
+        LexicalTypeResolution::Missing => {
+            if let Some(unit) = ctx.visibility.unique_visible_parameter_type_fallback(
+                &ctx.analyzer,
+                ctx.file,
+                node,
+                ctx.source,
+            ) {
+                ctx.record(unit.fq_name(), node);
+            }
+        }
+        LexicalTypeResolution::Ambiguous => {}
     }
 }
 
@@ -633,7 +666,6 @@ fn record_recovered_macro_decorated_type_reference(
     scope_node: Node<'_>,
     type_node: Node<'_>,
     ctx: &mut CppScan<'_>,
-    bindings: &LocalInferenceEngine<CodeUnit>,
 ) {
     let mut resolved = Vec::new();
     for candidate in [scope_node, type_node] {
@@ -657,10 +689,7 @@ fn record_recovered_macro_decorated_type_reference(
     let [(unit, candidate)] = resolved.as_slice() else {
         return;
     };
-    ctx.record(
-        unit.fq_name(),
-        type_reference_hit_node(*candidate, ctx.file, ctx.source, bindings),
-    );
+    ctx.record(unit.fq_name(), type_reference_hit_node(*candidate));
 }
 
 /// Resolve an inverted type edge to the concrete specialization named by a
@@ -844,7 +873,15 @@ fn record_call(node: Node<'_>, ctx: &mut CppScan<'_>, bindings: &LocalInferenceE
                 return;
             }
             if let Some(receiver_owner) = receiver_type_unit(receiver, ctx, bindings, 32) {
-                match resolve_declaring_member_owner_cached(ctx, &receiver_owner, name) {
+                let ordinary = resolve_declaring_member_owner_cached(ctx, &receiver_owner, name);
+                match resolve_declaring_callable_owner(
+                    &ctx.analyzer,
+                    ctx.visibility,
+                    ctx.file,
+                    ordinary,
+                    name,
+                    call_arity,
+                ) {
                     EnclosingMemberOwnerResolution::Owner(owner) => {
                         match ctx
                             .visibility
@@ -886,7 +923,15 @@ fn record_call(node: Node<'_>, ctx: &mut CppScan<'_>, bindings: &LocalInferenceE
                 return;
             }
             if let Some(enclosing_owner) = enclosing_callable_owner(function, ctx) {
-                match resolve_declaring_member_owner_cached(ctx, &enclosing_owner, name) {
+                let ordinary = resolve_declaring_member_owner_cached(ctx, &enclosing_owner, name);
+                match resolve_declaring_callable_owner(
+                    &ctx.analyzer,
+                    ctx.visibility,
+                    ctx.file,
+                    ordinary,
+                    name,
+                    call_arity,
+                ) {
                     EnclosingMemberOwnerResolution::Owner(owner)
                         if !same_visible_symbol(&owner, &enclosing_owner) =>
                     {

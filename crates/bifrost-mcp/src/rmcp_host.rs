@@ -1790,6 +1790,18 @@ fn speaks_2026_07_28(context: &RequestContext<RoleServer>) -> bool {
         .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28)
 }
 
+/// Whether this request's peer negotiated MCP `2025-06-18` or newer.
+///
+/// `outputSchema` on a tool descriptor entered the spec at that revision, so a
+/// `2024-11-05` or `2025-03-26` peer must not see it. `protocol_version()`
+/// reads the request's own `_meta` first and falls back to the connection
+/// handshake, which is the same combination the cache hints use.
+fn speaks_2025_06_18(context: &RequestContext<RoleServer>) -> bool {
+    context
+        .protocol_version()
+        .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2025_06_18)
+}
+
 /// Whether this request negotiated protocol version and capabilities on its
 /// own, through the `2026-07-28` per-request `_meta` keys, instead of through
 /// a connection-level `initialize`.
@@ -1900,7 +1912,16 @@ impl ServerHandler for BifrostMcpHandler {
         // Bifrost's tool list is small, fixed at process start, and
         // deliberately unpaginated: clients depend on seeing the whole
         // registry in one response.
-        let result = ListToolsResult::with_all_items(self.tools.clone());
+        let mut tools = self.tools.clone();
+        if !speaks_2025_06_18(&_context) {
+            // Descriptors carry the advertised output schemas unconditionally;
+            // a peer on a revision that predates `outputSchema` gets a clean
+            // legacy wire instead of a field it has no schema for.
+            for tool in &mut tools {
+                tool.output_schema = None;
+            }
+        }
+        let result = ListToolsResult::with_all_items(tools);
         Ok(if speaks_2026_07_28(&_context) {
             result
                 .with_ttl_ms(TOOL_LIST_CACHE_TTL_MS)

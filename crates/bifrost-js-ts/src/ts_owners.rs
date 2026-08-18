@@ -392,7 +392,9 @@ fn ts_callback_parameter_owners_from_callee(
         return Vec::new();
     };
     let imports = compute_jsts_import_binder(&source, &tree);
-    let aliases = AliasResolver::new(host.project().root().to_path_buf());
+    // The analyzer's shared resolver, so this route reuses its warm config and
+    // workspace-package memos instead of building cold ones per call.
+    let aliases = host.alias_resolver().as_ref();
     let mut owners = Vec::new();
     for node in ts_nodes_for_code_unit(host, callee, tree.root_node()) {
         let Some(callback_type) = ts_function_parameter_type_text(node, &source, argument_index)
@@ -410,7 +412,7 @@ fn ts_callback_parameter_owners_from_callee(
             callee.source(),
             &source,
             &imports,
-            &aliases,
+            aliases,
             &parameter_type,
             depth + 1,
         ));
@@ -1195,7 +1197,12 @@ fn jsts_function_returns_direct_object_literal(
     false
 }
 
-fn jsts_indexed_callable_node(mut node: Node<'_>) -> Option<Node<'_>> {
+/// The callable an indexed declaration node wraps.
+///
+/// A `function` declaration IS the callable; `const f = () => ...` indexes the
+/// `lexical_declaration` that binds it, so every question about the callable --
+/// its return type, its returns -- has to step through the declarator first.
+pub(crate) fn jsts_indexed_callable_node(mut node: Node<'_>) -> Option<Node<'_>> {
     loop {
         if matches!(
             node.kind(),
@@ -1230,14 +1237,16 @@ fn ts_resolve_type_from_unit_context(
         return Vec::new();
     };
     let imports = compute_jsts_import_binder(&source, &tree);
-    let aliases = AliasResolver::new(host.project().root().to_path_buf());
+    // The analyzer's shared resolver, so this route reuses its warm config and
+    // workspace-package memos instead of building cold ones per call.
+    let aliases = host.alias_resolver().as_ref();
     ts_resolve_type_text_to_property_owners(
         host,
         support,
         unit.source(),
         &source,
         &imports,
-        &aliases,
+        aliases,
         type_text,
         depth + 1,
     )
@@ -1259,7 +1268,9 @@ pub fn ts_function_return_property_owners(
         return Vec::new();
     };
     let imports = compute_jsts_import_binder(&source, &tree);
-    let aliases = AliasResolver::new(host.project().root().to_path_buf());
+    // The analyzer's shared resolver, so this route reuses its warm config and
+    // workspace-package memos instead of building cold ones per call.
+    let aliases = host.alias_resolver().as_ref();
     let mut owners = Vec::new();
     for node in ts_nodes_for_code_unit(host, function, tree.root_node()) {
         if let Some(type_text) = ts_function_return_type_text(node, &source) {
@@ -1269,7 +1280,7 @@ pub fn ts_function_return_property_owners(
                 function.source(),
                 &source,
                 &imports,
-                &aliases,
+                aliases,
                 &type_text,
                 depth + 1,
             ));
@@ -1280,7 +1291,7 @@ pub fn ts_function_return_property_owners(
             function.source(),
             &source,
             &imports,
-            &aliases,
+            aliases,
             node,
             node.id(),
             depth + 1,
