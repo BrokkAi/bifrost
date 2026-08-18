@@ -427,6 +427,16 @@ readinessTest("release readiness caps matrix concurrency", () => {
   assert.ok(caps.every((cap) => cap >= 1 && cap <= 4), `unexpected max-parallel caps: ${caps.join(", ")}`);
 });
 
+readinessTest("release readiness uses bash for the portable binary build", () => {
+  const build = jobBlock(readiness, "build");
+  const binaryBuild = build.match(
+    /^      - name: Build binary\n[\s\S]*?(?=^      - name: Build macOS universal binary)/mu,
+  )?.[0];
+  assert.ok(binaryBuild, "expected the cross-platform binary build step");
+  assert.match(binaryBuild, /^        shell: bash$/mu);
+  assert.match(binaryBuild, /run: cargo build --release --locked --bin "\$BIN_NAME"/u);
+});
+
 readinessTest("release readiness creates and verifies a retained commit/version qualification bundle", () => {
   assert.match(readiness, /upload-artifact@/u);
   assert.match(readiness, /release-qualification/iu);

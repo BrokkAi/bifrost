@@ -391,6 +391,7 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Build binary
         if: matrix.target != 'universal-apple-darwin'
+        shell: bash
         run: cargo build --release --locked --bin "$BIN_NAME" --target "${{ matrix.target }}"
       - name: Build macOS universal binary
         if: matrix.target == 'universal-apple-darwin'
