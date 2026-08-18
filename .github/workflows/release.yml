@@ -423,7 +423,7 @@ jobs:
           set -euo pipefail
           gh workflow run publish-npm.yml \
             --repo "$GITHUB_REPOSITORY" \
-            --ref "$RELEASE_TAG" \
+            --ref master \
             --field release_tag="$RELEASE_TAG" \
             --field release_version="$RELEASE_VERSION" \
             --field release_commit="$RELEASE_COMMIT" \
@@ -436,10 +436,10 @@ jobs:
           expected_title="Publish npm ${RELEASE_TAG} [${DISPATCH_NONCE}]"
           for attempt in $(seq 1 30); do
             gh run list --repo "$GITHUB_REPOSITORY" --workflow publish-npm.yml \
-              --event workflow_dispatch --branch "$RELEASE_TAG" --limit 10 \
-              --json databaseId,headSha,displayTitle > "$RUNNER_TEMP/npm-runs.json"
-            child_run="$(jq -r --arg commit "$RELEASE_COMMIT" --arg title "$expected_title" \
-              '[.[] | select(.headSha == $commit and .displayTitle == $title)] | first | .databaseId // empty' \
+              --event workflow_dispatch --branch master --limit 10 \
+              --json databaseId,displayTitle > "$RUNNER_TEMP/npm-runs.json"
+            child_run="$(jq -r --arg title "$expected_title" \
+              '[.[] | select(.displayTitle == $title)] | first | .databaseId // empty' \
               "$RUNNER_TEMP/npm-runs.json")"
             if [[ -n "$child_run" ]]; then
               echo "run_id=$child_run" >> "$GITHUB_OUTPUT"
