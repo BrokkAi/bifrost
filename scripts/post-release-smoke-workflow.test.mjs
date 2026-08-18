@@ -131,6 +131,13 @@ test("checks every GitHub asset and published SHA-256 sidecar", () => {
   assert.match(workflow, /unzip -p .*bifrost-vscode-\$\{RELEASE_TAG\}\.vsix/u);
   assert.match(workflow, /sha256sum -c/u);
   assert.match(workflow, /checksums=\("\$asset_dir"\/\*\.sha256\)/u);
+  assert.match(
+    workflow,
+    /raw\.githubusercontent\.com\/BrokkAi\/bifrost\/master\/plugins\/bifrost-agent\/bifrost-release\.json/u,
+  );
+  assert.match(workflow, /Public master plugin metadata matches/u);
+  assert.match(workflow, /\.archiveSha256\[\$target\]/u);
+  assert.match(workflow, /source_metadata.*binaryVersion.*minimumBinaryVersion/su);
 });
 
 test("checks all crates.io packages with bounded propagation retries", () => {

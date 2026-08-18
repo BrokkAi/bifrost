@@ -69,6 +69,71 @@ test("projects one compatibility range into agent and VSIX release metadata", as
   }
 });
 
+test("replaces stale release checksums with the exact staged archive sidecars", async () => {
+  const temp = await fs.mkdtemp(
+    path.join(os.tmpdir(), "bifrost-vscode-manifest-test-"),
+  );
+  const dist = path.join(temp, "dist");
+  const manifest = path.join(temp, "package.json");
+  const pluginRelease = path.join(temp, "bifrost-release.json");
+  await fs.mkdir(dist);
+  const staleHash = "e5a2fdd5c11dd3d4fce6b06f580cadca56439178345402bf565fb3551d86ee85";
+  const stagedHash = "4ebd001ba0c34a28ff0dee84a0df810e1caeb131dbdab6ccefa11e8a7b64a0fd";
+  await fs.writeFile(
+    manifest,
+    `${JSON.stringify({
+      bifrost: {
+        binaryVersion: "0.10.3",
+        archiveSha256: { "universal-apple-darwin": staleHash },
+      },
+    }, null, 2)}\n`,
+  );
+  await fs.writeFile(
+    pluginRelease,
+    `${JSON.stringify({
+      binaryVersion: "0.10.3",
+      minimumBinaryVersion: "0.10.3",
+      allowPrerelease: false,
+      archiveSha256: { "universal-apple-darwin": staleHash },
+    }, null, 2)}\n`,
+  );
+  for (const target of SUPPORTED_TARGETS) {
+    const archive = `bifrost-v0.10.3-${target}${target.includes("windows") ? ".zip" : ".tar.gz"}`;
+    const hash = target === "universal-apple-darwin" ? stagedHash : "b".repeat(64);
+    await fs.writeFile(
+      path.join(dist, `${archive}.sha256`),
+      `${hash}  ${archive}\n`,
+    );
+  }
+
+  await execFileAsync(process.execPath, [
+    script,
+    "--version",
+    "0.10.3",
+    "--dist",
+    dist,
+    "--manifest",
+    manifest,
+    "--plugin-release",
+    pluginRelease,
+  ]);
+
+  const projectedManifest = JSON.parse(await fs.readFile(manifest, "utf8"));
+  const projectedPlugin = JSON.parse(await fs.readFile(pluginRelease, "utf8"));
+  assert.equal(
+    projectedManifest.bifrost.archiveSha256["universal-apple-darwin"],
+    stagedHash,
+  );
+  assert.equal(
+    projectedPlugin.archiveSha256["universal-apple-darwin"],
+    stagedHash,
+  );
+  assert.notEqual(
+    projectedPlugin.archiveSha256["universal-apple-darwin"],
+    staleHash,
+  );
+});
+
 test("resets both projections when a release starts a new minor series", async () => {
   const temp = await fs.mkdtemp(
     path.join(os.tmpdir(), "bifrost-vscode-manifest-test-"),

@@ -106,6 +106,38 @@ jobs:
           done
           echo "Verified ${#checksums[@]} GitHub SHA-256 sidecars for $RELEASE_TAG"
 
+      - name: Check public marketplace source metadata against release sidecars
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_metadata="$RUNNER_TEMP/master-bifrost-release.json"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 5 --retry-all-errors --retry-delay 2 \
+            "https://raw.githubusercontent.com/BrokkAi/bifrost/master/plugins/bifrost-agent/bifrost-release.json" \
+            -o "$source_metadata"
+          jq -e --arg version "$RELEASE_VERSION" \
+            '.binaryVersion == $version and (.minimumBinaryVersion | type == "string") and .allowPrerelease == false' \
+            "$source_metadata" >/dev/null
+
+          for target in \
+            aarch64-pc-windows-msvc \
+            aarch64-unknown-linux-gnu \
+            universal-apple-darwin \
+            x86_64-pc-windows-msvc \
+            x86_64-unknown-linux-gnu; do
+            case "$target" in
+              *windows*) archive_suffix="zip" ;;
+              *) archive_suffix="tar.gz" ;;
+            esac
+            sidecar="$asset_dir/bifrost-v${RELEASE_VERSION}-${target}.${archive_suffix}.sha256"
+            test -s "$sidecar"
+            expected="$(jq -r --arg target "$target" '.archiveSha256[$target] // empty' "$source_metadata")"
+            actual="$(awk 'NF { print $1; exit }' "$sidecar")"
+            [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+            [[ "$expected" = "$actual" ]]
+          done
+          echo "Public master plugin metadata matches the v${RELEASE_VERSION} binary sidecars"
+
   crates-io:
     name: crates.io availability and checksums
     needs: resolve
