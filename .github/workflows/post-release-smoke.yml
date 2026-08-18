@@ -188,7 +188,7 @@ jobs:
               --output "$response" --write-out '%{http_code}' "$endpoint")"
             if [[ "$status" == 200 ]]; then
               jq -e --arg version "$RELEASE_VERSION" \
-                '.info.version == $version and (.urls | length > 0) and all(.[]; (.digests.sha256 | test("^[0-9a-f]{64}$")))' \
+                '.info.version == $version and (.urls | length > 0) and all(.urls[]; try ((.digests.sha256 | type == "string") and (.digests.sha256 | test("^[0-9a-f]{64}$"))) catch false)' \
                 "$response" >/dev/null
               echo "PyPI: brokk-bifrost $RELEASE_VERSION files and SHA-256 digests present"
               found=1
@@ -309,11 +309,22 @@ jobs:
             'https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery' -o "$response"
           jq -e --arg version "$RELEASE_VERSION" \
             '[.results[0].extensions[0].versions[] | select(.version == $version)] | length == 1' "$response" >/dev/null
-          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            --retry 5 --retry-all-errors --retry-delay 2 \
-            "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/brokk/vsextensions/bifrost-vscode/${RELEASE_VERSION}/vspackage" \
-            -o "$RUNNER_TEMP/bifrost-vscode.vsix"
-          unzip -tq "$RUNNER_TEMP/bifrost-vscode.vsix"
+          archive="$RUNNER_TEMP/bifrost-vscode.vsix"
+          archive_found=0
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              --compressed \
+              -H 'Accept: application/octet-stream' \
+              "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/brokk/vsextensions/bifrost-vscode/${RELEASE_VERSION}/vspackage" \
+              -o "$archive" && unzip -tq "$archive" >/dev/null 2>&1; then
+              archive_found=1
+              break
+            fi
+            echo "Waiting for a valid Visual Studio Marketplace archive ($attempt/30)"
+            sleep 10
+          done
+          test "$archive_found" = 1
           echo "Visual Studio Marketplace exposes bifrost-vscode $RELEASE_VERSION and a valid VSIX archive"
           echo "The Marketplace public API exposes no checksum endpoint; checksum comparison is not claimed here."
 

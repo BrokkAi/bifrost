@@ -155,7 +155,8 @@ test("checks PyPI and npm versions, archives, and integrity evidence", () => {
     /pypi\.org\/pypi\/brokk-bifrost\/\$\{RELEASE_VERSION\}\/json/u,
   );
   assert.match(workflow, /\.info\.version == \$version/u);
-  assert.match(workflow, /\.digests\.sha256.*\^\[0-9a-f\]\{64\}\$/su);
+  assert.match(workflow, /all\(\.urls\[\];.*\.digests\.sha256.*\^\[0-9a-f\]\{64\}\$/su);
+  assert.doesNotMatch(workflow, /all\(\.\[\];.*\.digests\.sha256/u);
   assert.match(workflow, /registry\.npmjs\.org\/\$\{encoded\}/u);
   assert.match(workflow, /\.versions\[\$version\]\.version == \$version/u);
   assert.match(workflow, /\.dist\.tarball.*startswith\("https:\/\/"\)/su);
@@ -192,6 +193,10 @@ test("checks both extension marketplaces and states the Marketplace checksum bou
   assert.match(workflow, /checksum_url=.*\.sha256/u);
   assert.ok(workflow.includes('test "$expected" = "$actual"'));
   assert.match(workflow, /unzip -tq/u);
+  assert.match(workflow, /archive_found=0/u);
+  assert.match(workflow, /Waiting for a valid Visual Studio Marketplace archive \(\$attempt\/30\)/u);
+  assert.match(workflow, /Accept: application\/octet-stream/u);
+  assert.match(workflow, /--compressed/u);
 });
 
 test("invokes published Codex and Claude MCP list_policies smoke checks", () => {
