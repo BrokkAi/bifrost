@@ -39,6 +39,7 @@ const PYTHON_BINDING_COMPONENTS = new Set(["python", "rust"]);
 const RQL_TEST_COMPONENTS = new Set([...RQL_COMPONENTS, "rust"]);
 const MCP_TEST_COMPONENTS = new Set([...MCP_COMPONENTS, "rust"]);
 const EXTERNAL_FIXTURE_COMPONENTS = new Set(["external_fixture", "rust"]);
+const MCP_AGENT_PLUGIN_FIXTURE_COMPONENTS = new Set([...MCP_TEST_COMPONENTS, "agent_plugin"]);
 const NO_COMPONENTS = new Set();
 
 function startsWithAny(path, prefixes) {
@@ -65,6 +66,7 @@ function isRqlTestPath(path) {
     startsWithAny(path, [
       "tests/fixtures/policies/",
       "tests/fixtures/policy-cli/",
+      "scripts/fixtures/policy-report/",
       "tests/suite_bench_policy/",
     ]) ||
     path === "tests/suite_cross_language/code_query_docs.rs"
@@ -149,6 +151,12 @@ function classifyPath(path) {
       components: NO_COMPONENTS,
       documentation: true,
       reason: "documentation-only surface",
+    };
+  }
+  if (path === "scripts/fixtures/mcp/codex-sandbox-state-handshake.json") {
+    return {
+      components: MCP_AGENT_PLUGIN_FIXTURE_COMPONENTS,
+      reason: "shared MCP and agent-plugin contract fixture",
     };
   }
   if (isRqlTestPath(path)) {

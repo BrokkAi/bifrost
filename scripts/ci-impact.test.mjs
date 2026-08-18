@@ -179,6 +179,27 @@ test("editor-only and plugin-only changes select only their Node checks", () => 
   );
 });
 
+test("public release contract fixtures retain their host and package checks", () => {
+  assert.deepEqual(
+    selected(
+      classifyChangeSet({
+        eventName: "pull_request",
+        changedPaths: ["scripts/fixtures/policy-report/v4-one-finding.json"],
+      }),
+    ),
+    ["lsp_contract", "mcp_contract", "policy_pack", "rql_runtime", "rust", "vscode"],
+  );
+  assert.deepEqual(
+    selected(
+      classifyChangeSet({
+        eventName: "pull_request",
+        changedPaths: ["scripts/fixtures/mcp/codex-sandbox-state-handshake.json"],
+      }),
+    ),
+    ["agent_plugin", "mcp_contract", "rql_runtime", "rust"],
+  );
+});
+
 test("combined paths union selected checks", () => {
   const decision = classifyChangeSet({
     eventName: "pull_request",
