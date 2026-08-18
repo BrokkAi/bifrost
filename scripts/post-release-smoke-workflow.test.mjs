@@ -140,6 +140,14 @@ test("checks every GitHub asset and published SHA-256 sidecar", () => {
   assert.match(workflow, /source_metadata.*binaryVersion.*minimumBinaryVersion/su);
 });
 
+test("source metadata check rebinds the downloaded asset directory in its own step", () => {
+  const start = workflow.indexOf("      - name: Check public marketplace source metadata against release sidecars");
+  const end = workflow.indexOf("\n\n  crates-io:", start);
+  assert.ok(start >= 0 && end > start, "source metadata check step must be present");
+  const step = workflow.slice(start, end);
+  assert.match(step, /^          asset_dir="\$RUNNER_TEMP\/release-assets"$/mu);
+});
+
 test("checks all crates.io packages with bounded propagation retries", () => {
   for (const packageName of CRATE_PACKAGES) {
     assert.ok(

@@ -110,6 +110,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          asset_dir="$RUNNER_TEMP/release-assets"
           source_metadata="$RUNNER_TEMP/master-bifrost-release.json"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --retry 5 --retry-all-errors --retry-delay 2 \
