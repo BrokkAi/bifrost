@@ -163,8 +163,14 @@ jobs:
           # which makes npm report a misleading 404 for OIDC publishes.
           NODE_AUTH_TOKEN: ""
           NPM_CONFIG_PROVENANCE: "true"
-        run: >-
-          npm run publish-release --prefix npm --
-          --dist "$RUNNER_TEMP/npm-qualified"
-          --release-tag "$RELEASE_TAG"
-          --yes-publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}"
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+          unset NODE_AUTH_TOKEN
+          test -z "${NODE_AUTH_TOKEN+x}"
+          npm run publish-release --prefix npm -- \
+            --dist "$RUNNER_TEMP/npm-qualified" \
+            --release-tag "$RELEASE_TAG" \
+            --yes-publish

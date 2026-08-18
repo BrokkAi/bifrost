@@ -357,6 +357,10 @@ test("publishers preserve their platform, environment, and OIDC protections", ()
   assert.match(publishNpm, /npm install --global npm@11\.19\.0/u);
   assert.match(publishNpm, /NODE_AUTH_TOKEN:\s*""/u);
   assert.match(publishNpm, /NPM_CONFIG_PROVENANCE:\s*"true"/u);
+  assert.match(publishNpm, /test -n "\$\{ACTIONS_ID_TOKEN_REQUEST_URL:-\}"/u);
+  assert.match(publishNpm, /test -n "\$\{ACTIONS_ID_TOKEN_REQUEST_TOKEN:-\}"/u);
+  assert.match(publishNpm, /unset NODE_AUTH_TOKEN/u);
+  assert.match(publishNpm, /test -z "\$\{NODE_AUTH_TOKEN\+x\}"/u);
   assert.match(publishNpm, /verify-qualified-release\.mjs\s+verify/u);
   assert.match(publishNpm, /--manifest-sha256/u);
   assert.match(publishNpm, /actions\/download-artifact@[0-9a-f]{40}/u);
