@@ -164,6 +164,10 @@ pub(crate) fn decorated_identifier_seeks(
         // range rather than an enumerable set.
         Language::CSharp => vec![IdentifierSeek::Prefix(format!("{source_identifier}`"))],
         Language::TypeScript => vec![IdentifierSeek::Exact(format!("{source_identifier}$static"))],
+        // A Scala object is indexed with a trailing `$` that its display form
+        // drops (`LabelEquivalenceRelation$`); nobody types the marker, so the
+        // source spelling's seek must name the decorated row (#2419).
+        Language::Scala => vec![IdentifierSeek::Exact(format!("{source_identifier}$"))],
         _ => Vec::new(),
     }
 }

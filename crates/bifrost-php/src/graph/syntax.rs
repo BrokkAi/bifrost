@@ -7,10 +7,10 @@ use crate::aliases::{
 use crate::graph::PhpGraphSource;
 use crate::graph_support::PhpSource;
 use crate::graph_support::{php_direct_declared_class_parent, php_file_context_from_source};
-use brokk_bifrost_core::analyzer::CodeUnit;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceEngine, SymbolResolution,
 };
+use brokk_bifrost_core::analyzer::{CodeUnit, Range};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
@@ -227,6 +227,35 @@ pub fn static_scope_type_fq_name(
 
 pub fn variable_identifier<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     node_text(node, source).trim_start_matches('$')
+}
+
+/// The source range of the token a PHP declaration name is written as.
+///
+/// [`variable_identifier`] above strips the `$` so that one identity spells a
+/// property the same way at its declaration (`$last`) and at every `->last`
+/// access -- the only spelling the two sites share. The stored identifier is
+/// therefore sigil-free, and generic name-range selection resolves it to the
+/// `name` child of `variable_name`, one column right of the token an editor
+/// highlights.
+///
+/// PHP's grammar makes `variable_name` exactly `$` + `name`, so widening to the
+/// parent restores the sigil and nothing else. This matches what Intelephense
+/// and phpactor return for a property declarator, and it changes only the
+/// reported range: the identifier keeps its sigil-free form.
+///
+/// A `->last` access is a bare `name` with no `variable_name` parent, so it is
+/// left alone -- correct, because that source token carries no sigil.
+pub fn php_declaration_name_range(node: Node<'_>) -> Range {
+    let token = match node.parent() {
+        Some(parent) if parent.kind() == "variable_name" => parent,
+        _ => node,
+    };
+    Range {
+        start_byte: token.start_byte(),
+        end_byte: token.end_byte(),
+        start_line: token.start_position().row,
+        end_line: token.end_position().row,
+    }
 }
 
 pub fn literal_member_identifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
@@ -633,5 +662,90 @@ pub fn magic_member_names(surface: PhpMagicSurface) -> &'static [&'static str] {
         PhpMagicSurface::InstanceProperty => &["__get", "__set"],
         PhpMagicSurface::StaticCall => &["__callStatic"],
         PhpMagicSurface::StaticData => &[],
+    }
+}
+
+#[cfg(test)]
+mod declaration_name_range_tests {
+    use super::php_declaration_name_range;
+    use tree_sitter::{Node, Parser};
+
+    fn parse(source: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .expect("PHP grammar");
+        parser.parse(source, None).expect("PHP tree")
+    }
+
+    /// The node generic name-range selection lands on: the `name` whose text is
+    /// the stored, sigil-free identifier.
+    fn identifier_node<'tree>(root: Node<'tree>, identifier: &str, source: &str) -> Node<'tree> {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "name" && node.utf8_text(source.as_bytes()) == Ok(identifier) {
+                return node;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        panic!("no `name` node spelling {identifier} in {source:?}");
+    }
+
+    fn range_text<'s>(source: &'s str, identifier: &str) -> &'s str {
+        let tree = parse(source);
+        let node = identifier_node(tree.root_node(), identifier, source);
+        let range = php_declaration_name_range(node);
+        &source[range.start_byte..range.end_byte]
+    }
+
+    /// A property declarator's token includes the `$`, so its reported range
+    /// must too -- even though the identity stays sigil-free so that the
+    /// declaration and every `->last` access share one name.
+    #[test]
+    fn a_property_declarator_range_covers_the_sigil() {
+        assert_eq!(
+            range_text(
+                "<?php\nclass R {\n    public string $last = '';\n}\n",
+                "last"
+            ),
+            "$last"
+        );
+    }
+
+    /// The static form parses to the same `property_element -> variable_name`
+    /// shape; `static` only changes the modifier text.
+    #[test]
+    fn a_static_property_declarator_range_covers_the_sigil() {
+        assert_eq!(
+            range_text(
+                "<?php\nclass C {\n    public static int $sent = 0;\n}\n",
+                "sent"
+            ),
+            "$sent"
+        );
+    }
+
+    /// A constructor-promoted property is declared with the same `$` token.
+    #[test]
+    fn a_promoted_property_declarator_range_covers_the_sigil() {
+        assert_eq!(
+            range_text(
+                "<?php\nclass S {\n    public function __construct(private string $repo) {}\n}\n",
+                "repo"
+            ),
+            "$repo"
+        );
+    }
+
+    /// A method name is a bare `name` with no `variable_name` parent. Widening
+    /// must not reach it, and must not reach a sigil-free `->last` access.
+    #[test]
+    fn a_name_without_a_variable_parent_is_left_alone() {
+        assert_eq!(
+            range_text("<?php\nclass F {\n    public function bar() {}\n}\n", "bar"),
+            "bar"
+        );
+        assert_eq!(range_text("<?php\n$r->last;\n", "last"), "last");
     }
 }

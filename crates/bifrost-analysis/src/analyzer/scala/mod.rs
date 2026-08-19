@@ -1553,6 +1553,14 @@ impl LanguageSupport for ScalaSupport {
             .join(".")
     }
 
+    /// The same decoration, read off a single identifier: an object is indexed
+    /// as `Name$` but declared as `Name`. Without this override the
+    /// seek-then-verify lookup of a source-spelled object name fails
+    /// verification against the persisted identifier (#2419).
+    fn source_identifier<'s>(&self, identifier: &'s str) -> &'s str {
+        identifier.strip_suffix('$').unwrap_or(identifier)
+    }
+
     fn signature_metadata_limited(
         &self,
         analyzer: &dyn IAnalyzer,

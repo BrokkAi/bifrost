@@ -149,7 +149,7 @@ impl<'a> PhpVisitor<'a> {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
-        let package_name = php_node_text(name_node, self.source).replace('\\', ".");
+        let package_name = php_namespace_package_name(name_node, self.source);
         let scope = PhpScope::new(package_name, scope.class_unit.clone());
         for index in (0..node.named_child_count()).rev() {
             let Some(child) = node.named_child(index) else {
@@ -491,10 +491,29 @@ fn determine_php_package_name(root: Node<'_>, source: &str) -> String {
             continue;
         }
         if let Some(name_node) = child.child_by_field_name("name") {
-            return php_node_text(name_node, source).replace('\\', ".");
+            return php_namespace_package_name(name_node, source);
         }
     }
     String::new()
+}
+
+/// The `.`-joined package path a `namespace_definition` declares. A leading
+/// `\` in the name text is tree-sitter recovering a namespace-RELATIVE name
+/// reference (`namespace\Foo::CLASS;`) as a namespace definition: the marker
+/// is an anonymous child token of the name node, so drop that token's range
+/// rather than stripping text. Keeping it turned the package into `.Foo`
+/// while the FqName bridge drops empty components, desyncing the
+/// package/short boundary assert for every unit in the file (phan's
+/// tests/files/src/0019_noop.php, #2413).
+fn php_namespace_package_name(name_node: Node<'_>, source: &str) -> String {
+    let start = name_node
+        .child(0)
+        .filter(|child| !child.is_named() && child.kind() == "\\")
+        .map_or(name_node.start_byte(), |marker| marker.end_byte());
+    source
+        .get(start..name_node.end_byte())
+        .expect("namespace name node covers one source range")
+        .replace('\\', ".")
 }
 
 fn php_class_body(node: Node<'_>) -> Option<Node<'_>> {

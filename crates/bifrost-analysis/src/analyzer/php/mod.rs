@@ -79,6 +79,7 @@ pub use brokk_bifrost_php::aliases::{
     parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
 use brokk_bifrost_php::composer::PhpComposerAutoload;
+use brokk_bifrost_php::graph::syntax::php_declaration_name_range;
 use brokk_bifrost_php::graph_support::{
     php_import_alias_candidates, php_is_constructor, php_namespace_of_file,
     php_resolve_declared_supertype, php_use_aliases_by_kind_of, php_use_aliases_of,
@@ -718,6 +719,10 @@ pub(crate) struct PhpSupport;
 impl LanguageSupport for PhpSupport {
     fn language(&self) -> Language {
         Language::Php
+    }
+
+    fn declaration_name_range(&self, node: tree_sitter::Node<'_>, _source: &str) -> Range {
+        php_declaration_name_range(node)
     }
 
     fn signature_metadata_limited(

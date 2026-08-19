@@ -1204,14 +1204,17 @@ test(
     const binary = path.join(temp, "bifrost");
     await writeExecutableFixture(
       binary,
+      // Never call process.exit() here: it races the asynchronous flush of the
+      // pipe this fixture writes to, and Node then exits on SIGSEGV often
+      // enough that the launcher's --version probe fails intermittently.
       `#!/usr/bin/env node
 if (process.argv.includes("--version")) {
   console.log("bifrost ${metadata.binaryVersion}");
-  process.exit(0);
+} else {
+  process.on("SIGTERM", () => console.error("bifrost-child-saw-term"));
+  console.error("bifrost-child-ready");
+  setInterval(() => {}, 1_000);
 }
-process.on("SIGTERM", () => console.error("bifrost-child-saw-term"));
-console.error("bifrost-child-ready");
-setInterval(() => {}, 1_000);
 `
     );
 
@@ -1237,12 +1240,29 @@ setInterval(() => {}, 1_000);
       launcher.once("close", (code, signal) => resolve({ code, signal }));
     });
     const ready = new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("timed out waiting for fake Bifrost")), 10_000);
+      const timeout = setTimeout(
+        () => reject(new Error(`timed out waiting for fake Bifrost; stderr so far: ${stderr.join("")}`)),
+        10_000
+      );
+      const settle = (outcome) => {
+        clearTimeout(timeout);
+        outcome();
+      };
       launcher.stderr.on("data", () => {
         if (stderr.join("").includes("bifrost-child-ready")) {
-          clearTimeout(timeout);
-          resolve();
+          settle(resolve);
         }
+      });
+      // A launcher that exits before it reports readiness is a failure now, not
+      // in ten seconds, and its stderr says why.
+      launcher.once("close", (code, signal) => {
+        settle(() =>
+          reject(
+            new Error(
+              `launcher exited before fake Bifrost was ready (code=${code} signal=${signal}): ${stderr.join("")}`
+            )
+          )
+        );
       });
     });
 
@@ -1274,6 +1294,11 @@ setInterval(() => {}, 1_000);
       if (launcher.exitCode === null && launcher.signalCode === null) {
         launcher.kill("SIGKILL");
       }
+      // The fake Bifrost inherits these pipes. If the launcher ever stops
+      // reaping it, the orphan holds their write ends open and this process
+      // would hang instead of reporting the failure.
+      launcher.stdout.destroy();
+      launcher.stderr.destroy();
     }
   }
 );

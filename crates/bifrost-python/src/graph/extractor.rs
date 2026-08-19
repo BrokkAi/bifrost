@@ -2078,15 +2078,24 @@ fn reference_is_deferred_function_body(node: Node<'_>) -> bool {
     false
 }
 
+/// Collect the names an assignment or `for` target *binds*: plain identifiers
+/// and identifiers nested in destructuring patterns. An `attribute`,
+/// `subscript`, or `call` target is evaluated, not bound (`recv.member = v`
+/// and `make().member = v` bind no local names), so its identifiers stay
+/// references and must not shadow same-named imports or declarations (#898).
 pub fn collect_assigned_identifiers(node: Node<'_>, source: &str, out: &mut HashSet<String>) {
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
-        if node.kind() == "identifier" {
-            let text = slice(node, source).trim();
-            if !text.is_empty() {
-                out.insert(text.to_string());
+        match node.kind() {
+            "attribute" | "subscript" | "call" => continue,
+            "identifier" => {
+                let text = slice(node, source).trim();
+                if !text.is_empty() {
+                    out.insert(text.to_string());
+                }
+                continue;
             }
-            continue;
+            _ => {}
         }
 
         let mut cursor = node.walk();

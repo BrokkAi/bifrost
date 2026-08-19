@@ -14,7 +14,7 @@ use crate::java::graph_support::JavaSource;
 use crate::scala::graph::inverted::{
     ScalaLogicalOwnerMember, ScalaLogicalReceiver, ScalaReferenceRole, ScalaReferenceSink,
     ScalaResolvedReference, callable_alternative_contradicts_literal_arguments,
-    callable_alternative_is_candidate, callable_alternative_matches, single_overload_family,
+    callable_alternative_is_candidate, callable_alternative_matches, single_replica_family,
 };
 use crate::scala::graph::resolver::{
     TargetKind, TargetSpec, import_candidate_fq_names, member_matches_target_kind,
@@ -483,17 +483,35 @@ impl ScalaQueryTargetCatalog {
         }
         // The whole-graph scanner still has a few resolution paths whose
         // authoritative result is an FQN. They are safe for exact query
-        // buckets only when the analyzer proves that FQN has one physical
-        // declaration project-wide. In particular, uniqueness among the
-        // requested targets is not enough: source replicas outside the request
-        // must keep the reference ambiguous.
-        let mut logical = HashMap::default();
+        // buckets only when the analyzer proves that FQN names one logical
+        // declaration project-wide. Cross-built source sets declare one logical
+        // symbol several times, so a coherent replica family counts as one
+        // declaration and the bucket carries every member's target id (#2021);
+        // a candidate set that disagrees on an identity field is a genuine
+        // collision and keeps the reference ambiguous. Uniqueness among the
+        // requested targets is still not enough on its own: the family is
+        // derived from the workspace declarations, not from the request.
+        //
+        // This loop runs once per family member and every member writes the
+        // same logical key, so the values accumulate rather than being
+        // inserted. A plain insert would let one arbitrary member win, and
+        // because HashMap iteration order is not deterministic, which one won
+        // would vary between runs.
+        let mut logical: HashMap<(String, ScalaReferenceRole), Vec<usize>> = HashMap::default();
         for ((unit, role), target_ids) in &exact {
             ensure_catalog_active(cancellation)?;
             let declarations = scala.definitions(&unit.fq_name()).collect::<Vec<_>>();
-            if declarations.len() == 1 && declarations.first() == Some(unit) {
-                logical.insert((unit.fq_name(), *role), target_ids.clone());
+            if declarations.contains(unit) && single_replica_family(declarations.iter()) {
+                logical
+                    .entry((unit.fq_name(), *role))
+                    .or_default()
+                    .extend(target_ids.iter().copied());
             }
+        }
+        for target_ids in logical.values_mut() {
+            ensure_catalog_active(cancellation)?;
+            target_ids.sort_unstable();
+            target_ids.dedup();
         }
 
         Ok(Self {
@@ -759,11 +777,25 @@ pub struct ScalaQueryHitSink<'a> {
 }
 
 impl ScalaQueryHitSink<'_> {
-    fn target_is_physically_unique(&self, target_id: usize) -> bool {
+    /// True when the candidates for this target's normalized name form one
+    /// replica family, so the reference belongs to the family and this target
+    /// is a member of it (#2021). A cross-built symbol declared once per source
+    /// set is one logical declaration with several physical homes, exactly as
+    /// the forward direction already reports it; a candidate set that
+    /// disagrees on any identity field is a genuine collision and keeps
+    /// failing closed.
+    ///
+    /// Both candidate filters below are load-bearing and must survive: the
+    /// first keeps a class and a method of the same name apart, the second
+    /// keeps `class Foo` and `object Foo` (short name `Foo$`) apart even
+    /// though both normalize to the same fully qualified name.
+    fn target_is_logically_coherent(&self, target_id: usize) -> bool {
         let target = &self.catalog.targets[target_id];
         let target_is_singleton = target.is_class() && target.short_name().ends_with('$');
         // Same-file overloads are one physical declaration family split into
-        // per-overload units (#1327); they must not read as replicas.
+        // per-overload units (#1327), and cross-built replicas are one logical
+        // declaration split across source sets (#2021); neither reads as a
+        // collision.
         let declarations = self
             .analyzer
             .definitions_by_normalized_fqn(&scala_normalized_fq_name(&target.fq_name()));
@@ -774,7 +806,7 @@ impl ScalaQueryHitSink<'_> {
                 !target.is_class() || (candidate.short_name().ends_with('$') == target_is_singleton)
             })
             .peekable();
-        candidates.peek().is_some() && single_overload_family(candidates)
+        candidates.peek().is_some() && single_replica_family(candidates)
     }
 
     fn wildcard_import_owner_target_ids(
@@ -854,17 +886,17 @@ impl ScalaQueryHitSink<'_> {
             else {
                 continue;
             };
-            let unique_target_ids = target_ids
+            let coherent_target_ids = target_ids
                 .iter()
                 .copied()
-                .filter(|target_id| self.target_is_physically_unique(*target_id))
+                .filter(|target_id| self.target_is_logically_coherent(*target_id))
                 .collect::<Vec<_>>();
-            if !unique_target_ids.is_empty()
+            if !coherent_target_ids.is_empty()
                 && !matches
                     .iter()
-                    .any(|existing| existing == &unique_target_ids)
+                    .any(|existing| existing == &coherent_target_ids)
             {
-                matches.push(unique_target_ids);
+                matches.push(coherent_target_ids);
             }
         }
         matches
@@ -1237,7 +1269,7 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
                         target_ids
                             .iter()
                             .copied()
-                            .filter(|target_id| self.target_is_physically_unique(*target_id)),
+                            .filter(|target_id| self.target_is_logically_coherent(*target_id)),
                     );
                 }
             }

@@ -394,6 +394,36 @@ pub fn single_overload_family<'a>(mut units: impl Iterator<Item = &'a CodeUnit>)
     units.all(|unit| same_overload_family(first, unit))
 }
 
+/// True when `left` and `right` are two physical declarations of ONE logical
+/// Scala symbol: same kind, same package, same short name, same synthetic
+/// flag, differing only in which file declares them (#2021). This is
+/// [`same_overload_family`] with the source conjunct removed, so
+/// `single_overload_family(X)` implies `single_replica_family(X)` for every
+/// set X.
+///
+/// Identity here is structural and nothing else. This predicate never reads a
+/// terminal name segment, a rendered display string, or a file path, and no
+/// caller may substitute such a comparison for it: replicas are merged on full
+/// structured identity and explicit source ownership, never on name
+/// similarity.
+pub fn same_replica_family(left: &CodeUnit, right: &CodeUnit) -> bool {
+    left.kind() == right.kind()
+        && left.package_name() == right.package_name()
+        && left.short_name() == right.short_name()
+        && left.is_synthetic() == right.is_synthetic()
+}
+
+/// True when every unit in the set belongs to one replica family (see
+/// [`same_replica_family`]). Empty sets are vacuously a single family, which
+/// matches [`single_overload_family`]; callers that need "at least one" must
+/// check emptiness themselves, and the existing gates do.
+pub fn single_replica_family<'a>(mut units: impl Iterator<Item = &'a CodeUnit>) -> bool {
+    let Some(first) = units.next() else {
+        return true;
+    };
+    units.all(|unit| same_replica_family(first, unit))
+}
+
 impl ProjectTypes {
     /// The declarations a bulk file-state read contributes to the workspace
     /// declaration index, in the index's insertion order.
@@ -678,7 +708,14 @@ impl ProjectTypes {
             .iter()
             .filter_map(|target| self.exact_structural_parent(scala, target))
             .collect::<HashSet<_>>();
-        if owners.len() > 1 {
+        // Cross-built replicas of one owner are distinct CodeUnit values,
+        // because their sources differ, so a raw owner count reads a coherent
+        // replica family as an ambiguity and drops the application (#2021). A
+        // replica family is one logical owner with several physical homes and
+        // contributes every member's callable, exactly as a same-file overload
+        // family does. Owners that disagree on an identity field are a genuine
+        // collision and stay ambiguous.
+        if owners.len() > 1 && !single_replica_family(owners.iter()) {
             PhysicalCallableTargets::Ambiguous
         } else {
             PhysicalCallableTargets::Unique(targets)
@@ -1692,14 +1729,20 @@ impl ProjectTypes {
                 }
                 next.extend(self.direct_ancestors_for_declaration(scala, &owner));
             }
-            if declaring_owners.len() > 1 {
+            // Two replicas of one owner are two distinct CodeUnit values and
+            // would trip this count before the family gate below is ever
+            // consulted, leaving this path fail-closed for cross-built symbols
+            // no matter what that gate says (#2021).
+            if declaring_owners.len() > 1 && !single_replica_family(declaring_owners.iter()) {
                 return BareMemberResolution::Unresolved;
             }
-            // A same-file overload family is one declaration (#1327); the
-            // method-value shape matching downstream selects among its units.
+            // A same-file overload family is one declaration (#1327), and a
+            // coherent replica family is one declaration cross-built across
+            // source sets (#2021); the method-value shape matching downstream
+            // selects among their units.
             if matched.is_empty() {
                 owners = next;
-            } else if single_overload_family(matched.iter()) {
+            } else if single_replica_family(matched.iter()) {
                 return BareMemberResolution::Resolved(matched);
             } else {
                 return BareMemberResolution::Unresolved;
@@ -4115,8 +4158,13 @@ impl ProjectTypes {
         }
         if candidates.iter().any(|unit| unit.is_function()) {
             // A same-file overload family is one importable declaration split
-            // into per-overload units (#1327); replicas across files stay out.
-            return if single_overload_family(candidates.iter().copied()) {
+            // into per-overload units (#1327), and a coherent replica family is
+            // one importable declaration cross-built across source sets
+            // (#2021); either way the selector names one logical declaration
+            // and every member unit is contributed. A candidate set that
+            // disagrees on an identity field is a genuine collision and still
+            // yields nothing.
+            return if single_replica_family(candidates.iter().copied()) {
                 candidates
             } else {
                 Vec::new()
@@ -5988,7 +6036,7 @@ impl VisibleNameBindings {
 
     fn resolve(&self, name: &str) -> Option<String> {
         let binding = self.entries.get(name)?;
-        (binding.candidates.len() == 1 && single_overload_family(binding.declarations.iter()))
+        (binding.candidates.len() == 1 && single_replica_family(binding.declarations.iter()))
             .then(|| binding.candidates.iter().next().cloned())?
     }
 
@@ -6004,6 +6052,29 @@ impl VisibleNameBindings {
             return None;
         };
         (binding.candidates.len() == 1).then(|| (*declaration).clone())
+    }
+
+    /// Every physical declaration a bare name binds to when they are all one
+    /// logical Scala symbol (#2021): one candidate fully qualified name, a
+    /// non-empty declaration set, and a declaration set that is a single
+    /// replica family. This is the plural sibling of [`Self::resolve_exact`],
+    /// which insists on exactly one declaration and is therefore the funnel
+    /// that drops cross-built replicas.
+    ///
+    /// It is deliberately NOT the same as [`Self::resolve_exact_candidates`],
+    /// which carries no coherence gate at all because its caller layers an
+    /// import-collision check on top instead.
+    fn resolve_exact_units(&self, name: &str) -> Vec<CodeUnit> {
+        let Some(binding) = self.entries.get(name) else {
+            return Vec::new();
+        };
+        if binding.candidates.len() != 1
+            || binding.declarations.is_empty()
+            || !single_replica_family(binding.declarations.iter())
+        {
+            return Vec::new();
+        }
+        sorted_unique_units(binding.declarations.iter().cloned().collect())
     }
 
     fn resolve_exact_candidates(&self, name: &str) -> Vec<CodeUnit> {
@@ -6122,6 +6193,15 @@ fn scala_default_namespace_is_source_backed(name: &str) -> bool {
 impl NameResolver {
     pub fn resolve_unit(&self, name: &str) -> Option<CodeUnit> {
         self.names.resolve_exact(name)
+    }
+
+    /// Every physical declaration this name binds to when they are one logical
+    /// symbol cross-built across source sets (#2021). Call sites whose
+    /// contract is "the reference names this symbol" use this and record one
+    /// hit per member; call sites whose contract genuinely needs a single
+    /// physical declaration keep [`Self::resolve_unit`].
+    pub fn resolve_units(&self, name: &str) -> Vec<CodeUnit> {
+        self.names.resolve_exact_units(name)
     }
 
     pub fn resolve_object_unit(&self, name: &str) -> Option<CodeUnit> {
@@ -7866,6 +7946,11 @@ impl ScalaScan<'_, '_> {
             ScalaTypeNamespaceResolution::Resolved(declaration) => {
                 Some(ScalaResolvedReference::Exact(declaration))
             }
+            // Single-unit by contract: this produces one
+            // `ScalaResolvedReference`, and a cross-built replica falls
+            // through to the `Logical` arm below, whose catalog bucket carries
+            // every family member's target id since #2021. Migrating this to
+            // the plural resolver would duplicate that routing, not extend it.
             ScalaTypeNamespaceResolution::NoMatch => self
                 .resolver
                 .resolve_unit(name)
@@ -8621,13 +8706,14 @@ fn resolve_exact_import_path_references(
         let owners = if let Some(lexical_root) = &lexical_root {
             vec![lexical_root.clone()]
         } else {
-            [
-                ctx.resolver.resolve_unit(root),
-                ctx.resolver.resolve_object_unit(root),
-            ]
-            .into_iter()
-            .flatten()
-            .collect()
+            // A cross-built root is one logical owner with several physical
+            // homes (#2021), so every family member contributes its nested
+            // type candidates.
+            ctx.resolver
+                .resolve_units(root)
+                .into_iter()
+                .chain(ctx.resolver.resolve_object_unit(root))
+                .collect()
         };
         root_is_authoritative = !owners.is_empty();
         if root_is_authoritative {
@@ -8692,9 +8778,11 @@ fn resolve_exact_import_path_references(
         type_targets,
     ] {
         // One selectable declaration per role; a same-file overload family
-        // counts as one declaration and contributes every overload unit.
+        // counts as one declaration and contributes every overload unit
+        // (#1327), and a coherent replica family counts as one declaration and
+        // contributes every physical member (#2021).
         let targets = sorted_unique_units(targets.into_iter().collect());
-        if !targets.is_empty() && single_overload_family(targets.iter()) {
+        if !targets.is_empty() && single_replica_family(targets.iter()) {
             exact.extend(targets);
         }
     }
@@ -10870,15 +10958,23 @@ fn record_qualified_stable_reference(
     // enum/type root is an independently meaningful reference in addition to
     // the terminal extractor. Preserve the complete parser expression as the
     // hit range so exact forward sites covering the qualified extractor round
-    // trip, while the resolver's exact-unit requirement keeps physical
-    // replicas ambiguous.
+    // trip. A cross-built root is one logical symbol with several physical
+    // homes, so the reference is recorded against every family member (#2021);
+    // an incoherent candidate set resolves to nothing and stays ambiguous.
+    //
+    // `type_is_stable_owner` is asked per member rather than once for the
+    // family on purpose: family membership says the units are the same symbol,
+    // it does not say every member satisfies an independent structural
+    // property.
     if reference.role == ScalaQualifiedStableTypeRole::Extractor
         && reference.segments.len() > 1
         && let Some(root) = reference.segments.first()
-        && let Some(target) = ctx.resolver.resolve_unit(root)
-        && ctx.types.type_is_stable_owner(ctx.scala, &target)
     {
-        ctx.record_exact(target, ScalaReferenceRole::Type, reference.expression);
+        for target in ctx.resolver.resolve_units(root) {
+            if ctx.types.type_is_stable_owner(ctx.scala, &target) {
+                ctx.record_exact(target, ScalaReferenceRole::Type, reference.expression);
+            }
+        }
     }
     let lexical_object_root = reference
         .segments
@@ -11106,7 +11202,11 @@ fn record_intermediate_stable_object_reference(
         return false;
     }
     let mut lexical_roots = Vec::new();
-    if let Some(declaration) = ctx.resolver.resolve_unit(root) {
+    // A cross-built root is one logical symbol with several physical homes
+    // (#2021); each member contributes its own companion objects, and the
+    // stable-owner question is asked per member because family membership does
+    // not confer an independent structural property.
+    for declaration in ctx.resolver.resolve_units(root) {
         lexical_roots.extend(ctx.types.exact_companion_objects(ctx.scala, &declaration));
         if ctx.types.type_is_stable_owner(ctx.scala, &declaration) {
             lexical_roots.push(declaration);
@@ -13205,6 +13305,11 @@ fn resolve_receiver_type_declaration_node(
             ScalaTypeNamespaceResolution::Resolved(declaration) => declaration,
             ScalaTypeNamespaceResolution::AuthoritativeMiss
             | ScalaTypeNamespaceResolution::Ambiguous(_) => return None,
+            // Single-unit by contract: this answers "which declaration node is
+            // this receiver's type", which is a one-declaration question. The
+            // plural replica resolver (#2021) has nothing to say here, because
+            // a caller that needs several answers would need a different
+            // return type, not a different lookup.
             ScalaTypeNamespaceResolution::NoMatch if path.len() == 1 => {
                 ctx.resolver.resolve_unit(&path[0])?
             }
@@ -13329,4 +13434,208 @@ fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
         parent = current.parent();
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::model::CodeUnitType;
+
+    /// The cross-built shape of #2021: one logical `com.example.Probe`
+    /// declared by a `scala-2` file and a `scala-3` file.
+    fn scala2_file() -> ProjectFile {
+        ProjectFile::new(
+            std::env::temp_dir(),
+            "src/main/scala-2/com/example/Probe.scala",
+        )
+    }
+
+    fn scala3_file() -> ProjectFile {
+        ProjectFile::new(
+            std::env::temp_dir(),
+            "src/main/scala-3/com/example/Probe.scala",
+        )
+    }
+
+    fn unit(
+        source: ProjectFile,
+        kind: CodeUnitType,
+        package_name: &str,
+        short_name: &str,
+        signature: Option<&str>,
+        synthetic: bool,
+    ) -> CodeUnit {
+        CodeUnit::with_signature(
+            source,
+            kind,
+            package_name,
+            short_name,
+            signature.map(str::to_string),
+            synthetic,
+        )
+    }
+
+    fn probe(source: ProjectFile) -> CodeUnit {
+        unit(
+            source,
+            CodeUnitType::Class,
+            "com.example",
+            "Probe",
+            None,
+            false,
+        )
+    }
+
+    /// The central case: two declarations that differ only in which file
+    /// declares them are one replica family, and are NOT one overload family.
+    #[test]
+    fn a_source_only_difference_is_a_replica_family_but_not_an_overload_family() {
+        let left = probe(scala2_file());
+        let right = probe(scala3_file());
+        assert!(same_replica_family(&left, &right));
+        assert!(!same_overload_family(&left, &right));
+        assert!(single_replica_family([&left, &right].into_iter()));
+        assert!(!single_overload_family([&left, &right].into_iter()));
+    }
+
+    /// Signature is excluded from replica identity exactly as it is excluded
+    /// from overload identity, so cross-built overloads still group.
+    #[test]
+    fn a_source_and_signature_difference_is_still_a_replica_family() {
+        let left = unit(
+            scala2_file(),
+            CodeUnitType::Function,
+            "com.example",
+            "Probe.read",
+            Some("()"),
+            false,
+        );
+        let right = unit(
+            scala3_file(),
+            CodeUnitType::Function,
+            "com.example",
+            "Probe.read",
+            Some("(String)"),
+            false,
+        );
+        assert!(same_replica_family(&left, &right));
+    }
+
+    /// A class and a function of the same name are different declarations.
+    #[test]
+    fn a_kind_mismatch_is_not_a_replica_family() {
+        let left = probe(scala2_file());
+        let right = unit(
+            scala3_file(),
+            CodeUnitType::Function,
+            "com.example",
+            "Probe",
+            None,
+            false,
+        );
+        assert!(!same_replica_family(&left, &right));
+    }
+
+    /// Two packages are two symbols however alike their tails read.
+    #[test]
+    fn a_package_mismatch_is_not_a_replica_family() {
+        let left = probe(scala2_file());
+        let right = unit(
+            scala3_file(),
+            CodeUnitType::Class,
+            "com.other",
+            "Probe",
+            None,
+            false,
+        );
+        assert!(!same_replica_family(&left, &right));
+    }
+
+    /// `class Probe` and `object Probe` normalize to the same fully qualified
+    /// name, so this pins that the predicate reads the short name it is given
+    /// rather than a normalized rendering of it.
+    #[test]
+    fn a_class_and_its_object_singleton_are_not_a_replica_family() {
+        let left = probe(scala2_file());
+        let right = unit(
+            scala3_file(),
+            CodeUnitType::Class,
+            "com.example",
+            "Probe$",
+            None,
+            false,
+        );
+        assert!(!same_replica_family(&left, &right));
+    }
+
+    /// A compiler-implied declaration is not a replica of a written one.
+    #[test]
+    fn a_synthetic_flag_mismatch_is_not_a_replica_family() {
+        let left = probe(scala2_file());
+        let right = unit(
+            scala3_file(),
+            CodeUnitType::Class,
+            "com.example",
+            "Probe",
+            None,
+            true,
+        );
+        assert!(!same_replica_family(&left, &right));
+    }
+
+    /// Empty sets are vacuously a single family, matching
+    /// [`single_overload_family`]; gates check emptiness themselves.
+    #[test]
+    fn an_empty_set_is_vacuously_a_single_replica_family() {
+        assert!(single_replica_family(std::iter::empty()));
+        assert!(single_overload_family(std::iter::empty()));
+    }
+
+    /// `same_overload_family` is `same_replica_family` plus source equality,
+    /// so every set the overload gate admits the replica gate admits too. This
+    /// pins the implication in code so a later edit cannot break it silently.
+    #[test]
+    fn a_same_file_overload_family_is_also_a_single_replica_family() {
+        let file = scala2_file();
+        let first = unit(
+            file.clone(),
+            CodeUnitType::Function,
+            "com.example",
+            "Probe.read",
+            Some("()"),
+            false,
+        );
+        let second = unit(
+            file,
+            CodeUnitType::Function,
+            "com.example",
+            "Probe.read",
+            Some("(String)"),
+            false,
+        );
+        assert!(single_overload_family([&first, &second].into_iter()));
+        assert!(single_replica_family([&first, &second].into_iter()));
+    }
+
+    /// One disagreeing member spoils the whole set; incoherent sets fail closed.
+    #[test]
+    fn one_incoherent_member_breaks_a_three_element_replica_family() {
+        let first = probe(scala2_file());
+        let second = probe(scala3_file());
+        let third = unit(
+            ProjectFile::new(
+                std::env::temp_dir(),
+                "src/main/scala/com/example/Probe.scala",
+            ),
+            CodeUnitType::Class,
+            "com.example",
+            "Probe$",
+            None,
+            false,
+        );
+        assert!(single_replica_family([&first, &second].into_iter()));
+        assert!(!single_replica_family(
+            [&first, &second, &third].into_iter()
+        ));
+    }
 }
