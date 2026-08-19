@@ -663,6 +663,8 @@ jobs:
           --version "${{ needs.preflight.outputs.version }}"
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
+      - name: Re-vendor the DSH launcher copies
+        run: node plugins/bifrost-dsh/scripts/sync-launcher.mjs
       - name: Test agent plugin launcher
         run: node --test plugins/bifrost-agent/test/launcher.test.mjs
       - name: Validate agent plugin manifests
@@ -808,6 +810,8 @@ jobs:
           --version "${{ needs.preflight.outputs.version }}"
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
+      - name: Re-vendor the DSH launcher copies
+        run: node plugins/bifrost-dsh/scripts/sync-launcher.mjs
       - name: Install Pi package dependencies
         run: npm ci --ignore-scripts
         working-directory: plugins/bifrost-agent
@@ -857,6 +861,8 @@ jobs:
           --manifest editors/vscode/package.json
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
+      - name: Re-vendor the DSH launcher copies
+        run: node plugins/bifrost-dsh/scripts/sync-launcher.mjs
       - name: Install VS Code extension dependencies
         run: npm ci --ignore-scripts
         working-directory: editors/vscode
