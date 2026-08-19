@@ -118,6 +118,19 @@ pub struct AuthoredProcedureSummary {
     pub id: String,
     pub target: AuthoredProcedureTarget,
     pub completeness: Completeness,
+    /// The author's explicit claim that every implementation of this member
+    /// outside the workspace conforms to this summary (#2371).
+    ///
+    /// This is a statement about the member's *implementations*, not about this
+    /// summary's own coverage of its target, so it is deliberately not inherited
+    /// from `completeness: complete`. Only a summary carrying it can discharge a
+    /// call's residual dynamic-dispatch arm, and only after the workspace
+    /// implementors of the same declaring member have been enumerated.
+    ///
+    /// Serialized only when claimed, so adding the field leaves the content
+    /// digest of every summary that does not claim it unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub covers_overrides: bool,
     #[serde(default)]
     pub locations: Vec<AuthoredSummaryLocation>,
     pub transfers: Vec<AuthoredSummaryTransfer>,

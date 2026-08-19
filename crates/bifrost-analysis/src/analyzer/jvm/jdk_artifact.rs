@@ -6,7 +6,7 @@ use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
     AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics, Completeness,
-    ExternalArtifactKind, ExternalArtifactPackProducer, NameSelector, Producer, ProducerDiagnostic,
+    ExternalArtifactKind, ExternalArtifactPackProducer, Producer, ProducerDiagnostic,
     ProducerDiagnosticSeverity, Visibility, read_exact_artifact_while,
 };
 use crate::hash::{HashMap, HashSet};
@@ -47,6 +47,7 @@ impl JdkSourceArchivePackProducer {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "artifact.kind".to_owned(),
                     location: None,
+                    declaration: None,
                     message: "JDK producer requires a JDK source ZIP artifact".to_owned(),
                 },
                 limits,
@@ -58,6 +59,7 @@ impl JdkSourceArchivePackProducer {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "jdk.activation.missing".to_owned(),
                     location: None,
+                    declaration: None,
                     message: "JDK production requires an exact toolchain activation selector"
                         .to_owned(),
                 },
@@ -91,6 +93,7 @@ impl JdkSourceArchivePackProducer {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "limit.archive_directory".to_owned(),
                     location: None,
+                    declaration: None,
                     message: "JDK ZIP central directory exceeds bounded entry or byte limits"
                         .to_owned(),
                 },
@@ -105,6 +108,7 @@ impl JdkSourceArchivePackProducer {
                         severity: ProducerDiagnosticSeverity::Error,
                         code: "jdk.archive.invalid".to_owned(),
                         location: None,
+                        declaration: None,
                         message: "artifact is not a readable JDK source ZIP".to_owned(),
                     },
                     limits,
@@ -378,17 +382,9 @@ impl JdkSourceArchivePackProducer {
             if types.is_empty() {
                 continue;
             }
-            let mut activation = request.activation.clone();
-            for selector in &mut activation {
-                selector.module = Some(NameSelector {
-                    name: module.clone(),
-                    version: None,
-                });
-                selector.artifact_sha256 = Some(artifact.sha256().to_owned());
-            }
             shards.push(AuthoredShard {
                 id: format!("declarations.jdk.{module}"),
-                activation,
+                activation: request.activation.clone(),
                 payload: AuthoredPayload::DeclarationFacts {
                     types,
                     members,
@@ -459,6 +455,7 @@ pub fn detect_jdk_source_archive_layout(
             severity: ProducerDiagnosticSeverity::Error,
             code: "limit.archive_directory".to_owned(),
             location: Some(artifact.path().to_string_lossy().into_owned()),
+            declaration: None,
             message: "JDK ZIP central directory exceeds bounded entry or byte limits".to_owned(),
         });
     }
@@ -467,6 +464,7 @@ pub fn detect_jdk_source_archive_layout(
             severity: ProducerDiagnosticSeverity::Error,
             code: "jdk.archive.invalid".to_owned(),
             location: Some(artifact.path().to_string_lossy().into_owned()),
+            declaration: None,
             message: "artifact is not a readable JDK source ZIP".to_owned(),
         })?;
     let mut module_prefixed = false;
@@ -492,6 +490,7 @@ pub fn detect_jdk_source_archive_layout(
             severity: ProducerDiagnosticSeverity::Error,
             code: "jdk.layout.ambiguous".to_owned(),
             location: Some(artifact.path().to_string_lossy().into_owned()),
+            declaration: None,
             message: "JDK source ZIP mixes flat and module-prefixed module descriptors".to_owned(),
         });
     }
@@ -591,6 +590,7 @@ fn cancelled_production(limits: &ArtifactProducerLimits) -> ArtifactProduction {
             severity: ProducerDiagnosticSeverity::Error,
             code: "artifact.cancelled".to_owned(),
             location: None,
+            declaration: None,
             message: "JDK source production was cancelled".to_owned(),
         },
         limits,
@@ -675,16 +675,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["declarations.jdk.java.base", "declarations.jdk.java.sql"]
         );
-        for shard in &pack.shards {
-            let module = shard.id.trim_start_matches("declarations.jdk.");
-            assert!(shard.activation.iter().all(|selector| {
-                selector
-                    .module
-                    .as_ref()
-                    .is_some_and(|value| value.name == module)
-                    && selector.artifact_sha256 == production.artifact_sha256
-            }));
-        }
+        assert!(
+            pack.shards
+                .iter()
+                .all(|shard| shard.activation == request(std::path::PathBuf::new()).activation),
+            "module partitioning must not narrow the operator-authored activation selector"
+        );
         let java_base = pack
             .shards
             .iter()
@@ -831,7 +827,7 @@ mod tests {
             activation: vec![ActivationSelector {
                 package: None,
                 module: None,
-                toolchain: Some(NameSelector {
+                toolchain: Some(crate::analyzer::semantic_model::NameSelector {
                     name: "jdk".to_owned(),
                     version: Some(format!("={version}")),
                 }),

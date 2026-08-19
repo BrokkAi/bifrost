@@ -1295,6 +1295,73 @@ pub enum PolicyQueryProof {
     Unknown,
 }
 
+/// The authored identity that closed a residual dispatch arm (#2342).
+///
+/// A `ProvenBySummary` run trusts this claim to describe a call's target set,
+/// not only that target's transfers. The model id, content hash, and contract
+/// version are the same fields `AuthoredArmClosure` retains on the analysis
+/// result.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct AuthoredArmClosureEvidence {
+    model: String,
+    content: String,
+    contract_version: u32,
+}
+
+impl AuthoredArmClosureEvidence {
+    pub fn try_new(
+        model: impl Into<String>,
+        content: impl Into<String>,
+        contract_version: u32,
+    ) -> Result<Self, ReportValueError> {
+        let mut model = model.into();
+        let mut content = content.into();
+        validate_report_prose(&model)?;
+        validate_report_identifier(&content)?;
+        if model.is_empty() {
+            return Err(ReportValueError::EmptyIdentifier);
+        }
+        if contract_version == 0 {
+            return Err(ReportValueError::EmptyIdentifier);
+        }
+        tighten_string(&mut model);
+        tighten_string(&mut content);
+        Ok(Self {
+            model,
+            content,
+            contract_version,
+        })
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
+    pub const fn contract_version(&self) -> u32 {
+        self.contract_version
+    }
+
+    pub fn to_proof_reason(&self) -> ProofReason {
+        ProofReason::AuthoredArmClosure {
+            model: self.model.clone(),
+            content: self.content.clone(),
+            contract_version: self.contract_version,
+        }
+    }
+}
+
+impl RetainedSize for AuthoredArmClosureEvidence {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.model.capacity())
+            .saturating_add(self.content.capacity())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProofMetadata {
     state: ProofState,
@@ -1383,7 +1450,16 @@ pub enum ProofReason {
     TypestateWitness,
     AmbiguousTarget,
     PartialWitness,
-    AnalyzerEvidence { code: String },
+    AnalyzerEvidence {
+        code: String,
+    },
+    /// An authored-complete external summary closed this run's residual
+    /// dispatch arm. The fields name that claim (#2342).
+    AuthoredArmClosure {
+        model: String,
+        content: String,
+        contract_version: u32,
+    },
 }
 
 impl ProofReason {
@@ -1395,8 +1471,13 @@ impl ProofReason {
     }
 
     fn validate(&self) -> Result<(), ReportValueError> {
-        if let Self::AnalyzerEvidence { code } = self {
-            validate_report_identifier(code)?;
+        match self {
+            Self::AnalyzerEvidence { code } => validate_report_identifier(code)?,
+            Self::AuthoredArmClosure { model, content, .. } => {
+                validate_report_prose(model)?;
+                validate_report_identifier(content)?;
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1406,6 +1487,9 @@ impl RetainedSize for ProofReason {
     fn retained_size(&self) -> usize {
         size_of::<Self>().saturating_add(match self {
             Self::AnalyzerEvidence { code } => code.capacity(),
+            Self::AuthoredArmClosure { model, content, .. } => {
+                model.capacity().saturating_add(content.capacity())
+            }
             _ => 0,
         })
     }
@@ -2622,6 +2706,10 @@ pub struct PolicyRun {
     diagnostics: Vec<PolicyDiagnostic>,
     diagnostics_truncated: bool,
     work: PolicyWorkReport,
+    /// Authored identities that closed a residual dispatch arm when this run
+    /// is `ProvenBySummary`. Empty for every other tier.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    authored_arm_closures: Vec<AuthoredArmClosureEvidence>,
 }
 
 impl PolicyRun {
@@ -2704,6 +2792,7 @@ impl PolicyRun {
             diagnostics,
             diagnostics_truncated,
             work,
+            authored_arm_closures: Vec::new(),
         };
         run.refresh_retained_bytes();
         if run.retained_size() > budget.max_retained_report_bytes() {
@@ -2749,6 +2838,26 @@ impl PolicyRun {
     }
     pub const fn work(&self) -> &PolicyWorkReport {
         &self.work
+    }
+
+    pub fn authored_arm_closures(&self) -> &[AuthoredArmClosureEvidence] {
+        &self.authored_arm_closures
+    }
+
+    pub(crate) fn set_authored_arm_closures(
+        &mut self,
+        mut closures: Vec<AuthoredArmClosureEvidence>,
+    ) {
+        if !matches!(self.completion, PolicyRunCompletion::ProvenBySummary) {
+            self.authored_arm_closures.clear();
+            self.refresh_retained_bytes();
+            return;
+        }
+        closures.sort();
+        closures.dedup();
+        tighten_vec(&mut closures);
+        self.authored_arm_closures = closures;
+        self.refresh_retained_bytes();
     }
 
     pub(crate) fn replace_incomplete_reason(
@@ -2869,6 +2978,7 @@ impl RetainedSize for PolicyRun {
             .saturating_add(retained_extra(&self.findings))
             .saturating_add(retained_extra(&self.diagnostics))
             .saturating_add(retained_extra(&self.work))
+            .saturating_add(retained_extra(&self.authored_arm_closures))
     }
 }
 

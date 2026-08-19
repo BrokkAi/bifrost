@@ -1814,6 +1814,7 @@ fn failed(
             severity: ProducerDiagnosticSeverity::Error,
             code: code.to_owned(),
             location: None,
+            declaration: None,
             message: message.into(),
         },
         limits,

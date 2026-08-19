@@ -44,9 +44,10 @@ pub(crate) fn collect_go_semantic_diagnostics(
         |import_path| external.packages().declared_package_name(import_path),
     );
     let support = analyzer.global_usage_definition_index();
-    brokk_bifrost_go::diagnostics::collect_go_semantic_diagnostics(
+    let report = brokk_bifrost_go::diagnostics::collect_go_semantic_diagnostics(
         &bindings, &support, &external, file, source,
-    )
+    );
+    crate::analyzer::semantic_model::degrade_pack_gap_absences(analyzer, report)
 }
 
 /// The retained external Go state one diagnostic request may read.

@@ -207,6 +207,7 @@ impl GoModulePackProducer {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "artifact.kind".to_owned(),
                     location: None,
+                    declaration: None,
                     message: "Go module producer requires a Go source-set artifact".to_owned(),
                 },
                 limits,

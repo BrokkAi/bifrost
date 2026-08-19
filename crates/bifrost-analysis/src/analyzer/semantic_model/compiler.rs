@@ -386,6 +386,7 @@ fn compile_procedure_summary(
             parameter_count: summary.target.parameter_count,
         },
         completeness: summary.completeness,
+        covers_overrides: summary.covers_overrides,
         locations: summary
             .locations
             .iter()

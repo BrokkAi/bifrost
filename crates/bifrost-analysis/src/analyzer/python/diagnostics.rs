@@ -59,13 +59,14 @@ pub(crate) fn collect_python_semantic_diagnostics(
         overlay: analyzer.semantic_model_overlay(),
         evidence: analyzer.dependency_discovery_evidence(Language::Python),
     };
-    brokk_bifrost_python::diagnostics::collect_python_semantic_diagnostics(
+    let report = brokk_bifrost_python::diagnostics::collect_python_semantic_diagnostics(
         py,
         &support,
         &environment,
         file,
         source,
-    )
+    );
+    crate::analyzer::semantic_model::degrade_pack_gap_absences(analyzer, report)
 }
 
 /// The environment facts a diagnostic request is allowed to read: what an

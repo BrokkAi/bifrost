@@ -61,6 +61,7 @@ use super::syntax::{
 use crate::scala::declarations::scala_class_parameter_field_keyword;
 use crate::scala::graph_support::{
     ScalaCallableFactsIndex, ScalaDefinitionIndex, ScalaFileFacts, ScalaSource,
+    ScalaWorkspaceSource,
 };
 use crate::scala::imports::scala_import_infos_from_node;
 use crate::scala::supertypes::{
@@ -107,6 +108,39 @@ pub enum ScalaReferenceRole {
 pub enum ScalaResolvedReference {
     Exact(CodeUnit),
     Logical(String),
+}
+
+/// The receiver shape a [`ScalaLogicalOwnerMember`] event was seen through.
+///
+/// The Scala walk cannot know whether the foreign target is declared `static`;
+/// it can only report how the site wrote the receiver. The sink pairs the two
+/// (a static target matches only a `StaticOwner` event and vice versa), which
+/// keeps an instance call like `sectionValue.read(..)` from matching the static
+/// overload when both arities coincide. Java's legal-but-rare "static through
+/// an instance" spelling stays unmatched, exactly as the retired duplicate
+/// scanner behaved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScalaLogicalReceiver {
+    /// A value whose seeded or inferred type is the owner: `c.size()`.
+    Instance,
+    /// The owner type itself written as the receiver: `Config.of(..)`.
+    StaticOwner,
+}
+
+/// A member reference proven up to a receiver *type* that has no Scala
+/// declaration (the #1859 replacement channel for the retired duplicate
+/// scanner). The owner is a fully qualified name the scan resolved
+/// through the file's imports and the all-language definition index; it is
+/// never a guessed bare name. Carried separately from
+/// [`ScalaResolvedReference::Logical`] so the sink can match the owner's
+/// normalized fqn against a target's receiver-owner set and the member name
+/// independently, which is what subtype receiver matching needs.
+pub struct ScalaLogicalOwnerMember<'a> {
+    pub owner_fqn: &'a str,
+    pub member: &'a str,
+    pub role: ScalaReferenceRole,
+    pub receiver: ScalaLogicalReceiver,
+    pub call_shape: Option<&'a ScalaCallSiteShape>,
 }
 
 /// Same-owner policy (#1014 facet B / #1138): Scala's receiver shape is threaded
@@ -188,6 +222,20 @@ pub trait ScalaReferenceSink {
         _owner: CodeUnit,
         _member: &str,
         _role: ScalaReferenceRole,
+        _reference_kind: UsageReferenceKind,
+        _hit_kind: UsageHitKind,
+        _start: usize,
+        _end: usize,
+    ) {
+    }
+
+    /// A member reference whose receiver type resolved to a fully qualified
+    /// name with no Scala declaration. Sinks that serve foreign (Java/Kotlin)
+    /// targets override this; the default drops it, which keeps Scala-target
+    /// catalogs and the edge build bit-identical.
+    fn record_logical_owner_member(
+        &mut self,
+        _event: ScalaLogicalOwnerMember<'_>,
         _reference_kind: UsageReferenceKind,
         _hit_kind: UsageHitKind,
         _start: usize,
@@ -3071,6 +3119,22 @@ impl ProjectTypes {
         Some(resolved.clone())
     }
 
+    /// The single nested object `member` names under `owner`, including one the
+    /// owner inherits. More than one declaration at the first declaring
+    /// template is ambiguous and resolves nothing.
+    fn stable_nested_object_for_owner(
+        &self,
+        scala: &dyn ScalaSource,
+        owner: &CodeUnit,
+        member: &str,
+    ) -> Option<CodeUnit> {
+        let matches = self.stable_nested_objects_for_owner(scala, owner, member);
+        let [resolved] = matches.as_slice() else {
+            return None;
+        };
+        Some(resolved.clone())
+    }
+
     fn exact_nested_objects_for_owner(
         &self,
         scala: &dyn ScalaSource,
@@ -3087,6 +3151,56 @@ impl ProjectTypes {
                 .cloned()
                 .collect(),
         )
+    }
+
+    /// The nested objects `member` names under `owner`, reading the owner's own
+    /// children first and its linearization second.
+    ///
+    /// A declared object inherits the nested objects of its parents, so
+    /// `Holder.PersistNone` selects the `case object PersistNone` that `object
+    /// Holder extends PersistentEntity` inherits (#2223). The direct-children
+    /// read stays authoritative when it answers: an object's own declaration
+    /// shadows an inherited one, and it alone carries the source and
+    /// structural-child filters that distinguish physical replicas of the
+    /// owner. The linearized read is the walk the wildcard-import binding and
+    /// the type-projection member already use, so the first template that
+    /// declares the name is the one it binds, and every declaration of the
+    /// name at that tier is returned for the caller's ambiguity check. Like
+    /// the direct read, it keeps only declared objects: a nested case class
+    /// accepts object roles through its implicit companion, and recording it
+    /// here would pre-empt the type-namespace resolution that owns its
+    /// identity.
+    ///
+    /// An owner that accepts object roles only through an implicit companion
+    /// declares no template of its own -- the parents in its `extends` clause
+    /// belong to the class, not to the companion a stable selection reads --
+    /// so there the direct children are the whole answer, exactly as in
+    /// `wildcard_member_declarations`.
+    fn stable_nested_objects_for_owner(
+        &self,
+        scala: &dyn ScalaSource,
+        owner: &CodeUnit,
+        member: &str,
+    ) -> Vec<CodeUnit> {
+        let exact = self.exact_nested_objects_for_owner(scala, owner, member);
+        if !exact.is_empty() || !owner.short_name().ends_with('$') {
+            return exact;
+        }
+        self.linearized_nested_declarations(
+            scala,
+            owner,
+            HashSet::default(),
+            |unit| {
+                unit.is_class()
+                    && unit.short_name().ends_with('$')
+                    && self.type_accepts_object_roles(scala, unit)
+            },
+            scala_simple_type_name,
+        )
+        .into_iter()
+        .filter(|(simple, _)| simple == member)
+        .map(|(_, unit)| unit)
+        .collect()
     }
 
     pub fn exact_nested_type(&self, owner_fqn: &str, member: &str) -> Option<String> {
@@ -3464,7 +3578,7 @@ impl ProjectTypes {
                     owners = owners
                         .iter()
                         .flat_map(|owner| {
-                            self.exact_nested_objects_for_owner(scala, owner, segment)
+                            self.stable_nested_objects_for_owner(scala, owner, segment)
                         })
                         .collect();
                     let mut seen = HashSet::default();
@@ -3475,7 +3589,7 @@ impl ProjectTypes {
                     .iter()
                     .flat_map(|owner| {
                         if terminal_object {
-                            self.exact_nested_objects_for_owner(scala, owner, terminal)
+                            self.stable_nested_objects_for_owner(scala, owner, terminal)
                         } else {
                             self.exact_nested_types_for_owner(scala, owner, terminal)
                         }
@@ -3791,7 +3905,11 @@ impl ProjectTypes {
     /// shadows an inherited member of the same name. The caller adds the
     /// aliases themselves; this reports only the declarations they leave
     /// visible.
-    fn wildcard_member_declarations(
+    ///
+    /// Shared with the forward resolver in `brokk-bifrost-analysis`, whose
+    /// wildcard-imported-member lookup binds the same members (#2212); the
+    /// linearization walk is not re-derived there.
+    pub fn wildcard_member_declarations(
         &self,
         scala: &dyn ScalaSource,
         owner: &CodeUnit,
@@ -7217,6 +7335,7 @@ pub fn scan_edge_file(
         scala_import_owner_scopes(&state.imports, &class_ranges, scala, types);
     let mut ctx = ScalaScan {
         scala,
+        workspace: None,
         source: input.source,
         source_file: file,
         imports: &state.imports,
@@ -7243,9 +7362,16 @@ pub fn scan_edge_file(
 /// Scan one caller-supplied Scala file through the same structured resolver used
 /// by the whole-workspace graph, without constructing or hydrating that graph.
 /// The caller supplies the exact-target sink and owns file eligibility.
+///
+/// `workspace` is the dispatching, all-language definition view (see
+/// [`ScalaWorkspaceSource`]). The walk consults it only to give a receiver or
+/// type whose written name has no Scala declaration one logical chance through
+/// the realm before giving up on it (#1859); per-file `ScalaSource` state is
+/// never used for that (#1805).
 pub fn scan_scala_query_file(
     scala: &dyn ScalaSource,
     analyzer: &dyn CodeUnitIndex,
+    workspace: &dyn ScalaWorkspaceSource,
     file: &ProjectFile,
     source: &str,
     sink: &mut dyn ScalaReferenceSink,
@@ -7284,6 +7410,7 @@ pub fn scan_scala_query_file(
     let import_owner_scopes = scala_import_owner_scopes(&imports, &class_ranges, scala, &types);
     let mut ctx = ScalaScan {
         scala,
+        workspace: Some(workspace),
         source,
         source_file: file,
         imports: &imports,
@@ -7311,6 +7438,10 @@ pub fn scan_scala_query_file(
 
 struct ScalaScan<'a, 'b> {
     scala: &'a dyn ScalaSource,
+    /// The all-language definition view (#1859). Present only on the query
+    /// path: the edge build runs inside the Scala analyzer's own indexing and
+    /// has no merged index to consult, and its behavior must not change here.
+    workspace: Option<&'a dyn ScalaWorkspaceSource>,
     source: &'a str,
     source_file: &'a ProjectFile,
     imports: &'a [ImportInfo],
@@ -7861,6 +7992,115 @@ impl ScalaScan<'_, '_> {
         );
     }
 
+    /// Emit a member reference whose owner is a fully qualified name with no
+    /// Scala declaration (a Java/Kotlin type the realm proved to exist), or an
+    /// exact owner whose own member lookup found nothing. Sinks serving foreign
+    /// targets match it; every other sink keeps its default no-op (#1859).
+    fn record_logical_owner_member(
+        &mut self,
+        owner_fqn: &str,
+        member: &str,
+        role: ScalaReferenceRole,
+        receiver: ScalaLogicalReceiver,
+        call_shape: Option<&ScalaCallSiteShape>,
+        node: Node<'_>,
+    ) {
+        self.sink.record_logical_owner_member(
+            ScalaLogicalOwnerMember {
+                owner_fqn,
+                member,
+                role,
+                receiver,
+                call_shape,
+            },
+            classify_reference_node(node),
+            UsageHitKind::Reference,
+            node.start_byte(),
+            node.end_byte(),
+        );
+    }
+
+    /// The candidate fqn when the realm — every language's definition shard,
+    /// not only Scala's — proves it names a class-like declaration. `None`
+    /// when this scan has no realm view (the edge build) or the realm knows no
+    /// such type. A name the Scala index itself holds is never foreign: when
+    /// the physical tiers decline to resolve it (replicas, wildcard companion
+    /// collisions, package/singleton same-tier clashes), that refusal is the
+    /// answer and no lower tier may overrule it (#1859).
+    fn realm_class_fqn(&self, candidate: &str) -> Option<String> {
+        let workspace = self.workspace?;
+        if !self.types.index.by_fqn(candidate).is_empty() {
+            return None;
+        }
+        let normalized = scala_normalized_fq_name(candidate);
+        workspace
+            .definitions_by_normalized_fqn(&normalized)
+            .iter()
+            .any(CodeUnit::is_class)
+            .then_some(candidate.to_string())
+    }
+
+    /// Resolve a written dotted path to the unique foreign (non-Scala) type fqn
+    /// it can denote: the path as spelled, its head expanded through this
+    /// file's logical import bindings (explicit imports and renames, and
+    /// wildcard owners with no Scala backing), or the path under a package
+    /// clause in scope — each checked against the realm. `None` when no
+    /// candidate exists in the realm or more than one does. This is the
+    /// structured counterpart of the retired duplicate scanner's
+    /// `QualifierBindings::denoted_paths` (#1859).
+    fn realm_foreign_type_fqn(&self, segments: &[String], byte: usize) -> Option<String> {
+        self.workspace?;
+        let (head, rest) = segments.split_first()?;
+        let mut candidates = Vec::new();
+        let written = segments.join(".");
+        candidates.push(written.clone());
+        for base in self.resolver.logical_type_import_candidates(head) {
+            let mut expanded = base;
+            for segment in rest {
+                expanded.push('.');
+                expanded.push_str(segment);
+            }
+            candidates.push(expanded);
+        }
+        // Wildcard owners with Scala backing never land in the resolver's
+        // logical wildcard set (it exists for owners the Scala index lacks),
+        // but a wildcard may still bring in a *foreign* type the Scala index
+        // does not hold: `import com.example._` with Scala classes in
+        // `com.example` still names Java's `com.example.Target` (#1859).
+        let package_prefixes = self.package_contexts.prefixes_at(byte);
+        for import in self.imports {
+            if !import.is_wildcard {
+                continue;
+            }
+            let Some(path) = scala_import_path(import) else {
+                continue;
+            };
+            let lexical_prefixes = import
+                .path
+                .as_ref()
+                .map(|path| path.lexical_prefixes.as_slice())
+                .unwrap_or_default();
+            for base in scala_import_path_candidates(&path, lexical_prefixes) {
+                candidates.push(format!("{base}.{written}"));
+            }
+        }
+        for prefix in package_prefixes {
+            if prefix.is_empty() {
+                continue;
+            }
+            candidates.push(format!("{prefix}.{written}"));
+        }
+        candidates.sort();
+        candidates.dedup();
+        let mut proven = candidates
+            .iter()
+            .filter_map(|candidate| self.realm_class_fqn(candidate));
+        let resolved = proven.next()?;
+        // Two live candidates mean the spelling is ambiguous; fail closed
+        // rather than attribute the receiver to one of them.
+        proven.next().is_none().then_some(resolved)
+    }
+
     fn record_exact_callable(&mut self, callee: CodeUnit, node: Node<'_>) {
         let Some(call_shape) = call_site_shape_for_reference(node) else {
             self.record_exact(callee, ScalaReferenceRole::Callable, node);
@@ -8310,12 +8550,27 @@ fn record_exact_import_path_reference(
     include_type_targets: bool,
     ctx: &mut ScalaScan<'_, '_>,
 ) {
-    for target in resolve_exact_import_path_references(
+    let targets = resolve_exact_import_path_references(
         path_segments,
         declaration_start_byte,
         include_type_targets,
         ctx,
-    ) {
+    );
+    if targets.is_empty() {
+        // A physically unresolved import path may still name a foreign
+        // (Java/Kotlin) type: importing `com.example.RetryConfig.withDefaults`
+        // references the owner `com.example.RetryConfig` on the way (#1859).
+        // The retired duplicate scanner recorded import sites as ordinary
+        // references (the external usage surface excludes `Import`-kind hits),
+        // so the logical event deliberately keeps `UsageHitKind::Reference`.
+        if include_type_targets
+            && let Some(foreign) = ctx.realm_foreign_type_fqn(path_segments, declaration_start_byte)
+        {
+            ctx.record_logical(foreign, ScalaReferenceRole::Type, name_node);
+        }
+        return;
+    }
+    for target in targets {
         if target.is_class() && !target.short_name().ends_with('$') {
             ctx.record_exact_import(target.clone(), ScalaReferenceRole::Type, name_node);
             if ctx.types.type_accepts_object_roles(ctx.scala, &target) {
@@ -8681,6 +8936,12 @@ fn record_reference(
             } else {
                 None
             };
+            // A type the Scala index does not hold gets one structured chance
+            // through the realm before the reference goes unrecorded (#1859).
+            if resolved.is_none() {
+                record_foreign_type_reference(node, text, ctx, bindings);
+                return;
+            }
             if let Some(resolved) = resolved {
                 if is_constructor_like_reference(node, ctx.source) {
                     if let ScalaResolvedReference::Exact(alias) = &resolved
@@ -8876,12 +9137,27 @@ fn record_reference(
                                 if record_qualified_stable_reference(field, ctx, bindings) {
                                     return;
                                 }
-                                for extension in visible_extensions(
+                                let extensions = visible_extensions(
                                     ctx,
                                     name,
                                     Some(&owner),
                                     Some(call_arities.as_slice()),
-                                ) {
+                                );
+                                if extensions.is_empty() {
+                                    // The receiver type is proven, but no
+                                    // Scala declaration of the member exists:
+                                    // a foreign (Java/Kotlin) owner-member
+                                    // reference (#1859).
+                                    ctx.record_logical_owner_member(
+                                        &owner,
+                                        name,
+                                        ScalaReferenceRole::Callable,
+                                        ScalaLogicalReceiver::Instance,
+                                        Some(&call_shape),
+                                        field,
+                                    );
+                                }
+                                for extension in extensions {
                                     ctx.record_exact(
                                         extension.declaration,
                                         ScalaReferenceRole::Callable,
@@ -8897,7 +9173,24 @@ fn record_reference(
                         let extensions =
                             visible_extensions(ctx, name, None, call_arities.as_deref());
                         if extensions.is_empty() {
-                            ctx.record_unproven_name(name, field);
+                            // A receiver the value bindings cannot type may
+                            // still spell a foreign type itself
+                            // (`Config.of(..)`); that is a static-style
+                            // reference, not an unproven one (#1859).
+                            if let Some(static_owner) =
+                                realm_static_owner_fqn(receiver, ctx, bindings)
+                            {
+                                ctx.record_logical_owner_member(
+                                    &static_owner,
+                                    name,
+                                    ScalaReferenceRole::Callable,
+                                    ScalaLogicalReceiver::StaticOwner,
+                                    call_site_shape_for_reference(field).as_ref(),
+                                    field,
+                                );
+                            } else {
+                                ctx.record_unproven_name(name, field);
+                            }
                         } else {
                             for extension in extensions {
                                 ctx.record_exact(
@@ -9516,7 +9809,7 @@ fn record_reference(
                                 .as_ref()
                                 .and_then(|owner| {
                                     ctx.types
-                                        .exact_nested_object_for_owner(ctx.scala, owner, name)
+                                        .stable_nested_object_for_owner(ctx.scala, owner, name)
                                 })
                                 .or_else(|| {
                                     ctx.types.exact_nested_object_unit(ctx.scala, &owner, name)
@@ -9608,6 +9901,63 @@ fn record_reference(
                                 }
                                 return;
                             }
+                            // The receiver type is proven, but no Scala
+                            // declaration of the member exists: a foreign
+                            // (Java/Kotlin) owner-member reference (#1859).
+                            ctx.record_logical_owner_member(
+                                &owner,
+                                name,
+                                ScalaReferenceRole::Field,
+                                ScalaLogicalReceiver::Instance,
+                                call_shape.as_ref(),
+                                node,
+                            );
+                        }
+                    }
+                } else if let Some(static_owner) = realm_static_owner_fqn(qualifier, ctx, bindings)
+                {
+                    // The qualifier spells a foreign type itself
+                    // (`Stats.origin`): a static-style reference (#1859).
+                    ctx.record_logical_owner_member(
+                        &static_owner,
+                        name,
+                        ScalaReferenceRole::Field,
+                        ScalaLogicalReceiver::StaticOwner,
+                        None,
+                        node,
+                    );
+                    // The same terminal may name a nested foreign type
+                    // (`com.example.JarManifest.Section`).
+                    if let Some(nested) = ctx.realm_class_fqn(&format!("{static_owner}.{name}")) {
+                        ctx.record_logical(nested, ScalaReferenceRole::Type, node);
+                    }
+                } else {
+                    // The qualifier may be a package path, making the whole
+                    // selection a foreign type (`com.example.JarManifest`).
+                    let mut segments =
+                        receiver_static_path_segments(qualifier, ctx.source).unwrap_or_default();
+                    segments.push(name.trim_end_matches('$').to_string());
+                    if segments.len() > 1
+                        && let Some(foreign) =
+                            ctx.realm_foreign_type_fqn(&segments, node.start_byte())
+                    {
+                        ctx.record_logical(foreign, ScalaReferenceRole::Type, node);
+                    } else {
+                        // A single-name qualifier that the bindings know as an
+                        // opaque value is an unproven receiver (#1859); a
+                        // package path that names nothing is just not the
+                        // target. Query scans only: the edge build has no realm
+                        // view and keeps its previous shape here.
+                        let value_like = receiver_static_path_segments(qualifier, ctx.source)
+                            .is_some_and(|segments| {
+                                segments.len() == 1
+                                    && segments.first().is_some_and(|head| {
+                                        !bindings.resolve_symbol(head).is_unknown()
+                                            || bindings.is_shadowed(head)
+                                    })
+                            });
+                        if value_like && ctx.workspace.is_some() {
+                            ctx.record_unproven_name(name, node);
                         }
                     }
                 }
@@ -9654,16 +10004,15 @@ fn record_qualified_root_owner_reference(
         return false;
     }
     let mut recorded = false;
-    if let Some(ScalaResolvedReference::Exact(target)) =
-        ctx.visible_object_reference(node.start_byte(), name)
-    {
+    let object_reference = ctx.visible_object_reference(node.start_byte(), name);
+    if let Some(ScalaResolvedReference::Exact(target)) = &object_reference {
         let companions = if target.is_class() && !target.short_name().ends_with('$') {
-            ctx.types.exact_companion_objects(ctx.scala, &target)
+            ctx.types.exact_companion_objects(ctx.scala, target)
         } else {
             Vec::new()
         };
         if companions.is_empty() {
-            ctx.record_exact(target, ScalaReferenceRole::StableObject, node);
+            ctx.record_exact(target.clone(), ScalaReferenceRole::StableObject, node);
         } else {
             for companion in companions {
                 ctx.record_exact(companion, ScalaReferenceRole::StableObject, node);
@@ -9671,25 +10020,135 @@ fn record_qualified_root_owner_reference(
         }
         recorded = true;
     }
-    if let Some(ScalaResolvedReference::Exact(target)) = ctx.visible_type_reference(node, name)
-        && (ctx.types.type_is_stable_owner(ctx.scala, &target)
-            || ctx.types.type_accepts_object_roles(ctx.scala, &target))
+    let type_reference = ctx.visible_type_reference(node, name);
+    if let Some(ScalaResolvedReference::Exact(target)) = &type_reference
+        && (ctx.types.type_is_stable_owner(ctx.scala, target)
+            || ctx.types.type_accepts_object_roles(ctx.scala, target))
     {
         let companions = if target.is_class() && !target.short_name().ends_with('$') {
-            ctx.types.exact_companion_objects(ctx.scala, &target)
+            ctx.types.exact_companion_objects(ctx.scala, target)
         } else {
             Vec::new()
         };
         if companions.is_empty() {
-            ctx.record_exact(target, ScalaReferenceRole::Type, node);
+            ctx.record_exact(target.clone(), ScalaReferenceRole::Type, node);
         } else {
             for companion in companions {
                 ctx.record_exact(companion, ScalaReferenceRole::StableObject, node);
             }
         }
         recorded = true;
+    }
+    // The realm fallback is only for a name with no physical answer at all: a
+    // resolution the stable-owner rules above declined (an ordinary Scala
+    // class qualifier) or a local unindexed binding (a type parameter) is a
+    // proven Scala fact, never a foreign type (#1859).
+    if !recorded
+        && object_reference.is_none()
+        && type_reference.is_none()
+        && scala_nearest_unindexed_type_binding(ctx.source, node, name.trim_end_matches('$'))
+            .is_none()
+        && let Some(foreign) =
+            ctx.realm_foreign_type_fqn(&[name.trim_end_matches('$').to_string()], node.start_byte())
+    {
+        // The root of a qualified path names a foreign (Java/Kotlin) type the
+        // Scala index does not hold (#1859).
+        ctx.record_logical(foreign, ScalaReferenceRole::Type, node);
+        return true;
     }
     recorded
+}
+
+/// The foreign (non-Scala) resolution of a type reference the physical tiers
+/// could not answer (#1859): expand the written path through the file's
+/// logical imports and package clauses, prove it against the all-language
+/// realm, and record it logically so a foreign-target catalog can match. A
+/// `new` site carries its call shape so the sink can apply the Java
+/// constructor's arity family. The guards mirror this arm's Scala branches: a
+/// name bound or shadowed locally, a declaration name, or a local unindexed
+/// type binding is never a foreign type.
+fn record_foreign_type_reference(
+    node: Node<'_>,
+    text: &str,
+    ctx: &mut ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
+) {
+    if ctx.workspace.is_none()
+        || !is_scala_class_reference(node, ctx.source)
+        || is_declaration_name(node)
+        || !bindings.resolve_symbol(text).is_unknown()
+        || bindings.is_shadowed(text)
+    {
+        return;
+    }
+    // Only a true NoMatch may fall through to the realm: an ambiguous or
+    // locally bound name is a deliberate physical answer that no lower tier
+    // may overrule.
+    if !matches!(
+        ctx.exact_lexically_visible_type(node),
+        ScalaTypeNamespaceResolution::NoMatch
+    ) {
+        return;
+    }
+    let lookup = scala_qualified_type_root(node);
+    let path = scala_type_lookup_segments(lookup, ctx.source);
+    let Some(head) = path.first() else {
+        return;
+    };
+    if scala_nearest_unindexed_type_binding(ctx.source, node, head).is_some() {
+        return;
+    }
+    let Some(foreign) = ctx.realm_foreign_type_fqn(&path, node.start_byte()) else {
+        return;
+    };
+    // A `new` site carries its call shape so the sink can apply the Java
+    // constructor's arity family. The argument list belongs to the
+    // `instance_expression`, which the shape helper reads from the outermost
+    // type node rather than from the leaf.
+    if let Some(constructed) = foreign_constructed_type_root(node)
+        && let Some(call_shape) = call_site_shape_for_reference(constructed)
+    {
+        ctx.sink.record_callable(
+            ScalaResolvedReference::Logical(foreign),
+            ScalaReferenceRole::Type,
+            &call_shape,
+            classify_reference_node(node),
+            UsageHitKind::Reference,
+            node.start_byte(),
+            node.end_byte(),
+        );
+        return;
+    }
+    ctx.record_logical(foreign, ScalaReferenceRole::Type, node);
+}
+
+/// The outermost type node of the `new` expression this leaf belongs to, or
+/// `None` when the leaf is not the constructed type of any `new`. Only the
+/// last segment of a qualified type is the type itself; `lib` in
+/// `new lib.Stats()` names a package.
+fn foreign_constructed_type_root(node: Node<'_>) -> Option<Node<'_>> {
+    let mut constructed = node;
+    loop {
+        let parent = constructed.parent()?;
+        if parent.kind() == "instance_expression" {
+            return Some(constructed);
+        }
+        let wraps_the_constructed_type = match parent.kind() {
+            "stable_type_identifier" => {
+                let mut cursor = parent.walk();
+                parent.named_children(&mut cursor).last() == Some(constructed)
+            }
+            "generic_type" | "applied_constructor_type" | "annotated_type" | "type" => {
+                parent.child_by_field_name("type") == Some(constructed)
+                    || parent.named_child(0) == Some(constructed)
+            }
+            _ => false,
+        };
+        if !wraps_the_constructed_type {
+            return None;
+        }
+        constructed = parent;
+    }
 }
 
 fn reference_lookup_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
@@ -10529,6 +10988,12 @@ fn record_qualified_stable_reference(
             ctx.record_exact(target, ScalaReferenceRole::Type, node);
         } else if let Some(target) = object_unit {
             ctx.record_exact(target, ScalaReferenceRole::StableObject, node);
+        } else if let Some(foreign) =
+            ctx.realm_foreign_type_fqn(&reference.segments, node.start_byte())
+        {
+            // A qualified type path no Scala tier could resolve names a
+            // foreign (Java/Kotlin) type when the realm proves it (#1859).
+            ctx.record_logical(foreign, ScalaReferenceRole::Type, node);
         }
         return true;
     }
@@ -12100,7 +12565,12 @@ fn seed_parameter(
     }
     let resolved = parameter
         .child_by_field_name("type")
-        .and_then(|type_node| resolve_receiver_type_node(type_node, ctx));
+        .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
+        .or_else(|| {
+            parameter
+                .child_by_field_name("type")
+                .and_then(|type_node| resolve_foreign_receiver_type_node(type_node, ctx))
+        });
     seed_binding(binding_name, resolved, declaration_owner, bindings);
 }
 
@@ -12168,14 +12638,18 @@ fn seed_value_definition_with_owner(
     bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     // Prefer the declared type; otherwise infer from a `new Foo()` initializer
-    // or a call with a declared factory return.
+    // or a call with a declared factory return. A declared type with no Scala
+    // declaration still binds when the realm proves it foreign (#1859).
     let receiver_declaration = node
         .child_by_field_name("type")
         .and_then(|type_node| resolve_receiver_type_declaration_node(type_node, ctx));
     let resolved = node
         .child_by_field_name("type")
         .filter(|_| receiver_declaration.is_none())
-        .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
+        .and_then(|type_node| {
+            resolve_receiver_type_node(type_node, ctx)
+                .or_else(|| resolve_foreign_receiver_type_node(type_node, ctx))
+        })
         .map(ScalaValueOwner::Logical)
         .or_else(|| {
             node.child_by_field_name("value")
@@ -12358,6 +12832,17 @@ fn constructed_or_applied_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Optio
     }
     constructed_type(node, ctx)
         .map(ScalaValueOwner::Logical)
+        .or_else(|| {
+            // `new Foreign()` with no Scala declaration: bind the value to the
+            // constructed type when the realm proves it (#1859).
+            let type_node = constructed_type_node(node)?;
+            let path = scala_type_lookup_segments(type_node, ctx.source);
+            if path.is_empty() {
+                return None;
+            }
+            ctx.realm_foreign_type_fqn(&path, type_node.start_byte())
+                .map(ScalaValueOwner::Logical)
+        })
         .or_else(|| {
             if node.kind() != "call_expression" {
                 return None;
@@ -12592,6 +13077,73 @@ fn exact_owner_field_binding(
     name: &str,
 ) -> Option<CodeUnit> {
     precise_scala_binding(bindings, name).and_then(|binding| binding.declaration_owner)
+}
+
+/// The foreign (non-Scala) type a written type node names, when the realm
+/// proves exactly one expansion of its path exists (#1859). Runs only after
+/// the physical Scala tiers have missed: a name the Scala index resolves never
+/// reaches here, so this cannot rebind a Scala type to a foreign one.
+fn resolve_foreign_receiver_type_node(
+    type_node: Node<'_>,
+    ctx: &ScalaScan<'_, '_>,
+) -> Option<String> {
+    let type_node = scala_capture_underlying_type(type_node, ctx.source);
+    let path = scala_type_lookup_segments(type_node, ctx.source);
+    if path.is_empty() {
+        return None;
+    }
+    ctx.realm_foreign_type_fqn(&path, type_node.start_byte())
+}
+
+/// The dotted path a receiver *expression* spells when it is a plain qualified
+/// name — `Config`, `msg.Entry`, `com.example.JarManifest` — or `None` when
+/// any part of it is a value computation (a call, an application, `this`)
+/// rather than a name. Iterative: the chain is a linked list of
+/// `field_expression` nodes.
+fn receiver_static_path_segments(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    let mut segments = Vec::new();
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "identifier" | "type_identifier" => {
+                let name = node_text(current, source).trim().trim_end_matches('$');
+                if name.is_empty() {
+                    return None;
+                }
+                segments.push(name.to_string());
+                break;
+            }
+            "field_expression" => {
+                let field = current.child_by_field_name("field")?;
+                let member = node_text(field, source).trim().trim_end_matches('$');
+                if member.is_empty() {
+                    return None;
+                }
+                segments.push(member.to_string());
+                current = current.child_by_field_name("value")?;
+            }
+            _ => return None,
+        }
+    }
+    segments.reverse();
+    Some(segments)
+}
+
+/// The receiver expression as a foreign type written in receiver position —
+/// `Config.of(..)`, `msg.Entry.parse(..)` — proven against the realm (#1859).
+/// A name the local value bindings know (or shadow) is a value, not a type
+/// path, and is left to the unproven channel.
+fn realm_static_owner_fqn(
+    receiver: Node<'_>,
+    ctx: &ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaLocalBinding>,
+) -> Option<String> {
+    let segments = receiver_static_path_segments(receiver, ctx.source)?;
+    let head = segments.first()?;
+    if !bindings.resolve_symbol(head).is_unknown() || bindings.is_shadowed(head) {
+        return None;
+    }
+    ctx.realm_foreign_type_fqn(&segments, receiver.start_byte())
 }
 
 fn resolve_receiver_type_node(type_node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {

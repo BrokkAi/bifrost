@@ -50,7 +50,7 @@ pub(crate) fn collect_javascript_semantic_diagnostics(
         return SemanticDiagnosticReport::new();
     };
     let evidence = JavaScriptNpmSurface(RetainedNpmSurface::read(analyzer, Language::JavaScript));
-    collect_js_ts_semantic_diagnostics(
+    let report = collect_js_ts_semantic_diagnostics(
         analyzer,
         &evidence,
         file,
@@ -58,7 +58,8 @@ pub(crate) fn collect_javascript_semantic_diagnostics(
         Language::JavaScript,
         JAVASCRIPT_SEMANTIC_DIAGNOSTIC_SOURCE,
         javascript.alias_resolver(),
-    )
+    );
+    crate::analyzer::semantic_model::degrade_pack_gap_absences(analyzer, report)
 }
 
 pub(crate) fn collect_typescript_semantic_diagnostics(
@@ -70,7 +71,7 @@ pub(crate) fn collect_typescript_semantic_diagnostics(
         return SemanticDiagnosticReport::new();
     };
     let evidence = TypeScriptNpmSurface(RetainedNpmSurface::read(analyzer, Language::TypeScript));
-    collect_js_ts_semantic_diagnostics(
+    let report = collect_js_ts_semantic_diagnostics(
         analyzer,
         &evidence,
         file,
@@ -78,7 +79,8 @@ pub(crate) fn collect_typescript_semantic_diagnostics(
         Language::TypeScript,
         TYPESCRIPT_SEMANTIC_DIAGNOSTIC_SOURCE,
         typescript.alias_resolver(),
-    )
+    );
+    crate::analyzer::semantic_model::degrade_pack_gap_absences(analyzer, report)
 }
 
 /// The retained npm surface one diagnostic request may read.

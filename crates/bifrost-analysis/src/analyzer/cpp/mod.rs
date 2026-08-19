@@ -905,6 +905,16 @@ impl CppSource for CppAnalyzer {
         CppAnalyzer::compile_contexts_for(self, file)
     }
 
+    fn reaching_translation_units(&self, file: &ProjectFile) -> Vec<ProjectFile> {
+        let mut translation_units = self
+            .transitive_reaching_translation_units(file)
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        translation_units.sort();
+        translation_units
+    }
+
     fn header_uses_c_semantics(&self, file: &ProjectFile) -> bool {
         CppAnalyzer::header_uses_c_semantics(self, file)
     }
@@ -1302,7 +1312,9 @@ impl IAnalyzer for CppAnalyzer {
         // include closure could be reproduced, and which of those failures
         // leaves a name unjudged rather than absent. The blanket
         // workspace-local wrapper would report every one of them as clean.
-        brokk_bifrost_cpp::diagnostics::collect_cpp_semantic_diagnostics(self, file, source)
+        let report =
+            brokk_bifrost_cpp::diagnostics::collect_cpp_semantic_diagnostics(self, file, source);
+        crate::analyzer::semantic_model::degrade_pack_gap_absences(self, report)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

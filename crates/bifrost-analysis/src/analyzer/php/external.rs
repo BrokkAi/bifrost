@@ -289,6 +289,7 @@ impl ComposerPackagePackProducer {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "artifact.kind".to_owned(),
                     location: None,
+                    declaration: None,
                     message: "Composer package producer requires a Composer source-set artifact"
                         .to_owned(),
                 },
@@ -489,6 +490,7 @@ fn failed(code: &str, message: &str) -> DependencyPackProduction {
             severity: ProducerDiagnosticSeverity::Error,
             code: code.to_owned(),
             location: None,
+            declaration: None,
             message: message.to_owned(),
         }],
         suppressed_diagnostics: 0,

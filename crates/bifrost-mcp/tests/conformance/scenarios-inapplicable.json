@@ -1,0 +1,146 @@
+{
+  "server-session-lifecycle": {
+    "rationale": "Judges the Streamable HTTP session contract (DELETE the session, then expect 404 for requests bearing the terminated id). Sessions exist only in bridge.mjs; stdio has no session layer, so a pass or failure here says nothing about Bifrost. Currently fails on 'Expected 404 on terminated session ID, got 200' because the bridge does not track terminated ids. Becomes applicable only if Bifrost ever gains a real HTTP transport."
+  },
+  "server-sse-polling": {
+    "rationale": "Requires the fixture tool test_reconnection (which must close the SSE stream mid-call) and judges SSE resumability, priming events, and retry fields, all of which live in bridge.mjs rather than in Bifrost. Becomes applicable only if Bifrost ever gains a real HTTP transport."
+  },
+  "server-sse-multiple-streams": {
+    "rationale": "Judges how the transport multiplexes concurrent SSE streams. It currently passes, but only bridge.mjs stream bookkeeping is under test; Bifrost's stdio pipe has no streams. Kept out of the gating set so a green result is not read as Bifrost evidence. Becomes applicable only if Bifrost ever gains a real HTTP transport."
+  },
+  "dns-rebinding-protection": {
+    "rationale": "Requires the server to reject invalid Host and Origin headers with 4xx. HTTP headers exist only at bridge.mjs, which deliberately relays instead of validating. Becomes applicable only if Bifrost ever gains a real HTTP transport that terminates these headers itself."
+  },
+  "http-header-validation": {
+    "rationale": "Requires HTTP 400 for malformed MCP-Protocol-Version and custom x-mcp-* headers (SEP-2243). The bridge relays bodies and does not police headers, so all five failures are bridge behavior. Becomes applicable only if Bifrost ever gains a real HTTP transport."
+  },
+  "http-custom-header-server-validation": {
+    "rationale": "Doubly inapplicable: it needs a tool annotated with x-mcp-header (the run reports 'server exposes no tool with x-mcp-header annotations'), and the requirements it checks are HTTP header validation performed by the transport. Becomes applicable if Bifrost both gains an HTTP transport and annotates a tool with x-mcp-header."
+  },
+  "logging-set-level": {
+    "rationale": "Bifrost's initialize result advertises only tools, resources, and the tasks extension; there is no logging capability, and logging/setLevel returns -32601. Becomes applicable if Bifrost ever advertises logging and implements logging/setLevel."
+  },
+  "tools-call-with-logging": {
+    "rationale": "Calls logging/setLevel before invoking a fixture tool, so it fails on the same missing logging capability ('MCP error -32601: logging/setLevel'). Becomes applicable if Bifrost ever advertises logging."
+  },
+  "resources-subscribe": {
+    "rationale": "Bifrost advertises resources as an empty object, i.e. without subscribe, and resources/subscribe is unimplemented. Becomes applicable if Bifrost ever advertises resources.subscribe."
+  },
+  "resources-unsubscribe": {
+    "rationale": "Same missing resources.subscribe capability; the scenario fails while establishing the subscription it then removes. Becomes applicable if Bifrost ever advertises resources.subscribe."
+  },
+  "prompts-list": {
+    "rationale": "Bifrost does not advertise the prompts capability, so a prompts inventory is not part of its surface. It passes at 2025-11-25 only because rmcp answers prompts/list with an empty list anyway; at 2026-07-28 that same answer omits the required cacheScope and ttlMs. That wire defect is real and is gated as an expected failure under `caching` and `input-required-result-unsupported-methods` instead of here, because whole-scenario triage cannot record 'passes at one revision, fails at the other'. Becomes applicable if Bifrost ever advertises prompts."
+  },
+  "prompts-get-simple": {
+    "rationale": "Requires a prompt named test_simple_prompt; Bifrost advertises no prompts capability and prompts/get errors. Becomes applicable if Bifrost ever advertises prompts and ships named prompts."
+  },
+  "prompts-get-with-args": {
+    "rationale": "Requires a fixture prompt that interpolates arguments; Bifrost advertises no prompts capability and prompts/get errors. Becomes applicable if Bifrost ever advertises prompts."
+  },
+  "prompts-get-embedded-resource": {
+    "rationale": "Requires a fixture prompt whose messages embed a resource; Bifrost advertises no prompts capability and prompts/get errors. Becomes applicable if Bifrost ever advertises prompts."
+  },
+  "prompts-get-with-image": {
+    "rationale": "Requires a fixture prompt whose messages carry image content; Bifrost advertises no prompts capability and prompts/get errors. Becomes applicable if Bifrost ever advertises prompts."
+  },
+  "tools-call-image": {
+    "rationale": "Requires the fixture tool test_image to return ImageContent. Bifrost's product tools return text and structured content only, so the run reports 'No image content found'. Becomes applicable if a Bifrost tool ever returns image content."
+  },
+  "tools-call-audio": {
+    "rationale": "Requires the fixture tool test_audio to return AudioContent; the run reports 'No audio content found'. Becomes applicable if a Bifrost tool ever returns audio content."
+  },
+  "tools-call-embedded-resource": {
+    "rationale": "Requires a fixture tool that returns EmbeddedResource content; the run reports 'No resource content found'. Becomes applicable if a Bifrost tool ever embeds resource content in a tool result."
+  },
+  "tools-call-mixed-content": {
+    "rationale": "Requires a fixture tool returning text plus image plus embedded resource in one result; the run reports all three shortfalls. Becomes applicable if a Bifrost tool ever returns multi-modal content."
+  },
+  "tools-call-with-progress": {
+    "rationale": "Requires the fixture tool test_tool_with_progress to emit at least three notifications/progress for a supplied progressToken. Bifrost does emit progress notifications for its real tools when a progressToken is supplied (proven by the mcp_wire_schema gate and by progress_token_yields_phase_progress_and_silence_without_it in the hand-authored suite), but the fixture tool does not exist, so the call returns an immediate unknown-tool result and the run reports 'No progress notifications received'. Becomes applicable if the scenario ever drives progress through a tool discovered from tools/list."
+  },
+  "tools-call-sampling": {
+    "rationale": "Requires the fixture tool test_sampling to drive sampling/createMessage back to the client; Bifrost never requests sampling. Becomes applicable if a Bifrost tool ever calls back into the client for LLM sampling."
+  },
+  "tools-call-elicitation": {
+    "rationale": "Requires a fixture tool that drives elicitation/create; Bifrost never requests elicitation ('Server did not request elicitation from client'). Becomes applicable if a Bifrost tool ever elicits input from the client."
+  },
+  "elicitation-sep1034-defaults": {
+    "rationale": "Exercises SEP-1034 default values inside an elicitation request schema, which requires a tool that elicits at all; Bifrost never requests elicitation. Becomes applicable if Bifrost ever drives elicitation."
+  },
+  "elicitation-sep1330-enums": {
+    "rationale": "Exercises SEP-1330 enum handling inside an elicitation request schema, which requires a tool that elicits at all; Bifrost never requests elicitation. Becomes applicable if Bifrost ever drives elicitation."
+  },
+  "json-schema-2020-12": {
+    "rationale": "Requires a fixture tool literally named json_schema_2020_12_tool whose inputSchema uses 2020-12 keywords; the run reports it missing and lists Bifrost's real tools instead. Bifrost's own tool schemas are validated by the Rust wire-schema gate. Becomes applicable only if Bifrost ships a tool under that fixture name."
+  },
+  "resources-read-text": {
+    "rationale": "Reads the fixture resource test://static-text; Bifrost exposes bifrost://agent-guidance/agents.md and correctly answers 'Resource not found: test://static-text'. Becomes applicable if the upstream scenario ever reads a resource discovered from resources/list instead of a hard-coded fixture URI."
+  },
+  "resources-read-binary": {
+    "rationale": "Reads the fixture resource test://static-binary and expects base64 blob contents; Bifrost has no binary resource. Becomes applicable if Bifrost ever exposes a binary resource under the fixture URI the scenario reads."
+  },
+  "resources-templates-read": {
+    "rationale": "Reads test://template/123/data, expanded from a fixture resource template; Bifrost advertises no resource templates. Becomes applicable if Bifrost ever advertises resource templates matching the fixture URI space."
+  },
+  "tasks-lifecycle": {
+    "rationale": "Drives the SEP-2663 task lifecycle through the fixture tools slow_compute, failing_job, and protocol_error_job. Bifrost advertises the tasks extension but has no tool under those names, so no task is ever created and six of the seven failures are 'no task was created by the preceding step'. Becomes applicable if the upstream scenario ever drives tasks through a tool discovered from tools/list, or if Bifrost ships tools under the fixture names."
+  },
+  "tasks-capability-negotiation": {
+    "rationale": "Four of its five checks pass, including that Bifrost advertises io.modelcontextprotocol/tasks under capabilities.extensions with no v1 tasks slot and gates tasks/* on client negotiation. The one failure, tasks-per-request-meta-opt-in, calls the fixture tool slow_compute and expects a CreateTaskResult; Bifrost has no such tool so the call falls through to a complete result. Becomes applicable if the scenario ever opts in on a tool discovered from tools/list."
+  },
+  "tasks-wire-fields": {
+    "rationale": "Checks the v1-to-v2 field renames (ttlMs, no related-task _meta) on a CreateTaskResult that only the fixture tool slow_compute can produce; two of the three failures are explicitly 'no task was created by the preceding step'. Becomes applicable if the scenario ever creates its task through a tool discovered from tools/list."
+  },
+  "tasks-request-state-removal": {
+    "rationale": "Its setup step needs a taskId from a fixture tools/call ('no taskId in tools/call response') before it can check that requestState is absent from task responses. Becomes applicable if the scenario ever creates its task through a tool discovered from tools/list."
+  },
+  "tasks-mrtr-input": {
+    "rationale": "Drives multi-round-trip input through the fixture tools confirm_delete and multi_input; all three failures are 'did not create a task'. Becomes applicable if the scenario ever drives MRTR through a tool discovered from tools/list."
+  },
+  "tasks-request-headers": {
+    "rationale": "Mixed transport and fixture scenario: two checks require Mcp-Method and Mcp-Name HTTP routing headers to be validated (and mismatches rejected with -32020), which bridge.mjs relays rather than enforces, and the other two need a task from the fixture tool slow_compute. Becomes applicable only if Bifrost gains a real HTTP transport that terminates SEP-2243 routing headers."
+  },
+  "tasks-dispatch-and-envelope": {
+    "rationale": "Seven of its nine checks pass, including that tasks/result and tasks/list are removed with -32601, that a legacy task param is tolerated without promoting a sync tool, and that non-task responses carry resultType:\"complete\". Both failures require the fixture tool slow_compute to produce a CreateTaskResult. Becomes applicable if the scenario ever dispatches through a tool discovered from tools/list."
+  },
+  "tasks-status-notifications": {
+    "rationale": "The scenario skips itself: its single check reports that SEP-2663 delivers notifications/tasks over the SEP-2575 subscriptions/listen stream, which the harness does not open, so it judges nothing (zero SUCCESS and zero FAILURE checks). Becomes applicable when upstream implements the listen-stream path and Bifrost serves subscriptions/listen."
+  },
+  "tasks-required-task-error": {
+    "rationale": "Expects -32021 MissingRequiredClientCapability for a tools/call against the fixture tool failing_job from a client that did not declare the tasks extension. Bifrost has no failing_job, so the call returns an ordinary 'Unknown tool' result and never reaches the task path. Becomes applicable if the scenario ever probes a task-supporting tool discovered from tools/list."
+  },
+  "tasks-mrtr-composition": {
+    "rationale": "Requires the fixture tool test_tool_with_task; Bifrost answers 'Unknown tool: test_tool_with_task', so the scenario cannot start its first MRTR round. Becomes applicable if the scenario ever composes MRTR with tasks through a tool discovered from tools/list."
+  },
+  "input-required-result-basic-elicitation": {
+    "rationale": "Requires the fixture tool test_input_required_result_elicitation to return resultType:\"input_required\" with an elicitation/create inputRequest. Bifrost has no such tool and never returns input_required. Becomes applicable if a Bifrost tool ever returns an InputRequiredResult."
+  },
+  "input-required-result-basic-sampling": {
+    "rationale": "Requires a fixture tool that returns an InputRequiredResult carrying a sampling/createMessage inputRequest; Bifrost has no such tool. Becomes applicable if a Bifrost tool ever requests sampling through SEP-2322."
+  },
+  "input-required-result-basic-list-roots": {
+    "rationale": "Requires the fixture tool test_input_required_result_list_roots to return an InputRequiredResult with a roots/list inputRequest. Bifrost does bind roots through MRTR, but only from the tools it actually ships and only when it needs a workspace root, and the harness starts it with an explicit --root. The scenario names a fixture tool, so it cannot reach that path. Becomes applicable if the scenario ever drives roots binding through a tool discovered from tools/list."
+  },
+  "input-required-result-request-state": {
+    "rationale": "Needs an InputRequiredResult carrying requestState from a fixture tool before it can check state round-tripping; Bifrost returns a complete result. Becomes applicable if a Bifrost tool ever returns an InputRequiredResult."
+  },
+  "input-required-result-multiple-input-requests": {
+    "rationale": "Needs a fixture tool that returns several inputRequests of different types in one InputRequiredResult; Bifrost returns a complete result. Becomes applicable if a Bifrost tool ever returns an InputRequiredResult."
+  },
+  "input-required-result-multi-round": {
+    "rationale": "Needs a fixture tool that drives more than one input round; round 1 already fails because Bifrost returns a complete result. Becomes applicable if a Bifrost tool ever returns an InputRequiredResult."
+  },
+  "input-required-result-non-tool-request": {
+    "rationale": "Requires prompts/get to return an InputRequiredResult; Bifrost advertises no prompts capability and prompts/get errors. Becomes applicable if Bifrost ever advertises prompts and drives SEP-2322 input from a non-tool method."
+  },
+  "input-required-result-result-type": {
+    "rationale": "Checks that resultType is \"input_required\" on an InputRequiredResult; Bifrost's fixture-less tools/call returns \"complete\". Becomes applicable if a Bifrost tool ever returns an InputRequiredResult."
+  },
+  "input-required-result-tampered-state": {
+    "rationale": "Cannot reach its negative path: 'Prerequisite failed: could not get initial InputRequiredResult with requestState'. Becomes applicable if a Bifrost tool ever returns an InputRequiredResult carrying requestState."
+  },
+  "input-required-result-capability-check": {
+    "rationale": "Expects the server to emit only the inputRequests the client declared capabilities for; Bifrost emits none because no tool of its returns InputRequiredResult. Becomes applicable if a Bifrost tool ever returns an InputRequiredResult."
+  }
+}

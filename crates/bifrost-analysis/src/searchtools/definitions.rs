@@ -206,11 +206,21 @@ pub(super) fn resolve_definition_context_symbol(
         }
     }
 
+    let mut anchored_is_dotted_guess = false;
     let anchored = match split_workspace_definition_selector(analyzer, symbol) {
         DefinitionSelector::FileAnchored { anchor, lookup } => Some((anchor, lookup)),
         DefinitionSelector::Name(_) => {
             match split_path_qualified_definition_selector(analyzer, symbol) {
                 Some(PathQualifiedSelector::Resolved { anchor, lookup }) => Some((anchor, lookup)),
+                Some(PathQualifiedSelector::DottedGuess { anchor, lookup }) => {
+                    // The dotted-file fallback is a guess: only adopt it when
+                    // the anchor actually names the symbol. Otherwise the input
+                    // is a dotted symbol spelling whose first segment collides
+                    // with a file's basename, and the fuzzy stage below must
+                    // see it (#2409).
+                    anchored_is_dotted_guess = true;
+                    Some((anchor, lookup))
+                }
                 Some(PathQualifiedSelector::AmbiguousPath(item)) => {
                     return Err(vec![DefinitionDiagnostic {
                         kind: "ambiguous_path".to_string(),
@@ -234,7 +244,9 @@ pub(super) fn resolve_definition_context_symbol(
             .into_iter()
             .filter(|unit| rel_path_string(unit.source()) == anchor)
             .collect();
-        return group_definition_context_symbols(analyzer, symbol, narrowed);
+        if !(anchored_is_dotted_guess && narrowed.is_empty()) {
+            return group_definition_context_symbols(analyzer, symbol, narrowed);
+        }
     }
 
     match resolve_codeunit_fuzzy(analyzer, symbol) {

@@ -1,6 +1,7 @@
 use crate::call_match::{
     CppArgType, cpp_signature_param_types, cpp_split_top_level_commas, normalize_cpp_type_name,
 };
+use crate::compile_context::CppCompileContext;
 #[cfg(test)]
 use crate::declarations::cpp_displaced_preprocessor_terminator;
 use crate::declarations::{
@@ -3102,16 +3103,24 @@ impl<'a> VisibilityIndex<'a> {
             .is_some_and(|activation| activation <= reference_byte)
     }
 
-    /// The preprocessor facts the translation unit's compile command proves
-    /// for `file` (#2011).
+    /// The preprocessor facts the build proves for a reference sited in
+    /// `file` (#2011).
     ///
     /// Every `-D` that survives its command's `-D`/`-U` ordering is a positive
     /// `Defined` fact, and a fact holds only when every compile configuration
-    /// that names the file agrees on it (intersection). A file without a
-    /// database entry has no facts and every check runs on source structure
-    /// alone. The facts are strictly additive to the reference's active guard
-    /// set: they can prove a required guard, but the guard check itself is
-    /// never weakened and no implication is ever inferred from source text.
+    /// that governs the file agrees on it (intersection). The facts are
+    /// strictly additive to the reference's active guard set: they can prove a
+    /// required guard, but the guard check itself is never weakened and no
+    /// implication is ever inferred from source text.
+    ///
+    /// A file with its own database entry answers from that entry alone
+    /// (phase 1). A header takes its context from the translation units whose
+    /// include closure reaches it, intersected across all of them (phase 2):
+    /// the header is compiled once per including TU, so a fact holds for a
+    /// header-sited reference only when every one of those compilations
+    /// proves it. A reaching TU the database does not cover proves nothing,
+    /// which empties the intersection. A file nothing covers or reaches has
+    /// no facts and every check runs on source structure alone.
     pub fn compile_proven_guards(&self, file: &ProjectFile) -> Arc<HashSet<PreprocessorGuard>> {
         if let Some(cached) = self
             .compile_proven_guard_cells
@@ -3121,26 +3130,61 @@ impl<'a> VisibilityIndex<'a> {
         {
             return Arc::clone(cached);
         }
-        let contexts = self.cpp.compile_contexts_for(file);
-        let proven: HashSet<PreprocessorGuard> = match contexts.split_first() {
-            None => HashSet::default(),
-            Some((first, rest)) => first
-                .defined_macros
-                .iter()
-                .filter(|name| {
-                    rest.iter()
-                        .all(|context| context.defined_macros.contains(*name))
-                })
-                .cloned()
-                .map(PreprocessorGuard::Defined)
-                .collect(),
+        let names = match context_fact_names(self.cpp.compile_contexts_for(file)) {
+            Some(names) => names,
+            None => {
+                let mut translation_units = self.cpp.reaching_translation_units(file).into_iter();
+                let seed = translation_units.next().and_then(|translation_unit| {
+                    context_fact_names(self.cpp.compile_contexts_for(&translation_unit))
+                });
+                match seed {
+                    None => HashSet::default(),
+                    Some(mut names) => {
+                        for translation_unit in translation_units {
+                            let Some(reached) = context_fact_names(
+                                self.cpp.compile_contexts_for(&translation_unit),
+                            ) else {
+                                names.clear();
+                                break;
+                            };
+                            names.retain(|name| reached.contains(name));
+                            if names.is_empty() {
+                                break;
+                            }
+                        }
+                        names
+                    }
+                }
+            }
         };
-        let proven = Arc::new(proven);
+        let proven = Arc::new(
+            names
+                .into_iter()
+                .map(PreprocessorGuard::Defined)
+                .collect::<HashSet<_>>(),
+        );
         self.compile_proven_guard_cells
             .lock()
             .expect("C++ compile-proven guard cache poisoned")
             .insert(file.clone(), Arc::clone(&proven));
         proven
+    }
+
+    /// Whether no compile data covers the compilations of `file`: it has no
+    /// database entry of its own, and either nothing reaches it or some
+    /// translation unit that reaches it has no entry. This is the state a
+    /// regenerated `compile_commands.json` could decide; data that is present
+    /// for every governing compilation but does not prove a guard is a
+    /// decided conservative miss, not this state.
+    fn compile_context_is_absent(&self, file: &ProjectFile) -> bool {
+        if !self.cpp.compile_contexts_for(file).is_empty() {
+            return false;
+        }
+        let translation_units = self.cpp.reaching_translation_units(file);
+        translation_units.is_empty()
+            || translation_units
+                .iter()
+                .any(|translation_unit| self.cpp.compile_contexts_for(translation_unit).is_empty())
     }
 
     /// Whether a lookup miss for `identifier` in `file` is explainable by
@@ -3160,7 +3204,7 @@ impl<'a> VisibilityIndex<'a> {
         identifier: &str,
         reference: Node<'_>,
     ) -> bool {
-        if !self.cpp.compile_contexts_for(file).is_empty() {
+        if !self.compile_context_is_absent(file) {
             return false;
         }
         let Some(prepared) = self.cpp.prepared_syntax(file) else {
@@ -7724,33 +7768,53 @@ fn find_conditional_include_projection_index(
         }
     }
 
-    // One reached file can have several distinct compatible guard paths. A
-    // state is expanded once for each exact guard set and top-level activation
-    // byte; this preserves those paths while terminating include cycles.
+    // One reached file can have several distinct compatible guard paths. Each
+    // (file, activation byte) key keeps only the inclusion-minimal guard sets:
+    // the consumers ask existence questions whose answers are monotone in the
+    // guard set -- a path whose requirements hold, stay stable, and stay
+    // compatible under one environment does so under every subset as well --
+    // so a state subsumed by an existing subset cannot witness anything its
+    // subset does not, and inserting a smaller set evicts the supersets it
+    // subsumes. Exact-set dedup still terminated cycles, but dense `#ifdef`
+    // lattices (QMK's per-keyboard feature guards) enumerated the powerset of
+    // path-union guard sets through it: the state space, the per-key linear
+    // scans, and resident memory all grew without bound (#2365).
     let mut expanded: HashMap<(ProjectFile, usize), Vec<HashSet<PreprocessorGuard>>> =
         HashMap::default();
     while let Some((current_file, activation_byte, required_guards)) = pending.pop() {
         let guard_sets = expanded
             .entry((current_file.clone(), activation_byte))
             .or_default();
-        if guard_sets.contains(&required_guards) {
+        if guard_sets
+            .iter()
+            .any(|existing| existing.is_subset(&required_guards))
+        {
             continue;
         }
+        let (evicted, kept): (Vec<_>, Vec<_>) = guard_sets
+            .drain(..)
+            .partition(|existing| required_guards.is_subset(existing));
+        *guard_sets = kept;
         guard_sets.push(required_guards.clone());
+        if !evicted.is_empty()
+            && let Some(projections) = projections_by_source.get_mut(&current_file)
+        {
+            projections.retain(|projection| {
+                projection.activation_byte != activation_byte
+                    || !evicted.contains(&projection.required_guards)
+            });
+        }
         on_state();
 
-        let projections = projections_by_source
+        // A fresh minimal set has no equal in the store: equality would have
+        // been caught by the subset check above.
+        projections_by_source
             .entry(current_file.clone())
-            .or_default();
-        if !projections.iter().any(|projection| {
-            projection.activation_byte == activation_byte
-                && projection.required_guards == required_guards
-        }) {
-            projections.push(ConditionalIncludeProjection {
+            .or_default()
+            .push(ConditionalIncludeProjection {
                 activation_byte,
                 required_guards: required_guards.clone(),
             });
-        }
 
         let Some(current_prepared) = cpp.prepared_syntax(&current_file) else {
             continue;
@@ -7901,6 +7965,26 @@ fn first_declaration_byte(analyzer: &CppGraphSource<'_>, candidate: &CodeUnit) -
         .into_iter()
         .map(|range| range.start_byte)
         .min()
+}
+
+/// The macro names every configuration in `contexts` defines -- the fact set
+/// one file's compile-database coverage proves (#2011). `None` when the
+/// database has no entry for the file, which is different from an empty
+/// intersection: no entry means no coverage, while an empty intersection is
+/// covered-and-proves-nothing.
+fn context_fact_names(contexts: &[CppCompileContext]) -> Option<HashSet<String>> {
+    let (first, rest) = contexts.split_first()?;
+    Some(
+        first
+            .defined_macros
+            .iter()
+            .filter(|name| {
+                rest.iter()
+                    .all(|context| context.defined_macros.contains(*name))
+            })
+            .cloned()
+            .collect(),
+    )
 }
 
 fn guard_requirements_hold_at_reference(

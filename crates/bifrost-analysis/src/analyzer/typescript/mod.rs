@@ -28,9 +28,10 @@ use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 use crate::analyzer::usages::js_ts_graph::JsTsUsageIndex;
 use brokk_bifrost_js_ts::identifiers::collect_js_ts_identifiers;
 use brokk_bifrost_js_ts::imports::extract_js_ts_call_receiver;
-use brokk_bifrost_js_ts::model::{module_code_unit, module_scoped_field_uses_file_name};
+use brokk_bifrost_js_ts::model::{module_code_unit, module_scoped_field_uses_file_name, node_text};
 use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::test_detection::detect_js_ts_test_assertion_smells;
+use brokk_bifrost_js_ts::type_text::ts_clean_type_text;
 use brokk_bifrost_js_ts::typescript::*;
 
 mod semantic;
@@ -191,6 +192,34 @@ impl JsTsSource for TypescriptAnalyzer {
 
     fn raw_signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner.signatures_vec_of(code_unit)
+    }
+
+    fn type_alias_value_text(&self, code_unit: &CodeUnit) -> Option<String> {
+        if !self.inner.is_type_alias(code_unit) {
+            return None;
+        }
+        let prepared = self.inner.prepared_syntax(code_unit.source())?;
+        let node = prepared.declaration_node(code_unit)?;
+        let declaration = if node.kind() == "export_statement" {
+            node.child_by_field_name("declaration")?
+        } else {
+            node
+        };
+        if declaration.kind() != "type_alias_declaration" {
+            return None;
+        }
+        let value = declaration.child_by_field_name("value")?;
+        Some(node_text(value, prepared.source()).trim().to_string())
+    }
+
+    fn member_type_annotation_text(&self, code_unit: &CodeUnit) -> Option<String> {
+        let prepared = self.inner.prepared_syntax(code_unit.source())?;
+        let node = prepared.declaration_node(code_unit)?;
+        if node.kind() != "property_signature" && node.kind() != "index_signature" {
+            return None;
+        }
+        let annotation = node.child_by_field_name("type")?;
+        Some(ts_clean_type_text(node_text(annotation, prepared.source())))
     }
 
     fn usage_definitions(&self) -> &dyn brokk_bifrost_core::analyzer::BoundedDefinitionLookup {

@@ -1,0 +1,35 @@
+{
+  "server-initialize": {
+    "proves": "The stateful 2025-11-25 handshake: initialize returns a well-formed InitializeResult, the bridge-minted session id is visible ASCII, and every byte Bifrost sent validates against the official 2025-11-25 schema."
+  },
+  "ping": {
+    "proves": "Bifrost answers ping with an empty result and the response validates against the official schema."
+  },
+  "completion-complete": {
+    "proves": "Bifrost answers completion/complete with a schema-valid CompleteResult ({\"completion\":{\"values\":[]}}) at both supported revisions. Bifrost does not advertise the completions capability; the value here is that the answer it does give is spec-shaped rather than malformed."
+  },
+  "tools-list": {
+    "proves": "tools/list returns Bifrost's real toolset with schema-valid Tool entries at both supported revisions, including the 2026-07-28 cache hints (ttlMs, cacheScope) that the caching scenario finds missing on other list methods."
+  },
+  "tools-call-simple-text": {
+    "proves": "A full tools/call round trip is schema-valid at both revisions. The fixture tool test_simple_text does not exist in Bifrost, so what the behavioral check actually accepts is Bifrost's isError tool result carrying text content; that result shape, and the resultType:\"complete\" envelope at 2026-07-28, is what regressing here would break."
+  },
+  "tools-call-error": {
+    "proves": "Bifrost reports an unusable tool call as an isError CallToolResult rather than a JSON-RPC error, and that result is schema-valid at both revisions. As with tools-call-simple-text the named fixture tool is absent, so this pins the tool-level error envelope, not a fixture behavior."
+  },
+  "resources-list": {
+    "proves": "resources/list returns Bifrost's real resource (bifrost://agent-guidance/agents.md) with a schema-valid Resource entry at both revisions, including the 2026-07-28 cache hints."
+  },
+  "sep-2164-resource-not-found": {
+    "proves": "resources/read for an unknown URI returns a JSON-RPC -32602 error rather than an empty contents array, per SEP-2164, and the error is schema-valid at 2026-07-28. The data.uri echo is a SHOULD and is reported as a warning."
+  },
+  "input-required-result-missing-input-response": {
+    "proves": "A tools/call that carries an inputResponses object Bifrost never asked for still produces a schema-valid complete result at 2026-07-28 instead of a malformed or crashed response. The scenario's SEP-2322 behavioral expectation is a WARNING for a server that never returns input_required, so this is a wire-shape pin."
+  },
+  "input-required-result-ignore-extra-params": {
+    "proves": "Bifrost ignores unexpected tools/call params instead of rejecting the request, per SEP-2322, and the response is schema-valid at 2026-07-28."
+  },
+  "input-required-result-validate-input": {
+    "proves": "Malformed inputResponses values (a number, then null) do not break Bifrost's tools/call handling; the responses stay schema-valid at 2026-07-28. The SHOULD-level validation expectations are reported as warnings."
+  }
+}

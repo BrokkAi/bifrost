@@ -110,7 +110,11 @@ impl Language {
             Language::None => &[],
             Language::Java => &["java"],
             Language::Go => &["go"],
-            Language::Cpp => &["c", "cc", "cpp", "cxx", "h", "hpp", "hh", "hxx"],
+            // `hin` is the C header-template convention (krb5's
+            // `include/krb5/krb5.hin` generates the public `krb5/krb5.h`);
+            // the template holds the real declarations, so it is parsed and
+            // indexed like any other C header.
+            Language::Cpp => &["c", "cc", "cpp", "cxx", "h", "hin", "hpp", "hh", "hxx"],
             Language::JavaScript => &["js", "mjs", "cjs", "jsx"],
             Language::TypeScript => &["ts", "tsx"],
             Language::Python => &["py"],
@@ -3492,15 +3496,34 @@ pub struct SemanticAbsenceProof {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticDiagnosticIncompleteReason {
-    MissingDependencyDiscovery { boundary: BoundaryStatus },
-    StaleGeneration { expected: u64, actual: u64 },
+    MissingDependencyDiscovery {
+        boundary: BoundaryStatus,
+    },
+    StaleGeneration {
+        expected: u64,
+        actual: u64,
+    },
     Cancelled,
     Truncated,
-    UnsupportedSemantics { detail: String },
-    DynamicBehavior { detail: String },
-    RuntimeUnavailable { detail: String },
-    CorruptSemanticPack { detail: String },
-    UnsupportedGeneratedSurface { detail: String },
+    UnsupportedSemantics {
+        detail: String,
+    },
+    DynamicBehavior {
+        detail: String,
+    },
+    RuntimeUnavailable {
+        detail: String,
+    },
+    CorruptSemanticPack {
+        detail: String,
+    },
+    UnsupportedGeneratedSurface {
+        detail: String,
+    },
+    PackExtractionGap {
+        pack_id: String,
+        declaration: String,
+    },
 }
 
 /// The result of one structured lookup made while collecting diagnostics.
@@ -3619,6 +3642,41 @@ impl SemanticDiagnosticReport {
         self.outcomes
             .push(SemanticDiagnosticOutcome::Incomplete { range, reasons });
         self.status = SemanticDiagnosticReportStatus::Incomplete;
+    }
+
+    /// Replace otherwise-proven absences whose checked domain intersects an
+    /// external knowledge gap. The diagnostic paired with a degraded absence
+    /// is removed because incomplete evidence must never emit an error.
+    pub fn degrade_absences(
+        &mut self,
+        mut reason_for: impl FnMut(
+            &SemanticDiagnosticDomain,
+        ) -> Option<SemanticDiagnosticIncompleteReason>,
+    ) {
+        let mut diagnostics = std::mem::take(&mut self.diagnostics).into_iter();
+        let mut retained = Vec::new();
+        for outcome in &mut self.outcomes {
+            let SemanticDiagnosticOutcome::Absent(proof) = outcome else {
+                continue;
+            };
+            let diagnostic = diagnostics
+                .next()
+                .expect("every absence outcome has one diagnostic");
+            if let Some(reason) = reason_for(&proof.domain) {
+                *outcome = SemanticDiagnosticOutcome::Incomplete {
+                    range: Some(proof.range),
+                    reasons: vec![reason],
+                };
+                self.status = SemanticDiagnosticReportStatus::Incomplete;
+            } else {
+                retained.push(diagnostic);
+            }
+        }
+        debug_assert!(
+            diagnostics.next().is_none(),
+            "every semantic diagnostic has one absence outcome"
+        );
+        self.diagnostics = retained;
     }
 
     pub fn diagnostics(&self) -> &[SemanticDiagnostic] {

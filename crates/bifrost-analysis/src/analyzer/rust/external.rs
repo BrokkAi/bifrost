@@ -81,6 +81,7 @@ impl DependencyPackAdapter for RustDependencyPackAdapter {
                     code: "rust.rustdoc.feature_set_narrower_than_resolved".to_owned(),
                     severity: ProducerDiagnosticSeverity::Warning,
                     location: None,
+                    declaration: None,
                     message: format!(
                         "rustdoc ran without the Cargo-resolved features {missing:?}, so items they gate are absent from this surface"
                     ),
@@ -335,6 +336,7 @@ fn failed_production(code: &str, message: &str) -> DependencyPackProduction {
             severity: ProducerDiagnosticSeverity::Error,
             code: code.to_owned(),
             location: None,
+            declaration: None,
             message: message.to_owned(),
         }],
         suppressed_diagnostics: 0,

@@ -692,6 +692,7 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
                         severity: ProducerDiagnosticSeverity::Error,
                         code: "artifact.kind".to_owned(),
                         location: Some(artifact.path().to_string_lossy().into_owned()),
+                        declaration: None,
                         message: format!("unsupported JVM dependency artifact kind {kind:?}"),
                     },
                     limits,
@@ -718,6 +719,7 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "artifact.role".to_owned(),
                     location: Some(artifact.path().to_string_lossy().into_owned()),
+                    declaration: None,
                     message: "JVM dependency requires binary or sources artifact roles".to_owned(),
                 }),
                 (_, None) => {}
@@ -1134,6 +1136,7 @@ fn push_java_merge_conflict(
             severity: ProducerDiagnosticSeverity::Warning,
             code: "java.source_binary_conflict".to_owned(),
             location: Some(declaration_id.to_owned()),
+            declaration: None,
             message: "source and binary facts disagree; deterministic source facts were kept"
                 .to_owned(),
         });
@@ -1558,6 +1561,7 @@ impl JvmExternalDeclarationIndex {
                 severity: ProducerDiagnosticSeverity::Warning,
                 code: "jvm.index.unread_entries".to_owned(),
                 location: Some(artifact_path.to_string_lossy().into_owned()),
+                declaration: None,
                 message: format!(
                     "bounded index read skipped {skipped_entries} archive entries, so this artifact declares types and members the index never read"
                 ),
@@ -1568,6 +1572,7 @@ impl JvmExternalDeclarationIndex {
                 severity: ProducerDiagnosticSeverity::Warning,
                 code: "limit.artifact_members".to_owned(),
                 location: Some(artifact_path.to_string_lossy().into_owned()),
+                declaration: None,
                 message: format!(
                     "bounded index read stopped after {MAX_ARTIFACT_MEMBERS} member declarations from this artifact"
                 ),
@@ -1721,6 +1726,7 @@ fn discovery_producer_diagnostic(diagnostic: DependencyPackDiagnostic) -> Produc
         },
         code: diagnostic.code,
         location: diagnostic.location,
+        declaration: None,
         message: diagnostic.message,
     }
 }

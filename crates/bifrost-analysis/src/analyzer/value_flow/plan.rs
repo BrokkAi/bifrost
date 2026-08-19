@@ -1884,8 +1884,8 @@ impl ValueFlowPlan {
         })
     }
 
-    /// The authored-complete external summary that closes this call's residual
-    /// blanket-refinement arm, if the guards permit the closure (#2342).
+    /// The contract-claiming external summary that closes this call's residual
+    /// blanket-refinement arm, if the guards permit the closure (#2342, #2371).
     ///
     /// A call to a callee with no analyzed body carries two dispatch arms: the
     /// named-target arm the activated summary binds to, and a residual
@@ -1897,10 +1897,11 @@ impl ValueFlowPlan {
     /// can never address it, and `ProvenBySummary` was unreachable for every
     /// external call regardless of how complete the authored claim was.
     ///
-    /// An authored-complete summary for the exact target named on a sibling arm
-    /// of the same call is an assertion about that call's behavior at that
-    /// target, so it answers the residual arm as well. The guards keep that
-    /// from becoming a blanket amnesty:
+    /// A contract-claiming summary for the exact target named on a sibling arm
+    /// of the same call is an assertion about every implementation of that
+    /// target, so it answers the residual arm too -- that is the "external
+    /// residual" half of #2371's discharge rule. The guards keep that from
+    /// becoming a blanket amnesty:
     ///
     ///   * The caller admits only `AcceptAuthoredComplete`, so `Complete` keeps
     ///     asking `Derived` and authored trust still cannot launder into it
@@ -1910,15 +1911,29 @@ impl ValueFlowPlan {
     ///     second `Unresolved` arm name none, and a `Limit` or `Continuation`
     ///     boundary is not a dispatch arm at all -- none of them can carry the
     ///     summary, so a genuinely ambiguous target set still refuses.
-    ///   * The summary must be authored complete and fully bindable at this
-    ///     call. A partial summary does not claim to close its own boundary, so
-    ///     it certainly does not close a sibling's.
+    ///   * The summary must carry an explicit `covers_overrides` claim (#2371),
+    ///     be authored complete, and be fully bindable at this call. Complete
+    ///     alone is not enough: it is a statement about the summary's own
+    ///     target, not about every implementation of it, so closing on
+    ///     completeness alone -- what this closure did before #2371 -- is
+    ///     exactly the inheritance the design rejects.
     ///   * The call must have no analyzed callee of its own. A call that both
     ///     enters a workspace body and names an unmaterialized declaration --
     ///     an interface member with one visible implementor, say -- has a
     ///     target set the summary does not describe, and its residual arm is
     ///     about the implementors nobody enumerated. That is exactly the
     ///     genuine ambiguity the residual arm exists to report, so it refuses.
+    ///
+    /// This closure is the "external residual" half of the discharge rule
+    /// only. The "workspace half" -- CHA proving the workspace implementors of
+    /// the resolved declaring member enumerated, possibly empty -- is proven
+    /// upstream in `workspace_oracle::dispatch`: a call whose only named target
+    /// is an unmaterialized external member carries no workspace declaration to
+    /// run CHA against, so that half is proven instead from the analyzer's
+    /// complete short-name index, and when it cannot be proven the call gets an
+    /// additional `Truncated` arm that this closure cannot address (`Truncated`
+    /// is excluded above), so `call_boundaries_are_fully_modeled` still refuses
+    /// the call as a whole. This closure never has to ask that question itself.
     ///
     /// A sibling arm that names a target the activated packs do not summarize
     /// fails `call_boundaries_are_fully_modeled` on its own turn through the
@@ -1949,7 +1964,22 @@ impl ValueFlowPlan {
                     | DispatchBoundaryKind::Truncated => return None,
                 };
                 let summary = self.external_summaries.summary_for(target)?;
-                if !summary.completeness().is_complete()
+                let SummaryOrigin::External(origin) = summary.key().identity().origin() else {
+                    // An inferred summary is derived from a body Bifrost read,
+                    // so it is not an authored claim and has no authored
+                    // identity to record.
+                    return None;
+                };
+                // #2371: completeness alone used to be enough to close this
+                // arm, which is exactly the inheritance the design rejects --
+                // a summary can be honestly complete about its own target
+                // without its author having asserted anything about every
+                // other implementation of the member. `covers_overrides` is
+                // the explicit opt-in that statement requires; a call whose
+                // sibling arm names a target with no such claim keeps its
+                // residual arm open regardless of how complete the summary is.
+                if !origin.covers_overrides()
+                    || !summary.completeness().is_complete()
                     || !self.model_is_fully_bindable(
                         call,
                         summary.transfers(),
@@ -1958,12 +1988,6 @@ impl ValueFlowPlan {
                 {
                     return None;
                 }
-                let SummaryOrigin::External(origin) = summary.key().identity().origin() else {
-                    // An inferred summary is derived from a body Bifrost read,
-                    // so it is not an authored claim and has no authored
-                    // identity to record.
-                    return None;
-                };
                 Some(AuthoredArmClosure {
                     call: call.clone(),
                     target: target.clone(),

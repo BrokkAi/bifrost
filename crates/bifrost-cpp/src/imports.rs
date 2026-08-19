@@ -213,7 +213,28 @@ pub fn resolve_include_targets_with_index(
         return candidates;
     }
     candidates.extend(include_targets.resolve_unique_fallback(source_file, include));
+    if candidates.is_empty()
+        && let Some(template) = header_template_include_spelling(include)
+    {
+        candidates = include_targets.resolve_direct(source_file, &template);
+        if candidates.is_empty() {
+            candidates.extend(include_targets.resolve_unique_fallback(source_file, &template));
+        }
+    }
     candidates
+}
+
+/// The `.hin` header-template spelling of an `.h` include, or `None` for any
+/// other include. A `.hin` file is the committed template the build turns
+/// into the like-named public header in the same directory -- krb5 generates
+/// `include/krb5/krb5.h` from `include/krb5/krb5.hin` (#2372) -- so in a tree
+/// without build artifacts the template is the only file holding those
+/// declarations. The retry runs only after every `.h` rule has failed, so a
+/// real header always wins over its template.
+fn header_template_include_spelling(include: &str) -> Option<String> {
+    let path = Path::new(include);
+    (path.extension() == Some(std::ffi::OsStr::new("h")))
+        .then(|| path.with_extension("hin").to_string_lossy().into_owned())
 }
 
 pub fn resolve_direct_include_targets_with_index(
@@ -443,5 +464,30 @@ mod tests {
             &ambiguous_index,
         );
         assert!(ambiguous.is_empty());
+    }
+
+    #[test]
+    fn unresolved_h_include_falls_back_to_hin_template() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let stub = write_file(&root, "src/include/krb5.h");
+        let template = write_file(&root, "src/include/krb5/krb5.hin");
+        let index = IncludeTargetIndex::build([&stub, &template]);
+
+        let resolved = resolve_include_targets_with_index(&stub, "krb5/krb5.h", &index);
+        assert_eq!(resolved, vec![template]);
+    }
+
+    #[test]
+    fn real_header_wins_over_hin_template() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let stub = write_file(&root, "src/include/krb5.h");
+        let generated = write_file(&root, "src/include/krb5/krb5.h");
+        let template = write_file(&root, "src/include/krb5/krb5.hin");
+        let index = IncludeTargetIndex::build([&stub, &generated, &template]);
+
+        let resolved = resolve_include_targets_with_index(&stub, "krb5/krb5.h", &index);
+        assert_eq!(resolved, vec![generated]);
     }
 }

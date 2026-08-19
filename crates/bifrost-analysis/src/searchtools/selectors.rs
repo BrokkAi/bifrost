@@ -614,7 +614,23 @@ pub(super) enum DefinitionSelector<'a> {
 }
 
 pub(super) enum PathQualifiedSelector<'a> {
-    Resolved { anchor: String, lookup: &'a str },
+    Resolved {
+        anchor: String,
+        lookup: &'a str,
+    },
+    /// A match from the dotted-file fallback ([`dotted_file_symbol_selector`]):
+    /// a *guess* that a dotted spelling means `file.symbol`, unlike the
+    /// explicit `path::symbol` and `path:symbol` forms. When the guessed
+    /// anchor's scoped lookup finds nothing, callers must fall through to
+    /// plain symbol resolution on the full input instead of reporting anchor
+    /// not-found: a dotted namespace path whose first segment happens to be
+    /// the basename of an extensionless workspace file (SteamTools'
+    /// `ref/ArchiSteamFarm` vs the `ArchiSteamFarm.IPC...` namespace) is a
+    /// symbol spelling, not a path (#2409).
+    DottedGuess {
+        anchor: String,
+        lookup: &'a str,
+    },
     AmbiguousPath(AmbiguousPathInput),
 }
 
@@ -762,6 +778,10 @@ fn resolve_selectable_definition_groups_bounded(
     {
         match path_selector {
             PathQualifiedSelector::Resolved {
+                anchor: path_anchor,
+                lookup: path_lookup,
+            }
+            | PathQualifiedSelector::DottedGuess {
                 anchor: path_anchor,
                 lookup: path_lookup,
             } => {
@@ -1540,7 +1560,7 @@ pub(super) fn unsupported_selector_shape_guidance(
             "`symbol@path` selectors are not supported; retry with the bare symbol `{symbol}` plus the `paths` parameter `{path}`, or use `{path}#{symbol}`"
         ));
     }
-    if let Some(PathQualifiedSelector::Resolved {
+    if let Some(PathQualifiedSelector::DottedGuess {
         anchor: path,
         lookup: symbol,
     }) = dotted_file_symbol_selector(analyzer, trimmed)
@@ -1682,7 +1702,7 @@ pub(super) fn dotted_file_symbol_selector<'a>(
         }
         match resolver.resolve_literal(path_candidate) {
             ResolvedFileInput::File(file) => {
-                return Some(PathQualifiedSelector::Resolved {
+                return Some(PathQualifiedSelector::DottedGuess {
                     anchor: rel_path_string(&file),
                     lookup: symbol,
                 });

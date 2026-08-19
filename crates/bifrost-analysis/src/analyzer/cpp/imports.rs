@@ -34,8 +34,9 @@ use std::sync::Arc;
 
 /// Extensions [`Language::Cpp`] claims that are headers, not translation
 /// units. Everything else in [`Language::Cpp::extensions`] (`c`, `cc`, `cpp`,
-/// `cxx`) is a translation unit -- see [`is_cpp_translation_unit`].
-const CPP_HEADER_EXTENSIONS: &[&str] = &["h", "hpp", "hh", "hxx"];
+/// `cxx`) is a translation unit -- see [`is_cpp_translation_unit`]. `hin` is
+/// the C header-template spelling (krb5's `krb5.hin`), so it is a header too.
+const CPP_HEADER_EXTENSIONS: &[&str] = &["h", "hin", "hpp", "hh", "hxx"];
 
 /// Whether `file` is a C/C++ translation unit (as opposed to a header): one of
 /// [`Language::Cpp::extensions`] that is not in [`CPP_HEADER_EXTENSIONS`].

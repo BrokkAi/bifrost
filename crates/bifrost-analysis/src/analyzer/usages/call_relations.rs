@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::languages::language_support;
 use crate::analyzer::lexical_definitions::{
     FormalParameterLayout, PythonMethodBinding, formal_parameter_slots,
 };
@@ -516,7 +517,11 @@ impl CallRelationService {
                 super::get_definition::trace::boundary_evidence(analyzer, &location.file, name);
             lookup.boundary = Some(boundary);
         }
-        apply_call_target_outcome(&mut lookup, outcome, limits.max_candidates);
+        apply_call_target_outcome(
+            &mut lookup,
+            expand_imported_external_callee(analyzer, &location.file, outcome),
+            limits.max_candidates,
+        );
         lookup.cancelled |= cancellation.is_some_and(CancellationToken::is_cancelled);
         lookup
     }
@@ -962,6 +967,30 @@ fn apply_dispatch_outcome(
     max_targets: usize,
 ) {
     apply_dispatch_outcome_with_flags(lookup, outcome, max_targets, false, false, false);
+}
+
+/// Give the owning language a chance to expand an imported callee spelling to
+/// the external identity that semantic models publish.
+fn expand_imported_external_callee(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    mut outcome: CallTargetLookupOutcome,
+) -> CallTargetLookupOutcome {
+    if outcome.outcome.status != DefinitionLookupStatus::NoDefinition {
+        return outcome;
+    }
+    let Some(text) = outcome.outcome.resolved_reference_target() else {
+        return outcome;
+    };
+    let Some(expanded) = language_support(language_for_file(file))
+        .and_then(|support| support.expand_imported_external_callee(analyzer, file, text))
+    else {
+        return outcome;
+    };
+    if let Some(reference) = outcome.outcome.reference.as_mut() {
+        reference.text = expanded;
+    }
+    outcome
 }
 
 fn apply_call_target_outcome(

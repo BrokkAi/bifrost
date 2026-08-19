@@ -5,7 +5,6 @@ import {
   confirmReleaseVersion,
   normalizeReleaseTag,
   readCargoVersion,
-  syncBifrostCompatibilityRequirementSource,
   syncBifrostDependencyVersions,
   syncCitationVersion,
   validatePyprojectVersionInheritance,
@@ -62,23 +61,6 @@ test("rejects missing or duplicate top-level citation versions", () => {
   assert.throws(
     () => syncCitationVersion('version: "0.9.5"\nversion: "0.9.6"\n', "0.10.0"),
     /found 2/u,
-  );
-});
-
-test("synchronizes a foundry compatibility requirement without changing its lower bound", () => {
-  const source = [
-    'const BIFROST_REQUIREMENT: &str = ">=0.8.0, <0.10.0";',
-    'const PACK_LICENSE: &str = "Apache-2.0";',
-    "",
-  ].join("\r\n");
-
-  assert.equal(
-    syncBifrostCompatibilityRequirementSource(source, "0.10.0", "foundry.rs"),
-    [
-      'const BIFROST_REQUIREMENT: &str = ">=0.8.0, <0.11.0";',
-      'const PACK_LICENSE: &str = "Apache-2.0";',
-      "",
-    ].join("\r\n"),
   );
 });
 

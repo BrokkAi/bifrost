@@ -486,6 +486,86 @@ mod tests {
             sarif.contains("\"executionSuccessful\":true"),
             "a reliable summary-backed run reports a successful invocation:\n{sarif}"
         );
+        assert!(
+            !sarif.contains("authoredArmClosures"),
+            "a synthetic run with no recorded closure must omit the property:\n{sarif}"
+        );
+    }
+
+    #[test]
+    fn authored_arm_closure_renders_in_human_and_sarif() {
+        use crate::{PolicyAnalysisType, PolicyRun, PolicyWorkReport};
+
+        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+            CatalogRegistryLimits::default(),
+        ));
+        let mut registry =
+            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
+        registry
+            .register_policy_bytes(
+                PolicySourceIdentity::new("test:render-authored-arm-closure"),
+                MATCHING_POLICY.as_bytes(),
+            )
+            .expect("valid policy");
+        let policy = registry.policies().next().expect("one policy");
+        let descriptor = PolicyRuleDescriptor::from_loaded(policy);
+        let mut run = PolicyRun::try_new(
+            policy.definition().metadata.id.clone(),
+            policy.semantic_hash(),
+            PolicyAnalysisType::Match,
+            PolicyRunCompletion::ProvenBySummary,
+            Vec::new(),
+            Vec::new(),
+            false,
+            PolicyWorkReport::default(),
+            &PolicyBudget::default(),
+        )
+        .expect("synthetic run");
+        run.set_authored_arm_closures(vec![
+            crate::AuthoredArmClosureEvidence::try_new(
+                "test.pack#summary.decode",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                1,
+            )
+            .unwrap(),
+        ]);
+        let report =
+            PolicyReportDocument::try_new(vec![descriptor], vec![run], Vec::new(), false, 0, None)
+                .expect("report with authored-arm-closure evidence");
+
+        let mut human = Vec::new();
+        write_policy_human(
+            &report,
+            &HumanRenderOptions::default(),
+            &mut human,
+            usize::MAX,
+        )
+        .unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(
+            human.contains("authored arm closure model test.pack#summary.decode"),
+            "human output must name the authored claim:\n{human}"
+        );
+
+        let mut sarif = Vec::new();
+        write_policy_sarif(
+            &report,
+            &SarifToolIdentity::default(),
+            &mut sarif,
+            usize::MAX,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&sarif).unwrap();
+        let closures = &value["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+            .as_array()
+            .expect("completion notifications")
+            .iter()
+            .find(|notification| {
+                notification["descriptor"]["id"] == "BIFROST_POLICY_PROVEN_BY_SUMMARY"
+            })
+            .expect("proven-by-summary notification")["properties"]["bifrost.authoredArmClosures"];
+        assert_eq!(closures[0]["model"], "test.pack#summary.decode", "{value}");
+        assert_eq!(closures[0]["contract_version"], 1, "{value}");
     }
 
     fn diagnostic_report(source: &str) -> PolicyReportDocument {

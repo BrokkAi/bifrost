@@ -82,7 +82,9 @@ pub(crate) struct ScalaQueryResolver<'a> {
 /// `CppDispatch` carries: a `dyn IAnalyzer` cannot be unsized to another trait
 /// object, and one of the three questions -- the merged `DefinitionIndexHandle`
 /// -- is built per call and so can never be lent out as a `&dyn` at all.
-struct ScalaDispatch<'a>(&'a dyn IAnalyzer);
+pub(in crate::analyzer::usages) struct ScalaDispatch<'a>(
+    pub(in crate::analyzer::usages) &'a dyn IAnalyzer,
+);
 
 impl ScalaWorkspaceSource for ScalaDispatch<'_> {
     fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
@@ -184,6 +186,7 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
                 eligibility,
                 hits: &mut hits,
                 observed_hits: &mut observed_hits,
+                unproven_hits: None,
                 enclosing_cache: HashMap::default(),
                 relevant_names: catalog.relevant_names(),
                 allow_all_names: false,
@@ -193,6 +196,7 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
             scan_scala_query_file(
                 self.scala,
                 analyzer,
+                &dispatch,
                 file,
                 &source,
                 &mut sink,

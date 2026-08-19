@@ -9,7 +9,7 @@
   "language": "java",
   "ecosystem": "maven",
   "compatibility": {
-    "bifrost": ">=0.8.0, <0.11.0",
+    "bifrost": ">=0.8.0, <1.0.0",
     "toolchains": [
       {
         "name": "jdk",
@@ -46,14 +46,15 @@
         "kind": "procedure_summaries",
         "summaries": [
           {
-            "id": "javax.servlet.http.httpservletrequest.getparametervalues",
+            "id": "javax.servlet.servletrequest.getparametervalues",
             "target": {
-              "path": "javax/servlet/http/HttpServletRequest.java",
-              "symbol": "javax.servlet.http.HttpServletRequest.getParameterValues(java.lang.String)",
+              "path": "javax/servlet/ServletRequest.java",
+              "symbol": "javax.servlet.ServletRequest.getParameterValues(java.lang.String)",
               "has_receiver": true,
               "parameter_count": 1
             },
             "completeness": "complete",
+            "covers_overrides": true,
             "locations": [],
             "transfers": [
               {
@@ -69,14 +70,15 @@
             "effects": []
           },
           {
-            "id": "javax.servlet.http.httpservletrequest.getparameter",
+            "id": "javax.servlet.servletrequest.getparameter",
             "target": {
-              "path": "javax/servlet/http/HttpServletRequest.java",
-              "symbol": "javax.servlet.http.HttpServletRequest.getParameter(java.lang.String)",
+              "path": "javax/servlet/ServletRequest.java",
+              "symbol": "javax.servlet.ServletRequest.getParameter(java.lang.String)",
               "has_receiver": true,
               "parameter_count": 1
             },
             "completeness": "complete",
+            "covers_overrides": true,
             "locations": [],
             "transfers": [
               {
@@ -100,6 +102,7 @@
               "parameter_count": 0
             },
             "completeness": "complete",
+            "covers_overrides": true,
             "locations": [],
             "transfers": [
               {
@@ -123,6 +126,7 @@
               "parameter_count": 1
             },
             "completeness": "complete",
+            "covers_overrides": true,
             "locations": [],
             "transfers": [
               {
@@ -138,14 +142,15 @@
             "effects": []
           },
           {
-            "id": "javax.servlet.http.httpservletrequest.getparametermap",
+            "id": "javax.servlet.servletrequest.getparametermap",
             "target": {
-              "path": "javax/servlet/http/HttpServletRequest.java",
-              "symbol": "javax.servlet.http.HttpServletRequest.getParameterMap()",
+              "path": "javax/servlet/ServletRequest.java",
+              "symbol": "javax.servlet.ServletRequest.getParameterMap()",
               "has_receiver": true,
               "parameter_count": 0
             },
             "completeness": "complete",
+            "covers_overrides": true,
             "locations": [],
             "transfers": [
               {
@@ -161,14 +166,15 @@
             "effects": []
           },
           {
-            "id": "javax.servlet.http.httpservletrequest.getparameternames",
+            "id": "javax.servlet.servletrequest.getparameternames",
             "target": {
-              "path": "javax/servlet/http/HttpServletRequest.java",
-              "symbol": "javax.servlet.http.HttpServletRequest.getParameterNames()",
+              "path": "javax/servlet/ServletRequest.java",
+              "symbol": "javax.servlet.ServletRequest.getParameterNames()",
               "has_receiver": true,
               "parameter_count": 0
             },
             "completeness": "complete",
+            "covers_overrides": true,
             "locations": [],
             "transfers": [
               {
@@ -192,6 +198,7 @@
               "parameter_count": 1
             },
             "completeness": "complete",
+            "covers_overrides": true,
             "locations": [],
             "transfers": [
               {
@@ -215,6 +222,7 @@
               "parameter_count": 0
             },
             "completeness": "complete",
+            "covers_overrides": true,
             "locations": [],
             "transfers": [
               {
@@ -238,6 +246,7 @@
               "parameter_count": 0
             },
             "completeness": "complete",
+            "covers_overrides": true,
             "locations": [],
             "transfers": [
               {

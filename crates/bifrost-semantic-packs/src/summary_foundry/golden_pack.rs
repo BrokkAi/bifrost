@@ -53,6 +53,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
 use serde::{Deserialize, Serialize};
 
 use super::sanitizer_pack::summary_id;
+use super::{FOUNDRY_BIFROST_REQUIREMENT, FOUNDRY_PRODUCER_VERSION};
 
 /// The audit-report format tag. Bump it when a consumer must read the file
 /// differently, not when a field is added.
@@ -64,19 +65,9 @@ pub const GOLDEN_AUDIT_FILE_NAME: &str = "rejects.json";
 /// The producer name recorded in the generated pack.
 const PRODUCER_NAME: &str = "bifrost-golden-foundry";
 
-/// The golden foundry's own version, advanced when the converter changes the
-/// shape of its output. It is deliberately not the crate version: the checked-in
-/// pack is gated on byte equality with this generator, and reading the crate
-/// version would break that gate at every release bump without any content
-/// change.
-const PRODUCER_VERSION: &str = "0.9.0";
-
 /// The pack content version. It is the golden content's own version, not the
 /// Bifrost version, and advances when the shipped claims change.
 const PACK_CONTENT_VERSION: &str = "0.1.0";
-
-/// The Bifrost compatibility requirement the generated pack declares.
-const BIFROST_REQUIREMENT: &str = ">=0.8.0, <0.11.0";
 
 /// The authored golden content is Bifrost's own claim, not a slice of the JDK
 /// or of CPython. New Bifrost-owned public packs use the public project
@@ -500,6 +491,7 @@ fn build_summary(candidate: GoldenCandidate, realm: GoldenRealm) -> AuthoredProc
         id: summary_id(&target.symbol),
         target,
         completeness: candidate.completeness,
+        covers_overrides: false,
         locations: Vec::new(),
         transfers: candidate.transfers,
         effects: Vec::new(),
@@ -643,12 +635,12 @@ fn build_pack(
         version: PACK_CONTENT_VERSION.to_owned(),
         producer: Producer {
             name: PRODUCER_NAME.to_owned(),
-            version: PRODUCER_VERSION.to_owned(),
+            version: FOUNDRY_PRODUCER_VERSION.to_owned(),
         },
         language: realm.language.to_owned(),
         ecosystem: realm.ecosystem.to_owned(),
         compatibility: Compatibility {
-            bifrost: BIFROST_REQUIREMENT.to_owned(),
+            bifrost: FOUNDRY_BIFROST_REQUIREMENT.to_owned(),
             toolchains: vec![VersionConstraint {
                 name: realm.toolchain.to_owned(),
                 requirement: realm.toolchain_requirement.to_owned(),

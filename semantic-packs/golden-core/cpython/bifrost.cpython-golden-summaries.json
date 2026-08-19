@@ -9,7 +9,7 @@
   "language": "python",
   "ecosystem": "python",
   "compatibility": {
-    "bifrost": ">=0.8.0, <0.11.0",
+    "bifrost": ">=0.8.0, <1.0.0",
     "toolchains": [
       {
         "name": "cpython",

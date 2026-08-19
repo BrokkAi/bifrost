@@ -40,12 +40,12 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActivationSelector, ArtifactEncoding, ArtifactProducerLimits, ArtifactProduction,
     ArtifactProductionRequest, CatalogCoordinate, CatalogOptions, Compatibility,
     CompiledSemanticModelPack, CompilerOptions, Completeness, DecodeLimits, DurablePackSource,
-    DurablePackSourceKind, ExactArtifact, ExternalArtifactKind, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, Provenance, ResolvedActiveSemanticModels, Safety,
-    SemanticModelActivationEvidence, SemanticModelActivationRequest,
-    SemanticModelResolutionOutcome, SemanticPackCatalog, compile_pack, decode_manifest,
-    decode_shard_for_manifest, read_exact_artifact, read_exact_source_set,
-    resolve_active_semantic_models,
+    DurablePackSourceKind, ExactArtifact, ExternalArtifactKind, PackExtractionAccounting,
+    PackExtractionGap, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
+    ResolvedActiveSemanticModels, Safety, SemanticModelActivationEvidence,
+    SemanticModelActivationRequest, SemanticModelResolutionOutcome, SemanticPackCatalog,
+    compile_pack, decode_manifest, decode_shard_for_manifest, pack_rejects_are_warning_only,
+    read_exact_artifact, read_exact_source_set, resolve_active_semantic_models,
 };
 use brokk_bifrost_analysis::analyzer::{
     CSharpAssemblyPackProducer, ComposerPackagePackProducer, ComposerPinnedAutoloadRule,
@@ -340,6 +340,8 @@ pub struct ReleaseReject {
     pub severity: ReleaseRejectSeverity,
     pub code: String,
     pub location: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration: Option<String>,
     pub message: String,
 }
 
@@ -532,7 +534,13 @@ fn generate_one(
         BundleError::new(format!("parse spec {}: {error}", input.spec_path.display()))
     })?;
     validate_spec(&spec, &input.spec_path)?;
-    let producer_limits = ArtifactProducerLimits::default();
+    // A release bundle is the durable extraction-accounting boundary. Retain
+    // the interactive safety bound, but size it to the already-bounded source
+    // set so every rejected declaration can be named in `rejects.json`.
+    let producer_limits = ArtifactProducerLimits {
+        max_diagnostics: MAX_SOURCE_SET_FILES,
+        ..ArtifactProducerLimits::default()
+    };
     let artifact = read_pinned_artifact(&spec, &input.artifact_path, &producer_limits)?;
     if artifact.sha256() != spec.artifact.sha256 {
         return Err(BundleError::new(format!(
@@ -639,6 +647,7 @@ fn generate_one(
                 },
                 code: diagnostic.code.clone(),
                 location: diagnostic.location.clone(),
+                declaration: diagnostic.declaration.clone(),
                 message: diagnostic.message.clone(),
             })
             .collect(),
@@ -1370,7 +1379,43 @@ fn verify_rejects(
             "release rejects do not match the indexed packs",
         ));
     }
+    for (pack, pack_rejects) in index.packs.iter().zip(&rejects.packs) {
+        let extraction = release_extraction_accounting(pack_rejects);
+        if !pack_rejects_are_warning_only(&extraction) {
+            return Err(BundleError::new(format!(
+                "release pack {}@{} has error-grade extraction rejects",
+                pack.pack_id, pack.pack_version
+            )));
+        }
+    }
     Ok(rejects)
+}
+
+fn release_extraction_accounting(rejects: &ReleasePackRejects) -> PackExtractionAccounting {
+    PackExtractionAccounting {
+        reject_count: rejects.rejects.len().try_into().unwrap_or(u64::MAX),
+        suppressed_reject_count: rejects.suppressed_rejects,
+        error_reject_count: rejects
+            .rejects
+            .iter()
+            .filter(|reject| reject.severity == ReleaseRejectSeverity::Error)
+            .count()
+            .try_into()
+            .unwrap_or(u64::MAX),
+        gaps: rejects
+            .rejects
+            .iter()
+            .filter_map(|reject| {
+                reject
+                    .declaration
+                    .as_ref()
+                    .map(|declaration| PackExtractionGap {
+                        declaration: declaration.clone(),
+                        reason: format!("{}: {}", reject.code, reject.message),
+                    })
+            })
+            .collect(),
+    }
 }
 
 /// Verify and install every compiled pack in a downloaded release bundle.
@@ -1382,12 +1427,14 @@ pub fn install_release_bundle(
     bundle_root: &Path,
     catalog: &SemanticPackCatalog,
 ) -> Result<Vec<ReleasePackInstallation>, BundleError> {
-    let index = verify_release_bundle(bundle_root)?.index;
+    let bundle = verify_release_bundle(bundle_root)?;
     let limits = DecodeLimits::default();
-    index
+    bundle
+        .index
         .packs
         .iter()
-        .map(|pack| {
+        .zip(&bundle.rejects.packs)
+        .map(|(pack, rejects)| {
             let manifest_bytes = verify_asset(bundle_root, &pack.manifest)?;
             let manifest = decode_manifest(&manifest_bytes, &limits).map_err(|error| {
                 BundleError::new(format!("decode manifest for {}: {error}", pack.pack_id))
@@ -1414,8 +1461,9 @@ pub fn install_release_bundle(
                 manifest_bytes,
                 shards,
             };
+            let extraction = release_extraction_accounting(rejects);
             let installed = catalog
-                .install(
+                .install_release(
                     &compiled,
                     &DurablePackSource {
                         kind: DurablePackSourceKind::PreShipped,
@@ -1424,6 +1472,7 @@ pub fn install_release_bundle(
                             pack.pack_id, pack.pack_version, pack.manifest.sha256
                         ),
                     },
+                    &extraction,
                 )
                 .map_err(|error| {
                     BundleError::new(format!(
@@ -2447,6 +2496,7 @@ mod tests {
                 severity: ReleaseRejectSeverity::Warning,
                 code: "kotlin.source.parse".to_owned(),
                 location: Some("kotlin/Bad.kt".to_owned()),
+                declaration: None,
                 message: "Kotlin source entry contains syntax unsupported by the pinned parser"
                     .to_owned(),
             }]

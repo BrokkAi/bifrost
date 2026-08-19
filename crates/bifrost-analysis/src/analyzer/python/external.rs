@@ -72,6 +72,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "artifact.cancelled".to_owned(),
                     location: None,
+                    declaration: None,
                     message: "Python dependency production was cancelled".to_owned(),
                 });
                 completeness = Completeness::Partial;
@@ -82,6 +83,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "python.artifact_module".to_owned(),
                     location: Some(artifact.path().display().to_string()),
+                    declaration: None,
                     message: "Python environment artifact has no import-module identity".to_owned(),
                 });
                 completeness = Completeness::Partial;
@@ -199,6 +201,7 @@ impl PythonArtifactPackProducer {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "artifact.kind".to_owned(),
                     location: None,
+                    declaration: None,
                     message: "Python producer requires a .pyi or .py artifact".to_owned(),
                 },
                 limits,
@@ -236,6 +239,7 @@ impl PythonArtifactPackProducer {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "artifact.kind".to_owned(),
                     location: None,
+                    declaration: None,
                     message: "Python producer requires a .pyi or .py artifact".to_owned(),
                 },
                 limits,
@@ -249,6 +253,7 @@ impl PythonArtifactPackProducer {
                         severity: ProducerDiagnosticSeverity::Error,
                         code: "python.source.encoding".to_owned(),
                         location: Some(artifact.path().display().to_string()),
+                        declaration: None,
                         message: "Python artifact is not UTF-8".to_owned(),
                     },
                     limits,
@@ -261,6 +266,7 @@ impl PythonArtifactPackProducer {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "python.source.parse".to_owned(),
                     location: Some(artifact.path().display().to_string()),
+                    declaration: None,
                     message: "Python parser did not produce a syntax tree".to_owned(),
                 },
                 limits,
@@ -350,6 +356,7 @@ impl PythonArtifactPackProducer {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "artifact.kind".to_owned(),
                     location: None,
+                    declaration: None,
                     message: "Python stub source-set producer requires a python_stub artifact"
                         .to_owned(),
                 },

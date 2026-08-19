@@ -2173,6 +2173,18 @@ fn write_proof_detail<W: Write>(
                 write!(output, "analyzer evidence {}", escape_terminal_text(code))
                     .map_err(map_io_error)?;
             }
+            ProofReason::AuthoredArmClosure {
+                model,
+                content,
+                contract_version,
+            } => write!(
+                output,
+                "authored arm closure model {} content {} contract {}",
+                escape_terminal_text(model),
+                escape_terminal_text(content),
+                contract_version,
+            )
+            .map_err(map_io_error)?,
             _ => write!(output, "{}", proof_reason(reason)).map_err(map_io_error)?,
         }
         writeln!(output).map_err(map_io_error)?;
@@ -2547,6 +2559,16 @@ fn write_run_completion<W: Write>(
                 "proven by summary (precise via authored models, not exhaustive from analyzed code)"
             )
             .map_err(map_io_error)?;
+            for closure in run.authored_arm_closures() {
+                write!(
+                    output,
+                    "; authored arm closure model {} content {} contract {}",
+                    escape_terminal_text(closure.model()),
+                    escape_terminal_text(closure.content()),
+                    closure.contract_version(),
+                )
+                .map_err(map_io_error)?;
+            }
         }
         PolicyRunCompletion::Inconclusive { reasons } => {
             write!(output, "inconclusive (").map_err(map_io_error)?;
@@ -2994,6 +3016,7 @@ fn proof_reason(value: &ProofReason) -> &str {
         ProofReason::AmbiguousTarget => "ambiguous_target",
         ProofReason::PartialWitness => "partial_witness",
         ProofReason::AnalyzerEvidence { code } => code.as_str(),
+        ProofReason::AuthoredArmClosure { .. } => "authored_arm_closure",
     }
 }
 

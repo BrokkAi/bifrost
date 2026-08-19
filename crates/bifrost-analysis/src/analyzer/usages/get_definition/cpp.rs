@@ -4681,8 +4681,8 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     "missing_compile_context",
                     format!(
                         "`{name}` is declared behind a conditional include whose guard needs \
-                         compile-context proof, and no compile_commands.json entry covers this \
-                         translation unit"
+                         compile-context proof, and compile_commands.json does not cover every \
+                         compilation of this file"
                     ),
                 );
             }

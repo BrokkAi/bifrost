@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
+use crate::hash::{HashSet, set_with_capacity};
 
 use super::{
     ArtifactProducerLimits, AuthoredSemanticModelPack, CatalogError, CatalogPackSourceKind,
@@ -313,6 +314,8 @@ pub struct PreparedInstalledDependencyPack {
     pub dependency_id: String,
     pub manifest_digests: Vec<String>,
     pub completeness: Completeness,
+    pub gaps: usize,
+    pub activation_ready: bool,
     pub evidence: SemanticModelActivationEvidence,
 }
 
@@ -980,9 +983,7 @@ pub fn prepare_dependency_semantic_packs(
         && packs
             .iter()
             .all(|pack| pack.completeness == Completeness::Complete)
-        && installed_packs
-            .iter()
-            .all(|pack| pack.completeness == Completeness::Complete)
+        && installed_packs.iter().all(|pack| pack.activation_ready)
         && !diagnostics
             .diagnostics
             .iter()
@@ -1041,7 +1042,10 @@ fn compatible_installed_pack(
         return Ok(None);
     };
     let mut manifest_digests = Vec::new();
-    let mut has_complete_pack = false;
+    let mut all_complete = true;
+    let mut activation_ready = true;
+    let mut gaps = 0usize;
+    let mut accounted_manifests: HashSet<String> = set_with_capacity(4);
     for candidate in catalog.candidates(&query)? {
         if !matches!(
             candidate.source_kind(),
@@ -1051,7 +1055,17 @@ fn compatible_installed_pack(
         ) {
             continue;
         }
-        has_complete_pack |= candidate.completeness() == Completeness::Complete;
+        if accounted_manifests.insert(candidate.manifest_digest().to_owned()) {
+            let extraction = catalog.extraction_accounting(candidate.manifest_digest())?;
+            all_complete &= candidate.completeness() == Completeness::Complete;
+            activation_ready &=
+                super::pack_is_activation_ready(candidate.completeness(), extraction.as_ref());
+            gaps = gaps.saturating_add(
+                extraction
+                    .as_ref()
+                    .map_or(0, |accounting| accounting.gaps.len()),
+            );
+        }
         manifest_digests.push(candidate.manifest_digest().to_owned());
     }
     manifest_digests.sort();
@@ -1060,11 +1074,13 @@ fn compatible_installed_pack(
         (!manifest_digests.is_empty()).then(|| PreparedInstalledDependencyPack {
             dependency_id: dependency.id.clone(),
             manifest_digests,
-            completeness: if has_complete_pack {
+            completeness: if all_complete {
                 Completeness::Complete
             } else {
                 Completeness::Partial
             },
+            gaps,
+            activation_ready,
             evidence: dependency.evidence.clone(),
         }),
     )

@@ -6,13 +6,13 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::{
-    ActiveSemanticModelShard, AsciiTransform, CaptureBinding, CaptureProjection, CaptureSource,
-    CatalogPackSourceKind, Completeness, EmbeddedTypeFact, EmittedDeclaration, GeneratorRule,
-    HierarchyFact, HierarchyKind, Locator, MemberFact, MemberKind, ReceiverFact, RelationFact,
-    RelationKind, ResolvedActiveSemanticModels, RuleEmission, RuleTrigger,
-    SemanticModelActivationStatus, SemanticModelMatchDisposition, Signature,
-    StructuredTypeExpression, TemplateExpression, TemplateSignature, TemplateTypeRef, TypeFact,
-    TypeKind, TypeParameterConstraint, TypeRef, Visibility,
+    ActivePackExtractionGap, ActiveSemanticModelShard, AsciiTransform, CaptureBinding,
+    CaptureProjection, CaptureSource, CatalogPackSourceKind, Completeness, EmbeddedTypeFact,
+    EmittedDeclaration, GeneratorRule, HierarchyFact, HierarchyKind, Locator, MemberFact,
+    MemberKind, ReceiverFact, RelationFact, RelationKind, ResolvedActiveSemanticModels,
+    RuleEmission, RuleTrigger, SemanticModelActivationStatus, SemanticModelMatchDisposition,
+    Signature, StructuredTypeExpression, TemplateExpression, TemplateSignature, TemplateTypeRef,
+    TypeFact, TypeKind, TypeParameterConstraint, TypeRef, Visibility,
 };
 use crate::analyzer::structural::{FileFacts, NormalizedKind, Role};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
@@ -374,6 +374,8 @@ impl SemanticModelOwnerSurface<'_> {
 #[derive(Debug)]
 pub struct SemanticModelOverlay {
     active_model_set_hash: String,
+    extraction_gaps: Vec<ActivePackExtractionGap>,
+    extraction_gap_by_declaration: HashMap<String, usize>,
     symbols: Vec<SemanticModelSymbol>,
     relations: Vec<SemanticModelRelation>,
     symbols_by_id: HashMap<String, Vec<usize>>,
@@ -383,6 +385,14 @@ pub struct SemanticModelOverlay {
     symbols_by_owner: HashMap<String, Vec<usize>>,
     relations_from: HashMap<String, Vec<usize>>,
     relations_to: HashMap<String, Vec<usize>>,
+}
+
+fn extraction_gap_index(gaps: &[ActivePackExtractionGap]) -> HashMap<String, usize> {
+    let mut index = HashMap::default();
+    for (ordinal, gap) in gaps.iter().enumerate() {
+        index.entry(gap.declaration.clone()).or_insert(ordinal);
+    }
+    index
 }
 
 impl SemanticModelOverlay {
@@ -397,6 +407,8 @@ impl SemanticModelOverlay {
         if active.shards().is_empty() {
             return Ok(Self {
                 active_model_set_hash: active.active_model_set_hash().to_string(),
+                extraction_gaps: active.extraction_gaps().to_vec(),
+                extraction_gap_by_declaration: extraction_gap_index(active.extraction_gaps()),
                 symbols: Vec::new(),
                 relations: Vec::new(),
                 symbols_by_id: HashMap::default(),
@@ -540,6 +552,8 @@ impl SemanticModelOverlay {
 
         let mut overlay = Self {
             active_model_set_hash: active.active_model_set_hash().to_string(),
+            extraction_gaps: active.extraction_gaps().to_vec(),
+            extraction_gap_by_declaration: extraction_gap_index(active.extraction_gaps()),
             symbols,
             relations,
             symbols_by_id: HashMap::default(),
@@ -563,6 +577,21 @@ impl SemanticModelOverlay {
 
     pub fn active_model_set_hash(&self) -> &str {
         &self.active_model_set_hash
+    }
+
+    pub fn gapped(&self, declaration: &str) -> Option<&ActivePackExtractionGap> {
+        self.extraction_gap_by_declaration
+            .get(declaration)
+            .map(|index| &self.extraction_gaps[*index])
+    }
+
+    pub fn gapped_member_surface(
+        &self,
+        owner: &str,
+        member: &str,
+    ) -> Option<&ActivePackExtractionGap> {
+        let declaration = format!("{owner}.{member}");
+        self.gapped(&declaration).or_else(|| self.gapped(owner))
     }
 
     pub fn symbols(&self) -> &[SemanticModelSymbol] {
@@ -3906,6 +3935,8 @@ mod tests {
     ) -> SemanticModelOverlay {
         let mut overlay = SemanticModelOverlay {
             active_model_set_hash: "test".to_string(),
+            extraction_gaps: Vec::new(),
+            extraction_gap_by_declaration: HashMap::default(),
             symbols,
             relations,
             symbols_by_id: HashMap::default(),

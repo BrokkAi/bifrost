@@ -11183,7 +11183,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_batches_257_small_files_into_five_transactions() {
+    fn reconcile_batches_257_small_files_into_two_transactions() {
         const FILES: usize = 257;
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -11208,8 +11208,8 @@ mod tests {
         )
         .expect("analyzer epochs should initialize");
 
-        assert_eq!(store.parsed_blob_transaction_starts_for_test(), 5);
-        assert_eq!(analyzer.state.persistence_stats.transactions, 5);
+        assert_eq!(store.parsed_blob_transaction_starts_for_test(), 2);
+        assert_eq!(analyzer.state.persistence_stats.transactions, 2);
         assert_eq!(analyzer.state.persistence_stats.committed_blobs, FILES);
         assert_eq!(analyzer.state.persistence_stats.failed_blobs, 0);
         assert!(analyzer.state.persistence_stats.peak_in_flight_items > 0);

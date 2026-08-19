@@ -47,11 +47,12 @@ pub(crate) fn collect_ruby_semantic_diagnostics(
         overlay: analyzer.semantic_model_overlay(),
         evidence: analyzer.dependency_discovery_evidence(Language::Ruby),
     };
-    with_ruby_graph_source(analyzer, |graph| {
+    let report = with_ruby_graph_source(analyzer, |graph| {
         brokk_bifrost_ruby::diagnostics::collect_ruby_semantic_diagnostics(
             graph, ruby, &gems, file, source,
         )
-    })
+    });
+    crate::analyzer::semantic_model::degrade_pack_gap_absences(analyzer, report)
 }
 
 /// The gem facts a diagnostic request is allowed to read: what an activation

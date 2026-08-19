@@ -76,6 +76,8 @@ pub struct ProducerDiagnostic {
     pub severity: ProducerDiagnosticSeverity,
     pub code: String,
     pub location: Option<String>,
+    /// Canonical fully-qualified declaration whose extraction failed.
+    pub declaration: Option<String>,
     pub message: String,
 }
 
@@ -122,6 +124,7 @@ pub trait ExternalArtifactPackProducer {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "artifact.cancelled".to_owned(),
                     location: None,
+                    declaration: None,
                     message: "exact artifact production was cancelled".to_owned(),
                 },
                 limits,
@@ -215,6 +218,7 @@ pub(crate) fn read_exact_artifact_while(
         severity: ProducerDiagnosticSeverity::Error,
         code: "artifact.metadata".to_owned(),
         location: None,
+        declaration: None,
         message: bounded_message(
             format!("could not inspect exact artifact: {error}"),
             limits.max_diagnostic_message_bytes,
@@ -225,6 +229,7 @@ pub(crate) fn read_exact_artifact_while(
             severity: ProducerDiagnosticSeverity::Error,
             code: "artifact.not_file".to_owned(),
             location: None,
+            declaration: None,
             message: "exact artifact path is not a regular file".to_owned(),
         });
     }
@@ -233,6 +238,7 @@ pub(crate) fn read_exact_artifact_while(
             severity: ProducerDiagnosticSeverity::Error,
             code: "limit.artifact_bytes".to_owned(),
             location: None,
+            declaration: None,
             message: bounded_message(
                 format!("exact artifact exceeds {} bytes", limits.max_artifact_bytes),
                 limits.max_diagnostic_message_bytes,
@@ -244,6 +250,7 @@ pub(crate) fn read_exact_artifact_while(
         severity: ProducerDiagnosticSeverity::Error,
         code: "artifact.open".to_owned(),
         location: None,
+        declaration: None,
         message: bounded_message(
             format!("could not open exact artifact: {error}"),
             limits.max_diagnostic_message_bytes,
@@ -258,6 +265,7 @@ pub(crate) fn read_exact_artifact_while(
                 severity: ProducerDiagnosticSeverity::Error,
                 code: "artifact.cancelled".to_owned(),
                 location: None,
+                declaration: None,
                 message: "exact artifact read was cancelled".to_owned(),
             });
         }
@@ -267,6 +275,7 @@ pub(crate) fn read_exact_artifact_while(
                 severity: ProducerDiagnosticSeverity::Error,
                 code: "artifact.read".to_owned(),
                 location: None,
+                declaration: None,
                 message: bounded_message(
                     format!("could not read exact artifact: {error}"),
                     limits.max_diagnostic_message_bytes,
@@ -282,6 +291,7 @@ pub(crate) fn read_exact_artifact_while(
             severity: ProducerDiagnosticSeverity::Error,
             code: "limit.artifact_bytes".to_owned(),
             location: None,
+            declaration: None,
             message: bounded_message(
                 format!("exact artifact exceeds {} bytes", limits.max_artifact_bytes),
                 limits.max_diagnostic_message_bytes,
@@ -587,6 +597,7 @@ fn source_set_diagnostic(
         severity: ProducerDiagnosticSeverity::Error,
         code: code.to_owned(),
         location: Some(path.to_string_lossy().into_owned()),
+        declaration: None,
         message: bounded_message(message.into(), limits.max_diagnostic_message_bytes),
     }
 }
@@ -614,7 +625,29 @@ impl BoundedProducerDiagnostics {
         location: Option<String>,
         message: impl Into<String>,
     ) {
-        self.push(ProducerDiagnosticSeverity::Warning, code, location, message);
+        self.push(
+            ProducerDiagnosticSeverity::Warning,
+            code,
+            location,
+            None,
+            message,
+        );
+    }
+
+    pub fn warning_for_declaration(
+        &mut self,
+        code: impl Into<String>,
+        location: Option<String>,
+        declaration: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.push(
+            ProducerDiagnosticSeverity::Warning,
+            code,
+            location,
+            Some(declaration.into()),
+            message,
+        );
     }
 
     pub fn error(
@@ -623,7 +656,13 @@ impl BoundedProducerDiagnostics {
         location: Option<String>,
         message: impl Into<String>,
     ) {
-        self.push(ProducerDiagnosticSeverity::Error, code, location, message);
+        self.push(
+            ProducerDiagnosticSeverity::Error,
+            code,
+            location,
+            None,
+            message,
+        );
     }
 
     fn push(
@@ -631,6 +670,7 @@ impl BoundedProducerDiagnostics {
         severity: ProducerDiagnosticSeverity,
         code: impl Into<String>,
         location: Option<String>,
+        declaration: Option<String>,
         message: impl Into<String>,
     ) {
         if self.diagnostics.len() >= self.max_diagnostics {
@@ -641,6 +681,8 @@ impl BoundedProducerDiagnostics {
             severity,
             code: code.into(),
             location: location.map(|location| bounded_message(location, self.max_message_bytes)),
+            declaration: declaration
+                .map(|declaration| bounded_message(declaration, self.max_message_bytes)),
             message: bounded_message(message.into(), self.max_message_bytes),
         });
     }
@@ -650,6 +692,7 @@ impl BoundedProducerDiagnostics {
             diagnostic.severity,
             diagnostic.code,
             diagnostic.location,
+            diagnostic.declaration,
             diagnostic.message,
         );
     }
@@ -842,6 +885,7 @@ mod tests {
                 severity: ProducerDiagnosticSeverity::Error,
                 code: "failure".to_owned(),
                 location: Some("unbounded-location".to_owned()),
+                declaration: None,
                 message: "unbounded-message".to_owned(),
             },
             &ArtifactProducerLimits {

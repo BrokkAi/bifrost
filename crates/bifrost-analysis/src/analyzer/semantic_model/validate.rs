@@ -462,6 +462,29 @@ impl Validator {
             );
         }
 
+        // #2371: `covers_overrides` is an author's claim that every
+        // implementation of this member outside the workspace conforms to the
+        // summary. A partial summary does not describe even its own target, so
+        // it cannot describe every implementation of it, and a receiverless
+        // target has no overrides to claim in the first place -- there is
+        // exactly one callable it could ever name.
+        if summary.covers_overrides {
+            if matches!(summary.completeness, Completeness::Partial) {
+                self.error(
+                    "summary.covers_overrides_on_partial_summary",
+                    format!("{path}.covers_overrides"),
+                    "covers_overrides requires completeness: complete",
+                );
+            }
+            if !summary.target.has_receiver {
+                self.error(
+                    "summary.covers_overrides_on_receiverless_target",
+                    format!("{path}.covers_overrides"),
+                    "covers_overrides requires a receiver target: a receiverless callee has no overrides to cover",
+                );
+            }
+        }
+
         if summary.locations.len() > MAX_PROCEDURE_SUMMARY_LOCATIONS {
             self.error(
                 "limit.summary_locations",

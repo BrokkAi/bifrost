@@ -5135,19 +5135,36 @@ mod watcher_startup_tests {
         let service = SearchToolsService::new_deferred_manual(root).unwrap();
         service.ensure_ready().unwrap();
 
+        let ready = || {
+            let guard = service.session.read().unwrap();
+            guard.as_ref().unwrap().usage_index_ready()
+        };
+
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
+            // `usage_index_ready` is a `JoinHandle::is_finished` read, so it
+            // moves false -> true exactly once. Reading it only after the probe
+            // compared two different instants: when the warm finished inside
+            // the call, the probe's honest `false` met a later `true`.
+            // Bracketing the call pins the probe to the state it could have
+            // observed without weakening the claim. On every iteration where
+            // the warm does not finish mid-call the two reads agree and the
+            // probe must match exactly, so a constant `true` still fails the
+            // first iteration and a constant `false` still never leaves the
+            // loop. Only the one straddling iteration accepts either answer,
+            // which is the only sound treatment of it.
+            let before = ready();
             let reported = service
                 .call_tool_value("get_active_workspace", json!({}))
                 .unwrap();
-            let ready = {
-                let guard = service.session.read().unwrap();
-                guard.as_ref().unwrap().usage_index_ready()
-            };
-            // The probe reports the session's own readiness rather than a
-            // constant, in both states.
-            assert_eq!(reported["usage_index_ready"], json!(ready));
-            if ready {
+            let after = ready();
+            let reported_ready = &reported["usage_index_ready"];
+            assert!(
+                *reported_ready == json!(before) || *reported_ready == json!(after),
+                "the probe reports the session's own readiness rather than a constant: \
+                 reported {reported_ready} with readiness {before} before and {after} after"
+            );
+            if after {
                 break;
             }
             assert!(

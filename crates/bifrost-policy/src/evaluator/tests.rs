@@ -388,6 +388,7 @@ impl TaintPolicyEvaluator for FakeTaintAdapter {
             diagnostics: Vec::new(),
             diagnostics_truncated: false,
             work: PolicyWorkReport::default(),
+            authored_arm_closures: Vec::new(),
         }
     }
 }
@@ -602,6 +603,7 @@ fn duplicate_taint_projection_fails_but_preserves_unrelated_strong_positive() {
         diagnostics: Vec::new(),
         diagnostics_truncated: false,
         work: PolicyWorkReport::default(),
+        authored_arm_closures: Vec::new(),
     });
     let run = assemble_taint_projection_batch(
         policy,
@@ -721,6 +723,7 @@ fn terminal_adapter_completion_survives_secondary_overlay_budget() {
             diagnostics: Vec::new(),
             diagnostics_truncated: false,
             work: PolicyWorkReport::default(),
+            authored_arm_closures: Vec::new(),
         }),
         &PolicyEvaluationContext {
             analyzer: &analyzer,

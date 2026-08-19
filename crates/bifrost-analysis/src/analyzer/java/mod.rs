@@ -216,6 +216,33 @@ impl JavaAnalyzer {
         resolve_java_forward_type_name_candidates(self, file, raw_name)
     }
 
+    /// Expand `URLDecoder.decode` to `java.net.URLDecoder.decode` when the
+    /// file imports that type or the activated overlay names it (#2364).
+    /// Fully-qualified callees are left untouched; they already bind through
+    /// the #1978 identity.
+    pub(crate) fn expand_imported_external_callee(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        file: &ProjectFile,
+        callee_text: &str,
+    ) -> Option<String> {
+        let (owner, member) = crate::analyzer::semantic::split_qualified_member(callee_text)?;
+        if owner.contains('.') {
+            return None;
+        }
+        match self.resolve_type_name_with_external(packs, file, owner) {
+            Some(JavaTypeResolution::External(external_type)) => {
+                Some(format!("{}.{}", external_type.fqn(), member))
+            }
+            Some(JavaTypeResolution::Source(unit)) => {
+                Some(format!("{}.{}", unit.fq_name(), member))
+            }
+            None => self
+                .explicit_imported_type_fqn(file, owner)
+                .map(|fqn| format!("{fqn}.{member}")),
+        }
+    }
+
     /// Whether `raw_name` names a type this file can see, in the workspace or
     /// past it. `packs` is the dispatching analyzer's activated overlay; see
     /// [`JavaAnalyzer::resolve_type_name_with_external`].
@@ -1009,6 +1036,19 @@ impl LanguageSupport for JavaSupport {
 
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
         &JAVA_USAGE_STRATEGY
+    }
+
+    fn expand_imported_external_callee(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        callee_text: &str,
+    ) -> Option<String> {
+        resolve_analyzer::<JavaAnalyzer>(analyzer)?.expand_imported_external_callee(
+            analyzer.semantic_model_overlay(),
+            file,
+            callee_text,
+        )
     }
 
     fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {

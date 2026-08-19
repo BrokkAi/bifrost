@@ -258,10 +258,16 @@ pub fn symbol_source_candidate_files(
             };
 
         if anchor.is_none()
-            && let Some(PathQualifiedSelector::Resolved {
-                anchor: path_anchor,
-                lookup: path_lookup,
-            }) = split_path_qualified_definition_selector(analyzer, symbol)
+            && let Some(
+                PathQualifiedSelector::Resolved {
+                    anchor: path_anchor,
+                    lookup: path_lookup,
+                }
+                | PathQualifiedSelector::DottedGuess {
+                    anchor: path_anchor,
+                    lookup: path_lookup,
+                },
+            ) = split_path_qualified_definition_selector(analyzer, symbol)
         {
             if let ResolvedFileInput::File(file) = resolver.resolve_literal(&path_anchor) {
                 files.insert(file);
@@ -517,6 +523,24 @@ fn get_symbol_sources_with_budget(
                             source_budget,
                         ),
                     );
+                }
+                Some(PathQualifiedSelector::DottedGuess { anchor, lookup }) => {
+                    // The dotted-file fallback is a guess, not an explicit path
+                    // selector: when the guessed anchor names nothing, the input
+                    // is a dotted symbol spelling (a namespace path whose first
+                    // segment collides with a file's basename), so fall through
+                    // to the fuzzy symbol stage instead of reporting anchor
+                    // not-found (#2409).
+                    match resolve_file_anchored_symbol_sources(
+                        analyzer,
+                        &symbol,
+                        anchor,
+                        lookup,
+                        source_budget,
+                    ) {
+                        SourceLookupOutcome::NotFound(_) => {}
+                        outcome => return (index, outcome),
+                    }
                 }
                 Some(PathQualifiedSelector::AmbiguousPath(item)) => {
                     return (index, SourceLookupOutcome::AmbiguousPath(item));

@@ -65,6 +65,17 @@ pub trait JvmActiveSemanticModel {
 
     /// What the published set says about the fully-qualified name `fqn`.
     fn qualified_name_disposition(&self, fqn: &str) -> JvmModelDisposition;
+
+    /// The exact activated-pack extraction gap for `fqn`, if one exists.
+    fn extraction_gap(&self, _fqn: &str) -> Option<JvmPackExtractionGap> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JvmPackExtractionGap {
+    pub pack_id: String,
+    pub declaration: String,
 }
 
 /// What a published dependency model says about one fully-qualified name.
@@ -137,9 +148,14 @@ pub enum JvmNameProof {
 pub enum JvmProofGap {
     /// Nothing past the workspace is retained, or what is retained does not
     /// claim to cover the name. `boundary` names how far the lookup saw.
-    ExternalBoundary { boundary: BoundaryStatus },
+    ExternalBoundary {
+        boundary: BoundaryStatus,
+    },
     /// A construct the resolver does not model, named exactly.
-    Unsupported { detail: String },
+    Unsupported {
+        detail: String,
+    },
+    PackExtraction(JvmPackExtractionGap),
 }
 
 impl JvmProofGap {
@@ -151,6 +167,10 @@ impl JvmProofGap {
             Self::Unsupported { detail } => {
                 SemanticDiagnosticIncompleteReason::UnsupportedSemantics { detail }
             }
+            Self::PackExtraction(gap) => SemanticDiagnosticIncompleteReason::PackExtractionGap {
+                pack_id: gap.pack_id,
+                declaration: gap.declaration,
+            },
         }
     }
 }
@@ -216,7 +236,7 @@ pub fn record_jvm_name_proof(
 pub fn prove_against_active_model(
     retained: JvmRetainedExternalIndex,
     model: &dyn JvmActiveSemanticModel,
-    model_disposition: impl FnOnce() -> JvmModelDisposition,
+    model_disposition: impl FnOnce() -> Result<JvmModelDisposition, JvmPackExtractionGap>,
 ) -> JvmNameProof {
     // A partially-read index may hold the name in the part it never read, so
     // nothing can be proved past it. That stays true however complete the model
@@ -233,11 +253,12 @@ pub fn prove_against_active_model(
         });
     }
     match model_disposition() {
-        JvmModelDisposition::Unique => JvmNameProof::ExternalIndexed,
-        JvmModelDisposition::Conflicting { declarations } => JvmNameProof::Ambiguous {
+        Err(gap) => JvmNameProof::Incomplete(JvmProofGap::PackExtraction(gap)),
+        Ok(JvmModelDisposition::Unique) => JvmNameProof::ExternalIndexed,
+        Ok(JvmModelDisposition::Conflicting { declarations }) => JvmNameProof::Ambiguous {
             boundaries: vec![BoundaryStatus::ExternalIndexed; declarations],
         },
-        JvmModelDisposition::Absent => JvmNameProof::Absent {
+        Ok(JvmModelDisposition::Absent) => JvmNameProof::Absent {
             boundary: BoundaryStatus::ExternalIndexed,
         },
     }
@@ -252,12 +273,15 @@ pub fn prove_against_active_model(
 pub fn model_disposition_over_tiers<'a>(
     model: &dyn JvmActiveSemanticModel,
     spellings: impl IntoIterator<Item = &'a str>,
-) -> JvmModelDisposition {
+) -> Result<JvmModelDisposition, JvmPackExtractionGap> {
     for spelling in spellings {
         let disposition = model.qualified_name_disposition(spelling);
         if disposition != JvmModelDisposition::Absent {
-            return disposition;
+            return Ok(disposition);
+        }
+        if let Some(gap) = model.extraction_gap(spelling) {
+            return Err(gap);
         }
     }
-    JvmModelDisposition::Absent
+    Ok(JvmModelDisposition::Absent)
 }

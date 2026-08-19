@@ -17,9 +17,9 @@ use crate::budget::PolicyBudget;
 use crate::definition::{PolicyId, PolicyPort, PolicySelectorPath, TaintLabel};
 use crate::evaluator::{PolicyEvaluationContext, TaintPolicyEvaluator};
 use crate::finding::{
-    BoundedWitness, CertaintyReason, FindingCertainty, FindingCompleteness,
-    FindingIncompleteReason, PolicyDiagnostic, PolicyDiagnosticCode, PolicyDiagnosticImpact,
-    PolicyDiagnosticSeverity, PolicyFailureReason, PolicyIncompleteReason,
+    AuthoredArmClosureEvidence, BoundedWitness, CertaintyReason, FindingCertainty,
+    FindingCompleteness, FindingIncompleteReason, PolicyDiagnostic, PolicyDiagnosticCode,
+    PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyFailureReason, PolicyIncompleteReason,
     PolicyLocationRelationship, PolicyRunCompletion, ProofMetadata, ProofReason, ProofState,
     RelatedPolicyLocation, WitnessStepKind,
 };
@@ -196,6 +196,7 @@ fn compiled_payload(work: PolicyWorkReport, refusals: Vec<String>) -> TaintProje
             diagnostics: Vec::new(),
             diagnostics_truncated: false,
             work,
+            authored_arm_closures: Vec::new(),
         };
     }
     let completion =
@@ -221,6 +222,7 @@ fn compiled_payload(work: PolicyWorkReport, refusals: Vec<String>) -> TaintProje
         diagnostics,
         diagnostics_truncated: false,
         work,
+        authored_arm_closures: Vec::new(),
     }
 }
 
@@ -2026,6 +2028,13 @@ fn solve_and_project_batch(
                 if matches!(payload.completion, PolicyRunCompletion::Complete) {
                     payload.completion = PolicyRunCompletion::ProvenBySummary;
                 }
+                if matches!(payload.completion, PolicyRunCompletion::ProvenBySummary) {
+                    payload
+                        .authored_arm_closures
+                        .extend(policy_authored_arm_closures(retained.report()));
+                    payload.authored_arm_closures.sort();
+                    payload.authored_arm_closures.dedup();
+                }
             } else {
                 // Keep the first path-relevant cause the plan retained (#1952):
                 // an unavailable capability stays a typed capability reason and
@@ -2040,6 +2049,7 @@ fn solve_and_project_batch(
                 };
                 payload.completion = PolicyRunCompletion::inconclusive(vec![reason])
                     .map_err(|error| error.to_string())?;
+                payload.authored_arm_closures.clear();
                 if let Some(cause) = cause {
                     let locator = cause.procedure().semantics().locator();
                     let name = locator
@@ -2431,6 +2441,7 @@ fn project_policy_findings(
                     .min(budget.max_witnesses_per_finding()),
                 witness_limits,
                 budget,
+                report.authored_arm_closures(),
             )?;
             let witness_refs_truncated = projected_report.witnesses_truncated;
             pairs.push(TaintPairProjection {
@@ -2580,6 +2591,29 @@ fn project_taint_origins(
     Ok((origins, omitted))
 }
 
+fn policy_authored_arm_closures(report: &TaintFindingReport) -> Vec<AuthoredArmClosureEvidence> {
+    policy_authored_arm_closures_from(report.authored_arm_closures())
+}
+
+fn policy_authored_arm_closures_from(
+    closures: &[brokk_bifrost_analysis::analyzer::value_flow::AuthoredArmClosure],
+) -> Vec<AuthoredArmClosureEvidence> {
+    let mut evidence = closures
+        .iter()
+        .filter_map(|closure| {
+            AuthoredArmClosureEvidence::try_new(
+                closure.origin().model().as_str(),
+                closure.origin().content().to_string(),
+                closure.origin().contract_version(),
+            )
+            .ok()
+        })
+        .collect::<Vec<_>>();
+    evidence.sort();
+    evidence.dedup();
+    evidence
+}
+
 #[allow(clippy::too_many_arguments)]
 fn project_taint_report(
     workspace: &WorkspaceAnalyzer,
@@ -2593,6 +2627,7 @@ fn project_taint_report(
     witness_limit: usize,
     witness_limits: EffectiveWitnessLimits,
     budget: &PolicyBudget,
+    authored_arm_closures: &[brokk_bifrost_analysis::analyzer::value_flow::AuthoredArmClosure],
 ) -> Result<(ProjectedFindingReport, Vec<WitnessId>), String> {
     let certainty = if proven {
         FindingCertainty::Definite
@@ -2636,13 +2671,19 @@ fn project_taint_report(
     } else {
         FindingCompleteness::partial(incomplete).map_err(|error| error.to_string())?
     };
+    let mut proof_reasons = vec![ProofReason::DataflowWitness];
+    proof_reasons.extend(
+        policy_authored_arm_closures_from(authored_arm_closures)
+            .into_iter()
+            .map(|closure| closure.to_proof_reason()),
+    );
     let proof = ProofMetadata::try_new(
         if proven {
             ProofState::Proven
         } else {
             ProofState::Unproven
         },
-        vec![ProofReason::DataflowWitness],
+        proof_reasons,
         Vec::new(),
     )
     .map_err(|error| error.to_string())?;
@@ -2803,6 +2844,7 @@ fn record_exhausted_lane(payload: &mut TaintProjectionPayload, lane: ExhaustedTa
         | PolicyRunCompletion::ProvenBySummary => {
             payload.completion = PolicyRunCompletion::inconclusive(vec![lane.incomplete_reason()])
                 .expect("one incomplete reason is canonical");
+            payload.authored_arm_closures.clear();
         }
         PolicyRunCompletion::Inconclusive { reasons } => {
             reasons.push(lane.incomplete_reason());
@@ -2848,6 +2890,7 @@ fn prepared_failure_payload(message: &str, work: PolicyWorkReport) -> TaintProje
         diagnostics: diagnostic.into_iter().collect(),
         diagnostics_truncated: false,
         work,
+        authored_arm_closures: Vec::new(),
     }
 }
 
@@ -2898,6 +2941,7 @@ fn prepared_compile_failure_payload(failure: TaintPolicyCompileFailure) -> Taint
         diagnostics: diagnostic.into_iter().collect(),
         diagnostics_truncated: false,
         work,
+        authored_arm_closures: Vec::new(),
     }
 }
 

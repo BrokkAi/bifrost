@@ -2083,6 +2083,19 @@ fn rust_macro_argument_outcome(
         MacroUnitResolution::NotAMacroName => return None,
     };
     if units.is_empty() {
+        // An opaque macro matcher cannot classify a bare token's namespace,
+        // but qualified paths, receiver-member expressions, constructor calls,
+        // and exact imports inside a nested macro already carry structured
+        // evidence. Let the existing Rust resolver consume that evidence
+        // instead of allowing the missing matcher to hide an indexed local
+        // definition.
+        if rust_macro_argument_has_structured_reference(focused, source, site)
+            || rust_macro_argument_has_resolved_nested_import(
+                rust, support, file, source, site, focused,
+            )
+        {
+            return None;
+        }
         return Some(boundary_unchecked(format!(
             "Rust macro `{macro_name}` is defined outside the indexed workspace and matcher evidence is unavailable"
         )));
@@ -2170,9 +2183,114 @@ fn rust_macro_argument_outcome(
             ),
         ));
     }
+    if first.namespace == MacroNamespaceEvidence::NoNamespace
+        && (rust_macro_argument_has_structured_reference(focused, source, site)
+            || rust_macro_argument_has_resolved_nested_import(
+                rust, support, file, source, site, focused,
+            ))
+    {
+        return None;
+    }
     Some(rust_matcher_namespace_outcome(
         analyzer, rust, support, file, source, tree, site, focused, first,
     ))
+}
+
+fn rust_macro_argument_has_structured_reference(
+    focused: Node<'_>,
+    source: &str,
+    site: &ResolvedReferenceSite,
+) -> bool {
+    let focused = rust_macro_argument_focused_node(focused, site);
+    if brokk_bifrost_rust::graph::resolver::token_tree_ancestor(focused).is_none() {
+        return false;
+    }
+    if matches!(
+        focused.kind(),
+        "scoped_identifier" | "scoped_type_identifier"
+    ) {
+        return true;
+    }
+    if brokk_bifrost_rust::graph::resolver::rust_token_path_segment_is_qualified(focused) {
+        return true;
+    }
+    if matches!(
+        crate::analyzer::usages::rust_graph::rust_bare_token_tree_role(focused, source),
+        RustBareTokenTreeRole::Pattern | RustBareTokenTreeRole::TypeReference
+    ) {
+        return true;
+    }
+    focused.parent().is_some_and(|parent| {
+        parent.kind() == "token_tree"
+            && ((focused
+                .prev_sibling()
+                .is_some_and(|token| token.kind() == ".")
+                && focused
+                    .prev_sibling()
+                    .and_then(|separator| separator.prev_sibling())
+                    .is_some_and(|receiver| matches!(receiver.kind(), "identifier" | "self")))
+                || (focused
+                    .next_sibling()
+                    .is_some_and(|token| token.kind() == ".")
+                    && focused
+                        .next_sibling()
+                        .and_then(|separator| separator.next_sibling())
+                        .is_some_and(|member| member.kind() == "identifier"))
+                || focused.next_sibling().is_some_and(|arguments| {
+                    arguments.kind() == "token_tree"
+                        && arguments.child(0).is_some_and(|open| open.kind() == "(")
+                }))
+    })
+}
+
+fn rust_macro_argument_has_resolved_nested_import(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    site: &ResolvedReferenceSite,
+    focused: Node<'_>,
+) -> bool {
+    let focused = rust_macro_argument_focused_node(focused, site);
+    let Some(arguments) = brokk_bifrost_rust::graph::resolver::token_tree_ancestor(focused) else {
+        return false;
+    };
+    let nested_macro = arguments.parent().is_some_and(|parent| {
+        parent.kind() == "token_tree"
+            && arguments
+                .prev_sibling()
+                .is_some_and(|separator| separator.kind() == "!")
+            && arguments
+                .prev_sibling()
+                .and_then(|separator| separator.prev_sibling())
+                .is_some_and(|name| name.kind() == "identifier")
+    });
+    if !nested_macro {
+        return false;
+    }
+    let name = rust_node_text(focused, source).trim();
+    !name.is_empty()
+        && matches!(
+            rust_visible_import_resolution(
+                rust,
+                support,
+                file,
+                source,
+                site.focus_start_byte,
+                name,
+                RustBareReferenceRole::Value,
+            ),
+            RustVisibleImportResolution::Resolved(_) | RustVisibleImportResolution::GlobResolved(_)
+        )
+}
+
+fn rust_macro_argument_focused_node<'tree>(
+    focused: Node<'tree>,
+    site: &ResolvedReferenceSite,
+) -> Node<'tree> {
+    focused
+        .descendant_for_byte_range(site.focus_start_byte, site.focus_end_byte)
+        .unwrap_or(focused)
 }
 
 fn argument_boundary_outcome(
@@ -8169,6 +8287,120 @@ mod bounded_tests {
             focus_start_byte: start_byte,
             focus_end_byte: end_byte,
         }
+    }
+
+    fn site_for_qualified_expression(
+        source: &str,
+        file: &ProjectFile,
+        expression: &str,
+        target: &str,
+    ) -> ResolvedReferenceSite {
+        let start_byte = source.find(expression).expect("expression");
+        let end_byte = start_byte + expression.len();
+        let focus_start_byte = start_byte + expression.rfind(target).expect("target in expression");
+        let focus_end_byte = focus_start_byte + target.len();
+        let start_line = source[..start_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        ResolvedReferenceSite {
+            path: rel_path_string(file),
+            text: expression.to_string(),
+            range: Range {
+                start_byte,
+                end_byte,
+                start_line,
+                end_line: start_line,
+            },
+            focus_start_byte,
+            focus_end_byte,
+        }
+    }
+
+    fn assert_opaque_macro_reference_resolves(
+        source: &str,
+        expression: &str,
+        target: &str,
+        expected_fqn: &str,
+    ) {
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
+        let tree = lexical_scope::parse_rust_tree(source).expect("Rust tree");
+        let site = site_for_qualified_expression(source, &file, expression, target);
+        let rust =
+            resolve_analyzer::<RustAnalyzer>(fixture.analyzer.analyzer()).expect("Rust analyzer");
+        let support = AnalyzerRustDefinitionProvider::new(rust, false);
+        let mut cache = RustTypeLookupCache::default();
+        let value = resolve_rust(
+            fixture.analyzer.analyzer(),
+            &support,
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            &mut cache,
+            None,
+        );
+
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(
+            value
+                .definitions
+                .iter()
+                .any(|definition| definition.fq_name() == expected_fqn),
+            "{value:#?}"
+        );
+    }
+
+    #[test]
+    fn opaque_macro_keeps_structured_qualified_path_resolution() {
+        assert_opaque_macro_reference_resolves(
+            "enum State { Ready }\nfn ready(state: &State) -> bool { matches!(state, State::Ready) }\n",
+            "State::Ready",
+            "Ready",
+            "State.Ready",
+        );
+    }
+
+    #[test]
+    fn opaque_macro_keeps_structured_receiver_member_resolution() {
+        assert_opaque_macro_reference_resolves(
+            "struct DbColumn { r#type: String }\nimpl DbColumn { fn describe(&self) -> String { format!(\"{}\", self.r#type) } }\n",
+            "self.r#type",
+            "r#type",
+            "DbColumn.type",
+        );
+    }
+
+    #[test]
+    fn tt_matcher_keeps_structured_receiver_member_resolution() {
+        assert_opaque_macro_reference_resolves(
+            "macro_rules! render { ($($tt:tt)*) => {}; }\nstruct AlertType;\nimpl AlertType { fn default_title(&self) {} }\nstruct NodeAlert { alert_type: AlertType }\nfn render_alert(alert: &NodeAlert) { render!(alert.alert_type.default_title()); }\n",
+            "alert.alert_type.default_title",
+            "default_title",
+            "AlertType.default_title",
+        );
+    }
+
+    #[test]
+    fn opaque_macro_keeps_structured_tuple_constructor_resolution() {
+        assert_opaque_macro_reference_resolves(
+            "fn build() { let _ = vec![Item(1)]; }\nstruct Item(u8);\n",
+            "Item",
+            "Item",
+            "Item",
+        );
+    }
+
+    #[test]
+    fn nested_opaque_macro_keeps_exact_imported_pattern_resolution() {
+        assert_opaque_macro_reference_resolves(
+            "fn ready(state: State) -> bool { assert!(matches!(state, Ready)); true }\nenum State { Ready }\nuse State::*;\n",
+            "Ready",
+            "Ready",
+            "State.Ready",
+        );
     }
 
     fn member_fixture() -> (

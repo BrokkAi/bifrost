@@ -37,9 +37,10 @@ pub(crate) fn collect_php_semantic_diagnostics(
         overlay: analyzer.semantic_model_overlay(),
         evidence: analyzer.dependency_discovery_evidence(Language::Php),
     };
-    brokk_bifrost_php::diagnostics::collect_php_semantic_diagnostics(
+    let report = brokk_bifrost_php::diagnostics::collect_php_semantic_diagnostics(
         php, analyzer, &support, &external, file, source,
-    )
+    );
+    crate::analyzer::semantic_model::degrade_pack_gap_absences(analyzer, report)
 }
 
 /// The overlay and discovery evidence an analyzer already holds, presented as

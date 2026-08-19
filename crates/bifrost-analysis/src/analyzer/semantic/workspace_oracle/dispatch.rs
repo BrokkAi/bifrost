@@ -669,6 +669,41 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
             );
         }
 
+        // #2371: the discharge rule for a call's residual dynamic-dispatch arm
+        // needs the workspace half proven -- workspace implementors of the
+        // resolved declaring member enumerated, possibly empty -- before a
+        // contract-claiming summary can answer the external half. A call whose
+        // only named target is an unmaterialized external member never queues a
+        // `DispatchTargetGroup` for it (there is no workspace `CodeUnit` to
+        // queue), so the ordinary CHA expansion above never runs for it and
+        // "enumerated" is not satisfied by construction. Prove it here instead,
+        // or else refuse: see `external_member_workspace_override_proven_absent`.
+        if call_dispatch_gap.is_some()
+            && !boundaries
+                .iter()
+                .any(|boundary| boundary.kind == DispatchBoundaryKind::Truncated)
+        {
+            let unenumerated = boundaries
+                .iter()
+                .filter_map(|boundary| match &boundary.kind {
+                    DispatchBoundaryKind::External(Some(_)) => {
+                        boundary.unmaterialized_external_target.as_ref()
+                    }
+                    _ => None,
+                })
+                .any(|target| {
+                    !external_member_workspace_override_proven_absent(
+                        self.workspace.analyzer(),
+                        target,
+                    )
+                });
+            if unenumerated {
+                boundaries.push(workspace_hierarchy_unenumerated_boundary());
+                materialization_quality =
+                    merge_dispatch_quality(materialization_quality, DispatchQuality::Truncated);
+            }
+        }
+
         candidates.sort_by(|left, right| {
             left.target
                 .semantics()
@@ -883,6 +918,63 @@ fn virtual_dispatch_implementor_targets(
         );
     }
     Some(targets)
+}
+
+/// #2371: whether the analyzer's complete short-name index proves that no
+/// workspace declaration can override `target`'s external member.
+///
+/// `virtual_dispatch_implementor_targets` above answers the same "workspace
+/// half" question for a *workspace* declaration with no body, by expanding its
+/// `CodeUnit` through class-hierarchy analysis. An unmaterialized external
+/// member has no such `CodeUnit` -- it is definitionally not indexed -- so
+/// that expansion never runs for it, and #2371's discharge rule cannot treat
+/// "never ran" as "enumerated and proven empty".
+///
+/// The proof this asks instead: a workspace type overriding `target` must
+/// declare a member spelled exactly like it (the same terminal identifier), so
+/// no workspace declaration with that identifier means no workspace type
+/// overrides it. `lookup_candidates_by_identifier` answers this from the
+/// analyzer's persisted index without a source scan, but only a *complete*
+/// index makes an empty answer conclusive; an analyzer that cannot answer
+/// cheaply reports an empty set regardless, so the completeness flag is
+/// checked first.
+///
+/// The proof is sound only in the refusing direction. An unrelated
+/// same-named declaration -- a workspace class with its own, unconnected
+/// `getParameter` method, say -- costs a discharge, exactly like an
+/// incomplete index does: both fail closed rather than open. Neither
+/// manufactures a false discharge, which is what keeps the workspace-double
+/// fixture (#2371) from being skated past: a workspace type that actually
+/// implements the external interface and declares the member is exactly a
+/// declaration `lookup_candidates_by_identifier` finds.
+fn external_member_workspace_override_proven_absent(
+    analyzer: &dyn IAnalyzer,
+    target: &UnmaterializedExternalTarget,
+) -> bool {
+    analyzer.has_complete_symbol_lookup_index()
+        && analyzer
+            .lookup_candidates_by_identifier(target.member())
+            .is_empty()
+}
+
+/// #2371: the arm a call keeps when the workspace half of its residual
+/// dynamic-dispatch gap is not proven enumerated. Distinct from the generic
+/// [`truncated_dispatch_boundary`] reason so a corpus trace can tell the two
+/// causes apart; both are `Truncated`, so both refuse discharge identically.
+fn workspace_hierarchy_unenumerated_boundary() -> DispatchBoundary {
+    DispatchBoundary {
+        kind: DispatchBoundaryKind::Truncated,
+        exact_external_target: None,
+        unmaterialized_external_target: None,
+        proof: ProofStatus::Unproven(
+            "workspace implementors of the external member are not proven enumerated".into(),
+        ),
+        completeness: EvidenceCompleteness::Partial(
+            "no workspace declaration shares the external member's identifier, or the identifier index is not complete, so an absent workspace override is not proven"
+                .into(),
+        ),
+        provenance: Box::new([]),
+    }
 }
 
 /// Whether `BIFROST_DEBUG_CHA` asks for the class-hierarchy dispatch trace.

@@ -91,6 +91,7 @@ export const BIFROST_OWNED_SEMANTIC_PACK_SPECS = [
 ];
 
 export const BIFROST_OWNED_SEMANTIC_PACK_REQUIREMENT_SOURCES = [
+  "crates/bifrost-semantic-packs/src/summary_foundry/mod.rs",
   "crates/bifrost-semantic-packs/src/summary_foundry/framework_pack.rs",
   "crates/bifrost-semantic-packs/src/summary_foundry/golden_pack.rs",
   "crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs",
@@ -118,21 +119,6 @@ export function syncCitationVersion(contents, version) {
   }
   return contents.replace(pattern, (_match, prefix, suffix, carriageReturn) =>
     `${prefix}"${version}"${suffix}${carriageReturn}`,
-  );
-}
-
-export function syncBifrostCompatibilityRequirementSource(contents, version, sourceName) {
-  const pattern = /^(const BIFROST_REQUIREMENT: &str = ")([^"\r\n]+)(";[ \t]*)(\r?)$/gmu;
-  const matches = [...contents.matchAll(pattern)];
-  if (matches.length !== 1) {
-    throw new Error(
-      `Expected exactly one BIFROST_REQUIREMENT constant in ${sourceName}, found ${matches.length}.`,
-    );
-  }
-  return contents.replace(
-    pattern,
-    (_match, prefix, requirement, suffix, carriageReturn) =>
-      `${prefix}${syncCompatibilityRequirement(requirement, version, sourceName)}${suffix}${carriageReturn}`,
   );
 }
 
@@ -260,21 +246,6 @@ function collectProjectionUpdates(repoRoot, version) {
         syncBifrostDependencyVersions(contents, version),
       ),
     ),
-    ...BIFROST_OWNED_SEMANTIC_PACK_REQUIREMENT_SOURCES.map((relativePath) =>
-      updateText(repoRoot, relativePath, (contents) =>
-        syncBifrostCompatibilityRequirementSource(contents, version, relativePath),
-      ),
-    ),
-    ...RELEASE_BUNDLE_SPECS.map((relativePath) =>
-      updateJson(repoRoot, relativePath, (json) => {
-        json.compatibility ??= {};
-        json.compatibility.bifrost = syncCompatibilityRequirement(
-          json.compatibility.bifrost,
-          version,
-          relativePath,
-        );
-      }),
-    ),
     updateJson(repoRoot, "plugins/bifrost-agent/.claude-plugin/plugin.json", (json) => {
       json.version = version;
     }),
@@ -367,24 +338,6 @@ function sameMinorSeries(left, right) {
     && rightParts.length >= 2
     && leftParts[0] === rightParts[0]
     && leftParts[1] === rightParts[1];
-}
-
-function syncCompatibilityRequirement(requirement, version, sourceName) {
-  if (typeof requirement !== "string") {
-    throw new Error(`${sourceName} does not declare compatibility.bifrost.`);
-  }
-  const versionMatch = /^(\d+)\.(\d+)\.(\d+)$/u.exec(version);
-  if (!versionMatch) {
-    throw new Error(`Cargo version is not semantic: ${version}`);
-  }
-  const major = Number(versionMatch[1]);
-  const minor = Number(versionMatch[2]);
-  const upper = major === 0 ? `0.${minor + 1}.0` : `${major + 1}.0.0`;
-  const upperPattern = /,\s*<\d+\.\d+\.\d+$/u;
-  if (!upperPattern.test(requirement)) {
-    throw new Error(`${sourceName} compatibility.bifrost has no exclusive upper bound.`);
-  }
-  return requirement.replace(upperPattern, `, <${upper}`);
 }
 
 function readTomlSection(contents, section, sourceName) {

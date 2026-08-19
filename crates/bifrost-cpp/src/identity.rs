@@ -512,7 +512,10 @@ pub fn cpp_header_body_implementation_file<'a>(
 
 pub fn cpp_source_path_is_header(source: &ProjectFile) -> bool {
     let path = rel_path_string(source).to_ascii_lowercase();
-    matches!(path.rsplit('.').next(), Some("h" | "hh" | "hpp" | "hxx"))
+    matches!(
+        path.rsplit('.').next(),
+        Some("h" | "hin" | "hh" | "hpp" | "hxx")
+    )
 }
 
 pub fn cpp_occurrence_role_for_range(

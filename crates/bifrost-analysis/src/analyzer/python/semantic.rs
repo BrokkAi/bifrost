@@ -51,33 +51,40 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let (specs, class_names, range_builtin_proof, exception_builtin_proof, initial_work) =
-            match enumerate_procedures(file, prepared, budget, cancellation)? {
-                ProcedureEnumeration::Complete {
-                    value,
-                    initial_work,
-                    ..
-                } => (
-                    value.specs,
-                    value.class_names,
-                    value.range_builtin_proof,
-                    value.exception_builtin_proof,
-                    initial_work,
-                ),
-                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                    return Ok(SemanticOutcome::ExceededBudget {
-                        partial: None,
-                        exceeded,
-                        work,
-                    });
-                }
-                ProcedureEnumeration::Cancelled { work } => {
-                    return Ok(SemanticOutcome::Cancelled {
-                        partial: None,
-                        work,
-                    });
-                }
-            };
+        let (
+            specs,
+            class_names,
+            range_builtin_proof,
+            exception_builtin_proof,
+            str_builtin_proof,
+            initial_work,
+        ) = match enumerate_procedures(file, prepared, budget, cancellation)? {
+            ProcedureEnumeration::Complete {
+                value,
+                initial_work,
+                ..
+            } => (
+                value.specs,
+                value.class_names,
+                value.range_builtin_proof,
+                value.exception_builtin_proof,
+                value.str_builtin_proof,
+                initial_work,
+            ),
+            ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
+                });
+            }
+            ProcedureEnumeration::Cancelled { work } => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work,
+                });
+            }
+        };
 
         lower_procedure_batch(
             &specs,
@@ -91,6 +98,7 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
                     &class_names,
                     range_builtin_proof,
                     exception_builtin_proof,
+                    str_builtin_proof,
                     staged_budget,
                     cancellation,
                 )
@@ -156,6 +164,7 @@ struct PythonProcedureInventory<'tree> {
     class_names: HashSet<Box<str>>,
     range_builtin_proof: bool,
     exception_builtin_proof: bool,
+    str_builtin_proof: bool,
 }
 
 type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<PythonProcedureInventory<'tree>>;
@@ -327,6 +336,7 @@ fn enumerate_procedures<'tree>(
     let range_builtin_proof = !module_bindings.contains_key("range") && !module_wildcard_import;
     let exception_builtin_proof =
         !module_bindings.contains_key("Exception") && !module_wildcard_import;
+    let str_builtin_proof = !module_bindings.contains_key("str") && !module_wildcard_import;
     let class_names = module_bindings
         .into_iter()
         .filter_map(|(name, kind)| {
@@ -338,6 +348,7 @@ fn enumerate_procedures<'tree>(
         class_names,
         range_builtin_proof,
         exception_builtin_proof,
+        str_builtin_proof,
     }))
 }
 
@@ -540,16 +551,19 @@ struct LoweringContext<'tree, 'targets> {
     receiver: Option<ValueId>,
     class_names: &'targets HashSet<Box<str>>,
     range_builtin_proof: bool,
+    str_builtin_proof: bool,
     bindings: PythonLexicalScopeInventory<'tree>,
     cleanups: Vec<CleanupRegion<'tree>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
     class_names: &'targets HashSet<Box<str>>,
     range_builtin_proof: bool,
     exception_builtin_proof: bool,
+    str_builtin_proof: bool,
     budget: &SemanticBudget,
     cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), PythonLoweringError> {
@@ -594,6 +608,7 @@ fn lower_procedure<'tree, 'targets>(
         receiver: None,
         class_names,
         range_builtin_proof,
+        str_builtin_proof,
         bindings,
         cleanups: Vec::new(),
     };
@@ -2305,6 +2320,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.emit_lexical_input_flow(builder, node, entry, result)?;
         }
         match node.kind() {
+            "call" if self.proven_builtin_str_call(node) => {
+                self.builtin_str_expression(builder, node, entry, next, scope, stack)
+            }
             "call" => self.call_expression(builder, node, entry, next, scope, stack),
             "lambda" => self.callable_expression(builder, node, entry, next),
             "await" => self.await_expression(builder, node, entry, next, scope, stack),
@@ -3408,6 +3426,72 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 == PythonLexicalNameResolution::Unbound
             && python_range_literal_values(self.prepared.source(), call)
                 .is_some_and(|values| !matches!(values.as_slice(), [_, _, step] if *step == 0))
+    }
+
+    /// Whether a call provably denotes the builtin `str`: the module does not
+    /// rebind the name, there is no wildcard import, and the use-site resolves
+    /// lexically unbound. This is the same proof shape as
+    /// [`Self::proven_builtin_range_call`].
+    fn proven_builtin_str_call(&self, call: Node<'tree>) -> bool {
+        if !self.str_builtin_proof || call.kind() != "call" {
+            return false;
+        }
+        let function = match call.child_by_field_name("function") {
+            Some(function) if function.kind() == "identifier" => function,
+            _ => return false,
+        };
+        node_text(self.prepared.source(), function) == Some("str")
+            && self.bindings.name_resolution_at("str", function)
+                == PythonLexicalNameResolution::Unbound
+    }
+
+    /// Lower a proven builtin `str(...)` call as a modeled boundary instead of
+    /// an unresolved call site: each argument value flows to the call result,
+    /// matching how the binary-operator lowering propagates operand values.
+    /// The builtin cannot be rebound once the proof holds, so no dispatch gap
+    /// is published; an unproven `str` keeps the generic call path and its
+    /// honest refinement gap.
+    fn builtin_str_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PythonLoweringError> {
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        let terminal = self.point(builder, node, Vec::new())?;
+        let arguments = call_arguments(node);
+        let mut argument_values = Vec::with_capacity(arguments.len());
+        for argument in &arguments {
+            let value_node = python_argument_value_node(*argument);
+            argument_values.push(self.expression_value(
+                builder,
+                value_node,
+                expression_value_kind(value_node),
+            )?);
+        }
+        for source in argument_values {
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::LanguageDefined,
+                    source,
+                    target: result,
+                },
+            )?;
+        }
+        self.edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &arguments,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
     }
 
     fn try_statement(
@@ -5062,6 +5146,75 @@ mod tests {
         assert!(assignments.contains(&(inner, parenthesized)));
         assert!(flows.contains(&(parenthesized, outer)));
         assert!(flows.iter().all(|(_, target)| *target != unrelated_literal));
+    }
+
+    #[test]
+    fn proven_builtin_str_call_flows_argument_to_result_without_a_call_site() {
+        let source = "def convert(value):\n    result = str(value)\n    return result\n";
+        let parts = lower_fixture(source);
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("Python grammar is valid");
+        let tree = parser.parse(source, None).expect("fixture parses");
+        let function = tree
+            .root_node()
+            .named_child(0)
+            .expect("function definition is present");
+        let body = function
+            .child_by_field_name("body")
+            .expect("function body is present");
+        let assignment_statement = body
+            .named_child(0)
+            .expect("str assignment statement is present");
+        let assignment =
+            first_named_child(assignment_statement).expect("str assignment is present");
+        let call = assignment
+            .child_by_field_name("right")
+            .expect("str call is present");
+        assert_eq!(call.kind(), "call");
+        let argument = call
+            .child_by_field_name("arguments")
+            .expect("str argument list is present")
+            .named_child(0)
+            .expect("str argument is present");
+
+        let argument_value = value_for_node(&parts, argument, SemanticValueKind::Temporary);
+        let result_value = value_for_node(&parts, call, SemanticValueKind::Temporary);
+        assert!(
+            flow_reaches(&parts, argument_value, result_value),
+            "a proven builtin str call must flow its argument to the call result"
+        );
+        assert!(
+            parts.call_sites.is_empty(),
+            "a proven builtin str call must not retain an unresolved call site"
+        );
+        assert!(
+            !parts
+                .gaps
+                .iter()
+                .any(|gap| gap.capability == SemanticCapability::DynamicDispatch),
+            "a proven builtin str call must not publish a dispatch gap"
+        );
+    }
+
+    #[test]
+    fn rebound_str_keeps_the_generic_call_path() {
+        let source = "def str(value):\n    return value\n\n\ndef convert(value):\n    result = str(value)\n    return result\n";
+        let parts = lower_fixture_named(source, Some("convert"));
+
+        assert!(
+            !parts.call_sites.is_empty(),
+            "a rebound str keeps the generic call site"
+        );
+        assert!(
+            parts
+                .gaps
+                .iter()
+                .any(|gap| gap.capability == SemanticCapability::DynamicDispatch),
+            "a rebound str keeps the honest dispatch gap"
+        );
     }
 
     fn condition_literal(source: &str) -> Option<bool> {

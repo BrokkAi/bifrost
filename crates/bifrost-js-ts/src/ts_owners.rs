@@ -1073,23 +1073,15 @@ fn ts_expand_property_owners(
     let mut owners = Vec::new();
     for candidate in candidates {
         if jsts_unit_is_type_only(host, &candidate) {
-            let signatures = host.signatures(&candidate);
-            let expanded = signatures
-                .iter()
-                .flat_map(|signature| {
-                    ts_alias_rhs(signature)
-                        .map(|rhs| {
-                            ts_resolve_type_from_unit_context(
-                                host,
-                                support,
-                                &candidate,
-                                rhs,
-                                depth + 1,
-                            )
-                        })
-                        .unwrap_or_default()
+            // The aliased type comes from the declaration's AST `value` field;
+            // the signature string cannot be split at `=` without hitting a
+            // type-parameter default (#2227).
+            let expanded = host
+                .type_alias_value_text(&candidate)
+                .map(|rhs| {
+                    ts_resolve_type_from_unit_context(host, support, &candidate, &rhs, depth + 1)
                 })
-                .collect::<Vec<_>>();
+                .unwrap_or_default();
             if expanded.is_empty() {
                 owners.push(candidate);
             } else {
@@ -1398,19 +1390,20 @@ fn ts_field_signature_type_owners(
     depth: usize,
 ) -> Vec<CodeUnit> {
     let mut owners = Vec::new();
-    for signature in host.signatures(field) {
-        if let Some(type_text) = ts_field_type_text(&signature) {
-            owners.extend(ts_resolve_type_text_to_property_owners(
-                host,
-                support,
-                file,
-                source,
-                imports,
-                aliases,
-                type_text,
-                depth + 1,
-            ));
-        }
+    // The declared type comes from the property signature's AST `type`
+    // annotation; the signature string cannot be split on `,` without cutting
+    // a multi-argument generic like `Map<string, number>` in half (#2227).
+    if let Some(type_text) = host.member_type_annotation_text(field) {
+        owners.extend(ts_resolve_type_text_to_property_owners(
+            host,
+            support,
+            file,
+            source,
+            imports,
+            aliases,
+            &type_text,
+            depth + 1,
+        ));
     }
     owners
 }
@@ -1449,23 +1442,6 @@ pub fn node_text_matches(node: Node<'_>, source: &str, expected: &str) -> bool {
     source
         .get(node.start_byte()..node.end_byte())
         .is_some_and(|text| text.trim() == expected)
-}
-
-fn ts_field_type_text(signature: &str) -> Option<&str> {
-    let (_, rhs) = signature.split_once(':')?;
-    Some(
-        rhs.split(['=', ','])
-            .next()
-            .unwrap_or(rhs)
-            .trim()
-            .trim_end_matches(';')
-            .trim(),
-    )
-}
-
-fn ts_alias_rhs(signature: &str) -> Option<&str> {
-    let (_, rhs) = signature.split_once('=')?;
-    Some(rhs.trim().trim_end_matches(';').trim())
 }
 
 fn ts_typeof_target(text: &str) -> Option<&str> {

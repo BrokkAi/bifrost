@@ -1876,7 +1876,7 @@ fn assemble_taint_projection_batch(
             }
         }
     }
-    finish_assembled_run(
+    let mut run = finish_assembled_run(
         policy,
         PolicyAnalysisType::Taint,
         validated.completion,
@@ -1886,7 +1886,9 @@ fn assemble_taint_projection_batch(
         validated.work,
         "taint evaluation produced an invalid policy run",
         budget,
-    )
+    )?;
+    run.set_authored_arm_closures(validated.authored_arm_closures);
+    Ok(run)
 }
 
 fn assemble_typestate_projection_batch(

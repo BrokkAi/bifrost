@@ -496,6 +496,7 @@ impl FoundryEntry {
                 FoundryCompleteness::Partial => Completeness::Partial,
                 FoundryCompleteness::Complete => Completeness::Complete,
             },
+            covers_overrides: false,
             locations: Vec::new(),
             transfers: self.transfers.clone(),
             effects: Vec::new(),

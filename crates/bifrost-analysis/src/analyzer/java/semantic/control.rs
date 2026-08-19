@@ -267,7 +267,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
             }
             vec![right]
-        } else if left.kind() == "field_access" {
+        } else if left.kind() == "field_access" && !self.field_access_is_type_qualifier(left) {
             let object = required_field(left, "object")?;
             let field = required_field(left, "field")?;
             let base = self.expression_value(builder, object, expression_value_kind(object))?;
@@ -974,6 +974,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 } else {
                     self.edge(builder, entry, next)
                 }
+            }
+            "field_access" if self.field_access_is_type_qualifier(node) => {
+                // A package-or-type qualifier (`java.net.URLDecoder`) denotes
+                // no runtime value (#2363). Do not mint a Field location or
+                // an undischargeable FieldMemory gap.
+                self.edge(builder, entry, next)
             }
             "field_access" => {
                 let object = required_field(node, "object")?;

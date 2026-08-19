@@ -126,12 +126,9 @@ release date, then run:
 node scripts/release-version.mjs sync
 ```
 
-That script updates these committed version fields and compatibility bounds:
+That script updates these committed version fields:
 
 - `CITATION.cff`'s `version` field, without changing `date-released`
-- the exclusive Bifrost compatibility upper bound in shipped semantic-pack
-  specifications and Bifrost-owned framework, golden, and sanitizer foundry
-  sources; other pack metadata and lower bounds remain unchanged
 - `plugins/bifrost-agent/.claude-plugin/plugin.json`
 - `plugins/bifrost-agent/.codex-plugin/plugin.json`
 - `plugins/bifrost-agent/.cursor-plugin/plugin.json`
@@ -251,7 +248,9 @@ To cut a release:
    resolve any conflicts against current `master` deliberately. Changes that
    land on `master` after the branch point remain outside the release unless
    they are explicitly selected for the RC branch.
-8. After the RC branch is frozen and validated, tag the validated RC commit -
+8. After the RC branch is frozen and validated, compare the RC commit to the
+   previous release with `scripts/check-build-ancestry.sh` so a higher version
+   label is not treated as newer source. Then tag the validated RC commit -
    not the current `master` tip - and push the tag:
 
    ```bash
@@ -424,7 +423,9 @@ Use one explicit handoff from source projection to release publication:
    not use the latest run merely because it is latest.
 3. Inspect the retained `release-qualification.json` manifest and its recorded
    file digests, release inventory, commit, version, and workflow run. Treat
-   that single qualification bundle as the evidence for the handoff.
+   that single qualification bundle as the evidence for the handoff. Confirm
+   with `scripts/check-build-ancestry.sh` that the qualified public commit
+   contains the prior release tag's source.
 4. Only after that inspection, separately create and authorize the public
    `vX.Y.Z` tag on the qualified public commit. Projection does not create a
    tag, dispatch `Release`, or publish an artifact.

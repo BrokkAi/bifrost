@@ -8,7 +8,8 @@ use crate::analyzer::semantic::{
     ProcedureHandle, ProgramPointHandle, SemanticArtifactKey, SemanticLocator,
 };
 use crate::analyzer::value_flow::{
-    ValueFlowCarrierKey, ValueFlowEventKey, ValueFlowSinkId, semantic_locator_heap_bytes,
+    AuthoredArmClosure, ValueFlowCarrierKey, ValueFlowEventKey, ValueFlowSinkId,
+    semantic_locator_heap_bytes,
 };
 
 use super::{
@@ -234,6 +235,15 @@ impl TaintFindingReport {
     /// truncated collection is a real gap, so it never earns this state.
     pub fn is_proven_by_authored_summaries(&self) -> bool {
         self.result.is_proven_by_authored_summaries() && !self.collection_truncated
+    }
+
+    /// Authored identities that closed a residual dispatch arm when this
+    /// report is proven by summary (#2342). Empty otherwise.
+    pub fn authored_arm_closures(&self) -> &[AuthoredArmClosure] {
+        if self.collection_truncated {
+            return &[];
+        }
+        self.result.authored_arm_closures()
     }
 
     pub const fn omitted_findings_lower_bound(&self) -> usize {

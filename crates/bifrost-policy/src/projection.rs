@@ -92,6 +92,7 @@ impl<'a> TaintProjectionAuthority<'a> {
             diagnostics,
             diagnostics_truncated,
             work,
+            authored_arm_closures,
         } = payload;
         TaintProjectionBatch {
             seal: self.seal.clone(),
@@ -100,6 +101,7 @@ impl<'a> TaintProjectionAuthority<'a> {
             diagnostics,
             diagnostics_truncated,
             work,
+            authored_arm_closures,
         }
     }
 }
@@ -312,6 +314,7 @@ pub(crate) struct TaintProjectionPayload {
     pub(crate) diagnostics: Vec<PolicyDiagnostic>,
     pub(crate) diagnostics_truncated: bool,
     pub(crate) work: PolicyWorkReport,
+    pub(crate) authored_arm_closures: Vec<crate::AuthoredArmClosureEvidence>,
 }
 
 /// Unsealed typestate adapter output. It deliberately carries no policy or
@@ -336,6 +339,7 @@ pub(crate) struct TaintProjectionBatch {
     diagnostics: Vec<PolicyDiagnostic>,
     diagnostics_truncated: bool,
     work: PolicyWorkReport,
+    authored_arm_closures: Vec<crate::AuthoredArmClosureEvidence>,
 }
 
 /// Raw adapter output for one typestate evaluation.
@@ -354,6 +358,7 @@ pub(crate) struct ValidatedTaintProjectionBatch {
     pub(crate) diagnostics: Vec<PolicyDiagnostic>,
     pub(crate) diagnostics_truncated: bool,
     pub(crate) work: PolicyWorkReport,
+    pub(crate) authored_arm_closures: Vec<crate::AuthoredArmClosureEvidence>,
 }
 
 pub(crate) struct ValidatedTypestateProjectionBatch {
@@ -543,6 +548,7 @@ pub(crate) fn validate_taint_batch(
         diagnostics,
         diagnostics_truncated,
         work,
+        authored_arm_closures: batch.authored_arm_closures,
     })
 }
 
@@ -2070,6 +2076,7 @@ mod tests {
             diagnostics,
             diagnostics_truncated,
             work,
+            authored_arm_closures: Vec::new(),
         })
     }
 

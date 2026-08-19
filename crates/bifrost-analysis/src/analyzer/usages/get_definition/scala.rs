@@ -702,6 +702,39 @@ impl<'a> ForwardScalaNameResolver<'a> {
         ScalaNameResolution::Unresolved
     }
 
+    /// Resolve the owner of an explicit member import. A declaration made
+    /// available by the compilation unit's own package binds the import's
+    /// relative owner before a wildcard import does (#2222). Ordinary Scala
+    /// references keep their existing wildcard-before-package precedence;
+    /// only the import selector and references bound by it use this tier.
+    fn resolve_import_owner_segments(
+        &self,
+        segments: &[String],
+        kind: ScalaOwnerKind,
+    ) -> ScalaNameResolution {
+        if segments.is_empty() || segments.first().is_some_and(|segment| segment == "_root_") {
+            return self.resolve_owner_segments(segments, kind);
+        }
+        match self.resolve_explicit_owner_segments(segments, kind) {
+            ScalaNameResolution::Unresolved => {}
+            outcome => return outcome,
+        }
+        if let Some(package) = self
+            .package_prefixes
+            .last()
+            .filter(|prefix| !prefix.is_empty())
+        {
+            let outcome = self.resolve_candidate_tier(
+                scala_nested_type_candidates(package.clone(), segments, false),
+                kind,
+            );
+            if outcome != ScalaNameResolution::Unresolved {
+                return outcome;
+            }
+        }
+        self.resolve_owner_segments(segments, kind)
+    }
+
     fn resolve_wildcard_owner_segments(
         &self,
         segments: &[String],
@@ -1085,7 +1118,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
             };
             if !owner_segments.is_empty()
                 && let ScalaNameResolution::Resolved(owner) = qualifier_resolver
-                    .resolve_owner_segments(owner_segments, ScalaOwnerKind::SingletonObject)
+                    .resolve_import_owner_segments(owner_segments, ScalaOwnerKind::SingletonObject)
             {
                 members.extend(
                     self.support
@@ -3757,6 +3790,17 @@ fn resolve_scala_with_context(
     {
         return resolve_scala_type(ctx, &resolver, root, qualified_type_root);
     }
+    // `#` selects a type member of the type on its left, so a caret on that
+    // selector is answered by projection semantics (#2221) rather than by the
+    // qualified-path reading below, which flattens `A#B` to the two-segment
+    // path `A.B` and used to answer the companion object of the projected
+    // owner. A caret on the owner segment asks for the owner and falls
+    // through to that per-segment reading.
+    if let Some(projection) =
+        scala_focused_projected_type(node, site.focus_start_byte, site.focus_end_byte)
+    {
+        return scala_projected_type_outcome(ctx, &resolver, projection);
+    }
     if let Some(outcome) = resolve_scala_focused_qualified_path(
         ctx,
         &resolver,
@@ -3948,7 +3992,9 @@ fn resolve_scala_with_context(
                 }
                 ScalaNameResolution::Unresolved => {}
             }
-            if let Some(imported_member) = scala_wildcard_imported_member_outcome(ctx, text, None) {
+            if let Some(imported_member) =
+                scala_wildcard_imported_member_outcome(ctx, &resolver, text, None)
+            {
                 return imported_member;
             }
             // `scala_import_boundary_for_name` checks the workspace-package /
@@ -4302,7 +4348,7 @@ fn scala_import_member_outcome(
         ScalaOwnerKind::TypeNamespace,
     ] {
         let ScalaNameResolution::Resolved(owner) =
-            resolver.resolve_owner_segments(owner_segments, kind)
+            resolver.resolve_import_owner_segments(owner_segments, kind)
         else {
             continue;
         };
@@ -4399,6 +4445,27 @@ fn scala_direct_import_segment_index(
 struct ScalaFocusedQualifiedPath<'tree> {
     segments: Vec<(Node<'tree>, String)>,
     focus_index: usize,
+}
+
+impl ScalaFocusedQualifiedPath<'_> {
+    /// True when the focused segment is the owner immediately left of a `#`.
+    ///
+    /// `Owner#Member` selects a type member of a *type*, so the owner resolves
+    /// in the type namespace alone. An object is not a legal projection owner,
+    /// and reading the owner as one is how a caret on `A` in `A#B` used to
+    /// answer `A`'s companion object rather than the class the projection
+    /// names.
+    fn focus_owns_a_projection_selector(&self) -> bool {
+        let Some((next, _)) = self.segments.get(self.focus_index + 1) else {
+            return false;
+        };
+        next.parent().is_some_and(|parent| {
+            parent.kind() == "projected_type"
+                && parent
+                    .child_by_field_name("selector")
+                    .is_some_and(|selector| selector.id() == next.id())
+        })
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4612,20 +4679,26 @@ fn resolve_scala_focused_qualified_path(
         }
         ScalaExactMemberResolution::NoMatch => {}
     }
-    let singleton = resolver.resolve_owner_segments(&prefix, ScalaOwnerKind::SingletonObject);
-    let missing_singleton_import = singleton == ScalaNameResolution::MissingExplicitImport;
-    match singleton {
-        ScalaNameResolution::Resolved(owner) => {
-            return Some(scala_fqn_outcome(ctx.support, &owner.fqn, &display));
+    // A dotted qualifier is a stable path, so its owner segments are singleton
+    // objects; a projection owner is a type and never one, so that arm is not
+    // consulted for it.
+    let mut missing_singleton_import = false;
+    if !path.focus_owns_a_projection_selector() {
+        let singleton = resolver.resolve_owner_segments(&prefix, ScalaOwnerKind::SingletonObject);
+        missing_singleton_import = singleton == ScalaNameResolution::MissingExplicitImport;
+        match singleton {
+            ScalaNameResolution::Resolved(owner) => {
+                return Some(scala_fqn_outcome(ctx.support, &owner.fqn, &display));
+            }
+            ScalaNameResolution::Ambiguous(owners) => {
+                return Some(scala_ambiguous_outcome(
+                    "ambiguous_scala_type",
+                    scala_owner_declarations(owners),
+                    format!("`{display}` resolves to multiple physical Scala owners"),
+                ));
+            }
+            ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => {}
         }
-        ScalaNameResolution::Ambiguous(owners) => {
-            return Some(scala_ambiguous_outcome(
-                "ambiguous_scala_type",
-                scala_owner_declarations(owners),
-                format!("`{display}` resolves to multiple physical Scala owners"),
-            ));
-        }
-        ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => {}
     }
     Some(
         match resolver.resolve_owner_segments(&prefix, ScalaOwnerKind::Class) {
@@ -6554,6 +6627,9 @@ fn resolve_scala_type(
             );
         }
     }
+    if node.kind() == "projected_type" {
+        return scala_projected_type_outcome(ctx, resolver, node);
+    }
     let local_import = scala_enclosing_type_definition_range(node).and_then(|declaration_range| {
         (!type_segments.is_empty()).then(|| {
             resolver.resolve_explicit_owner_segments_in_range(
@@ -6700,6 +6776,150 @@ fn resolve_scala_type(
         "no_indexed_definition",
         format!("`{text}` did not resolve to an indexed Scala type"),
     )
+}
+
+/// The innermost `projected_type` at or above `node` whose selector covers the
+/// focus.
+///
+/// `#` selects a type member of the type on its left, so only a caret on that
+/// selector asks for the member; a caret on the owner asks for the owner, the
+/// same per-segment reading `scala_focused_qualified_path` gives every other
+/// qualified path. `A#B#C` parses as `projected_type(projected_type(A, B), C)`,
+/// so a caret on `C` selects the whole projection, a caret on `B` selects the
+/// inner `A#B`, and a caret on `A` selects no projection at all.
+fn scala_focused_projected_type(
+    node: Node<'_>,
+    focus_start_byte: usize,
+    focus_end_byte: usize,
+) -> Option<Node<'_>> {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate.kind() == "projected_type"
+            && let Some(selector) = candidate.child_by_field_name("selector")
+            && selector.start_byte() <= focus_start_byte
+            && focus_end_byte <= selector.end_byte()
+        {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+/// The outcome for a `projected_type` reference `Owner#Member`.
+///
+/// `#` selects a type member of the type on its left, so the member lookup is
+/// #2176's linearized `ProjectTypes::projected_type_member` walk, shared with
+/// the inverse scan rather than re-derived here: the first template in the
+/// owner's linearization that declares the name binds it, and two
+/// declarations at that tier are ambiguous and bind nothing. The owner needs
+/// one deliberate step off the ordinary route, because
+/// `scala_qualified_type_root` climbs through `projected_type` and so reads
+/// `CustomURLZipArchive#Entry` as the two-segment path
+/// `CustomURLZipArchive.Entry` -- which is how the forward side used to
+/// answer the companion object of the projected owner (#2221). The arm
+/// consumes its node either way: a fall-through would look the member up as a
+/// bare type name and hand it to an unrelated top-level declaration of the
+/// same spelling.
+fn scala_projected_type_outcome(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    node: Node<'_>,
+) -> DefinitionLookupOutcome {
+    // `A#B#C` parses as `projected_type(projected_type(A, B), C)`, so peel
+    // the selectors iteratively: the innermost `type` field is the path owner
+    // and the members select outward from it.
+    let mut members = Vec::new();
+    let mut owner_node = node;
+    while owner_node.kind() == "projected_type" {
+        let (Some(type_child), Some(selector)) = (
+            owner_node.child_by_field_name("type"),
+            owner_node.child_by_field_name("selector"),
+        ) else {
+            break;
+        };
+        let member = scala_node_text(selector, ctx.source).trim();
+        if member.is_empty() {
+            break;
+        }
+        members.push(member.to_string());
+        owner_node = type_child;
+    }
+    members.reverse();
+    let text = scala_node_text(node, ctx.source);
+    let unresolved_projection = || {
+        no_definition(
+            "unresolved_scala_type_projection",
+            format!("`{text}` did not resolve to an indexed Scala type member"),
+        )
+    };
+    if owner_node.kind() == "projected_type" {
+        return unresolved_projection();
+    }
+    let owner_segments = scala_type_lookup_segments(owner_node, ctx.source);
+    if owner_segments.is_empty() || members.is_empty() {
+        return unresolved_projection();
+    }
+    // A lexically nested owner has no package-level binding (scalaz's `trait
+    // IterateeTF` inside `trait IterateeTHoist`), so probe the enclosing
+    // templates before the ordinary namespace route, exactly like the
+    // inverse side's lexical tier.
+    let exact_owner = scala_resolve_enclosing_qualified_type(
+        ctx,
+        resolver,
+        owner_node,
+        &owner_segments,
+        ScalaOwnerKind::TypeNamespace,
+    )
+    .and_then(|fqn| scala_owner_declaration(ctx, &fqn));
+    let project_types = ctx.scala.project_types();
+    let projected_member = |mut owner: CodeUnit| {
+        for member in &members {
+            owner = project_types.projected_type_member(ctx.scala, &owner, member)?;
+        }
+        Some(owner)
+    };
+    if let Some(owner) = exact_owner {
+        return projected_member(owner).map_or_else(unresolved_projection, |member| {
+            candidates_outcome(vec![member])
+        });
+    }
+    match resolver.resolve_owner_segments(&owner_segments, ScalaOwnerKind::TypeNamespace) {
+        ScalaNameResolution::Resolved(owner) => projected_member(owner._declaration)
+            .map_or_else(unresolved_projection, |member| {
+                candidates_outcome(vec![member])
+            }),
+        ScalaNameResolution::Ambiguous(owners) => {
+            let mut contenders = scala_owner_declarations(owners);
+            for member in &members {
+                let mut selected = Vec::new();
+                for owner in contenders {
+                    match scala_exact_owner_member_candidate_units(ctx, &owner, member, false) {
+                        ScalaExactMemberResolution::Found(candidates)
+                        | ScalaExactMemberResolution::Ambiguous(candidates) => {
+                            selected.extend(candidates);
+                        }
+                        ScalaExactMemberResolution::NoMatch => {}
+                    }
+                }
+                sort_units(&mut selected);
+                selected.dedup();
+                contenders = selected;
+            }
+            if contenders.len() < 2 {
+                unresolved_projection()
+            } else {
+                scala_ambiguous_outcome(
+                    "ambiguous_scala_type",
+                    contenders,
+                    format!("`{text}` resolves through multiple physical Scala owners"),
+                )
+            }
+        }
+        ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => {
+            unresolved_projection()
+        }
+    }
 }
 
 fn scala_enclosing_type_definition_range(mut node: Node<'_>) -> Option<(usize, usize)> {
@@ -7194,7 +7414,7 @@ fn resolve_scala_call(
                 ScalaNameResolution::Unresolved => {}
             }
             if let Some(imported_member) =
-                scala_wildcard_imported_member_outcome(ctx, name, call_shape.as_ref())
+                scala_wildcard_imported_member_outcome(ctx, resolver, name, call_shape.as_ref())
             {
                 return imported_member;
             }
@@ -9924,6 +10144,7 @@ fn scala_extension_receiver_matches(
 
 fn scala_wildcard_imported_member_outcome(
     ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
     member: &str,
     call_shape: Option<&ScalaCallSiteShape>,
 ) -> Option<DefinitionLookupOutcome> {
@@ -9970,6 +10191,7 @@ fn scala_wildcard_imported_member_outcome(
         let mut import_candidates = scala_wildcard_imported_member_units(
             ctx.scala,
             ctx.support,
+            resolver,
             &path,
             &file_package,
             &enclosing_owners,
@@ -10032,9 +10254,11 @@ fn scala_wildcard_base_exports_undecorated_members(
     types.iter().all(|unit| project_types.is_enum(scala, unit))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scala_wildcard_imported_member_units(
     scala: &ScalaAnalyzer,
     support: &dyn BoundedDefinitionLookup,
+    resolver: &ScalaNameResolver,
     path: &str,
     file_package: &str,
     enclosing_owners: &[String],
@@ -10042,14 +10266,29 @@ fn scala_wildcard_imported_member_units(
     member: &str,
 ) -> Vec<CodeUnit> {
     let mut candidates = Vec::new();
-    for imported_fqn in import_candidate_fq_names(path, file_package) {
+    let mut imported_fqns: Vec<String> = import_candidate_fq_names(path, file_package)
+        .into_iter()
+        .collect();
+    // A relative wildcard base may be bound by an earlier import in the same
+    // file -- specs2 writes `import example.data.*` before `import
+    // EditDistance.*` -- so qualify the base through the name resolver's
+    // import tiers in addition to the package spellings above.
+    if !segments.is_empty()
+        && let ScalaNameResolution::Resolved(owner) =
+            resolver.resolve_owner_segments(segments, ScalaOwnerKind::SingletonObject)
+    {
+        imported_fqns.push(owner.fqn.trim_end_matches('$').to_string());
+    }
+    imported_fqns.sort();
+    imported_fqns.dedup();
+    for imported_fqn in imported_fqns {
         let singleton_fqn = format!("{}$", imported_fqn.trim_end_matches('$'));
-        candidates.extend(
-            support
-                .fqn_direct_children(&singleton_fqn)
-                .into_iter()
-                .filter(|unit| unit.identifier() == member),
-        );
+        candidates.extend(scala_wildcard_singleton_term_members(
+            scala,
+            support,
+            &singleton_fqn,
+            member,
+        ));
         if !scala_wildcard_base_exports_undecorated_members(scala, support, &imported_fqn) {
             continue;
         }
@@ -10070,12 +10309,9 @@ fn scala_wildcard_imported_member_units(
         for tier in scala_owner_qualified_import_candidate_tiers(enclosing_owners, segments) {
             for candidate in tier {
                 let owner_fqn = format!("{}$", candidate.trim_end_matches('$'));
-                candidates.extend(
-                    support
-                        .fqn_direct_children(&owner_fqn)
-                        .into_iter()
-                        .filter(|unit| unit.identifier() == member),
-                );
+                candidates.extend(scala_wildcard_singleton_term_members(
+                    scala, support, &owner_fqn, member,
+                ));
                 if !scala_wildcard_base_exports_undecorated_members(scala, support, &candidate) {
                     continue;
                 }
@@ -10090,6 +10326,46 @@ fn scala_wildcard_imported_member_units(
     }
     sort_units(&mut candidates);
     candidates.dedup();
+    candidates
+}
+
+/// The term members a wildcard import of the singleton `singleton_fqn` binds
+/// under the name `member`.
+///
+/// A declared `object` inherits its parents' term members and a wildcard
+/// import binds them: specs2's `import EditDistance.*` answers
+/// `levenhsteinDistance`, which `trait EditDistance` declares and `object
+/// EditDistance extends EditDistance` inherits (#2212). The inherited half is
+/// #2179's linearized `ProjectTypes::wildcard_member_declarations` walk,
+/// shared with the inverse scan rather than re-derived here. Only a declared
+/// `object` carries a `$`-suffixed unit in the index, so an implicit
+/// companion is never walked and the case class's parents stay out of the
+/// binding, exactly as on the inverse side.
+fn scala_wildcard_singleton_term_members(
+    scala: &ScalaAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    singleton_fqn: &str,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let mut candidates: Vec<CodeUnit> = support
+        .fqn_direct_children(singleton_fqn)
+        .into_iter()
+        .filter(|unit| unit.identifier() == member)
+        .collect();
+    let project_types = scala.project_types();
+    for owner in support
+        .fqn(singleton_fqn)
+        .into_iter()
+        .filter(|unit| unit.is_class() && unit.fq_name() == singleton_fqn)
+    {
+        candidates.extend(
+            project_types
+                .wildcard_member_declarations(scala, &owner)
+                .iter()
+                .filter(|(name, _)| name == member)
+                .map(|(_, unit)| unit.clone()),
+        );
+    }
     candidates
 }
 
@@ -11963,9 +12239,11 @@ fn scala_imported_member_shadows_bare_call(
                 .as_ref()
                 .map(|structured_path| structured_path.segments.as_slice())
                 .unwrap_or(&[]);
+            let resolver = ForwardScalaNameResolver::for_file(scala, support, file);
             if scala_wildcard_imported_member_units(
                 scala,
                 support,
+                &resolver,
                 &path,
                 &file_package,
                 &enclosing_owners,

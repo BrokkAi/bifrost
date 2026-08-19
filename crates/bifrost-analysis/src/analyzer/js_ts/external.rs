@@ -329,6 +329,7 @@ impl TypeScriptDeclarationPackProducer {
                 severity: ProducerDiagnosticSeverity::Error,
                 code: "npm.package.manifest_missing".to_owned(),
                 location: Some(manifest_path.to_owned()),
+                declaration: None,
                 message: "pinned npm source set does not contain its declared manifest".to_owned(),
             });
             return partial(diagnostics, suppressed_diagnostics);
@@ -338,6 +339,7 @@ impl TypeScriptDeclarationPackProducer {
                 severity: ProducerDiagnosticSeverity::Error,
                 code: "npm.package.identity".to_owned(),
                 location: Some(manifest_path.to_owned()),
+                declaration: None,
                 message,
             });
             return partial(diagnostics, suppressed_diagnostics);
@@ -351,6 +353,7 @@ impl TypeScriptDeclarationPackProducer {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "artifact.cancelled".to_owned(),
                     location: None,
+                    declaration: None,
                     message: "npm package source-set production was cancelled".to_owned(),
                 });
                 return partial(diagnostics, suppressed_diagnostics);
@@ -364,6 +367,7 @@ impl TypeScriptDeclarationPackProducer {
                     severity: ProducerDiagnosticSeverity::Warning,
                     code: "npm.declarations.missing".to_owned(),
                     location: Some(declaration_path.clone()),
+                    declaration: None,
                     message: "pinned npm source set does not contain its declared declaration file"
                         .to_owned(),
                 });
@@ -374,6 +378,7 @@ impl TypeScriptDeclarationPackProducer {
                     severity: ProducerDiagnosticSeverity::Warning,
                     code: "typescript.declaration.encoding".to_owned(),
                     location: Some(declaration_path.clone()),
+                    declaration: None,
                     message: "TypeScript declaration entry is not valid UTF-8".to_owned(),
                 });
                 continue;
@@ -393,6 +398,7 @@ impl TypeScriptDeclarationPackProducer {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "artifact.cancelled".to_owned(),
                     location: Some(declaration_path.clone()),
+                    declaration: None,
                     message: "npm package source-set production was cancelled".to_owned(),
                 });
                 return partial(diagnostics, suppressed_diagnostics);
@@ -415,6 +421,7 @@ impl TypeScriptDeclarationPackProducer {
                 severity: ProducerDiagnosticSeverity::Error,
                 code: "npm.declarations.no_external_declarations".to_owned(),
                 location: None,
+                declaration: None,
                 message: "pinned npm declaration files contain no exported or ambient declarations"
                     .to_owned(),
             });
@@ -1604,6 +1611,7 @@ fn failed_production(
             severity: ProducerDiagnosticSeverity::Error,
             code: code.to_owned(),
             location: None,
+            declaration: None,
             message: message.to_owned(),
         },
         limits,
@@ -1628,6 +1636,7 @@ fn dependency_failure(code: &str, message: &str) -> DependencyPackProduction {
             severity: ProducerDiagnosticSeverity::Error,
             code: code.to_owned(),
             location: None,
+            declaration: None,
             message: message.to_owned(),
         }],
         suppressed_diagnostics: 0,

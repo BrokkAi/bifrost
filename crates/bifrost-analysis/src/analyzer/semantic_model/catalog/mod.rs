@@ -215,6 +215,53 @@ pub struct InstallOutcome {
     pub inserted_objects: usize,
 }
 
+/// One declaration that a pack producer could not extract.
+///
+/// `declaration` is the producer's canonical fully-qualified type name. A
+/// member-specific reject may use `Owner.member`; owner-wide checks also
+/// consult the owning type. `reason` is stable diagnostic context for humans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackExtractionGap {
+    pub declaration: String,
+    pub reason: String,
+}
+
+/// Complete reject accounting installed from a verified release bundle.
+///
+/// Ordinary authored and workspace-generated packs have no row of this kind.
+/// That distinction is intentional: a partial pack may activate only when its
+/// release bundle accounts for every reject as an individually named warning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackExtractionAccounting {
+    pub reject_count: u64,
+    pub suppressed_reject_count: u64,
+    pub error_reject_count: u64,
+    pub gaps: Vec<PackExtractionGap>,
+}
+
+impl PackExtractionAccounting {
+    pub fn warning_only_and_fully_accounted(&self) -> bool {
+        self.suppressed_reject_count == 0
+            && self.error_reject_count == 0
+            && self.gaps.len() as u64 == self.reject_count
+    }
+}
+
+/// The single release-verification and activation-readiness definition.
+pub fn pack_is_activation_ready(
+    completeness: Completeness,
+    extraction: Option<&PackExtractionAccounting>,
+) -> bool {
+    completeness == Completeness::Complete
+        || extraction.is_some_and(PackExtractionAccounting::warning_only_and_fully_accounted)
+}
+
+pub fn pack_rejects_are_warning_only(extraction: &PackExtractionAccounting) -> bool {
+    extraction.error_reject_count == 0
+}
+
 const GENERATED_PRODUCTION_DOMAIN: &[u8] = b"bifrost.semantic-pack.generated-production.v1";
 
 /// Exact semantic inputs that identify one generated semantic-pack production.
@@ -349,6 +396,7 @@ pub struct CatalogPackInventory {
     pub ecosystem: String,
     pub provenance: super::Provenance,
     pub completeness: Completeness,
+    pub extraction: Option<PackExtractionAccounting>,
     pub sources: Vec<CatalogPackInventorySource>,
     pub catalog_activations: Vec<CatalogPackInventoryActivation>,
 }
@@ -372,6 +420,7 @@ fn inventory_pack(manifest: &CompiledPackManifest, state: String) -> CatalogPack
         ecosystem: manifest.ecosystem.clone(),
         provenance: manifest.provenance.clone(),
         completeness: manifest.completeness,
+        extraction: None,
         sources: Vec::new(),
         catalog_activations: Vec::new(),
     }
@@ -801,6 +850,10 @@ impl SemanticPackCatalog {
         drop(activation_statement);
         drop(connection);
 
+        for (manifest_digest, pack) in &mut packs {
+            pack.extraction = self.extraction_accounting(manifest_digest)?;
+        }
+
         let session_packs = self
             .session_packs
             .lock()
@@ -880,6 +933,72 @@ impl SemanticPackCatalog {
         source: &DurablePackSource,
     ) -> Result<InstallOutcome, CatalogError> {
         self.install_with(pack, source, |_, _, _| Ok(()))
+    }
+
+    pub fn install_release(
+        &self,
+        pack: &CompiledSemanticModelPack,
+        source: &DurablePackSource,
+        extraction: &PackExtractionAccounting,
+    ) -> Result<InstallOutcome, CatalogError> {
+        validate_extraction_accounting(extraction)?;
+        self.install_with(pack, source, |transaction, manifest, _| {
+            insert_extraction_accounting(transaction, &manifest.content_sha256, extraction)
+        })
+    }
+
+    pub fn extraction_accounting(
+        &self,
+        manifest_digest: &str,
+    ) -> Result<Option<PackExtractionAccounting>, CatalogError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        let counts = connection
+            .query_row(
+                "SELECT reject_count, suppressed_reject_count, error_reject_count
+                 FROM catalog_pack_extraction_accounting
+                 WHERE manifest_digest = ?1",
+                [manifest_digest],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| CatalogError::sqlite("read pack extraction accounting", error))?;
+        let Some((reject_count, suppressed_reject_count, error_reject_count)) = counts else {
+            return Ok(None);
+        };
+        let mut statement = connection
+            .prepare(
+                "SELECT declaration, reason
+                 FROM catalog_pack_extraction_gaps
+                 WHERE manifest_digest = ?1
+                 ORDER BY ordinal",
+            )
+            .map_err(|error| CatalogError::sqlite("prepare pack extraction gaps", error))?;
+        let rows = statement
+            .query_map([manifest_digest], |row| {
+                Ok(PackExtractionGap {
+                    declaration: row.get(0)?,
+                    reason: row.get(1)?,
+                })
+            })
+            .map_err(|error| CatalogError::sqlite("query pack extraction gaps", error))?;
+        let gaps = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| CatalogError::sqlite("read pack extraction gap", error))?;
+        Ok(Some(PackExtractionAccounting {
+            reject_count,
+            suppressed_reject_count,
+            error_reject_count,
+            gaps,
+        }))
     }
 
     pub fn install_generated(
@@ -2697,6 +2816,26 @@ fn validate_pack(
     Ok(ValidatedPack { manifest, shards })
 }
 
+fn validate_extraction_accounting(
+    extraction: &PackExtractionAccounting,
+) -> Result<(), CatalogError> {
+    if extraction.error_reject_count > extraction.reject_count {
+        return Err(CatalogError::Integrity(
+            "error reject count exceeds total reject count".to_owned(),
+        ));
+    }
+    if extraction
+        .gaps
+        .iter()
+        .any(|gap| gap.declaration.is_empty() || gap.reason.is_empty())
+    {
+        return Err(CatalogError::Integrity(
+            "pack extraction gaps require a declaration and reason".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn reconcile_storage(root: &Path, connection: &mut Connection) -> Result<(), CatalogError> {
     const RECONCILIATION_LIMIT: usize = 4_096;
     storage::cleanup_stale_staging(root, Duration::from_secs(60 * 60), RECONCILIATION_LIMIT)?;
@@ -2797,6 +2936,47 @@ fn insert_manifest(
         )
         .map_err(|error| CatalogError::sqlite("insert pack manifest", error))?;
     Ok(!existed)
+}
+
+fn insert_extraction_accounting(
+    transaction: &Transaction<'_>,
+    manifest_digest: &str,
+    extraction: &PackExtractionAccounting,
+) -> Result<(), CatalogError> {
+    transaction
+        .execute(
+            "INSERT INTO catalog_pack_extraction_accounting(
+               manifest_digest, reject_count, suppressed_reject_count, error_reject_count
+             ) VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(manifest_digest) DO UPDATE SET
+               reject_count = excluded.reject_count,
+               suppressed_reject_count = excluded.suppressed_reject_count,
+               error_reject_count = excluded.error_reject_count",
+            params![
+                manifest_digest,
+                extraction.reject_count,
+                extraction.suppressed_reject_count,
+                extraction.error_reject_count,
+            ],
+        )
+        .map_err(|error| CatalogError::sqlite("insert pack extraction accounting", error))?;
+    transaction
+        .execute(
+            "DELETE FROM catalog_pack_extraction_gaps WHERE manifest_digest = ?1",
+            [manifest_digest],
+        )
+        .map_err(|error| CatalogError::sqlite("replace pack extraction gaps", error))?;
+    for (ordinal, gap) in extraction.gaps.iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO catalog_pack_extraction_gaps(
+                   manifest_digest, ordinal, declaration, reason
+                 ) VALUES(?1, ?2, ?3, ?4)",
+                params![manifest_digest, ordinal, &gap.declaration, &gap.reason],
+            )
+            .map_err(|error| CatalogError::sqlite("insert pack extraction gap", error))?;
+    }
+    Ok(())
 }
 
 fn generated_production_digest(

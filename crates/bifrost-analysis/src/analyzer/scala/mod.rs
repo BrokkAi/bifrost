@@ -793,7 +793,9 @@ fn unfollowable_scala_import(spelling: &str) -> ScalaNameProof {
 /// spelling, or `None` when it does not hold that spelling at all.
 fn model_proof(model: &dyn JvmActiveSemanticModel, fqn: &str) -> Option<ScalaNameProof> {
     match model.qualified_name_disposition(fqn) {
-        JvmModelDisposition::Absent => None,
+        JvmModelDisposition::Absent => model
+            .extraction_gap(fqn)
+            .map(|gap| ScalaNameProof::Incomplete(JvmProofGap::PackExtraction(gap))),
         JvmModelDisposition::Unique => Some(ScalaNameProof::ExternalIndexed),
         JvmModelDisposition::Conflicting { declarations } => Some(ScalaNameProof::Ambiguous {
             boundaries: vec![BoundaryStatus::ExternalIndexed; declarations],

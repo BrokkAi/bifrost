@@ -4141,23 +4141,50 @@ fn resolve_csharp_nested_type_in_enclosing_classes(
     name: &str,
     byte: usize,
 ) -> Option<CodeUnit> {
-    if name.is_empty() || name.contains('.') {
+    if name.is_empty() {
         return None;
     }
+    // A qualified spelling (`ResultDialogDemo2.FooContext`, #2232) resolves the
+    // way C# reads it: the first segment is an ordinary simple name found on
+    // this same enclosing-class walk, and every later segment is a nested type
+    // of the type the previous segment named. The `.`-joined probe keys below
+    // match the index's `$`-joined nested fq names through the provider's
+    // normalized-fqn fallback, the same way the simple-name probe always has.
+    let (prefix, suffix) = match name.split_once('.') {
+        Some((prefix, suffix)) if !prefix.is_empty() && !suffix.is_empty() => {
+            (prefix, Some(suffix))
+        }
+        Some(_) => return None,
+        None => (name, None),
+    };
     let enclosing = csharp_enclosing_class(analyzer, definitions, file, byte)?;
-    crate::analyzer::usages::common::enclosing_owner_chain(enclosing, |unit| {
+    let owners = crate::analyzer::usages::common::enclosing_owner_chain(enclosing, |unit| {
         definitions
             .parent_of(analyzer, unit)
             .filter(CodeUnit::is_class)
     })
-    .map_while(|owner| definitions.scope_step().then_some(owner))
-    .find_map(|owner| {
-        let child_fqn = format!("{}.{}", owner.fq_name(), name);
-        definitions
+    .map_while(|owner| definitions.scope_step().then_some(owner));
+    for owner in owners {
+        let child_fqn = format!("{}.{}", owner.fq_name(), prefix);
+        let Some(prefix_unit) = definitions
             .fqn(&child_fqn)
             .into_iter()
             .find(CodeUnit::is_class)
-    })
+        else {
+            continue;
+        };
+        // The first enclosing class that binds the prefix decides: C# simple-name
+        // lookup stops there, so a missing nested suffix is unresolved rather
+        // than an invitation to bind a further-out type of the same spelling.
+        return match suffix {
+            None => Some(prefix_unit),
+            Some(suffix) => definitions
+                .fqn(&format!("{}.{}", prefix_unit.fq_name(), suffix))
+                .into_iter()
+                .find(CodeUnit::is_class),
+        };
+    }
+    None
 }
 
 fn csharp_import_boundary_for_type(

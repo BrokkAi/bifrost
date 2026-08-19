@@ -49,6 +49,19 @@ use joern::{
 };
 use join::{FoundryJoin, join_corpora};
 
+/// Shared foundry producer version. Advance it when a converter changes the
+/// shape of its output. It is not the crate version: checked-in packs are
+/// gated on byte equality with the generator, and reading the crate version
+/// would break that gate at every release bump without any content change.
+pub const FOUNDRY_PRODUCER_VERSION: &str = "0.9.0";
+
+/// Bifrost compatibility window every foundry-generated pack declares. It is
+/// a pack contract, not the crate version. `release-version.mjs` used to
+/// rewrite the exclusive upper bound from the crate minor, which would
+/// deactivate already-shipped packs at 0.11 without any content change.
+/// Advance this only when a generated pack actually requires a newer Bifrost.
+pub const FOUNDRY_BIFROST_REQUIREMENT: &str = ">=0.8.0, <1.0.0";
+
 /// The report format tag. Bump it when a consumer must read the file
 /// differently, not when a field is added.
 pub const FOUNDRY_JOIN_REPORT_FORMAT: &str = "bifrost_summary_foundry_join/v1";

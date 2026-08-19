@@ -1753,6 +1753,67 @@ ABSL_NAMESPACE_END
         );
     }
 
+    /// #2365: one guarded root include that fans out through a header diamond
+    /// reaches `target.h` with both `{A}` and `{A, B}` guard sets at the same
+    /// activation byte. Consumers only ask existence questions that are
+    /// monotone in the guard set, so the index must keep only the
+    /// inclusion-minimal set. Dense `#ifdef` lattices otherwise enumerate the
+    /// powerset of path-union guard sets, which is what hung the QMK C
+    /// forward differential with memory growing without bound.
+    #[test]
+    fn conditional_include_projection_index_keeps_only_minimal_guard_sets() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let mid = ProjectFile::new(root.clone(), "mid.h");
+        let x = ProjectFile::new(root.clone(), "x.h");
+        let target = ProjectFile::new(root.clone(), "target.h");
+        consumer
+            .write("#if defined(A)\n#include \"mid.h\"\n#endif\n")
+            .expect("write consumer");
+        mid.write("#include \"x.h\"\n#if defined(B)\n#include \"target.h\"\n#endif\n")
+            .expect("write mid");
+        x.write("#include \"target.h\"\n").expect("write x");
+        target.write("struct Target {};\n").expect("write target");
+
+        let analyzer = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let roots = HashSet::from_iter([consumer.clone()]);
+        let visibility =
+            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
+        let prepared = analyzer
+            .prepared_syntax(&consumer)
+            .expect("prepared consumer");
+
+        let target_projections = visibility.conditional_include_projections_for_source(
+            &consumer,
+            prepared.as_ref(),
+            &target,
+        );
+        assert_eq!(
+            target_projections.len(),
+            1,
+            "the subsumed {{A, B}} path must be evicted by its {{A}} subset"
+        );
+        assert_eq!(
+            target_projections[0].required_guards,
+            HashSet::from_iter([PreprocessorGuard::Defined("A".to_string())]),
+        );
+        assert_eq!(
+            visibility
+                .conditional_include_projections_for_source(&consumer, prepared.as_ref(), &x)
+                .len(),
+            1
+        );
+        assert_eq!(
+            visibility.conditional_include_projection_work_counts_for_test(),
+            (1, 4),
+            "one traversal: mid, x, target with {{A, B}} (later evicted), target with {{A}}"
+        );
+    }
+
     #[test]
     fn unconditional_include_reachability_keeps_c_and_cpp_contexts_separate() {
         let temp = tempfile::tempdir().expect("temp dir");

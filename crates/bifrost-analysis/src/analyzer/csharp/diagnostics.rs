@@ -56,9 +56,10 @@ pub(crate) fn collect_csharp_semantic_diagnostics(
         index: csharp.retained_external_index(),
         evidence: analyzer.dependency_discovery_evidence(Language::CSharp),
     };
-    brokk_bifrost_csharp::diagnostics::collect_csharp_semantic_diagnostics(
+    let report = brokk_bifrost_csharp::diagnostics::collect_csharp_semantic_diagnostics(
         csharp, &external, file, source,
-    )
+    );
+    crate::analyzer::semantic_model::degrade_pack_gap_absences(analyzer, report)
 }
 
 /// The external C# facts a diagnostic request may read: the assembly index an

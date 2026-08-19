@@ -157,6 +157,18 @@ pub(crate) trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// Expand a source-level callee spelling to the external identity that semantic
+    /// models publish, when this language can prove the expansion from structured
+    /// language evidence. The default offers no expansion.
+    fn expand_imported_external_callee(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _file: &ProjectFile,
+        _callee_text: &str,
+    ) -> Option<String> {
+        None
+    }
+
     /// How a fully qualified name is spelled for a reader. The default is the indexed
     /// spelling itself; the three languages that override strip indexer-only decoration
     /// their users never type (Scala's object `$`, C#'s generic arity and `global::`

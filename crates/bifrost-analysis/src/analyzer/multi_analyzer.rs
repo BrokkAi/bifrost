@@ -1592,6 +1592,15 @@ impl IAnalyzer for MultiAnalyzer {
                 self, file, source,
             );
         }
+        if language_for_file(file) == Language::Cpp
+            && self.delegates.contains_key(&Language::Cpp)
+            && let Some(cpp) =
+                crate::analyzer::resolve_analyzer::<crate::analyzer::CppAnalyzer>(self)
+        {
+            let report =
+                brokk_bifrost_cpp::diagnostics::collect_cpp_semantic_diagnostics(cpp, file, source);
+            return crate::analyzer::semantic_model::degrade_pack_gap_absences(self, report);
+        }
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().semantic_diagnostics(file, source))
             .unwrap_or_default()

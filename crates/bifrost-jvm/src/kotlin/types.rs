@@ -324,22 +324,29 @@ pub fn kotlin_type_name_proof(
         // an unrelated dependency type that merely shares the simple name
         // cannot silence a real error.
         let mut matched = JvmModelDisposition::Absent;
+        let mut extraction_gap = None;
         let decided = resolve_kotlin_type_name(raw_name, scope, |candidate| {
             match model.qualified_name_disposition(candidate) {
-                JvmModelDisposition::Absent => false,
+                JvmModelDisposition::Absent => {
+                    extraction_gap = model.extraction_gap(candidate);
+                    extraction_gap.is_some()
+                }
                 found => {
                     matched = found;
                     true
                 }
             }
         });
-        match decided {
+        if let Some(gap) = extraction_gap {
+            return Err(gap);
+        }
+        Ok(match decided {
             KotlinTypeName::Resolved(_) => matched,
             // Two star imports both name a modelled type: the spelling exists
             // and denotes neither one in particular.
             KotlinTypeName::Ambiguous => JvmModelDisposition::Conflicting { declarations: 2 },
             KotlinTypeName::Unresolved => JvmModelDisposition::Absent,
-        }
+        })
     })
 }
 

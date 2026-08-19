@@ -19,7 +19,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{JavaAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v6";
+const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v7";
 
 impl_program_semantics_provider!(JavaAnalyzer, JavaSemanticLowerer);
 

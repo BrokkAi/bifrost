@@ -2016,26 +2016,40 @@ fn resolve_in_enclosing_type_scopes(
     name: &str,
     byte: usize,
 ) -> Option<CodeUnit> {
-    if name.is_empty() || name.contains('.') {
+    if name.is_empty() {
         return None;
     }
+    // A qualified spelling (`Outer.Inner`, #972) resolves the way C# reads it:
+    // the first segment is a simple name found on this same enclosing-class
+    // walk, and every later segment is a nested type of the type the previous
+    // segment named. Without this, the inverse scan omits a nested-class
+    // construction (`new Outer.Inner(...)`) written where the outer is visible
+    // only through the site's enclosing classes -- a reference the forward side
+    // resolves (#2232).
+    let (prefix, suffix) = match name.split_once('.') {
+        Some((prefix, suffix)) if !prefix.is_empty() && !suffix.is_empty() => {
+            (prefix, Some(suffix))
+        }
+        Some(_) => return None,
+        None => (name, None),
+    };
 
     let mut scope = class_ranges.enclosing_unit(byte)?.clone();
     loop {
-        let mut parts = graph_support::usage_partial_type_parts(csharp, &scope);
-        if parts.is_empty() {
-            parts.push(scope.clone());
-        }
-        let mut candidates = parts
-            .into_iter()
-            .flat_map(|part| csharp.direct_children(&part))
-            .filter(|child| child.is_class() && child.identifier() == name)
-            .collect::<Vec<_>>();
+        let mut candidates = nested_class_children_named(csharp, &scope, prefix);
         if !candidates.is_empty() {
             graph_support::sort_dedup_type_candidates(&mut candidates);
-            return (graph_support::logical_type_count(&candidates) == 1)
+            let resolved = (graph_support::logical_type_count(&candidates) == 1)
                 .then(|| candidates.into_iter().next())
                 .flatten();
+            // The first scope that binds the prefix decides: C# simple-name
+            // lookup stops there, so a missing nested suffix is unresolved
+            // rather than an invitation to bind a further-out type of the same
+            // spelling.
+            return resolved.and_then(|unit| match suffix {
+                None => Some(unit),
+                Some(suffix) => resolve_nested_type_suffix(csharp, &unit, suffix),
+            });
         }
 
         let Some(parent) = csharp.parent_of(&scope) else {
@@ -2043,6 +2057,41 @@ fn resolve_in_enclosing_type_scopes(
         };
         scope = parent;
     }
+}
+
+/// Every nested class spelled `name` that `scope`'s partial parts declare.
+fn nested_class_children_named(
+    csharp: &dyn CSharpSource,
+    scope: &CodeUnit,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let mut parts = graph_support::usage_partial_type_parts(csharp, scope);
+    if parts.is_empty() {
+        parts.push(scope.clone());
+    }
+    parts
+        .into_iter()
+        .flat_map(|part| csharp.direct_children(&part))
+        .filter(|child| child.is_class() && child.identifier() == name)
+        .collect()
+}
+
+/// The nested type `suffix` names below `owner`, one segment at a time, or
+/// `None` when any segment is missing or ambiguous (#972).
+fn resolve_nested_type_suffix(
+    csharp: &dyn CSharpSource,
+    owner: &CodeUnit,
+    suffix: &str,
+) -> Option<CodeUnit> {
+    let mut owner = owner.clone();
+    for segment in suffix.split('.') {
+        let mut candidates = nested_class_children_named(csharp, &owner, segment);
+        graph_support::sort_dedup_type_candidates(&mut candidates);
+        owner = (graph_support::logical_type_count(&candidates) == 1)
+            .then(|| candidates.into_iter().next())
+            .flatten()?;
+    }
+    Some(owner)
 }
 
 fn resolve_in_enclosing_namespace(

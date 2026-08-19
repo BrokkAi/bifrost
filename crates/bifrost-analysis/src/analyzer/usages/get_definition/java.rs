@@ -1037,7 +1037,9 @@ fn java_method_invocation_binding(
         // (`request.getParameter(...)`) carries only its syntactic receiver
         // *variable* name, which no summary can ever match.
         if let Some(owner_fqn) = resolve_analyzer::<JavaAnalyzer>(analyzer).and_then(|java| {
-            java_external_receiver_owner_fqn(analyzer, java, session, file, source, root, object)
+            java_external_receiver_owner_fqn(
+                analyzer, java, session, file, source, root, object, name,
+            )
         }) {
             outcome.reference = Some(ResolvedReferenceSite {
                 path: file.to_string(),
@@ -1687,6 +1689,7 @@ fn java_unresolved_receiver_outcome(
 /// procedure summary binds by (#1978). A type-parameter spelling names no
 /// class and a workspace-source resolution is not external, so both answer
 /// `None` and the call keeps the identity-free boundary it had before.
+#[allow(clippy::too_many_arguments)]
 fn java_external_receiver_owner_fqn(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
@@ -1695,24 +1698,91 @@ fn java_external_receiver_owner_fqn(
     source: &str,
     root: Node<'_>,
     object: Node<'_>,
+    member_name: &str,
 ) -> Option<String> {
-    let type_node = java_receiver_type_node(session, file, source, root, object)?;
-    let normalized = normalize_java_type_text(java_node_text(type_node, source));
-    if normalized.is_empty()
-        || brokk_bifrost_jvm::java::graph_support::java_type_parameter_in_scope(
-            type_node, source, normalized,
-        )
-        .is_some()
-    {
+    if let Some(type_node) = java_receiver_type_node(session, file, source, root, object) {
+        let normalized = normalize_java_type_text(java_node_text(type_node, source));
+        if !normalized.is_empty()
+            && brokk_bifrost_jvm::java::graph_support::java_type_parameter_in_scope(
+                type_node, source, normalized,
+            )
+            .is_none()
+            && let Some(fqn) =
+                java_resolved_type_owner_fqn(analyzer, java, session, file, normalized, member_name)
+        {
+            return Some(fqn);
+        }
+    }
+    // #2364: a method qualifier with no variable or field in scope is a
+    // TypeName (JLS 6.5.2). Resolve the written spelling through imports and
+    // the activated overlay so `URLDecoder.decode` carries the same owner FQN
+    // as `java.net.URLDecoder.decode`.
+    let spelling = match object.kind() {
+        "identifier" => {
+            let name = java_node_text(object, source);
+            if java_bindings_before_scoped_inner(
+                session,
+                file,
+                source,
+                root,
+                object.start_byte(),
+                true,
+            )
+            .is_shadowed(name)
+            {
+                return None;
+            }
+            name
+        }
+        "field_access" | "scoped_type_identifier" | "type_identifier" => {
+            java_node_text(object, source)
+        }
+        _ => return None,
+    };
+    let normalized = normalize_java_type_text(spelling);
+    if normalized.is_empty() {
         return None;
     }
-    let resolution = session.query_optional_row(|| {
+    java_resolved_type_owner_fqn(analyzer, java, session, file, normalized, member_name)
+}
+
+fn java_resolved_type_owner_fqn(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    normalized: &str,
+    member_name: &str,
+) -> Option<String> {
+    if let Some(resolution) = session.query_optional_row(|| {
         java.resolve_type_name_with_external(analyzer.semantic_model_overlay(), file, normalized)
-    })?;
-    match resolution {
-        JavaTypeResolution::External(external_type) => Some(external_type.fqn().to_owned()),
-        JavaTypeResolution::Source(_) => None,
+    }) {
+        let JavaTypeResolution::External(external_type) = resolution else {
+            return None;
+        };
+        // #2371: an inherited member's canonical identity must name the type
+        // that *declares* it, not the (sub)type the receiver was written as.
+        // `HttpServletRequest.getParameter` is declared on `ServletRequest`.
+        if let Some(member) = session.query_optional_row(|| {
+            java.resolve_member_name_with_external(
+                analyzer.semantic_model_overlay(),
+                file,
+                &format!("{}.{member_name}", external_type.fqn()),
+            )
+        }) {
+            return Some(
+                member
+                    .fqn()
+                    .rsplit_once('.')
+                    .map_or_else(|| member.fqn().to_owned(), |(owner, _)| owner.to_owned()),
+            );
+        }
+        return Some(external_type.fqn().to_owned());
     }
+    // The overlay and jar index can both be empty in an inline fixture. An
+    // explicit single-type import is still file-local structured evidence of
+    // the owner FQN (#2364).
+    session.query_optional_row(|| java.explicit_imported_type_fqn(file, normalized))
 }
 
 /// The written bound of a type-parameter receiver whose bound this file imports

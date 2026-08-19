@@ -81,19 +81,206 @@
     "timed_out": 0
   },
   "verdict_split": {
-    "blocked_verdicts": 0,
+    "blocked_verdicts": 1,
     "verdicts_all_summary_closable": 0,
-    "verdicts_with_engine_blocker": 0,
-    "engine_blocked_verdict_permille": 0
+    "verdicts_with_engine_blocker": 1,
+    "engine_blocked_verdict_permille": 1000
   },
   "blocker_bucket_totals": {
-    "summary_closable": 0,
-    "engine_blocked": 0
+    "summary_closable": 18,
+    "engine_blocked": 3
   },
   "inconclusive_reason_verdicts": {
-    "capability_incomplete": 8
+    "capability_incomplete": 7,
+    "partial_discovery": 1
   },
-  "ranked_blockers": [],
+  "ranked_blockers": [
+    {
+      "kind": "external_call_through",
+      "bucket": "summary_closable",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "external_call_through",
+      "bucket": "summary_closable",
+      "callee": "bifrost-unmaterialized-external#com.alibaba.fastjson.JSON.toJSONString",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "external_call_through",
+      "bucket": "summary_closable",
+      "callee": "bifrost-unmaterialized-external#com.alibaba.fastjson.JSONObject.toJSONString",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "external_call_through",
+      "bucket": "summary_closable",
+      "callee": "bifrost-unmaterialized-external#java.lang.reflect.Method.getAnnotation",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "external_call_through",
+      "bucket": "summary_closable",
+      "callee": "bifrost-unmaterialized-external#java.util.Map.containsKey",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "external_call_through",
+      "bucket": "summary_closable",
+      "callee": "bifrost-unmaterialized-external#java.util.Map.get",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "external_call_through",
+      "bucket": "summary_closable",
+      "callee": "bifrost-unmaterialized-external#java.util.Map.put",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "external_call_through",
+      "bucket": "summary_closable",
+      "callee": "bifrost-unmaterialized-external#javax.servlet.http.HttpServletRequest.getParameterMap",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "external_call_through",
+      "bucket": "summary_closable",
+      "callee": "bifrost-unmaterialized-external#javax.servlet.http.HttpServletRequest.getRequestURI",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "external_call_through",
+      "bucket": "summary_closable",
+      "callee": "bifrost-unmaterialized-external#javax.servlet.http.HttpServletRequest.getSession",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "external_call_through",
+      "bucket": "summary_closable",
+      "callee": "bifrost-unmaterialized-external#javax.servlet.http.HttpServletResponse.getWriter",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "external_call_through",
+      "bucket": "summary_closable",
+      "callee": "bifrost-unmaterialized-external#javax.servlet.http.HttpServletResponse.setCharacterEncoding",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "external_call_through",
+      "bucket": "summary_closable",
+      "callee": "bifrost-unmaterialized-external#javax.servlet.http.HttpServletResponse.setHeader",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "external_call_through",
+      "bucket": "summary_closable",
+      "callee": "bifrost-unmaterialized-external#javax.servlet.http.HttpSession.getAttribute",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "external_call_through",
+      "bucket": "summary_closable",
+      "callee": "bifrost-unmaterialized-external#javax.servlet.http.HttpSession.setAttribute",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "external_call_through",
+      "bucket": "summary_closable",
+      "callee": "bifrost-unmaterialized-external#org.springframework.web.method.HandlerMethod.getMethod",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "unmaterialized_callee",
+      "bucket": "summary_closable",
+      "callee": "pear-common/src/main/java/com/pearadmin/common/plugin/submit/RepeatSubmitInterceptor.java#",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "unmaterialized_callee",
+      "bucket": "summary_closable",
+      "callee": "pear-common/src/main/java/com/pearadmin/common/web/domain/response/Result.java#Result",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "unresolved_dispatch",
+      "bucket": "engine_blocked",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "truncated_dispatch",
+      "bucket": "engine_blocked",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    },
+    {
+      "kind": "semantic_envelope",
+      "bucket": "engine_blocked",
+      "blocked_verdicts": 1,
+      "repos": [
+        "Cisurm__Portal-Drug-System"
+      ]
+    }
+  ],
   "repo_outcomes": [
     {
       "repo": "Appendium__flatpack",
@@ -127,8 +314,333 @@
         "completion": "inconclusive",
         "findings": 0
       },
+      "blockers": [
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#org.springframework.web.method.HandlerMethod.getMethod"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "truncated_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#java.lang.reflect.Method.getAnnotation"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "unmaterialized_callee",
+          "callee": "pear-common/src/main/java/com/pearadmin/common/plugin/submit/RepeatSubmitInterceptor.java#"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "unmaterialized_callee",
+          "callee": "pear-common/src/main/java/com/pearadmin/common/web/domain/response/Result.java#Result"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#javax.servlet.http.HttpServletResponse.setHeader"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#javax.servlet.http.HttpServletResponse.setCharacterEncoding"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#javax.servlet.http.HttpServletResponse.getWriter"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#com.alibaba.fastjson.JSON.toJSONString"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#java.util.Map.get"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "truncated_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#java.util.Map.get"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "truncated_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#java.util.Map.get"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "truncated_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#java.util.Map.get"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "truncated_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#com.alibaba.fastjson.JSONObject.toJSONString"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#javax.servlet.http.HttpServletRequest.getParameterMap"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#java.util.Map.put"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "truncated_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#java.util.Map.put"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "truncated_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#javax.servlet.http.HttpServletRequest.getRequestURI"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "truncated_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#javax.servlet.http.HttpServletRequest.getSession"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "truncated_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#javax.servlet.http.HttpSession.getAttribute"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#java.util.Map.containsKey"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#java.util.Map.get"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "truncated_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#java.util.Map.put"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        },
+        {
+          "kind": "truncated_dispatch"
+        },
+        {
+          "kind": "semantic_envelope"
+        },
+        {
+          "kind": "external_call_through",
+          "callee": "bifrost-unmaterialized-external#javax.servlet.http.HttpSession.setAttribute"
+        },
+        {
+          "kind": "unresolved_dispatch"
+        }
+      ],
       "inconclusive_reasons": [
-        "capability_incomplete"
+        "partial_discovery"
       ]
     },
     {

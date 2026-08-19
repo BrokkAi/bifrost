@@ -33,6 +33,7 @@ impl TaintPolicyEvaluator for SiblingTaintAdapter {
             diagnostics: Vec::new(),
             diagnostics_truncated: false,
             work: PolicyWorkReport::default(),
+            authored_arm_closures: Vec::new(),
         }
     }
 }

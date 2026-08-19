@@ -89,6 +89,7 @@ impl JavaJarPackProducer {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "artifact.kind".to_owned(),
                     location: None,
+                    declaration: None,
                     message: "Java producer requires a source or class JAR artifact".to_owned(),
                 },
                 limits,
@@ -118,6 +119,7 @@ impl JavaJarPackProducer {
                         severity: ProducerDiagnosticSeverity::Error,
                         code: "artifact.path_encoding".to_owned(),
                         location: None,
+                        declaration: None,
                         message: "artifact filename is not valid UTF-8".to_owned(),
                     },
                     limits,
@@ -130,6 +132,7 @@ impl JavaJarPackProducer {
                     severity: ProducerDiagnosticSeverity::Error,
                     code: "limit.archive_directory".to_owned(),
                     location: None,
+                    declaration: None,
                     message: "JAR central directory exceeds bounded entry or byte limits"
                         .to_owned(),
                 },
@@ -144,6 +147,7 @@ impl JavaJarPackProducer {
                         severity: ProducerDiagnosticSeverity::Error,
                         code: "java.archive.invalid".to_owned(),
                         location: None,
+                        declaration: None,
                         message: "artifact is not a readable ZIP/JAR archive".to_owned(),
                     },
                     limits,
@@ -171,6 +175,7 @@ impl JavaJarPackProducer {
                         severity: ProducerDiagnosticSeverity::Error,
                         code: "artifact.cancelled".to_owned(),
                         location: None,
+                        declaration: None,
                         message: "Java archive production was cancelled".to_owned(),
                     },
                     limits,
@@ -305,6 +310,7 @@ impl JavaJarPackProducer {
                             severity: ProducerDiagnosticSeverity::Error,
                             code: "artifact.cancelled".to_owned(),
                             location: None,
+                            declaration: None,
                             message: "Java source production was cancelled".to_owned(),
                         },
                         limits,
@@ -694,6 +700,7 @@ pub(super) fn source_api_types(
             max_depth,
             diagnostics,
             source_path,
+            &name,
         );
         if matches!(visibility, Visibility::Public | Visibility::Protected) {
             if !take_record(remaining_records, record_limit_hit) {
@@ -811,6 +818,7 @@ fn source_members(
                     max_depth,
                     diagnostics,
                     source_path,
+                    &format!("{owner_name}.{declared_name}"),
                 ) else {
                     continue;
                 };
@@ -836,9 +844,10 @@ fn source_members(
                         .child_by_field_name("type")
                         .is_none_or(|r#type| r#type.kind() != "void_type")
                 {
-                    diagnostics.warning(
+                    diagnostics.warning_for_declaration(
                         "java.source.unsupported_return_type",
                         Some(source_path.to_owned()),
+                        format!("{owner_name}.{declared_name}"),
                         format!("could not represent return type for {owner_name}.{declared_name}"),
                     );
                     continue;
@@ -885,9 +894,10 @@ fn source_members(
                     0,
                     max_depth,
                 ) else {
-                    diagnostics.warning(
+                    diagnostics.warning_for_declaration(
                         "java.source.unsupported_field_type",
                         Some(source_path.to_owned()),
+                        owner_name,
                         format!("could not represent field type in {owner_name}"),
                     );
                     continue;
@@ -952,6 +962,7 @@ fn source_members(
             max_depth,
             diagnostics,
             source_path,
+            owner_name,
         )
         .unwrap_or_default();
         if !has_constructor {
@@ -1141,6 +1152,7 @@ fn source_parameters(
     max_depth: usize,
     diagnostics: &mut BoundedProducerDiagnostics,
     source_path: &str,
+    declaration: &str,
 ) -> Option<Vec<Parameter>> {
     let Some(parameters) = node.child_by_field_name("parameters") else {
         return Some(Vec::new());
@@ -1176,9 +1188,10 @@ fn source_parameters(
             0,
             max_depth,
         ) else {
-            diagnostics.warning(
+            diagnostics.warning_for_declaration(
                 "java.source.unsupported_parameter_type",
                 Some(source_path.to_owned()),
+                declaration,
                 "could not represent Java parameter type",
             );
             return None;
@@ -1223,6 +1236,7 @@ fn dimension_count(dimensions: Node<'_>) -> usize {
     count
 }
 
+#[allow(clippy::too_many_arguments)] // Hierarchy extraction carries explicit resolution, limit, diagnostic, and declaration state.
 fn source_hierarchy(
     node: Node<'_>,
     source: &str,
@@ -1231,6 +1245,7 @@ fn source_hierarchy(
     max_depth: usize,
     diagnostics: &mut BoundedProducerDiagnostics,
     source_path: &str,
+    declaration: &str,
 ) -> Vec<HierarchyFact> {
     let mut result = Vec::new();
     for (field, hierarchy_kind) in [
@@ -1256,9 +1271,10 @@ fn source_hierarchy(
                     declaration_ordinal: None,
                 });
             } else {
-                diagnostics.warning(
+                diagnostics.warning_for_declaration(
                     "java.source.unsupported_hierarchy_type",
                     Some(source_path.to_owned()),
+                    declaration,
                     "could not represent Java hierarchy type",
                 );
             }
@@ -1771,9 +1787,10 @@ fn class_api_type(
     if signature_attribute(class_file.attributes(), &class_file).is_some()
         && !class_signature_decoded
     {
-        diagnostics.warning(
+        diagnostics.warning_for_declaration(
             "java.class.unsupported_signature",
             Some(class_entry.to_owned()),
+            &name,
             "could not fully decode generic class signature; erased hierarchy was retained",
         );
     }
@@ -1884,9 +1901,10 @@ fn class_field_member(
         decoded = cursor.parse_type(0).filter(|_| cursor.at_end());
     }
     let Some(mut field_type) = decoded else {
-        diagnostics.warning(
+        diagnostics.warning_for_declaration(
             "java.class.unsupported_field_signature",
             Some(class_entry.to_owned()),
+            format!("{owner_name}.{name}"),
             format!("could not decode field signature for {owner_name}.{name}"),
         );
         return None;
@@ -1950,9 +1968,10 @@ fn class_method_member(
             let Some((parameters, returns)) =
                 cursor.parse_method_descriptor().filter(|_| cursor.at_end())
             else {
-                diagnostics.warning(
+                diagnostics.warning_for_declaration(
                     "java.class.unsupported_method_signature",
                     Some(class_entry.to_owned()),
+                    format!("{owner_name}.{binary_name}"),
                     format!("could not decode method signature for {owner_name}.{binary_name}"),
                 );
                 return None;

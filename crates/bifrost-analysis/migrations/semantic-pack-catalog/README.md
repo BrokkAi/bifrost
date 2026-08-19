@@ -18,3 +18,7 @@ Current history:
   reservations, and GC indexes.
 - `0003-procedure-summaries.sql`: widens the generic shard payload-kind
   constraint while preserving shard, selector, and routing rows.
+- `0004-generated-productions.sql`: records deterministic generated-pack
+  production identities for reuse across workspaces.
+- `0005-extraction-gaps.sql`: records release-bundle reject accounting and
+  declaration-scoped extraction gaps without changing compiled manifests.

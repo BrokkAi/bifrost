@@ -134,6 +134,9 @@ pub struct SemanticModelActivationReport {
     pub catalog_candidates: usize,
     pub loaded_shards: usize,
     pub loaded_records: usize,
+    /// Individually identified declaration gaps carried by active packs.
+    #[serde(default)]
+    pub extraction_gaps: usize,
     /// Declarations a loaded shard publishes that the pinned activation
     /// coordinates prove absent, so the matcher never indexed them (#1899).
     #[serde(default)]
@@ -189,7 +192,16 @@ pub struct ResolvedActiveSemanticModels {
     active_model_set_hash: String,
     shards: Vec<ActiveSemanticModelShard>,
     indexes: MatcherIndexes,
+    extraction_gaps: Vec<ActivePackExtractionGap>,
+    extraction_gaps_by_declaration: HashMap<String, Vec<usize>>,
     report: SemanticModelActivationReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivePackExtractionGap {
+    pub pack_id: String,
+    pub declaration: String,
+    pub reason: String,
 }
 
 impl ResolvedActiveSemanticModels {
@@ -203,6 +215,27 @@ impl ResolvedActiveSemanticModels {
 
     pub fn activation_report(&self) -> &SemanticModelActivationReport {
         &self.report
+    }
+
+    pub fn extraction_gaps(&self) -> &[ActivePackExtractionGap] {
+        &self.extraction_gaps
+    }
+
+    pub fn gapped(&self, declaration: &str) -> Option<&ActivePackExtractionGap> {
+        self.extraction_gaps_by_declaration
+            .get(declaration)
+            .and_then(|indexes| indexes.first())
+            .map(|index| &self.extraction_gaps[*index])
+    }
+
+    pub fn gapped_member_surface(
+        &self,
+        owner: &str,
+        member: &str,
+    ) -> Option<&ActivePackExtractionGap> {
+        let member_declaration = format!("{owner}.{member}");
+        self.gapped(&member_declaration)
+            .or_else(|| self.gapped(owner))
     }
 
     pub fn retained_bytes(&self) -> u64 {
@@ -1038,6 +1071,33 @@ impl SemanticModelRuntimeOutcome {
     }
 }
 
+pub(crate) fn degrade_pack_gap_absences(
+    analyzer: &dyn IAnalyzer,
+    mut report: crate::analyzer::SemanticDiagnosticReport,
+) -> crate::analyzer::SemanticDiagnosticReport {
+    use crate::analyzer::{SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason};
+
+    let Some(overlay) = analyzer.semantic_model_overlay() else {
+        return report;
+    };
+    report.degrade_absences(|domain| {
+        let gap = match domain {
+            SemanticDiagnosticDomain::Type { name }
+            | SemanticDiagnosticDomain::Module { name }
+            | SemanticDiagnosticDomain::Package { name } => overlay.gapped(name),
+            SemanticDiagnosticDomain::MemberSurface { owner, member } => {
+                overlay.gapped_member_surface(owner, member)
+            }
+            SemanticDiagnosticDomain::LexicalScope { .. } => None,
+        }?;
+        Some(SemanticDiagnosticIncompleteReason::PackExtractionGap {
+            pack_id: gap.pack_id.clone(),
+            declaration: gap.declaration.clone(),
+        })
+    });
+    report
+}
+
 pub(crate) struct SemanticModelRuntimeCache {
     values: CompleteValueCache<String, ResolvedActiveSemanticModels>,
     published: Mutex<PublishedSemanticModelState>,
@@ -1494,6 +1554,66 @@ pub fn resolve_active_semantic_models(
             .then_with(|| left.status.cmp(&right.status))
     });
 
+    let active_packs = active
+        .iter()
+        .map(|selection| {
+            (
+                selection.active.manifest.content_sha256.clone(),
+                selection.active.manifest.pack_id.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut extraction_gaps = Vec::new();
+    let mut extraction_gap_counts = BTreeMap::new();
+    for (manifest_digest, pack_id) in active_packs {
+        let extraction = match catalog.extraction_accounting(&manifest_digest) {
+            Ok(extraction) => extraction,
+            Err(error) => {
+                push_request_explanation(
+                    &mut report,
+                    request.limits,
+                    format!("read extraction gaps for active pack {pack_id}: {error}"),
+                );
+                return SemanticModelResolutionOutcome::Unavailable(report);
+            }
+        };
+        if let Some(extraction) = extraction {
+            extraction_gap_counts.insert(manifest_digest, extraction.gaps.len());
+            extraction_gaps.extend(extraction.gaps.into_iter().map(|gap| {
+                ActivePackExtractionGap {
+                    pack_id: pack_id.clone(),
+                    declaration: gap.declaration,
+                    reason: gap.reason,
+                }
+            }));
+        } else {
+            extraction_gap_counts.insert(manifest_digest, 0);
+        }
+    }
+    for explanation in &mut report.explanations {
+        if explanation.status == SemanticModelActivationStatus::Active
+            && let Some(gaps) = extraction_gap_counts.get(&explanation.manifest_digest)
+        {
+            explanation.reason = format!(
+                "strict activation evidence and controls selected this shard; gaps: {gaps}"
+            );
+        }
+    }
+    extraction_gaps.sort_by(|left, right| {
+        left.declaration
+            .cmp(&right.declaration)
+            .then_with(|| left.pack_id.cmp(&right.pack_id))
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+    let mut extraction_gaps_by_declaration = map_with_capacity(extraction_gaps.len());
+    for (index, gap) in extraction_gaps.iter().enumerate() {
+        extraction_gaps_by_declaration
+            .entry(gap.declaration.clone())
+            .or_insert_with(Vec::new)
+            .push(index);
+    }
+    report.extraction_gaps = extraction_gaps.len();
+
     let active_model_set_hash = active_model_set_hash(&active);
     report.phase_measurements.decode_hydration_nanos = decode_hydration_nanos;
     let matcher_started = Instant::now();
@@ -1519,6 +1639,8 @@ pub fn resolve_active_semantic_models(
             .map(|selection| selection.active)
             .collect(),
         indexes,
+        extraction_gaps,
+        extraction_gaps_by_declaration,
         report: report.clone(),
     };
     if incomplete {
@@ -2406,6 +2528,7 @@ mod procedure_claim_agreement_tests {
                 parameter_count: 1,
             },
             completeness: Completeness::Complete,
+            covers_overrides: false,
             locations: Vec::new(),
             transfers: vec![transfer(CompiledSummaryInput::Parameter { ordinal: 0 })],
             effects: Vec::new(),

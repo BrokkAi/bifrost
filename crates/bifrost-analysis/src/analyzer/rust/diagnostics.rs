@@ -46,9 +46,10 @@ pub(crate) fn collect_rust_semantic_diagnostics(
         overlay: analyzer.semantic_model_overlay(),
         discovery: analyzer.dependency_discovery_evidence(Language::Rust),
     };
-    brokk_bifrost_rust::diagnostics::collect_rust_semantic_diagnostics(
+    let report = brokk_bifrost_rust::diagnostics::collect_rust_semantic_diagnostics(
         rust, &support, &external, file, source,
-    )
+    );
+    crate::analyzer::semantic_model::degrade_pack_gap_absences(analyzer, report)
 }
 
 /// The external Rust facts a diagnostic request is allowed to read: what an

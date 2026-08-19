@@ -5,7 +5,8 @@ use crate::analyzer::usages::js_ts_graph::{
     browser_global_property_shape, unbound_browser_global_property,
 };
 use brokk_bifrost_js_ts::imports::{
-    resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
+    require_call_module_specifier, resolve_js_ts_direct_import_candidates,
+    resolve_js_ts_module_binding_candidates,
 };
 use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::syntax::parse_js_ts_tree;
@@ -2097,7 +2098,9 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 /// does. Every strategy below is one the dotted member route already runs, in
 /// the same order and against the same owner machinery; only the receiver
 /// differs, because a destructuring pattern spells it as the initializer
-/// instead of as the access object.
+/// instead of as the access object. A `require` call initializer needs no
+/// spelled receiver at all: the call names its module in its own argument
+/// (#2211), so the key resolves against that module's export surface.
 ///
 /// `None` means the site is not a renamed destructuring key. `Some([])` is a
 /// key whose owner this file cannot prove -- an untyped parameter, an external
@@ -2188,6 +2191,25 @@ fn jsts_destructured_property_key_candidates(
         );
         candidates =
             jsts_destructured_member_candidates(analyzer, host, support, language, owners, member);
+    }
+    if candidates.is_empty()
+        && let Some(specifier) = require_call_module_specifier(initializer, source)
+    {
+        // A `require` call names its module in its own argument, the same fact
+        // the inverse binder reads through `declarator_module_value_specifier`
+        // (#2211). The member resolves against that module's export surface
+        // exactly as a dotted read off a require-bound namespace does; an
+        // external or unresolvable specifier yields no files and stays closed.
+        candidates = resolve_js_ts_module_binding_candidates(
+            host,
+            support,
+            language,
+            file,
+            &specifier,
+            member,
+            Some(aliases),
+            true,
+        );
     }
     if candidates.is_empty() && language == Language::TypeScript {
         candidates = ts_call_type_argument_member_candidates(

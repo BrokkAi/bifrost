@@ -103,12 +103,10 @@ test("release version update includes the current version in release bundle comp
 
     for (const relativePath of RELEASE_BUNDLE_SPECS) {
       const spec = JSON.parse(await readFile(path.join(root, relativePath), "utf8"));
-      assert.equal(spec.compatibility.bifrost, ">=0.8.0, <3.0.0");
-    }
-    for (const relativePath of BIFROST_OWNED_SEMANTIC_PACK_REQUIREMENT_SOURCES) {
-      assert.match(
-        await readFile(path.join(root, relativePath), "utf8"),
-        /const BIFROST_REQUIREMENT: &str = ">=0\.8\.0, <3\.0\.0";/u,
+      assert.equal(
+        spec.compatibility.bifrost,
+        ">=0.8.0, <2.0.0",
+        `${relativePath} compatibility must stay authored, not follow the crate version`,
       );
     }
     assert.match(
@@ -190,7 +188,7 @@ test("release metadata inventory covers every owned foundry compatibility surfac
     if (
       relativePath.endsWith(".rs")
       && (await readFile(path.join(repositoryRoot, relativePath), "utf8")).includes(
-        "const BIFROST_REQUIREMENT: &str",
+        "FOUNDRY_BIFROST_REQUIREMENT",
       )
     ) {
       discoveredSources.push(relativePath);
@@ -289,7 +287,7 @@ async function createFixture(cargoVersion, projectionVersion, lineEnding) {
     await writeFixtureFile(
       root,
       relativePath,
-      `const BIFROST_REQUIREMENT: &str = ">=0.8.0, <${upperBound}";${lineEnding}`,
+      `pub const FOUNDRY_BIFROST_REQUIREMENT: &str = ">=0.8.0, <${upperBound}";${lineEnding}`,
     );
   }
   await writeFixtureFile(

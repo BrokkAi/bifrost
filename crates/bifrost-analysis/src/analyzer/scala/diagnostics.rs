@@ -23,10 +23,11 @@ pub(crate) fn collect_scala_semantic_diagnostics(
     let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
         return SemanticDiagnosticReport::new();
     };
-    brokk_bifrost_jvm::scala::diagnostics::collect_scala_semantic_diagnostics(
+    let report = brokk_bifrost_jvm::scala::diagnostics::collect_scala_semantic_diagnostics(
         scala,
         file,
         source,
         &JvmOverlayModel(analyzer.semantic_model_overlay()),
-    )
+    );
+    crate::analyzer::semantic_model::degrade_pack_gap_absences(analyzer, report)
 }

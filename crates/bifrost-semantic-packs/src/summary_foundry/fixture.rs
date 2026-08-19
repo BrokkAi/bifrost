@@ -558,6 +558,7 @@ fn pack_source(
                         parameter_count: entry.boundary.parameter_count,
                     },
                     completeness,
+                    covers_overrides: false,
                     locations: Vec::new(),
                     transfers: entry.transfers.clone(),
                     effects: Vec::new(),

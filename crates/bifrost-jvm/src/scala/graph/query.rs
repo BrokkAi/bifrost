@@ -9,10 +9,12 @@
 //! companions and import spellings that can name it, and the sink that decides
 //! which of the scanner's events belong to which target.
 
+use crate::java::graph::resolver::{self as java_resolver, java_callable_arity};
+use crate::java::graph_support::JavaSource;
 use crate::scala::graph::inverted::{
-    ScalaReferenceRole, ScalaReferenceSink, ScalaResolvedReference,
-    callable_alternative_contradicts_literal_arguments, callable_alternative_is_candidate,
-    callable_alternative_matches, single_overload_family,
+    ScalaLogicalOwnerMember, ScalaLogicalReceiver, ScalaReferenceRole, ScalaReferenceSink,
+    ScalaResolvedReference, callable_alternative_contradicts_literal_arguments,
+    callable_alternative_is_candidate, callable_alternative_matches, single_overload_family,
 };
 use crate::scala::graph::resolver::{
     TargetKind, TargetSpec, import_candidate_fq_names, member_matches_target_kind,
@@ -22,14 +24,16 @@ use crate::scala::graph::syntax::{ScalaCallSiteShape, ScalaCallableSiteRole};
 use crate::scala::graph_support::{ScalaSource, ScalaWorkspaceSource};
 use crate::scala::wildcard_imports::scala_import_path;
 use crate::scala::{scala_nested_type_candidates, scala_short_name_terminal_segment};
-use brokk_bifrost_core::analyzer::model::ImportInfo;
-use brokk_bifrost_core::analyzer::usages::common::{external_usage_hit_count, usage_hit};
+use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo};
+use brokk_bifrost_core::analyzer::usages::common::{
+    SNIPPET_CONTEXT_LINES, external_usage_hit_count, usage_hit,
+};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{ClassRangeIndex, UsageReferenceKind};
 use brokk_bifrost_core::analyzer::usages::model::{UsageHit, UsageHitKind};
 use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile, Range};
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
-use brokk_bifrost_core::text_utils::find_line_index_for_offset;
+use brokk_bifrost_core::text_utils::{find_line_index_for_offset, snippet_around_line};
 use std::collections::BTreeSet;
 
 pub struct ScalaQueryTargetCatalog {
@@ -40,6 +44,79 @@ pub struct ScalaQueryTargetCatalog {
     logical: HashMap<(String, ScalaReferenceRole), Vec<usize>>,
     explicit_imports: HashMap<String, Vec<usize>>,
     owner_imports: HashMap<String, Vec<usize>>,
+    /// Member targets whose declarations no Scala index can hold (#1859):
+    /// keyed by (normalized owner fqn, member name). Never mixed with the
+    /// Scala-keyed maps above -- a catalog serves either Scala targets or one
+    /// foreign JVM target family, and the `CodeUnit`-keyed buckets stay empty
+    /// for the latter so identity never depends on `CodeUnit` equality across
+    /// the language seam (#1239).
+    foreign_members: HashMap<(String, String), Vec<usize>>,
+    /// Foreign *type* targets, keyed by normalized fqn: the type itself for
+    /// `Type` targets, the owner for `Constructor` targets (`new Owner(..)` is
+    /// a type reference whose arity the sink checks separately).
+    foreign_types: HashMap<String, Vec<usize>>,
+    foreign_specs: Vec<ForeignJvmMemberSpec>,
+}
+
+/// The Java/Kotlin member shape of a foreign catalog target. Arity families
+/// are split by staticness because a Java overload family may mix both
+/// (`static read(String)` beside `read(int)`), and only the style matching the
+/// written receiver may hit.
+pub struct ForeignJvmMemberSpec {
+    pub kind: java_resolver::TargetKind,
+    pub member_name: String,
+    pub static_callable_arities: HashSet<CallableArity>,
+    pub instance_callable_arities: HashSet<CallableArity>,
+    pub has_static_field: bool,
+    pub has_instance_field: bool,
+}
+
+impl ForeignJvmMemberSpec {
+    /// Whether a member event written through this receiver style can name the
+    /// target family. `call_shape` is present for call sites and absent for
+    /// bare selections; a bare selection names the whole family, matching the
+    /// retired duplicate scanner's paren-less rule (#1859).
+    fn accepts(
+        &self,
+        receiver: ScalaLogicalReceiver,
+        role: ScalaReferenceRole,
+        call_shape: Option<&ScalaCallSiteShape>,
+    ) -> bool {
+        let is_static = receiver == ScalaLogicalReceiver::StaticOwner;
+        match self.kind {
+            java_resolver::TargetKind::Type | java_resolver::TargetKind::Constructor => false,
+            java_resolver::TargetKind::Field => {
+                role == ScalaReferenceRole::Field
+                    && if is_static {
+                        self.has_static_field
+                    } else {
+                        self.has_instance_field
+                    }
+            }
+            java_resolver::TargetKind::Method => {
+                let arities = if is_static {
+                    &self.static_callable_arities
+                } else {
+                    &self.instance_callable_arities
+                };
+                if arities.is_empty() {
+                    return false;
+                }
+                let Some(shape) = call_shape.filter(|_| role == ScalaReferenceRole::Callable)
+                else {
+                    // A paren-less selection or method value names the family.
+                    return true;
+                };
+                // Java callables take exactly one argument list; a curried or
+                // type-only application can only be a Scala construct.
+                if shape.type_arguments_only || shape.lists.len() != 1 {
+                    return false;
+                }
+                let actual = shape.lists[0].arity;
+                arities.iter().any(|expected| expected.accepts(actual))
+            }
+        }
+    }
 }
 
 pub enum ScalaCatalogBuildError {
@@ -427,7 +504,134 @@ impl ScalaQueryTargetCatalog {
             logical,
             explicit_imports,
             owner_imports,
+            foreign_members: HashMap::default(),
+            foreign_types: HashMap::default(),
+            foreign_specs: Vec::new(),
         })
+    }
+
+    /// Build the catalog for a foreign (Java/Kotlin) target family from the
+    /// *Java-side* [`java_resolver::TargetSpec`] the call sites already hold,
+    /// so overload and arity selection follow Java's own rules (#1859). No
+    /// Scala `TargetSpec::from_target` runs: the target's source is not Scala
+    /// and the Scala grammar has nothing to say about it. Target identity is
+    /// the normalized fully qualified owner name plus the member name -- never
+    /// `CodeUnit` equality across the language seam.
+    ///
+    /// `receiver_owner_fq_names` is the exact-owner set in phase 1
+    /// (`spec.receiver_owner_fq_names`); the analysis layer widens it with
+    /// visible descendants for subtype receivers.
+    pub fn build_foreign_jvm(
+        spec: &java_resolver::TargetSpec,
+        java: &dyn JavaSource,
+        receiver_owner_fq_names: &HashSet<String>,
+    ) -> Self {
+        let mut static_callable_arities = HashSet::default();
+        let mut instance_callable_arities = HashSet::default();
+        let mut has_static_field = false;
+        let mut has_instance_field = false;
+        let mut targets: Vec<CodeUnit> = spec.targets.iter().cloned().collect();
+        targets.sort();
+        for target in &targets {
+            // Type targets skip metadata: their unit may belong to another JVM
+            // language (Kotlin types arrive here too), and they have no
+            // callable or field staticness to record.
+            if spec.kind == java_resolver::TargetKind::Type {
+                break;
+            }
+            let metadata = java.signature_metadata(target);
+            let is_static = metadata.first().is_some_and(|metadata| {
+                metadata.callable_is_static() || metadata.field_is_static()
+            });
+            match spec.kind {
+                java_resolver::TargetKind::Method | java_resolver::TargetKind::Constructor => {
+                    let arity = java_callable_arity(java, target);
+                    if is_static {
+                        static_callable_arities.insert(arity);
+                    } else {
+                        instance_callable_arities.insert(arity);
+                    }
+                }
+                java_resolver::TargetKind::Field => {
+                    has_static_field |= is_static;
+                    has_instance_field |= !is_static;
+                }
+                java_resolver::TargetKind::Type => {}
+            }
+        }
+        let foreign_spec = ForeignJvmMemberSpec {
+            kind: spec.kind,
+            member_name: spec.member_name.clone(),
+            static_callable_arities,
+            instance_callable_arities,
+            has_static_field,
+            has_instance_field,
+        };
+        let mut foreign_members: HashMap<(String, String), Vec<usize>> = HashMap::default();
+        for owner_fqn in receiver_owner_fq_names {
+            foreign_members.insert(
+                (
+                    scala_normalized_fq_name(owner_fqn),
+                    spec.member_name.clone(),
+                ),
+                vec![0],
+            );
+        }
+        let mut foreign_types: HashMap<String, Vec<usize>> = HashMap::default();
+        let mut explicit_imports: HashMap<String, Vec<usize>> = HashMap::default();
+        let mut owner_imports: HashMap<String, Vec<usize>> = HashMap::default();
+        match spec.kind {
+            java_resolver::TargetKind::Type => {
+                let normalized = scala_normalized_fq_name(&spec.target.fq_name());
+                foreign_types.insert(normalized.clone(), vec![0]);
+                explicit_imports.insert(normalized.clone(), vec![0]);
+                owner_imports.insert(normalized, vec![0]);
+            }
+            java_resolver::TargetKind::Constructor => {
+                // `new Owner(..)` is a type reference to the owner; the arity
+                // filter at the sink separates the constructor from the type.
+                foreign_types.insert(scala_normalized_fq_name(&spec.owner.fq_name()), vec![0]);
+            }
+            java_resolver::TargetKind::Method | java_resolver::TargetKind::Field => {}
+        }
+        let kind = match spec.kind {
+            java_resolver::TargetKind::Type => TargetKind::Type,
+            java_resolver::TargetKind::Constructor => TargetKind::Constructor,
+            java_resolver::TargetKind::Method => TargetKind::Method,
+            java_resolver::TargetKind::Field => TargetKind::Field,
+        };
+        let scala_spec = TargetSpec {
+            target: spec.target.clone(),
+            kind,
+            owner: Some(spec.owner.clone()),
+            owner_name: Some(spec.owner.identifier().to_string()),
+            family_owners: Vec::new(),
+            receiver_owners: Vec::new(),
+            member_name: spec.member_name.clone(),
+            target_fq_name: scala_normalized_fq_name(&spec.target.fq_name()),
+            owner_fq_name: Some(scala_normalized_fq_name(&spec.owner.fq_name())),
+            arity: None,
+            callable_alternatives: Default::default(),
+            family_callable_alternatives: Default::default(),
+            is_extension_method: false,
+            accepts_field_implementation: false,
+            is_object_type: false,
+            accepts_apply_role: false,
+            accepts_term_field_role: false,
+            accepts_companion_apply_syntax: false,
+        };
+        Self {
+            targets: vec![spec.target.clone()],
+            specs: vec![scala_spec],
+            exact: HashMap::default(),
+            exact_owner_members: HashMap::default(),
+            logical: HashMap::default(),
+            explicit_imports,
+            owner_imports,
+            foreign_members,
+            foreign_types,
+            foreign_specs: vec![foreign_spec],
+        }
     }
 
     fn target_ids(&self, target: &ScalaResolvedReference, role: ScalaReferenceRole) -> &[usize] {
@@ -440,9 +644,21 @@ impl ScalaQueryTargetCatalog {
             ScalaResolvedReference::Logical(fqn) => self
                 .logical
                 .get(&(fqn.clone(), role))
+                .or_else(|| {
+                    // A foreign type target is keyed by normalized fqn and only
+                    // ever carries the Type role (#1859).
+                    (role == ScalaReferenceRole::Type)
+                        .then(|| self.foreign_types.get(&scala_normalized_fq_name(fqn)))
+                        .flatten()
+                })
                 .map(Vec::as_slice)
                 .unwrap_or_default(),
         }
+    }
+
+    /// A catalog built for a foreign (Java/Kotlin) target family (#1859).
+    fn is_foreign(&self) -> bool {
+        !self.foreign_specs.is_empty()
     }
 
     pub fn relevant_names(&self) -> HashSet<String> {
@@ -531,6 +747,10 @@ pub struct ScalaQueryHitSink<'a> {
     pub eligibility: &'a ScalaFileEligibility,
     pub hits: &'a mut [BTreeSet<UsageHit>],
     pub observed_hits: &'a mut BTreeSet<UsageHit>,
+    /// Foreign-target scans (#1859) report receiver references they cannot
+    /// type here instead of dropping them; Scala-target scans leave this
+    /// `None` and keep dropping unproven names.
+    pub unproven_hits: Option<&'a mut BTreeSet<UsageHit>>,
     pub enclosing_cache: HashMap<(usize, usize), Option<CodeUnit>>,
     pub relevant_names: HashSet<String>,
     pub allow_all_names: bool,
@@ -650,6 +870,58 @@ impl ScalaQueryHitSink<'_> {
         matches
     }
 
+    /// The hit snippet. Scala-target queries answer with the single trimmed
+    /// line; foreign JVM targets follow the Java extractor's convention of a
+    /// few lines of context (#1859), which the Java usage surfaces and tests
+    /// are written against.
+    fn hit_snippet(&self, line: usize) -> String {
+        if self.catalog.is_foreign() {
+            snippet_around_line(self.source, &self.line_starts, line, SNIPPET_CONTEXT_LINES)
+        } else {
+            query_snippet(self.source, &self.line_starts, line)
+        }
+    }
+
+    /// The foreign type/constructor rules applied to ids a `Logical` type
+    /// event matched (#1859): a type target accepts any reference to the type,
+    /// a constructor target only a `new` whose single argument list the Java
+    /// arity family accepts. Scala ids pass through untouched.
+    fn filter_foreign_type_ids(
+        &self,
+        target_ids: &[usize],
+        call_shape: Option<&ScalaCallSiteShape>,
+    ) -> Vec<usize> {
+        target_ids
+            .iter()
+            .copied()
+            .filter(|target_id| {
+                let Some(spec) = self.catalog.foreign_specs.get(*target_id) else {
+                    return true;
+                };
+                match spec.kind {
+                    java_resolver::TargetKind::Type => true,
+                    java_resolver::TargetKind::Constructor => {
+                        let Some(shape) = call_shape else {
+                            return false;
+                        };
+                        if shape.type_arguments_only || shape.lists.len() != 1 {
+                            return false;
+                        }
+                        let actual = shape.lists[0].arity;
+                        spec.instance_callable_arities
+                            .iter()
+                            .chain(&spec.static_callable_arities)
+                            .any(|expected| expected.accepts(actual))
+                    }
+                    java_resolver::TargetKind::Method | java_resolver::TargetKind::Field => {
+                        debug_assert!(false, "member kinds never populate the foreign type bucket");
+                        false
+                    }
+                }
+            })
+            .collect()
+    }
+
     fn record_target_ids(
         &mut self,
         target_ids: &[usize],
@@ -675,6 +947,16 @@ impl ScalaQueryHitSink<'_> {
                 )
             })
             .clone();
+        // The retired duplicate scanner attributed a top-level site (an
+        // import line has no enclosing unit) to the file's first declaration;
+        // keep that convention for foreign catalogs only, so the Scala query
+        // contract is untouched (#1859).
+        let enclosing = enclosing.or_else(|| {
+            self.catalog
+                .is_foreign()
+                .then(|| self.scala.declarations(self.file).into_iter().next())
+                .flatten()
+        });
         let Some(enclosing) = enclosing else {
             return;
         };
@@ -685,7 +967,7 @@ impl ScalaQueryHitSink<'_> {
             start,
             end,
             enclosing.clone(),
-            query_snippet(self.source, &self.line_starts, line),
+            self.hit_snippet(line),
         );
         hit.kind = hit_kind;
         for target_id in target_ids.iter().copied() {
@@ -750,7 +1032,14 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
         end: usize,
     ) {
         let target_ids = self.catalog.target_ids(&target, role);
-        self.record_target_ids(target_ids, hit_kind, start, end);
+        if self.catalog.is_foreign() {
+            // A shapeless reference can name a foreign type but never one of
+            // its constructors.
+            let target_ids = self.filter_foreign_type_ids(target_ids, None);
+            self.record_target_ids(&target_ids, hit_kind, start, end);
+        } else {
+            self.record_target_ids(target_ids, hit_kind, start, end);
+        }
     }
 
     fn record_callable(
@@ -806,6 +1095,13 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
                 })
             })
             .collect::<Vec<_>>();
+        if self.catalog.is_foreign() {
+            // The foreign constructor rule replaces the Scala overload filter:
+            // Java's arity family is the whole selection (#1859).
+            let target_ids = self.filter_foreign_type_ids(&target_ids, Some(call_shape));
+            self.record_target_ids(&target_ids, hit_kind, start, end);
+            return;
+        }
         self.record_target_ids(&target_ids, hit_kind, start, end);
     }
 
@@ -826,6 +1122,77 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
             .map(Vec::as_slice)
             .unwrap_or_default();
         self.record_target_ids(target_ids, hit_kind, start, end);
+    }
+
+    fn record_logical_owner_member(
+        &mut self,
+        event: ScalaLogicalOwnerMember<'_>,
+        _reference_kind: UsageReferenceKind,
+        hit_kind: UsageHitKind,
+        start: usize,
+        end: usize,
+    ) {
+        let key = (
+            scala_normalized_fq_name(event.owner_fqn),
+            event.member.to_string(),
+        );
+        let Some(target_ids) = self.catalog.foreign_members.get(&key) else {
+            return;
+        };
+        let target_ids = target_ids
+            .iter()
+            .copied()
+            .filter(|target_id| {
+                self.catalog.foreign_specs[*target_id].accepts(
+                    event.receiver,
+                    event.role,
+                    event.call_shape,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.record_target_ids(&target_ids, hit_kind, start, end);
+    }
+
+    fn record_unproven_name(&mut self, name: &str, start: usize, end: usize) {
+        if !self
+            .catalog
+            .foreign_specs
+            .iter()
+            .any(|spec| spec.member_name == name)
+        {
+            return;
+        }
+        let enclosing = self
+            .enclosing_cache
+            .entry((start, end))
+            .or_insert_with(|| {
+                self.analyzer.enclosing_code_unit(
+                    self.file,
+                    &Range {
+                        start_byte: start,
+                        end_byte: end,
+                        start_line: 0,
+                        end_line: 0,
+                    },
+                )
+            })
+            .clone();
+        let enclosing = enclosing.or_else(|| {
+            self.catalog
+                .is_foreign()
+                .then(|| self.scala.declarations(self.file).into_iter().next())
+                .flatten()
+        });
+        let Some(enclosing) = enclosing else {
+            return;
+        };
+        let line = find_line_index_for_offset(&self.line_starts, start);
+        let snippet = self.hit_snippet(line);
+        let hit = usage_hit(self.file, line, start, end, enclosing, snippet).into_unproven();
+        let Some(unproven_hits) = self.unproven_hits.as_deref_mut() else {
+            return;
+        };
+        unproven_hits.insert(hit);
     }
 
     fn should_stop(&self) -> bool {
@@ -879,6 +1246,16 @@ impl ScalaReferenceSink for ScalaQueryHitSink<'_> {
         matches.dedup();
         for target_id in matches {
             if !self.eligibility.allows(target_id) {
+                continue;
+            }
+            if self.catalog.is_foreign() {
+                // The import maps already keyed the target by its normalized
+                // fqn; re-resolving through an `Exact` event would compare
+                // `CodeUnit`s across the language seam and never match (#1859).
+                // The retired duplicate scanner recorded import sites as
+                // ordinary references, and the external usage surface excludes
+                // `Import`-kind hits -- keep the site visible with `Reference`.
+                self.record_target_ids(&[target_id], UsageHitKind::Reference, start, end);
                 continue;
             }
             let kind = self.catalog.specs[target_id].kind;

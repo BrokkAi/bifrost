@@ -895,6 +895,7 @@ impl<'a> SarifNotification<'a> {
                 report_diagnostic: Some(diagnostic),
                 diagnostics_truncated: false,
                 omitted_diagnostics_lower_bound: 0,
+                authored_arm_closures: &[],
             },
         }
     }
@@ -917,6 +918,7 @@ impl<'a> SarifNotification<'a> {
                 report_diagnostic: None,
                 diagnostics_truncated: true,
                 omitted_diagnostics_lower_bound: report.omitted_diagnostics_lower_bound(),
+                authored_arm_closures: &[],
             },
         }
     }
@@ -962,6 +964,7 @@ impl<'a> SarifNotification<'a> {
                 report_diagnostic: None,
                 diagnostics_truncated: run.diagnostics_truncated(),
                 omitted_diagnostics_lower_bound: u64::from(run.diagnostics_truncated()),
+                authored_arm_closures: run.authored_arm_closures(),
             },
         })
     }
@@ -989,6 +992,11 @@ struct SarifNotificationProperties<'a> {
     diagnostics_truncated: bool,
     #[serde(rename = "bifrost.omittedDiagnosticsLowerBound")]
     omitted_diagnostics_lower_bound: u64,
+    #[serde(
+        rename = "bifrost.authoredArmClosures",
+        skip_serializing_if = "slice_is_empty"
+    )]
+    authored_arm_closures: &'a [crate::AuthoredArmClosureEvidence],
 }
 
 #[derive(Serialize)]
@@ -1222,6 +1230,10 @@ fn normalize_absolute_uri(uri: &str) -> Option<String> {
         .ok()
         .filter(|parsed| !parsed.scheme().is_empty() && !syntax_violation.get())
         .map(|parsed| parsed.to_string())
+}
+
+const fn slice_is_empty<T>(value: &[T]) -> bool {
+    value.is_empty()
 }
 
 const fn is_false(value: &bool) -> bool {

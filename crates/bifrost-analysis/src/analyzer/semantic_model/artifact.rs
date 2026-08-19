@@ -152,6 +152,11 @@ pub struct CompiledProcedureSummary {
     pub content_sha256: String,
     pub target: CompiledProcedureTarget,
     pub completeness: Completeness,
+    /// The author's explicit claim that every implementation outside the
+    /// workspace conforms to this summary (#2371). Serialized only when
+    /// claimed, so a summary that does not claim it keeps its content digest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub covers_overrides: bool,
     pub locations: Vec<CompiledSummaryLocation>,
     pub transfers: Vec<CompiledSummaryTransfer>,
     pub effects: Vec<CompiledSummaryEffect>,
@@ -1144,6 +1149,7 @@ fn authored_procedure_summary_from_compiled(
             parameter_count: summary.target.parameter_count,
         },
         completeness: summary.completeness,
+        covers_overrides: summary.covers_overrides,
         locations: summary
             .locations
             .iter()

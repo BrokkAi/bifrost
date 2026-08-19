@@ -1636,6 +1636,7 @@ fn failure(code: &str, message: &str, limits: &ArtifactProducerLimits) -> Artifa
             severity: ProducerDiagnosticSeverity::Error,
             code: code.to_owned(),
             location: None,
+            declaration: None,
             message: message.to_owned(),
         },
         limits,

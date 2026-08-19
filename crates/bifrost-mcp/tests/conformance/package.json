@@ -1,0 +1,9 @@
+{
+  "name": "bifrost-mcp-conformance-harness",
+  "private": true,
+  "type": "module",
+  "description": "Official MCP conformance and wire-schema gate for the Bifrost stdio MCP server (issue #2319).",
+  "dependencies": {
+    "@modelcontextprotocol/conformance": "0.2.0-alpha.11"
+  }
+}

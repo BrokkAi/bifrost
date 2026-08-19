@@ -221,6 +221,49 @@ impl JavaAnalyzer {
             .map(JavaTypeResolution::External)
     }
 
+    /// The FQN a file's explicit non-static single-type import binds to
+    /// `simple_name`.
+    ///
+    /// An `import java.net.URLDecoder;` is file-local structured evidence that
+    /// `URLDecoder` is `java.net.URLDecoder`. The jar index and activated
+    /// overlay are not required. Wildcard and static imports do not answer:
+    /// they need the declaration surface to name the member.
+    ///
+    /// Two explicit imports of the same simple name are a compile error in
+    /// Java. If they appear anyway, this returns nothing rather than picking
+    /// one.
+    pub(crate) fn explicit_imported_type_fqn(
+        &self,
+        file: &ProjectFile,
+        simple_name: &str,
+    ) -> Option<String> {
+        if simple_name.is_empty() || simple_name.contains('.') {
+            return None;
+        }
+        let mut match_fqn = None;
+        for import in self.inner.import_info_of(file) {
+            if import.is_wildcard {
+                continue;
+            }
+            let Some(import_path) = non_static_import_path(&import) else {
+                continue;
+            };
+            if import.identifier.as_deref() != Some(simple_name) {
+                continue;
+            }
+            let fqn = import_path.render_segments(".");
+            if !fqn.contains('.') {
+                continue;
+            }
+            match match_fqn.as_deref() {
+                Some(existing) if existing == fqn => {}
+                Some(_) => return None,
+                None => match_fqn = Some(fqn),
+            }
+        }
+        match_fqn
+    }
+
     /// Resolve `raw_name` in `file` as a member spelling -- a written
     /// `Owner.member` whose head is a type and whose last segment is a member
     /// the external declaration surface declares (#1900).

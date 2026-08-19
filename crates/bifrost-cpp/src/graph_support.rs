@@ -168,6 +168,15 @@ pub trait CppSource:
     /// contexts, because their include closures can disagree about a name.
     fn compile_contexts_for(&self, file: &ProjectFile) -> &[CppCompileContext];
 
+    /// Every workspace translation unit whose `#include` closure transitively
+    /// reaches `file` -- the header-to-TU attribution map from #1970's
+    /// Milestone 2, which #2011 phase 2 reads for header-sited guard proof.
+    /// Empty when nothing reaches `file` or the implementor has no include
+    /// graph, which conservatively yields no compile-context facts.
+    fn reaching_translation_units(&self, _file: &ProjectFile) -> Vec<ProjectFile> {
+        Vec::new()
+    }
+
     /// Count a precise-parent resolution against the analyzer's counter.
     ///
     /// Called from production code in [`crate::graph::resolver`], which is why

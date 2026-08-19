@@ -19,11 +19,12 @@ pub(crate) fn collect_java_semantic_diagnostics(
     let Some(java) = crate::analyzer::resolve_analyzer::<JavaAnalyzer>(analyzer) else {
         return SemanticDiagnosticReport::new();
     };
-    brokk_bifrost_jvm::java::diagnostics::collect_java_semantic_diagnostics(
+    let report = brokk_bifrost_jvm::java::diagnostics::collect_java_semantic_diagnostics(
         java,
         &analyzer.global_usage_definition_index(),
         &JvmOverlayModel(analyzer.semantic_model_overlay()),
         file,
         source,
-    )
+    );
+    crate::analyzer::semantic_model::degrade_pack_gap_absences(analyzer, report)
 }

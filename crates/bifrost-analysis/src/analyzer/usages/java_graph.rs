@@ -245,8 +245,11 @@ impl UsageAnalyzer for JavaUsageGraphStrategy {
 /// Collect hits on a Java target from Scala source, when the workspace has a
 /// Scala analyzer to read Scala's own imports and declarations with.
 ///
-/// The scan itself is [`brokk_bifrost_jvm::java::graph::jvm_scala`]; what stays
-/// here is the downcast that produces its `ScalaSource`.
+/// The scan is the Scala query walk itself (#1859): the walk types receivers,
+/// the foreign catalog matches the owner's normalized fqn plus the member name
+/// under Java's own arity rules, and a receiver that cannot be typed lands in
+/// the unproven channel. What stays here is the downcast that produces the
+/// scan's `ScalaSource`.
 pub(in crate::analyzer::usages) fn scan_scala_files_for_java_target(
     analyzer: &dyn IAnalyzer,
     candidate_files: &HashSet<ProjectFile>,
@@ -257,14 +260,110 @@ pub(in crate::analyzer::usages) fn scan_scala_files_for_java_target(
     let Some(scala) = resolve_analyzer::<crate::analyzer::ScalaAnalyzer>(analyzer) else {
         return;
     };
-    brokk_bifrost_jvm::java::graph::jvm_scala::scan_scala_files_for_java_target(
+    let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
+        return;
+    };
+    scan_scala_files_for_foreign_target(
         analyzer,
         scala,
+        java,
         candidate_files,
         spec,
         state,
         cancellation,
     );
+}
+
+/// One foreign catalog for the Java (or other JVM-language) target family,
+/// then the ordinary per-file Scala query scan with a hit sink that also keeps
+/// unproven receiver references.
+fn scan_scala_files_for_foreign_target(
+    analyzer: &dyn IAnalyzer,
+    scala: &crate::analyzer::ScalaAnalyzer,
+    java: &JavaAnalyzer,
+    candidate_files: &HashSet<ProjectFile>,
+    spec: &TargetSpec,
+    state: &mut brokk_bifrost_jvm::java::graph::extractor::ScanState<'_>,
+    cancellation: Option<&crate::cancellation::CancellationToken>,
+) {
+    use brokk_bifrost_jvm::scala::graph::query::{
+        ScalaFileEligibility, ScalaQueryHitSink, ScalaQueryTargetCatalog,
+    };
+
+    // Subtype receivers (#1859): a receiver typed as a descendant of the Java
+    // owner dispatches to the inherited member, so the catalog's owner set is
+    // the receiver set plus every descendant the dispatching analyzer can see.
+    // The realm hierarchy is one-directional: a Scala class extending a Java
+    // base records no ancestor edge, so a Scala-subclass receiver stays a
+    // documented miss until that hierarchy work lands.
+    let mut receiver_owners = spec.receiver_owner_fq_names.clone();
+    if matches!(spec.kind, TargetKind::Method | TargetKind::Field)
+        && let Some(hierarchy) = analyzer.type_hierarchy_provider()
+    {
+        for descendant in hierarchy.get_descendants(&spec.owner) {
+            if descendant.is_class() {
+                receiver_owners.insert(descendant.fq_name());
+            }
+        }
+    }
+    let catalog = ScalaQueryTargetCatalog::build_foreign_jvm(spec, java, &receiver_owners);
+    let relevant_names = catalog.relevant_names();
+    let dispatch = crate::analyzer::usages::scala_graph::shared::ScalaDispatch(analyzer);
+    let eligibility = ScalaFileEligibility::All;
+    let member_name = spec.member_name.as_str();
+    let owner_name = spec.owner.identifier();
+    let mut files: Vec<ProjectFile> = candidate_files
+        .iter()
+        .filter(|file| crate::analyzer::usages::common::language_for_file(file) == Language::Scala)
+        .cloned()
+        .collect();
+    files.sort();
+    let mut observed_hits = std::collections::BTreeSet::new();
+    for file in &files {
+        if *state.limit_exceeded || cancellation.is_some_and(|token| token.is_cancelled()) {
+            break;
+        }
+        let Some(source) = analyzer.indexed_source(file) else {
+            continue;
+        };
+        // The retired scanner's cheap gate: a file that spells neither the
+        // member nor its owner cannot reference the target.
+        if !source.contains(member_name) && !source.contains(owner_name) {
+            continue;
+        }
+        let mut sink = ScalaQueryHitSink {
+            analyzer: &dispatch,
+            scala,
+            file,
+            source: &source,
+            class_ranges: crate::analyzer::usages::inverted_edges::ClassRangeIndex::build(
+                analyzer, file,
+            ),
+            line_starts: crate::text_utils::compute_line_starts(&source),
+            catalog: &catalog,
+            eligibility: &eligibility,
+            hits: std::slice::from_mut(&mut *state.hits),
+            observed_hits: &mut observed_hits,
+            unproven_hits: Some(&mut *state.unproven_hits),
+            enclosing_cache: crate::hash::HashMap::default(),
+            relevant_names: relevant_names.clone(),
+            allow_all_names: false,
+            max_usages: state.max_usages,
+            limit_exceeded: false,
+        };
+        brokk_bifrost_jvm::scala::graph::inverted::scan_scala_query_file(
+            scala,
+            analyzer,
+            &dispatch,
+            file,
+            &source,
+            &mut sink,
+            cancellation,
+        );
+        if sink.limit_exceeded {
+            *state.limit_exceeded = true;
+        }
+    }
 }
 
 /// The whole-workspace inverted pass: the shared driver's parallel fan-out plus

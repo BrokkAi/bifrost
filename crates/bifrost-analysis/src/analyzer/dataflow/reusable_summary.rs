@@ -235,6 +235,12 @@ pub struct ExternalSummaryOrigin {
     model: ExternalSummaryModelId,
     content: ExternalSummaryContentHash,
     contract_version: u32,
+    /// The author's explicit claim that every implementation of this member
+    /// outside the workspace conforms to this summary (#2371). Carried on the
+    /// origin, not a side table: the origin is already the authored identity a
+    /// consumer reports and it participates in the identity fingerprint, so a
+    /// pack that changes its claim invalidates the summaries keyed by it.
+    covers_overrides: bool,
 }
 
 impl ExternalSummaryOrigin {
@@ -242,6 +248,7 @@ impl ExternalSummaryOrigin {
         model: ExternalSummaryModelId,
         content: ExternalSummaryContentHash,
         contract_version: u32,
+        covers_overrides: bool,
     ) -> Result<Self, SummaryValidationError> {
         if contract_version == 0 {
             return Err(SummaryValidationError::ZeroExternalContractVersion);
@@ -250,6 +257,7 @@ impl ExternalSummaryOrigin {
             model,
             content,
             contract_version,
+            covers_overrides,
         })
     }
 
@@ -263,6 +271,15 @@ impl ExternalSummaryOrigin {
 
     pub const fn contract_version(&self) -> u32 {
         self.contract_version
+    }
+
+    /// Whether the author explicitly claimed this summary covers every
+    /// implementation of the member outside the workspace (#2371). This is
+    /// deliberately not derived from any completeness field on the summary:
+    /// see `crate::analyzer::value_flow::plan::ValueFlowPlan::authored_arm_closure`
+    /// for the one place it is read to discharge a residual dispatch arm.
+    pub const fn covers_overrides(&self) -> bool {
+        self.covers_overrides
     }
 }
 
@@ -2758,6 +2775,7 @@ fn fingerprint_procedure_identity(identity: &ProcedureSummaryIdentity) -> Stable
             push_digest_part(&mut bytes, origin.model.as_str().as_bytes());
             push_digest_part(&mut bytes, origin.content.as_bytes());
             push_digest_part(&mut bytes, &origin.contract_version.to_le_bytes());
+            push_digest_part(&mut bytes, &[u8::from(origin.covers_overrides)]);
         }
     }
     StableDigest::sha256(bytes)

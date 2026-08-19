@@ -78,4 +78,12 @@ impl JvmActiveSemanticModel for JvmOverlayModel {
             declarations => JvmModelDisposition::Conflicting { declarations },
         }
     }
+
+    fn extraction_gap(&self, fqn: &str) -> Option<brokk_bifrost_jvm::proof::JvmPackExtractionGap> {
+        let gap = self.0.as_ref()?.gapped(fqn)?;
+        Some(brokk_bifrost_jvm::proof::JvmPackExtractionGap {
+            pack_id: gap.pack_id.clone(),
+            declaration: gap.declaration.clone(),
+        })
+    }
 }

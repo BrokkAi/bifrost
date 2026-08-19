@@ -415,11 +415,15 @@ fn external_origin(
             source,
         }
     })?;
-    ExternalSummaryOrigin::new(model, content, summary.contract_version).map_err(|source| {
-        ProcedureSummaryBindingError::InvalidSummary {
-            summary_id: summary.id.clone(),
-            source,
-        }
+    ExternalSummaryOrigin::new(
+        model,
+        content,
+        summary.contract_version,
+        summary.covers_overrides,
+    )
+    .map_err(|source| ProcedureSummaryBindingError::InvalidSummary {
+        summary_id: summary.id.clone(),
+        source,
     })
 }
 

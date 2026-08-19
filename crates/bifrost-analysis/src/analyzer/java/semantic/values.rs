@@ -378,6 +378,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .add_mapping(builder, anchor, SourceMappingKind::Exact)
     }
 
+    pub(super) fn field_access_is_type_qualifier(&self, node: Node<'tree>) -> bool {
+        java_field_access_is_type_qualifier(node, self.prepared.source(), |root| {
+            self.root_identifier_is_value(root, node)
+        })
+    }
+
+    fn root_identifier_is_value(&self, name: &str, access: Node<'tree>) -> bool {
+        if self.local_at(name, access.start_byte()).is_some() || self.parameters.contains_key(name)
+        {
+            return true;
+        }
+        let Some(owner) = enclosing_type_name(self.prepared.source(), access) else {
+            return false;
+        };
+        self.field_declaration_anchors
+            .contains_key(&(owner, name.into()))
+    }
+
     pub(super) fn memory_member_locator(
         &self,
         node: Node<'tree>,

@@ -4828,7 +4828,7 @@ fn insert_rust_fact_rows(
     rows: &RustFactRows,
 ) -> Result<()> {
     if !rows.exports.is_empty() {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_exports(
                blob_oid, lang, ordinal, exported_name, source_path, imported_name, is_glob
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -4846,7 +4846,7 @@ fn insert_rust_fact_rows(
         }
     }
     if !rows.import_targets.is_empty() {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_import_targets(
                blob_oid, lang, ordinal, module_path, bound_name, imported_name, is_glob,
                is_extern_crate, visibility, cfg_condition, owner_module, owner_start,
@@ -4874,7 +4874,7 @@ fn insert_rust_fact_rows(
         }
     }
     if !rows.modules.is_empty() {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_modules(
                blob_oid, lang, ordinal, module_name, is_inline, start_byte, end_byte
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -4892,7 +4892,7 @@ fn insert_rust_fact_rows(
         }
     }
     if !rows.identifier_occurrences.is_empty() {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_identifier_occurrences(
                blob_oid, lang, identifier, context_mask
              ) VALUES(?1, ?2, ?3, ?4)",
@@ -4903,7 +4903,7 @@ fn insert_rust_fact_rows(
     }
     let routes = &rows.module_routes;
     if !routes.scopes.is_empty() {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_module_scopes(
                blob_oid, lang, ordinal, parent_ordinal, module_name, path_attribute,
                imports_macros, body_start, body_end
@@ -4924,7 +4924,7 @@ fn insert_rust_fact_rows(
         }
     }
     if !routes.routes.is_empty() {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_module_routes(
                blob_oid, lang, ordinal, scope_ordinal, module_name, path_attribute,
                visibility, imports_macros, test_gated, declaration_start, declaration_end
@@ -4947,7 +4947,7 @@ fn insert_rust_fact_rows(
         }
     }
     if !routes.gates.is_empty() {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_module_route_gates(
                blob_oid, lang, route_ordinal, gate_ordinal, macro_name, invocation_start
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
@@ -4964,7 +4964,7 @@ fn insert_rust_fact_rows(
         }
     }
     if !routes.item_macros.is_empty() {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_item_macros(
                blob_oid, lang, ordinal, macro_name, visible_after, scope_start, scope_end,
                passthrough
@@ -4984,12 +4984,12 @@ fn insert_rust_fact_rows(
         }
     }
     if !rows.include_edges.is_empty() {
-        let mut edge_stmt = tx.prepare(
+        let mut edge_stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_include_edges(
                blob_oid, lang, ordinal, relative_path, file_name, include_start
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
-        let mut binding_stmt = tx.prepare(
+        let mut binding_stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_include_host_bindings(
                blob_oid, lang, edge_ordinal, ordinal, local_name, module_specifier,
                imported_name, scope_start, kind
@@ -5489,9 +5489,13 @@ pub(crate) struct PersistBatchLimits {
 }
 
 impl PersistBatchLimits {
+    // Issue #2326 writer-stage profile: with 32 KiB pages and a 512 MiB writer
+    // page cache, 256-blob/400 k-row batches cut commit cost ~3.5x versus the
+    // previous 64-blob/100 k-row batches; the byte cap stays as the
+    // payload-size guardrail.
     pub(crate) const PRODUCTION: Self = Self {
-        max_blobs: 64,
-        max_rows: 100_000,
+        max_blobs: 256,
+        max_rows: 400_000,
         max_payload_bytes: 32 * 1024 * 1024,
     };
 
@@ -5815,7 +5819,7 @@ fn insert_import_rows(
     rows: &ImportRows,
 ) -> Result<()> {
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO import_statements(
                blob_oid, lang, ordinal, statement, is_wildcard, is_global,
                identifier, alias, path_kind, declaration_start_byte,
@@ -5840,7 +5844,7 @@ fn insert_import_rows(
         }
     }
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO import_path_segments(
                blob_oid, lang, ordinal, seg_ordinal, segment
              ) VALUES(?1, ?2, ?3, ?4, ?5)",
@@ -5850,7 +5854,7 @@ fn insert_import_rows(
         }
     }
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO import_lexical_scopes(
                blob_oid, lang, ordinal, scope_ordinal, start_byte, end_byte
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
@@ -5866,7 +5870,7 @@ fn insert_import_rows(
             ])?;
         }
     }
-    let mut stmt = tx.prepare(
+    let mut stmt = tx.prepare_cached(
         "INSERT OR IGNORE INTO import_lexical_prefixes(
            blob_oid, lang, ordinal, prefix_ordinal, prefix
          ) VALUES(?1, ?2, ?3, ?4, ?5)",
@@ -6187,16 +6191,15 @@ fn write_prepared_blob_rows_tx(
 ) -> Result<()> {
     let oid = blob.oid_text.as_str();
     let lang = blob.lang.as_str();
-    tx.execute(
-        "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2",
-        params![oid, lang],
-    )?;
-    tx.execute(
-        "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, ?3)",
-        params![oid, lang, generation.0],
-    )?;
+    // Every statement in this batch path is connection-cached: a cold reconcile
+    // writes hundreds of blobs per transaction and re-preparing ~25 statements
+    // per blob was a measured writer-CPU cost (issue #2326).
+    tx.prepare_cached("DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2")?
+        .execute(params![oid, lang])?;
+    tx.prepare_cached("INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, ?3)")?
+        .execute(params![oid, lang, generation.0])?;
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO code_units(
                blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
                exact_fqn, normalized_fqn, simple_type_name, signature, synthetic,
@@ -6229,7 +6232,7 @@ fn write_prepared_blob_rows_tx(
     }
     macro_rules! insert_rows {
         ($sql:expr, $rows:expr, |$stmt:ident, $row:ident| $body:block) => {{
-            let mut $stmt = tx.prepare($sql)?;
+            let mut $stmt = tx.prepare_cached($sql)?;
             for $row in $rows $body
         }};
     }
@@ -6312,27 +6315,27 @@ fn write_prepared_blob_rows_tx(
         }
     );
     insert_rust_fact_rows(tx, oid, lang, &blob.rust_facts)?;
-    tx.execute(
+    tx.prepare_cached(
         "INSERT OR IGNORE INTO blob_meta(
            blob_oid, lang, contains_tests, content_package, stored_unit_count,
            range_count, signature_count, signature_metadata_count, supertype_count,
            child_count, import_statement_count, type_identifier_count, is_complete
          ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)",
-        params![
-            oid,
-            lang,
-            blob.contains_tests,
-            blob.content_package,
-            usize_to_i64(blob.units.len())?,
-            usize_to_i64(blob.ranges.len())?,
-            usize_to_i64(blob.signatures.len())?,
-            usize_to_i64(blob.signature_metadata.len())?,
-            usize_to_i64(blob.supertypes.len())?,
-            usize_to_i64(blob.children.len())?,
-            usize_to_i64(blob.imports.statements.len())?,
-            usize_to_i64(blob.type_identifiers.len())?,
-        ],
-    )?;
+    )?
+    .execute(params![
+        oid,
+        lang,
+        blob.contains_tests,
+        blob.content_package,
+        usize_to_i64(blob.units.len())?,
+        usize_to_i64(blob.ranges.len())?,
+        usize_to_i64(blob.signatures.len())?,
+        usize_to_i64(blob.signature_metadata.len())?,
+        usize_to_i64(blob.supertypes.len())?,
+        usize_to_i64(blob.children.len())?,
+        usize_to_i64(blob.imports.statements.len())?,
+        usize_to_i64(blob.type_identifiers.len())?,
+    ])?;
     insert_optional_fact_manifest(
         tx,
         oid,
@@ -6352,7 +6355,8 @@ fn write_prepared_blob_rows_tx(
            AND {integrity_condition}"
     );
     let complete = tx
-        .query_row(&integrity_sql, params![oid, lang], |_| Ok(()))
+        .prepare_cached(&integrity_sql)?
+        .query_row(params![oid, lang], |_| Ok(()))
         .optional()?
         .is_some();
     if !complete {
@@ -10153,11 +10157,11 @@ fn insert_blob_payload_cost_tx(
     lang: &str,
     payload_bytes: usize,
 ) -> Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO blob_payload_costs(blob_oid, lang, payload_bytes)
          VALUES(?1, ?2, ?3)",
-        params![oid, lang, usize_to_i64(payload_bytes)?],
-    )?;
+    )?
+    .execute(params![oid, lang, usize_to_i64(payload_bytes)?])?;
     Ok(())
 }
 

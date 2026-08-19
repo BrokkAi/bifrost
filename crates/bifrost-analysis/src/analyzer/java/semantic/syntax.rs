@@ -487,6 +487,128 @@ pub(super) fn operation_can_throw_implicitly(node: Node<'_>) -> bool {
     }
 }
 
+/// Whether `name` is spelled like a Java type identifier: it starts with an
+/// uppercase letter and is not a constant (`HTTP_OK`). JLS 6.5 reclassifies
+/// an ambiguous name as a TypeName when it names a type; this is that
+/// spelling half, used only when the root of the chain is not a proven value.
+pub(super) fn java_type_name_spelling(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_uppercase()) && !name.contains('_')
+}
+
+fn java_package_name_spelling(name: &str) -> bool {
+    matches!(name.chars().next(), Some(first) if first.is_ascii_lowercase())
+}
+
+/// Longest prefix of `segments` that is a package-or-type name ending in a
+/// type identifier (`java.net.URLDecoder`, `Outer.Inner`). Zero when no
+/// segment is a type spelling.
+pub(super) fn java_type_name_prefix_len(segments: &[&str]) -> usize {
+    let mut last_type = 0;
+    for (index, segment) in segments.iter().enumerate() {
+        if java_type_name_spelling(segment) {
+            last_type = index + 1;
+            continue;
+        }
+        if last_type == 0 && java_package_name_spelling(segment) {
+            continue;
+        }
+        break;
+    }
+    last_type
+}
+
+/// The identifier chain of a `field_access`, root first.
+pub(super) fn java_field_access_segments<'a>(mut node: Node<'_>, source: &'a str) -> Vec<&'a str> {
+    let mut segments = Vec::new();
+    loop {
+        if node.kind() != "field_access" {
+            if let Some(text) = node_text(source, node) {
+                segments.push(text);
+            }
+            break;
+        }
+        let Some(field) = node.child_by_field_name("field") else {
+            break;
+        };
+        if let Some(text) = node_text(source, field) {
+            segments.push(text);
+        }
+        let Some(object) = node.child_by_field_name("object") else {
+            break;
+        };
+        node = object;
+    }
+    segments.reverse();
+    segments
+}
+
+fn java_field_access_identifier_count(mut node: Node<'_>) -> usize {
+    let mut count = 0;
+    loop {
+        if node.kind() != "field_access" {
+            count += 1;
+            break;
+        }
+        count += 1;
+        let Some(object) = node.child_by_field_name("object") else {
+            break;
+        };
+        node = object;
+    }
+    count
+}
+
+fn java_outermost_selector_field_access(mut node: Node<'_>) -> Node<'_> {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "field_access" && parent.child_by_field_name("object") == Some(node) {
+            node = parent;
+            continue;
+        }
+        break;
+    }
+    node
+}
+
+fn java_field_access_is_selector_object(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "field_access" | "method_invocation")
+            && parent.child_by_field_name("object") == Some(node)
+    })
+}
+
+/// A `field_access` that is only a type or package qualifier, not heap memory.
+///
+/// The proof is JLS 6.5 reclassification of a PackageOrTypeName, not "the
+/// root is not a local". A root that is `this`, a parameter, a local, or an
+/// in-file field stays a value, so inherited-looking `field.nested` chains
+/// whose last segment is not a type spelling keep their Field lowering.
+pub(super) fn java_field_access_is_type_qualifier(
+    node: Node<'_>,
+    source: &str,
+    root_is_value: impl Fn(&str) -> bool,
+) -> bool {
+    if node.kind() != "field_access" || !java_field_access_is_selector_object(node) {
+        return false;
+    }
+    let outermost = java_outermost_selector_field_access(node);
+    let segments = java_field_access_segments(outermost, source);
+    if segments.is_empty() {
+        return false;
+    }
+    if segments
+        .first()
+        .is_some_and(|root| root_is_value(root) || *root == "this" || *root == "super")
+    {
+        return false;
+    }
+    let type_prefix = java_type_name_prefix_len(&segments);
+    if type_prefix == 0 {
+        return false;
+    }
+    java_field_access_identifier_count(node) <= type_prefix
+}
+
 pub(super) fn is_runtime_leaf(kind: &str) -> bool {
     matches!(
         kind,

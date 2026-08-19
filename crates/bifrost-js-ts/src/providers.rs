@@ -89,6 +89,27 @@ pub trait JsTsSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProv
     /// rendering, which the alias skeleton must not double up on.
     fn raw_signatures(&self, code_unit: &CodeUnit) -> Vec<String>;
 
+    /// The aliased type of a TypeScript type-alias declaration, read from the
+    /// `type_alias_declaration`'s AST `value` field. `None` when the unit is
+    /// not an alias or the analyzer holds no syntax tree for its file.
+    ///
+    /// The signature string cannot answer this: splitting it at the first
+    /// `=` hits a type-parameter default's `=` instead of the alias's own
+    /// assignment (#2227).
+    fn type_alias_value_text(&self, _code_unit: &CodeUnit) -> Option<String> {
+        None
+    }
+
+    /// A member field's declared type, read from the `property_signature`'s
+    /// AST `type` annotation. `None` when the unit has no annotation or the
+    /// analyzer holds no syntax tree for its file.
+    ///
+    /// The signature string cannot answer this: splitting it on `,` cuts a
+    /// multi-argument generic like `Map<string, number>` in half (#2227).
+    fn member_type_annotation_text(&self, _code_unit: &CodeUnit) -> Option<String> {
+        None
+    }
+
     /// The workspace's usage-definition index, as the bounded lookup contract.
     ///
     /// The `JavaSource::usage_definitions` spelling. Before the extraction the

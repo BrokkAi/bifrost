@@ -30,12 +30,13 @@ pub(crate) fn collect_kotlin_semantic_diagnostics(
     let Some(kotlin) = resolve_analyzer::<KotlinAnalyzer>(analyzer) else {
         return SemanticDiagnosticReport::new();
     };
-    brokk_bifrost_jvm::kotlin::diagnostics::collect_kotlin_semantic_diagnostics(
+    let report = brokk_bifrost_jvm::kotlin::diagnostics::collect_kotlin_semantic_diagnostics(
         analyzer,
         kotlin,
         file,
         source,
         realm,
         &JvmOverlayModel(analyzer.semantic_model_overlay()),
-    )
+    );
+    crate::analyzer::semantic_model::degrade_pack_gap_absences(analyzer, report)
 }
