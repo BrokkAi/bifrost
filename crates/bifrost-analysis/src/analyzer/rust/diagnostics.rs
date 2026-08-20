@@ -15,6 +15,7 @@
 //! filled earlier; an empty one is an unknown boundary, never a reason to go
 //! and build it.
 
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use std::sync::Arc;
 
 use crate::analyzer::rust::crate_identity::RustOverlayCrates;
@@ -46,8 +47,14 @@ pub(crate) fn collect_rust_semantic_diagnostics(
         overlay: analyzer.semantic_model_overlay(),
         discovery: analyzer.dependency_discovery_evidence(Language::Rust),
     };
+    let scope = AnalyzerQueryScope::new(analyzer);
     let report = brokk_bifrost_rust::diagnostics::collect_rust_semantic_diagnostics(
-        rust, &support, &external, file, source,
+        rust,
+        scope.token(),
+        &support,
+        &external,
+        file,
+        source,
     );
     crate::analyzer::semantic_model::degrade_pack_gap_absences(analyzer, report)
 }

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use git2::Oid;
 use moka::sync::Cache;
 
+use crate::analyzer::QueryScope;
 use crate::analyzer::complete_value_cache::{
     CompleteValueAcquisition, CompleteValueCache, CompleteValueWait,
 };
@@ -343,20 +344,21 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
     }
 
     let max_source_bytes = request.budget.remaining().source_bytes;
-    let (source_identity, prepared) = match analyzer.prepared_syntax_limited(file, max_source_bytes)
-    {
-        Ok(Some(resolved)) => resolved,
-        Ok(None) => {
-            return Err(SemanticProviderError::source_access(format!(
-                "could not prepare the current source snapshot for `{file}`"
-            )));
-        }
-        Err(limit) => {
-            let work = SemanticWork {
-                source_bytes: limit.minimum_source_bytes(),
-                ..SemanticWork::default()
-            };
-            let exceeded = request.budget.check(work).map_or_else(
+    let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+    let (source_identity, prepared) =
+        match analyzer.prepared_syntax_limited(scope.token(), file, max_source_bytes) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => {
+                return Err(SemanticProviderError::source_access(format!(
+                    "could not prepare the current source snapshot for `{file}`"
+                )));
+            }
+            Err(limit) => {
+                let work = SemanticWork {
+                    source_bytes: limit.minimum_source_bytes(),
+                    ..SemanticWork::default()
+                };
+                let exceeded = request.budget.check(work).map_or_else(
                 |exceeded| exceeded,
                 |_| {
                     unreachable!(
@@ -364,13 +366,13 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
                     )
                 },
             );
-            return Ok(SemanticOutcome::ExceededBudget {
-                partial: None,
-                exceeded,
-                work,
-            });
-        }
-    };
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
+                });
+            }
+        };
     let source_work = SemanticWork {
         source_bytes: prepared.source().len(),
         ..SemanticWork::default()

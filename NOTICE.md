@@ -10,5 +10,6 @@ under their own terms. See `docs/src/content/docs/third-party-notices.md` and
 the notice files under `licenses/` and `semantic-packs/**/notices/` for the
 applicable attribution and provenance information.
 
-Semantic packs already published before the open-core cutoff retain the
-license identified in each pack.
+Every Bifrost-owned semantic pack is Apache-2.0. A pack built from third-party
+material records that material's own license, which the pack's notice file under
+`semantic-packs/**/notices/` identifies.

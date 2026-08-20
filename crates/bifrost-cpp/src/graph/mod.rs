@@ -20,6 +20,7 @@ pub mod syntax;
 use crate::graph_support::CppSource;
 use brokk_bifrost_core::analyzer::capabilities::{TypeAliasProvider, TypeHierarchyProvider};
 use brokk_bifrost_core::analyzer::model::{CppFieldLinkage, SignatureMetadata};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile, Range};
 use std::collections::BTreeSet;
 
@@ -80,6 +81,11 @@ pub struct CppGraphSource<'a> {
     pub aliases: Option<&'a dyn TypeAliasProvider>,
     pub hierarchy: Option<&'a dyn TypeHierarchyProvider>,
     pub workspace: &'a dyn CppWorkspaceSource,
+    /// Proof that the request scope this bundle serves is open. The bundle is
+    /// a per-query object built at a query boundary, so the syntax accessors
+    /// its resolution paths reach can take the proof from here rather than
+    /// from ninety extra parameters (issue #2414 step 3).
+    pub token: QueryToken<'a>,
 }
 
 impl<'a> CppGraphSource<'a> {
@@ -89,13 +95,14 @@ impl<'a> CppGraphSource<'a> {
     /// analyzer in hand: they passed `&CppAnalyzer` where a `&dyn IAnalyzer`
     /// was wanted, and its `type_alias_provider()`/`type_hierarchy_provider()`
     /// both answered `Some(self)`, so every field is the same object here too.
-    pub fn from_source(source: &'a dyn CppSource) -> Self {
+    pub fn from_source(source: &'a dyn CppSource, token: QueryToken<'a>) -> Self {
         Self {
             index: source,
             cpp: Some(source),
             aliases: Some(source),
             hierarchy: Some(source),
             workspace: source,
+            token,
         }
     }
 

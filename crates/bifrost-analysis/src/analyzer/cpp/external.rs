@@ -17,6 +17,7 @@ use crate::analyzer::semantic_model::{
 };
 use crate::analyzer::semantic_model::{SemanticModelCompleteness, SemanticModelOverlay};
 use crate::analyzer::structural::BoundaryStatus;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{Language, Project};
 use crate::hash::HashMap;
 use brokk_bifrost_core::analyzer::model::{
@@ -164,7 +165,10 @@ fn build_directly_reached_external_headers(
         return None;
     }
     analyzer.record_external_header_closure_build();
-    let Some(syntax) = analyzer.prepared_syntax(file) else {
+    // Runs on a cache miss only, nested inside whatever request scope the
+    // caller opened (issue #2414 step 3).
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let Some(syntax) = analyzer.prepared_syntax(scope.token(), file) else {
         return Some(ReachedExternalHeaders::Unavailable);
     };
     const MAX_CLOSURE_HEADERS: usize = 10_000;

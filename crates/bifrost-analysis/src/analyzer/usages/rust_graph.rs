@@ -6,6 +6,7 @@ mod hits;
 mod inverted;
 mod resolver;
 use crate::analyzer::usages::traits::{GraphUsageAnalyzer, PreparedUsageQuery};
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
@@ -111,10 +112,14 @@ impl PreparedRustUsageQuery {
         include_finder_augmentation: bool,
         cancellation: &CancellationToken,
     ) -> Option<Self> {
+        // The planning phase's request boundary; nested inside any
+        // caller-owned scope (issue #2414 step 3).
+        let scope = AnalyzerQueryScope::new(rust);
+        let token = scope.token();
         let keep_going = || !cancellation.is_cancelled();
         let mut canonical_targets = Vec::with_capacity(overloads.len());
         for overload in overloads {
-            let canonical = canonical_usage_target(rust, overload);
+            let canonical = canonical_usage_target(rust, token, overload);
             if !canonical_targets.contains(&canonical) {
                 canonical_targets.push(canonical);
             }
@@ -126,7 +131,7 @@ impl PreparedRustUsageQuery {
             let member = is_member_target(rust, &target);
             let seed_result = {
                 let _scope = crate::profiling::scope("rust_graph::seed_inference");
-                infer_graph_seeds_while(rust, &target, &keep_going)?
+                infer_graph_seeds_while(rust, token, &target, &keep_going)?
             };
             if seed_result.roots.is_empty() {
                 targets.push(PreparedRustTarget {
@@ -138,7 +143,7 @@ impl PreparedRustUsageQuery {
             let seeds = {
                 let _scope = crate::profiling::scope("rust_graph::binding_seed_discovery");
                 rust.note_usage_binding_seed_preparation();
-                usage_binding_seeds_while(rust, &seed_result.roots, &keep_going)?
+                usage_binding_seeds_while(rust, token, &seed_result.roots, &keep_going)?
             };
             crate::profiling::note_with(|| {
                 format!(
@@ -150,7 +155,7 @@ impl PreparedRustUsageQuery {
             let graph_visible = !member || is_graph_visible_member_target(rust, &target);
             let protected_files = if include_finder_augmentation {
                 let _scope = crate::profiling::scope("RustQueryResolver::usage_candidates");
-                usage_candidate_files_from_binding_seeds_while(rust, &seeds, &keep_going)?
+                usage_candidate_files_from_binding_seeds_while(rust, token, &seeds, &keep_going)?
             } else {
                 HashSet::default()
             };
@@ -197,16 +202,18 @@ impl PreparedRustUsageQuery {
             let mut target_files = if include_finder_augmentation {
                 effective_scan_files_from_prepared_candidates(
                     rust,
+                    token,
                     &planning_scope,
                     &prepared.target,
                     seeds,
                 )
             } else {
-                effective_scan_files(rust, &planning_scope, &prepared.target, seeds)
+                effective_scan_files(rust, token, &planning_scope, &prepared.target, seeds)
             };
             if *kind == RustGraphSeedKind::LocalDeclaration {
                 target_files.extend(local_impl_target_importer_files_while(
                     rust,
+                    token,
                     &prepared.target,
                     &keep_going,
                 )?);
@@ -300,6 +307,10 @@ impl RustQueryResolver<'_> {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
+        // The scan's request boundary; nested inside any caller-owned scope
+        // (issue #2414 step 3).
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let rust = self.rust;
         let candidates: Vec<_> = prepared
             .targets
@@ -341,10 +352,11 @@ impl RustQueryResolver<'_> {
                 {
                     return Ok(CandidateUsageHits::default());
                 }
-                let scan_target = trait_member_for_impl_member(rust, target);
+                let scan_target = trait_member_for_impl_member(rust, token, target);
                 let scan_target = scan_target.as_ref().unwrap_or(target);
                 let result = scan_files_for_member_target(
                     analyzer,
+                    token,
                     rust,
                     scan_files,
                     scan_target,
@@ -357,6 +369,7 @@ impl RustQueryResolver<'_> {
                 (
                     scan_files_for_target(
                         analyzer,
+                        token,
                         rust,
                         scan_files,
                         target,
@@ -442,8 +455,14 @@ impl RustExportUsageGraphStrategy {
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
     ) -> ReferenceGraphResult {
-        let external_frontier_specifiers =
-            unresolved_external_frontier_specifiers(analyzer, defining_file, export_name);
+        // The export query's request boundary (issue #2414 step 3).
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let external_frontier_specifiers = unresolved_external_frontier_specifiers(
+            analyzer,
+            scope.token(),
+            defining_file,
+            export_name,
+        );
         let hits = query_target
             .map(|target| {
                 Self::new()

@@ -44,6 +44,7 @@ use crate::analyzer::{
     TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
     resolve_analyzer,
 };
+use crate::analyzer::{AnalyzerQueryScope, QueryScope, QueryToken};
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
@@ -367,8 +368,20 @@ impl CppAnalyzer {
         let Some(groups) = self
             .reconciled_definitions_by_group
             .optionally_get_with_by_ref(&key, || {
-                cpp_reconcile_group(self, &key, &candidates, &keep_going, &on_candidate)
-                    .map(Arc::new)
+                // This builder runs on a cache miss, inside whatever request
+                // scope the caller opened; nesting one here makes the syntax
+                // reads below provable without changing what they memoize
+                // (issue #2414 step 3).
+                let scope = AnalyzerQueryScope::new(self);
+                cpp_reconcile_group(
+                    self,
+                    scope.token(),
+                    &key,
+                    &candidates,
+                    &keep_going,
+                    &on_candidate,
+                )
+                .map(Arc::new)
             })
         else {
             return empty();
@@ -479,9 +492,10 @@ impl CppAnalyzer {
 
     pub(crate) fn prepared_syntax(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
-        self.inner.prepared_syntax(file)
+        self.inner.prepared_syntax(token, file)
     }
 
     pub(crate) fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
@@ -523,12 +537,13 @@ impl CppAnalyzer {
 
     pub(crate) fn prepared_syntax_limited_cancellable(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         max_source_bytes: usize,
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome {
         self.inner
-            .prepared_syntax_limited_cancellable(file, max_source_bytes, cancellation)
+            .prepared_syntax_limited_cancellable(token, file, max_source_bytes, cancellation)
     }
 
     pub(crate) fn bulk_file_states_for_query(&self, files: impl IntoIterator<Item = ProjectFile>) {
@@ -594,6 +609,14 @@ impl CppAnalyzer {
         limit: usize,
     ) -> LimitedQueryRows<Range> {
         self.inner.ranges_limited(code_unit, limit)
+    }
+
+    /// See [`TreeSitterAnalyzer::claim_import_hydration_count_for_test`]. C++
+    /// is the one adapter that claims included files, so this is where the
+    /// #1865 locality pin reads it.
+    #[doc(hidden)]
+    pub fn claim_import_hydration_count_for_test(&self) -> usize {
+        self.inner.claim_import_hydration_count_for_test()
     }
 
     #[cfg(test)]
@@ -831,12 +854,16 @@ impl CppSource for CppAnalyzer {
         CppAnalyzer::visible_type_units_while(self, file, keep_going)
     }
 
-    fn source_using_index(&self, file: &ProjectFile) -> Arc<SourceUsingIndex> {
+    fn source_using_index(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Arc<SourceUsingIndex> {
         self.source_using_index_by_file.get_with_by_ref(file, || {
             #[cfg(any(test, feature = "test-support"))]
             self.source_using_index_build_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Arc::new(build_source_using_index(self, file))
+            Arc::new(build_source_using_index(self, token, file))
         })
     }
 
@@ -846,9 +873,10 @@ impl CppSource for CppAnalyzer {
 
     fn prepared_syntax(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
-        CppAnalyzer::prepared_syntax(self, file)
+        CppAnalyzer::prepared_syntax(self, token, file)
     }
 
     fn cpp_field_linkage(&self, code_unit: &CodeUnit) -> Option<CppFieldLinkage> {

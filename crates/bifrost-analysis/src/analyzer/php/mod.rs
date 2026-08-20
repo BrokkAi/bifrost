@@ -25,6 +25,7 @@ pub use external::{
     ComposerPackagePackProducer, ComposerPinnedAutoloadRule, PhpDependencyPackAdapter,
 };
 
+use crate::analyzer::QueryToken;
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };
@@ -167,12 +168,13 @@ impl PhpAnalyzer {
 
     pub(crate) fn prepared_syntax_limited_cancellable(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         max_source_bytes: usize,
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome {
         self.inner
-            .prepared_syntax_limited_cancellable(file, max_source_bytes, cancellation)
+            .prepared_syntax_limited_cancellable(token, file, max_source_bytes, cancellation)
     }
 
     pub(crate) fn declaration_candidates_by_identifier_limited(

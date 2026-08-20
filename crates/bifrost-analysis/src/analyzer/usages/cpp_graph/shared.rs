@@ -10,6 +10,7 @@ use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
+use crate::analyzer::{AnalyzerQueryScope, QueryScope, QueryToken};
 use crate::analyzer::{
     CodeUnit, CppAnalyzer, IAnalyzer, Language, ProjectFile, Range, resolve_analyzer,
 };
@@ -84,10 +85,17 @@ pub struct CppAuthoritativeUsageBatch<'a> {
     analyzer: &'a dyn IAnalyzer,
     resolver: CppQueryResolver<'a>,
     visibility: VisibilityIndex<'a>,
+    /// Proof that the caller's request scope is open for the batch's whole
+    /// life (issue #2414 step 3).
+    token: QueryToken<'a>,
 }
 
 impl<'a> CppAuthoritativeUsageBatch<'a> {
-    pub fn new(analyzer: &'a dyn IAnalyzer, roots: &HashSet<ProjectFile>) -> Option<Self> {
+    pub fn new(
+        analyzer: &'a dyn IAnalyzer,
+        token: QueryToken<'a>,
+        roots: &HashSet<ProjectFile>,
+    ) -> Option<Self> {
         let mut resolver = CppQueryResolver::try_new(analyzer)?;
         // This listing already validates every live path for the active outer
         // request scope.  Have it seed the request's live-source memo before
@@ -114,12 +122,13 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
         resolver
             .cpp
             .record_authoritative_visibility_build_for_test();
-        let dispatch = CppDispatch::new(analyzer);
-        let visibility = VisibilityIndex::build(resolver.cpp, &dispatch.source(), roots);
+        let dispatch = CppDispatch::new(analyzer, token);
+        let visibility = VisibilityIndex::build(resolver.cpp, token, &dispatch.source(), roots);
         Some(Self {
             analyzer,
             resolver,
             visibility,
+            token,
         })
     }
 
@@ -132,6 +141,7 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
         let scan_scope = UsageScanScope::new(candidate_files, true);
         self.resolver.find_usages_with_visibility(
             self.analyzer,
+            self.token,
             overloads,
             &scan_scope,
             max_usages,
@@ -144,7 +154,7 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
         file: &ProjectFile,
         limit: usize,
     ) -> Option<Vec<Range>> {
-        let prepared = self.resolver.cpp.prepared_syntax(file)?;
+        let prepared = self.resolver.cpp.prepared_syntax(self.token, file)?;
         match self.visibility.recovered_c_reference_ranges(
             file,
             prepared.tree().root_node(),
@@ -182,17 +192,30 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
+        // The scan's request boundary. Nested inside any caller-owned scope,
+        // so memoization is shared rather than reset; standing alone it is what
+        // keeps this scan's syntax reads memoized (issue #2414 step 3).
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let files = self.scan_files(overloads, scan_scope);
         #[cfg(any(test, feature = "test-support"))]
         self.cpp.record_authoritative_visibility_build_for_test();
-        let dispatch = CppDispatch::new(analyzer);
+        let dispatch = CppDispatch::new(analyzer, token);
         let visibility = VisibilityIndex::build_with_cancellation(
             self.cpp,
+            token,
             &dispatch.source(),
             &files,
             scan_scope.cancellation(),
         );
-        self.find_usages_with_visibility(analyzer, overloads, scan_scope, max_usages, &visibility)
+        self.find_usages_with_visibility(
+            analyzer,
+            token,
+            overloads,
+            scan_scope,
+            max_usages,
+            &visibility,
+        )
     }
 }
 
@@ -214,6 +237,7 @@ impl CppQueryResolver<'_> {
     fn find_usages_with_visibility(
         &self,
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         overloads: &[CodeUnit],
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
@@ -222,7 +246,7 @@ impl CppQueryResolver<'_> {
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
-        let dispatch = CppDispatch::new(analyzer);
+        let dispatch = CppDispatch::new(analyzer, token);
         let source = dispatch.source();
         let mut specs = Vec::with_capacity(overloads.len());
         let mut seen_type_specs = HashSet::default();
@@ -280,7 +304,7 @@ impl CppQueryResolver<'_> {
             &specs,
             || scan_scope.is_cancelled(),
             |file| {
-                prepare_file(self.cpp, file).map(|prepared| {
+                prepare_file(self.cpp, token, file).map(|prepared| {
                     let recovered_sentinel_classes = cpp_sentinel_recovered_classes(
                         prepared.tree().root_node(),
                         prepared.source(),
@@ -389,6 +413,7 @@ impl CppQueryResolver<'_> {
 /// per-file C++ walk crossed.
 pub(super) fn build_cpp_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     files: &[ProjectFile],
     visibility: &VisibilityIndex<'_>,
     nodes: &HashSet<String>,
@@ -399,7 +424,7 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let language = tree_sitter_cpp::LANGUAGE.into();
-    let dispatch = CppDispatch::new(analyzer);
+    let dispatch = CppDispatch::new(analyzer, token);
     prewarm_project_using_index(visibility);
     build_edge_output(files, keep_file, |file| {
         parse_and_collect(
@@ -444,6 +469,9 @@ impl<'a> CppEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
+        // The pass's request boundary; nested inside any caller-owned scope.
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         // Resolution honors each caller file's include closure, so the visibility
         // index is seeded with every in-scope caller file as a root (mirroring the
         // forward scan, which builds it from the query's candidate files). Built here
@@ -454,9 +482,9 @@ impl<'a> CppEdgeResolver<'a> {
             .filter(|file| keep_file(file))
             .cloned()
             .collect();
-        let dispatch = CppDispatch::new(analyzer);
-        let visibility = VisibilityIndex::build(self.cpp, &dispatch.source(), &roots);
-        build_cpp_edges(analyzer, &self.files, &visibility, nodes, keep_file)
+        let dispatch = CppDispatch::new(analyzer, token);
+        let visibility = VisibilityIndex::build(self.cpp, token, &dispatch.source(), &roots);
+        build_cpp_edges(analyzer, token, &self.files, &visibility, nodes, keep_file)
     }
 
     pub(crate) fn build_edge_weights<F>(
@@ -468,15 +496,18 @@ impl<'a> CppEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
+        // The pass's request boundary; nested inside any caller-owned scope.
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let roots: HashSet<ProjectFile> = self
             .files
             .iter()
             .filter(|file| keep_file(file))
             .cloned()
             .collect();
-        let dispatch = CppDispatch::new(analyzer);
-        let visibility = VisibilityIndex::build(self.cpp, &dispatch.source(), &roots);
-        build_cpp_edges(analyzer, &self.files, &visibility, nodes, keep_file)
+        let dispatch = CppDispatch::new(analyzer, token);
+        let visibility = VisibilityIndex::build(self.cpp, token, &dispatch.source(), &roots);
+        build_cpp_edges(analyzer, token, &self.files, &visibility, nodes, keep_file)
     }
 }
 

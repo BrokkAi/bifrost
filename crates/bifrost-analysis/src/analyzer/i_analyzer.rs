@@ -14,10 +14,12 @@ use crate::gitblob;
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 pub(crate) use brokk_bifrost_core::analyzer::code_unit_index::default_parent_fq_name;
 pub use brokk_bifrost_core::analyzer::query_batch::QueryBatch;
+pub use brokk_bifrost_core::analyzer::query_token::{QueryScope, QueryToken};
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// One analyzer's contribution to a batched symbol-search request.
@@ -482,6 +484,45 @@ fn escape_sigil_anchors(pattern: &str) -> String {
 pub struct AnalyzerQueryContext {
     first_store_error: Mutex<Option<StoreError>>,
     cancellation: Option<CancellationToken>,
+    /// Storage-funnel crossings observed while this request boundary was
+    /// active, one counter per [`InformationTier`]. Scopes nest, so an access
+    /// made under an inner scope is recorded on every enclosing scope too:
+    /// each of them did pay for it.
+    tier_accesses: [AtomicUsize; InformationTier::COUNT],
+}
+
+/// One rung of the information-cost ladder (issue #2414).
+///
+/// Bifrost answers a query by consuming progressively more expensive derived
+/// information, and the recurring defect family behind #2414 is a query path
+/// that should stay on a cheap rung silently reaching a costlier one while
+/// staying functionally correct. The variants are ordered cheap to expensive
+/// by convention, and their discriminants index the per-scope counters above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum InformationTier {
+    /// A per-file tree-sitter parse.
+    Syntax,
+    /// A store read of a file's import statements.
+    Imports,
+    /// A store read of a code unit's raw supertypes.
+    Supertypes,
+    /// A build of the whole-workspace usage/definition index.
+    UsageGraph,
+}
+
+impl InformationTier {
+    pub const COUNT: usize = 4;
+
+    pub const ALL: [InformationTier; Self::COUNT] = [
+        InformationTier::Syntax,
+        InformationTier::Imports,
+        InformationTier::Supertypes,
+        InformationTier::UsageGraph,
+    ];
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
 }
 
 /// Analyzer-snapshot-owned query caches. The container is public only because
@@ -652,7 +693,20 @@ impl AnalyzerQueryContext {
         Self {
             first_store_error: Mutex::new(None),
             cancellation: Some(cancellation),
+            tier_accesses: Default::default(),
         }
+    }
+
+    /// Records one crossing of `tier`'s storage funnel under this request.
+    pub fn record_tier_access(&self, tier: InformationTier) {
+        self.tier_accesses[tier.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Crossings of `tier`'s storage funnel observed while this request was
+    /// active. Read relaxed: the counts are advisory bounds for tests and
+    /// diagnostics, not a synchronization edge.
+    pub fn tier_access_count(&self, tier: InformationTier) -> usize {
+        self.tier_accesses[tier.index()].load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The deadline this request is running under, if its opener set one.
@@ -1418,11 +1472,23 @@ impl<'a> AnalyzerQueryScope<'a> {
         self.context.store_error()
     }
 
+    /// How often `tier`'s storage funnel was crossed since this scope opened
+    /// (issue #2414). This is the executable form of "a tier-N query touches
+    /// no tier-N+1 storage": open a scope, run the query, assert the tiers it
+    /// must not reach report zero.
+    pub fn tier_access_count(&self, tier: InformationTier) -> usize {
+        self.context.tier_access_count(tier)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn record_store_error_for_test(&self, error: StoreError) {
         self.context.record_store_error(error);
     }
 }
+
+/// The one mint for [`QueryToken`]: an open scope proves request-scoped
+/// memoization is active, which is exactly what the syntax accessors demand.
+impl QueryScope for AnalyzerQueryScope<'_> {}
 
 impl Drop for AnalyzerQueryScope<'_> {
     fn drop(&mut self) {

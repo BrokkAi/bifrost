@@ -6,9 +6,10 @@
 //! include map on the analyzer; every decision they make is a function here.
 
 use brokk_bifrost_core::analyzer::ProjectFile;
-use brokk_bifrost_core::analyzer::model::ImportInfo;
+use brokk_bifrost_core::analyzer::model::{ImportInfo, Language};
 use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
+use brokk_bifrost_core::path_utils::path_suffix_key;
 use regex::Regex;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -312,6 +313,89 @@ pub fn included_claimable_files(
         }
     }
     edges
+}
+
+/// The claim demand `sources` record at the imports tier (#1865): for each
+/// source file, the target keys a workspace file that does not exist yet would
+/// have to match for one of that source's quoted `#include` lines to reach it.
+///
+/// Recorded alongside [`included_claimable_files`] and consulted when a new
+/// file appears: an update that sees a created `.md`/`.txt`/`.json` in a C++
+/// workspace re-derives the claim relation only when the created path answers
+/// recorded demand, instead of re-deriving it for the whole analyzed set every
+/// time (#1865, the blanket branch in `TreeSitterAnalyzer::update`).
+///
+/// Completeness, not precision, is what this must have: the caller uses a hit
+/// to decide whether to run the real resolution, so a key that matches a file
+/// resolution would reject costs one derivation, while a missing key would
+/// leave a genuinely included file unindexed until the next full build. Three
+/// deliberate widenings follow from that:
+///
+/// - every quoted include contributes, resolved or not. `resolve_direct`
+///   returns *all* rel-path matches, so a created file can add a target to an
+///   include that already resolved, and `resolve_unique_fallback`'s uniqueness
+///   test can flip in either direction when a candidate appears.
+/// - the key is a path suffix, which is exactly what the includer-relative
+///   rule, the project-relative rule and the `ends_with`/file-name fallback all
+///   reduce to.
+/// - `.h` includes contribute their `.hin` header-template spelling
+///   (`header_template_include_spelling`), which is the form a claimable file
+///   can actually have.
+///
+/// The one narrowing is sound rather than heuristic: a key whose extension some
+/// language's registry claims is dropped, because only a file with an unclaimed
+/// extension is ever claimable, and every match rule preserves the file name.
+/// It is what keeps the record proportional to a workspace's `.inc`-shaped
+/// includes rather than to its include count.
+pub fn claimable_include_demand(
+    sources: &[(ProjectFile, Vec<ImportInfo>)],
+) -> HashMap<ProjectFile, BTreeSet<String>> {
+    let mut demand: HashMap<ProjectFile, BTreeSet<String>> = HashMap::default();
+    for (source_file, imports) in sources {
+        let mut keys = BTreeSet::new();
+        for include in imports
+            .iter()
+            .filter_map(|import| parse_quoted_include(&import.raw_snippet))
+        {
+            let template = header_template_include_spelling(&include);
+            for spelling in std::iter::once(include).chain(template) {
+                collect_include_demand_keys(source_file, &spelling, &mut keys);
+            }
+        }
+        if !keys.is_empty() {
+            demand.insert(source_file.clone(), keys);
+        }
+    }
+    demand
+}
+
+fn collect_include_demand_keys(
+    source_file: &ProjectFile,
+    include: &str,
+    keys: &mut BTreeSet<String>,
+) {
+    let include_path = Path::new(include);
+    let claimable_spelling = include_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_none_or(|extension| !Language::is_source_extension(extension));
+    if !claimable_spelling {
+        return;
+    }
+    if include_path.is_absolute() {
+        // An absolute include names a path outside the workspace-relative
+        // suffix relation, so its only key is the projection
+        // `IncludeTargetIndex::resolve_direct` itself takes.
+        if let Some(rel_path) = project_relative_include_path(source_file.root(), include_path)
+            && let Some(key) = path_suffix_key(&rel_path)
+        {
+            keys.insert(key);
+        }
+        return;
+    }
+    if let Some(key) = path_suffix_key(include_path) {
+        keys.insert(key);
+    }
 }
 
 pub fn quoted_include_paths(parsed: &[String]) -> Vec<String> {

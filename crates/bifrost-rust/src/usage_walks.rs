@@ -17,6 +17,7 @@
 //! visibility, Cargo routes, the analyzed-file set), not only file bytes, so a
 //! content-hash key would claim an invariance these values do not have.
 
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use moka::sync::Cache;
 use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
@@ -134,6 +135,10 @@ impl RustWalkCaches {
 /// needs.
 pub struct RustUsageWalks<'a> {
     analyzer: &'a dyn RustFactSource,
+    /// Proof that the request scope this walker serves is open. The walker is
+    /// a per-query object whose lifetime is inside the scope's, so it carries
+    /// the proof for the syntax reads its walks make (issue #2414 step 3).
+    token: QueryToken<'a>,
     queries: RustUsageQueries<'a>,
     cargo_routes: Arc<RustCargoRouteIndex>,
     files: Arc<RustPackageFileIndex>,
@@ -324,8 +329,13 @@ pub struct RustModuleBinding {
 }
 
 impl<'a> RustUsageWalks<'a> {
-    pub fn new(analyzer: &'a dyn RustFactSource) -> Self {
-        Self::with_cargo_routes(analyzer, analyzer.cargo_routes(), None)
+    pub fn new(analyzer: &'a dyn RustFactSource, token: QueryToken<'a>) -> Self {
+        Self::with_cargo_routes(analyzer, token, analyzer.cargo_routes(), None)
+    }
+
+    /// The request-scope proof this walker was built with (issue #2414 step 3).
+    pub fn token(&self) -> QueryToken<'a> {
+        self.token
     }
 
     /// The cancellable constructor. Cargo routes are the one input a walk
@@ -335,10 +345,12 @@ impl<'a> RustUsageWalks<'a> {
     /// kept and polled by every loop below rather than being consumed here.
     pub fn new_while(
         analyzer: &'a dyn RustFactSource,
+        token: QueryToken<'a>,
         keep_going: &'a (impl Fn() -> bool + Sync),
     ) -> Option<Self> {
         Some(Self::with_cargo_routes(
             analyzer,
+            token,
             analyzer.cargo_routes_while(keep_going)?,
             Some(keep_going),
         ))
@@ -350,12 +362,14 @@ impl<'a> RustUsageWalks<'a> {
     /// one atomic probe once the generation has settled.
     fn with_cargo_routes(
         analyzer: &'a dyn RustFactSource,
+        token: QueryToken<'a>,
         cargo_routes: Arc<RustCargoRouteIndex>,
         keep_going: Option<&'a (dyn Fn() -> bool + Sync)>,
     ) -> Self {
         analyzer.ensure_rust_facts_caught_up();
         Self {
             analyzer,
+            token,
             queries: RustUsageQueries::new(analyzer),
             cargo_routes,
             files: analyzer.package_file_index(),
@@ -948,6 +962,7 @@ impl<'a> RustUsageWalks<'a> {
                 identity.namespace == RustSymbolNamespace::Module
                     && crate::graph_support::is_external_module_declaration(
                         self.analyzer,
+                        self.token,
                         declaration,
                     )
             })
@@ -1598,7 +1613,7 @@ impl<'a> RustUsageWalks<'a> {
             return cached;
         }
         let mut edges = Vec::new();
-        if let Some(prepared) = self.analyzer.prepared_syntax(file) {
+        if let Some(prepared) = self.analyzer.prepared_syntax(self.token, file) {
             let source = prepared.source();
             let root_module = ModuleKey::new(file, &rust_package_name(file));
             let mut pending = vec![(prepared.tree().root_node(), root_module)];

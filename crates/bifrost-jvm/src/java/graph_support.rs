@@ -31,6 +31,7 @@ use brokk_bifrost_core::analyzer::capabilities::{
 };
 use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::resolution::PrecedenceTier;
 use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -86,7 +87,13 @@ pub trait JavaSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProv
     fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String>;
 
     /// The request-scoped prepared syntax tree for `file`, when one is available.
-    fn prepared_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>>;
+    /// The [`QueryToken`] is proof that a request scope is open, so the cache
+    /// this reads is live (issue #2414 step 3).
+    fn prepared_syntax(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Arc<PreparedSyntaxTree>>;
 
     /// What the analyzer has retained of the JVM dependency surface, read
     /// without building it. See [`crate::proof`] on why a diagnostic peeks.
@@ -1011,11 +1018,12 @@ pub fn compute_java_same_package_reference_index(
 /// enclosing class, so FQN and arity alone cannot distinguish the two.
 pub fn java_constructor_context(
     source: &dyn JavaSource,
+    token: QueryToken<'_>,
     owner: &CodeUnit,
     candidates: Vec<CodeUnit>,
     call_arity: usize,
 ) -> (Vec<CodeUnit>, bool) {
-    let Some(prepared) = source.prepared_syntax(owner.source()) else {
+    let Some(prepared) = source.prepared_syntax(token, owner.source()) else {
         return (Vec::new(), false);
     };
     let owner_children = prepared.direct_children(owner);

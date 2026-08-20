@@ -3,6 +3,7 @@
 //! See [`super::resolver_tests`] for why they stayed on this side of the seam.
 
 use crate::analyzer::usages::cpp_graph::shared::build_cpp_edges;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use brokk_bifrost_cpp::graph::CppGraphSource;
 use brokk_bifrost_cpp::graph::resolver::*;
 
@@ -46,12 +47,19 @@ ABSL_NAMESPACE_END
             .find(|unit| unit.fq_name() == "absl.beta_distribution$param_type")
             .expect("param_type owner");
         let roots = std::iter::once(file.clone()).collect();
-        let visibility =
-            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        let visibility = VisibilityIndex::build(
+            &analyzer,
+            token,
+            &CppGraphSource::from_source(&analyzer, token),
+            &roots,
+        );
         let nodes = [alias.fq_name(), owner.fq_name()].into_iter().collect();
 
         let edges: crate::analyzer::usages::inverted_edges::UsageEdges = build_cpp_edges(
             &analyzer,
+            token,
             std::slice::from_ref(&file),
             &visibility,
             &nodes,
@@ -87,14 +95,21 @@ int use(void) { return LIMIT + 1; }
             .find(|unit| unit.is_function() && unit.identifier() == "use")
             .expect("use function");
         let roots = std::iter::once(file.clone()).collect();
-        let visibility =
-            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        let visibility = VisibilityIndex::build(
+            &analyzer,
+            token,
+            &CppGraphSource::from_source(&analyzer, token),
+            &roots,
+        );
         let nodes = [macro_unit.fq_name(), caller.fq_name()]
             .into_iter()
             .collect();
 
         let edges: crate::analyzer::usages::inverted_edges::UsageEdges = build_cpp_edges(
             &analyzer,
+            token,
             std::slice::from_ref(&file),
             &visibility,
             &nodes,

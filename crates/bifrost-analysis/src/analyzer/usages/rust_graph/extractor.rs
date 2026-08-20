@@ -1,4 +1,5 @@
 use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::QueryToken;
 use crate::analyzer::rust::canonical_rust_hierarchy_type;
 use crate::analyzer::rust::{RustBindingSeeds, RustReferenceNamespace};
 use crate::analyzer::rust::{
@@ -67,17 +68,25 @@ use tree_sitter::{Node, Parser, Tree};
 
 pub(super) fn effective_scan_files(
     analyzer: &RustAnalyzer,
+    token: QueryToken<'_>,
     scan_scope: &UsageScanScope<'_>,
     target: &CodeUnit,
     seeds: &RustBindingSeeds,
 ) -> HashSet<ProjectFile> {
-    effective_scan_files_with_additional_importers(analyzer, scan_scope, target, seeds, || {
-        if target.is_module() {
-            usage_importers(analyzer, seeds)
-        } else {
-            seeds.verified_importer_files().cloned().collect()
-        }
-    })
+    effective_scan_files_with_additional_importers(
+        analyzer,
+        token,
+        scan_scope,
+        target,
+        seeds,
+        || {
+            if target.is_module() {
+                usage_importers(analyzer, token, seeds)
+            } else {
+                seeds.verified_importer_files().cloned().collect()
+            }
+        },
+    )
 }
 
 /// Complete the effective scan set after the finder has already admitted the
@@ -88,17 +97,24 @@ pub(super) fn effective_scan_files(
 /// importer it returns is already in `scan_scope`; it only repeats the walk.
 pub(super) fn effective_scan_files_from_prepared_candidates(
     analyzer: &RustAnalyzer,
+    token: QueryToken<'_>,
     scan_scope: &UsageScanScope<'_>,
     target: &CodeUnit,
     seeds: &RustBindingSeeds,
 ) -> HashSet<ProjectFile> {
-    effective_scan_files_with_additional_importers(analyzer, scan_scope, target, seeds, || {
-        HashSet::default()
-    })
+    effective_scan_files_with_additional_importers(
+        analyzer,
+        token,
+        scan_scope,
+        target,
+        seeds,
+        HashSet::default,
+    )
 }
 
 fn effective_scan_files_with_additional_importers(
     analyzer: &RustAnalyzer,
+    token: QueryToken<'_>,
     scan_scope: &UsageScanScope<'_>,
     target: &CodeUnit,
     seeds: &RustBindingSeeds,
@@ -117,7 +133,7 @@ fn effective_scan_files_with_additional_importers(
         HashSet::default()
     } else {
         let _scope = crate::profiling::scope("rust_graph::include_candidate_discovery");
-        RustIncludeRoutes::new(analyzer)
+        RustIncludeRoutes::new(analyzer, token)
             .all_included_files()
             .iter()
             .filter(|file| analyzed.contains(*file))
@@ -178,7 +194,7 @@ fn effective_scan_files_with_additional_importers(
 
     let importers = {
         let _scope = crate::profiling::scope("rust_graph::importer_candidate_discovery");
-        usage_importers(analyzer, seeds)
+        usage_importers(analyzer, token, seeds)
     };
 
     let textual_candidates: HashSet<_> = {
@@ -286,6 +302,7 @@ impl UsageCapStop {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_files_for_target(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     rust: &RustAnalyzer,
     files: HashSet<ProjectFile>,
     target: &CodeUnit,
@@ -316,7 +333,7 @@ pub(super) fn scan_files_for_target(
         }
         rust.note_scanned_candidate_file();
         let started = RustScanPhaseTimings::start();
-        let Some(prepared) = rust.prepared_syntax(file) else {
+        let Some(prepared) = rust.prepared_syntax(token, file) else {
             RustScanPhaseTimings::record(&timings.prepared_syntax_ns, started);
             return;
         };
@@ -333,7 +350,7 @@ pub(super) fn scan_files_for_target(
         // therefore not `Sync`. Constructing it is a handful of memo probes,
         // and every route it composes is memoized on the analyzer, so the
         // repeated construction costs no repeated work.
-        let include_routes = RustIncludeRoutes::new(rust);
+        let include_routes = RustIncludeRoutes::new(rust, token);
         let started = RustScanPhaseTimings::start();
         let lexical_scope = RustLexicalScopeIndex::new(tree.root_node(), source);
         RustScanPhaseTimings::record(&timings.lexical_scope_ns, started);
@@ -341,13 +358,13 @@ pub(super) fn scan_files_for_target(
             return;
         }
         let started = RustScanPhaseTimings::start();
-        let refs = rust.reference_context_of(file);
+        let refs = rust.reference_context_of(token, file);
         RustScanPhaseTimings::record(&timings.reference_context_ns, started);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
         let (mut direct_names, _) = match seeds {
-            Some(seeds) => usage_binding_names(rust, file, seeds),
+            Some(seeds) => usage_binding_names(rust, token, file, seeds),
             None => (HashSet::default(), HashSet::default()),
         };
         // A file that re-exports a seed (`pub use path::name`) can also reference
@@ -369,6 +386,7 @@ pub(super) fn scan_files_for_target(
         let mut token_tree_roles = RustTokenTreeRoleCache::default();
         ingest_file_macro_matcher_roles(
             &mut token_tree_roles,
+            token,
             analyzer,
             &support,
             file,
@@ -405,7 +423,7 @@ pub(super) fn scan_files_for_target(
             hits: &mut local_hits,
         };
         let started = RustScanPhaseTimings::start();
-        scan_node(tree.root_node(), &mut ctx);
+        scan_node(tree.root_node(), token, &mut ctx);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
@@ -863,7 +881,15 @@ impl ScanCtx<'_> {
                 }
                 RustReferenceNamespace::Any => true,
             })
-            .filter(|candidate| usage_declaration_visible_at(self.rust, candidate, self.file, byte))
+            .filter(|candidate| {
+                usage_declaration_visible_at(
+                    self.rust,
+                    self.refs.token(),
+                    candidate,
+                    self.file,
+                    byte,
+                )
+            })
             .collect::<Vec<_>>();
         declarations.sort();
         declarations.dedup();
@@ -917,7 +943,15 @@ impl ScanCtx<'_> {
         }
         if !self.direct_names.contains(text)
             && !self.seeds.is_some_and(|seeds| {
-                usage_has_exact_scoped_binding(self.rust, self.file, seeds, text, byte, namespace)
+                usage_has_exact_scoped_binding(
+                    self.rust,
+                    self.refs.token(),
+                    self.file,
+                    seeds,
+                    text,
+                    byte,
+                    namespace,
+                )
             })
         {
             return false;
@@ -925,6 +959,7 @@ impl ScanCtx<'_> {
         if self.seeds.is_none_or(|seeds| {
             let resolution = usage_reference_at(
                 self.rust,
+                self.refs.token(),
                 self.file,
                 seeds,
                 &[text],
@@ -1009,6 +1044,7 @@ impl ScanCtx<'_> {
         if self.seeds.is_some_and(|seeds| {
             let resolution = usage_reference_at(
                 self.rust,
+                self.refs.token(),
                 self.file,
                 seeds,
                 segments,
@@ -1038,20 +1074,42 @@ impl ScanCtx<'_> {
     fn path_item_shadows_target(&self, name: &str, byte: usize) -> bool {
         self.lexical_scope.item_bound_at(name, byte)
             && self.seeds.is_none_or(|seeds| {
-                !usage_root_declaration_matches_at(self.rust, self.file, seeds, name, byte)
-                    && !usage_local_module_prefix_visible_at(
-                        self.rust, self.file, seeds, name, byte,
-                    )
+                !usage_root_declaration_matches_at(
+                    self.rust,
+                    self.refs.token(),
+                    self.file,
+                    seeds,
+                    name,
+                    byte,
+                ) && !usage_local_module_prefix_visible_at(
+                    self.rust,
+                    self.refs.token(),
+                    self.file,
+                    seeds,
+                    name,
+                    byte,
+                )
             })
     }
 
     fn item_shadows_target(&self, name: &str, byte: usize) -> bool {
         self.lexical_scope.local_item_bound_at(name, byte)
             && self.seeds.is_none_or(|seeds| {
-                !usage_root_declaration_matches_at(self.rust, self.file, seeds, name, byte)
-                    && !usage_local_module_prefix_visible_at(
-                        self.rust, self.file, seeds, name, byte,
-                    )
+                !usage_root_declaration_matches_at(
+                    self.rust,
+                    self.refs.token(),
+                    self.file,
+                    seeds,
+                    name,
+                    byte,
+                ) && !usage_local_module_prefix_visible_at(
+                    self.rust,
+                    self.refs.token(),
+                    self.file,
+                    seeds,
+                    name,
+                    byte,
+                )
             })
     }
 
@@ -1134,9 +1192,10 @@ impl ScanCtx<'_> {
         leading_absolute: bool,
     ) -> bool {
         let roots = BTreeSet::from([self.target.clone()]);
-        let seeds = usage_binding_seeds(self.rust, &roots);
+        let seeds = usage_binding_seeds(self.rust, self.refs.token(), &roots);
         let resolution = usage_reference_at(
             self.rust,
+            self.refs.token(),
             self.file,
             &seeds,
             segments,
@@ -1145,7 +1204,7 @@ impl ScanCtx<'_> {
             false,
             leading_absolute,
         );
-        usage_exact_root_for_resolution(self.rust, &resolution, &seeds).as_ref()
+        usage_exact_root_for_resolution(self.rust, self.refs.token(), &resolution, &seeds).as_ref()
             == Some(self.target)
     }
 }
@@ -1169,7 +1228,7 @@ fn rust_path_root_is_rooted(segments: &[&str]) -> bool {
     )
 }
 
-fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn scan_node(root: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     walk_tree_iterative(
         root,
         ctx,
@@ -1179,7 +1238,7 @@ fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
             }
             match node.kind() {
                 "use_declaration" => {
-                    record_use_import_hits(node, ctx);
+                    record_use_import_hits(node, token, ctx);
                     return TreeWalkAction::Skip;
                 }
                 "scoped_identifier" | "scoped_type_identifier" if !ctx.target_is_module => {
@@ -1229,7 +1288,7 @@ fn scan_node(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     // `Self` names the target through the enclosing impl type
                     // rather than by spelling it, so it bypasses the name gate.
                     let matching_self_type =
-                        text == "Self" && self_reference_matches_target(node, ctx);
+                        text == "Self" && self_reference_matches_target(node, token, ctx);
                     // `matches_identifier` gates on the same condition; checking it
                     // here also skips token-tree role classification and the
                     // whole-tree shadowing walk.
@@ -1365,7 +1424,7 @@ fn identifier_is_scoped_path_part(node: Node<'_>) -> bool {
         })
 }
 
-fn self_reference_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+fn self_reference_matches_target(node: Node<'_>, token: QueryToken<'_>, ctx: &ScanCtx<'_>) -> bool {
     if !ctx.target.is_class() {
         return false;
     }
@@ -1397,16 +1456,17 @@ fn self_reference_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     }
     let resolved = rust_resolve_type_node_fqn(
         ctx.analyzer,
+        token,
         ctx.support,
         ctx.file,
         ctx.source,
         type_node,
         Some(type_node.start_byte()),
     );
-    resolved.is_some_and(|fqn| fqn_matches_owner(ctx.rust, ctx.support, &fqn, ctx.target))
+    resolved.is_some_and(|fqn| fqn_matches_owner(ctx.rust, token, ctx.support, &fqn, ctx.target))
 }
 
-fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn record_use_import_hits(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     walk_tree_iterative(
         node,
         ctx,
@@ -1438,7 +1498,7 @@ fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(
                             path.root,
                         ),
-                    ) || rust_exported_macro_import_matches_target(node, current, ctx)
+                    ) || rust_exported_macro_import_matches_target(node, token, current, ctx)
                     {
                         record_import_hit(current, ctx);
                     }
@@ -1473,7 +1533,7 @@ fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         });
                 if ctx.matches_identifier(text, current.start_byte(), RustReferenceNamespace::Any)
                     || matches_target_namespace
-                    || rust_exported_macro_import_matches_target(node, current, ctx)
+                    || rust_exported_macro_import_matches_target(node, token, current, ctx)
                 {
                     record_import_hit(current, ctx);
                 }
@@ -1486,6 +1546,7 @@ fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 fn rust_exported_macro_import_matches_target(
     use_declaration: Node<'_>,
+    token: QueryToken<'_>,
     binder: Node<'_>,
     ctx: &ScanCtx<'_>,
 ) -> bool {
@@ -1517,7 +1578,7 @@ fn rust_exported_macro_import_matches_target(
         return false;
     }
     let module_specifier = module_segments.join("::");
-    resolve_module_package(ctx.rust, ctx.file, &module_specifier)
+    resolve_module_package(ctx.rust, token, ctx.file, &module_specifier)
         .is_some_and(|package| package == rust_crate_root_package(ctx.target.source()))
 }
 
@@ -1575,6 +1636,7 @@ fn use_path_leaf_is_prefix(node: Node<'_>) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_files_for_member_target(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     rust: &RustAnalyzer,
     files: HashSet<ProjectFile>,
     target: &CodeUnit,
@@ -1588,16 +1650,16 @@ pub(super) fn scan_files_for_member_target(
     else {
         return RustMemberScanResult::default();
     };
-    let owner = canonical_member_owner(rust, owner);
+    let owner = canonical_member_owner(rust, token, owner);
     let owner_roots = BTreeSet::from([owner.clone()]);
-    let owner_seeds = usage_binding_seeds(rust, &owner_roots);
+    let owner_seeds = usage_binding_seeds(rust, token, &owner_roots);
     let member_name = target.identifier().to_string();
     let hits = Mutex::new(BTreeSet::new());
     let unproven_hits = Mutex::new(BTreeSet::new());
     let cap = UsageCapStop::new(max_usages);
     let support = analyzer.global_usage_definition_index();
-    let constructor_returns = self_like_constructor_returns(rust, &support, &owner);
-    let self_like_constructors = self_like_constructor_seeds(rust, &constructor_returns);
+    let constructor_returns = self_like_constructor_returns(rust, token, &support, &owner);
+    let self_like_constructors = self_like_constructor_seeds(rust, token, &constructor_returns);
 
     let files_vec = files.into_iter().collect::<Vec<_>>();
     let timings = RustScanPhaseTimings::default();
@@ -1610,7 +1672,7 @@ pub(super) fn scan_files_for_member_target(
         }
         rust.note_scanned_candidate_file();
         let started = RustScanPhaseTimings::start();
-        let Some(prepared) = rust.prepared_syntax(file) else {
+        let Some(prepared) = rust.prepared_syntax(token, file) else {
             RustScanPhaseTimings::record(&timings.prepared_syntax_ns, started);
             return;
         };
@@ -1628,7 +1690,7 @@ pub(super) fn scan_files_for_member_target(
             return;
         }
         let started = RustScanPhaseTimings::start();
-        let refs = rust.reference_context_of(file);
+        let refs = rust.reference_context_of(token, file);
         RustScanPhaseTimings::record(&timings.reference_context_ns, started);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
@@ -1636,12 +1698,12 @@ pub(super) fn scan_files_for_member_target(
         let mut owner_local_names: HashSet<String> = if file == target.source() {
             [owner.identifier().to_string()].into_iter().collect()
         } else {
-            usage_binding_local_names(rust, file, &owner_seeds)
+            usage_binding_local_names(rust, token, file, &owner_seeds)
         };
         owner_local_names.extend(refs.bare_names_resolving_to(&owner.fq_name()));
         let trait_owner = is_trait_owner(rust, &owner);
         let receiver_type_names = if trait_owner {
-            trait_implementer_names(rust, &owner, file)
+            trait_implementer_names(rust, token, &owner, file)
         } else {
             owner_local_names.clone()
         };
@@ -1655,7 +1717,7 @@ pub(super) fn scan_files_for_member_target(
             return;
         }
         let visible_bare_constructors =
-            visible_bare_constructor_names(rust, file, &self_like_constructors);
+            visible_bare_constructor_names(rust, token, file, &self_like_constructors);
         let mut receiver_names = infer_receiver_names(
             tree.root_node(),
             source,
@@ -1666,6 +1728,7 @@ pub(super) fn scan_files_for_member_target(
         );
         receiver_names.extend(resolved_owner_receiver_names(
             tree.root_node(),
+            token,
             source,
             analyzer,
             rust,
@@ -1693,6 +1756,7 @@ pub(super) fn scan_files_for_member_target(
         let mut token_tree_roles = RustTokenTreeRoleCache::default();
         ingest_file_macro_matcher_roles(
             &mut token_tree_roles,
+            token,
             analyzer,
             &support,
             file,
@@ -1737,7 +1801,7 @@ pub(super) fn scan_files_for_member_target(
             unproven_hits: &mut local_unproven_hits,
         };
         let started = RustScanPhaseTimings::start();
-        scan_member_node(tree.root_node(), &mut ctx);
+        scan_member_node(tree.root_node(), token, &mut ctx);
         RustScanPhaseTimings::record(&timings.ast_scan_ns, started);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
@@ -1803,7 +1867,7 @@ struct MemberScanCtx<'a> {
     unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
 
-fn scan_member_node(root: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+fn scan_member_node(root: Node<'_>, token: QueryToken<'_>, ctx: &mut MemberScanCtx<'_>) {
     walk_tree_iterative(
         root,
         ctx,
@@ -1819,18 +1883,18 @@ fn scan_member_node(root: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
                     record_member_use_import_hits(node, ctx);
                     return TreeWalkAction::Skip;
                 }
-                "field_expression" => record_instance_member_hit(node, ctx),
+                "field_expression" => record_instance_member_hit(node, token, ctx),
                 "token_tree" => {
-                    record_token_tree_instance_member_hits(node, ctx);
-                    record_token_tree_static_member_hits(node, ctx);
+                    record_token_tree_instance_member_hits(node, token, ctx);
+                    record_token_tree_static_member_hits(node, token, ctx);
                 }
                 "scoped_identifier" | "scoped_type_identifier" => {
-                    record_static_member_hit(node, ctx)
+                    record_static_member_hit(node, token, ctx)
                 }
                 "type_binding" | "associated_type_binding"
                     if ctx.target_is_field && ctx.target_owner_is_trait =>
                 {
-                    record_associated_type_binding_hit(node, ctx)
+                    record_associated_type_binding_hit(node, token, ctx)
                 }
                 "type_item"
                     if ctx.target_is_field
@@ -1840,10 +1904,10 @@ fn scan_member_node(root: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
                             ctx.requested_target,
                         ) =>
                 {
-                    record_associated_type_declaration_hit(node, ctx)
+                    record_associated_type_declaration_hit(node, token, ctx)
                 }
                 "tuple_struct_pattern" if ctx.target_is_enum_variant => {
-                    record_tuple_variant_pattern_hit(node, ctx)
+                    record_tuple_variant_pattern_hit(node, token, ctx)
                 }
                 "identifier" | "type_identifier"
                     if ctx.target_is_pattern_value
@@ -1851,10 +1915,10 @@ fn scan_member_node(root: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
                             .parent()
                             .is_some_and(|parent| parent.kind() == "token_tree") =>
                 {
-                    record_bare_token_tree_variant_pattern_hit(node, ctx)
+                    record_bare_token_tree_variant_pattern_hit(node, token, ctx)
                 }
                 "identifier" if ctx.target_is_enum_variant => {
-                    record_bare_enum_variant_value_hit(node, ctx)
+                    record_bare_enum_variant_value_hit(node, token, ctx)
                 }
                 "struct_expression" | "struct_pattern" if ctx.target_is_field => {
                     record_struct_field_hits(node, ctx)
@@ -1910,7 +1974,11 @@ fn record_member_use_import_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     }
 }
 
-fn record_associated_type_binding_hit(binding: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+fn record_associated_type_binding_hit(
+    binding: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut MemberScanCtx<'_>,
+) {
     let Some(name) = binding.child_by_field_name("name") else {
         return;
     };
@@ -1934,7 +2002,7 @@ fn record_associated_type_binding_hit(binding: Node<'_>, ctx: &mut MemberScanCtx
     let Some(trait_type) = trait_type else {
         return;
     };
-    if !resolved_type_matches_owner(trait_type, ctx) {
+    if !resolved_type_matches_owner(trait_type, token, ctx) {
         return;
     }
 
@@ -1955,7 +2023,11 @@ fn record_associated_type_binding_hit(binding: Node<'_>, ctx: &mut MemberScanCtx
     );
 }
 
-fn record_associated_type_declaration_hit(type_item: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+fn record_associated_type_declaration_hit(
+    type_item: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut MemberScanCtx<'_>,
+) {
     let Some(name) = type_item.child_by_field_name("name") else {
         return;
     };
@@ -1968,7 +2040,7 @@ fn record_associated_type_declaration_hit(type_item: Node<'_>, ctx: &mut MemberS
     let Some(trait_type) = impl_item.child_by_field_name("trait") else {
         return;
     };
-    if !resolved_type_matches_owner(trait_type, ctx) {
+    if !resolved_type_matches_owner(trait_type, token, ctx) {
         return;
     }
 
@@ -1989,12 +2061,16 @@ fn record_associated_type_declaration_hit(type_item: Node<'_>, ctx: &mut MemberS
     );
 }
 
-fn record_tuple_variant_pattern_hit(pattern: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+fn record_tuple_variant_pattern_hit(
+    pattern: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut MemberScanCtx<'_>,
+) {
     let Some(name) = pattern.child_by_field_name("type") else {
         return;
     };
     if name.kind() == "scoped_identifier" {
-        record_qualified_tuple_variant_pattern_hit(name, ctx);
+        record_qualified_tuple_variant_pattern_hit(name, token, ctx);
         return;
     }
     if name.kind() != "identifier"
@@ -2009,12 +2085,16 @@ fn record_tuple_variant_pattern_hit(pattern: Node<'_>, ctx: &mut MemberScanCtx<'
         return;
     }
 
-    if unqualified_enum_variant_matches(name, ctx) {
+    if unqualified_enum_variant_matches(name, token, ctx) {
         record_static_member_name_hit(name, ctx);
     }
 }
 
-fn record_bare_token_tree_variant_pattern_hit(name: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+fn record_bare_token_tree_variant_pattern_hit(
+    name: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut MemberScanCtx<'_>,
+) {
     let role = ctx.token_tree_roles.role(name, ctx.source);
     if simple_node_text(name, ctx.source).as_deref() != Some(ctx.member_name)
         || rust_token_path_segment_is_qualified(name)
@@ -2026,17 +2106,21 @@ fn record_bare_token_tree_variant_pattern_hit(name: Node<'_>, ctx: &mut MemberSc
         return;
     }
     let matches = if ctx.target_is_enum_variant {
-        exact_forward_pattern_value_matches(name, ctx)
-            || unqualified_enum_variant_matches(name, ctx)
+        exact_forward_pattern_value_matches(name, token, ctx)
+            || unqualified_enum_variant_matches(name, token, ctx)
     } else {
-        exact_forward_pattern_value_matches(name, ctx)
+        exact_forward_pattern_value_matches(name, token, ctx)
     };
     if matches {
         record_static_member_name_hit(name, ctx);
     }
 }
 
-fn record_bare_enum_variant_value_hit(name: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+fn record_bare_enum_variant_value_hit(
+    name: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut MemberScanCtx<'_>,
+) {
     let Some(written_name) = simple_node_text(name, ctx.source) else {
         return;
     };
@@ -2057,7 +2141,7 @@ fn record_bare_enum_variant_value_hit(name: Node<'_>, ctx: &mut MemberScanCtx<'_
     if pattern_binding && !identifier_is_match_arm_pattern(name) {
         return;
     }
-    let matches_variant = unqualified_enum_variant_matches(name, ctx);
+    let matches_variant = unqualified_enum_variant_matches(name, token, ctx);
     if pattern_binding && !matches_variant {
         return;
     }
@@ -2082,11 +2166,16 @@ fn identifier_is_match_arm_pattern(node: Node<'_>) -> bool {
     false
 }
 
-fn exact_forward_pattern_value_matches(name: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+fn exact_forward_pattern_value_matches(
+    name: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &MemberScanCtx<'_>,
+) -> bool {
     let roots = BTreeSet::from([ctx.requested_target.clone()]);
-    let seeds = usage_binding_seeds(ctx.rust, &roots);
+    let seeds = usage_binding_seeds(ctx.rust, token, &roots);
     let resolution = usage_reference_at(
         ctx.rust,
+        token,
         ctx.file,
         &seeds,
         &[ctx.member_name],
@@ -2095,13 +2184,17 @@ fn exact_forward_pattern_value_matches(name: Node<'_>, ctx: &MemberScanCtx<'_>) 
         false,
         false,
     );
-    let Some(root) = usage_exact_root_for_resolution(ctx.rust, &resolution, &seeds) else {
+    let Some(root) = usage_exact_root_for_resolution(ctx.rust, token, &resolution, &seeds) else {
         return false;
     };
     same_rust_declaration_identity(&root, ctx.requested_target)
 }
 
-fn unqualified_enum_variant_matches(name: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+fn unqualified_enum_variant_matches(
+    name: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &MemberScanCtx<'_>,
+) -> bool {
     let Some(written_name) = simple_node_text(name, ctx.source) else {
         return false;
     };
@@ -2130,9 +2223,13 @@ fn unqualified_enum_variant_matches(name: Node<'_>, ctx: &MemberScanCtx<'_>) -> 
         // Ordinary module globs and re-export globs are already represented by
         // the import graph. Enum globs (`use Enum::*`) name a type rather than a
         // module, so resolve that owner through the same Rust reference context.
-        for (target_file, target_name) in
-            resolve_imported_export_from_binder_forward(ctx.rust, ctx.file, &binder, &written_name)
-        {
+        for (target_file, target_name) in resolve_imported_export_from_binder_forward(
+            ctx.rust,
+            token,
+            ctx.file,
+            &binder,
+            &written_name,
+        ) {
             for candidate in ctx.support.file_identifier(&target_file, &target_name) {
                 insert_enum_variant_candidate(candidate, ctx, &mut candidates);
             }
@@ -2157,7 +2254,11 @@ fn unqualified_enum_variant_matches(name: Node<'_>, ctx: &MemberScanCtx<'_>) -> 
         })
 }
 
-fn record_qualified_tuple_variant_pattern_hit(variant_path: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+fn record_qualified_tuple_variant_pattern_hit(
+    variant_path: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut MemberScanCtx<'_>,
+) {
     let Some(name) = variant_path.child_by_field_name("name") else {
         return;
     };
@@ -2170,10 +2271,11 @@ fn record_qualified_tuple_variant_pattern_hit(variant_path: Node<'_>, ctx: &mut 
     let Some(owner_segments) = rust_path_segments(owner_path) else {
         return;
     };
-    let Some(resolved_owner) = exact_ast_owner(&owner_segments, ctx.owner_seeds, ctx) else {
+    let Some(resolved_owner) = exact_ast_owner(&owner_segments, token, ctx.owner_seeds, ctx) else {
         return;
     };
-    let Some(requested_owner) = canonical_rust_hierarchy_type(ctx.rust, ctx.owner.clone()) else {
+    let Some(requested_owner) = canonical_rust_hierarchy_type(ctx.rust, token, ctx.owner.clone())
+    else {
         return;
     };
     if resolved_owner != requested_owner {
@@ -2211,7 +2313,7 @@ fn insert_enum_variant_candidate(
     }
 }
 
-fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+fn record_instance_member_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut MemberScanCtx<'_>) {
     // A method target is referenced by a call (`receiver.method()`); a field target
     // is referenced by a read/write (`receiver.field`), never as the callee.
     if ctx.target_is_field {
@@ -2238,7 +2340,7 @@ fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     };
     let receiver_name = simple_node_text(receiver, ctx.source);
     let inferred_match =
-        match receiver_owner_proof(receiver, receiver_name.as_deref(), &enclosing, ctx) {
+        match receiver_owner_proof(receiver, token, receiver_name.as_deref(), &enclosing, ctx) {
             ReceiverOwnerProof::Structured => false,
             ReceiverOwnerProof::Inferred => true,
             ReceiverOwnerProof::Mismatches => return,
@@ -2307,7 +2409,11 @@ fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     }
 }
 
-fn record_token_tree_instance_member_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+fn record_token_tree_instance_member_hits(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut MemberScanCtx<'_>,
+) {
     let mut cursor = node.walk();
     let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
     for (index, window) in children.windows(3).enumerate() {
@@ -2345,17 +2451,17 @@ fn record_token_tree_instance_member_hits(node: Node<'_>, ctx: &mut MemberScanCt
         let proof = if receiver_is_adapter_parens {
             // No token-stream type inference is available for an adapter's call-parens
             // receiver; prove it by the enclosing impl's Self type, matching bare `self`.
-            if enclosing_impl_type_matches_owner(*receiver, ctx) {
+            if enclosing_impl_type_matches_owner(*receiver, token, ctx) {
                 ReceiverOwnerProof::Inferred
             } else {
                 ReceiverOwnerProof::Unknown
             }
         } else {
-            let receiver_types = token_tree_receiver_type_candidates(&children, index, ctx);
+            let receiver_types = token_tree_receiver_type_candidates(&children, token, index, ctx);
             if receiver_types.is_empty() {
-                receiver_owner_proof(*receiver, receiver_name.as_deref(), &enclosing, ctx)
+                receiver_owner_proof(*receiver, token, receiver_name.as_deref(), &enclosing, ctx)
             } else {
-                receiver_type_candidates_proof(&receiver_types, ctx)
+                receiver_type_candidates_proof(&receiver_types, token, ctx)
             }
         };
         let inferred_match = match proof {
@@ -2470,6 +2576,7 @@ fn token_tree_adapter_chain_root_is_self(
 
 fn token_tree_receiver_type_candidates(
     children: &[Node<'_>],
+    token: QueryToken<'_>,
     receiver_index: usize,
     ctx: &mut MemberScanCtx<'_>,
 ) -> Vec<CodeUnit> {
@@ -2488,6 +2595,7 @@ fn token_tree_receiver_type_candidates(
 
     let mut receiver_types = rust_expression_type_definition_candidates_cached(
         ctx.analyzer,
+        token,
         ctx.support,
         ctx.file,
         ctx.source,
@@ -2524,6 +2632,7 @@ fn token_tree_receiver_type_candidates(
             .flat_map(|field| {
                 rust_field_definition_type_candidates_cached(
                     ctx.analyzer,
+                    token,
                     ctx.support,
                     field,
                     ctx.type_lookup_cache,
@@ -2537,7 +2646,11 @@ fn token_tree_receiver_type_candidates(
     receiver_types
 }
 
-fn record_token_tree_static_member_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+fn record_token_tree_static_member_hits(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut MemberScanCtx<'_>,
+) {
     let mut cursor = node.walk();
     let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
     for member_index in 2..children.len() {
@@ -2561,7 +2674,7 @@ fn record_token_tree_static_member_hits(node: Node<'_>, ctx: &mut MemberScanCtx<
         let Some(owner_segments) = rust_token_owner_segments(&children, owner_index) else {
             continue;
         };
-        if !structured_static_member_matches_target(owner, &owner_segments, ctx) {
+        if !structured_static_member_matches_target(owner, token, &owner_segments, ctx) {
             continue;
         }
         record_static_member_name_hit(member, ctx);
@@ -2649,7 +2762,7 @@ fn record_struct_field_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     let Some((type_node, fields)) = rust_struct_field_references(node) else {
         return;
     };
-    if !resolved_struct_field_owner_matches(type_node, ctx) {
+    if !resolved_struct_field_owner_matches(type_node, ctx.refs.token(), ctx) {
         return;
     }
     for field in fields {
@@ -2675,14 +2788,18 @@ fn record_struct_field_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     }
 }
 
-fn resolved_struct_field_owner_matches(type_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+fn resolved_struct_field_owner_matches(
+    type_node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &MemberScanCtx<'_>,
+) -> bool {
     if !is_rust_enum_variant_declaration(ctx.rust, ctx.owner) {
-        return resolved_type_matches_owner(type_node, ctx);
+        return resolved_type_matches_owner(type_node, token, ctx);
     }
     let Some(segments) = rust_path_segments(type_node) else {
         return false;
     };
-    structured_owner_candidate_fqn(type_node, &segments, ctx)
+    structured_owner_candidate_fqn(type_node, token, &segments, ctx)
         .is_some_and(|owner| owner == ctx.owner.fq_name())
 }
 
@@ -2695,6 +2812,7 @@ enum ReceiverOwnerProof {
 
 fn receiver_owner_proof(
     receiver: Node<'_>,
+    token: QueryToken<'_>,
     receiver_name: Option<&str>,
     enclosing: &CodeUnit,
     ctx: &mut MemberScanCtx<'_>,
@@ -2708,6 +2826,7 @@ fn receiver_owner_proof(
 
     let receiver_types = rust_expression_type_definition_candidates_cached(
         ctx.analyzer,
+        token,
         ctx.support,
         ctx.file,
         ctx.source,
@@ -2717,13 +2836,14 @@ fn receiver_owner_proof(
         ctx.type_lookup_cache,
     );
     if !receiver_types.is_empty() {
-        match receiver_type_candidates_proof(&receiver_types, ctx) {
+        match receiver_type_candidates_proof(&receiver_types, token, ctx) {
             ReceiverOwnerProof::Unknown => {}
             proof => return proof,
         }
     }
     if let Some(fqn) = rust_expression_type_definition_fqn_cached(
         ctx.analyzer,
+        token,
         ctx.support,
         ctx.file,
         ctx.source,
@@ -2732,7 +2852,9 @@ fn receiver_owner_proof(
         receiver.start_byte(),
         ctx.type_lookup_cache,
     ) {
-        if !ctx.target_owner_is_trait && fqn_matches_owner(ctx.rust, ctx.support, &fqn, ctx.owner) {
+        if !ctx.target_owner_is_trait
+            && fqn_matches_owner(ctx.rust, token, ctx.support, &fqn, ctx.owner)
+        {
             return ReceiverOwnerProof::Structured;
         }
         if let Some(matches) = receiver_type_matches_requested_dispatch(&fqn, ctx) {
@@ -2763,12 +2885,12 @@ fn receiver_owner_proof(
     // this also covers the cross-impl case (a trait `impl` calling an inherent sibling),
     // because it matches on the impl's Self *type*, not on physical range containment.
     let matches = match receiver.kind() {
-        "self" => enclosing_impl_type_matches_owner(receiver, ctx),
-        "field_expression" => self_field_receiver_matches_owner(receiver, enclosing, ctx),
+        "self" => enclosing_impl_type_matches_owner(receiver, token, ctx),
+        "field_expression" => self_field_receiver_matches_owner(receiver, token, enclosing, ctx),
         "call_expression" | "parenthesized_expression"
             if receiver_is_self_rooted(receiver, ctx.source) =>
         {
-            enclosing_impl_type_matches_owner(receiver, ctx)
+            enclosing_impl_type_matches_owner(receiver, token, ctx)
         }
         _ => false,
     };
@@ -2781,9 +2903,10 @@ fn receiver_owner_proof(
 
 fn receiver_type_candidates_proof(
     receiver_types: &[CodeUnit],
+    token: QueryToken<'_>,
     ctx: &MemberScanCtx<'_>,
 ) -> ReceiverOwnerProof {
-    if !ctx.target_owner_is_trait && type_candidates_match_owner(receiver_types, ctx) {
+    if !ctx.target_owner_is_trait && type_candidates_match_owner(receiver_types, token, ctx) {
         return ReceiverOwnerProof::Structured;
     }
     if let Some(matches) = receiver_type_candidates_match_requested_dispatch(receiver_types, ctx) {
@@ -2816,11 +2939,15 @@ fn foreign_receiver_verdict(rust: &RustAnalyzer, resolved: &[CodeUnit]) -> Recei
     }
 }
 
-fn type_candidates_match_owner(receiver_types: &[CodeUnit], ctx: &MemberScanCtx<'_>) -> bool {
+fn type_candidates_match_owner(
+    receiver_types: &[CodeUnit],
+    token: QueryToken<'_>,
+    ctx: &MemberScanCtx<'_>,
+) -> bool {
     let canonical: Option<BTreeSet<_>> = receiver_types
         .iter()
         .cloned()
-        .map(|unit| canonical_rust_hierarchy_type(ctx.rust, unit))
+        .map(|unit| canonical_rust_hierarchy_type(ctx.rust, token, unit))
         .collect();
     let Some(canonical) = canonical else {
         return false;
@@ -2978,14 +3105,18 @@ fn self_rooted_adapter_call(call: Node<'_>, source: &str) -> bool {
 
 /// Whether `receiver` is direct `self` inside an inherent impl whose resolved
 /// target type is the owner, so `self.member` resolves to that owner member.
-fn enclosing_impl_type_matches_owner(receiver: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+fn enclosing_impl_type_matches_owner(
+    receiver: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &MemberScanCtx<'_>,
+) -> bool {
     let Some(impl_item) = enclosing_impl_item(receiver) else {
         return false;
     };
     let Some(type_node) = impl_item.child_by_field_name("type") else {
         return false;
     };
-    resolved_type_matches_owner(type_node, ctx)
+    resolved_type_matches_owner(type_node, token, ctx)
 }
 
 /// Whether `receiver` is `self.<field>` and that field's declared type on the
@@ -2993,6 +3124,7 @@ fn enclosing_impl_type_matches_owner(receiver: Node<'_>, ctx: &MemberScanCtx<'_>
 /// resolves without the receiver being a simple local of the owner type.
 fn self_field_receiver_matches_owner(
     receiver: Node<'_>,
+    token: QueryToken<'_>,
     enclosing: &CodeUnit,
     ctx: &mut MemberScanCtx<'_>,
 ) -> bool {
@@ -3017,7 +3149,7 @@ fn self_field_receiver_matches_owner(
     for member in ctx.analyzer.get_members_in_class(&self_type) {
         if member.is_field()
             && member.identifier() == field_name
-            && field_declared_type_matches_receiver(&member, ctx)
+            && field_declared_type_matches_receiver(&member, token, ctx)
         {
             return true;
         }
@@ -3034,14 +3166,19 @@ fn enclosing_impl_item(mut node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-fn resolved_type_matches_owner(type_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+fn resolved_type_matches_owner(
+    type_node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &MemberScanCtx<'_>,
+) -> bool {
     if let Some(segments) = rust_path_segments(type_node)
-        && exact_ast_owner(&segments, ctx.owner_seeds, ctx).as_ref() == Some(ctx.owner)
+        && exact_ast_owner(&segments, token, ctx.owner_seeds, ctx).as_ref() == Some(ctx.owner)
     {
         return true;
     }
     let Some(fqn) = rust_resolve_type_node_fqn(
         ctx.analyzer,
+        token,
         ctx.support,
         ctx.file,
         ctx.source,
@@ -3050,11 +3187,12 @@ fn resolved_type_matches_owner(type_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> 
     ) else {
         return false;
     };
-    fqn_matches_owner(ctx.rust, ctx.support, &fqn, ctx.owner)
+    fqn_matches_owner(ctx.rust, token, ctx.support, &fqn, ctx.owner)
 }
 
 fn fqn_matches_owner(
     rust: &RustAnalyzer,
+    token: QueryToken<'_>,
     support: &DefinitionIndexHandle<'_>,
     fqn: &str,
     owner: &CodeUnit,
@@ -3062,7 +3200,7 @@ fn fqn_matches_owner(
     let candidates = support.fqn(fqn);
     let canonical: Option<BTreeSet<_>> = candidates
         .into_iter()
-        .map(|unit| canonical_rust_hierarchy_type(rust, unit))
+        .map(|unit| canonical_rust_hierarchy_type(rust, token, unit))
         .collect();
     let Some(canonical) = canonical else {
         return false;
@@ -3070,19 +3208,24 @@ fn fqn_matches_owner(
     canonical.len() == 1 && canonical.first().is_some_and(|unit| unit == owner)
 }
 
-fn canonical_member_owner(rust: &RustAnalyzer, owner: CodeUnit) -> CodeUnit {
-    let owner = canonical_imported_impl_target(rust, &owner).unwrap_or(owner);
-    canonical_rust_hierarchy_type(rust, owner.clone()).unwrap_or(owner)
+fn canonical_member_owner(rust: &RustAnalyzer, token: QueryToken<'_>, owner: CodeUnit) -> CodeUnit {
+    let owner = canonical_imported_impl_target(rust, token, &owner).unwrap_or(owner);
+    canonical_rust_hierarchy_type(rust, token, owner.clone()).unwrap_or(owner)
 }
 
-fn field_declared_type_matches_receiver(member: &CodeUnit, ctx: &mut MemberScanCtx<'_>) -> bool {
+fn field_declared_type_matches_receiver(
+    member: &CodeUnit,
+    token: QueryToken<'_>,
+    ctx: &mut MemberScanCtx<'_>,
+) -> bool {
     let receiver_types = rust_field_definition_type_candidates_cached(
         ctx.analyzer,
+        token,
         ctx.support,
         member,
         ctx.type_lookup_cache,
     );
-    type_candidates_match_owner(&receiver_types, ctx)
+    type_candidates_match_owner(&receiver_types, token, ctx)
 }
 
 fn node_for_exact_range(root: Node<'_>, start: usize, end: usize) -> Option<Node<'_>> {
@@ -3131,7 +3274,7 @@ fn field_expression_is_called(node: Node<'_>) -> bool {
     })
 }
 
-fn record_static_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+fn record_static_member_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut MemberScanCtx<'_>) {
     if node_in_use_declaration(node) {
         return;
     }
@@ -3147,7 +3290,7 @@ fn record_static_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     if !static_member_role_matches_target(field_expression_is_called(node), ctx) {
         return;
     }
-    if !ast_static_member_matches_target(path, ctx) {
+    if !ast_static_member_matches_target(path, token, ctx) {
         return;
     }
 
@@ -3186,37 +3329,43 @@ fn node_in_use_declaration(mut node: Node<'_>) -> bool {
     false
 }
 
-fn ast_static_member_matches_target(owner_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+fn ast_static_member_matches_target(
+    owner_node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &MemberScanCtx<'_>,
+) -> bool {
     let Some(segments) = rust_path_segments(owner_node) else {
         return false;
     };
-    structured_static_member_matches_target(owner_node, &segments, ctx)
+    structured_static_member_matches_target(owner_node, token, &segments, ctx)
 }
 
 fn structured_static_member_matches_target(
     owner_node: Node<'_>,
+    token: QueryToken<'_>,
     segments: &[Node<'_>],
     ctx: &MemberScanCtx<'_>,
 ) -> bool {
     if segments.len() == 1 && simple_node_text(segments[0], ctx.source).as_deref() == Some("Self") {
-        return self_static_owner_matches_target(owner_node, ctx);
+        return self_static_owner_matches_target(owner_node, token, ctx);
     }
     let item_matches = if ctx.target_is_field {
         CodeUnit::is_field
     } else {
         CodeUnit::is_function
     };
-    let owner = exact_ast_owner(segments, ctx.owner_seeds, ctx)
-        .or_else(|| exact_structured_static_owner(owner_node, segments, ctx))
+    let owner = exact_ast_owner(segments, token, ctx.owner_seeds, ctx)
+        .or_else(|| exact_structured_static_owner(owner_node, token, segments, ctx))
         .or_else(|| {
             (!ctx.target_owner_is_trait)
-                .then(|| exact_type_alias_owner(owner_node, segments, ctx))
+                .then(|| exact_type_alias_owner(owner_node, token, segments, ctx))
                 .flatten()
         });
     let Some(owner) = owner else {
         return ctx.target_owner_is_trait
             && trait_implementer_static_member_matches_target(
                 owner_node,
+                token,
                 segments,
                 item_matches,
                 ctx,
@@ -3235,7 +3384,7 @@ fn structured_static_member_matches_target(
                 .structural_parent_of(candidate)
                 .or_else(|| ctx.rust.parent_of(candidate));
             let owner_matches = parent
-                .map(|parent| canonical_member_owner(ctx.rust, parent))
+                .map(|parent| canonical_member_owner(ctx.rust, token, parent))
                 .as_ref()
                 == Some(&owner);
             name_matches && role_matches && owner_matches
@@ -3254,7 +3403,7 @@ fn structured_static_member_matches_target(
                 ctx.rust
                     .structural_parent_of(candidate)
                     .or_else(|| ctx.rust.parent_of(candidate))
-                    .map(|parent| canonical_member_owner(ctx.rust, parent))
+                    .map(|parent| canonical_member_owner(ctx.rust, token, parent))
                     .as_ref()
                     == Some(&owner)
             })
@@ -3272,7 +3421,7 @@ fn structured_static_member_matches_target(
             owner_node.start_byte(),
         )
     };
-    associated_candidates_match_target(outcome, owner_node, Some(&owner), ctx)
+    associated_candidates_match_target(outcome, token, owner_node, Some(&owner), ctx)
 }
 
 /// `candidates` narrowed to the declarations that `file`'s own Cargo target
@@ -3295,10 +3444,11 @@ fn cargo_target_preferred_candidates(
 
 fn exact_structured_static_owner(
     owner_node: Node<'_>,
+    token: QueryToken<'_>,
     segments: &[Node<'_>],
     ctx: &MemberScanCtx<'_>,
 ) -> Option<CodeUnit> {
-    let owner_fqn = structured_owner_candidate_fqn(owner_node, segments, ctx)?;
+    let owner_fqn = structured_owner_candidate_fqn(owner_node, token, segments, ctx)?;
     let mut candidates = cargo_target_preferred_candidates(
         ctx.rust,
         ctx.file,
@@ -3306,7 +3456,7 @@ fn exact_structured_static_owner(
             .fqn(&owner_fqn)
             .into_iter()
             .filter(|candidate| rust_is_type_definition(ctx.analyzer, candidate))
-            .filter_map(|candidate| canonical_rust_hierarchy_type(ctx.rust, candidate))
+            .filter_map(|candidate| canonical_rust_hierarchy_type(ctx.rust, token, candidate))
             .collect(),
     );
     candidates.sort();
@@ -3316,10 +3466,11 @@ fn exact_structured_static_owner(
 
 fn exact_type_alias_owner(
     owner_node: Node<'_>,
+    token: QueryToken<'_>,
     segments: &[Node<'_>],
     ctx: &MemberScanCtx<'_>,
 ) -> Option<CodeUnit> {
-    let owner_fqn = structured_owner_candidate_fqn(owner_node, segments, ctx)?;
+    let owner_fqn = structured_owner_candidate_fqn(owner_node, token, segments, ctx)?;
     let roots = ctx
         .support
         .fqn(&owner_fqn)
@@ -3329,14 +3480,15 @@ fn exact_type_alias_owner(
     if roots.is_empty() {
         return None;
     }
-    let seeds = usage_binding_seeds(ctx.rust, &roots);
-    let alias_owner = exact_ast_owner(segments, &seeds, ctx)?;
-    let target_owner = canonical_rust_hierarchy_type(ctx.rust, ctx.owner.clone())?;
+    let seeds = usage_binding_seeds(ctx.rust, token, &roots);
+    let alias_owner = exact_ast_owner(segments, token, &seeds, ctx)?;
+    let target_owner = canonical_rust_hierarchy_type(ctx.rust, token, ctx.owner.clone())?;
     (alias_owner == target_owner).then_some(alias_owner)
 }
 
 fn exact_ast_owner(
     segments: &[Node<'_>],
+    token: QueryToken<'_>,
     seeds: &RustBindingSeeds,
     ctx: &MemberScanCtx<'_>,
 ) -> Option<CodeUnit> {
@@ -3358,6 +3510,7 @@ fn exact_ast_owner(
         }
         && !usage_root_declaration_matches_at(
             ctx.rust,
+            token,
             ctx.file,
             seeds,
             root_name,
@@ -3365,6 +3518,7 @@ fn exact_ast_owner(
         )
         && !usage_local_module_prefix_visible_at(
             ctx.rust,
+            token,
             ctx.file,
             seeds,
             root_name,
@@ -3372,6 +3526,7 @@ fn exact_ast_owner(
         );
     let resolution = usage_reference_at(
         ctx.rust,
+        token,
         ctx.file,
         seeds,
         &segment_refs,
@@ -3380,17 +3535,18 @@ fn exact_ast_owner(
         root_shadowed,
         crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(*segments.last()?),
     );
-    let root = usage_exact_root_for_resolution(ctx.rust, &resolution, seeds)?;
-    canonical_rust_hierarchy_type(ctx.rust, root)
+    let root = usage_exact_root_for_resolution(ctx.rust, token, &resolution, seeds)?;
+    canonical_rust_hierarchy_type(ctx.rust, token, root)
 }
 
 fn trait_implementer_static_member_matches_target(
     owner_node: Node<'_>,
+    token: QueryToken<'_>,
     segments: &[Node<'_>],
     item_matches: fn(&CodeUnit) -> bool,
     ctx: &MemberScanCtx<'_>,
 ) -> bool {
-    let Some(owner_fqn) = structured_owner_candidate_fqn(owner_node, segments, ctx) else {
+    let Some(owner_fqn) = structured_owner_candidate_fqn(owner_node, token, segments, ctx) else {
         return false;
     };
     let mut roots = ctx
@@ -3403,13 +3559,13 @@ fn trait_implementer_static_member_matches_target(
     if is_rust_trait_impl_member_declaration(ctx.rust, ctx.requested_target)
         && let Some(owner) = ctx.rust.parent_of(ctx.requested_target)
     {
-        roots.insert(canonical_member_owner(ctx.rust, owner));
+        roots.insert(canonical_member_owner(ctx.rust, token, owner));
     }
     if roots.is_empty() {
         return false;
     }
-    let seeds = usage_binding_seeds(ctx.rust, &roots);
-    let Some(owner) = exact_ast_owner(segments, &seeds, ctx) else {
+    let seeds = usage_binding_seeds(ctx.rust, token, &roots);
+    let Some(owner) = exact_ast_owner(segments, token, &seeds, ctx) else {
         return false;
     };
     let outcome = resolve_exact_owner_associated_item_matching(
@@ -3422,11 +3578,12 @@ fn trait_implementer_static_member_matches_target(
         item_matches,
         owner_node.start_byte(),
     );
-    associated_candidates_match_target(outcome, owner_node, None, ctx)
+    associated_candidates_match_target(outcome, token, owner_node, None, ctx)
 }
 
 fn structured_owner_candidate_fqn(
     owner_node: Node<'_>,
+    token: QueryToken<'_>,
     segments: &[Node<'_>],
     ctx: &MemberScanCtx<'_>,
 ) -> Option<String> {
@@ -3444,6 +3601,7 @@ fn structured_owner_candidate_fqn(
     resolved.or_else(|| {
         rust_resolve_type_node_fqn(
             ctx.analyzer,
+            token,
             ctx.support,
             ctx.file,
             ctx.source,
@@ -3455,6 +3613,7 @@ fn structured_owner_candidate_fqn(
 
 fn associated_candidates_match_target(
     outcome: ReceiverAnalysisOutcome<CodeUnit>,
+    token: QueryToken<'_>,
     owner_node: Node<'_>,
     expected_owner: Option<&CodeUnit>,
     ctx: &MemberScanCtx<'_>,
@@ -3506,11 +3665,11 @@ fn associated_candidates_match_target(
                 let owner_matches = expected_owner.is_none_or(|expected| {
                     parent.as_ref().is_some_and(|parent| {
                         is_rust_trait_declaration(ctx.rust, parent)
-                            || canonical_member_owner(ctx.rust, parent.clone()) == *expected
+                            || canonical_member_owner(ctx.rust, token, parent.clone()) == *expected
                     })
                 });
                 let mapped_trait = is_rust_trait_impl_member_declaration(ctx.rust, &candidate)
-                    .then(|| trait_member_for_impl_member(ctx.rust, &candidate))
+                    .then(|| trait_member_for_impl_member(ctx.rust, token, &candidate))
                     .flatten();
                 let enum_parent = ctx
                     .target_is_enum_variant
@@ -3522,6 +3681,7 @@ fn associated_candidates_match_target(
                 let directly_visible = if mapped_trait.is_some() || enum_parent.is_some() {
                     usage_declaration_visible_at(
                         ctx.rust,
+                        token,
                         visibility_declaration,
                         ctx.file,
                         owner_node.start_byte(),
@@ -3529,6 +3689,7 @@ fn associated_candidates_match_target(
                 } else {
                     usage_identity_visible_at(
                         ctx.rust,
+                        token,
                         visibility_declaration,
                         ctx.file,
                         owner_node.start_byte(),
@@ -3543,6 +3704,7 @@ fn associated_candidates_match_target(
                             matches!(
                                 brokk_bifrost_rust::graph_support::rust_declaration_visibility(
                                     ctx.rust,
+                                    token,
                                     &trait_owner,
                                 ),
                                 brokk_bifrost_rust::imports::RustVisibility::Public
@@ -3575,7 +3737,11 @@ fn associated_candidates_match_target(
     }
 }
 
-fn self_static_owner_matches_target(owner_node: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+fn self_static_owner_matches_target(
+    owner_node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &MemberScanCtx<'_>,
+) -> bool {
     let mut current = Some(owner_node);
     while let Some(node) = current {
         match node.kind() {
@@ -3592,6 +3758,7 @@ fn self_static_owner_matches_target(owner_node: Node<'_>, ctx: &MemberScanCtx<'_
                     return node.child_by_field_name("type").is_some_and(|type_node| {
                         rust_resolve_type_node_fqn(
                             ctx.analyzer,
+                            token,
                             ctx.support,
                             ctx.file,
                             ctx.source,
@@ -3599,7 +3766,7 @@ fn self_static_owner_matches_target(owner_node: Node<'_>, ctx: &MemberScanCtx<'_
                             Some(type_node.start_byte()),
                         )
                         .is_some_and(|fqn| {
-                            fqn_matches_owner(ctx.rust, ctx.support, &fqn, &requested_owner)
+                            fqn_matches_owner(ctx.rust, token, ctx.support, &fqn, &requested_owner)
                         })
                     });
                 }
@@ -3608,12 +3775,12 @@ fn self_static_owner_matches_target(owner_node: Node<'_>, ctx: &MemberScanCtx<'_
                 } else {
                     node.child_by_field_name("type")
                 };
-                return owner.is_some_and(|owner| resolved_type_matches_owner(owner, ctx));
+                return owner.is_some_and(|owner| resolved_type_matches_owner(owner, token, ctx));
             }
             "trait_item" => {
                 return node
                     .child_by_field_name("name")
-                    .is_some_and(|name| resolved_type_matches_owner(name, ctx));
+                    .is_some_and(|name| resolved_type_matches_owner(name, token, ctx));
             }
             _ => current = node.parent(),
         }
@@ -3640,6 +3807,7 @@ fn impl_item_contains_target(node: Node<'_>, target: &CodeUnit, ctx: &MemberScan
 
 fn self_like_constructor_returns(
     rust: &RustAnalyzer,
+    token: QueryToken<'_>,
     support: &DefinitionIndexHandle<'_>,
     owner: &CodeUnit,
 ) -> HashMap<String, SelfLikeConstructor> {
@@ -3670,6 +3838,7 @@ fn self_like_constructor_returns(
             let return_type = function_return_type_node(function)?;
             let ctx = ConstructorReturnCtx {
                 rust,
+                token,
                 support,
                 file: code_unit.source(),
                 source: &source,
@@ -3690,6 +3859,7 @@ fn self_like_constructor_returns(
 
 struct ConstructorReturnCtx<'a> {
     rust: &'a RustAnalyzer,
+    token: QueryToken<'a>,
     support: &'a DefinitionIndexHandle<'a>,
     file: &'a ProjectFile,
     source: &'a str,
@@ -3762,14 +3932,14 @@ fn type_node_matches_constructor_owner(
     }
     constructor_type_node_fqn(type_node, ctx)
         .as_deref()
-        .is_some_and(|fqn| fqn_matches_owner(ctx.rust, ctx.support, fqn, ctx.owner))
+        .is_some_and(|fqn| fqn_matches_owner(ctx.rust, ctx.token, ctx.support, fqn, ctx.owner))
 }
 
 fn constructor_type_node_fqn(
     type_node: Node<'_>,
     ctx: &ConstructorReturnCtx<'_>,
 ) -> Option<String> {
-    let refs = ctx.rust.reference_context_of(ctx.file);
+    let refs = ctx.rust.reference_context_of(ctx.token, ctx.file);
 
     match type_node.kind() {
         "type_identifier" | "identifier" => {
@@ -3800,13 +3970,14 @@ fn constructor_type_node_fqn(
 
 fn self_like_constructor_seeds(
     rust: &RustAnalyzer,
+    token: QueryToken<'_>,
     constructor_returns: &HashMap<String, SelfLikeConstructor>,
 ) -> HashMap<String, RustBindingSeeds> {
     constructor_returns
         .iter()
         .map(|(name, constructor)| {
             let roots = BTreeSet::from([constructor.declaration.clone()]);
-            let seeds = usage_binding_seeds(rust, &roots);
+            let seeds = usage_binding_seeds(rust, token, &roots);
             (name.clone(), seeds)
         })
         .collect()
@@ -3814,12 +3985,13 @@ fn self_like_constructor_seeds(
 
 fn visible_bare_constructor_names(
     rust: &RustAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     constructors: &HashMap<String, RustBindingSeeds>,
 ) -> HashSet<String> {
     let mut visible = HashSet::default();
     for (constructor, seeds) in constructors {
-        let (direct_names, _) = usage_binding_names(rust, file, seeds);
+        let (direct_names, _) = usage_binding_names(rust, token, file, seeds);
         if direct_names.contains(constructor)
             || seeds
                 .identities_in_file(file)
@@ -3916,6 +4088,7 @@ fn infer_receiver_names(
 #[allow(clippy::too_many_arguments)]
 fn resolved_owner_receiver_names(
     root: Node<'_>,
+    token: QueryToken<'_>,
     source: &str,
     analyzer: &dyn IAnalyzer,
     rust: &RustAnalyzer,
@@ -3937,13 +4110,14 @@ fn resolved_owner_receiver_names(
             && let Some(type_node) = node.child_by_field_name("type")
             && rust_resolve_type_node_fqn(
                 analyzer,
+                token,
                 support,
                 file,
                 source,
                 type_node,
                 Some(type_node.start_byte()),
             )
-            .is_some_and(|fqn| fqn_matches_owner(rust, support, &fqn, owner))
+            .is_some_and(|fqn| fqn_matches_owner(rust, token, support, &fqn, owner))
         {
             receivers.push(name);
         }
@@ -4423,6 +4597,7 @@ fn simple_node_text(node: Node<'_>, source: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::QueryScope;
     use crate::analyzer::{AnalyzerQueryScope, Language, TestProject};
     use std::sync::Arc;
 
@@ -4478,13 +4653,13 @@ mod tests {
         std::fs::write(root.join("lib.rs"), "pub fn target() {}\n").unwrap();
         let file = ProjectFile::new(root.clone(), "lib.rs");
         let analyzer = RustAnalyzer::from_project(TestProject::new(root, Language::Rust));
-        let _scope = AnalyzerQueryScope::new(&analyzer);
+        let scope = AnalyzerQueryScope::new(&analyzer);
 
         let first = analyzer
-            .prepared_syntax(&file)
+            .prepared_syntax(scope.token(), &file)
             .expect("first prepared syntax");
         let second = analyzer
-            .prepared_syntax(&file)
+            .prepared_syntax(scope.token(), &file)
             .expect("reused prepared syntax");
 
         assert!(Arc::ptr_eq(&first, &second));

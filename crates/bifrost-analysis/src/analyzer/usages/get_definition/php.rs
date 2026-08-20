@@ -1951,7 +1951,9 @@ fn php_prepared_syntax_bounded(
     if !session.scope_step() {
         return None;
     }
+    let scope = crate::analyzer::AnalyzerQueryScope::new(php);
     match php.prepared_syntax_limited_cancellable(
+        scope.token(),
         file,
         PHP_BOUNDED_AUXILIARY_MAX_SOURCE_BYTES,
         session.cancellation(),

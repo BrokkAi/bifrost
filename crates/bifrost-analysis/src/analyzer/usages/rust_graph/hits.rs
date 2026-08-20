@@ -291,7 +291,14 @@ fn structured_scoped_type_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Strin
     }
     let path = node.child_by_field_name("path")?;
     let name = node.child_by_field_name("name")?;
-    let owner_fqn = lexical_explicit_import_fqn(ctx.rust, ctx.support, ctx.file, ctx.source, path);
+    let owner_fqn = lexical_explicit_import_fqn(
+        ctx.rust,
+        ctx.refs.token(),
+        ctx.support,
+        ctx.file,
+        ctx.source,
+        path,
+    );
     if let Some(owner_fqn) = owner_fqn {
         let owners = ctx
             .support
@@ -301,7 +308,13 @@ fn structured_scoped_type_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Strin
                 candidate.is_module() || candidate.is_class() || ctx.rust.is_type_alias(candidate)
             })
             .filter(|candidate| {
-                usage_declaration_visible_at(ctx.rust, candidate, ctx.file, path.start_byte())
+                usage_declaration_visible_at(
+                    ctx.rust,
+                    ctx.refs.token(),
+                    candidate,
+                    ctx.file,
+                    path.start_byte(),
+                )
             })
             .collect::<BTreeSet<_>>();
         if owners.len() != 1 {
@@ -314,7 +327,13 @@ fn structured_scoped_type_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Strin
         )
         .into_iter()
         .filter(|candidate| {
-            usage_declaration_visible_at(ctx.rust, candidate, ctx.file, name.start_byte())
+            usage_declaration_visible_at(
+                ctx.rust,
+                ctx.refs.token(),
+                candidate,
+                ctx.file,
+                name.start_byte(),
+            )
         })
         .map(|candidate| candidate.fq_name())
         .collect();

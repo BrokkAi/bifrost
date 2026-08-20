@@ -1305,7 +1305,7 @@ pub fn call_result_types(
             if callable.source() != file {
                 return None;
             }
-            let prepared = python.prepared_syntax(file)?;
+            let prepared = python.prepared_syntax(graph.token, file)?;
             let key = factory_function_key(graph, &callable);
             collect_factory_return_types_from_root(prepared.tree().root_node(), prepared.source())
                 .remove(&key)
@@ -2189,7 +2189,7 @@ fn callable_return_type_name(
     // once per imported class member, and the fallback below clones the entire
     // file source and builds a fresh `Parser` per declaration range. Same
     // prepared-syntax fast path C++ resolution uses for the same reason.
-    if let Some(prepared) = python.prepared_syntax(callable.source()) {
+    if let Some(prepared) = python.prepared_syntax(graph.token, callable.source()) {
         #[cfg(any(test, feature = "test-support"))]
         note_callable_return_type_lookup_for_test(true);
         return callable_return_type_name_in_tree(

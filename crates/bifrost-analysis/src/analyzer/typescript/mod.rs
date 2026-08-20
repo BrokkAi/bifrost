@@ -8,6 +8,7 @@ use crate::analyzer::{
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
     TypeAliasProvider, TypeHierarchyProvider,
 };
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
 use brokk_bifrost_js_ts::queries::TYPESCRIPT_QUERY_DIRECTORY;
@@ -198,7 +199,10 @@ impl JsTsSource for TypescriptAnalyzer {
         if !self.inner.is_type_alias(code_unit) {
             return None;
         }
-        let prepared = self.inner.prepared_syntax(code_unit.source())?;
+        let scope = AnalyzerQueryScope::new(self);
+        let prepared = self
+            .inner
+            .prepared_syntax(scope.token(), code_unit.source())?;
         let node = prepared.declaration_node(code_unit)?;
         let declaration = if node.kind() == "export_statement" {
             node.child_by_field_name("declaration")?
@@ -213,7 +217,10 @@ impl JsTsSource for TypescriptAnalyzer {
     }
 
     fn member_type_annotation_text(&self, code_unit: &CodeUnit) -> Option<String> {
-        let prepared = self.inner.prepared_syntax(code_unit.source())?;
+        let scope = AnalyzerQueryScope::new(self);
+        let prepared = self
+            .inner
+            .prepared_syntax(scope.token(), code_unit.source())?;
         let node = prepared.declaration_node(code_unit)?;
         if node.kind() != "property_signature" && node.kind() != "index_signature" {
             return None;

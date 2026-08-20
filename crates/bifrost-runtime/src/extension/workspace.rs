@@ -1,20 +1,23 @@
 use super::*;
+use brokk_bifrost_analysis::analyzer::semantic::cfg_algorithms::ProcedureControlDependenceStop;
 use brokk_bifrost_analysis::analyzer::semantic::{
-    CandidateCoverage, EvidenceCompleteness, OracleCallContext, ProofStatus, SemanticBudget,
-    SemanticOutcome, SemanticRequest, ValueFlowEndpoint, ValueFlowOracle, ValueFlowRelationKind,
-    WorkspaceSemanticOracle, cfg_algorithms::derive_procedure_control_dependence,
+    CandidateCoverage, EvidenceCompleteness, OracleCallContext, ProcedureSemantics, ProofStatus,
+    SemanticBudget, SemanticLocator, SemanticOutcome, SemanticRequest, ValueFlowEndpoint,
+    ValueFlowOracle, ValueFlowRelationKind, WorkspaceSemanticOracle,
+    cfg_algorithms::derive_procedure_control_dependence,
 };
 use brokk_bifrost_analysis::analyzer::structural::{
     CodeQueryCompletion, CodeQueryExecutionLimits, execute_workspace_request_with_cancellation,
 };
 use brokk_bifrost_analysis::analyzer::value_flow::ValueFlowCarrier;
 use brokk_bifrost_analysis::analyzer::{
-    AnalyzerConfig, FilesystemProject, OverlayProject, Project, ProjectFile, WorkspaceAnalyzer,
+    AnalyzerConfig, AnalyzerQueryScope, FilesystemProject, InformationTier, OverlayProject,
+    Project, ProjectFile, WorkspaceAnalyzer,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{fmt, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc};
 
 /// Where a workspace's analyzer store lives for the lifetime of one open.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,6 +380,10 @@ impl ExtensionWorkspace {
             max_scanned_files: values.semantic_files as usize,
             ..Default::default()
         };
+        // Same reason as in `semantic_relations`: the rung report is only
+        // truthful for work that ran under a scope this surface holds (#2414).
+        let scope =
+            AnalyzerQueryScope::with_cancellation(self.analyzer.analyzer(), cancellation.token());
         let response = execute_workspace_request_with_cancellation(
             &self.analyzer,
             &request.query,
@@ -413,14 +420,17 @@ impl ExtensionWorkspace {
                 .unwrap_or(0),
             ..Default::default()
         };
-        Ok(make_outcome(
-            Some(value),
-            completion,
-            &self.generation,
-            &request.limits,
-            "structural.query",
-            ApiStability::Stable,
-            work,
+        Ok(with_tiers(
+            make_outcome(
+                Some(value),
+                completion,
+                &self.generation,
+                &request.limits,
+                "structural.query",
+                ApiStability::Stable,
+                work,
+            ),
+            &scope,
         ))
     }
     pub fn semantic_relations(
@@ -457,6 +467,12 @@ impl ExtensionWorkspace {
                 "stable-node seeds require a prior snapshot resolver".into(),
             ));
         };
+        // One request boundary around every analyzer read this snapshot makes:
+        // it shares request memoization across the whole operation (the #1181
+        // fix shape) and, because tier crossings are recorded on every open
+        // scope, it is what makes the rung report below observable (#2414).
+        let scope =
+            AnalyzerQueryScope::with_cancellation(self.analyzer.analyzer(), cancellation.token());
         let root = self.analyzer.analyzer().project().root();
         let file = ProjectFile::new(root.to_path_buf(), seed.path.as_str());
         if self
@@ -464,16 +480,19 @@ impl ExtensionWorkspace {
             .program_semantics_provider_for_file(&file)
             .is_none()
         {
-            return Ok(make_outcome(
-                None,
-                ExtensionCompletion::Unsupported {
-                    capability: capability(operation),
-                },
-                &self.generation,
-                &ExtensionLimits::default(),
-                operation,
-                stability,
-                ExtensionWork::default(),
+            return Ok(with_tiers(
+                make_outcome(
+                    None,
+                    ExtensionCompletion::Unsupported {
+                        capability: capability(operation),
+                    },
+                    &self.generation,
+                    &ExtensionLimits::default(),
+                    operation,
+                    stability,
+                    ExtensionWork::default(),
+                ),
+                &scope,
             ));
         }
         let values = request.limits;
@@ -485,14 +504,17 @@ impl ExtensionWorkspace {
             .map_err(|error| ExtensionError::Execution(error.to_string().into_boxed_str()))?;
         let completion = semantic_completion(&materialized);
         let Some(artifact) = materialized.available_value() else {
-            return Ok(make_outcome(
-                None,
-                completion,
-                &self.generation,
-                &ExtensionLimits::default(),
-                operation,
-                stability,
-                ExtensionWork::default(),
+            return Ok(with_tiers(
+                make_outcome(
+                    None,
+                    completion,
+                    &self.generation,
+                    &ExtensionLimits::default(),
+                    operation,
+                    stability,
+                    ExtensionWork::default(),
+                ),
+                &scope,
             ));
         };
         let seed_start = u32::try_from(seed.start_utf8_byte)
@@ -509,21 +531,43 @@ impl ExtensionWorkspace {
                     - procedure.locator().anchor().span().start_byte()
             });
         let Some(procedure) = procedure else {
-            return Ok(make_outcome(
-                None,
-                ExtensionCompletion::Unknown,
-                &self.generation,
-                &ExtensionLimits::default(),
-                operation,
-                stability,
-                ExtensionWork::default(),
+            return Ok(with_tiers(
+                make_outcome(
+                    None,
+                    ExtensionCompletion::Unknown,
+                    &self.generation,
+                    &ExtensionLimits::default(),
+                    operation,
+                    stability,
+                    ExtensionWork::default(),
+                ),
+                &scope,
             ));
         };
         let wants_value = request
             .relations
             .contains(&SemanticRelationKind::ValueDependence);
-        let mut truncated = procedure.points().len() > values.max_nodes as usize
-            || procedure.control_edges().len() > values.max_edges as usize;
+        // Caller-supplied dimensions this derivation actually exhausted, in the
+        // order they were hit. Kept as data rather than one boolean so the
+        // result can name the limit to raise (#2412).
+        let mut exhausted = ExhaustedBudgets::default();
+        if procedure.points().len() > values.max_nodes as usize {
+            exhausted.record("max_nodes", SemanticRelationBoundaryKind::NodeLimit);
+        }
+        if procedure.control_edges().len() > values.max_edges as usize {
+            exhausted.record("max_edges", SemanticRelationBoundaryKind::EdgeLimit);
+        }
+        // Anchors are derived over *every* point of the procedure, in document
+        // order, before the node budget is applied: an occurrence ordinal must
+        // be a property of the procedure's own text, not of how many nodes this
+        // particular request happened to be allowed to emit.
+        let source = self
+            .analyzer
+            .analyzer()
+            .project()
+            .read_source_snapshot(&file)
+            .map_err(|error| ExtensionError::Execution(error.to_string().into_boxed_str()))?;
+        let anchors = semantic_node_anchors(procedure, source.source());
         let nodes = procedure
             .points()
             .iter()
@@ -534,15 +578,15 @@ impl ExtensionWorkspace {
                     .source_mapping(point.source)
                     .expect("validated semantic source mapping");
                 let span = mapping.locator.anchor().span();
+                let anchor = &anchors[local_id];
                 SemanticNodeOccurrence {
                     local_id: local_id as u32,
-                    stable_id: stable_semantic_id(
-                        &self.generation,
-                        seed.path.as_str(),
-                        span.start_byte(),
-                        span.end_byte(),
-                        point.id.index(),
-                    ),
+                    stable_id: stable_semantic_id(&SemanticNodeAnchor {
+                        path: seed.path.as_str(),
+                        owner: &anchor.owner,
+                        slice: &anchor.slice,
+                        occurrence_ordinal: anchor.occurrence_ordinal,
+                    }),
                     call_context: Box::new([]),
                     span: SourceSpan {
                         path: seed.path.clone(),
@@ -618,41 +662,71 @@ impl ExtensionWorkspace {
             .relations
             .contains(&SemanticRelationKind::ControlDependence)
         {
-            let dependence = derive_procedure_control_dependence(
+            // A caller's own work limit is not an execution failure: exhausting
+            // it is an answer about that limit, reported as the exhausted
+            // dimension rather than as an error (#2412).
+            let dependence = match derive_procedure_control_dependence(
                 procedure,
                 usize::try_from(values.max_traversal_steps).unwrap_or(usize::MAX),
                 cancellation.token(),
-            )
-            .map_err(ExtensionError::Execution)?;
-            algorithm_work = (dependence.node_visits + dependence.edge_visits) as u64;
-            edges.extend(dependence.rows.iter().filter_map(|(edge_id, governed)| {
-                let edge = procedure.control_edge(*edge_id)?;
-                (edge.source_point.index() < values.max_nodes as usize
-                    && governed.index() < values.max_nodes as usize)
-                    .then(|| SemanticRelationEdge {
-                        source: edge.source_point.index() as u32,
-                        target: governed.index() as u32,
-                        kind: SemanticRelationKind::ControlDependence,
-                        subtype: Some(edge.kind.label().into()),
-                        detail: SemanticRelationDetail::Generic,
-                        proof: SemanticProof::Proven,
-                        completeness: SemanticRelationCompleteness::Complete,
-                        evidence: vec![edge_evidence(edge)].into_boxed_slice(),
-                    })
-            }));
-            relation_boundaries.extend(dependence.non_exiting_regions.iter().map(|region| {
-                SemanticRelationBoundary {
-                    kind: SemanticRelationBoundaryKind::NonExitingRegion,
-                    at: region.first().map(|point| point.index() as u32),
-                    relations: vec![SemanticRelationKind::ControlDependence].into_boxed_slice(),
-                    message: format!(
-                        "{} live program points cannot reach a procedure exit",
-                        region.len()
-                    )
-                    .into_boxed_str(),
-                    evidence: Box::new([]),
+            ) {
+                Ok(dependence) => Some(dependence),
+                Err(ProcedureControlDependenceStop::ExceededBudget { .. }) => {
+                    exhausted.record(
+                        "max_traversal_steps",
+                        SemanticRelationBoundaryKind::TraversalStepLimit,
+                    );
+                    None
                 }
-            }));
+                Err(ProcedureControlDependenceStop::Cancelled) => {
+                    return Ok(with_tiers(
+                        make_outcome(
+                            None,
+                            ExtensionCompletion::Cancelled,
+                            &self.generation,
+                            &ExtensionLimits::default(),
+                            operation,
+                            stability,
+                            ExtensionWork::default(),
+                        ),
+                        &scope,
+                    ));
+                }
+                Err(ProcedureControlDependenceStop::Failed(message)) => {
+                    return Err(ExtensionError::Execution(message));
+                }
+            };
+            if let Some(dependence) = dependence {
+                algorithm_work = (dependence.node_visits + dependence.edge_visits) as u64;
+                edges.extend(dependence.rows.iter().filter_map(|(edge_id, governed)| {
+                    let edge = procedure.control_edge(*edge_id)?;
+                    (edge.source_point.index() < values.max_nodes as usize
+                        && governed.index() < values.max_nodes as usize)
+                        .then(|| SemanticRelationEdge {
+                            source: edge.source_point.index() as u32,
+                            target: governed.index() as u32,
+                            kind: SemanticRelationKind::ControlDependence,
+                            subtype: Some(edge.kind.label().into()),
+                            detail: SemanticRelationDetail::Generic,
+                            proof: SemanticProof::Proven,
+                            completeness: SemanticRelationCompleteness::Complete,
+                            evidence: vec![edge_evidence(edge)].into_boxed_slice(),
+                        })
+                }));
+                relation_boundaries.extend(dependence.non_exiting_regions.iter().map(|region| {
+                    SemanticRelationBoundary {
+                        kind: SemanticRelationBoundaryKind::NonExitingRegion,
+                        at: region.first().map(|point| point.index() as u32),
+                        relations: vec![SemanticRelationKind::ControlDependence].into_boxed_slice(),
+                        message: format!(
+                            "{} live program points cannot reach a procedure exit",
+                            region.len()
+                        )
+                        .into_boxed_str(),
+                        evidence: Box::new([]),
+                    }
+                }));
+            }
         }
         if wants_value {
             let procedure_handle = artifact
@@ -670,9 +744,24 @@ impl ExtensionWorkspace {
                 )
                 .map_err(|error| ExtensionError::Execution(error.to_string().into()))?;
             if let Some(snapshot) = outcome.available_value() {
-                truncated |= snapshot.relations().len()
-                    > values.max_value_dependence_edges as usize
-                    || snapshot.coverage() != CandidateCoverage::Exhaustive;
+                if snapshot.relations().len() > values.max_value_dependence_edges as usize {
+                    exhausted.record(
+                        "max_value_dependence_edges",
+                        SemanticRelationBoundaryKind::EdgeLimit,
+                    );
+                }
+                // Non-exhaustive candidate coverage is a property of what the
+                // value-flow analysis could see, not of any caller limit: it is
+                // a frontier, and raising every budget returns it again.
+                if snapshot.coverage() != CandidateCoverage::Exhaustive {
+                    relation_boundaries.push(SemanticRelationBoundary {
+                        kind: SemanticRelationBoundaryKind::MissingSemantics,
+                        at: None,
+                        relations: vec![SemanticRelationKind::ValueDependence].into_boxed_slice(),
+                        message: "value-flow candidate coverage is not exhaustive".into(),
+                        evidence: Box::new([]),
+                    });
+                }
                 for relation in snapshot
                     .relations()
                     .iter()
@@ -736,6 +825,9 @@ impl ExtensionWorkspace {
         }
         let derived_edge_count = edges.len();
         edges.truncate(values.max_edges as usize);
+        if derived_edge_count > values.max_edges as usize {
+            exhausted.record("max_edges", SemanticRelationBoundaryKind::EdgeLimit);
+        }
         let work = ExtensionWork {
             semantic_nodes: nodes.len() as u64,
             semantic_edges: edges.len() as u64,
@@ -744,49 +836,119 @@ impl ExtensionWorkspace {
         };
         let request_digest = request_digest(&request)
             .map_err(|error| ExtensionError::InvalidRequest(error.to_string().into()))?;
-        let mut boundaries = if truncated || derived_edge_count > values.max_edges as usize {
-            vec![SemanticRelationBoundary {
-                kind: SemanticRelationBoundaryKind::NodeLimit,
+        // A boundary per exhausted dimension, each naming its own limit: the
+        // consumer's question is "which number do I raise?", and one synthetic
+        // `NodeLimit` saying "node or edge" could not answer it (#2412).
+        let mut boundaries = exhausted
+            .dimensions
+            .iter()
+            .map(|dimension| SemanticRelationBoundary {
+                kind: dimension.kind,
                 at: None,
                 relations: request.relations.clone(),
-                message: "semantic node or edge limit reached".into(),
+                message: format!("{} exhausted", dimension.limit).into_boxed_str(),
                 evidence: Box::new([]),
-            }]
-        } else {
-            Vec::new()
-        };
+            })
+            .collect::<Vec<_>>();
+        // Frontier boundaries are carried alongside, never folded into the
+        // budget verdict: a genuine analysis frontier is the same answer at
+        // every budget, so it must not report as truncation.
+        let frontier_kinds = distinct_kinds(&relation_boundaries);
         boundaries.extend(relation_boundaries);
-        let truncated =
-            truncated || derived_edge_count > values.max_edges as usize || !boundaries.is_empty();
+        // Precedence when both occurred: budget-bounded wins, because it is the
+        // caller-actionable state. The frontier boundaries stay in the snapshot.
+        let (status, snapshot_completion) = match (exhausted.dimensions.first(), frontier_kinds) {
+            (Some(dimension), _) => (
+                SemanticRelationStatus::BudgetBounded,
+                ExtensionCompletion::Truncated {
+                    limit: dimension.limit.into(),
+                },
+            ),
+            (None, kinds) if !kinds.is_empty() => (
+                SemanticRelationStatus::FrontierBounded,
+                ExtensionCompletion::FrontierBounded { kinds },
+            ),
+            (None, _) => (SemanticRelationStatus::Complete, completion),
+        };
         let snapshot = SemanticRelationSnapshot::try_new(
             self.generation.clone(),
             request_digest,
-            if truncated {
-                SemanticRelationStatus::Partial
-            } else {
-                SemanticRelationStatus::Complete
-            },
+            status,
             nodes,
             edges,
             boundaries,
         )
         .map_err(|error| ExtensionError::Execution(error.to_string().into()))?;
-        Ok(make_outcome(
-            Some(snapshot),
-            if truncated {
-                ExtensionCompletion::Truncated {
-                    limit: "semantic_nodes_or_edges".into(),
-                }
-            } else {
-                completion
-            },
-            &self.generation,
-            &ExtensionLimits::default(),
-            operation,
-            stability,
-            work,
+        Ok(with_tiers(
+            make_outcome(
+                Some(snapshot),
+                snapshot_completion,
+                &self.generation,
+                &ExtensionLimits::default(),
+                operation,
+                stability,
+                work,
+            ),
+            &scope,
         ))
     }
+}
+
+/// The caller-supplied dimensions one derivation exhausted, in the order it hit
+/// them, deduplicated. The first is the one the result's `limit` label names.
+#[derive(Debug, Default)]
+struct ExhaustedBudgets {
+    dimensions: Vec<ExhaustedDimension>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExhaustedDimension {
+    /// The request-limit field name, spelled as the caller spells it.
+    limit: &'static str,
+    kind: SemanticRelationBoundaryKind,
+}
+
+impl ExhaustedBudgets {
+    fn record(&mut self, limit: &'static str, kind: SemanticRelationBoundaryKind) {
+        debug_assert!(
+            kind.is_budget(),
+            "an exhausted budget must be reported with a budget boundary kind, got {kind:?}"
+        );
+        if !self
+            .dimensions
+            .iter()
+            .any(|dimension| dimension.limit == limit)
+        {
+            self.dimensions.push(ExhaustedDimension { limit, kind });
+        }
+    }
+}
+
+/// The distinct boundary kinds present, sorted, for the frontier completion.
+fn distinct_kinds(boundaries: &[SemanticRelationBoundary]) -> Box<[SemanticRelationBoundaryKind]> {
+    let mut kinds = boundaries
+        .iter()
+        .map(|boundary| boundary.kind)
+        .collect::<Vec<_>>();
+    kinds.sort_unstable();
+    kinds.dedup();
+    kinds.into_boxed_slice()
+}
+
+/// Attaches the rung report (#2414 step 6) an operation's request scope
+/// observed. Read at the end of the operation, so it covers every tier
+/// crossing the answer paid for.
+fn with_tiers<T>(
+    mut outcome: ExtensionOutcome<T>,
+    scope: &AnalyzerQueryScope<'_>,
+) -> ExtensionOutcome<T> {
+    outcome.metadata.tiers = ExtensionTierReport {
+        syntax: scope.tier_access_count(InformationTier::Syntax) as u64,
+        imports: scope.tier_access_count(InformationTier::Imports) as u64,
+        supertypes: scope.tier_access_count(InformationTier::Supertypes) as u64,
+        usage_graph: scope.tier_access_count(InformationTier::UsageGraph) as u64,
+    };
+    outcome
 }
 
 fn value_occurrence(
@@ -901,16 +1063,116 @@ fn unsupported_content_diagnostic(file: &ProjectFile) -> ExtensionDiagnostic {
 fn capability(value: &str) -> ExtensionCapabilityId {
     ExtensionCapabilityId::new(value).expect("static capability is valid")
 }
-fn stable_semantic_id(
-    generation: &WorkspaceGeneration,
-    path: &str,
-    start: u32,
-    end: u32,
-    local: usize,
-) -> StableDigest {
-    StableDigest::from_hash(format!(
-        "semantic-node-v1\0{generation}\0{path}\0{start}\0{end}\0{local}"
-    ))
+/// The identity anchor of one extension semantic node (#2411).
+///
+/// Deliberately mirrors `PolicyFindingId::from_match_anchor()`: nothing here is
+/// a coordinate or a workspace-wide value, so an edit that does not touch the
+/// denoted bytes, the enclosing declaration, or the ordering of identical
+/// siblings leaves the id unchanged. Editing the denoted bytes *does* change
+/// the id, so an old id can never silently alias a changed node.
+struct SemanticNodeAnchor<'a> {
+    /// Workspace-relative, slash-normalized path. Never the absolute path and
+    /// never the project root, so relocating the checkout is not observable.
+    path: &'a str,
+    /// The enclosing declaration path, rendered from the node's
+    /// `SemanticLocator` declaration segments (kind, name, sibling ordinal).
+    /// Segment anchors are excluded: they are byte offsets.
+    owner: &'a str,
+    /// The exact source bytes the node denotes -- not its offsets.
+    slice: &'a str,
+    /// Position among otherwise identical anchors (same path, owner and slice)
+    /// in document order within the procedure, so byte-identical siblings stay
+    /// distinct and an identical earlier insertion shifts only its own
+    /// duplicates.
+    occurrence_ordinal: u32,
+}
+
+fn stable_semantic_id(anchor: &SemanticNodeAnchor<'_>) -> StableDigest {
+    let mut hasher = Sha256::new();
+    let mut field = |value: &[u8]| {
+        let length = u64::try_from(value.len()).expect("usize fits in u64 on supported targets");
+        hasher.update(length.to_be_bytes());
+        hasher.update(value);
+    };
+    field(b"semantic-node-v2");
+    field(anchor.path.as_bytes());
+    field(anchor.owner.as_bytes());
+    field(format!("{:x}", Sha256::digest(anchor.slice.as_bytes())).as_bytes());
+    field(&anchor.occurrence_ordinal.to_be_bytes());
+    StableDigest::parse(format!("{:x}", hasher.finalize())).expect("SHA-256 is canonical")
+}
+
+/// The derived anchor parts of one program point, in `points()` order.
+struct DerivedNodeAnchor {
+    owner: String,
+    slice: String,
+    occurrence_ordinal: u32,
+}
+
+/// Derives the identity anchor of every program point of one procedure.
+///
+/// Ordinals are assigned in document order over the whole procedure, so a node
+/// keeps its ordinal regardless of the request's node budget and regardless of
+/// the order `points()` happens to store points in.
+fn semantic_node_anchors(procedure: &ProcedureSemantics, source: &str) -> Vec<DerivedNodeAnchor> {
+    let mut spans = Vec::with_capacity(procedure.points().len());
+    let mut parts = procedure
+        .points()
+        .iter()
+        .map(|point| {
+            let mapping = procedure
+                .source_mapping(point.source)
+                .expect("validated semantic source mapping");
+            let span = mapping.locator.anchor().span();
+            spans.push((span.start_byte(), span.end_byte()));
+            let (start, end) = (span.start_byte() as usize, span.end_byte() as usize);
+            DerivedNodeAnchor {
+                owner: semantic_owner_key(&mapping.locator),
+                // A mapped span that is not a char boundary of the current
+                // source cannot happen for a materialization of this same
+                // revision; an empty slice keeps identity total rather than
+                // panicking a caller's request if it ever does.
+                slice: source.get(start..end).unwrap_or_default().to_owned(),
+                occurrence_ordinal: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut document_order = (0..parts.len()).collect::<Vec<_>>();
+    document_order.sort_by_key(|&index| (spans[index], index));
+    // Keyed by the digest of the identical-anchor key (owner plus slice) so a
+    // procedure with large denoted slices does not carry them twice.
+    let mut seen: HashMap<[u8; 32], u32> = HashMap::new();
+    for index in document_order {
+        let mut hasher = Sha256::new();
+        hasher.update((parts[index].owner.len() as u64).to_be_bytes());
+        hasher.update(parts[index].owner.as_bytes());
+        hasher.update(parts[index].slice.as_bytes());
+        let key: [u8; 32] = hasher.finalize().into();
+        let ordinal = seen.entry(key).or_insert(0);
+        parts[index].occurrence_ordinal = *ordinal;
+        *ordinal += 1;
+    }
+    parts
+}
+
+/// Renders one node's enclosing declaration path into the stable owner string
+/// the anchor hashes. Only stable parts participate: the segment kind label,
+/// the declared name (absent for an anonymous callable), and the sibling
+/// ordinal that distinguishes same-shaped siblings. The segment's own
+/// `SourceAnchor` is a byte offset and is excluded on purpose.
+fn semantic_owner_key(locator: &SemanticLocator) -> String {
+    let mut owner = String::new();
+    for segment in locator.declaration().segments() {
+        if !owner.is_empty() {
+            owner.push('/');
+        }
+        owner.push_str(segment.kind().stable_label());
+        owner.push(':');
+        owner.push_str(segment.name().unwrap_or("<anonymous>"));
+        owner.push('#');
+        owner.push_str(&segment.sibling_ordinal().to_string());
+    }
+    owner
 }
 fn semantic_completion<T>(outcome: &SemanticOutcome<T>) -> ExtensionCompletion {
     match outcome {
@@ -947,6 +1209,9 @@ fn make_outcome<T>(
             generation: generation.clone(),
             diagnostics: Box::new([]),
             work,
+            // Zero reads as "no tier crossing observed"; an operation that ran
+            // under a request scope overwrites it through `with_tiers`.
+            tiers: ExtensionTierReport::default(),
             limits: limits.values(),
             provenance: vec![
                 format!("brokk-bifrost-runtime:{}", env!("CARGO_PKG_VERSION")).into_boxed_str(),

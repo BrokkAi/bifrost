@@ -16,6 +16,54 @@ pub fn rel_path_string(file: &ProjectFile) -> String {
     file.rel_path().to_string_lossy().replace('\\', "/")
 }
 
+/// The path-suffix key `path` denotes: its `Normal` components joined with
+/// `/`, or `None` when it has none.
+///
+/// This is the spelling both halves of the tier demand record (#1865) agree on.
+/// A demand key is recorded from the target text of an import directive that
+/// resolved to nothing, and a candidate file is tested by generating
+/// [`path_suffix_keys`] of its workspace-relative path: a hit means the file
+/// could satisfy that directive.
+///
+/// Non-`Normal` components (`.`, `..`, a root, a Windows prefix) are dropped
+/// rather than rejected, which widens the key -- `../gen/x.inc` records
+/// `gen/x.inc`. Widening is the safe direction: the demand record decides
+/// whether to *re-derive*, so an over-broad key costs one derivation and a
+/// too-narrow one would silently drop a file from the index.
+pub fn path_suffix_key(path: &Path) -> Option<String> {
+    let mut key = String::new();
+    for component in path.components() {
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        if !key.is_empty() {
+            key.push('/');
+        }
+        key.push_str(&part.to_string_lossy());
+    }
+    (!key.is_empty()).then_some(key)
+}
+
+/// Every suffix of `path`'s `Normal` components as a [`path_suffix_key`],
+/// longest first: `a/b/c.inc` yields `a/b/c.inc`, `b/c.inc`, `c.inc`.
+///
+/// A recorded demand key matches `path` exactly when it is one of these, which
+/// is the same relation `#include` resolution uses -- full workspace-relative
+/// path, includer-relative path, and the trailing-components fallback are all
+/// component suffixes of the file that satisfies them.
+pub fn path_suffix_keys(path: &Path) -> Vec<String> {
+    let parts: Vec<String> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    (0..parts.len())
+        .map(|start| parts[start..].join("/"))
+        .collect()
+}
+
 // Reject absolute paths, root-anchored paths, and Windows drive-relative
 // references so MCP callers cannot escape the active workspace via a crafted
 // `file_paths` entry. Returns the normalized project-relative path on success.

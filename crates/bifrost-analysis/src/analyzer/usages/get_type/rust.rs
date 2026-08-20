@@ -1,4 +1,6 @@
 use super::{TypeLookupOutcome, candidates_outcome, no_type, type_reference_outcome};
+use crate::analyzer::QueryScope;
+use crate::analyzer::QueryToken;
 use crate::analyzer::usages::get_definition::{
     AnalyzerRustDefinitionProvider, BoundedResolution, ResolutionSession, RustTypeLookupCache,
     rust_expression_type_definition_fqn_cached, rust_is_type_definition,
@@ -26,6 +28,7 @@ pub(crate) fn resolve_rust_type_bounded(
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<TypeLookupOutcome> {
+    let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
     let session = ResolutionSession::bounded(budget, cancellation);
     let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
         return session.finish(no_type(
@@ -35,8 +38,16 @@ pub(crate) fn resolve_rust_type_bounded(
     };
     let support = AnalyzerRustDefinitionProvider::bounded(rust, &session);
     let mut cache = RustTypeLookupCache::bounded_for_query();
-    let outcome =
-        resolve_rust_type_with_provider(analyzer, file, source, tree, site, &mut cache, &support);
+    let outcome = resolve_rust_type_with_provider(
+        analyzer,
+        scope.token(),
+        file,
+        source,
+        tree,
+        site,
+        &mut cache,
+        &support,
+    );
     session.finish(outcome)
 }
 
@@ -58,6 +69,7 @@ pub(crate) fn resolve_rust_type_interactive(
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<TypeLookupOutcome> {
+    let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
     let session = ResolutionSession::bounded(budget, cancellation);
     let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
         return session.finish(no_type(
@@ -67,14 +79,23 @@ pub(crate) fn resolve_rust_type_interactive(
     };
     let support = AnalyzerRustDefinitionProvider::cancellable_full(rust, &session);
     let mut cache = RustTypeLookupCache::default();
-    let outcome =
-        resolve_rust_type_with_provider(analyzer, file, source, tree, site, &mut cache, &support);
+    let outcome = resolve_rust_type_with_provider(
+        analyzer,
+        scope.token(),
+        file,
+        source,
+        tree,
+        site,
+        &mut cache,
+        &support,
+    );
     session.finish(outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_rust_type_with_provider(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -99,6 +120,7 @@ fn resolve_rust_type_with_provider(
     if rust_is_type_reference_position(support, node) {
         let Some(fqn) = rust_resolve_type_node_fqn(
             analyzer,
+            token,
             support,
             file,
             source,
@@ -135,6 +157,7 @@ fn resolve_rust_type_with_provider(
     };
     let Some(fqn) = rust_expression_type_definition_fqn_cached(
         analyzer,
+        token,
         support,
         file,
         source,

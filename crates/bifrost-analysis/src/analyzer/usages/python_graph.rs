@@ -9,6 +9,7 @@
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
 use crate::analyzer::usages::common::{classify_recursive_hits, language_for_target};
 use crate::analyzer::usages::inverted_edges::{
@@ -51,7 +52,9 @@ pub(in crate::analyzer::usages) fn with_python_graph_source<R>(
     let definitions = |consume: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| {
         consume(&analyzer.global_usage_definition_index());
     };
+    let scope = AnalyzerQueryScope::new(analyzer);
     visit(PythonGraphSource {
+        token: scope.token(),
         index: analyzer,
         hierarchy: analyzer.type_hierarchy_provider(),
         imports: analyzer.import_analysis_provider(),
@@ -336,6 +339,7 @@ impl UsageAnalyzer for PythonExportUsageGraphStrategy {
 #[cfg(test)]
 mod tests {
     use crate::analyzer::usages::python_graph::with_python_graph_source;
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{CodeUnitIndex, Language, PythonAnalyzer, TestProject};
     use brokk_bifrost_python::graph::extractor::{
         collect_scope_facts_from_parsed_source, with_callable_return_type_lookup_counter_for_test,
@@ -380,8 +384,9 @@ mod tests {
             .into_iter()
             .find(|file| file.to_string().ends_with("consumer.py"))
             .expect("consumer file");
+        let scope = AnalyzerQueryScope::new(&analyzer);
         let prepared = analyzer
-            .prepared_syntax(&consumer)
+            .prepared_syntax(scope.token(), &consumer)
             .expect("consumer prepared syntax");
 
         let (_facts, counts) = with_callable_return_type_lookup_counter_for_test(|| {

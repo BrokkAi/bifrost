@@ -58,6 +58,34 @@ fn port_endpoint(endpoint: &ValueFlowEndpoint, expected: ProcedurePortKind) -> b
     matches!(endpoint, ValueFlowEndpoint::Port(port) if port.kind() == expected)
 }
 
+/// Whether a memory access names an index location.
+///
+/// #2453: a subscript is not an identity the analysis can prove apart across
+/// accesses, so an index access publishes its *container* alongside the exact
+/// element it names -- the array reads out of, and writes into, one smashed
+/// cell. When the access-path resolver walked the subscripted expression back
+/// to an origin that a value or a port carries, that container is a value or a
+/// port endpoint rather than a location, so this is the one memory-access shape
+/// whose relation endpoint may be something other than a location.
+///
+/// Field accesses are deliberately excluded. Smashing indices does not change
+/// what a member selector proves, and a field access that published its base
+/// this way would silently make the whole object one cell.
+fn memory_access_is_indexed(
+    procedure: &ProcedureHandle,
+    location: crate::analyzer::semantic::MemoryLocationId,
+) -> bool {
+    procedure
+        .semantics()
+        .memory_location(location)
+        .is_some_and(|row| {
+            matches!(
+                row.kind,
+                crate::analyzer::semantic::MemoryLocationKind::Index { .. }
+            )
+        })
+}
+
 fn relation_matches_event(
     procedure: &ProcedureHandle,
     relation: &ValueFlowRelation,
@@ -148,15 +176,21 @@ fn relation_matches_event(
                     )
                     && value_endpoint(&relation.target, row.result)
             }),
-        SemanticEffect::MemoryLoad { result, .. } => {
+        SemanticEffect::MemoryLoad {
+            location, result, ..
+        } => {
             relation.kind == ValueFlowRelationKind::MemoryLoad
-                && matches!(&relation.source, ValueFlowEndpoint::Location(_))
+                && (matches!(&relation.source, ValueFlowEndpoint::Location(_))
+                    || memory_access_is_indexed(procedure, *location))
                 && value_endpoint(&relation.target, *result)
         }
-        SemanticEffect::MemoryStore { value, .. } => {
+        SemanticEffect::MemoryStore {
+            location, value, ..
+        } => {
             relation.kind == ValueFlowRelationKind::MemoryStore
                 && value_endpoint(&relation.source, *value)
-                && matches!(&relation.target, ValueFlowEndpoint::Location(_))
+                && (matches!(&relation.target, ValueFlowEndpoint::Location(_))
+                    || memory_access_is_indexed(procedure, *location))
         }
         SemanticEffect::CaptureBind { capture } => {
             procedure.semantics().capture(*capture).is_some_and(|row| {

@@ -6,8 +6,10 @@ mod hierarchy;
 pub(crate) mod imports;
 mod semantic;
 mod structural;
+use crate::analyzer::QueryToken;
 use crate::analyzer::Range;
 use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
@@ -339,7 +341,8 @@ impl JavaAnalyzer {
         candidates: Vec<CodeUnit>,
         call_arity: usize,
     ) -> (Vec<CodeUnit>, bool) {
-        java_constructor_context(self, owner, candidates, call_arity)
+        let scope = AnalyzerQueryScope::new(self);
+        java_constructor_context(self, scope.token(), owner, candidates, call_arity)
     }
 }
 
@@ -397,8 +400,12 @@ impl JavaSource for JavaAnalyzer {
         self.inner.raw_supertypes_of(code_unit)
     }
 
-    fn prepared_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>> {
-        self.inner.prepared_syntax(file)
+    fn prepared_syntax(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Arc<PreparedSyntaxTree>> {
+        self.inner.prepared_syntax(token, file)
     }
 
     fn retained_external_index(&self) -> JvmRetainedExternalIndex {

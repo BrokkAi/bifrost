@@ -15,6 +15,7 @@ use super::materialization::MaterializationAxis;
 use super::occurrences::OccurrenceRole;
 use super::resolution::EnvironmentAxis;
 use super::routes::{IdentityAxis, RouteHopKind};
+use crate::analyzer::QueryScope;
 use crate::analyzer::tree_sitter_analyzer::{
     LanguageAdapter, PreparedSyntaxLimitedOutcome, PreparedSyntaxTree, TreeSitterAnalyzer,
 };
@@ -381,7 +382,13 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
         max_source_bytes: usize,
         cancellation: Option<&CancellationToken>,
     ) -> StructuralSyntaxLimitedOutcome {
-        match self.prepared_syntax_limited_cancellable(file, max_source_bytes, cancellation) {
+        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        match self.prepared_syntax_limited_cancellable(
+            scope.token(),
+            file,
+            max_source_bytes,
+            cancellation,
+        ) {
             PreparedSyntaxLimitedOutcome::Available(_, inner) => {
                 StructuralSyntaxLimitedOutcome::Available(StructuralPreparedSyntax { inner })
             }

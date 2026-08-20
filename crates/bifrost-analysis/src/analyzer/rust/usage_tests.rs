@@ -7,6 +7,7 @@
 #[cfg(test)]
 mod tests {
     use crate::analyzer::rust::RustAnalyzer;
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{CodeUnit, CodeUnitIndex};
     use crate::analyzer::{CodeUnitType, Language, ProjectFile, TestProject};
     use brokk_bifrost_rust::usage::RustReferenceResolution;
@@ -57,7 +58,8 @@ mod tests {
             "get_connection",
         );
         let roots = BTreeSet::from([target.clone()]);
-        let walks = RustUsageWalks::new(&analyzer);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, scope.token());
         let seeds = walks
             .binding_seeds_while(&analyzer, &roots, &|| true)
             .expect("an uncancelled walk answers");
@@ -187,7 +189,12 @@ mod tests {
         let analyzer = analyzer_for(&root);
         let util = ProjectFile::new(root.clone(), "src/util.rs");
         for d in analyzer.declarations(&util) {
-            let vis = brokk_bifrost_rust::graph_support::rust_declaration_visibility(&analyzer, &d);
+            let scope = AnalyzerQueryScope::new(&analyzer);
+            let vis = brokk_bifrost_rust::graph_support::rust_declaration_visibility(
+                &analyzer,
+                scope.token(),
+                &d,
+            );
             println!(
                 "DBG {} kind={:?} vis={:?} parent={:?}",
                 d.fq_name(),

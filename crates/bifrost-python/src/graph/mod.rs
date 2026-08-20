@@ -13,6 +13,7 @@ pub mod inverted;
 pub mod resolver;
 
 use brokk_bifrost_core::analyzer::capabilities::{ImportAnalysisProvider, TypeHierarchyProvider};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{CodeUnitIndex, DefinitionLookupAccess};
 
 /// The *dispatching* analyzer's side of a Python usage-graph scan.
@@ -34,4 +35,7 @@ pub struct PythonGraphSource<'a> {
     pub hierarchy: Option<&'a dyn TypeHierarchyProvider>,
     pub imports: Option<&'a dyn ImportAnalysisProvider>,
     pub definitions: &'a DefinitionLookupAccess<'a>,
+    /// Proof that the request scope this per-query bundle serves is open
+    /// (issue #2414 step 3).
+    pub token: QueryToken<'a>,
 }

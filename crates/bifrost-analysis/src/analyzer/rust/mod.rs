@@ -20,6 +20,7 @@ mod usage_tests;
 #[cfg(test)]
 mod usage_walks_tests;
 
+use crate::analyzer::QueryToken;
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
@@ -46,6 +47,7 @@ use crate::analyzer::{
     TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
     resolve_analyzer,
 };
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
@@ -174,9 +176,10 @@ impl RustAnalyzer {
 
     pub(crate) fn prepared_syntax(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
-        self.inner.prepared_syntax(file)
+        self.inner.prepared_syntax(token, file)
     }
 
     pub(super) fn analyzer_store(&self) -> &Arc<crate::analyzer::store::AnalyzerStore> {
@@ -212,6 +215,7 @@ impl RustAnalyzer {
         let facts = Arc::new(
             brokk_bifrost_rust::usage_queries::rust_declaration_facts(
                 self,
+                AnalyzerQueryScope::new(self).token(),
                 file,
                 &self.declarations(file),
                 &|| true,
@@ -445,6 +449,7 @@ impl RustAnalyzer {
         keep_going: &(dyn Fn() -> bool + Sync),
     ) -> Option<HashMap<ProjectFile, RustModuleRouteFacts>> {
         keep_going().then_some(())?;
+        let scope = AnalyzerQueryScope::new(self);
         let snapshot = self.live_path_snapshot();
         let oids: Vec<(ProjectFile, git2::Oid)> = files
             .iter()
@@ -477,7 +482,7 @@ impl RustAnalyzer {
         }
         for file in missing {
             keep_going().then_some(())?;
-            let Some(prepared) = self.prepared_syntax(&file) else {
+            let Some(prepared) = self.prepared_syntax(scope.token(), &file) else {
                 continue;
             };
             self.module_route_fact_fallback_count
@@ -703,9 +708,10 @@ impl brokk_bifrost_rust::graph_support::RustSource for RustAnalyzer {
 
     fn prepared_syntax(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
-        self.prepared_syntax(file)
+        self.prepared_syntax(token, file)
     }
 
     fn cargo_routes(&self) -> Arc<RustCargoRouteIndex> {
@@ -809,28 +815,38 @@ impl RustFactSource for RustAnalyzer {
         self.ensure_rust_facts_caught_up();
     }
 
-    fn reference_context_of<'a>(&'a self, file: &ProjectFile) -> RustReferenceContext<'a> {
-        self.reference_context_of(file)
+    fn reference_context_of<'a>(
+        &'a self,
+        token: QueryToken<'a>,
+        file: &ProjectFile,
+    ) -> RustReferenceContext<'a> {
+        self.reference_context_of(token, file)
     }
 
     fn reference_context_of_with_progress<'a>(
         &'a self,
+        token: QueryToken<'a>,
         file: &ProjectFile,
         progress: &'a dyn Fn() -> bool,
     ) -> Option<RustReferenceContext<'a>> {
-        progress().then(|| self.reference_context_of_while(file, progress))
+        progress().then(|| self.reference_context_of_while(token, file, progress))
     }
 
-    fn forward_reference_context_of<'a>(&'a self, file: &ProjectFile) -> RustReferenceContext<'a> {
-        self.forward_reference_context_of(file)
+    fn forward_reference_context_of<'a>(
+        &'a self,
+        token: QueryToken<'a>,
+        file: &ProjectFile,
+    ) -> RustReferenceContext<'a> {
+        self.forward_reference_context_of(token, file)
     }
 
     fn forward_reference_context_of_with_progress<'a>(
         &'a self,
+        token: QueryToken<'a>,
         file: &ProjectFile,
         progress: &'a dyn Fn() -> bool,
     ) -> Option<RustReferenceContext<'a>> {
-        progress().then(|| self.forward_reference_context_of_while(file, progress))
+        progress().then(|| self.forward_reference_context_of_while(token, file, progress))
     }
 }
 
@@ -1479,8 +1495,10 @@ impl StructuralReceiverResolver for RustSupport {
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<DefinitionLookupOutcome> {
+        let scope = AnalyzerQueryScope::new(query.analyzer);
         resolve_rust_bounded(
             query.analyzer,
+            scope.token(),
             query.file,
             query.source,
             query.tree,

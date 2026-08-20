@@ -8,7 +8,8 @@
 
 use crate::analyzer::usages::cpp_graph::CppDispatch;
 use crate::analyzer::{
-    CodeUnit, CodeUnitIndex, CodeUnitType, CppAnalyzer, ProjectFile, resolve_analyzer,
+    CodeUnit, CodeUnitIndex, CodeUnitType, CppAnalyzer, ProjectFile, QueryScope, QueryToken,
+    resolve_analyzer,
 };
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, CppTemplateExpression, CppTemplateParameterMetadata, CppTemplateTerm,
@@ -321,6 +322,8 @@ ABSL_NAMESPACE_END
             root.clone(),
             crate::analyzer::Language::Cpp,
         ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let query_token = query_scope.token();
         let source_location = ProjectFile::new(root.clone(), "source_location.h");
         let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
         let declarations = analyzer
@@ -349,11 +352,15 @@ ABSL_NAMESPACE_END
             })
             .expect("standard-library alias declaration");
         let roots = HashSet::from_iter([consumer.clone()]);
-        let visibility =
-            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
+        let visibility = VisibilityIndex::build(
+            &analyzer,
+            query_token,
+            &CppGraphSource::from_source(&analyzer, query_token),
+            &roots,
+        );
         assert_eq!(
             visibility.unique_type_candidate_preserving_target(
-                &CppGraphSource::from_source(&analyzer),
+                &CppGraphSource::from_source(&analyzer, query_token),
                 &consumer,
                 &[class_decl, alias_decl],
                 class_decl,
@@ -362,12 +369,12 @@ ABSL_NAMESPACE_END
             "same-file conditional declarations preserve the selected target identity"
         );
         assert!(visibility.alternate_same_fqn_type_declarations(
-            &CppGraphSource::from_source(&analyzer),
+            &CppGraphSource::from_source(&analyzer, query_token),
             &[class_decl, alias_decl],
             class_decl,
         ));
         assert!(visibility.complementary_same_fqn_type_declarations(
-            &CppGraphSource::from_source(&analyzer),
+            &CppGraphSource::from_source(&analyzer, query_token),
             &[class_decl, alias_decl],
             class_decl,
         ));
@@ -381,7 +388,7 @@ ABSL_NAMESPACE_END
         );
         assert!(
             !visibility.alternate_same_fqn_type_declarations(
-                &CppGraphSource::from_source(&analyzer),
+                &CppGraphSource::from_source(&analyzer, query_token),
                 &[class_decl, alias_decl, &unguarded_duplicate],
                 class_decl,
             ),
@@ -397,7 +404,7 @@ ABSL_NAMESPACE_END
             false,
         );
         assert!(!visibility.alternate_same_fqn_type_declarations(
-            &CppGraphSource::from_source(&analyzer),
+            &CppGraphSource::from_source(&analyzer, query_token),
             &[class_decl, &duplicate],
             class_decl,
         ));
@@ -410,7 +417,7 @@ ABSL_NAMESPACE_END
             false,
         );
         assert!(!visibility.alternate_same_fqn_type_declarations(
-            &CppGraphSource::from_source(&analyzer),
+            &CppGraphSource::from_source(&analyzer, query_token),
             &[class_decl, &other_namespace_decl],
             class_decl,
         ));
@@ -445,6 +452,8 @@ ABSL_NAMESPACE_END
             root,
             crate::analyzer::Language::Cpp,
         ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let query_token = query_scope.token();
         let target = analyzer
             .get_all_declarations()
             .into_iter()
@@ -458,7 +467,7 @@ ABSL_NAMESPACE_END
         let (internal, inspected_peers) =
             with_cpp_global_field_linkage_peer_inspection_counter_for_test(|| {
                 cpp_global_field_has_internal_linkage(
-                    &CppGraphSource::from_source(&analyzer),
+                    &CppGraphSource::from_source(&analyzer, query_token),
                     &target,
                 )
             });
@@ -585,7 +594,9 @@ ABSL_NAMESPACE_END
             |file, _c_semantics| declarations.get(file).cloned().unwrap_or_default(),
         );
         let cpp = visibility_analyzer(&visible_by_file);
-        let visibility = visibility_index(&cpp, visible_by_file);
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
+        let visibility = visibility_index(&cpp, query_token, visible_by_file);
         let candidate_sources = |file: &ProjectFile| {
             visibility
                 .visible_identifier_candidates(file, "Collision")
@@ -614,6 +625,8 @@ ABSL_NAMESPACE_END
             root.clone(),
             crate::analyzer::Language::Cpp,
         ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
         let target_for = |source: &ProjectFile| {
             cpp.get_all_declarations()
                 .into_iter()
@@ -627,7 +640,8 @@ ABSL_NAMESPACE_END
         let left_global = target_for(&left);
         let right_global = target_for(&right);
         let roots = HashSet::from_iter([left.clone(), right.clone()]);
-        let batch = CppAuthoritativeUsageBatch::new(&cpp, &roots).expect("shared cpp batch");
+        let batch =
+            CppAuthoritativeUsageBatch::new(&cpp, query_token, &roots).expect("shared cpp batch");
         let candidate_files = HashSet::from_iter([left.clone(), right.clone()]);
         let expected_hit = |file: &ProjectFile, source: &str| {
             let start = source.rfind("local_value;").expect("usage marker");
@@ -663,7 +677,12 @@ ABSL_NAMESPACE_END
             HashSet::from_iter([expected_hit(&right, right_source)]),
         );
 
-        let visibility = VisibilityIndex::build(&cpp, &CppGraphSource::from_source(&cpp), &roots);
+        let visibility = VisibilityIndex::build(
+            &cpp,
+            query_token,
+            &CppGraphSource::from_source(&cpp, query_token),
+            &roots,
+        );
         assert!(visibility.is_visible(&left, &left_global));
         assert!(visibility.is_visible(&right, &right_global));
         assert!(
@@ -699,10 +718,12 @@ ABSL_NAMESPACE_END
             ),
         ]);
         let cpp = visibility_analyzer(&visible_by_file);
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
         let (by_identifier, classification_count) =
             with_cpp_global_field_internal_linkage_classification_counter_for_test(|| {
                 build_visible_identifier_index(
-                    &CppGraphSource::from_source(&cpp),
+                    &CppGraphSource::from_source(&cpp, query_token),
                     &visible_by_file,
                     &visible_source_files_by_root,
                     &mut HashMap::default(),
@@ -757,9 +778,10 @@ ABSL_NAMESPACE_END
 
     fn visibility_index<'a>(
         cpp: &'a CppAnalyzer,
+        token: QueryToken<'a>,
         visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     ) -> VisibilityIndex<'a> {
-        VisibilityIndex::from_visible_files_for_test(cpp, visible_by_file)
+        VisibilityIndex::from_visible_files_for_test(cpp, token, visible_by_file)
     }
 
     #[test]
@@ -776,7 +798,9 @@ ABSL_NAMESPACE_END
         let visible_by_file =
             HashMap::from_iter([(consumer.clone(), HashSet::from_iter([legacy.clone()]))]);
         let cpp = visibility_analyzer(&visible_by_file);
-        let visibility = visibility_index(&cpp, visible_by_file);
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
+        let visibility = visibility_index(&cpp, query_token, visible_by_file);
         let source = "legacy<int> value;";
         let mut parser = Parser::new();
         parser
@@ -899,7 +923,9 @@ ABSL_NAMESPACE_END
             (alias.source().clone(), visible),
         ]);
         let cpp = visibility_analyzer(&visible_by_file);
-        let visibility = visibility_index(&cpp, visible_by_file);
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
+        let visibility = visibility_index(&cpp, query_token, visible_by_file);
 
         visibility.reset_qualified_candidate_inspections();
         let candidates = visibility.type_candidates(&consumer, "perf::Exact");
@@ -1001,7 +1027,9 @@ ABSL_NAMESPACE_END
             ]),
         )]);
         let cpp = visibility_analyzer(&visible_by_file);
-        let visibility = visibility_index(&cpp, visible_by_file);
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
+        let visibility = visibility_index(&cpp, query_token, visible_by_file);
 
         assert_eq!(
             visibility.candidate_units(&consumer, "ns::Outer::Inner", TargetKind::Type),
@@ -1178,9 +1206,10 @@ ABSL_NAMESPACE_END
             "every candidate must share the same source: {candidates:#?}"
         );
 
-        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        let query_token = query_scope.token();
         assert!(
-            cpp.prepared_syntax(&file).is_some(),
+            cpp.prepared_syntax(query_token, &file).is_some(),
             "prepare shared syntax"
         );
         cpp.reset_cpp_owner_resolution_counts_for_test();
@@ -1188,7 +1217,7 @@ ABSL_NAMESPACE_END
             .iter()
             .map(|candidate| {
                 cpp_class_declaration_strength(
-                    &CppDispatch::new(workspace.analyzer()).source(),
+                    &CppDispatch::new(workspace.analyzer(), query_token).source(),
                     candidate,
                 )
             })
@@ -1260,14 +1289,18 @@ ABSL_NAMESPACE_END
             crate::analyzer::AnalyzerConfig::default(),
         );
         let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
-        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        let query_token = query_scope.token();
         let roots = [file.clone()].into_iter().collect();
         let visibility = VisibilityIndex::build(
             cpp,
-            &CppDispatch::new(workspace.analyzer()).source(),
+            query_token,
+            &CppDispatch::new(workspace.analyzer(), query_token).source(),
             &roots,
         );
-        let prepared = cpp.prepared_syntax(&file).expect("prepared macro fixture");
+        let prepared = cpp
+            .prepared_syntax(query_token, &file)
+            .expect("prepared macro fixture");
         let mut stack = vec![prepared.tree().root_node()];
         let mut calls = Vec::new();
         while let Some(node) = stack.pop() {
@@ -1373,11 +1406,13 @@ ABSL_NAMESPACE_END
             crate::analyzer::AnalyzerConfig::default(),
         );
         let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
-        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        let query_token = query_scope.token();
         let roots = HashSet::from_iter([file.clone()]);
         let visibility = VisibilityIndex::build(
             cpp,
-            &CppDispatch::new(workspace.analyzer()).source(),
+            query_token,
+            &CppDispatch::new(workspace.analyzer(), query_token).source(),
             &roots,
         );
 
@@ -1395,7 +1430,7 @@ ABSL_NAMESPACE_END
             let worker_visibility = &visibility;
             let worker = scope.spawn(move || {
                 let prepared = cpp
-                    .prepared_syntax(worker_file)
+                    .prepared_syntax(query_token, worker_file)
                     .expect("prepared macro consumer");
                 let mut stack = vec![prepared.tree().root_node()];
                 let mut calls = Vec::new();
@@ -1501,7 +1536,8 @@ ABSL_NAMESPACE_END
             crate::analyzer::AnalyzerConfig::default(),
         );
         let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
-        let _query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
+        let query_token = query_scope.token();
         let roots = [
             guarded.clone(),
             macro_guarded.clone(),
@@ -1513,7 +1549,8 @@ ABSL_NAMESPACE_END
         .collect();
         let visibility = VisibilityIndex::build(
             cpp,
-            &CppDispatch::new(workspace.analyzer()).source(),
+            query_token,
+            &CppDispatch::new(workspace.analyzer(), query_token).source(),
             &roots,
         );
 
@@ -1575,10 +1612,19 @@ ABSL_NAMESPACE_END
             crate::analyzer::AnalyzerConfig::default(),
         );
         let analyzer = workspace.analyzer();
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+        let query_token = query_scope.token();
         let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
         let roots = HashSet::from_iter([consumer.clone()]);
-        let visibility = VisibilityIndex::build(cpp, &CppDispatch::new(analyzer).source(), &roots);
-        let prepared = cpp.prepared_syntax(&consumer).expect("prepared consumer");
+        let visibility = VisibilityIndex::build(
+            cpp,
+            query_token,
+            &CppDispatch::new(analyzer, query_token).source(),
+            &roots,
+        );
+        let prepared = cpp
+            .prepared_syntax(query_token, &consumer)
+            .expect("prepared consumer");
         let targets = cpp
             .get_all_declarations()
             .into_iter()
@@ -1590,11 +1636,12 @@ ABSL_NAMESPACE_END
             .collect::<Vec<_>>();
         assert_eq!(targets.len(), TARGET_COUNT, "scale fixture targets");
         for target in &targets {
-            let spec = TargetSpec::from_target(&CppDispatch::new(analyzer).source(), target)
-                .expect("target spec");
+            let spec =
+                TargetSpec::from_target(&CppDispatch::new(analyzer, query_token).source(), target)
+                    .expect("target spec");
             assert!(matches!(
                 spec.with_visible_callable_arities(
-                    &CppDispatch::new(analyzer).source(),
+                    &CppDispatch::new(analyzer, query_token).source(),
                     cpp,
                     &visibility,
                     &consumer,
@@ -1629,11 +1676,17 @@ ABSL_NAMESPACE_END
             root,
             crate::analyzer::Language::Cpp,
         ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let query_token = query_scope.token();
         let roots = HashSet::from_iter([consumer.clone()]);
-        let first =
-            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
+        let first = VisibilityIndex::build(
+            &analyzer,
+            query_token,
+            &CppGraphSource::from_source(&analyzer, query_token),
+            &roots,
+        );
         let prepared = analyzer
-            .prepared_syntax(&consumer)
+            .prepared_syntax(query_token, &consumer)
             .expect("prepared consumer");
         assert!(
             first
@@ -1642,8 +1695,12 @@ ABSL_NAMESPACE_END
             "the direct include must reach the donor through the bridge"
         );
 
-        let second =
-            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
+        let second = VisibilityIndex::build(
+            &analyzer,
+            query_token,
+            &CppGraphSource::from_source(&analyzer, query_token),
+            &roots,
+        );
         assert!(
             second
                 .include_activation_for_source(&analyzer, &consumer, prepared.as_ref(), &donor)
@@ -1686,11 +1743,17 @@ ABSL_NAMESPACE_END
             root,
             crate::analyzer::Language::Cpp,
         ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let query_token = query_scope.token();
         let roots = HashSet::from_iter([consumer.clone()]);
-        let visibility =
-            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
+        let visibility = VisibilityIndex::build(
+            &analyzer,
+            query_token,
+            &CppGraphSource::from_source(&analyzer, query_token),
+            &roots,
+        );
         let prepared = analyzer
-            .prepared_syntax(&consumer)
+            .prepared_syntax(query_token, &consumer)
             .expect("prepared consumer");
 
         let [
@@ -1780,11 +1843,17 @@ ABSL_NAMESPACE_END
             root,
             crate::analyzer::Language::Cpp,
         ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let query_token = query_scope.token();
         let roots = HashSet::from_iter([consumer.clone()]);
-        let visibility =
-            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
+        let visibility = VisibilityIndex::build(
+            &analyzer,
+            query_token,
+            &CppGraphSource::from_source(&analyzer, query_token),
+            &roots,
+        );
         let prepared = analyzer
-            .prepared_syntax(&consumer)
+            .prepared_syntax(query_token, &consumer)
             .expect("prepared consumer");
 
         let target_projections = visibility.conditional_include_projections_for_source(
@@ -1837,12 +1906,18 @@ ABSL_NAMESPACE_END
             root,
             crate::analyzer::Language::Cpp,
         ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let query_token = query_scope.token();
         for (consumer, reaches) in [(c_consumer, false), (cpp_consumer, true)] {
             let roots = HashSet::from_iter([consumer.clone()]);
-            let visibility =
-                VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
+            let visibility = VisibilityIndex::build(
+                &analyzer,
+                query_token,
+                &CppGraphSource::from_source(&analyzer, query_token),
+                &roots,
+            );
             let prepared = analyzer
-                .prepared_syntax(&consumer)
+                .prepared_syntax(query_token, &consumer)
                 .expect("prepared consumer");
             assert_eq!(
                 visibility
@@ -1948,6 +2023,8 @@ ABSL_NAMESPACE_END
             &root,
             crate::analyzer::Language::Cpp,
         ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let query_token = query_scope.token();
         let target = analyzer
             .get_all_declarations()
             .into_iter()
@@ -1972,21 +2049,28 @@ ABSL_NAMESPACE_END
             "fragmented export-macro members keep their recovered class owner"
         );
         let roots = HashSet::from_iter([consumer_file.clone()]);
-        let visibility =
-            VisibilityIndex::build(&analyzer, &CppGraphSource::from_source(&analyzer), &roots);
+        let visibility = VisibilityIndex::build(
+            &analyzer,
+            query_token,
+            &CppGraphSource::from_source(&analyzer, query_token),
+            &roots,
+        );
         let prepared = analyzer
-            .prepared_syntax(&consumer_file)
+            .prepared_syntax(query_token, &consumer_file)
             .expect("prepared consumer");
-        let spec = TargetSpec::from_target(&CppGraphSource::from_source(&analyzer), &target)
-            .expect("target spec")
-            .with_visible_callable_arities(
-                &CppGraphSource::from_source(&analyzer),
-                &analyzer,
-                &visibility,
-                &consumer_file,
-                prepared.as_ref(),
-            )
-            .into_owned();
+        let spec = TargetSpec::from_target(
+            &CppGraphSource::from_source(&analyzer, query_token),
+            &target,
+        )
+        .expect("target spec")
+        .with_visible_callable_arities(
+            &CppGraphSource::from_source(&analyzer, query_token),
+            &analyzer,
+            &visibility,
+            &consumer_file,
+            prepared.as_ref(),
+        )
+        .into_owned();
         let arity = spec.callable_arity_at(usize::MAX).expect("callable arity");
         assert!(
             arity.accepts(1),
@@ -2047,8 +2131,11 @@ int recovered_explicit_assignment(void) {
             "fixture declarations: {:#?}",
             analyzer.get_all_declarations()
         );
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let query_token = query_scope.token();
         let roots = HashSet::from_iter([file.clone()]);
-        let batch = CppAuthoritativeUsageBatch::new(&analyzer, &roots).expect("C batch");
+        let batch =
+            CppAuthoritativeUsageBatch::new(&analyzer, query_token, &roots).expect("C batch");
         let ranges = batch
             .recovered_c_reference_ranges(&file, 100)
             .expect("complete recovered ranges");

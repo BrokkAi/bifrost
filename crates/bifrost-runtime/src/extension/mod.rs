@@ -50,7 +50,7 @@ pub use limits::{
 pub use observation::*;
 pub use outcome::{
     ExtensionCompletion, ExtensionDiagnostic, ExtensionOutcome, ExtensionResultMetadata,
-    ExtensionWork,
+    ExtensionTierReport, ExtensionWork,
 };
 pub use relation::*;
 pub use version::{

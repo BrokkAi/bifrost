@@ -482,16 +482,51 @@ fn build_conversion(
     })
 }
 
+/// Java owners declared `final` in every supported toolchain version, so an
+/// instance method on them has no overrides to cover. Reviewed list; a class
+/// that is merely effectively-final does not belong here.
+const JAVA_FINAL_OWNERS: &[&str] = &[
+    "java.lang.String",
+    "java.lang.StringBuilder",
+    "java.lang.StringBuffer",
+    "java.util.StringJoiner",
+];
+
+/// Whether the shipped summary may claim `covers_overrides` (#2371) from
+/// language semantics alone: a static method has exactly one target, and an
+/// instance method on a `final` class has no overrides. A constructor's target
+/// is also exact, but it stays receiverless after conversion and a receiverless
+/// claim is rejected at validation, so it keeps `false`. Everything else --
+/// interface and overridable-class members -- stays `false` honestly.
+///
+/// Reads the authored `has_receiver`, which marks staticness, so it must run
+/// before [`shipped_has_receiver`] rewrites the field for binding.
+fn shipped_covers_overrides(target: &AuthoredProcedureTarget, realm: GoldenRealm) -> bool {
+    if realm.language != "java" || target.symbol.contains("<init>") {
+        return false;
+    }
+    if !target.has_receiver {
+        return true;
+    }
+    let name = target.symbol.split('(').next().unwrap_or(&target.symbol);
+    name.rsplit_once('.')
+        .is_some_and(|(owner, _)| JAVA_FINAL_OWNERS.contains(&owner))
+}
+
 /// Build one shipped summary from one candidate. A golden entry carries only
 /// flow-through transfers, so the effects list stays empty.
 fn build_summary(candidate: GoldenCandidate, realm: GoldenRealm) -> AuthoredProcedureSummary {
     let mut target = candidate.target;
+    // The production compiler rejects the claim on a partial summary, so the
+    // language-semantics derivation only applies to complete entries.
+    let covers_overrides = candidate.completeness == Completeness::Complete
+        && shipped_covers_overrides(&target, realm);
     target.has_receiver = shipped_has_receiver(&target, realm);
     AuthoredProcedureSummary {
         id: summary_id(&target.symbol),
         target,
         completeness: candidate.completeness,
-        covers_overrides: false,
+        covers_overrides,
         locations: Vec::new(),
         transfers: candidate.transfers,
         effects: Vec::new(),
@@ -578,6 +613,9 @@ fn reconcile_overload_groups(
 
     for index in weakened {
         summaries[index].completeness = Completeness::Partial;
+        // A partial summary cannot carry the covers_overrides claim (#2371),
+        // and the production compiler rejects the combination.
+        summaries[index].covers_overrides = false;
     }
     if !dropped.is_empty() {
         let mut index = 0usize;

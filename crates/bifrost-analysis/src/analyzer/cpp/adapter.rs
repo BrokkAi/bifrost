@@ -10,7 +10,7 @@ use brokk_bifrost_cpp::adapter::{
     CPP_COGNITIVE_CONFIG, CPP_FILE_EXTENSION, cpp_extract_call_receiver, cpp_projections_differ,
     parse_cpp_file, parse_cpp_file_in_dialect,
 };
-use brokk_bifrost_cpp::imports::included_claimable_files;
+use brokk_bifrost_cpp::imports::{claimable_include_demand, included_claimable_files};
 use brokk_bifrost_cpp::queries::CPP_QUERY_DIRECTORY;
 use brokk_bifrost_cpp::test_detection::cpp_contains_tests;
 use tree_sitter::Tree;
@@ -151,5 +151,12 @@ impl LanguageAdapter for CppAdapter {
         claimable: &BTreeSet<ProjectFile>,
     ) -> HashMap<ProjectFile, BTreeSet<ProjectFile>> {
         included_claimable_files(sources, claimable)
+    }
+
+    fn claim_demand(
+        &self,
+        sources: &[(ProjectFile, Vec<ImportInfo>)],
+    ) -> HashMap<ProjectFile, BTreeSet<String>> {
+        claimable_include_demand(sources)
     }
 }

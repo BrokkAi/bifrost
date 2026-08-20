@@ -40,12 +40,13 @@ use crate::analyzer::store::{
     PreparedParsedBlob, StoreError,
 };
 use crate::analyzer::structural::materialization::MaterializationRecord;
+use crate::analyzer::tier_demand::TierDemand;
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, CppTemplateMetadata, DeclarationInfo,
-    DefinitionIndexHandle, FqName, GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language,
-    LanguageDialect, PackageAnchor, Project, ProjectFile, Range, RubyMethodDispatchMode,
-    SearchSymbolCandidate, SearchSymbolCandidates, SearchSymbolPatternBatch, SignatureMetadata,
-    SummaryFileProjection, UsageFactsIndex,
+    DefinitionIndexHandle, FqName, GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo,
+    InformationTier, Language, LanguageDialect, PackageAnchor, Project, ProjectFile, QueryScope,
+    QueryToken, Range, RubyMethodDispatchMode, SearchSymbolCandidate, SearchSymbolCandidates,
+    SearchSymbolPatternBatch, SignatureMetadata, SummaryFileProjection, UsageFactsIndex,
 };
 use crate::cancellation::CancellationToken;
 use crate::gitblob;
@@ -455,6 +456,30 @@ pub trait LanguageAdapter: Send + Sync + 'static {
         claimable: &BTreeSet<ProjectFile>,
     ) -> HashMap<ProjectFile, BTreeSet<ProjectFile>> {
         let _ = (sources, claimable);
+        HashMap::default()
+    }
+    /// The demand [`LanguageAdapter::infer_claimed_files`] leaves behind
+    /// (#1865): for each source, the path-suffix keys a workspace file that
+    /// does not exist yet would have to match for one of that source's import
+    /// directives to reach it.
+    ///
+    /// Recorded at the imports tier by `reconcile_claimed_files` from exactly
+    /// the same `sources`, so the record and the relation always describe one
+    /// generation. `TreeSitterAnalyzer::update` consults it to decide whether a
+    /// newly created unclaimed-extension file can change the claim relation at
+    /// all; a miss means the event is local and no bulk store read runs.
+    ///
+    /// The contract is completeness, not precision: an implementation must emit
+    /// a key for every file its resolution *could* accept, because the caller
+    /// treats a miss as proof that re-derivation would find nothing. An extra
+    /// key costs one derivation; a missing one leaves a file unindexed until the
+    /// next full build. An adapter that does not claim included files has no
+    /// demand to record.
+    fn claim_demand(
+        &self,
+        sources: &[(ProjectFile, Vec<ImportInfo>)],
+    ) -> HashMap<ProjectFile, BTreeSet<String>> {
+        let _ = sources;
         HashMap::default()
     }
     fn storage_language_keys(&self) -> Vec<(String, TsLanguage)> {
@@ -1009,6 +1034,35 @@ struct AnalyzerRuntimeState {
     /// the transitive closure of the whole relation from the
     /// extension-discovered roots.
     claim_edges: HashMap<ProjectFile, BTreeSet<ProjectFile>>,
+    /// The unresolved demand the same derivation recorded (#1865). Carried
+    /// forward across an update exactly like `claim_edges`, and for the same
+    /// reason: both are per-generation facts about the relation, and re-deriving
+    /// one without the other would let `update` consult a record describing a
+    /// generation the edges no longer match.
+    tier_demand: TierDemand,
+    /// Bulk import-fact reads the include-claim derivation performed while
+    /// producing this generation (#1865).
+    ///
+    /// The observable the locality pin needs. The tier funnel on
+    /// `TreeSitterAnalyzer` cannot serve it: claim derivation is a static
+    /// pass that runs before the analyzer holding the new generation exists,
+    /// so it has no `&self` to count against. Counting on the state it
+    /// produces attributes the reads to exactly the generation that made them.
+    claim_import_reads: AtomicUsize,
+}
+
+/// The previous generation's include-claim relation, handed to the next
+/// derivation by `TreeSitterAnalyzer::reconcile_claimed_files`.
+///
+/// One struct rather than two parameters because the edges and the unresolved
+/// demand recorded with them are only ever correct together: an update that
+/// carried one forward without the other would consult a record describing a
+/// generation the relation no longer matches. Both are empty on a build, which
+/// re-derives them from the whole extension-discovered set.
+#[derive(Debug, Default)]
+struct RetainedClaimRelation {
+    edges: HashMap<ProjectFile, BTreeSet<ProjectFile>>,
+    demand: TierDemand,
 }
 
 impl AnalyzerRuntimeState {
@@ -1025,6 +1079,8 @@ impl AnalyzerRuntimeState {
             seeded_file_states,
             persistence_stats: PersistBatchStats::default(),
             claim_edges: HashMap::default(),
+            tier_demand: TierDemand::default(),
+            claim_import_reads: AtomicUsize::new(0),
         }
     }
 
@@ -1039,6 +1095,8 @@ impl AnalyzerRuntimeState {
             seeded_file_states,
             persistence_stats,
             claim_edges,
+            tier_demand,
+            claim_import_reads,
         } = other;
         self.fresh_parse_errors.extend(fresh_parse_errors);
         // The second pass was handed this pass's dirty maps as input and
@@ -1060,6 +1118,9 @@ impl AnalyzerRuntimeState {
             .truncate(SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY);
         self.persistence_stats.merge(persistence_stats);
         self.claim_edges.extend(claim_edges);
+        self.tier_demand.absorb(tier_demand);
+        self.claim_import_reads
+            .fetch_add(claim_import_reads.into_inner(), Ordering::Relaxed);
     }
 
     fn seed_snapshot_file_states(&self, cache: &mut SourceSnapshotFileStateIndex) {
@@ -2240,20 +2301,21 @@ pub struct TreeSitterAnalyzer<A> {
     /// Cross-request indexes for smallest-enclosing declaration lookup in
     /// generated files with large declaration sets.
     enclosing_code_unit_store: Arc<Mutex<EnclosingCodeUnitStore>>,
-    /// Import hydrations this analyzer issued to the store, for perf pins. The
-    /// call count alone cannot see the #1451 shape -- callers legitimately ask
-    /// per reference -- so what must stay bounded is the *store reads* those
-    /// calls turn into.
-    import_info_hydration_count: Arc<AtomicUsize>,
     #[cfg(test)]
     live_oid_validation_counts: Arc<Mutex<HashMap<ProjectFile, usize>>>,
-    /// Syntax parses performed per file, for perf pins. Always compiled: a
-    /// parse is a source re-read plus a tree build, so one map update per parse
-    /// is free relative to the work it measures — and the counter has to
-    /// survive in non-test builds for integration tests to pin it (#1175,
-    /// where a detached analyzer clone re-parsed one 4.8 MB header tens of
-    /// thousands of times inside a single scan).
-    syntax_parse_counts: Arc<Mutex<HashMap<ProjectFile, usize>>>,
+    /// Crossings of each information tier's storage funnel, per file, for perf
+    /// pins (#2414). Always compiled: a tier crossing is a parse or a store
+    /// read, so one map update per crossing is free relative to the work it
+    /// measures — and the counter has to survive in non-test builds for
+    /// integration tests to pin it (#1175, where a detached analyzer clone
+    /// re-parsed one 4.8 MB header tens of thousands of times inside a single
+    /// scan).
+    tier_access_counts: Arc<Mutex<HashMap<(InformationTier, ProjectFile), usize>>>,
+    /// The same crossings summed over files. The usage-graph tier has no file
+    /// key at all, and the import tier's pre-#2414 counter was already a plain
+    /// total: what must stay bounded there is the number of *store reads* the
+    /// per-reference calls turn into (#1451), not any one file's share.
+    tier_access_totals: Arc<[AtomicUsize; InformationTier::COUNT]>,
     transient_file_states: Arc<Mutex<FileStateCache>>,
     source_snapshot_file_states: Arc<SourceSnapshotFileStateIndex>,
     summary_file_projections: Arc<Mutex<SummaryFileProjectionCache>>,
@@ -2290,7 +2352,6 @@ pub struct TreeSitterAnalyzer<A> {
     /// Whole-workspace declaration scans issued to answer a *package-scoped*
     /// class lookup (`class_declarations_in_package`). Pinned by #1194.
     package_declaration_scan_count: Arc<AtomicUsize>,
-    global_usage_definition_index_build_count: Arc<AtomicUsize>,
     workspace_path_scan_count: Arc<AtomicUsize>,
     _state: PhantomData<A>,
 }
@@ -2315,10 +2376,10 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             import_info_store: Arc::clone(&self.import_info_store),
             type_alias_store: Arc::clone(&self.type_alias_store),
             enclosing_code_unit_store: Arc::clone(&self.enclosing_code_unit_store),
-            import_info_hydration_count: Arc::clone(&self.import_info_hydration_count),
             #[cfg(test)]
             live_oid_validation_counts: Arc::clone(&self.live_oid_validation_counts),
-            syntax_parse_counts: Arc::clone(&self.syntax_parse_counts),
+            tier_access_counts: Arc::clone(&self.tier_access_counts),
+            tier_access_totals: Arc::clone(&self.tier_access_totals),
             transient_file_states: Arc::clone(&self.transient_file_states),
             source_snapshot_file_states: Arc::clone(&self.source_snapshot_file_states),
             summary_file_projections: Arc::clone(&self.summary_file_projections),
@@ -2344,9 +2405,6 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             search_candidate_hydration_count: Arc::clone(&self.search_candidate_hydration_count),
             package_declaration_scan_count: Arc::clone(&self.package_declaration_scan_count),
             analyzed_file_listing_count: Arc::clone(&self.analyzed_file_listing_count),
-            global_usage_definition_index_build_count: Arc::clone(
-                &self.global_usage_definition_index_build_count,
-            ),
             workspace_path_scan_count: Arc::clone(&self.workspace_path_scan_count),
             _state: PhantomData,
         }
@@ -2534,10 +2592,10 @@ where
             enclosing_code_unit_store: Arc::new(Mutex::new(EnclosingCodeUnitStore::new(
                 ENCLOSING_CODE_UNIT_INDEX_STORE_MAX_BYTES,
             ))),
-            import_info_hydration_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
-            syntax_parse_counts: Arc::new(Mutex::new(HashMap::default())),
+            tier_access_counts: Arc::new(Mutex::new(HashMap::default())),
+            tier_access_totals: Arc::new(Default::default()),
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
                 file_state_cache_budget,
             ))),
@@ -2562,7 +2620,6 @@ where
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             search_candidate_hydration_count: Arc::new(AtomicUsize::new(0)),
             package_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
-            global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             workspace_path_scan_count: Arc::new(AtomicUsize::new(0)),
             analyzed_file_listing_count: Arc::new(AtomicUsize::new(0)),
             _state: PhantomData,
@@ -2791,10 +2848,10 @@ where
             enclosing_code_unit_store: Arc::new(Mutex::new(EnclosingCodeUnitStore::new(
                 ENCLOSING_CODE_UNIT_INDEX_STORE_MAX_BYTES,
             ))),
-            import_info_hydration_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
-            syntax_parse_counts: Arc::new(Mutex::new(HashMap::default())),
+            tier_access_counts: Arc::new(Mutex::new(HashMap::default())),
+            tier_access_totals: Arc::new(Default::default()),
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
                 file_state_cache_budget,
             ))),
@@ -2819,7 +2876,6 @@ where
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             search_candidate_hydration_count: Arc::new(AtomicUsize::new(0)),
             package_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
-            global_usage_definition_index_build_count: Arc::new(AtomicUsize::new(0)),
             workspace_path_scan_count: Arc::new(AtomicUsize::new(0)),
             analyzed_file_listing_count: Arc::new(AtomicUsize::new(0)),
             _state: PhantomData,
@@ -3569,7 +3625,7 @@ where
             config,
             store_context,
             &analyzable_files,
-            HashMap::default(),
+            RetainedClaimRelation::default(),
             &mut state,
         ));
         {
@@ -3648,6 +3704,7 @@ where
         if entries.is_empty() {
             return out;
         }
+        state.claim_import_reads.fetch_add(1, Ordering::Relaxed);
         let facts = store_context
             .store
             .hydrate_import_facts_by_key(&entries, store_context.generations.as_ref(), adapter)
@@ -3703,15 +3760,16 @@ where
     ///
     /// `roots` are the files whose imports seed the relation -- the whole
     /// extension-discovered set on a build, only the changed files on an update.
-    /// `retained_edges` carries the previous generation's relation forward on an
-    /// update and is empty on a build. `state` receives the merged reconcile
-    /// results and the closed relation.
+    /// `retained` carries the previous generation's relation and its unresolved
+    /// demand forward on an update and is empty on a build. `state` receives the
+    /// merged reconcile results, the closed relation and the demand record.
     ///
     /// Cost: one bulk import-fact read per round over the frontier, no source
     /// reads. A build's first frontier is the whole extension-discovered set,
     /// which is why the imports come from the store the preceding reconcile just
-    /// filled rather than from a second pass over the workspace's bytes. A
-    /// workspace with no unclaimed-extension file at all pays nothing.
+    /// filled rather than from a second pass over the workspace's bytes. An
+    /// update with no root pays nothing, which is what makes a created file
+    /// that answers no recorded demand free (#1865).
     ///
     /// Returns the claimed files, which the caller treats as indexed files from
     /// here on.
@@ -3721,9 +3779,13 @@ where
         config: &AnalyzerConfig,
         store_context: &AnalyzerStoreContext,
         roots: &[ProjectFile],
-        retained_edges: HashMap<ProjectFile, BTreeSet<ProjectFile>>,
+        retained: RetainedClaimRelation,
         state: &mut AnalyzerRuntimeState,
     ) -> Vec<ProjectFile> {
+        let RetainedClaimRelation {
+            edges: retained_edges,
+            mut demand,
+        } = retained;
         if !adapter.claims_included_files() {
             return Vec::new();
         }
@@ -3733,14 +3795,16 @@ where
         ));
         let claimable = Self::claimable_workspace_files(project);
         let mut edges = retained_edges;
-        // With nothing eligible there is no reason to read anyone's imports.
-        // The closure below still runs, so a claim an earlier generation
-        // recorded retires when its target leaves the workspace.
-        let mut frontier: Vec<ProjectFile> = if claimable.is_empty() {
-            Vec::new()
-        } else {
-            roots.to_vec()
-        };
+        // The roots' imports are read even when nothing is eligible today.
+        // They used to be skipped in that case, but the round below is also
+        // where the unresolved demand for this generation is recorded (#1865),
+        // and that record is what decides whether a file created *tomorrow* can
+        // be claimed: skipping it would leave a workspace whose only
+        // unclaimed-extension file is the one about to be generated unable to
+        // ever adopt it. The skipped case is a workspace with no non-source
+        // file at all -- no README, no license -- which is one bulk read on a
+        // build that already read every one of those files' bytes.
+        let mut frontier: Vec<ProjectFile> = roots.to_vec();
         let mut visited: HashSet<ProjectFile> = roots.iter().cloned().collect();
         let mut claimed_files = Vec::new();
         // Fixpoint over the claim relation. Each round reads one frontier's
@@ -3750,6 +3814,16 @@ where
         while !frontier.is_empty() {
             let sources = Self::stored_import_facts(adapter, store_context, state, &frontier);
             let round_edges = adapter.infer_claimed_files(&sources, &claimable);
+            // Recorded from the same `sources` as the edges, in the same round,
+            // so the demand record can never describe a generation the relation
+            // does not (#1865).
+            let round_demand = adapter.claim_demand(&sources);
+            for source in &frontier {
+                demand.clear_source(InformationTier::Imports, source);
+            }
+            for (source, keys) in round_demand {
+                demand.set_source(InformationTier::Imports, source, keys);
+            }
             debug_assert!(
                 round_edges
                     .values()
@@ -3819,6 +3893,7 @@ where
             }
         }
         state.claim_edges = edges;
+        state.tier_demand = demand;
         claimed_files.retain(|file| closed.contains(file));
         claimed_files
     }
@@ -4827,8 +4902,19 @@ where
         Some(cell)
     }
 
-    pub(crate) fn prepared_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>> {
-        self.prepared_indexed_syntax(file)
+    /// The parsed tree and its source backing for `file`, from the query read
+    /// cache.
+    ///
+    /// The [`QueryToken`] is proof that an [`AnalyzerQueryScope`] is open
+    /// somewhere up the stack, so the memoization this reads is active and the
+    /// call is a cache probe rather than a re-parse (issue #2414 step 3). The
+    /// token carries no data; it is a compile-time obligation only.
+    pub(crate) fn prepared_syntax(
+        &self,
+        _token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Arc<PreparedSyntaxTree>> {
+        self.prepared_indexed_syntax(_token, file)
     }
 
     /// Capture the same request-scoped atomic source used by syntax
@@ -4847,10 +4933,11 @@ where
     /// refusing snapshots larger than `max_source_bytes` before parsing.
     pub(crate) fn prepared_syntax_limited(
         &self,
+        _token: QueryToken<'_>,
         file: &ProjectFile,
         max_source_bytes: usize,
     ) -> Result<Option<(Oid, Arc<PreparedSyntaxTree>)>, PreparedSyntaxLimitExceeded> {
-        match self.prepared_syntax_limited_cancellable(file, max_source_bytes, None) {
+        match self.prepared_syntax_limited_cancellable(_token, file, max_source_bytes, None) {
             PreparedSyntaxLimitedOutcome::Available(oid, prepared) => Ok(Some((oid, prepared))),
             PreparedSyntaxLimitedOutcome::Exceeded(exceeded) => Err(exceeded),
             PreparedSyntaxLimitedOutcome::Cancelled => {
@@ -4862,6 +4949,7 @@ where
 
     pub(crate) fn prepared_syntax_limited_cancellable(
         &self,
+        _token: QueryToken<'_>,
         file: &ProjectFile,
         max_source_bytes: usize,
         cancellation: Option<&CancellationToken>,
@@ -4963,7 +5051,11 @@ where
             .retain(key, Arc::clone(prepared));
     }
 
-    fn prepared_indexed_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>> {
+    fn prepared_indexed_syntax(
+        &self,
+        _token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Arc<PreparedSyntaxTree>> {
         let resolved = self.resolve_prepared_source(file, None).ok().flatten()?;
         let key = Self::transient_cache_key(resolved.oid, file);
         let (origin, overlay_revision) = match resolved.snapshot.origin() {
@@ -5077,12 +5169,7 @@ where
         if !set_parser_for_file(&mut parser, self.adapter.as_ref(), file, source.source()) {
             return PreparedSyntaxPreparation::Complete(None);
         }
-        *self
-            .syntax_parse_counts
-            .lock()
-            .expect("syntax parse count mutex poisoned")
-            .entry(file.clone())
-            .or_default() += 1;
+        self.record_file_tier_access(InformationTier::Syntax, file);
         let exact_source = source.source();
         let tree = match parse_complete_file_bounded(
             &mut parser,
@@ -5110,25 +5197,82 @@ where
         ))))
     }
 
+    /// One crossing of `tier`'s storage funnel, attributed to `file`.
+    fn record_file_tier_access(&self, tier: InformationTier, file: &ProjectFile) {
+        *self
+            .tier_access_counts
+            .lock()
+            .expect("tier access count mutex poisoned")
+            .entry((tier, file.clone()))
+            .or_default() += 1;
+        self.record_tier_access(tier);
+    }
+
+    /// One crossing of `tier`'s storage funnel, counted for this analyzer and
+    /// for every query scope that is open around it, and returning the new
+    /// analyzer-wide total.
+    ///
+    /// The active contexts are cloned out from under the coarse
+    /// `query_read_cache` read lock before they are touched, exactly as
+    /// `record_store_error` does, so this adds no lock-order edge: the
+    /// per-file map's mutex is never held while the cache lock is.
+    fn record_tier_access(&self, tier: InformationTier) -> usize {
+        let total = self.tier_access_totals[tier.index()].fetch_add(1, Ordering::Relaxed) + 1;
+        let contexts = self.query_read_cache_lock().contexts.clone();
+        for context in contexts {
+            context.record_tier_access(tier);
+        }
+        total
+    }
+
+    /// How many times `file` crossed `tier`'s funnel since the last reset.
+    #[doc(hidden)]
+    pub fn tier_access_count_for_test(&self, tier: InformationTier, file: &ProjectFile) -> usize {
+        self.tier_access_counts
+            .lock()
+            .expect("tier access count mutex poisoned")
+            .get(&(tier, file.clone()))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// How many times `tier`'s funnel was crossed at all since the last reset.
+    #[doc(hidden)]
+    pub fn tier_access_total_for_test(&self, tier: InformationTier) -> usize {
+        self.tier_access_totals[tier.index()].load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn reset_tier_access_counts_for_test(&self) {
+        self.tier_access_counts
+            .lock()
+            .expect("tier access count mutex poisoned")
+            .clear();
+        for total in self.tier_access_totals.iter() {
+            total.store(0, Ordering::Relaxed);
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn reset_tier_access_count_for_test(&self, tier: InformationTier) {
+        self.tier_access_counts
+            .lock()
+            .expect("tier access count mutex poisoned")
+            .retain(|(counted, _), _| *counted != tier);
+        self.tier_access_totals[tier.index()].store(0, Ordering::Relaxed);
+    }
+
     /// How many times `file` has been parsed since the last reset. Pins the
     /// per-query parse budget: a scan must parse each candidate file once, not
     /// once per candidate declaration it inspects.
     #[doc(hidden)]
     pub fn prepared_syntax_parse_count_for_test(&self, file: &ProjectFile) -> usize {
-        self.syntax_parse_counts
-            .lock()
-            .expect("syntax parse count mutex poisoned")
-            .get(file)
-            .copied()
-            .unwrap_or_default()
+        self.tier_access_count_for_test(InformationTier::Syntax, file)
     }
 
     #[doc(hidden)]
     pub fn reset_prepared_syntax_parse_counts_for_test(&self) {
-        self.syntax_parse_counts
-            .lock()
-            .expect("syntax parse count mutex poisoned")
-            .clear();
+        self.reset_tier_access_count_for_test(InformationTier::Syntax);
     }
 
     fn bulk_file_state_entries(
@@ -6572,7 +6716,18 @@ where
 
     #[doc(hidden)]
     pub fn import_info_hydration_count_for_test(&self) -> usize {
-        self.import_info_hydration_count.load(Ordering::Relaxed)
+        self.tier_access_total_for_test(InformationTier::Imports)
+    }
+
+    /// Bulk import-fact store reads the include-claim derivation performed
+    /// while producing *this* generation (#1865).
+    ///
+    /// Zero on an analyzer whose update saw no claim root, which is the
+    /// locality property: a created file that answers no recorded demand must
+    /// not cost a store read over the analyzed set.
+    #[doc(hidden)]
+    pub fn claim_import_hydration_count_for_test(&self) -> usize {
+        self.state.claim_import_reads.load(Ordering::Relaxed)
     }
 
     #[doc(hidden)]
@@ -6695,14 +6850,12 @@ where
 
     #[doc(hidden)]
     pub fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.global_usage_definition_index_build_count
-            .store(0, Ordering::Relaxed);
+        self.reset_tier_access_count_for_test(InformationTier::UsageGraph);
     }
 
     #[doc(hidden)]
     pub fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.global_usage_definition_index_build_count
-            .load(Ordering::Relaxed)
+        self.tier_access_total_for_test(InformationTier::UsageGraph)
     }
 
     #[doc(hidden)]
@@ -8620,8 +8773,7 @@ where
             return retained.to_vec();
         }
         let storage_key = self.adapter.storage_language_key_for_file(file);
-        self.import_info_hydration_count
-            .fetch_add(1, Ordering::Relaxed);
+        self.record_file_tier_access(InformationTier::Imports, file);
         let Some(imports) = self
             .store_query_or_record(
                 self.store_context.store.hydrate_import_infos_by_key(
@@ -8802,6 +8954,7 @@ where
         let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
+        self.record_file_tier_access(InformationTier::Supertypes, file);
         self.store_query_or_record(
             self.store_context.store.raw_supertypes_for_unit_limited(
                 oid,
@@ -9481,10 +9634,7 @@ where
             return Ok(index);
         }
         let _scope = profiling::scope("TreeSitterAnalyzer::global_usage_definition_index_build");
-        let build_count = self
-            .global_usage_definition_index_build_count
-            .fetch_add(1, Ordering::Relaxed)
-            + 1;
+        let build_count = self.record_tier_access(InformationTier::UsageGraph);
         if profiling::enabled() {
             profiling::note(format!(
                 "language={:?} build_count={build_count}",
@@ -10123,7 +10273,8 @@ where
     }
 
     fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
-        let syntax = self.prepared_syntax(code_unit.source())?;
+        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        let syntax = self.prepared_syntax(scope.token(), code_unit.source())?;
         let mut node = syntax.declaration_node(code_unit)?;
         let fallback = node.kind();
         loop {
@@ -10178,11 +10329,19 @@ where
             if !self.adapter_owns_file(file, &live) {
                 // A claimable file that did not exist last generation can turn
                 // an `#include` that resolved to nothing into a claim, and the
-                // includer itself did not change. Re-derive the whole relation
-                // in that case -- rare, and the alternative is leaving the new
-                // file unindexed until the next full build.
+                // includer itself did not change. Re-deriving the whole relation
+                // is the only way to find out -- but only for a file some
+                // recorded import directive could actually name (#1865). Every
+                // other creation (a `.md`, a `.txt`, a `.json` in a C++
+                // workspace) is local to itself: the demand record is written
+                // from the same import facts the derivation reads, so a miss is
+                // proof that re-deriving would claim nothing new.
                 new_claimable_file_appeared |= self.adapter.claims_included_files()
-                    && crate::analyzer::common::has_unclaimed_extension(file);
+                    && crate::analyzer::common::has_unclaimed_extension(file)
+                    && self
+                        .state
+                        .tier_demand
+                        .is_demanded(InformationTier::Imports, file);
                 continue;
             }
             to_update.push(file.clone());
@@ -10219,7 +10378,10 @@ where
             &self.config,
             &store_context,
             &claim_roots,
-            self.state.claim_edges.clone(),
+            RetainedClaimRelation {
+                edges: self.state.claim_edges.clone(),
+                demand: self.state.tier_demand.clone(),
+            },
             &mut state,
         );
         dirty_path_symbol_rows = state.dirty_path_symbol_snapshot();
@@ -13306,10 +13468,14 @@ mod tests {
             .expect("rust source");
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
         let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
-        let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
 
-        let first = analyzer.prepared_syntax(&file).expect("first syntax");
-        let second = analyzer.prepared_syntax(&file).expect("reused syntax");
+        let first = analyzer
+            .prepared_syntax(scope.token(), &file)
+            .expect("first syntax");
+        let second = analyzer
+            .prepared_syntax(scope.token(), &file)
+            .expect("reused syntax");
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
@@ -13334,12 +13500,16 @@ mod tests {
         let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
 
         let first = {
-            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-            analyzer.prepared_syntax(&file).expect("first syntax")
+            let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer
+                .prepared_syntax(scope.token(), &file)
+                .expect("first syntax")
         };
         let second = {
-            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-            analyzer.prepared_syntax(&file).expect("retained syntax")
+            let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer
+                .prepared_syntax(scope.token(), &file)
+                .expect("retained syntax")
         };
 
         assert!(Arc::ptr_eq(&first, &second));
@@ -13359,8 +13529,8 @@ mod tests {
         let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
 
         let exact = |label: &str| {
-            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-            match analyzer.prepared_syntax_limited(&file, 1 << 20) {
+            let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            match analyzer.prepared_syntax_limited(scope.token(), &file, 1 << 20) {
                 Ok(Some((_, prepared))) => prepared,
                 other => panic!("{label} exact syntax: {other:?}"),
             }
@@ -13386,16 +13556,20 @@ mod tests {
         let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
 
         let first = {
-            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-            analyzer.prepared_syntax(&file).expect("first syntax")
+            let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer
+                .prepared_syntax(scope.token(), &file)
+                .expect("first syntax")
         };
         assert_eq!(first.source(), "fn target() {}\n");
 
         file.write("fn target() {}\nfn consumer() { target(); }\n")
             .expect("edited rust source");
         let second = {
-            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-            analyzer.prepared_syntax(&file).expect("edited syntax")
+            let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer
+                .prepared_syntax(scope.token(), &file)
+                .expect("edited syntax")
         };
 
         assert!(!Arc::ptr_eq(&first, &second));
@@ -13410,8 +13584,10 @@ mod tests {
         file.write("fn target() {}\n")
             .expect("restored rust source");
         let restored = {
-            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-            analyzer.prepared_syntax(&file).expect("restored syntax")
+            let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer
+                .prepared_syntax(scope.token(), &file)
+                .expect("restored syntax")
         };
         assert!(Arc::ptr_eq(&first, &restored));
         assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 2);
@@ -13427,8 +13603,10 @@ mod tests {
         file.write("fn target() {}\n").expect("rust source");
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
         let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
-        let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-        let prepared = analyzer.prepared_syntax(&file).expect("syntax");
+        let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let prepared = analyzer
+            .prepared_syntax(scope.token(), &file)
+            .expect("syntax");
 
         let key = |seed: u8| PreparedSyntaxCacheKey {
             file_state: FileStateCacheKey {
@@ -13475,8 +13653,10 @@ mod tests {
         file.write("fn target() {}\n").expect("rust source");
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
         let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
-        let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-        let prepared = analyzer.prepared_syntax(&file).expect("syntax");
+        let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let prepared = analyzer
+            .prepared_syntax(scope.token(), &file)
+            .expect("syntax");
 
         let mut store = PreparedSyntaxStore::new(PREPARED_SYNTAX_STORE_ENTRY_OVERHEAD_BYTES);
         let key = PreparedSyntaxCacheKey {
@@ -13665,7 +13845,10 @@ mod tests {
                     let file = file.clone();
                     threads.spawn(move || {
                         barrier.wait();
-                        analyzer.prepared_syntax(&file).expect("prepared syntax")
+                        let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+                        analyzer
+                            .prepared_syntax(scope.token(), &file)
+                            .expect("prepared syntax")
                     })
                 })
                 .collect();
@@ -13697,16 +13880,20 @@ mod tests {
             TreeSitterAnalyzer::new(Arc::clone(&project) as Arc<dyn Project>, RustAdapter);
 
         let first = {
-            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-            let prepared = analyzer.prepared_syntax(&file).expect("first syntax");
+            let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            let prepared = analyzer
+                .prepared_syntax(scope.token(), &file)
+                .expect("first syntax");
             assert_eq!(prepared.source(), "fn first() {}\n");
             assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 1);
             prepared
         };
 
         project.set_source("fn second() { first(); }\n");
-        let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-        let second = analyzer.prepared_syntax(&file).expect("updated syntax");
+        let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let second = analyzer
+            .prepared_syntax(scope.token(), &file)
+            .expect("updated syntax");
 
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(second.source(), "fn second() { first(); }\n");
@@ -13729,16 +13916,16 @@ mod tests {
         file.write(source).expect("rust source");
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
         let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
-        let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
 
         let exceeded = analyzer
-            .prepared_syntax_limited(&file, source.len() - 1)
+            .prepared_syntax_limited(scope.token(), &file, source.len() - 1)
             .expect_err("source larger than the caller cap must not be parsed");
         assert_eq!(exceeded.minimum_source_bytes(), source.len());
         assert_eq!(analyzer.prepared_syntax_parse_count_for_test(&file), 0);
 
         let (_, prepared) = analyzer
-            .prepared_syntax_limited(&file, source.len())
+            .prepared_syntax_limited(scope.token(), &file, source.len())
             .expect("exact source-size cap should be accepted")
             .expect("bounded source should prepare");
         assert_eq!(prepared.source(), source);
@@ -13760,11 +13947,16 @@ mod tests {
             .collect::<String>();
         assert!(overlay.set(file.abs_path(), source.clone()));
         analyzer.reset_full_hydration_count_for_test();
-        let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+        let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
         let cancellation = CancellationToken::cancel_after_checks_for_test(6);
 
         assert!(matches!(
-            analyzer.prepared_syntax_limited_cancellable(&file, source.len(), Some(&cancellation)),
+            analyzer.prepared_syntax_limited_cancellable(
+                scope.token(),
+                &file,
+                source.len(),
+                Some(&cancellation)
+            ),
             PreparedSyntaxLimitedOutcome::Cancelled
         ));
         assert_eq!(
@@ -13778,7 +13970,8 @@ mod tests {
             "bounded cancellation must not hydrate or analyze the cold overlay revision"
         );
 
-        let prepared = analyzer.prepared_syntax_limited_cancellable(&file, source.len(), None);
+        let prepared =
+            analyzer.prepared_syntax_limited_cancellable(scope.token(), &file, source.len(), None);
         let PreparedSyntaxLimitedOutcome::Available(_, prepared) = prepared else {
             panic!("a later uncancelled request must retry instead of reading cached failure");
         };
@@ -13798,7 +13991,7 @@ mod tests {
         );
 
         let indexed = analyzer
-            .prepared_syntax(&file)
+            .prepared_syntax(scope.token(), &file)
             .expect("ordinary preparation should remain indexed");
         assert_eq!(indexed.source(), source);
         assert_eq!(indexed.origin(), prepared.origin());
@@ -13827,9 +14020,10 @@ mod tests {
         file.write("").expect("empty rust source");
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
         let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+        let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
 
         let (_, prepared) = analyzer
-            .prepared_syntax_limited(&file, 0)
+            .prepared_syntax_limited(scope.token(), &file, 0)
             .expect("empty source fits a zero-byte preparation cap")
             .expect("empty source remains valid syntax input");
 
@@ -13852,18 +14046,24 @@ mod tests {
 
         assert!(overlay.set(file.abs_path(), repeated_source.to_owned()));
         let first = {
-            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-            analyzer.prepared_syntax(&file).expect("first overlay")
+            let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer
+                .prepared_syntax(scope.token(), &file)
+                .expect("first overlay")
         };
         assert!(overlay.set(file.abs_path(), "fn middle() {}\n".to_owned()));
         let middle = {
-            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-            analyzer.prepared_syntax(&file).expect("middle overlay")
+            let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer
+                .prepared_syntax(scope.token(), &file)
+                .expect("middle overlay")
         };
         assert!(overlay.set(file.abs_path(), repeated_source.to_owned()));
         let repeated = {
-            let _scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
-            analyzer.prepared_syntax(&file).expect("repeated overlay")
+            let scope = crate::analyzer::AnalyzerQueryScope::new(&analyzer);
+            analyzer
+                .prepared_syntax(scope.token(), &file)
+                .expect("repeated overlay")
         };
 
         assert_eq!(first.source(), repeated.source());

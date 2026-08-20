@@ -42,6 +42,7 @@ use crate::usage::{
     usage_exact_root_for_resolution, usage_local_module_prefix_visible_at, usage_reference_at,
     usage_root_declaration_matches_at,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     FileEdgeScanInput, PerFileEdges, UsageReferenceKind, classify_reference_node,
@@ -68,6 +69,7 @@ impl RustSeedsCache {
     fn seeds(
         &self,
         rust: &dyn RustFactSource,
+        token: QueryToken<'_>,
         roots: &BTreeSet<CodeUnit>,
     ) -> Arc<RustBindingSeeds> {
         if let Some(seeds) = self.by_roots.lock().unwrap().get(roots) {
@@ -75,7 +77,7 @@ impl RustSeedsCache {
         }
         // Computed outside the lock: a racing thread may duplicate the BFS for
         // the same roots, but the first insert wins and the loss is benign.
-        let seeds = Arc::new(usage_binding_seeds(rust, roots));
+        let seeds = Arc::new(usage_binding_seeds(rust, token, roots));
         self.by_roots
             .lock()
             .unwrap()
@@ -117,6 +119,7 @@ pub fn scan_file(
     }
     let mut ctx = RustScan {
         rust,
+        token: refs.token(),
         support,
         seeds_cache,
         file,
@@ -136,6 +139,9 @@ pub fn scan_file(
 
 struct RustScan<'a> {
     rust: &'a dyn RustFactSource,
+    /// Proof that the request scope this per-file scan runs under is open
+    /// (issue #2414 step 3).
+    token: QueryToken<'a>,
     support: &'a dyn RustDefinitionProvider,
     seeds_cache: &'a RustSeedsCache,
     file: &'a ProjectFile,
@@ -189,9 +195,10 @@ impl RustScan<'_> {
             .find_map(|declaration| {
                 let roots =
                     std::iter::once(declaration.clone()).collect::<std::collections::BTreeSet<_>>();
-                let seeds = self.seeds_cache.seeds(self.rust, &roots);
+                let seeds = self.seeds_cache.seeds(self.rust, self.token, &roots);
                 let resolution = usage_reference_at(
                     self.rust,
+                    self.token,
                     self.file,
                     &seeds,
                     &[name],
@@ -278,7 +285,7 @@ impl RustScan<'_> {
             })
             .filter_map(|unit| {
                 let roots = std::collections::BTreeSet::from([unit.clone()]);
-                let seeds = self.seeds_cache.seeds(self.rust, &roots);
+                let seeds = self.seeds_cache.seeds(self.rust, self.token, &roots);
                 self.exact_ast_owner(owner_segments, &seeds)
                     .is_some()
                     .then(|| unit.fq_name())
@@ -324,7 +331,7 @@ impl RustScan<'_> {
             return None;
         }
 
-        let seeds = self.seeds_cache.seeds(self.rust, &roots);
+        let seeds = self.seeds_cache.seeds(self.rust, self.token, &roots);
         self.exact_ast_owner(owner_segments, &seeds)
             .is_some()
             .then_some(candidate)
@@ -376,7 +383,7 @@ impl RustScan<'_> {
             return candidate_units.is_empty().then_some(candidate);
         }
 
-        let seeds = self.seeds_cache.seeds(self.rust, &roots);
+        let seeds = self.seeds_cache.seeds(self.rust, self.token, &roots);
         let segments = path
             .iter()
             .map(|node| slice(*node, self.source))
@@ -396,6 +403,7 @@ impl RustScan<'_> {
                 .item_bound_at(root_name, root.start_byte())
             && !usage_root_declaration_matches_at(
                 self.rust,
+                self.token,
                 self.file,
                 &seeds,
                 root_name,
@@ -403,6 +411,7 @@ impl RustScan<'_> {
             )
             && !usage_local_module_prefix_visible_at(
                 self.rust,
+                self.token,
                 self.file,
                 &seeds,
                 root_name,
@@ -410,6 +419,7 @@ impl RustScan<'_> {
             );
         usage_reference_at(
             self.rust,
+            self.token,
             self.file,
             &seeds,
             &segments,
@@ -445,10 +455,11 @@ impl RustScan<'_> {
             return candidate_units.is_empty().then_some(candidate);
         }
 
-        let seeds = self.seeds_cache.seeds(self.rust, &roots);
+        let seeds = self.seeds_cache.seeds(self.rust, self.token, &roots);
         let segment_refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
         usage_reference_at(
             self.rust,
+            self.token,
             self.file,
             &seeds,
             &segment_refs,
@@ -476,6 +487,7 @@ impl RustScan<'_> {
                 .item_bound_at(root_name, root.start_byte())
             && !usage_root_declaration_matches_at(
                 self.rust,
+                self.token,
                 self.file,
                 seeds,
                 root_name,
@@ -483,6 +495,7 @@ impl RustScan<'_> {
             )
             && !usage_local_module_prefix_visible_at(
                 self.rust,
+                self.token,
                 self.file,
                 seeds,
                 root_name,
@@ -490,6 +503,7 @@ impl RustScan<'_> {
             );
         let resolution = usage_reference_at(
             self.rust,
+            self.token,
             self.file,
             seeds,
             &segment_refs,
@@ -498,8 +512,8 @@ impl RustScan<'_> {
             root_shadowed,
             rust_path_is_leading_absolute(*segments.last()?),
         );
-        let root = usage_exact_root_for_resolution(self.rust, &resolution, seeds)?;
-        canonical_rust_hierarchy_type(self.rust, root)
+        let root = usage_exact_root_for_resolution(self.rust, self.token, &resolution, seeds)?;
+        canonical_rust_hierarchy_type(self.rust, self.token, root)
     }
 
     fn use_path_callee(
@@ -513,6 +527,7 @@ impl RustScan<'_> {
         {
             resolve_rust_import_package_scoped(
                 self.rust,
+                self.token,
                 self.file,
                 self.source,
                 focused.start_byte(),

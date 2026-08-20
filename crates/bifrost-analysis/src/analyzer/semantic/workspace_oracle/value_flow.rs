@@ -584,6 +584,157 @@ fn location_has_unproven_exact_index(location: &AbstractLocation) -> bool {
     })
 }
 
+/// The carrier that stands for an access path's root object.
+///
+/// This mirrors `value_flow::plan::root_carrier`, which the fallback-location
+/// index already uses to decide which carrier an unmodeled call's escaping
+/// locations belong to. Every root that names a value, a call result, a port,
+/// an allocation or a lexical cell is carried by that value or port; the four
+/// program-global roots have no value carrier and stand for themselves as a
+/// selector-free location.
+fn access_root_endpoint(
+    location: &AbstractLocation,
+    limits: crate::analyzer::semantic::OracleLimits,
+) -> Result<ValueFlowEndpoint, SemanticProviderError> {
+    let root = location.path().root();
+    let value = match root {
+        AccessPathRoot::Value(value) => Some(value.clone()),
+        AccessPathRoot::CallResult(result) => Some(result.result().clone()),
+        AccessPathRoot::ProcedurePort(port) | AccessPathRoot::CaptureSlot(port) => {
+            return Ok(ValueFlowEndpoint::Port(port.clone()));
+        }
+        AccessPathRoot::Allocation(allocation) => allocation
+            .procedure()
+            .semantics()
+            .allocation(allocation.id())
+            .and_then(|row| allocation.procedure().value_handle(row.result)),
+        AccessPathRoot::LexicalCell(cell) => cell
+            .procedure()
+            .semantics()
+            .memory_location(cell.id())
+            .and_then(|row| match row.kind {
+                MemoryLocationKind::LexicalCell { binding } => {
+                    cell.procedure().value_handle(binding)
+                }
+                _ => None,
+            }),
+        AccessPathRoot::Static(_)
+        | AccessPathRoot::TypeSummary(_)
+        | AccessPathRoot::ModuleObject(_)
+        | AccessPathRoot::External(_) => None,
+    };
+    if let Some(value) = value {
+        return Ok(ValueFlowEndpoint::Value(value));
+    }
+    let path = AccessPath::bounded(root.clone(), Vec::new(), location.path().tail(), limits)
+        .map_err(|error| internal_contract("invalid container access path", error))?;
+    let container = AbstractLocation::new(location.object().clone(), path)
+        .map_err(|error| internal_contract("invalid container location", error))?;
+    Ok(ValueFlowEndpoint::Location(Box::new(container)))
+}
+
+/// The container an indexed access reads out of or writes into, with every
+/// index selector dropped.
+///
+/// #2453: a taint label can live on the array object itself, which is a
+/// different carrier from any element of it. `String[] values =
+/// request.getParameterValues(name)` labels the array; `values[0]` names an
+/// element. Publishing the container alongside the element is what carries the
+/// array's own label into a read of it.
+///
+/// Answers `None` for a path with no index selector, which leaves field
+/// sensitivity exactly as it was: this is about subscripts, not members.
+fn indexed_container_endpoint(
+    location: &AbstractLocation,
+    limits: crate::analyzer::semantic::OracleLimits,
+) -> Result<Option<ValueFlowEndpoint>, SemanticProviderError> {
+    let selectors = location.path().selectors();
+    let Some(first_index) = selectors
+        .iter()
+        .position(|selector| matches!(selector, AccessSelector::Index(_)))
+    else {
+        return Ok(None);
+    };
+    if first_index == 0 {
+        return access_root_endpoint(location, limits).map(Some);
+    }
+    let path = AccessPath::bounded(
+        location.path().root().clone(),
+        selectors[..first_index].to_vec(),
+        location.path().tail(),
+        limits,
+    )
+    .map_err(|error| internal_contract("invalid container access path", error))?;
+    let container = AbstractLocation::new(location.object().clone(), path)
+        .map_err(|error| internal_contract("invalid container location", error))?;
+    Ok(Some(ValueFlowEndpoint::Location(Box::new(container))))
+}
+
+/// The same location with every index selector replaced by the structured
+/// wildcard.
+///
+/// This is the cell an access whose subscript the analysis cannot prove reads
+/// out of or writes into. It is deliberately *not* the cell a proven-constant
+/// subscript uses: #2191 established that two literal subscripts of one array
+/// are separable, and the `array-element-negative` kernel in
+/// `tests/suite_bench_policy/issue_2314_dataflowbench_kernel.rs` pins that in
+/// Java, Python and JavaScript. Smashing every subscript would revoke it. So a
+/// store always publishes the wildcard cell and only an *unproven* load reads
+/// it, which keeps two constants apart while never letting an unprovable
+/// subscript be treated as precise.
+fn wildcard_index_endpoint(
+    location: &AbstractLocation,
+    limits: crate::analyzer::semantic::OracleLimits,
+) -> Result<Option<ValueFlowEndpoint>, SemanticProviderError> {
+    let selectors = location.path().selectors();
+    if !selectors
+        .iter()
+        .any(|selector| matches!(selector, AccessSelector::Index(_)))
+    {
+        return Ok(None);
+    }
+    let wildcard = selectors
+        .iter()
+        .map(|selector| match selector {
+            AccessSelector::Index(_) => AccessSelector::Index(IndexSelector::Any),
+            other => other.clone(),
+        })
+        .collect::<Vec<_>>();
+    let path = AccessPath::bounded(
+        location.path().root().clone(),
+        wildcard,
+        location.path().tail(),
+        limits,
+    )
+    .map_err(|error| internal_contract("invalid wildcard access path", error))?;
+    let cell = AbstractLocation::new(location.object().clone(), path)
+        .map_err(|error| internal_contract("invalid wildcard location", error))?;
+    Ok(Some(ValueFlowEndpoint::Location(Box::new(cell))))
+}
+
+/// The value the language lowering subscripted, when a memory location names an
+/// index access.
+///
+/// The container endpoint above is rooted at the access path's *origin*, which
+/// the resolver walks back through assignments; this is the array expression as
+/// it stands at the access itself. Both are needed: the origin is what a store
+/// into an unprovable subscript marks, and the subscripted expression is what
+/// carries a label that entered the array downstream of its origin -- the
+/// `String[] values = request.getParameterValues(...)` shape the OWASP corpus is
+/// built from.
+fn indexed_base_value(
+    procedure: &ProcedureHandle,
+    location: MemoryLocationId,
+) -> Result<Option<ValueHandle>, SemanticProviderError> {
+    let Some(row) = procedure.semantics().memory_location(location) else {
+        return Ok(None);
+    };
+    let MemoryLocationKind::Index { base, .. } = row.kind else {
+        return Ok(None);
+    };
+    value_handle(procedure, base).map(Some)
+}
+
 fn materialize_abstract_location(
     procedure: &ProcedureHandle,
     draft: AccessPathDraft,
@@ -1255,6 +1406,16 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 let evidence = evidence_handle(procedure, event.evidence)?;
                 let (proof, mut completeness) = evidence_quality(std::slice::from_ref(&evidence));
                 let mut exact_index = false;
+                // #2453: the extra relations an indexed access publishes, so a
+                // label on the array itself is not silently lost at the
+                // subscript. They ride the same event, so they carry the same
+                // evidence, proof and completeness as the access they derive
+                // from.
+                let mut smashed: Vec<(
+                    ValueFlowRelationKind,
+                    ValueFlowEndpoint,
+                    ValueFlowEndpoint,
+                )> = Vec::new();
                 let (kind, source, target, summary) = match &event.effect {
                     SemanticEffect::Assignment { target, value } => (
                         ValueFlowRelationKind::Assignment,
@@ -1368,7 +1529,11 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                             false,
                         )
                     }
-                    SemanticEffect::MemoryLoad { result, .. } => {
+                    SemanticEffect::MemoryLoad {
+                        location: memory,
+                        result,
+                        ..
+                    } => {
                         let (location, summary) = materialize_abstract_location(
                             procedure,
                             access_path
@@ -1376,11 +1541,45 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                                 .expect("memory loads resolve an access path"),
                             *self.limits(),
                         )?;
-                        exact_index |= location_has_unproven_exact_index(&location);
+                        let unproven_index = location_has_unproven_exact_index(&location);
+                        exact_index |= unproven_index;
+                        let loaded = ValueFlowEndpoint::Value(value_handle(procedure, *result)?);
+                        // #2453: an element read of a tainted array carries the
+                        // array's label. The subscripted expression carries a
+                        // label the array acquired downstream of its access-path
+                        // origin; the container carries one it acquired at or
+                        // before that origin, and is also what a store through
+                        // an unprovable subscript marks.
+                        if let Some(base) = indexed_base_value(procedure, *memory)? {
+                            smashed.push((
+                                ValueFlowRelationKind::MemoryLoad,
+                                ValueFlowEndpoint::Value(base),
+                                loaded.clone(),
+                            ));
+                        }
+                        if let Some(container) =
+                            indexed_container_endpoint(&location, *self.limits())?
+                        {
+                            smashed.push((
+                                ValueFlowRelationKind::MemoryLoad,
+                                container,
+                                loaded.clone(),
+                            ));
+                        }
+                        // A subscript the analysis cannot prove reads whatever
+                        // any store put in the array, so it reads the wildcard
+                        // cell every store also writes. A proven-constant
+                        // subscript does not, which is what keeps #2191's
+                        // constant-index separation intact.
+                        if unproven_index
+                            && let Some(cell) = wildcard_index_endpoint(&location, *self.limits())?
+                        {
+                            smashed.push((ValueFlowRelationKind::MemoryLoad, cell, loaded.clone()));
+                        }
                         (
                             ValueFlowRelationKind::MemoryLoad,
                             ValueFlowEndpoint::Location(Box::new(location)),
-                            ValueFlowEndpoint::Value(value_handle(procedure, *result)?),
+                            loaded,
                             summary,
                         )
                     }
@@ -1392,10 +1591,37 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                                 .expect("memory stores resolve an access path"),
                             *self.limits(),
                         )?;
-                        exact_index |= location_has_unproven_exact_index(&location);
+                        let unproven_index = location_has_unproven_exact_index(&location);
+                        exact_index |= unproven_index;
+                        let stored = ValueFlowEndpoint::Value(value_handle(procedure, *value)?);
+                        // #2453, the write direction. Every element store also
+                        // writes the wildcard cell, which is what an unprovable
+                        // subscript later reads.
+                        if let Some(cell) = wildcard_index_endpoint(&location, *self.limits())? {
+                            smashed.push((
+                                ValueFlowRelationKind::MemoryStore,
+                                stored.clone(),
+                                cell,
+                            ));
+                        }
+                        // A store *through* an unprovable subscript could have
+                        // landed anywhere in the array, so it marks the array
+                        // itself, which every element read observes. A store at
+                        // a proven constant does not: #2191 separates two
+                        // literal subscripts and this must not revoke that.
+                        if unproven_index
+                            && let Some(container) =
+                                indexed_container_endpoint(&location, *self.limits())?
+                        {
+                            smashed.push((
+                                ValueFlowRelationKind::MemoryStore,
+                                stored.clone(),
+                                container,
+                            ));
+                        }
                         (
                             ValueFlowRelationKind::MemoryStore,
-                            ValueFlowEndpoint::Value(value_handle(procedure, *value)?),
+                            stored,
                             ValueFlowEndpoint::Location(Box::new(location)),
                             summary,
                         )
@@ -1458,25 +1684,50 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                         "exact index identity is not value-proven across accesses".into(),
                     );
                 }
+                let relation_point = procedure.point_handle(point.id).ok_or_else(|| {
+                    SemanticProviderError::internal("value-flow relation point could not be scoped")
+                })?;
+                let relation_event = u32::try_from(event_index).map_err(|_| {
+                    SemanticProviderError::internal("value-flow event ordinal exceeds u32")
+                })?;
                 let draft = FlowRelationDraft {
-                    point: procedure.point_handle(point.id).ok_or_else(|| {
-                        SemanticProviderError::internal(
-                            "value-flow relation point could not be scoped",
-                        )
-                    })?,
-                    event_index: u32::try_from(event_index).map_err(|_| {
-                        SemanticProviderError::internal("value-flow event ordinal exceeds u32")
-                    })?,
+                    point: relation_point.clone(),
+                    event_index: relation_event,
                     kind,
                     source,
                     target,
-                    proof,
-                    completeness,
-                    evidence: vec![evidence],
+                    proof: proof.clone(),
+                    completeness: completeness.clone(),
+                    evidence: vec![evidence.clone()],
                 };
                 if !push_flow_relation(&mut drafts, &mut retained_evidence, *self.limits(), draft) {
                     truncated = true;
                     break 'points;
+                }
+                // #2453: the smashed-container relations derived from this same
+                // access. They are published after the access they derive from
+                // so the primary relation is never dropped in favour of one of
+                // them when the provenance budget runs out.
+                for (kind, source, target) in smashed {
+                    let draft = FlowRelationDraft {
+                        point: relation_point.clone(),
+                        event_index: relation_event,
+                        kind,
+                        source,
+                        target,
+                        proof: proof.clone(),
+                        completeness: completeness.clone(),
+                        evidence: vec![evidence.clone()],
+                    };
+                    if !push_flow_relation(
+                        &mut drafts,
+                        &mut retained_evidence,
+                        *self.limits(),
+                        draft,
+                    ) {
+                        truncated = true;
+                        break 'points;
+                    }
                 }
             }
         }

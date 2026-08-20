@@ -17,6 +17,7 @@ use crate::analyzer::usages::applicability::{
 };
 use crate::analyzer::usages::cpp_graph::canonical_cpp_scope_components;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope, QueryToken};
 use crate::analyzer::{SignatureMetadata, StructuredTypeName};
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
@@ -305,7 +306,8 @@ pub(super) fn resolve_cpp<'a>(
             )
         };
     }
-    let dispatch = CppDispatch::new(analyzer);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let dispatch = CppDispatch::new(analyzer, scope.token());
     let graph = dispatch.source();
     match visibility.resolve_ordinary_macro_reference(&graph, file, node, source) {
         OrdinaryMacroReferenceResolution::Resolved(macro_unit) => {
@@ -610,6 +612,7 @@ impl CppBoundedProvider<'_> {
 
     fn prepared_syntax(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
         use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxLimitedOutcome;
@@ -618,6 +621,7 @@ impl CppBoundedProvider<'_> {
             return None;
         }
         match self.cpp.prepared_syntax_limited_cancellable(
+            token,
             file,
             CPP_BOUNDED_AUXILIARY_MAX_SOURCE_BYTES,
             self.session.cancellation(),
@@ -1099,7 +1103,8 @@ fn cpp_bounded_direct_ancestor_edges(
     if !owner.is_class() {
         return Vec::new();
     }
-    let Some(prepared) = provider.prepared_syntax(owner.source()) else {
+    let scope = AnalyzerQueryScope::new(provider.cpp);
+    let Some(prepared) = provider.prepared_syntax(scope.token(), owner.source()) else {
         return Vec::new();
     };
     let mut edges = Vec::new();
@@ -2377,7 +2382,8 @@ fn cpp_type_node_resolves_lexically(
     source: &str,
     node: Node<'_>,
 ) -> bool {
-    let dispatch = CppDispatch::new(analyzer);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let dispatch = CppDispatch::new(analyzer, scope.token());
     let name = normalize_cpp_type_text(cpp_node_text(node, source));
     if name.is_empty() {
         return false;
@@ -2516,7 +2522,8 @@ fn resolve_cpp_type(
     node: Node<'_>,
     class_ranges: Option<&ClassRangeIndex>,
 ) -> DefinitionLookupOutcome {
-    let dispatch = CppDispatch::new(analyzer);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let dispatch = CppDispatch::new(analyzer, scope.token());
     let node = cpp_expand_tagged_type_scope_reference(node).unwrap_or(node);
     let text = normalize_cpp_type_text(cpp_node_text(node, source));
     let recovered_declarator_type = recovered_macro_decorated_declarator_type(node).is_some();
@@ -2957,7 +2964,8 @@ fn cpp_macro_candidates(
     }
     let include_targets =
         resolve_analyzer::<CppAnalyzer>(analyzer).map(|cpp| cpp.include_target_index());
-    let dispatch = CppDispatch::new(analyzer);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let dispatch = CppDispatch::new(analyzer, scope.token());
     let source = dispatch.source();
     analyzer
         .definitions(name)
@@ -3004,7 +3012,8 @@ fn resolve_cpp_type_without_focused_qualifier(
     text: &str,
     class_ranges: Option<&ClassRangeIndex>,
 ) -> DefinitionLookupOutcome {
-    let dispatch = CppDispatch::new(analyzer);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let dispatch = CppDispatch::new(analyzer, scope.token());
     let declaration_type_context = cpp_type_node_is_declaration_type(node);
     if node.kind() == "type_identifier"
         && let Some(alias_node) = cpp_active_block_type_alias_node(node, text, source)
@@ -4343,14 +4352,15 @@ fn cpp_navigation_type_target(
     if !cpp_unit_is_type_alias(analyzer, &unit) {
         return unit;
     }
-    let dispatch = CppDispatch::new(analyzer);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let dispatch = CppDispatch::new(analyzer, scope.token());
     visibility
         .canonical_type_unit(&dispatch.source(), file, &unit)
         .unwrap_or(unit)
 }
 
 fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLookupOutcome {
-    let ctx_dispatch = CppDispatch::new(ctx.analyzer);
+    let ctx_dispatch = CppDispatch::new(ctx.analyzer, ctx.visibility.token());
     let Some(function) = call.child_by_field_name("function") else {
         return no_definition("no_function_name", "C++ call expression has no function");
     };
@@ -4706,7 +4716,7 @@ fn cpp_bare_free_function_definition_candidates(
     units: Vec<CodeUnit>,
     reference_byte: usize,
 ) -> Vec<CodeUnit> {
-    let ctx_dispatch = CppDispatch::new(ctx.analyzer);
+    let ctx_dispatch = CppDispatch::new(ctx.analyzer, ctx.visibility.token());
     let mut candidates: Vec<_> = units
         .into_iter()
         .flat_map(|unit| {
@@ -5185,7 +5195,8 @@ fn cpp_visible_name_candidates(
     if let Some(kind) = kind {
         candidates.retain(|unit| cpp_unit_matches_kind(analyzer, support, unit, kind));
     }
-    let dispatch = CppDispatch::new(analyzer);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let dispatch = CppDispatch::new(analyzer, scope.token());
     let graph = dispatch.source();
     candidates = candidates
         .into_iter()
@@ -6548,7 +6559,8 @@ fn cpp_filter_candidates_by_arity(
     if filtered.is_empty() {
         candidates
     } else {
-        let dispatch = CppDispatch::new(analyzer);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let dispatch = CppDispatch::new(analyzer, scope.token());
         let graph = dispatch.source();
         candidates
             .into_iter()
@@ -6871,7 +6883,8 @@ fn cpp_field_declared_type(
     file: &ProjectFile,
     field: &CodeUnit,
 ) -> Option<CppType> {
-    let dispatch = CppDispatch::new(analyzer);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let dispatch = CppDispatch::new(analyzer, scope.token());
     let (name, unit, indirection) =
         cpp_field_declared_type_binding(&dispatch.source(), visibility, file, field)?;
     Some(CppType {
@@ -7118,7 +7131,8 @@ fn cpp_enclosing_class_member_candidates(
     class_ranges: Option<&ClassRangeIndex>,
     name: &str,
 ) -> Vec<CodeUnit> {
-    let dispatch = CppDispatch::new(analyzer);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let dispatch = CppDispatch::new(analyzer, scope.token());
     let candidates_for_owner = |owner: &CodeUnit| {
         cpp_direct_type_member_candidates(analyzer, support, owner, name)
             .into_iter()
@@ -7333,7 +7347,8 @@ fn cpp_resolve_owner_type_in_lexical_namespace(
     globally_qualified: bool,
     byte: usize,
 ) -> Option<CodeUnit> {
-    let dispatch = CppDispatch::new(analyzer);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let dispatch = CppDispatch::new(analyzer, scope.token());
     // Keep the complete owner path during lookup.  `resolve_type(file, name)`
     // is intentionally terminal-name based for compatibility with older
     // callers; it can therefore select an unrelated nested type when the
@@ -8527,7 +8542,7 @@ fn cpp_alias_target_unit(
 /// parameters, and resolve the pointee. This models the language rule rather than assuming the
 /// wrapper exposes its first template argument.
 fn cpp_alias_arrow_target_unit(ctx: CppLookupCtx<'_, '_>, alias: &CodeUnit) -> Option<CodeUnit> {
-    let ctx_dispatch = CppDispatch::new(ctx.analyzer);
+    let ctx_dispatch = CppDispatch::new(ctx.analyzer, ctx.visibility.token());
     cpp_alias_target_texts(ctx.analyzer, alias).find_map(|rhs| {
         let head = rhs.split('<').next()?.trim();
         let args = cpp_angle_group_items(&rhs);
@@ -8807,7 +8822,8 @@ fn cpp_function_return_type(
     file: &ProjectFile,
     function: &CodeUnit,
 ) -> Option<CppType> {
-    let dispatch = CppDispatch::new(analyzer);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let dispatch = CppDispatch::new(analyzer, scope.token());
     let type_text = cpp_function_return_type_text(&dispatch.source(), function)?;
     let indirection = cpp_type_text_pointer_depth(&type_text);
     let type_text = normalize_cpp_type_text(&type_text);
@@ -9050,7 +9066,8 @@ struct holder {
 
         CPP_BINDINGS_BUILD_COUNT.with(|count| count.set(0));
         let analyzer = fixture.analyzer.analyzer();
-        let mut context = DefinitionBatchContext::new(analyzer, false);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let mut context = DefinitionBatchContext::new(analyzer, scope.token(), false);
         context.bounded_support.set_language(Language::Cpp);
         let outcome = resolve_cpp(analyzer, &mut context, &file, &source, Some(&tree), &site);
         let builds = CPP_BINDINGS_BUILD_COUNT.with(std::cell::Cell::get);

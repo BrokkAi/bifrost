@@ -26,6 +26,7 @@ use crate::imports::{IncludeTargetIndex, include_paths, resolve_include_targets_
 use crate::reconcile::{ReconciledIdentity, VisibleClass, reconcile_out_of_line_member_identity};
 use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{CallableLinkage, Range};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq;
 use brokk_bifrost_core::analyzer::tree_walk::{node_for_exact_range, subtree_contains};
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile};
@@ -783,6 +784,7 @@ const CANDIDATE_BUCKETING_POLL_STRIDE: usize = 256;
 /// then; see [`cpp_reconcile_candidates`].
 pub fn cpp_reconcile_group(
     cpp: &dyn CppSource,
+    token: QueryToken<'_>,
     key: &CppReconcileGroupKey,
     candidates: &CppReconcileCandidates,
     keep_going: &dyn Fn() -> bool,
@@ -820,7 +822,8 @@ pub fn cpp_reconcile_group(
         ) {
             continue;
         }
-        let Some(reconciled) = cpp_reconcile_definition_identity(cpp, unit, &mut using_by_file)
+        let Some(reconciled) =
+            cpp_reconcile_definition_identity(cpp, token, unit, &mut using_by_file)
         else {
             continue;
         };
@@ -872,6 +875,7 @@ pub fn cpp_reconcile_group(
 /// namespace and the visible class table confirm its package.
 fn cpp_reconcile_definition_identity(
     cpp: &dyn CppSource,
+    token: QueryToken<'_>,
     unit: &CodeUnit,
     using_by_file: &mut HashMap<ProjectFile, Arc<Vec<String>>>,
 ) -> Option<ReconciledIdentity> {
@@ -910,8 +914,8 @@ fn cpp_reconcile_definition_identity(
     // FqName because it preserves template-owner normalization. Read the
     // declarator only for the previously unsupported one-segment shape, where
     // extraction can prepend a guessed using namespace.
-    let structured_owner_segments =
-        cpp_structured_out_of_line_owner_segments(cpp, unit).filter(|segments| segments.len() == 1);
+    let structured_owner_segments = cpp_structured_out_of_line_owner_segments(cpp, token, unit)
+        .filter(|segments| segments.len() == 1);
     let owner_segments = structured_owner_segments.as_ref().map_or_else(
         || provisional_owner_segments,
         |segments| segments.iter().map(String::as_str).collect(),
@@ -964,9 +968,10 @@ fn cpp_reconcile_definition_identity(
 /// using target and let the visible class table select the namespace.
 fn cpp_structured_out_of_line_owner_segments(
     cpp: &dyn CppSource,
+    token: QueryToken<'_>,
     unit: &CodeUnit,
 ) -> Option<Vec<String>> {
-    let prepared = cpp.prepared_syntax(unit.source())?;
+    let prepared = cpp.prepared_syntax(token, unit.source())?;
     let root = prepared.tree().root_node();
     for range in cpp.ranges(unit) {
         let mut current = cpp_declaration_node_for_range(root, &range)?;

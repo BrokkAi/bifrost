@@ -26,10 +26,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: BrokkAi/bifrost/.github/actions/policy-scan@v0.9.1
+      - uses: BrokkAi/bifrost-policy-scan@v0
 ```
 
 The default configuration installs the pinned Bifrost release, runs the `bifrost.code-smells` pack on the checkout, writes `bifrost-policy.sarif`, uploads it, and gates on the exit code.
+
+## Versioning
+
+Every Bifrost release publishes a matching `vX.Y.Z` tag of the action to [BrokkAi/bifrost-policy-scan](https://github.com/BrokkAi/bifrost-policy-scan), and that tag's `version` input defaults to the same Bifrost release. The action version and the binary it installs therefore stay in lockstep, including policy and RQL syntax compatibility. Pin an exact tag (for example `@v0.10.4`) for reproducible gates; the floating major tag (`@v0`) follows the newest release. The long form `BrokkAi/bifrost/.github/actions/policy-scan@vX.Y.Z` remains equivalent.
 
 The `security-events: write` permission is required for the SARIF upload. Code scanning must be available on the repository.
 
@@ -86,7 +90,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - uses: BrokkAi/bifrost/.github/actions/policy-scan@v0.9.1
+      - uses: BrokkAi/bifrost-policy-scan@v0
         with:
           diff-base: ${{ github.event.pull_request.base.sha }}
 ```

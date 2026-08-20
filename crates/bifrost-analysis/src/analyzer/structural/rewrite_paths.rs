@@ -24,6 +24,7 @@
 //! not answer: a cancelled run, a missing Rust analyzer, a file whose source
 //! the analyzer no longer holds.
 
+use crate::analyzer::QueryScope;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
@@ -153,6 +154,7 @@ fn rust_import_alias_paths(
     request: &mut RewritePathRequest<'_>,
 ) -> FileRewritePaths {
     let domain = RewriteDomainKind::RustImportAlias;
+    let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
     let Some(rust) = crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(analyzer)
     else {
         return FileRewritePaths::incomplete(
@@ -194,7 +196,8 @@ fn rust_import_alias_paths(
         // here on purpose: this layer reports how the chase terminated, and
         // the resolution result is the resolver's own business.
         let _resolved =
-            resolve_module_package_traced(rust, file, local_name, Some(&mut trace)).is_some();
+            resolve_module_package_traced(rust, scope.token(), file, local_name, Some(&mut trace))
+                .is_some();
         let (declared_bound, steps, outcome) = trace.into_parts();
         // A specifier whose root no alias rewrites never engaged the domain,
         // so it is not a path through it.

@@ -260,6 +260,104 @@
               }
             ],
             "effects": []
+          },
+          {
+            "id": "javax.servlet.servletresponse.getwriter",
+            "target": {
+              "path": "javax/servlet/ServletResponse.java",
+              "symbol": "javax.servlet.ServletResponse.getWriter()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
+            "id": "javax.servlet.servletresponse.setcontenttype",
+            "target": {
+              "path": "javax/servlet/ServletResponse.java",
+              "symbol": "javax.servlet.ServletResponse.setContentType(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "servlet.response.content-type",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "javax.servlet.http.httpservletresponse.setheader",
+            "target": {
+              "path": "javax/servlet/http/HttpServletResponse.java",
+              "symbol": "javax.servlet.http.HttpServletResponse.setHeader(java.lang.String,java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "servlet.response.header-name",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              },
+              {
+                "kind": "escape",
+                "event": "servlet.response.header-value",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                }
+              }
+            ]
           }
         ]
       }

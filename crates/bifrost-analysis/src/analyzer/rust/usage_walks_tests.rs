@@ -8,6 +8,7 @@
 #[cfg(test)]
 mod tests {
     use crate::analyzer::rust::RustAnalyzer;
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{AnalyzerTestHooks, CodeUnitIndex};
     use crate::analyzer::{IAnalyzer, Language, ProjectFile, TestProject};
     use brokk_bifrost_rust::graph_support::{
@@ -110,7 +111,8 @@ mod tests {
                 "pub fn describe() -> &'static str { \"Widget\" }\npub struct Widget;\n",
             ),
         ]);
-        let walks = RustUsageWalks::new(&analyzer);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
         let service = file(&analyzer, "service.rs");
         let consumer = file(&analyzer, "consumer.rs");
         let target = identity_named(&walks, &service, "Widget");
@@ -144,9 +146,11 @@ mod tests {
             ("src/lib.rs", "pub mod service;\n"),
             ("src/service.rs", "pub struct Widget;\n"),
         ]);
-        let walks = RustUsageWalks::new(&analyzer);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
         let first = walks.files_in_module_package("service");
-        let second = RustUsageWalks::new(&analyzer).files_in_module_package("service");
+        let second = RustUsageWalks::new(&analyzer, analyzer_scope.token())
+            .files_in_module_package("service");
         assert!(
             Arc::ptr_eq(&first, &second),
             "a second walker in the same generation must hit the cache"
@@ -161,7 +165,9 @@ mod tests {
         );
 
         let updated = analyzer.update_all();
-        let after = RustUsageWalks::new(&updated).files_in_module_package("service");
+        let updated_scope = AnalyzerQueryScope::new(&updated);
+        let after =
+            RustUsageWalks::new(&updated, updated_scope.token()).files_in_module_package("service");
         assert!(
             !Arc::ptr_eq(&first, &after),
             "a generation bump must not serve the previous generation's entry"
@@ -182,7 +188,8 @@ mod tests {
             ("src/lib.rs", "pub mod service;\n"),
             ("src/service.rs", "pub struct Widget;\n"),
         ]);
-        let walks = RustUsageWalks::new(&analyzer);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
         let importer = file(&analyzer, "lib.rs");
 
         let before = walks.caches.module_probe_computations();
@@ -206,7 +213,7 @@ mod tests {
             );
         }
         // A second walker in the same generation shares the analyzer's caches.
-        let sibling = RustUsageWalks::new(&analyzer)
+        let sibling = RustUsageWalks::new(&analyzer, analyzer_scope.token())
             .probed_module_files_from_path(&importer, "crate::service");
         assert!(Arc::ptr_eq(&first, &sibling));
         assert_eq!(
@@ -227,7 +234,8 @@ mod tests {
         // The generation is the invalidation, exactly as for every other walk
         // cache: a fresh analyzer probes the filesystem again.
         let updated = analyzer.update_all();
-        let next = RustUsageWalks::new(&updated);
+        let updated_scope = AnalyzerQueryScope::new(&updated);
+        let next = RustUsageWalks::new(&updated, updated_scope.token());
         let importer = file(&updated, "lib.rs");
         let fresh = next.probed_module_files_from_path(&importer, "crate::service");
         assert_eq!(next.caches.module_probe_computations(), 1);
@@ -242,7 +250,8 @@ mod tests {
             ("src/lib.rs", "pub mod service;\n"),
             ("src/service.rs", "pub struct Widget;\n"),
         ]);
-        let walks = RustUsageWalks::new(&analyzer);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
         let importer = file(&analyzer, "lib.rs");
         let segments = vec!["crate".to_string(), "service".to_string()];
 
@@ -275,7 +284,8 @@ mod tests {
                 "pub struct Echo;\npub use crate::alpha::Value;\n",
             ),
         ]);
-        let walks = RustUsageWalks::new(&analyzer);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
         let alpha = file(&analyzer, "alpha.rs");
         let beta = file(&analyzer, "beta.rs");
         let alpha_module = walks.physical_root_of(&alpha).expect("alpha is analyzed");
@@ -312,7 +322,8 @@ mod tests {
             ),
             ("src/user.rs", "use crate::defs::target;\n"),
         ]);
-        let walks = RustUsageWalks::new(&analyzer);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
         let defs = file(&analyzer, "defs.rs");
         let defs_module = walks.physical_root_of(&defs).expect("defs is analyzed");
 
@@ -357,7 +368,8 @@ mod tests {
         const MODULES: usize = 24;
         const NEIGHBOURS: usize = 4;
         let (_temp, analyzer) = cyclic_project(MODULES, NEIGHBOURS);
-        let walks = RustUsageWalks::new(&analyzer);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
         let head = file(&analyzer, "m0.rs");
         let head_module = walks.physical_root_of(&head).expect("m0 is analyzed");
 
@@ -408,10 +420,11 @@ mod tests {
     #[test]
     fn a_cancelled_walk_stops_promptly_and_memoizes_nothing() {
         let (_temp, analyzer) = cyclic_project(8, 3);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
         let head = file(&analyzer, "m0.rs");
 
         let complete = {
-            let walks = RustUsageWalks::new(&analyzer);
+            let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
             let module = walks.physical_root_of(&head).expect("m0 is analyzed");
             walks.bindings_at(&head, &module).as_ref().clone()
         };
@@ -421,15 +434,16 @@ mod tests {
         );
 
         let updated = analyzer.update_all();
+        let updated_scope = AnalyzerQueryScope::new(&updated);
         // Warm the Cargo routes on the new generation: the constructor's own
         // cancellation point is not what this test is about, and a cold build
         // there would stop the walker before it ever walked.
-        let module = RustUsageWalks::new(&updated)
+        let module = RustUsageWalks::new(&updated, updated_scope.token())
             .physical_root_of(&head)
             .expect("m0 is analyzed");
         let keep_going = || false;
-        let walks =
-            RustUsageWalks::new_while(&updated, &keep_going).expect("routes build before the poll");
+        let walks = RustUsageWalks::new_while(&updated, updated_scope.token(), &keep_going)
+            .expect("routes build before the poll");
         let truncated = walks.bindings_at(&head, &module);
         assert_eq!(
             walks.recursion_computations(),
@@ -442,7 +456,7 @@ mod tests {
              which is what makes the next assertion meaningful: {truncated:?}"
         );
 
-        let after = RustUsageWalks::new(&updated);
+        let after = RustUsageWalks::new(&updated, updated_scope.token());
         assert_eq!(
             *after.bindings_at(&head, &module),
             complete,
@@ -475,7 +489,8 @@ mod tests {
             .map(|(rel, body)| (rel.as_str(), body.as_str()))
             .collect();
         let (_temp, analyzer) = project(&borrowed);
-        let walks = RustUsageWalks::new(&analyzer);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
         let head = file(&analyzer, "link0.rs");
         let tail = file(&analyzer, &format!("link{}.rs", LINKS - 1));
         let head_module = walks.physical_root_of(&head).expect("link0 is analyzed");
@@ -510,7 +525,8 @@ mod tests {
                 "pub use crate::real as routed;\npub use crate::real::inner as routed_inner;\n",
             ),
         ]);
-        let walks = RustUsageWalks::new(&analyzer);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
         let outer = file(&analyzer, "outer.rs");
         let outer_module = walks.physical_root_of(&outer).expect("outer is analyzed");
 
@@ -565,6 +581,7 @@ mod tests {
                 "use crate::decoy::Widget;\npub fn take(_: Widget) {}\n",
             ),
         ]);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
         let service = file(&analyzer, "service.rs");
         let consumer = file(&analyzer, "consumer.rs");
         let widget_of = |analyzer: &RustAnalyzer| {
@@ -577,7 +594,12 @@ mod tests {
 
         let before = usage_importers(
             &analyzer,
-            &usage_binding_seeds(&analyzer, &BTreeSet::from([widget_of(&analyzer)])),
+            analyzer_scope.token(),
+            &usage_binding_seeds(
+                &analyzer,
+                analyzer_scope.token(),
+                &BTreeSet::from([widget_of(&analyzer)]),
+            ),
         );
         assert!(
             !before.contains(&consumer),
@@ -588,11 +610,17 @@ mod tests {
             .write("use crate::service::Widget;\npub fn take(_: Widget) {}\n")
             .expect("rewrite the consumer");
         let updated = analyzer.update(&BTreeSet::from([consumer.clone()]));
+        let updated_scope = AnalyzerQueryScope::new(&updated);
         updated.reset_full_declaration_scan_count_for_test();
 
         let after = usage_importers(
             &updated,
-            &usage_binding_seeds(&updated, &BTreeSet::from([widget_of(&updated)])),
+            updated_scope.token(),
+            &usage_binding_seeds(
+                &updated,
+                updated_scope.token(),
+                &BTreeSet::from([widget_of(&updated)]),
+            ),
         );
         assert!(
             after.contains(&consumer),
@@ -627,6 +655,7 @@ mod tests {
             ),
             ("src/unrelated.rs", "pub struct Gadget;\n"),
         ]);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
         let service = file(&analyzer, "service.rs");
         let target = analyzer
             .declarations(&service)
@@ -636,8 +665,8 @@ mod tests {
         let roots = BTreeSet::from([target]);
         analyzer.reset_full_declaration_scan_count_for_test();
 
-        let seeds = usage_binding_seeds(&analyzer, &roots);
-        let importers = usage_importers(&analyzer, &seeds);
+        let seeds = usage_binding_seeds(&analyzer, analyzer_scope.token(), &roots);
+        let importers = usage_importers(&analyzer, analyzer_scope.token(), &seeds);
 
         assert!(
             importers.contains(&file(&analyzer, "consumer.rs")),
@@ -672,6 +701,7 @@ mod tests {
                 "use crate::types::Thing;\npub fn take(_: Thing) {}\n",
             ),
         ]);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
         let target_file = file(&analyzer, "types/declaration/struct.rs");
         let consumer = file(&analyzer, "consumer.rs");
         let target = analyzer
@@ -679,7 +709,7 @@ mod tests {
             .into_iter()
             .find(|declaration| declaration.identifier() == "Thing")
             .expect("Thing declaration");
-        let walks = RustUsageWalks::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
         let identity = identity_named(&walks, &target_file, "Thing");
         let direct_edges = walks.edges_binding_identity(&identity);
         assert!(
@@ -688,8 +718,9 @@ mod tests {
                 .any(|edge| edge.importer.rel_path().ends_with("types/declaration.rs")),
             "raw-module glob edge: identity={identity:#?} edges={direct_edges:#?}"
         );
-        let seeds = usage_binding_seeds(&analyzer, &BTreeSet::from([target]));
-        let importers = usage_importers(&analyzer, &seeds);
+        let seeds =
+            usage_binding_seeds(&analyzer, analyzer_scope.token(), &BTreeSet::from([target]));
+        let importers = usage_importers(&analyzer, analyzer_scope.token(), &seeds);
         assert!(
             importers.contains(&consumer),
             "raw-module glob importers: {importers:#?}"

@@ -31,6 +31,7 @@ use crate::imports::IncludeTargetIndex;
 use brokk_bifrost_core::analyzer::capabilities::{TypeAliasProvider, TypeHierarchyProvider};
 use brokk_bifrost_core::analyzer::model::{CppFieldLinkage, CppTemplateMetadata};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -77,7 +78,11 @@ pub trait CppSource:
     /// fresh visibility index is built per usage query: rebuilding the index
     /// per query re-walked a 9.5 MB amalgamation's AST once per candidate
     /// (issue #1927).
-    fn source_using_index(&self, file: &ProjectFile) -> Arc<SourceUsingIndex>;
+    fn source_using_index(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Arc<SourceUsingIndex>;
 
     /// The indexed source of `file` (`TreeSitterAnalyzer::file_source`).
     fn file_source(&self, file: &ProjectFile) -> Option<String>;
@@ -90,7 +95,14 @@ pub trait CppSource:
     /// borrows the analyzer rather than cloning it precisely so this stays warm
     /// across a scan (#1175), so an implementor must forward to the same
     /// analyzer the query is running against.
-    fn prepared_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>>;
+    ///
+    /// The [`QueryToken`] is proof that a request scope is open, so the cache
+    /// this reads is live (issue #2414 step 3).
+    fn prepared_syntax(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Arc<PreparedSyntaxTree>>;
 
     /// The persisted linkage fact for one C++ field, when the parser recorded
     /// it. A missing fact requires the resolver's syntax fallback.

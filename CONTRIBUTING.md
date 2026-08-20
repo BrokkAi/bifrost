@@ -487,6 +487,32 @@ The workflows do not currently claim a fixed duration or speed improvement
 from caching. Any timing target must be measured and recorded by a completed
 rehearsal; it must not be inferred from configuration alone.
 
+The release workflow also syncs the policy-scan composite action into the
+standalone alias repository `BrokkAi/bifrost-policy-scan`, so workflows can
+reference `uses: BrokkAi/bifrost-policy-scan@vX.Y.Z` instead of the
+subdirectory form. `scripts/sync-policy-scan-action.sh` copies the canonical
+`.github/actions/policy-scan/action.yml`, rewrites its `version` input default
+to the release tag being published (keeping the action and the Bifrost binary
+it installs in lockstep), pushes one commit, tags the exact release tag, and
+force-moves the floating major tag (`v0`). The push authenticates as a GitHub
+App installation: the job mints a short-lived installation token with
+`actions/create-github-app-token` from the `POLICY_SCAN_APP_CLIENT_ID`
+variable and the `POLICY_SCAN_APP_PRIVATE_KEY` secret in the protected
+`release` environment (the job runs under `environment: release` like the
+other publisher jobs), downscoped at mint time to the alias repository and the
+Contents permission. One-time setup: create the alias repository with an
+initial commit; create a dedicated org-owned GitHub App with only the Contents
+read/write repository permission; install it on the alias repository only; and
+store the App client ID in the variable and a generated private key in the
+secret, both on the `release` environment. Do not reuse the open-core projector App for this: its private key can
+mint tokens with contents and workflows write on the public repository and
+belongs only in the private repository's secret store. An exact alias tag is
+immutable; if the remote tag
+exists with different content the sync fails instead of moving it. The sync is
+recorded in the release summary but does not gate npm publication; recover a
+failed sync with **Re-run failed jobs**. Listing the alias repository on the
+GitHub Marketplace is a one-time manual step from that repository's release UI.
+
 To announce a published GitHub Release in Discord, set the
 `DISCORD_RELEASE_WEBHOOK_URL` repository Actions secret to the target channel's
 webhook URL. The release workflow reuses GitHub's generated release notes,

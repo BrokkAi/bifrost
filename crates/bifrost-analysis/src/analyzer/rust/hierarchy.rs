@@ -5,6 +5,7 @@
 //! [`brokk_bifrost_rust::hierarchy`] and [`brokk_bifrost_rust::graph_support`].
 
 use crate::analyzer::type_relations::TypeRelation;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CodeUnit, TypeHierarchyProvider};
 use crate::hash::HashSet;
 use brokk_bifrost_rust::graph_support::{
@@ -50,7 +51,7 @@ impl TypeHierarchyProvider for RustAnalyzer {
 impl RustAnalyzer {
     pub fn hierarchy_index(&self) -> &RustHierarchyIndex {
         self.hierarchy_index
-            .get_or_init(|| RustHierarchyIndex::build(self))
+            .get_or_init(|| RustHierarchyIndex::build(self, AnalyzerQueryScope::new(self).token()))
     }
 
     pub fn type_relations(&self) -> &[TypeRelation] {

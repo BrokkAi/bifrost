@@ -24,6 +24,7 @@ use brokk_bifrost_core::analyzer::model::{
 };
 use brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::node_for_exact_range;
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
@@ -811,6 +812,11 @@ const MAX_COMPARABLE_ALIAS_HOPS: usize = 32;
 /// tens of thousands of times.
 pub struct VisibilityIndex<'a> {
     cpp: &'a dyn CppSource,
+    /// Proof that the request scope the index was built under is still open.
+    /// The index is a per-query object whose lifetime is inside the scope's,
+    /// so carrying the token here instead of on ninety method signatures is
+    /// the same guarantee for far less plumbing (issue #2414 step 3).
+    token: QueryToken<'a>,
     pub visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     visible_by_identifier: HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>>,
     global_field_internal_linkage: HashMap<CodeUnit, bool>,
@@ -1220,6 +1226,11 @@ impl<'a> VisibilityIndex<'a> {
         self.cpp
     }
 
+    /// The request-scope proof this index was built with (issue #2414 step 3).
+    pub fn token(&self) -> QueryToken<'a> {
+        self.token
+    }
+
     /// A [`VisibilityIndex`] over a caller-supplied visible-declaration map,
     /// bypassing the include-closure walk [`Self::build`] performs.
     ///
@@ -1230,6 +1241,7 @@ impl<'a> VisibilityIndex<'a> {
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_visible_files_for_test(
         cpp: &'a dyn CppSource,
+        token: QueryToken<'a>,
         visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     ) -> Self {
         let visible_source_files_by_root = visible_by_file
@@ -1248,8 +1260,9 @@ impl<'a> VisibilityIndex<'a> {
         let mut global_field_internal_linkage = HashMap::default();
         Self {
             cpp,
+            token,
             visible_by_identifier: build_visible_identifier_index(
-                &CppGraphSource::from_source(cpp),
+                &CppGraphSource::from_source(cpp, token),
                 &visible_by_file,
                 &visible_source_files_by_root,
                 &mut global_field_internal_linkage,
@@ -1305,19 +1318,21 @@ impl<'a> VisibilityIndex<'a> {
     /// against; before the move they passed `&CppAnalyzer` straight into a
     /// `&dyn IAnalyzer` parameter. See [`CppGraphSource::from_source`].
     fn cpp_source(&self) -> CppGraphSource<'a> {
-        CppGraphSource::from_source(self.cpp)
+        CppGraphSource::from_source(self.cpp, self.token)
     }
 
     pub fn build(
         cpp: &'a dyn CppSource,
+        token: QueryToken<'a>,
         analyzer: &CppGraphSource<'_>,
         roots: &HashSet<ProjectFile>,
     ) -> Self {
-        Self::build_with_cancellation(cpp, analyzer, roots, None)
+        Self::build_with_cancellation(cpp, token, analyzer, roots, None)
     }
 
     pub fn build_with_cancellation(
         cpp: &'a dyn CppSource,
+        token: QueryToken<'a>,
         analyzer: &CppGraphSource<'_>,
         roots: &HashSet<ProjectFile>,
         cancellation: Option<&CancellationToken>,
@@ -1382,6 +1397,7 @@ impl<'a> VisibilityIndex<'a> {
         }
         Self {
             cpp,
+            token,
             visible_by_file,
             visible_by_identifier,
             global_field_internal_linkage,
@@ -1952,7 +1968,7 @@ impl<'a> VisibilityIndex<'a> {
         if binding.source != *target.source() {
             return false;
         }
-        let Some(prepared) = self.cpp.prepared_syntax(target.source()) else {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, target.source()) else {
             return false;
         };
         analyzer.ranges(target).iter().any(|range| {
@@ -2106,7 +2122,7 @@ impl<'a> VisibilityIndex<'a> {
         if !include_stack.insert(file.clone()) {
             return;
         }
-        if self.cpp.prepared_syntax(file).is_none() {
+        if self.cpp.prepared_syntax(self.token, file).is_none() {
             environment.mark_unknown_names(file, before_byte.unwrap_or_default());
             include_stack.remove(file);
             return;
@@ -2266,7 +2282,7 @@ impl<'a> VisibilityIndex<'a> {
         if !include_stack.insert(file.clone()) {
             return;
         }
-        if self.cpp.prepared_syntax(file).is_none() {
+        if self.cpp.prepared_syntax(self.token, file).is_none() {
             environment.mark_unknown_names(conditional_file, conditional_byte);
             return;
         }
@@ -2375,20 +2391,21 @@ impl<'a> VisibilityIndex<'a> {
             .or_default()
             .clone();
         cell.get_or_init(|| {
-            self.cpp
-                .prepared_syntax(file)
-                .map_or(MacroIncludeProtection::None, |prepared| {
+            self.cpp.prepared_syntax(self.token, file).map_or(
+                MacroIncludeProtection::None,
+                |prepared| {
                     top_level_macro_include_protection(
                         prepared.tree().root_node(),
                         prepared.source(),
                     )
-                })
+                },
+            )
         })
         .clone()
     }
 
     fn collect_macro_events(&self, file: &ProjectFile) -> Vec<MacroEvent> {
-        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
             return Vec::new();
         };
         let source = prepared.source();
@@ -2566,7 +2583,8 @@ impl<'a> VisibilityIndex<'a> {
                                 .entry(visible_file.clone())
                                 .or_default() += 1;
                         }
-                        aliases_from_prepared_source(self.cpp, &visible_file).into_boxed_slice()
+                        aliases_from_prepared_source(self.cpp, self.token, &visible_file)
+                            .into_boxed_slice()
                     })
                     .iter()
                 {
@@ -2625,7 +2643,8 @@ impl<'a> VisibilityIndex<'a> {
                                 .entry(visible_file.clone())
                                 .or_default() += 1;
                         }
-                        aliases_from_prepared_source(self.cpp, &visible_file).into_boxed_slice()
+                        aliases_from_prepared_source(self.cpp, self.token, &visible_file)
+                            .into_boxed_slice()
                     })
                     .iter()
                 {
@@ -2692,14 +2711,15 @@ impl<'a> VisibilityIndex<'a> {
             let declaration_activation = if candidate.source() == file {
                 callable_declaration_activation_in_file(analyzer, prepared, candidate, &reference)
             } else {
-                cpp.prepared_syntax(candidate.source()).and_then(|syntax| {
-                    callable_declaration_activation_in_file(
-                        analyzer,
-                        syntax.as_ref(),
-                        candidate,
-                        &reference,
-                    )
-                })
+                cpp.prepared_syntax(self.token, candidate.source())
+                    .and_then(|syntax| {
+                        callable_declaration_activation_in_file(
+                            analyzer,
+                            syntax.as_ref(),
+                            candidate,
+                            &reference,
+                        )
+                    })
             };
             let Some(declaration_activation) = declaration_activation else {
                 continue;
@@ -2818,7 +2838,7 @@ impl<'a> VisibilityIndex<'a> {
         #[cfg(any(test, feature = "test-support"))]
         self.include_activation_build_count
             .fetch_add(1, Ordering::Relaxed);
-        let activation = find_include_activation(cpp, file, prepared, donor_source);
+        let activation = find_include_activation(cpp, self.token, file, prepared, donor_source);
         let mut cells = self
             .include_activation_cells
             .lock()
@@ -2844,7 +2864,7 @@ impl<'a> VisibilityIndex<'a> {
             #[cfg(any(test, feature = "test-support"))]
             self.conditional_include_projection_index_build_count
                 .fetch_add(1, Ordering::Relaxed);
-            find_conditional_include_projection_index(self.cpp, file, prepared, &|| {
+            find_conditional_include_projection_index(self.cpp, self.token, file, prepared, &|| {
                 #[cfg(any(test, feature = "test-support"))]
                 self.conditional_include_projection_state_count
                     .fetch_add(1, Ordering::Relaxed);
@@ -2976,7 +2996,7 @@ impl<'a> VisibilityIndex<'a> {
             .or_default()
             .clone();
         let spec = cell.get_or_init(|| {
-            let prepared = self.cpp.prepared_syntax(file)?;
+            let prepared = self.cpp.prepared_syntax(self.token, file)?;
             let spec = TargetSpec::from_target(analyzer, candidate)?;
             let spec = spec
                 .with_visible_callable_arities(analyzer, self.cpp, self, file, prepared.as_ref())
@@ -2997,7 +3017,7 @@ impl<'a> VisibilityIndex<'a> {
         reference_byte: usize,
         reference_guards: &OnceCell<Option<HashSet<PreprocessorGuard>>>,
     ) -> bool {
-        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
             return false;
         };
         let reference = CallableReferenceContext {
@@ -3025,7 +3045,7 @@ impl<'a> VisibilityIndex<'a> {
             })
             .is_some_and(|activation| activation < reference_byte);
         }
-        let Some(donor_syntax) = self.cpp.prepared_syntax(declaration.source()) else {
+        let Some(donor_syntax) = self.cpp.prepared_syntax(self.token, declaration.source()) else {
             return false;
         };
         if callable_declaration_activation_in_file(
@@ -3069,7 +3089,7 @@ impl<'a> VisibilityIndex<'a> {
         if candidate.source() == file {
             return true;
         }
-        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
             return false;
         };
         self.visible_identifier_candidates(file, candidate.identifier())
@@ -3096,7 +3116,7 @@ impl<'a> VisibilityIndex<'a> {
         if candidate.source() == file {
             return true;
         }
-        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
             return false;
         };
         self.include_activation_for_source(self.cpp, file, prepared.as_ref(), candidate.source())
@@ -3207,7 +3227,7 @@ impl<'a> VisibilityIndex<'a> {
         if !self.compile_context_is_absent(file) {
             return false;
         }
-        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
             return false;
         };
         let reference_guards = preprocessor_guard_environment(reference, prepared.source());
@@ -3306,7 +3326,7 @@ impl<'a> VisibilityIndex<'a> {
         candidate: &CodeUnit,
         reference: Node<'_>,
     ) -> bool {
-        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
             return false;
         };
         let macro_environment = self.macro_environment(file, reference.start_byte());
@@ -3494,7 +3514,7 @@ impl<'a> VisibilityIndex<'a> {
             return false;
         };
 
-        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
             return false;
         };
         let Some(reference_guards) = preprocessor_guard_environment(reference, prepared.source())
@@ -3537,7 +3557,7 @@ impl<'a> VisibilityIndex<'a> {
         candidate: &CodeUnit,
         reference: Node<'_>,
     ) -> bool {
-        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
             return false;
         };
         let reference_guards = preprocessor_guard_environment(reference, prepared.source());
@@ -3583,7 +3603,7 @@ impl<'a> VisibilityIndex<'a> {
         candidate: &CodeUnit,
         reference_byte: usize,
     ) -> bool {
-        let Some(prepared) = self.cpp.prepared_syntax(file) else {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
             return false;
         };
         let root = prepared.tree().root_node();
@@ -4865,7 +4885,7 @@ impl<'a> VisibilityIndex<'a> {
             .map(|range| range.start_byte)
             .min()
             .expect("non-empty alias ranges have a minimum");
-        let Some(prepared) = self.cpp.prepared_syntax(target.source()) else {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, target.source()) else {
             return false;
         };
         let root = prepared.tree().root_node();
@@ -5226,7 +5246,7 @@ impl<'a> VisibilityIndex<'a> {
     ) -> Option<(usize, usize)> {
         let mut family_range = None;
         for candidate in candidates {
-            let prepared = self.cpp.prepared_syntax(candidate.source())?;
+            let prepared = self.cpp.prepared_syntax(self.token, candidate.source())?;
             let root = prepared.tree().root_node();
             let mut candidate_family = None;
             for range in analyzer.ranges(candidate) {
@@ -5887,7 +5907,7 @@ impl<'a> VisibilityIndex<'a> {
         analyzer: &CppGraphSource<'_>,
         unit: &CodeUnit,
     ) -> Option<ExtractedComparable> {
-        let prepared = self.cpp.prepared_syntax(unit.source())?;
+        let prepared = self.cpp.prepared_syntax(self.token, unit.source())?;
         let root = prepared.tree().root_node();
         let declarator = analyzer
             .ranges(unit)
@@ -5955,7 +5975,7 @@ impl<'a> VisibilityIndex<'a> {
                     .entry(file.clone())
                     .or_default() += 1;
             }
-            aliases_from_prepared_source(cpp, file).into_boxed_slice()
+            aliases_from_prepared_source(cpp, self.token, file).into_boxed_slice()
         })
         .iter()
         .any(|alias| alias.name == alias_name && alias_target_matches_target(alias, target))
@@ -6342,7 +6362,7 @@ impl<'a> VisibilityIndex<'a> {
         if !candidate.is_function() {
             return false;
         }
-        let Some(prepared) = self.cpp.prepared_syntax(candidate.source()) else {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, candidate.source()) else {
             return false;
         };
         let root = prepared.tree().root_node();
@@ -6405,7 +6425,7 @@ impl<'a> VisibilityIndex<'a> {
         if !candidate.is_function() {
             return false;
         }
-        let Some(prepared) = self.cpp.prepared_syntax(candidate.source()) else {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, candidate.source()) else {
             return false;
         };
         nameable_callable_declaration_nodes(analyzer, prepared.as_ref(), candidate)
@@ -6444,7 +6464,7 @@ impl<'a> VisibilityIndex<'a> {
         if !candidate.is_function() {
             return false;
         }
-        let Some(prepared) = self.cpp.prepared_syntax(candidate.source()) else {
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, candidate.source()) else {
             return false;
         };
         let root = prepared.tree().root_node();
@@ -7427,8 +7447,12 @@ fn unanimous_return_binding(
     resolved_return
 }
 
-fn aliases_from_prepared_source(cpp: &dyn CppSource, file: &ProjectFile) -> Vec<CppAlias> {
-    let Some(prepared) = cpp.prepared_syntax(file) else {
+fn aliases_from_prepared_source(
+    cpp: &dyn CppSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+) -> Vec<CppAlias> {
+    let Some(prepared) = cpp.prepared_syntax(token, file) else {
         return Vec::new();
     };
     let mut aliases = Vec::new();
@@ -7675,6 +7699,7 @@ fn merge_compatible_callable_arities(
 
 fn find_include_activation(
     cpp: &dyn CppSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
     donor_source: &ProjectFile,
@@ -7721,6 +7746,7 @@ fn find_include_activation(
         .find(|(_, direct)| {
             unconditional_include_reaches(
                 cpp,
+                token,
                 include_targets,
                 direct,
                 donor_source,
@@ -7733,6 +7759,7 @@ fn find_include_activation(
 
 fn find_conditional_include_projection_index(
     cpp: &dyn CppSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     prepared: &PreparedSyntaxTree,
     on_state: &dyn Fn(),
@@ -7816,7 +7843,7 @@ fn find_conditional_include_projection_index(
                 required_guards: required_guards.clone(),
             });
 
-        let Some(current_prepared) = cpp.prepared_syntax(&current_file) else {
+        let Some(current_prepared) = cpp.prepared_syntax(token, &current_file) else {
             continue;
         };
         let mut nodes = vec![current_prepared.tree().root_node()];
@@ -7864,6 +7891,7 @@ fn find_conditional_include_projection_index(
 
 fn unconditional_include_reaches(
     cpp: &dyn CppSource,
+    token: QueryToken<'_>,
     include_targets: &IncludeTargetIndex,
     first: &ProjectFile,
     donor_source: &ProjectFile,
@@ -7902,7 +7930,7 @@ fn unconditional_include_reaches(
         if known_missing.contains(&file) || !visited.insert(file.clone()) {
             continue;
         }
-        let Some(prepared) = cpp.prepared_syntax(&file) else {
+        let Some(prepared) = cpp.prepared_syntax(token, &file) else {
             continue;
         };
         let mut nodes = vec![prepared.tree().root_node()];
@@ -7941,7 +7969,7 @@ fn declaration_guard_requirements(
     cpp: &dyn CppSource,
     candidate: &CodeUnit,
 ) -> Vec<(usize, HashSet<PreprocessorGuard>)> {
-    let Some(prepared) = cpp.prepared_syntax(candidate.source()) else {
+    let Some(prepared) = cpp.prepared_syntax(analyzer.token, candidate.source()) else {
         return Vec::new();
     };
     let root = prepared.tree().root_node();
@@ -8614,7 +8642,7 @@ fn flattened_macro_namespace_declaration_matches(
         return false;
     }
 
-    let Some(prepared) = cpp.prepared_syntax(visible_declaration.source()) else {
+    let Some(prepared) = cpp.prepared_syntax(analyzer.token, visible_declaration.source()) else {
         return false;
     };
     let root = prepared.tree().root_node();
@@ -12789,7 +12817,7 @@ pub fn cpp_class_declaration_strength(
 ) -> CppClassDeclarationStrength {
     if let Some(prepared) = analyzer
         .cpp
-        .and_then(|cpp| cpp.prepared_syntax(candidate.source()))
+        .and_then(|cpp| cpp.prepared_syntax(analyzer.token, candidate.source()))
     {
         return cpp_class_declaration_strength_in_tree(
             analyzer,
@@ -13064,7 +13092,7 @@ fn cpp_global_field_declaration_linkage(
         return Some(linkage);
     }
     let cpp = analyzer.cpp?;
-    if let Some(prepared) = cpp.prepared_syntax(candidate.source()) {
+    if let Some(prepared) = cpp.prepared_syntax(analyzer.token, candidate.source()) {
         return cpp_global_field_declaration_linkage_in_tree(
             analyzer,
             candidate,

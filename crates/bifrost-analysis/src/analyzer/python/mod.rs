@@ -18,6 +18,7 @@ mod imports;
 pub(crate) mod lexical_scope;
 mod semantic;
 mod structural;
+use crate::analyzer::QueryToken;
 use crate::analyzer::Range;
 
 pub(crate) use brokk_bifrost_python::syntax::{
@@ -402,9 +403,10 @@ impl PythonSource for PythonAnalyzer {
 
     fn prepared_syntax(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>> {
-        self.inner.prepared_syntax(file)
+        self.inner.prepared_syntax(token, file)
     }
 
     fn visit_file_facts(
