@@ -16,6 +16,7 @@
 //! nothing workspace-sized is built or retained.
 
 use brokk_bifrost_core::analyzer::model::Language;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ImportKind};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
@@ -526,6 +527,7 @@ impl RustUsageWalks<'_> {
     fn declaration_visible_at(
         &self,
         analyzer: &dyn RustFactSource,
+        token: QueryToken<'_>,
         declaration: &CodeUnit,
         caller_file: &ProjectFile,
         caller_byte: usize,
@@ -541,8 +543,11 @@ impl RustUsageWalks<'_> {
                 crate::graph_support::is_rust_trait_declaration(analyzer.code_units(), parent)
             })
             .unwrap_or(declaration);
-        let visibility =
-            crate::graph_support::rust_declaration_visibility(analyzer, visibility_declaration);
+        let visibility = crate::graph_support::rust_declaration_visibility(
+            analyzer,
+            token,
+            visibility_declaration,
+        );
         let mut parent = immediate_parent;
         let owner = loop {
             match parent {
@@ -1036,19 +1041,21 @@ fn rust_declaration_targets_in_files(
 /// Candidate files: those importing a seed, plus the seed files themselves.
 pub fn usage_importers(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     seeds: &RustBindingSeeds,
 ) -> HashSet<ProjectFile> {
-    RustUsageWalks::new(analyzer)
+    RustUsageWalks::new(analyzer, token)
         .importers_of_seeds_while(seeds, &|| true)
         .expect("uninterrupted Rust importer selection")
 }
 
 pub fn usage_candidate_files_while(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     roots: &BTreeSet<CodeUnit>,
     keep_going: &(impl Fn() -> bool + Sync),
 ) -> Option<HashSet<ProjectFile>> {
-    let walks = RustUsageWalks::new_while(analyzer, keep_going)?;
+    let walks = RustUsageWalks::new_while(analyzer, token, keep_going)?;
     keep_going().then_some(())?;
     let seeds = walks.binding_seeds_while(analyzer, roots, keep_going)?;
     keep_going().then_some(())?;
@@ -1062,20 +1069,22 @@ pub fn usage_candidate_files_while(
 /// semantic scan instead of rebuilding it only to recover the same file set.
 pub fn usage_candidate_files_from_binding_seeds_while(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     seeds: &RustBindingSeeds,
     keep_going: &(impl Fn() -> bool + Sync),
 ) -> Option<HashSet<ProjectFile>> {
-    let walks = RustUsageWalks::new_while(analyzer, keep_going)?;
+    let walks = RustUsageWalks::new_while(analyzer, token, keep_going)?;
     keep_going().then_some(())?;
     walks.importers_of_seeds_while(seeds, keep_going)
 }
 
 pub fn usage_binding_seeds_while(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     roots: &BTreeSet<CodeUnit>,
     keep_going: &(impl Fn() -> bool + Sync),
 ) -> Option<RustBindingSeeds> {
-    let walks = RustUsageWalks::new_while(analyzer, keep_going)?;
+    let walks = RustUsageWalks::new_while(analyzer, token, keep_going)?;
     keep_going().then_some(())?;
     walks.binding_seeds_while(analyzer, roots, keep_going)
 }
@@ -1084,9 +1093,10 @@ pub fn usage_binding_seeds_while(
 /// imports that can be imported again by descendant modules.
 pub fn usage_binding_seeds(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     roots: &BTreeSet<CodeUnit>,
 ) -> RustBindingSeeds {
-    RustUsageWalks::new(analyzer)
+    RustUsageWalks::new(analyzer, token)
         .binding_seeds_while(analyzer, roots, &|| true)
         .expect("uninterrupted Rust binding-seed construction")
 }
@@ -1096,12 +1106,13 @@ pub fn usage_binding_seeds(
 /// binding (`use crate_name;` followed by `crate_name::Item`).
 pub fn usage_binding_names(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     seeds: &RustBindingSeeds,
 ) -> (HashSet<String>, HashSet<String>) {
     let mut direct = HashSet::default();
     let mut qualified = HashSet::default();
-    let walks = RustUsageWalks::new(analyzer);
+    let walks = RustUsageWalks::new(analyzer, token);
     for edge in walks.matching_edges_for_importer(file, seeds) {
         match &edge.kind {
             RustImportEdgeKind::Namespace => {
@@ -1136,15 +1147,17 @@ pub fn usage_binding_names(
 
 pub fn usage_has_exact_scoped_binding(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     seeds: &RustBindingSeeds,
     name: &str,
     byte: usize,
     namespace: RustReferenceNamespace,
 ) -> bool {
-    scoped_explicit_import(analyzer, file, byte, name).is_some_and(|scoped| {
+    scoped_explicit_import(analyzer, token, file, byte, name).is_some_and(|scoped| {
         unique_seed_identity_for_import_targets(
             analyzer,
+            token,
             file,
             seeds,
             &scoped.targets,
@@ -1156,6 +1169,7 @@ pub fn usage_has_exact_scoped_binding(
             || scoped.fqn.as_deref().is_some_and(|fqn| {
                 unique_seed_identity_for_fqn(
                     analyzer,
+                    token,
                     file,
                     byte,
                     seeds,
@@ -1172,10 +1186,11 @@ pub fn usage_has_exact_scoped_binding(
 /// owner-binding names the member scan keys on.
 pub fn usage_binding_local_names(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     seeds: &RustBindingSeeds,
 ) -> HashSet<String> {
-    RustUsageWalks::new(analyzer)
+    RustUsageWalks::new(analyzer, token)
         .matching_edges_for_importer(file, seeds)
         .map(|edge| edge.local_name.clone())
         .collect()
@@ -1183,12 +1198,13 @@ pub fn usage_binding_local_names(
 
 pub fn usage_root_declaration_matches_at(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     seeds: &RustBindingSeeds,
     name: &str,
     byte: usize,
 ) -> bool {
-    let walks = RustUsageWalks::new(analyzer);
+    let walks = RustUsageWalks::new(analyzer, token);
     let Some(module) = walks.queries().module_at_byte(file, byte) else {
         return false;
     };
@@ -1202,52 +1218,62 @@ pub fn usage_root_declaration_matches_at(
 
 pub fn usage_declaration_visible_at(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     declaration: &CodeUnit,
     file: &ProjectFile,
     byte: usize,
 ) -> bool {
-    RustUsageWalks::new(analyzer).declaration_visible_at(analyzer, declaration, file, byte)
+    RustUsageWalks::new(analyzer, token).declaration_visible_at(
+        analyzer,
+        token,
+        declaration,
+        file,
+        byte,
+    )
 }
 
 pub fn usage_identity_visible_at(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     declaration: &CodeUnit,
     file: &ProjectFile,
     byte: usize,
 ) -> bool {
-    let walks = RustUsageWalks::new(analyzer);
+    let walks = RustUsageWalks::new(analyzer, token);
     if let Some(identity) = walks
         .identity_of(declaration)
         .or_else(|| walks.value_constructor_identity_of(declaration))
     {
         return walks.identity_visible_at(analyzer, &identity, file, byte);
     }
-    walks.declaration_visible_at(analyzer, declaration, file, byte)
+    walks.declaration_visible_at(analyzer, token, declaration, file, byte)
 }
 
 pub fn usage_exact_root_for_resolution(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     resolution: &RustReferenceResolution,
     seeds: &RustBindingSeeds,
 ) -> Option<CodeUnit> {
-    RustUsageWalks::new(analyzer).exact_root_for_resolution(resolution, seeds)
+    RustUsageWalks::new(analyzer, token).exact_root_for_resolution(resolution, seeds)
 }
 
 pub fn usage_local_module_prefix_visible_at(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     seeds: &RustBindingSeeds,
     name: &str,
     byte: usize,
 ) -> bool {
-    let walks = RustUsageWalks::new(analyzer);
+    let walks = RustUsageWalks::new(analyzer, token);
     let queries = RustUsageQueries::new(analyzer);
     let Some(module) = queries.module_at_byte(file, byte) else {
         return false;
     };
     let module = &module;
 
-    if let Some(syntax) = analyzer.prepared_syntax(file) {
+    if let Some(syntax) = analyzer.prepared_syntax(token, file) {
         if local_type_item_name_shadowed_in_tree(
             syntax.tree().root_node(),
             syntax.source(),
@@ -1262,6 +1288,7 @@ pub fn usage_local_module_prefix_visible_at(
         // the current module, but it still owns this path at the reference site.
         if let Some(routes) = visible_namespace_module_routes(
             analyzer,
+            token,
             &walks,
             &queries,
             file,
@@ -1375,6 +1402,7 @@ pub fn usage_local_module_prefix_visible_at(
 #[allow(clippy::too_many_arguments)]
 fn visible_namespace_module_routes(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     walks: &RustUsageWalks<'_>,
     queries: &RustUsageQueries<'_>,
     file: &ProjectFile,
@@ -1384,7 +1412,7 @@ fn visible_namespace_module_routes(
     leading_absolute: bool,
 ) -> Option<Vec<RustResolvedModuleRoute>> {
     let first = path_prefix.first()?;
-    let syntax = analyzer.prepared_syntax(file)?;
+    let syntax = analyzer.prepared_syntax(token, file)?;
     let leading_absolute_local =
         leading_absolute && walks.cargo_routes().file_uses_rust_2015_edition(file);
     let admitted = |provenance| {
@@ -1572,6 +1600,7 @@ fn cfg_conditions_proven_disjoint(left: &[RustCfgCondition], right: &[RustCfgCon
 #[allow(clippy::too_many_arguments)]
 pub fn usage_reference_at(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     seeds: &RustBindingSeeds,
     segments: &[&str],
@@ -1583,7 +1612,7 @@ pub fn usage_reference_at(
     if segments.is_empty() || (root_shadowed && !leading_absolute) {
         return RustReferenceResolution::Unresolved;
     }
-    let walks = RustUsageWalks::new(analyzer);
+    let walks = RustUsageWalks::new(analyzer, token);
     let queries = RustUsageQueries::new(analyzer);
     let Some(module) = queries.module_at_byte(file, byte) else {
         return RustReferenceResolution::Unresolved;
@@ -1774,10 +1803,11 @@ pub fn usage_reference_at(
             }
         }
         if matches.is_empty() {
-            let scoped_import = scoped_explicit_import(analyzer, file, byte, segments[0]);
+            let scoped_import = scoped_explicit_import(analyzer, token, file, byte, segments[0]);
             let identity = match scoped_import {
                 Some(scoped) => unique_seed_identity_for_import_targets(
                     analyzer,
+                    token,
                     file,
                     seeds,
                     &scoped.targets,
@@ -1789,6 +1819,7 @@ pub fn usage_reference_at(
                     scoped.fqn.as_deref().and_then(|fqn| {
                         unique_seed_identity_for_fqn(
                             analyzer,
+                            token,
                             file,
                             byte,
                             seeds,
@@ -1809,11 +1840,12 @@ pub fn usage_reference_at(
                     None
                 }
                 None => analyzer
-                    .reference_context_of(file)
+                    .reference_context_of(token, file)
                     .resolve_bare(segments[0])
                     .and_then(|resolved_fqn| {
                         unique_seed_identity_for_fqn(
                             analyzer,
+                            token,
                             file,
                             byte,
                             seeds,
@@ -1837,6 +1869,7 @@ pub fn usage_reference_at(
             .collect::<Vec<_>>();
         let local_namespace_routes = visible_namespace_module_routes(
             analyzer,
+            token,
             &walks,
             &queries,
             file,
@@ -1938,10 +1971,11 @@ pub fn usage_reference_at(
         if matches.is_empty()
             && !leading_absolute
             && let Some(resolved_fqn) = analyzer
-                .reference_context_of(file)
+                .reference_context_of(token, file)
                 .resolve_scoped(&prefix.join("::"), terminal)
             && let Some(identity) = unique_seed_identity_for_fqn(
                 analyzer,
+                token,
                 file,
                 byte,
                 seeds,
@@ -2014,18 +2048,24 @@ fn resolution_of(
 
 pub fn exported_targets_from_files(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     module_files: &[ProjectFile],
     export_name: &str,
 ) -> BTreeSet<(ProjectFile, String)> {
-    RustUsageWalks::new(analyzer).export_targets_from_files(analyzer, module_files, export_name)
+    RustUsageWalks::new(analyzer, token).export_targets_from_files(
+        analyzer,
+        module_files,
+        export_name,
+    )
 }
 
 pub fn usage_crate_export_targets(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     export_name: &str,
 ) -> BTreeSet<(ProjectFile, String)> {
-    let walks = RustUsageWalks::new(analyzer);
+    let walks = RustUsageWalks::new(analyzer, token);
     let mut crate_roots = walks
         .owner_roots_of(file)
         .iter()
@@ -2070,8 +2110,10 @@ pub fn edge_matches_single_seed(edge: &RustImportEdge, target: &RustSymbolIdenti
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn unique_seed_identity_for_fqn(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     importer: &ProjectFile,
     byte: usize,
     seeds: &RustBindingSeeds,
@@ -2089,6 +2131,7 @@ fn unique_seed_identity_for_fqn(
                 && identity.namespace.accepts(namespace)
                 && seed_identity_admitted_at(
                     analyzer,
+                    token,
                     importer,
                     byte,
                     seeds,
@@ -2127,11 +2170,12 @@ struct ScopedExplicitImport {
 
 fn scoped_explicit_import(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     byte: usize,
     name: &str,
 ) -> Option<ScopedExplicitImport> {
-    let syntax = analyzer.prepared_syntax(file)?;
+    let syntax = analyzer.prepared_syntax(token, file)?;
     // The prepared tree is already in hand; deriving the binders from its
     // source text instead would parse the same file a second time.
     for (scope_start, binder) in super::lexical_scope::visible_import_binders_with_scopes_in_tree(
@@ -2147,6 +2191,7 @@ fn scoped_explicit_import(
                 let imported = binding.imported_name.as_deref().unwrap_or(name);
                 resolve_rust_import_package_scoped(
                     analyzer,
+                    token,
                     file,
                     syntax.source(),
                     scope_start,
@@ -2156,6 +2201,7 @@ fn scoped_explicit_import(
             }
             ImportKind::Namespace => resolve_rust_import_package_scoped(
                 analyzer,
+                token,
                 file,
                 syntax.source(),
                 scope_start,
@@ -2163,7 +2209,7 @@ fn scoped_explicit_import(
             ),
             ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => continue,
         };
-        let walks = RustUsageWalks::new(analyzer);
+        let walks = RustUsageWalks::new(analyzer, token);
         let importer_module = walks.queries().module_at_byte(file, byte)?;
         let importer_module = &importer_module;
         let segments = brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(
@@ -2178,7 +2224,7 @@ fn scoped_explicit_import(
             .collect();
         return Some(ScopedExplicitImport {
             targets: crate::graph_support::resolve_imported_export_from_binder_forward(
-                analyzer, file, &binder, name,
+                analyzer, token, file, &binder, name,
             ),
             dependency_roots,
             fqn,
@@ -2187,8 +2233,10 @@ fn scoped_explicit_import(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn unique_seed_identity_for_import_targets(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     importer: &ProjectFile,
     seeds: &RustBindingSeeds,
     targets: &[(ProjectFile, String)],
@@ -2198,7 +2246,7 @@ fn unique_seed_identity_for_import_targets(
 ) -> Option<RustSymbolIdentity> {
     let importer_module = RustUsageQueries::new(analyzer).module_at_byte(importer, byte)?;
     let importer_module = &importer_module;
-    let walks = RustUsageWalks::new(analyzer);
+    let walks = RustUsageWalks::new(analyzer, token);
     let mut matches = seeds
         .identities
         .iter()
@@ -2229,8 +2277,7 @@ fn unique_seed_identity_for_import_targets(
                             .files_share_target(importer, &identity.file)
                             == Some(true)))
                     || (seed_identity_admitted_at(
-                        analyzer,
-                        importer,
+                        analyzer, token, importer,
                         byte,
                         seeds,
                         identity,
@@ -2261,6 +2308,7 @@ fn unique_seed_identity_for_import_targets(
 
 fn seed_identity_admitted_at(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     importer: &ProjectFile,
     byte: usize,
     seeds: &RustBindingSeeds,
@@ -2278,7 +2326,7 @@ fn seed_identity_admitted_at(
         return true;
     }
 
-    let walks = RustUsageWalks::new(analyzer);
+    let walks = RustUsageWalks::new(analyzer, token);
     if dependency_roots.iter().any(|root| {
         walks.owners_intersect(root, &identity.file)
             || walks.cargo_routes().target_relation(root, &identity.file)

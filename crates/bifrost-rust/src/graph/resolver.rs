@@ -15,6 +15,7 @@ use crate::usage::{
     usage_local_module_prefix_visible_at, usage_reference_at, usage_root_declaration_matches_at,
 };
 use brokk_bifrost_core::analyzer::model::SignatureMetadata;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome,
@@ -48,9 +49,10 @@ pub trait RustDefinitionProvider {
     fn forward_reference_context<'r>(
         &'r self,
         rust: &'r dyn RustFactSource,
+        token: QueryToken<'r>,
         file: &ProjectFile,
     ) -> Option<RustReferenceContext<'r>> {
-        Some(rust.forward_reference_context_of(file))
+        Some(rust.forward_reference_context_of(token, file))
     }
 
     fn ranges(&self, index: &dyn CodeUnitIndex, unit: &CodeUnit) -> Vec<Range> {
@@ -121,7 +123,7 @@ pub fn resolve_rust_path_fqn(
 ) -> Option<String> {
     refs.resolve_bare(full_path)
         .or_else(|| refs.resolve_scoped_owner(full_path))
-        .or_else(|| resolve_module_package(rust, file, full_path))
+        .or_else(|| resolve_module_package(rust, refs.token(), file, full_path))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -227,7 +229,7 @@ fn resolve_token_tree_path_container<'tree>(
         let root = children[index];
         let dollar_crate_root = rust_token_is_dollar_crate(root, source);
         let mut dollar_crate_owner = if dollar_crate_root {
-            resolve_module_package(rust, file, "crate")
+            resolve_module_package(rust, refs.token(), file, "crate")
         } else {
             None
         };
@@ -277,7 +279,12 @@ fn resolve_token_tree_path_container<'tree>(
                         .or_else(|| {
                             (path.len() == 2).then(|| {
                                 resolve_crate_exported_token_path_child(
-                                    rust, support, file, source, segment,
+                                    rust,
+                                    refs.token(),
+                                    support,
+                                    file,
+                                    source,
+                                    segment,
                                 )
                             })?
                         })
@@ -328,13 +335,14 @@ fn resolve_token_tree_path_container<'tree>(
 
 fn resolve_crate_exported_token_path_child(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     segment: Node<'_>,
 ) -> Option<String> {
     let name = source.get(segment.start_byte()..segment.end_byte())?;
-    let fqns = usage_crate_export_targets(rust, file, name)
+    let fqns = usage_crate_export_targets(rust, token, file, name)
         .into_iter()
         .flat_map(|(target_file, target_name)| support.file_identifier(&target_file, &target_name))
         .map(|candidate| candidate.fq_name())
@@ -379,7 +387,7 @@ fn resolve_token_path_segment_fqn(
 ) -> Option<String> {
     let Some(owner_terminal) = owner_terminal else {
         let path = source.get(root.start_byte()..segment.end_byte())?.trim();
-        return lexical_import_fqn(rust, support, file, source, root).or_else(|| {
+        return lexical_import_fqn(rust, refs.token(), support, file, source, root).or_else(|| {
             resolve_rust_path_fqn(rust, refs, file, path).filter(|fqn| !support.fqn(fqn).is_empty())
         });
     };
@@ -389,7 +397,7 @@ fn resolve_token_path_segment_fqn(
     let name = source.get(segment.start_byte()..segment.end_byte())?.trim();
     if owner_terminal.start_byte() == root.start_byte()
         && owner_terminal.end_byte() == root.end_byte()
-        && let Some(owner_fqn) = lexical_import_fqn(rust, support, file, source, root)
+        && let Some(owner_fqn) = lexical_import_fqn(rust, refs.token(), support, file, source, root)
     {
         let fqns: BTreeSet<_> = support
             .members_for_owner_name(&owner_fqn, name)
@@ -442,14 +450,15 @@ fn resolve_token_path_segment_fqn(
 
 pub fn lexical_import_fqn(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     segment: Node<'_>,
 ) -> Option<String> {
     let name = source.get(segment.start_byte()..segment.end_byte())?.trim();
-    lexical_explicit_import_fqn(rust, support, file, source, segment).or_else(|| {
-        let forward = support.forward_reference_context(rust, file)?;
+    lexical_explicit_import_fqn(rust, token, support, file, source, segment).or_else(|| {
+        let forward = support.forward_reference_context(rust, token, file)?;
         forward
             .resolve_bare(name)
             .filter(|fqn| !support.fqn(fqn).is_empty())
@@ -458,6 +467,7 @@ pub fn lexical_import_fqn(
 
 pub fn lexical_explicit_import_fqn(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -469,14 +479,17 @@ pub fn lexical_explicit_import_fqn(
         root = parent;
     }
     let binder = lexical_scope::visible_import_binder_in_tree(root, source, segment.start_byte());
-    let fqns: BTreeSet<_> = resolve_imported_export_from_binder_forward(rust, file, &binder, name)
-        .into_iter()
-        .flat_map(|(target_file, target_name)| support.file_identifier(&target_file, &target_name))
-        .filter(|candidate| {
-            candidate.is_module() || candidate.is_class() || rust.is_type_alias(candidate)
-        })
-        .map(|candidate| candidate.fq_name())
-        .collect();
+    let fqns: BTreeSet<_> =
+        resolve_imported_export_from_binder_forward(rust, token, file, &binder, name)
+            .into_iter()
+            .flat_map(|(target_file, target_name)| {
+                support.file_identifier(&target_file, &target_name)
+            })
+            .filter(|candidate| {
+                candidate.is_module() || candidate.is_class() || rust.is_type_alias(candidate)
+            })
+            .map(|candidate| candidate.fq_name())
+            .collect();
     if fqns.len() == 1 {
         return fqns.into_iter().next();
     }
@@ -501,6 +514,7 @@ pub fn lexical_explicit_import_fqn(
             }
             let Some(package) = resolve_rust_import_package_scoped(
                 rust,
+                token,
                 file,
                 source,
                 scope_start,
@@ -515,7 +529,8 @@ pub fn lexical_explicit_import_fqn(
                     .map(|candidate| (candidate, name.to_string())),
             );
         }
-        let imported_fqns = resolve_lexical_import_target_fqns(rust, support, scoped_pending);
+        let imported_fqns =
+            resolve_lexical_import_target_fqns(rust, token, support, scoped_pending);
         if !imported_fqns.is_empty() {
             return (imported_fqns.len() == 1)
                 .then(|| imported_fqns.into_iter().next())
@@ -523,8 +538,8 @@ pub fn lexical_explicit_import_fqn(
         }
     }
 
-    let pending = resolve_visible_import_targets_forward(rust, file, &binder, name);
-    let imported_fqns = resolve_lexical_import_target_fqns(rust, support, pending);
+    let pending = resolve_visible_import_targets_forward(rust, token, file, &binder, name);
+    let imported_fqns = resolve_lexical_import_target_fqns(rust, token, support, pending);
     (imported_fqns.len() == 1)
         .then(|| imported_fqns.into_iter().next())
         .flatten()
@@ -532,6 +547,7 @@ pub fn lexical_explicit_import_fqn(
 
 fn resolve_lexical_import_target_fqns(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     support: &dyn RustDefinitionProvider,
     mut pending: Vec<(ProjectFile, String)>,
 ) -> BTreeSet<String> {
@@ -559,6 +575,7 @@ fn resolve_lexical_import_target_fqns(
             lexical_scope::visible_import_binder_at(&target_source, target_source.len());
         pending.extend(resolve_visible_import_targets_forward(
             rust,
+            token,
             &target_file,
             &target_binder,
             &target_name,
@@ -976,13 +993,14 @@ pub fn is_graph_visible_member_target(rust: &dyn RustFactSource, target: &CodeUn
 
 pub fn trait_member_for_impl_member(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     target: &CodeUnit,
 ) -> Option<CodeUnit> {
     let owner = rust.parent_of(target)?;
     if !is_trait_impl_member_target(rust, target, &owner) {
         return None;
     }
-    let structural = rust_trait_for_impl_member(rust, target);
+    let structural = rust_trait_for_impl_member(rust, token, target);
     rust.get_direct_ancestors(&owner)
         .into_iter()
         .chain(structural)
@@ -1134,8 +1152,8 @@ pub fn resolve_exact_owner_associated_item_matching(
     item_matches: fn(&CodeUnit) -> bool,
     reference_byte: usize,
 ) -> ReceiverAnalysisOutcome<CodeUnit> {
-    let canonical_owner =
-        canonical_rust_hierarchy_type(rust, owner.clone()).unwrap_or_else(|| owner.clone());
+    let canonical_owner = canonical_rust_hierarchy_type(rust, refs.token(), owner.clone())
+        .unwrap_or_else(|| owner.clone());
     let candidates: Vec<_> = support
         .members_for_owner_name(&canonical_owner.fq_name(), item_name)
         .into_iter()
@@ -1143,7 +1161,7 @@ pub fn resolve_exact_owner_associated_item_matching(
         .filter(|candidate| {
             rust.structural_parent_of(candidate)
                 .or_else(|| rust.parent_of(candidate))
-                .and_then(|parent| canonical_rust_hierarchy_type(rust, parent))
+                .and_then(|parent| canonical_rust_hierarchy_type(rust, refs.token(), parent))
                 .is_some_and(|parent| parent == canonical_owner)
         })
         .collect();
@@ -1153,6 +1171,7 @@ pub fn resolve_exact_owner_associated_item_matching(
 
     resolve_trait_associated_item_for_owner_matching(
         rust,
+        refs.token(),
         support,
         refs,
         file,
@@ -1222,6 +1241,7 @@ pub fn resolve_trait_associated_item_matching(
 
     resolve_trait_associated_item_for_owner_matching(
         rust,
+        refs.token(),
         support,
         refs,
         file,
@@ -1235,6 +1255,7 @@ pub fn resolve_trait_associated_item_matching(
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_trait_associated_item_for_owner_matching(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     support: &dyn RustDefinitionProvider,
     _refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
@@ -1246,7 +1267,9 @@ pub fn resolve_trait_associated_item_for_owner_matching(
     ReceiverAnalysisOutcome::single_precise_or_ambiguous(
         rust.get_direct_ancestors(owner)
             .into_iter()
-            .filter(|trait_unit| trait_visible_at_call_site(rust, file, trait_unit, reference_byte))
+            .filter(|trait_unit| {
+                trait_visible_at_call_site(rust, token, file, trait_unit, reference_byte)
+            })
             .flat_map(|trait_unit| {
                 support
                     .members_for_owner_name(&trait_unit.fq_name(), item_name)
@@ -1267,24 +1290,33 @@ pub fn resolve_trait_associated_item_for_owner_matching(
 
 fn trait_visible_at_call_site(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     trait_unit: &CodeUnit,
     reference_byte: usize,
 ) -> bool {
     let roots = [trait_unit.clone()].into_iter().collect::<BTreeSet<_>>();
-    let seeds = usage_binding_seeds(rust, &roots);
-    let mut names = usage_binding_local_names(rust, file, &seeds);
+    let seeds = usage_binding_seeds(rust, token, &roots);
+    let mut names = usage_binding_local_names(rust, token, file, &seeds);
     names.insert(trait_unit.identifier().to_string());
-    let Some(prepared) = rust.prepared_syntax(file) else {
+    let Some(prepared) = rust.prepared_syntax(token, file) else {
         return false;
     };
     let lexical_scope = RustLexicalScopeIndex::new(prepared.tree().root_node(), prepared.source());
     names.into_iter().any(|name| {
         let root_shadowed = lexical_scope.name_bound_at(&name, reference_byte)
             || (lexical_scope.local_item_bound_at(&name, reference_byte)
-                && !usage_root_declaration_matches_at(rust, file, &seeds, &name, reference_byte)
+                && !usage_root_declaration_matches_at(
+                    rust,
+                    token,
+                    file,
+                    &seeds,
+                    &name,
+                    reference_byte,
+                )
                 && !usage_local_module_prefix_visible_at(
                     rust,
+                    token,
                     file,
                     &seeds,
                     &name,
@@ -1292,6 +1324,7 @@ fn trait_visible_at_call_site(
                 ));
         let resolution = usage_reference_at(
             rust,
+            token,
             file,
             &seeds,
             &[name.as_str()],
@@ -1300,29 +1333,35 @@ fn trait_visible_at_call_site(
             root_shadowed,
             false,
         );
-        usage_exact_root_for_resolution(rust, &resolution, &seeds)
+        usage_exact_root_for_resolution(rust, token, &resolution, &seeds)
             .is_some_and(|resolved| resolved == *trait_unit)
     })
 }
 
-pub fn canonical_usage_target(rust: &dyn RustFactSource, target: &CodeUnit) -> CodeUnit {
-    canonical_imported_impl_target(rust, target).unwrap_or_else(|| target.clone())
+pub fn canonical_usage_target(
+    rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
+    target: &CodeUnit,
+) -> CodeUnit {
+    canonical_imported_impl_target(rust, token, target).unwrap_or_else(|| target.clone())
 }
 
 pub fn local_impl_target_importer_files(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     target: &CodeUnit,
 ) -> HashSet<ProjectFile> {
-    local_impl_target_importer_files_while(rust, target, &|| true).unwrap_or_default()
+    local_impl_target_importer_files_while(rust, token, target, &|| true).unwrap_or_default()
 }
 
 pub fn local_impl_target_importer_files_while(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     target: &CodeUnit,
     keep_going: &(impl Fn() -> bool + Sync),
 ) -> Option<HashSet<ProjectFile>> {
     keep_going().then_some(())?;
-    let Some(resolved_fqn) = imported_impl_target_fqn(rust, target) else {
+    let Some(resolved_fqn) = imported_impl_target_fqn(rust, token, target) else {
         return Some(HashSet::default());
     };
     if rust.definitions(&resolved_fqn).next().is_some() {
@@ -1332,7 +1371,7 @@ pub fn local_impl_target_importer_files_while(
     let mut importers = HashSet::default();
     for file in rust.get_analyzed_files() {
         keep_going().then_some(())?;
-        let refs = rust.reference_context_of_with_progress(&file, keep_going)?;
+        let refs = rust.reference_context_of_with_progress(token, &file, keep_going)?;
         if refs
             .bare_names_resolving_to(&resolved_fqn)
             .contains(target.identifier())
@@ -1343,8 +1382,12 @@ pub fn local_impl_target_importer_files_while(
     Some(importers)
 }
 
-pub fn infer_graph_seeds(analyzer: &dyn RustFactSource, target: &CodeUnit) -> RustGraphSeeds {
-    infer_graph_seeds_while(analyzer, target, &|| true)
+pub fn infer_graph_seeds(
+    analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
+    target: &CodeUnit,
+) -> RustGraphSeeds {
+    infer_graph_seeds_while(analyzer, token, target, &|| true)
         .expect("uninterrupted Rust graph-seed inference")
 }
 
@@ -1353,11 +1396,12 @@ pub fn infer_graph_seeds(analyzer: &dyn RustFactSource, target: &CodeUnit) -> Ru
 /// inference has to be cancellable alongside it.
 pub fn infer_graph_seeds_while(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     target: &CodeUnit,
     keep_going: &(impl Fn() -> bool + Sync),
 ) -> Option<RustGraphSeeds> {
     keep_going().then_some(())?;
-    let roots = infer_export_graph_seeds_while(analyzer, target, keep_going)?;
+    let roots = infer_export_graph_seeds_while(analyzer, token, target, keep_going)?;
     if !roots.is_empty() {
         return Some(RustGraphSeeds {
             roots,
@@ -1367,17 +1411,18 @@ pub fn infer_graph_seeds_while(
 
     keep_going().then_some(())?;
     Some(RustGraphSeeds {
-        roots: local_declaration_graph_seeds(analyzer, target),
+        roots: local_declaration_graph_seeds(analyzer, token, target),
         kind: RustGraphSeedKind::LocalDeclaration,
     })
 }
 
 fn infer_export_graph_seeds_while(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     target: &CodeUnit,
     keep_going: &(impl Fn() -> bool + Sync),
 ) -> Option<BTreeSet<CodeUnit>> {
-    let Some(seed_target) = graph_seed_target(analyzer, target) else {
+    let Some(seed_target) = graph_seed_target(analyzer, token, target) else {
         return Some(BTreeSet::new());
     };
     let roots = BTreeSet::from([seed_target]);
@@ -1414,7 +1459,7 @@ fn infer_export_graph_seeds_while(
     // through a `pub use` re-export of a private module. These names are tried only
     // via real re-export chains, so a private, never-re-exported item stays unseeded.
     if !reexport_fallback_export_names(analyzer, target).is_empty() {
-        let seeds = usage_binding_seeds_while(analyzer, &roots, keep_going)?;
+        let seeds = usage_binding_seeds_while(analyzer, token, &roots, keep_going)?;
         if seeds.has_import_edges() {
             return Some(roots);
         }
@@ -1425,10 +1470,11 @@ fn infer_export_graph_seeds_while(
 
 fn local_declaration_graph_seeds(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     target: &CodeUnit,
 ) -> BTreeSet<CodeUnit> {
     let member_target = is_member_target(analyzer, target);
-    let seed_target = graph_seed_target(analyzer, target);
+    let seed_target = graph_seed_target(analyzer, token, target);
     let Some(seed_target) = seed_target else {
         return BTreeSet::new();
     };
@@ -1444,13 +1490,17 @@ fn local_declaration_graph_seeds(
     [seed_target].into_iter().collect()
 }
 
-fn graph_seed_target(analyzer: &dyn RustFactSource, target: &CodeUnit) -> Option<CodeUnit> {
+fn graph_seed_target(
+    analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
+    target: &CodeUnit,
+) -> Option<CodeUnit> {
     let seed_target = if is_member_target(analyzer, target) {
         analyzer.parent_of(target)?
     } else {
         target.clone()
     };
-    Some(canonical_imported_impl_target(analyzer, &seed_target).unwrap_or(seed_target))
+    Some(canonical_imported_impl_target(analyzer, token, &seed_target).unwrap_or(seed_target))
 }
 
 fn is_local_declaration(analyzer: &dyn RustFactSource, target: &CodeUnit) -> bool {
@@ -1462,9 +1512,10 @@ fn is_local_declaration(analyzer: &dyn RustFactSource, target: &CodeUnit) -> boo
 
 pub fn canonical_imported_impl_target(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     target: &CodeUnit,
 ) -> Option<CodeUnit> {
-    let resolved_fqn = imported_impl_target_fqn(rust, target)?;
+    let resolved_fqn = imported_impl_target_fqn(rust, token, target)?;
     let mut definitions = rust
         .definitions(&resolved_fqn)
         .filter(|definition| definition != target);
@@ -1472,7 +1523,11 @@ pub fn canonical_imported_impl_target(
     definitions.next().is_none().then_some(first)
 }
 
-fn imported_impl_target_fqn(rust: &dyn RustFactSource, target: &CodeUnit) -> Option<String> {
+fn imported_impl_target_fqn(
+    rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
+    target: &CodeUnit,
+) -> Option<String> {
     if !target.is_class()
         || rust
             .definitions(&target.fq_name())
@@ -1480,7 +1535,7 @@ fn imported_impl_target_fqn(rust: &dyn RustFactSource, target: &CodeUnit) -> Opt
     {
         return None;
     }
-    let refs = rust.reference_context_of(target.source());
+    let refs = rust.reference_context_of(token, target.source());
     let resolved = refs.resolve_bare(target.identifier())?;
     Some(resolved.to_string())
 }
@@ -1568,6 +1623,7 @@ fn infer_export_names_for_local(
 
 pub fn unresolved_external_frontier_specifiers(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     defining_file: &ProjectFile,
     export_name: &str,
 ) -> BTreeSet<String> {
@@ -1578,14 +1634,14 @@ pub fn unresolved_external_frontier_specifiers(
         module_specifier,
         ..
     }) = index.exports_by_name.get(export_name)
-        && resolve_module_files(analyzer, defining_file, module_specifier).is_empty()
+        && resolve_module_files(analyzer, token, defining_file, module_specifier).is_empty()
         && let Some(external) = external_frontier_specifier(module_specifier)
     {
         frontier.insert(external);
     }
 
     for star in &index.reexport_stars {
-        if resolve_module_files(analyzer, defining_file, &star.module_specifier).is_empty()
+        if resolve_module_files(analyzer, token, defining_file, &star.module_specifier).is_empty()
             && let Some(external) = external_frontier_specifier(&star.module_specifier)
         {
             frontier.insert(external);

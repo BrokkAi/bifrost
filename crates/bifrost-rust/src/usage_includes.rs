@@ -37,6 +37,7 @@
 //! cycle. Its result is memoized per included file in `RustWalkCaches`, which
 //! retires with the analyzer generation like every other cross-file walk cache.
 
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
@@ -98,10 +99,10 @@ pub struct RustIncludeRoutes<'a> {
 }
 
 impl<'a> RustIncludeRoutes<'a> {
-    pub fn new(analyzer: &'a dyn RustFactSource) -> Self {
+    pub fn new(analyzer: &'a dyn RustFactSource, token: QueryToken<'a>) -> Self {
         Self {
             analyzer,
-            walks: RustUsageWalks::new(analyzer),
+            walks: RustUsageWalks::new(analyzer, token),
         }
     }
 
@@ -214,7 +215,7 @@ impl<'a> RustIncludeRoutes<'a> {
         host: &ProjectFile,
         edge: &RustIncludeEdgeFact,
     ) -> Option<RustIncludeRoute> {
-        let prepared = self.analyzer.prepared_syntax(host)?;
+        let prepared = self.analyzer.prepared_syntax(self.walks.token(), host)?;
         let module_package =
             lexical_package_at(&route.module_package, prepared.source(), edge.include_start);
         let mut host_bindings = route.host_bindings;

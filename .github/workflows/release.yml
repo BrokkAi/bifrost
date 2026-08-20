@@ -520,6 +520,59 @@ jobs:
           actual="$(jq -r --arg name "$(basename "$file")" '.assets[] | select(.name == $name) | (.digest // "")' "$release_json")"
           test "$actual" = "$expected"
 
+  publish-policy-scan-action:
+    name: sync policy-scan action alias repository
+    # Publishes the composite action from the qualified release commit into
+    # the standalone alias repository so consumers can write
+    # `uses: BrokkAi/bifrost-policy-scan@vX.Y.Z`. The synced copy pins its
+    # `version` input default to this release, so the alias tag and the
+    # Bifrost binary it installs stay in lockstep. Runs after `release`
+    # because that default must resolve to published release assets.
+    needs: [release-context, promote-qualification, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+      RELEASE_COMMIT: ${{ needs.release-context.outputs.commit }}
+    steps:
+      - name: Checkout exact release commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-context.outputs.commit }}
+
+      - name: Verify tag still selects the qualified commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          tag_ref="refs/tags/$RELEASE_TAG"
+          remote_refs="$(git ls-remote --tags origin "${tag_ref}*")"
+          actual_commit="$(awk -v tag_ref="$tag_ref" '
+            $2 == (tag_ref "^{}") { print $1; found = 1; exit }
+            $2 == tag_ref { fallback = $1 }
+            END { if (!found && fallback) print fallback }
+          ' <<< "$remote_refs")"
+          test "$actual_commit" = "$RELEASE_COMMIT"
+
+      - name: Mint an alias-repository-only GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.POLICY_SCAN_APP_CLIENT_ID }}
+          private-key: ${{ secrets.POLICY_SCAN_APP_PRIVATE_KEY }}
+          owner: BrokkAi
+          repositories: bifrost-policy-scan
+          permission-contents: write
+
+      - name: Sync the action into the alias repository
+        env:
+          POLICY_SCAN_SYNC_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: bash scripts/sync-policy-scan-action.sh
+
   attach-vscode:
     name: verify qualified VSIX asset
     needs: [release-context, promote-qualification, release]
@@ -993,7 +1046,7 @@ jobs:
   release-summary:
     name: release promotion summary
     if: ${{ always() }}
-    needs: [release-context, resolve-qualification, promote-qualification, release, publish-crate-facade, publish-wheels, publish-npm, publish-agent-plugin, publish-pi-package, attach-vscode, publish-vscode, publish-open-vsx, post-release-smoke]
+    needs: [release-context, resolve-qualification, promote-qualification, release, publish-crate-facade, publish-wheels, publish-npm, publish-agent-plugin, publish-pi-package, publish-policy-scan-action, attach-vscode, publish-vscode, publish-open-vsx, post-release-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -1014,6 +1067,7 @@ jobs:
       NPM_CHILD_RUN_ID: ${{ needs.publish-npm.outputs.child_run_id }}
       AGENT: ${{ needs.publish-agent-plugin.result }}
       PI: ${{ needs.publish-pi-package.result }}
+      POLICY_SCAN_ALIAS: ${{ needs.publish-policy-scan-action.result }}
       VSCODE: ${{ needs.publish-vscode.result }}
       OPEN_VSX: ${{ needs.publish-open-vsx.result }}
       POST_RELEASE_SMOKE: ${{ needs.post-release-smoke.result }}
@@ -1036,6 +1090,7 @@ jobs:
             echo "- npm: \`$NPM\`"
             echo "- Agent asset: \`$AGENT\`"
             echo "- Pi asset: \`$PI\`"
+            echo "- Policy-scan action alias repository: \`$POLICY_SCAN_ALIAS\`"
             echo "- Visual Studio Marketplace: \`$VSCODE\`"
             echo "- Open VSX: \`$OPEN_VSX\`"
             echo "- Post-release smoke: \`$POST_RELEASE_SMOKE\`"

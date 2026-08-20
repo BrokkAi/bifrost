@@ -1128,37 +1128,15 @@ fn trim_trailing_static_member_segment(segments: &[String]) -> Option<Vec<String
     Some(variant)
 }
 
-/// The `$`-joined nesting encoding (`Outer$Inner`) read back as separate
-/// segments.
-///
-/// `$` names a join only when it stands *between* two names. A leading `$` has
-/// no name to its left, so it is the identifier's own first character -- which
-/// is exactly how JS/Angular spells `$LogProvider`, `$http`, and `$q`. It is
-/// kept on the segment it belongs to.
-///
-/// Dropping it was not a cosmetic loss. It minted `LogProvider` as a second
-/// reading of the bare query `$LogProvider`, the two readings then disagreed on
-/// the terminal leaf, and [`symbol_selector_leaf`] answers `None` on
-/// disagreement -- which switched off the whole member-aware bare-name stage in
-/// [`bare_query_leaf`] and let a lone top-level namesake silently win over a
-/// same-named member (`angular.mock.$LogProvider`; #1057). A trailing `$` is
-/// still split off, because that is the Scala object marker the sibling
-/// `scala_normalized` variant strips too.
 fn split_segments_on_dollar(segments: &[String]) -> Vec<String> {
     segments
         .iter()
         .flat_map(|segment| {
-            let body = segment.trim_start_matches('$');
-            let leading = &segment[..segment.len() - body.len()];
-            let mut parts = body
+            segment
                 .split('$') // fqname-M4: input-edge splitter of a client-supplied symbol path (pre-language, no CodeUnit/fq yet); the sanctioned MCP input boundary
                 .filter(|part| !part.is_empty())
                 .map(ToString::to_string)
-                .collect::<Vec<_>>();
-            if let Some(first) = parts.first_mut() {
-                first.insert_str(0, leading);
-            }
-            parts
+                .collect::<Vec<_>>()
         })
         .collect()
 }

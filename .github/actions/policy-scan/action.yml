@@ -5,6 +5,10 @@ description: >-
   fail-on threshold, 2 is unreliable. An unreliable result could not prove its
   own completeness and must never be treated as clean.
 
+branding:
+  icon: shield
+  color: purple
+
 inputs:
   version:
     description: >-
@@ -13,13 +17,7 @@ inputs:
       install and uses a release or debug `bifrost` binary from the checkout,
       otherwise the `bifrost` already on PATH.
     required: false
-    default: v0.9.5
-  release-token:
-    description: >-
-      Optional GitHub token used to download release assets while the Bifrost
-      release repository is private. Leave unset for public releases.
-    required: false
-    default: ''
+    default: v0.10.4
   policy-packs:
     description: Space-separated built-in pack IDs to run.
     required: false
@@ -89,7 +87,6 @@ runs:
       shell: bash
       env:
         BIFROST_VERSION: ${{ inputs.version }}
-        RELEASE_TOKEN: ${{ inputs.release-token }}
       run: |
         set -euo pipefail
         bin=bifrost
@@ -118,12 +115,8 @@ runs:
         dir="${RUNNER_TEMP}/bifrost-install"
         mkdir -p "${dir}"
         cd "${dir}"
-        curl_args=(-fsSL -O)
-        if [ -n "${RELEASE_TOKEN}" ]; then
-          curl_args+=(-H "Authorization: Bearer ${RELEASE_TOKEN}")
-        fi
-        curl "${curl_args[@]}" "${url}/${stage}.${archive}"
-        curl "${curl_args[@]}" "${url}/${stage}.${archive}.sha256"
+        curl -fsSL -O "${url}/${stage}.${archive}"
+        curl -fsSL -O "${url}/${stage}.${archive}.sha256"
         # Windows release checksum files carry CRLF from Out-File, and sha256sum -c rejects the \r in the filename.
         tr -d '\r' < "${stage}.${archive}.sha256" > "${stage}.${archive}.sha256.lf"
         mv "${stage}.${archive}.sha256.lf" "${stage}.${archive}.sha256"

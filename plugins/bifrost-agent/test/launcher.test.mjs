@@ -1302,3 +1302,46 @@ if (process.argv.includes("--version")) {
     }
   }
 );
+
+// #2427: `thisFile` comes from `import.meta.url`, which Node resolves through
+// symlinks. Comparing it against a merely normalized `process.argv[1]` meant
+// any invocation whose path crossed a link -- every macOS temp directory,
+// since `os.tmpdir()` is `/var/folders/...` and `/var` links to `/private/var`
+// -- failed the entry check and exited 0 having produced nothing on either
+// stream. A published launcher that silently does nothing is the worst
+// available failure, so this pins the entry check rather than any one command.
+test("runs its entry point when reached through a symlinked path", async () => {
+  const real = await fsp.mkdtemp(path.join(os.tmpdir(), "launcher-entry-real-"));
+  const link = path.join(
+    await fsp.mkdtemp(path.join(os.tmpdir(), "launcher-entry-link-")),
+    "linked",
+  );
+  try {
+    await fsp.symlink(real, link, "dir");
+  } catch {
+    // A platform that refuses to create the link cannot exercise the contract.
+    return;
+  }
+  const launcher = path.join(real, "bifrost-launcher.mjs");
+  await fsp.copyFile(path.join(packageDir, "bin", "bifrost-launcher.mjs"), launcher);
+  await fsp.copyFile(
+    path.join(packageDir, "bifrost-release.json"),
+    path.join(real, "..", "bifrost-release.json"),
+  ).catch(() => {});
+
+  // `--help` needs no network, no cache, and no installed binary; it only has
+  // to prove that main() ran at all.
+  const viaLink = await execFileAsync(
+    process.execPath,
+    [path.join(link, "bifrost-launcher.mjs"), "--help"],
+    { env: { ...process.env, BIFROST_LAUNCHER_ALLOW_PATH: "0", BIFROST_LAUNCHER_AUTO_INSTALL: "0" } },
+  ).catch((error) => ({ stdout: error.stdout ?? "", stderr: error.stderr ?? "" }));
+
+  assert.ok(
+    `${viaLink.stdout}${viaLink.stderr}`.trim().length > 0,
+    "launcher reached through a symlink produced no output on either stream, so its entry check rejected a direct execution",
+  );
+
+  await fsp.rm(real, { recursive: true, force: true });
+  await fsp.rm(path.dirname(link), { recursive: true, force: true });
+});

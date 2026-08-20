@@ -6,6 +6,7 @@
 //! contexts are query-scoped views implemented in `bifrost-rust`.
 
 use crate::analyzer::usages::{ExportIndex, ImportBinder};
+use crate::analyzer::{AnalyzerQueryScope, QueryScope, QueryToken};
 use crate::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
 use crate::hash::HashSet;
 use brokk_bifrost_rust::graph_support::{
@@ -29,7 +30,13 @@ impl RustAnalyzer {
             return cached;
         }
         let declarations = self.declarations(file);
-        let index = Arc::new(export_index_of_declarations(self, file, &declarations));
+        let scope = AnalyzerQueryScope::new(self);
+        let index = Arc::new(export_index_of_declarations(
+            self,
+            scope.token(),
+            file,
+            &declarations,
+        ));
         self.export_indexes.insert(file.clone(), index.clone());
         index
     }
@@ -44,28 +51,38 @@ impl RustAnalyzer {
         binder
     }
 
-    pub fn reference_context_of(&self, file: &ProjectFile) -> RustReferenceContext<'_> {
-        reference_context_of(self, file)
+    pub fn reference_context_of<'a>(
+        &'a self,
+        token: QueryToken<'a>,
+        file: &ProjectFile,
+    ) -> RustReferenceContext<'a> {
+        reference_context_of(self, token, file)
     }
 
     pub fn reference_context_of_while<'a>(
         &'a self,
+        token: QueryToken<'a>,
         file: &ProjectFile,
         keep_going: impl Fn() -> bool + 'a,
     ) -> RustReferenceContext<'a> {
-        reference_context_of_while(self, file, keep_going)
+        reference_context_of_while(self, token, file, keep_going)
     }
 
-    pub fn forward_reference_context_of(&self, file: &ProjectFile) -> RustReferenceContext<'_> {
-        forward_reference_context_of(self, file)
+    pub fn forward_reference_context_of<'a>(
+        &'a self,
+        token: QueryToken<'a>,
+        file: &ProjectFile,
+    ) -> RustReferenceContext<'a> {
+        forward_reference_context_of(self, token, file)
     }
 
     pub fn forward_reference_context_of_while<'a>(
         &'a self,
+        token: QueryToken<'a>,
         file: &ProjectFile,
         keep_going: impl Fn() -> bool + 'a,
     ) -> RustReferenceContext<'a> {
-        forward_reference_context_of_while(self, file, keep_going)
+        forward_reference_context_of_while(self, token, file, keep_going)
     }
 
     /// The analyzed-file listing bucketed by path-derived Rust package name,
@@ -84,7 +101,8 @@ impl RustAnalyzer {
         importing_file: &ProjectFile,
         module_specifier: &str,
     ) -> Vec<ProjectFile> {
-        resolve_module_files(self, importing_file, module_specifier)
+        let scope = AnalyzerQueryScope::new(self);
+        resolve_module_files(self, scope.token(), importing_file, module_specifier)
     }
 
     pub fn exact_member(
@@ -117,7 +135,8 @@ impl RustAnalyzer {
         &self,
         trait_member: &CodeUnit,
     ) -> Option<Vec<CodeUnit>> {
-        rust_trait_member_implementations(self, trait_member)
+        let scope = AnalyzerQueryScope::new(self);
+        rust_trait_member_implementations(self, scope.token(), trait_member)
     }
 
     /// Reached from `bifrost-lsp`; see
@@ -209,6 +228,7 @@ mod frozen {
 
     pub(super) fn build(
         analyzer: &RustAnalyzer,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         forward: bool,
     ) -> FrozenReferenceContext {
@@ -228,10 +248,15 @@ mod frozen {
                 ImportKind::Named => {
                     if let Some(imported) = binding.imported_name.as_deref() {
                         let files = analyzer.resolve_module_files(file, &binding.module_specifier);
-                        let resolved =
-                            canonical(analyzer, &files, imported, forward).or_else(|| {
-                                resolve_module_package(analyzer, file, &binding.module_specifier)
-                                    .map(|package| join(&package, imported))
+                        let resolved = canonical(analyzer, token, &files, imported, forward)
+                            .or_else(|| {
+                                resolve_module_package(
+                                    analyzer,
+                                    token,
+                                    file,
+                                    &binding.module_specifier,
+                                )
+                                .map(|package| join(&package, imported))
                             });
                         if let Some(resolved) = resolved {
                             named.insert(local.clone(), resolved);
@@ -240,13 +265,13 @@ mod frozen {
                 }
                 ImportKind::Namespace => {
                     if let Some(package) =
-                        resolve_module_package(analyzer, file, &binding.module_specifier)
+                        resolve_module_package(analyzer, token, file, &binding.module_specifier)
                     {
                         namespace.insert(local.clone(), package);
                     }
                     let files = analyzer.resolve_module_files(file, &binding.module_specifier);
                     for name in export_names(analyzer, &files) {
-                        if let Some(fqn) = canonical(analyzer, &files, &name, forward) {
+                        if let Some(fqn) = canonical(analyzer, token, &files, &name, forward) {
                             scoped.insert(format!("{local}::{name}"), fqn);
                         }
                     }
@@ -254,7 +279,7 @@ mod frozen {
                 ImportKind::Glob => {
                     let files = analyzer.resolve_module_files(file, &binding.module_specifier);
                     for name in export_names(analyzer, &files) {
-                        if let Some(fqn) = canonical(analyzer, &files, &name, forward) {
+                        if let Some(fqn) = canonical(analyzer, token, &files, &name, forward) {
                             glob_candidates.entry(name).or_default().insert(fqn);
                         }
                     }
@@ -277,7 +302,7 @@ mod frozen {
             ) {
                 continue;
             }
-            if let Some(fqn) = canonical(analyzer, &own_files, &name, forward) {
+            if let Some(fqn) = canonical(analyzer, token, &own_files, &name, forward) {
                 named.entry(name).or_insert(fqn);
             }
         }
@@ -302,11 +327,12 @@ mod frozen {
 
     fn canonical(
         analyzer: &RustAnalyzer,
+        token: QueryToken<'_>,
         files: &[ProjectFile],
         name: &str,
         forward: bool,
     ) -> Option<String> {
-        canonical_export_fqn_from_files(analyzer, files, name, forward, &|| true)
+        canonical_export_fqn_from_files(analyzer, token, files, name, forward, &|| true)
             .expect("uninterrupted frozen export traversal")
     }
 
@@ -463,7 +489,8 @@ mod tests {
         let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
         let root = fixture.project_root();
         let consumer = ProjectFile::new(root.clone(), "src/consumer.rs");
-        let anchors = analyzer.reference_context_of(&consumer);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let anchors = analyzer.reference_context_of(scope.token(), &consumer);
         assert_eq!(
             anchors.resolve_scoped_owner("barrel::Widget").as_deref(),
             Some("fixture.wide.Widget")
@@ -488,11 +515,11 @@ mod tests {
         for relative in EQUIVALENCE_FILES {
             let file = ProjectFile::new(root.clone(), relative);
             for forward in [false, true] {
-                let frozen = frozen::build(&analyzer, &file, forward);
+                let frozen = frozen::build(&analyzer, scope.token(), &file, forward);
                 let live = if forward {
-                    analyzer.forward_reference_context_of(&file)
+                    analyzer.forward_reference_context_of(scope.token(), &file)
                 } else {
-                    analyzer.reference_context_of(&file)
+                    analyzer.reference_context_of(scope.token(), &file)
                 };
                 for name in EQUIVALENCE_NAMES {
                     assert_eq!(
@@ -547,9 +574,10 @@ mod tests {
         let second = analyzer.export_index_of(&file);
 
         assert!(Arc::ptr_eq(&first, &second));
+        let scope = AnalyzerQueryScope::new(&analyzer);
         assert_eq!(
             analyzer
-                .forward_reference_context_of(&file)
+                .forward_reference_context_of(scope.token(), &file)
                 .resolve_bare("HashMap"),
             Some("std.collections.HashMap".to_string())
         );
@@ -582,9 +610,10 @@ mod tests {
         );
         let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
+        let scope = AnalyzerQueryScope::new(&analyzer);
         let checks = Cell::new(0usize);
 
-        let interrupted = analyzer.forward_reference_context_of_while(&file, || {
+        let interrupted = analyzer.forward_reference_context_of_while(scope.token(), &file, || {
             let next = checks.get() + 1;
             checks.set(next);
             false
@@ -593,7 +622,7 @@ mod tests {
         assert_eq!(interrupted.resolve_bare("Alias"), None);
         assert_eq!(checks.get(), 1);
 
-        let complete = analyzer.forward_reference_context_of(&file);
+        let complete = analyzer.forward_reference_context_of(scope.token(), &file);
 
         assert_eq!(
             complete.resolve_bare("Alias"),
@@ -622,9 +651,10 @@ mod tests {
         );
         let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
+        let scope = AnalyzerQueryScope::new(&analyzer);
         let checks = Cell::new(0usize);
 
-        let interrupted = analyzer.reference_context_of_while(&file, || {
+        let interrupted = analyzer.reference_context_of_while(scope.token(), &file, || {
             let next = checks.get() + 1;
             checks.set(next);
             false
@@ -633,7 +663,7 @@ mod tests {
         assert_eq!(interrupted.resolve_bare("Alias"), None);
         assert_eq!(checks.get(), 1);
 
-        let complete = analyzer.reference_context_of(&file);
+        let complete = analyzer.reference_context_of(scope.token(), &file);
 
         assert_eq!(
             complete.resolve_bare("Alias"),

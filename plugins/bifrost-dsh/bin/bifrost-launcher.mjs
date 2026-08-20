@@ -2,7 +2,7 @@
 
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -1280,6 +1280,28 @@ function isBinaryRecoveryError(error) {
   ].includes(error.code);
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === thisFile) {
+// `thisFile` comes from `import.meta.url`, which Node has already resolved
+// through symlinks, so the entry path has to be resolved the same way before
+// the two can be compared. Resolving only with `path.resolve` normalizes
+// without following links, so any invocation whose path crosses one -- every
+// macOS temp directory, since `os.tmpdir()` returns `/var/folders/...` and
+// `/var` links to `/private/var` -- failed this test and exited 0 having done
+// nothing at all, with no output on either stream (#2427).
+//
+// `realpathSync` throws when the entry does not exist on disk, which is the
+// normal shape for an eval or stdin entry rather than an error, so that case
+// falls back to the unresolved path and simply does not match.
+function isDirectExecution(entryPath) {
+  if (!entryPath) {
+    return false;
+  }
+  try {
+    return realpathSync(entryPath) === thisFile;
+  } catch {
+    return path.resolve(entryPath) === thisFile;
+  }
+}
+
+if (isDirectExecution(process.argv[1])) {
   await main();
 }

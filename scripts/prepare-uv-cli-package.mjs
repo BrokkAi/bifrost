@@ -6,8 +6,6 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = resolve(repoRoot, "packaging/bifrost-cli/.generated-licenses");
 const required = [
   "LICENSE.md",
-  "licenses/GPL-3.0.md",
-  "licenses/LGPL-3.0.md",
   "licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt",
 ];
 const generated = "licenses/THIRD_PARTY_LICENSES.html";

@@ -89,6 +89,36 @@ fn qualified_stdlib_method_object_is_a_type_qualifier() {
     }));
 }
 
+/// The accepted residual of the spelling-based JLS 6.5 reclassification
+/// (#2363, recorded on #2452): a PascalCase field inherited from another file
+/// is invisible to the intrafile `root_is_value` check, so a chain of
+/// type-spelled segments through it reads as a type qualifier and its heap
+/// identity is dropped. A scope that CAN name the root as a value keeps the
+/// Field lowering. If the first assertion ever starts failing, the residual
+/// has been fixed; retire the issue rather than this pin.
+#[test]
+fn pascal_case_cross_file_inherited_field_is_the_accepted_qualifier_residual() {
+    let source = r#"class App {
+  void run() {
+    CONFIG.DEFAULTS.value();
+  }
+}
+"#;
+    let tree = parse_java(source);
+    let invocation = first_kind(tree.root_node(), "method_invocation");
+    let access = invocation
+        .child_by_field_name("object")
+        .expect("selector object");
+    assert!(
+        java_field_access_is_type_qualifier(access, source, |_| false),
+        "a cross-file inherited PascalCase chain currently reads as a type qualifier"
+    );
+    assert!(
+        !java_field_access_is_type_qualifier(access, source, |root| root == "CONFIG"),
+        "a root the scope knows as a value must keep its Field lowering"
+    );
+}
+
 #[test]
 fn inherited_field_chain_is_not_a_type_qualifier() {
     let source = r#"class App {

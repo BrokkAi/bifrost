@@ -206,7 +206,22 @@ pub struct SemanticEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticNodeOccurrence {
+    /// Response-local dense index. Valid only inside this snapshot; never
+    /// persist it and never join on it across responses.
     pub local_id: u32,
+    /// Persistable identity of the node, anchored (like a policy finding id)
+    /// on the workspace-relative path, the enclosing declaration's stable
+    /// name, the hash of the exact source bytes the node denotes, and the
+    /// node's occurrence ordinal among byte-identical siblings under the same
+    /// owner. No workspace generation, no absolute byte offsets and no
+    /// absolute path participate, so an edit elsewhere in the file, an edit to
+    /// an unrelated file, or a relocated checkout leave the id unchanged.
+    ///
+    /// Editing the denoted bytes, renaming the enclosing declaration, or
+    /// moving the file *does* change the id: an id that still matches is
+    /// evidence the node still denotes the same text, never a silent alias for
+    /// changed source. Ids are therefore safe to persist and join across
+    /// revisions, but a disappeared id means "changed or gone", not "gone".
     pub stable_id: StableDigest,
     pub call_context: Box<[StableDigest]>,
     pub span: SourceSpan,
@@ -332,11 +347,63 @@ pub struct SemanticRelationBoundary {
     pub evidence: Box<[SemanticEvidence]>,
 }
 
+impl SemanticRelationBoundaryKind {
+    /// Whether this boundary exists because a caller-supplied budget stopped
+    /// the derivation, as opposed to analysis reaching a genuine edge of what
+    /// it can know.
+    ///
+    /// The distinction is the whole of issue #2412: a budget boundary is an
+    /// invitation to ask again with a larger limit, while a frontier boundary
+    /// is the same answer at every budget. Callers that only want to know
+    /// "would more budget help?" read this rather than matching every kind.
+    pub const fn is_budget(self) -> bool {
+        match self {
+            Self::CallDepthLimit
+            | Self::NodeLimit
+            | Self::EdgeLimit
+            | Self::BoundaryLimit
+            | Self::DiagnosticLimit
+            | Self::OutputByteLimit
+            | Self::SemanticWorkLimit
+            | Self::MaterializedFileLimit
+            | Self::TraversalStepLimit => true,
+            Self::DispatchGap
+            | Self::MissingSemantics
+            | Self::UnsupportedRelation
+            | Self::AmbiguousSeed
+            | Self::Cancelled
+            | Self::UnavailableContinuation
+            | Self::NonExitingRegion => false,
+        }
+    }
+}
+
+/// How far the derivation got, and — when it stopped short — *why* (#2412).
+///
+/// Frontier-bounded and budget-bounded are deliberately distinct states rather
+/// than one `Partial`: conflating them made every procedure that reaches any
+/// analysis frontier report as budget-truncated, so raising every budget
+/// thirtyfold produced byte-identical output with the same truncation flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticRelationStatus {
+    /// Every requested relation was derived, and no boundary of either kind
+    /// was reached. The only status from which an empty edge set is an
+    /// authoritative absence claim.
     Complete,
-    Partial,
+    /// Analysis reached a genuine edge of what it can know (a region with no
+    /// path to a procedure exit, a dispatch gap, non-exhaustive value-flow
+    /// candidate coverage, ...) while every caller budget still had room.
+    /// Raising the budgets returns exactly this answer again.
+    FrontierBounded,
+    /// A caller-supplied budget stopped the derivation. The snapshot's
+    /// boundaries name every exhausted dimension; asking again with a larger
+    /// limit can return more.
+    ///
+    /// Takes precedence over [`Self::FrontierBounded`] when both occurred,
+    /// because it is the actionable one — the frontier boundaries stay
+    /// enumerable in `boundaries` either way.
+    BudgetBounded,
     Unsupported,
     Cancelled,
 }
@@ -470,13 +537,42 @@ impl SemanticRelationSnapshot {
                 ));
             }
         }
-        if self.status == SemanticRelationStatus::Complete && !self.boundaries.is_empty() {
-            return Err(RelationCodecError::new(
-                "complete snapshots cannot contain boundaries",
-            ));
+        let budget_boundaries = self
+            .boundaries
+            .iter()
+            .filter(|boundary| boundary.kind.is_budget())
+            .count();
+        match self.status {
+            SemanticRelationStatus::Complete if !self.boundaries.is_empty() => {
+                return Err(RelationCodecError::new(
+                    "complete snapshots cannot contain boundaries",
+                ));
+            }
+            // The two bounded states are claims about *why* the derivation
+            // stopped, so each must be able to point at the boundary that says
+            // so. A frontier-bounded snapshot carrying a budget boundary would
+            // be the #2412 conflation in the other direction.
+            SemanticRelationStatus::BudgetBounded if budget_boundaries == 0 => {
+                return Err(RelationCodecError::new(
+                    "budget-bounded snapshots must name the exhausted dimension",
+                ));
+            }
+            SemanticRelationStatus::FrontierBounded
+                if budget_boundaries > 0 || self.boundaries.is_empty() =>
+            {
+                return Err(RelationCodecError::new(
+                    "frontier-bounded snapshots must carry only analysis boundaries",
+                ));
+            }
+            _ => {}
         }
         Ok(())
     }
+    /// Whether an empty edge set is a claim that no such edge exists.
+    ///
+    /// Only [`SemanticRelationStatus::Complete`] qualifies: a snapshot that
+    /// stopped at a frontier or ran out of budget has not looked everywhere,
+    /// and neither bounded state may be read as proof of absence.
     pub fn authoritative_absence(&self) -> bool {
         self.status == SemanticRelationStatus::Complete && self.edges.is_empty()
     }

@@ -20,6 +20,7 @@ mod inverted_tests;
 mod resolver_tests;
 mod shared;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope, QueryToken};
 
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::cpp_graph::shared::{CppEdgeResolver, CppQueryResolver};
@@ -78,13 +79,20 @@ pub use shared::CppAuthoritativeUsageBatch;
 pub(in crate::analyzer::usages) struct CppDispatch<'a> {
     analyzer: &'a dyn IAnalyzer,
     cpp: Option<&'a CppAnalyzer>,
+    /// Proof that the request scope this dispatch serves is open (issue #2414
+    /// step 3). Every C++ graph walk below reaches syntax through it.
+    token: QueryToken<'a>,
 }
 
 impl<'a> CppDispatch<'a> {
-    pub(in crate::analyzer::usages) fn new(analyzer: &'a dyn IAnalyzer) -> Self {
+    pub(in crate::analyzer::usages) fn new(
+        analyzer: &'a dyn IAnalyzer,
+        token: QueryToken<'a>,
+    ) -> Self {
         Self {
             analyzer,
             cpp: resolve_analyzer::<CppAnalyzer>(analyzer),
+            token,
         }
     }
 
@@ -95,6 +103,7 @@ impl<'a> CppDispatch<'a> {
             aliases: self.analyzer.type_alias_provider(),
             hierarchy: self.analyzer.type_hierarchy_provider(),
             workspace: self,
+            token: self.token,
         }
     }
 }
@@ -125,7 +134,11 @@ pub(in crate::analyzer::usages) fn with_cpp_graph_source<T>(
     analyzer: &dyn IAnalyzer,
     body: impl FnOnce(CppGraphSource<'_>) -> T,
 ) -> T {
-    let dispatch = CppDispatch::new(analyzer);
+    // The C++ graph's request boundary for callers that reach it without one
+    // of their own; nested inside a caller-owned scope it shares that scope's
+    // memoization (issue #2414 step 3).
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let dispatch = CppDispatch::new(analyzer, scope.token());
     body(dispatch.source())
 }
 

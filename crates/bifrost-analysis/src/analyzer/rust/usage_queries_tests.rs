@@ -10,6 +10,7 @@ mod tests {
     use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::rust::RustAnalyzer;
     use crate::analyzer::rust::rust_package_name;
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{Language, ProjectFile, TestProject};
     use crate::hash::HashSet;
     use brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_CODE;
@@ -68,7 +69,10 @@ mod tests {
     #[test]
     fn module_extents_from_the_store_match_the_syntax_tree_projection() {
         let (_temp, analyzer, lib, _worker) = analyzer_with_fixture();
-        let prepared = analyzer.prepared_syntax(&lib).expect("prepared syntax");
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let prepared = analyzer
+            .prepared_syntax(scope.token(), &lib)
+            .expect("prepared syntax");
         let expected: Vec<_> = rust_module_extents(
             prepared.tree().root_node(),
             prepared.source(),
@@ -95,7 +99,10 @@ mod tests {
         let leaf = analyzed_file(&analyzer, "leaf.rs");
         let package = rust_package_name(&leaf);
         assert!(!package.is_empty(), "fixture must have a nested package");
-        let prepared = analyzer.prepared_syntax(&leaf).expect("prepared syntax");
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let prepared = analyzer
+            .prepared_syntax(scope.token(), &leaf)
+            .expect("prepared syntax");
         let expected: Vec<_> =
             rust_module_extents(prepared.tree().root_node(), prepared.source(), &package)
                 .into_iter()

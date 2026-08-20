@@ -40,6 +40,7 @@ pub mod structural;
 pub(crate) mod symbol_lookup;
 pub mod taint;
 pub use brokk_bifrost_core::analyzer::test_assertions;
+pub(crate) mod tier_demand;
 pub mod tree_sitter_analyzer;
 pub(crate) mod tree_walk;
 mod typescript;
@@ -132,12 +133,12 @@ pub use go::{
     GoAnalyzer, GoDependencyPackAdapter, GoModulePackProducer, GoPinnedPackage,
     resolve_go_semantic_pack_dependencies,
 };
-pub use i_analyzer::AnalyzerQueryScope;
 pub use i_analyzer::AnalyzerStreamingFileScope;
 pub use i_analyzer::{
     AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, QueryBatch, SearchSymbolCandidates,
     SearchSymbolPatternBatch, WorkspaceFileIndex, WorkspaceFileIndexCell,
 };
+pub use i_analyzer::{AnalyzerQueryScope, InformationTier, QueryScope, QueryToken};
 #[cfg(any(test, feature = "test-support"))]
 pub use i_analyzer::{AnalyzerTestHooks, NoOpAnalyzerTestHooks};
 pub use index_warmer::IndexWarmer;

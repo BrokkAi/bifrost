@@ -28,6 +28,7 @@ use brokk_bifrost_core::analyzer::model::{
     ImportInfo, SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
     SemanticDiagnosticReport,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{
     contains_node, node_range, node_text, same_node,
 };
@@ -132,6 +133,7 @@ impl RustExternalEvidence for UnindexedRustDependencies {
 /// three -- see the analysis-side entry point of the same name.
 pub fn collect_rust_semantic_diagnostics(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     support: &dyn BoundedDefinitionLookup,
     external: &dyn RustExternalEvidence,
     file: &ProjectFile,
@@ -170,7 +172,7 @@ pub fn collect_rust_semantic_diagnostics(
     let line_starts = compute_line_starts(source);
     let root = tree.root_node();
     let visible_uses = collect_rust_use_bindings(root, source);
-    let refs = rust.reference_context_of(file);
+    let refs = rust.reference_context_of(token, file);
     let mut collector = RustDiagnosticCollector {
         rust,
         refs,

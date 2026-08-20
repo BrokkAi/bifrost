@@ -9,6 +9,7 @@ use crate::analyzer::usages::inverted_edges::{
     UsageEdgeBuildOutput, build_edge_output, parse_and_collect,
 };
 use crate::analyzer::usages::parsed_tree::ParseSpec;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CodeUnitIndex, IAnalyzer, ProjectFile, RustAnalyzer};
 use crate::hash::HashSet;
 use brokk_bifrost_rust::graph::inverted::{RustSeedsCache, scan_file};
@@ -24,6 +25,10 @@ where
     Output: UsageEdgeBuildOutput<String>,
     F: Fn(&ProjectFile) -> bool + Sync,
 {
+    // The pass's request boundary; nested inside any caller-owned scope
+    // (issue #2414 step 3).
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let files: Vec<ProjectFile> = rust.get_analyzed_files().into_iter().collect();
     let support = analyzer.global_usage_definition_index();
     let language = tree_sitter_rust::LANGUAGE.into();
@@ -32,7 +37,7 @@ where
     let seeds_cache = &seeds_cache;
     build_edge_output(&files, keep_file, |file| {
         keep_file(file).then_some(())?;
-        let refs = rust.reference_context_of_while(file, || keep_file(file));
+        let refs = rust.reference_context_of_while(token, file, || keep_file(file));
         parse_and_collect(
             analyzer,
             file,

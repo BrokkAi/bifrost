@@ -97,12 +97,17 @@ test("uv CLI package exposes bifrost through its package name", () => {
   assert.match(uvCliManifest, /^license-files = \["\.generated-licenses\/\*"\]$/mu);
   for (const license of [
     "LICENSE.md",
-    "GPL-3.0.md",
-    "LGPL-3.0.md",
     "SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt",
     "THIRD_PARTY_LICENSES.html",
   ]) {
     assert.ok(uvCliPreparer.includes(license));
+  }
+  // Bifrost is Apache-2.0 and no dependency imposes a GPLv3 or LGPLv3
+  // obligation, so the retained GNU v3 texts must not reappear in any wheel.
+  // libgit2's GPL-2.0 and winhttp's LGPL-2.1 are discharged by the
+  // supplemental notices, which carry those texts verbatim.
+  for (const stale of ["GPL-3.0.md", "LGPL-3.0.md"]) {
+    assert.ok(!uvCliPreparer.includes(stale));
   }
   assert.match(wheelBuilder, /node scripts\/prepare-uv-cli-package\.mjs/u);
 });

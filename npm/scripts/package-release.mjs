@@ -15,8 +15,6 @@ export const ROOT_PACKAGE = "@brokkai/bifrost";
 export const RELEASE_DOCUMENTS = [
   "README.md",
   "LICENSE.md",
-  "GPL-3.0.md",
-  "LGPL-3.0.md",
   "THIRD_PARTY_LICENSES.html",
   "SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt",
 ];

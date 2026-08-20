@@ -9,6 +9,7 @@ mod structural;
 
 use crate::analyzer::Range;
 use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 /// The Scala declaration walk, structured import/export parsing, raw-supertype
 /// extraction and ordered wildcard-import environment now live in
 /// [`brokk_bifrost_jvm::scala`]. Re-exporting the modules under their historical
@@ -314,7 +315,8 @@ impl ScalaAnalyzer {
             .into_iter()
             .map(|range| range.start_byte)
             .min()?;
-        let prepared = self.inner.prepared_syntax(unit.source())?;
+        let scope = AnalyzerQueryScope::new(self);
+        let prepared = self.inner.prepared_syntax(scope.token(), unit.source())?;
         let root = prepared.tree().root_node();
         Some((
             scala_package_prefixes_at(root, prepared.source(), reference_byte),
@@ -341,7 +343,11 @@ impl ScalaAnalyzer {
         let Some(range) = self.ranges(code_unit).into_iter().next() else {
             return false;
         };
-        let Some(prepared) = self.inner.prepared_syntax(code_unit.source()) else {
+        let scope = AnalyzerQueryScope::new(self);
+        let Some(prepared) = self
+            .inner
+            .prepared_syntax(scope.token(), code_unit.source())
+        else {
             return false;
         };
         prepared

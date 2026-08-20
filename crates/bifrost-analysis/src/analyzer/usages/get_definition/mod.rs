@@ -57,6 +57,7 @@ pub(crate) use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site_with_line_starts,
     simple_reference_name, smallest_named_node_covering,
 };
+use crate::analyzer::{QueryScope, QueryToken};
 use brokk_bifrost_cpp::graph::resolver::OrphanedNamespaceTypeScopeIndex;
 use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::syntax::JsTsImportBinder;
@@ -537,7 +538,8 @@ pub(crate) fn resolve_definition_batch(
     if profiling::enabled() {
         profiling::note(format!("request_count={}", requests.len()));
     }
-    let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
     resolve_definition_requests(analyzer, &mut context, requests, None, None, true)
 }
 
@@ -555,7 +557,8 @@ pub(crate) fn resolve_navigation_batch(
             requests.len()
         ));
     }
-    let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
     resolve_navigation_requests(
         analyzer,
         &mut context,
@@ -683,7 +686,8 @@ pub fn resolve_definition_batch_with_source(
     file: ProjectFile,
     source: Arc<str>,
 ) -> Vec<DefinitionLookupOutcome> {
-    let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
     context.sources.insert(file, Ok(source));
     resolve_definition_requests(analyzer, &mut context, requests, None, None, true)
 }
@@ -711,7 +715,8 @@ pub fn resolve_navigation_batch_with_source(
     source: Arc<str>,
     operation: NavigationOperation,
 ) -> Vec<NavigationLookupOutcome> {
-    let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
     context.sources.insert(file, Ok(source));
     resolve_navigation_requests(analyzer, &mut context, requests, operation, None, true)
 }
@@ -727,7 +732,8 @@ pub fn navigation_declaration_site_targets(
             declaration_range: None,
         }];
     }
-    let mut context = DefinitionBatchContext::new(analyzer, false);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let mut context = DefinitionBatchContext::new(analyzer, scope.token(), false);
     cpp::select_navigation_targets(&mut context, &[candidate], operation).targets
 }
 
@@ -748,7 +754,8 @@ pub fn resolve_definition_batch_with_source_and_cancellation(
     source: Arc<str>,
     cancellation: &CancellationToken,
 ) -> Vec<DefinitionLookupOutcome> {
-    let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
     context.sources.insert(file, Ok(source));
     resolve_definition_requests(
         analyzer,
@@ -789,7 +796,8 @@ pub(crate) fn resolve_call_target_batch_with_source(
             .collect();
     }
 
-    let mut context = DefinitionBatchContext::new(analyzer, requests.len() > 1);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
     context.sources.insert(file, Ok(source));
     resolve_navigation_requests(
         analyzer,
@@ -835,7 +843,8 @@ pub fn resolve_call_reference_definition_with_source(
         return None;
     }
 
-    let mut context = DefinitionBatchContext::new(analyzer, false);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let mut context = DefinitionBatchContext::new(analyzer, scope.token(), false);
     context.sources.insert(file, Ok(source));
     let source = context.source(&request.file).ok()?;
     let tree = context.tree(&request.file, language, &source)?;
@@ -876,6 +885,9 @@ pub(super) struct ScalaDefinitionContext {
 
 struct DefinitionBatchContext<'a> {
     analyzer: &'a dyn IAnalyzer,
+    /// Proof that the batch's request scope is open for the batch's whole life
+    /// (issue #2414 step 3).
+    token: QueryToken<'a>,
     bounded_support: AnalyzerDefinitionLookup<'a>,
     rust_support: Option<rust::AnalyzerRustDefinitionProvider<'a>>,
     rust_type_cache: RustTypeLookupCache,
@@ -906,9 +918,10 @@ struct DefinitionBatchContext<'a> {
 }
 
 impl<'a> DefinitionBatchContext<'a> {
-    fn new(analyzer: &'a dyn IAnalyzer, cache_rust_lookups: bool) -> Self {
+    fn new(analyzer: &'a dyn IAnalyzer, token: QueryToken<'a>, cache_rust_lookups: bool) -> Self {
         Self {
             analyzer,
+            token,
             bounded_support: AnalyzerDefinitionLookup::new(analyzer, Language::None),
             rust_support: resolve_analyzer::<RustAnalyzer>(analyzer)
                 .map(|rust| rust::AnalyzerRustDefinitionProvider::new(rust, cache_rust_lookups)),
@@ -1049,13 +1062,19 @@ impl<'a> DefinitionBatchContext<'a> {
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
     ) -> Arc<CppVisibilityIndex<'a>> {
-        let dispatch = CppDispatch::new(analyzer);
+        let token = self.token;
+        let dispatch = CppDispatch::new(analyzer, token);
         self.cpp_visibility
             .entry(file.clone())
             .or_insert_with(|| {
                 let mut roots = HashSet::default();
                 roots.insert(file.clone());
-                Arc::new(CppVisibilityIndex::build(cpp, &dispatch.source(), &roots))
+                Arc::new(CppVisibilityIndex::build(
+                    cpp,
+                    token,
+                    &dispatch.source(),
+                    &roots,
+                ))
             })
             .clone()
     }
@@ -1307,6 +1326,7 @@ fn resolve_one<'a>(
             if let Some(cancellation) = cancellation {
                 match rust::resolve_rust_cancellable(
                     analyzer,
+                    context.token,
                     &request.file,
                     &source,
                     tree.as_ref(),
@@ -1336,6 +1356,7 @@ fn resolve_one<'a>(
                     |support| {
                         rust::resolve_rust(
                             analyzer,
+                            context.token,
                             support,
                             &request.file,
                             &source,
@@ -2007,7 +2028,8 @@ mod tests {
         analyzer
             .test_hooks()
             .reset_full_declaration_scan_count_for_test();
-        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
         let requests = ["run", "stop"]
             .into_iter()
             .map(|needle| {
@@ -2051,7 +2073,8 @@ mod tests {
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
         let analyzer = fixture.analyzer.analyzer();
-        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
         let requests = source
             .match_indices("value")
             .skip(1)
@@ -2097,7 +2120,8 @@ mod tests {
         let analyzer = fixture.analyzer.analyzer();
         let tree = parse_tree_for_language(&file, Language::TypeScript, source)
             .expect("parse TypeScript source");
-        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
         let host =
             crate::analyzer::js_ts::providers::resolve_js_ts_source(analyzer, Language::TypeScript)
                 .expect("TypeScript analyzer is registered for this fixture");
@@ -2120,7 +2144,8 @@ mod tests {
         let analyzer = fixture.analyzer.analyzer();
         let go = resolve_analyzer::<GoAnalyzer>(analyzer).expect("Go analyzer");
         let tree = parse_tree_for_language(&file, Language::Go, source).expect("parse Go source");
-        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
 
         {
             let first = context.go_context(go, &file, source, &tree);
@@ -2152,7 +2177,8 @@ mod tests {
         let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer).expect("Scala analyzer");
         let tree =
             parse_tree_for_language(&file, Language::Scala, source).expect("parse Scala source");
-        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
 
         let first = context.scala_context(scala, &file);
         let second = context.scala_context(scala, &file);
@@ -2174,7 +2200,8 @@ mod tests {
         let fixture = AnalyzerFixture::new_for_language(Language::Scala, &[("main.scala", source)]);
         let file = ProjectFile::new(fixture.project_root(), "main.scala");
         let analyzer = fixture.analyzer.analyzer();
-        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
         let requests = ["alpha", "beta"]
             .into_iter()
             .map(|needle| {
@@ -2211,7 +2238,8 @@ mod tests {
         );
         let file = ProjectFile::new(fixture.project_root(), "app.py");
         let analyzer = fixture.analyzer.analyzer();
-        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
         let start_byte = source.rfind("run").expect("receiver member in source");
 
         let outcomes = resolve_definition_requests(
@@ -2266,7 +2294,8 @@ mod tests {
         );
         let file = ProjectFile::new(fixture.project_root(), "app.py");
         let analyzer = fixture.analyzer.analyzer();
-        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
         let requests = ["leaf_only", "local_only"]
             .into_iter()
             .map(|needle| {
@@ -2320,7 +2349,8 @@ mod tests {
         let file_a = ProjectFile::new(fixture.project_root(), "app_a.py");
         let file_b = ProjectFile::new(fixture.project_root(), "app_b.py");
         let analyzer = fixture.analyzer.analyzer();
-        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
         let requests = [(file_a, source_a, "run"), (file_b, source_b, "stop")]
             .into_iter()
             .map(|(file, source, needle)| {
@@ -2370,7 +2400,8 @@ mod tests {
         let file = ProjectFile::new(fixture.project_root(), "app.py");
         let analyzer = fixture.analyzer.analyzer();
         let py = resolve_analyzer::<PythonAnalyzer>(analyzer).expect("Python analyzer");
-        let mut context = DefinitionBatchContext::new(analyzer, true);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
         let python_context = context.python_context(py, &file);
         python_context.set_receiver_type_cache_limit(1);
         let member_offsets = [
@@ -2436,7 +2467,8 @@ mod tests {
                 end_byte: Some(start_byte + name.len()),
             })
             .collect::<Vec<_>>();
-        let mut context = DefinitionBatchContext::new(&analyzer, true);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let mut context = DefinitionBatchContext::new(&analyzer, scope.token(), true);
 
         let outcomes =
             resolve_definition_requests(&analyzer, &mut context, requests, None, None, false);

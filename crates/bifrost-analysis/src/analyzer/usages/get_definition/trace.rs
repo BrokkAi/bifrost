@@ -33,6 +33,7 @@
 //! removed on drop, so its lifetime is exactly the batch that asked for it.
 
 use super::{DefinitionLookupOutcome, DefinitionLookupStatus, resolve_definition_requests_traced};
+use crate::analyzer::QueryScope;
 use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::structural::resolution::{
     BoundaryStatus, CandidateOutcome, DeclaredVisibility, HierarchyRelation, MemberDispatchTier,
@@ -618,7 +619,9 @@ pub fn resolve_definition_batch_with_trace(
 ) -> Vec<(DefinitionLookupOutcome, ResolutionTraceResult)> {
     let completeness = trace_completeness_for(&file);
     let session = TraceSession::install();
-    let mut context = super::DefinitionBatchContext::new(analyzer, requests.len() > 1);
+    let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+    let mut context =
+        super::DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
     context.sources.insert(file.clone(), Ok(source));
     let mut per_request = Vec::with_capacity(requests.len());
     let outcomes = resolve_definition_requests_traced(

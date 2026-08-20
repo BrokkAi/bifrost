@@ -3,6 +3,7 @@ use brokk_bifrost_core::analyzer::common::node_span;
 use brokk_bifrost_core::analyzer::model::{
     ImportInfo, StructuredImportPath, StructuredImportPathKind, StructuredImportScope,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::facts::Span;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
@@ -677,6 +678,7 @@ pub fn resolve_rust_module_path_with_crate(
 /// module's package rather than the package inferred from the backing file.
 pub fn resolve_rust_import_package_scoped(
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     scope_start: usize,
@@ -685,7 +687,7 @@ pub fn resolve_rust_import_package_scoped(
     let segments = parse_symbol_path(Language::Rust, module_specifier);
     let first = segments.first().map(String::as_str)?;
     if !matches!(first, "self" | "super") {
-        return resolve_module_package(rust, file, module_specifier);
+        return resolve_module_package(rust, token, file, module_specifier);
     }
     let file_package = rust_package_name(file);
     let lexical_package =

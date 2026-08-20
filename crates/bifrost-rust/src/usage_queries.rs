@@ -24,6 +24,7 @@
 //! a path enters, and it is why `facts_of` takes a `ProjectFile` rather than an
 //! `Oid`.
 
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -123,6 +124,7 @@ pub struct RustDeclarationFacts {
 /// `None` only when `keep_going` asked to stop.
 pub fn rust_declaration_facts(
     analyzer: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     declarations: &BTreeSet<CodeUnit>,
     keep_going: &impl Fn() -> bool,
@@ -130,7 +132,7 @@ pub fn rust_declaration_facts(
     let mut facts = RustDeclarationFacts::default();
     let mut ordered_domains: Vec<(RustSymbolIdentity, Domain)> = Vec::new();
     let mut ordered_cfg_conditions: Vec<(RustSymbolIdentity, RustCfgCondition)> = Vec::new();
-    let prepared = analyzer.prepared_syntax(file);
+    let prepared = analyzer.prepared_syntax(token, file);
     let is_actual_crate_root = rust_file_is_actual_crate_root(analyzer, file);
     for declaration in declarations {
         keep_going().then_some(())?;
@@ -206,7 +208,7 @@ pub fn rust_declaration_facts(
             direct_import_scope_for_module(
                 file,
                 &owner.package(),
-                crate::graph_support::rust_declaration_visibility(analyzer, declaration),
+                crate::graph_support::rust_declaration_visibility(analyzer, token, declaration),
                 is_actual_crate_root,
             )
         };

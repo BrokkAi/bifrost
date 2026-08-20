@@ -3,7 +3,7 @@
 //! See [`super::resolver_tests`] for why they stayed on this side of the seam.
 
 use crate::analyzer::usages::cpp_graph::CppDispatch;
-use crate::analyzer::{CppAnalyzer, ProjectFile};
+use crate::analyzer::{CppAnalyzer, ProjectFile, QueryScope};
 use brokk_bifrost_core::hash::HashSet;
 use brokk_bifrost_cpp::graph::extractor::*;
 use brokk_bifrost_cpp::graph::resolver::*;
@@ -57,14 +57,22 @@ mod effective_using_scale_tests {
         let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
         let analyzer = workspace.analyzer();
         let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
-        let _scope = AnalyzerQueryScope::new(analyzer);
+        let query_scope = AnalyzerQueryScope::new(analyzer);
+        let query_token = query_scope.token();
         let roots = HashSet::from_iter([left.clone(), right]);
-        let visibility = VisibilityIndex::build(cpp, &CppDispatch::new(analyzer).source(), &roots);
-        let prepared = cpp.prepared_syntax(&left).expect("prepared left consumer");
+        let visibility = VisibilityIndex::build(
+            cpp,
+            query_token,
+            &CppDispatch::new(analyzer, query_token).source(),
+            &roots,
+        );
+        let prepared = cpp
+            .prepared_syntax(query_token, &left)
+            .expect("prepared left consumer");
         let root_node = prepared.tree().root_node();
         let imports = initialized_ordinary_type_imports(
             root_node,
-            &CppDispatch::new(analyzer).source(),
+            &CppDispatch::new(analyzer, query_token).source(),
             &visibility,
             &left,
             prepared.source(),
@@ -107,7 +115,7 @@ mod effective_using_scale_tests {
                 scope.spawn(move || {
                     let prepared = visibility
                         .cpp()
-                        .prepared_syntax(&left)
+                        .prepared_syntax(query_token, &left)
                         .expect("prepared concurrent consumer");
                     for _ in 0..100 {
                         let _ = effective_using_bindings_for_name(
@@ -156,7 +164,7 @@ mod effective_using_scale_tests {
                         assert!(
                             visibility
                                 .callable_arity_at_reference(
-                                    &CppDispatch::new(analyzer).source(),
+                                    &CppDispatch::new(analyzer, query_token).source(),
                                     &left,
                                     &callable,
                                     usize::MAX,
@@ -177,11 +185,15 @@ mod effective_using_scale_tests {
         // fresh visibility index -- one is built per usage query -- assembles
         // its project index without re-walking any file's AST.
         let builds_before_second_visibility = cpp.source_using_index_build_count_for_test();
-        let second_visibility =
-            VisibilityIndex::build(cpp, &CppDispatch::new(analyzer).source(), &roots);
+        let second_visibility = VisibilityIndex::build(
+            cpp,
+            query_token,
+            &CppDispatch::new(analyzer, query_token).source(),
+            &roots,
+        );
         let second_imports = initialized_ordinary_type_imports(
             root_node,
-            &CppDispatch::new(analyzer).source(),
+            &CppDispatch::new(analyzer, query_token).source(),
             &second_visibility,
             &left,
             prepared.source(),
@@ -233,10 +245,18 @@ mod effective_using_scale_tests {
         let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
         let analyzer = workspace.analyzer();
         let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
-        let _scope = AnalyzerQueryScope::new(analyzer);
+        let query_scope = AnalyzerQueryScope::new(analyzer);
+        let query_token = query_scope.token();
         let roots = HashSet::from_iter([consumer.clone()]);
-        let visibility = VisibilityIndex::build(cpp, &CppDispatch::new(analyzer).source(), &roots);
-        let prepared = cpp.prepared_syntax(&consumer).expect("prepared consumer");
+        let visibility = VisibilityIndex::build(
+            cpp,
+            query_token,
+            &CppDispatch::new(analyzer, query_token).source(),
+            &roots,
+        );
+        let prepared = cpp
+            .prepared_syntax(query_token, &consumer)
+            .expect("prepared consumer");
         let source = prepared.source();
         let start = source.find("Missing").expect("unqualified type reference");
         let end = start + "Missing".len();
@@ -272,7 +292,7 @@ mod effective_using_scale_tests {
         let template_node = template_node.expect("template type node");
         let imports = initialized_ordinary_type_imports(
             prepared.tree().root_node(),
-            &CppDispatch::new(analyzer).source(),
+            &CppDispatch::new(analyzer, query_token).source(),
             &visibility,
             &consumer,
             source,
@@ -283,12 +303,12 @@ mod effective_using_scale_tests {
             .find(|unit| unit.kind() == CodeUnitType::Class && unit.fq_name() == "target.Wanted")
             .expect("target declaration");
         let first_alias_names = visibility.visible_type_reference_component_names_for_target(
-            &CppDispatch::new(analyzer).source(),
+            &CppDispatch::new(analyzer, query_token).source(),
             &consumer,
             &target,
         );
         let second_alias_names = visibility.visible_type_reference_component_names_for_target(
-            &CppDispatch::new(analyzer).source(),
+            &CppDispatch::new(analyzer, query_token).source(),
             &consumer,
             &target,
         );
@@ -303,7 +323,7 @@ mod effective_using_scale_tests {
             for _ in 0..2 {
                 let resolution = resolve_type_node_lexically_for_target(
                     node,
-                    &CppDispatch::new(analyzer).source(),
+                    &CppDispatch::new(analyzer, query_token).source(),
                     &visibility,
                     &imports,
                     &consumer,

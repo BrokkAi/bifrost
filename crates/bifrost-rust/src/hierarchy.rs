@@ -7,6 +7,7 @@ use crate::graph_support::{
 use crate::imports::{resolve_rust_module_path_with_crate, rust_crate_root_package};
 use crate::lexical_scope::{parse_rust_tree, visible_import_binder_at};
 use crate::usage::exported_targets_from_files;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportKind};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
@@ -21,6 +22,7 @@ pub struct RustHierarchyIndex {
 
 pub fn rust_trait_for_impl_member(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     member: &CodeUnit,
 ) -> Option<CodeUnit> {
     let source = rust.project().read_source(member.source()).ok()?;
@@ -43,6 +45,7 @@ pub fn rust_trait_for_impl_member(
             let binder = visible_import_binder_at(source, impl_item.start_byte());
             resolve_rust_hierarchy_trait_ref(
                 rust,
+                token,
                 member.source(),
                 source,
                 impl_item,
@@ -55,34 +58,38 @@ pub fn rust_trait_for_impl_member(
 
 pub fn resolve_rust_hierarchy_trait_ref(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     impl_item: Node<'_>,
     binder: &ImportBinder,
     raw: &str,
 ) -> Option<CodeUnit> {
-    resolve_rust_hierarchy_ref(rust, file, source, impl_item, binder, raw, |unit| {
+    resolve_rust_hierarchy_ref(rust, token, file, source, impl_item, binder, raw, |unit| {
         is_rust_trait_declaration(rust.code_units(), unit)
     })
 }
 
 pub fn resolve_rust_hierarchy_type_ref(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     impl_item: Node<'_>,
     binder: &ImportBinder,
     raw: &str,
 ) -> Option<CodeUnit> {
-    resolve_rust_hierarchy_ref(rust, file, source, impl_item, binder, raw, |unit| {
+    resolve_rust_hierarchy_ref(rust, token, file, source, impl_item, binder, raw, |unit| {
         is_rust_struct_declaration(rust.code_units(), unit)
             || is_rust_enum_declaration(rust.code_units(), unit)
             || is_rust_type_alias_declaration(rust.code_units(), unit)
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_rust_hierarchy_ref<F>(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     impl_item: Node<'_>,
@@ -100,6 +107,7 @@ where
     if let Some((module_specifier, imported_name)) = normalized.rsplit_once("::") {
         candidates.extend(resolve_units_in_module(
             rust,
+            token,
             file,
             binder,
             &lexical_package,
@@ -110,7 +118,7 @@ where
         candidates.extend(same_module_declarations(
             rust, file, source, impl_item, normalized,
         ));
-        candidates.extend(imported_units(rust, file, binder, normalized));
+        candidates.extend(imported_units(rust, token, file, binder, normalized));
     }
 
     // Ambiguity means *two different declarations*, not two routes to one. A type
@@ -128,6 +136,7 @@ where
 
 pub fn resolve_units_in_module(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     binder: &ImportBinder,
     lexical_package: &str,
@@ -149,10 +158,10 @@ pub fn resolve_units_in_module(
 
     let resolved_module = resolved_package.replace('.', "::");
     let mut candidates = Vec::new();
-    let module_files = resolve_module_files(rust, file, &resolved_module);
+    let module_files = resolve_module_files(rust, token, file, &resolved_module);
     candidates.extend(units_from_export_targets(
         rust,
-        exported_targets_from_files(rust, &module_files, name).into_iter(),
+        exported_targets_from_files(rust, token, &module_files, name).into_iter(),
     ));
 
     if candidates.is_empty() {
@@ -209,11 +218,12 @@ pub fn same_module_declarations(
 
 pub fn imported_units(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     binder: &ImportBinder,
     reference: &str,
 ) -> Vec<CodeUnit> {
-    let targets = resolve_imported_export_from_binder(rust, file, binder, reference);
+    let targets = resolve_imported_export_from_binder(rust, token, file, binder, reference);
     units_from_export_targets(rust, targets.into_iter())
 }
 
@@ -234,7 +244,7 @@ pub fn units_from_export_targets(
 }
 
 impl RustHierarchyIndex {
-    pub fn build(rust: &dyn RustFactSource) -> Self {
+    pub fn build(rust: &dyn RustFactSource, token: QueryToken<'_>) -> Self {
         let mut direct_ancestors: HashMap<CodeUnit, Vec<CodeUnit>> = HashMap::default();
         let mut direct_descendants: HashMap<CodeUnit, HashSet<CodeUnit>> = HashMap::default();
         let mut relations = Vec::new();
@@ -253,19 +263,20 @@ impl RustHierarchyIndex {
                 };
                 let binder = visible_import_binder_at(&source, impl_item.start_byte());
                 let Some(trait_unit) = resolve_rust_hierarchy_trait_ref(
-                    rust, &file, &source, impl_item, &binder, trait_ref,
+                    rust, token, &file, &source, impl_item, &binder, trait_ref,
                 ) else {
                     continue;
                 };
                 let Some(implementer) = resolve_rust_hierarchy_type_ref(
                     rust,
+                    token,
                     &file,
                     &source,
                     impl_item,
                     &binder,
                     implementer_ref,
                 )
-                .and_then(|unit| canonical_rust_hierarchy_type(rust, unit)) else {
+                .and_then(|unit| canonical_rust_hierarchy_type(rust, token, unit)) else {
                     continue;
                 };
 
@@ -295,6 +306,7 @@ impl RustHierarchyIndex {
 
 pub fn canonical_rust_hierarchy_type(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     unit: CodeUnit,
 ) -> Option<CodeUnit> {
     if !is_rust_type_alias_declaration(rust.code_units(), &unit) {
@@ -308,6 +320,7 @@ pub fn canonical_rust_hierarchy_type(
     let binder = visible_import_binder_at(&source, alias_node.start_byte());
     resolve_rust_hierarchy_ref(
         rust,
+        token,
         unit.source(),
         &source,
         alias_node,

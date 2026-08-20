@@ -201,6 +201,7 @@ impl RustAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::QueryScope;
     use crate::analyzer::{IAnalyzer, Language, TestProject};
     use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
@@ -243,9 +244,16 @@ mod tests {
             .into_iter()
             .find(|declaration| declaration.identifier() == "Widget")
             .expect("Widget declaration");
+        let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         brokk_bifrost_rust::usage::usage_importers(
             analyzer,
-            &brokk_bifrost_rust::usage::usage_binding_seeds(analyzer, &BTreeSet::from([target])),
+            token,
+            &brokk_bifrost_rust::usage::usage_binding_seeds(
+                analyzer,
+                token,
+                &BTreeSet::from([target]),
+            ),
         )
     }
 

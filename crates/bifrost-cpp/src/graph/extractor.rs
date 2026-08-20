@@ -19,6 +19,7 @@ use crate::graph::syntax::qualified_callable_value;
 use crate::graph_support::CppSource;
 use brokk_bifrost_core::analyzer::fq_name::segment_interner;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
@@ -94,8 +95,12 @@ pub struct EnclosingContext {
     pub owner: Option<CodeUnit>,
 }
 
-pub fn prepare_file(cpp: &dyn CppSource, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>> {
-    cpp.prepared_syntax(file)
+pub fn prepare_file(
+    cpp: &dyn CppSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+) -> Option<Arc<PreparedSyntaxTree>> {
+    cpp.prepared_syntax(token, file)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9280,8 +9285,12 @@ fn ordinary_using_scope(node: Node<'_>) -> Option<(usize, usize, usize, bool)> {
 /// lets `CppSource::source_using_index` memoize it on the analyzer (#1927):
 /// a `VisibilityIndex` is rebuilt per usage query, and rebuilding this index
 /// per query re-walked a 9.5 MB amalgamation's AST for every candidate.
-pub fn build_source_using_index(cpp: &dyn CppSource, file: &ProjectFile) -> SourceUsingIndex {
-    let Some(prepared) = cpp.prepared_syntax(file) else {
+pub fn build_source_using_index(
+    cpp: &dyn CppSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+) -> SourceUsingIndex {
+    let Some(prepared) = cpp.prepared_syntax(token, file) else {
         return SourceUsingIndex::default();
     };
     collect_source_using_index(cpp, file, prepared.tree().root_node(), prepared.source())
@@ -9583,7 +9592,9 @@ fn build_project_using_index(visibility: &VisibilityIndex<'_>) -> ProjectUsingIn
         // The per-file index is memoized on the analyzer, so assembling the
         // project index for a fresh `VisibilityIndex` copies bindings instead
         // of re-walking each file's AST (#1927).
-        let source_index = visibility.cpp().source_using_index(&source_file);
+        let source_index = visibility
+            .cpp()
+            .source_using_index(visibility.token(), &source_file);
         for (name, bindings) in &source_index.ordinary_by_name {
             project
                 .ordinary_by_name
@@ -9635,7 +9646,7 @@ fn using_binding_target_components_for_name(
 ) -> Option<Vec<String>> {
     // Built once per call rather than per candidate: the filter runs over every
     // visible identifier of `name`, and the source is the same object each time.
-    let cpp_source = CppGraphSource::from_source(visibility.cpp());
+    let cpp_source = CppGraphSource::from_source(visibility.cpp(), visibility.token());
     let visible_candidates = visibility
         .visible_identifier_candidates(file, name)
         .filter(|candidate| {
@@ -9725,7 +9736,7 @@ fn project_using_bindings(
         return Vec::new();
     }
     visibility.note_using_donor_activation_for_test();
-    let Some(prepared) = visibility.cpp().prepared_syntax(file) else {
+    let Some(prepared) = visibility.cpp().prepared_syntax(visibility.token(), file) else {
         return Vec::new();
     };
     let projections = visibility
@@ -10091,7 +10102,7 @@ fn type_candidate_matches_lookup_components(
     let Some(cpp) = analyzer.cpp else {
         return false;
     };
-    let Some(prepared) = cpp.prepared_syntax(candidate.source()) else {
+    let Some(prepared) = cpp.prepared_syntax(visibility.token(), candidate.source()) else {
         return false;
     };
     let root = prepared.tree().root_node();

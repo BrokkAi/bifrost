@@ -990,12 +990,30 @@ pub struct ProcedureControlDependence {
     pub edge_visits: usize,
 }
 
+/// Why a control-dependence derivation produced no result.
+///
+/// `ExceededBudget` is separated from the rest because a caller-supplied work
+/// limit is not a failure: it is an answer about the caller's own limit, and a
+/// host that conflates the two reports an execution error where it should
+/// report a truncated result (issue #2412).
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcedureControlDependenceStop {
+    /// `max_work` was exhausted. No partial result exists.
+    ExceededBudget {
+        limit: usize,
+        attempted: usize,
+    },
+    Cancelled,
+    Failed(Box<str>),
+}
+
 #[doc(hidden)]
 pub fn derive_procedure_control_dependence(
     procedure: &ProcedureSemantics,
     max_work: usize,
     cancellation: &CancellationToken,
-) -> Result<ProcedureControlDependence, Box<str>> {
+) -> Result<ProcedureControlDependence, ProcedureControlDependenceStop> {
     let mut budget = CfgAlgorithmBudget::uniform(max_work);
     let mut request = CfgAlgorithmRequest::new(&mut budget, cancellation);
     let result = control_dependence(
@@ -1005,7 +1023,18 @@ pub fn derive_procedure_control_dependence(
         procedure.exceptional_exit_point(),
         &mut request,
     )
-    .map_err(|error| format!("{error:?}").into_boxed_str())?;
+    .map_err(|error| match error {
+        CfgAlgorithmError::ExceededBudget(exceeded) => {
+            ProcedureControlDependenceStop::ExceededBudget {
+                limit: exceeded.limit,
+                attempted: exceeded.attempted,
+            }
+        }
+        CfgAlgorithmError::Cancelled { .. } => ProcedureControlDependenceStop::Cancelled,
+        CfgAlgorithmError::InvalidNode(node) => ProcedureControlDependenceStop::Failed(
+            format!("invalid node {node:?}").into_boxed_str(),
+        ),
+    })?;
     Ok(ProcedureControlDependence {
         rows: result
             .rows

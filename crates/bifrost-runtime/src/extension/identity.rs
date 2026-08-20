@@ -19,10 +19,6 @@ impl StableDigest {
         }
         Ok(Self(value.into_boxed_str()))
     }
-    pub(crate) fn from_hash(bytes: impl AsRef<[u8]>) -> Self {
-        use sha2::{Digest, Sha256};
-        Self(format!("{:x}", Sha256::digest(bytes.as_ref())).into_boxed_str())
-    }
     pub fn as_str(&self) -> &str {
         &self.0
     }

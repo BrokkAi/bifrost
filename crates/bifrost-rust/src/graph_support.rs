@@ -3,6 +3,7 @@ use brokk_bifrost_core::analyzer::capabilities::{
 };
 use brokk_bifrost_core::analyzer::common::node_ident_text;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::rewrite_path::{
     ALIAS_SUBSTITUTION_RULE, RewriteOutcome, RewriteStep, RewriteTrace,
 };
@@ -55,7 +56,15 @@ pub trait RustSource:
     /// [`CodeUnitIndex::parent_of`] never falls back to a definition-row lookup.
     fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit>;
 
-    fn prepared_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>>;
+    /// The parsed tree and its source backing for `file`.
+    ///
+    /// The [`QueryToken`] is proof that a request scope is open, so the cache
+    /// this reads is live (issue #2414 step 3).
+    fn prepared_syntax(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Arc<PreparedSyntaxTree>>;
 
     fn cargo_routes(&self) -> Arc<RustCargoRouteIndex>;
 
@@ -142,18 +151,28 @@ pub trait RustFactSource: RustSource {
     /// them. Runs at most once per analyzer generation.
     fn ensure_rust_facts_caught_up(&self);
 
-    fn reference_context_of<'a>(&'a self, file: &ProjectFile) -> RustReferenceContext<'a>;
+    fn reference_context_of<'a>(
+        &'a self,
+        token: QueryToken<'a>,
+        file: &ProjectFile,
+    ) -> RustReferenceContext<'a>;
 
     fn reference_context_of_with_progress<'a>(
         &'a self,
+        token: QueryToken<'a>,
         file: &ProjectFile,
         progress: &'a dyn Fn() -> bool,
     ) -> Option<RustReferenceContext<'a>>;
 
-    fn forward_reference_context_of<'a>(&'a self, file: &ProjectFile) -> RustReferenceContext<'a>;
+    fn forward_reference_context_of<'a>(
+        &'a self,
+        token: QueryToken<'a>,
+        file: &ProjectFile,
+    ) -> RustReferenceContext<'a>;
 
     fn forward_reference_context_of_with_progress<'a>(
         &'a self,
+        token: QueryToken<'a>,
         file: &ProjectFile,
         progress: &'a dyn Fn() -> bool,
     ) -> Option<RustReferenceContext<'a>>;
@@ -184,6 +203,10 @@ enum RustReferenceQuery {
 /// file; see the execplan's "Identity model".)
 pub struct RustReferenceContext<'a> {
     rust: &'a dyn RustFactSource,
+    /// Proof that the request scope this context serves is open. The context
+    /// is per-query and per-file, so it carries the proof for the syntax reads
+    /// its resolutions make (issue #2414 step 3).
+    token: QueryToken<'a>,
     file: ProjectFile,
     forward: bool,
     keep_going: Box<dyn Fn() -> bool + 'a>,
@@ -210,12 +233,14 @@ impl std::fmt::Debug for RustReferenceContext<'_> {
 impl<'a> RustReferenceContext<'a> {
     pub fn new(
         rust: &'a dyn RustFactSource,
+        token: QueryToken<'a>,
         file: &ProjectFile,
         forward: bool,
         keep_going: Box<dyn Fn() -> bool + 'a>,
     ) -> Self {
         Self {
             rust,
+            token,
             file: file.clone(),
             forward,
             keep_going,
@@ -225,6 +250,11 @@ impl<'a> RustReferenceContext<'a> {
             same_file: OnceCell::new(),
             memo: RefCell::new(HashMap::default()),
         }
+    }
+
+    /// The request-scope proof this context was built with (issue #2414 step 3).
+    pub fn token(&self) -> QueryToken<'a> {
+        self.token
     }
 
     fn going(&self) -> bool {
@@ -338,7 +368,7 @@ impl<'a> RustReferenceContext<'a> {
             // complete module package.
             if is_rooted_rust_module_path(path)
                 && let Some(shared) =
-                    resolve_target_kind_root_module(self.rust, &self.file, &resolved)
+                    resolve_target_kind_root_module(self.rust, self.token, &self.file, &resolved)
             {
                 return Some(shared);
             }
@@ -371,12 +401,17 @@ impl<'a> RustReferenceContext<'a> {
             && let Some(imported) = binding.imported_name.as_deref()
         {
             let module_files =
-                resolve_module_files(self.rust, &self.file, &binding.module_specifier);
+                resolve_module_files(self.rust, self.token, &self.file, &binding.module_specifier);
             let resolved = self
                 .canonical_export_fqn(&module_files, imported)
                 .or_else(|| {
-                    resolve_module_package(self.rust, &self.file, &binding.module_specifier)
-                        .map(|package| join_rust_fqn(&package, imported))
+                    resolve_module_package(
+                        self.rust,
+                        self.token,
+                        &self.file,
+                        &binding.module_specifier,
+                    )
+                    .map(|package| join_rust_fqn(&package, imported))
                 });
             if resolved.is_some() {
                 return resolved;
@@ -388,7 +423,9 @@ impl<'a> RustReferenceContext<'a> {
     fn namespace_binding(&self, name: &str) -> Option<String> {
         let binding = self.binder().bindings.get(name)?;
         (binding.kind == ImportKind::Namespace)
-            .then(|| resolve_module_package(self.rust, &self.file, &binding.module_specifier))
+            .then(|| {
+                resolve_module_package(self.rust, self.token, &self.file, &binding.module_specifier)
+            })
             .flatten()
     }
 
@@ -399,11 +436,13 @@ impl<'a> RustReferenceContext<'a> {
             imported_name,
         }) = export_index.exports_by_name.get(name)
         {
-            let module_files = resolve_module_files(self.rust, &self.file, module_specifier);
+            let module_files =
+                resolve_module_files(self.rust, self.token, &self.file, module_specifier);
             let mut targets = self.exported_targets(&module_files, imported_name)?;
             if targets.is_empty() {
                 targets.extend(rust_member_reexport_targets(
                     self.rust,
+                    self.token,
                     &self.file,
                     module_specifier,
                     imported_name,
@@ -418,7 +457,8 @@ impl<'a> RustReferenceContext<'a> {
         }
         for star in &export_index.reexport_stars {
             self.going().then_some(())?;
-            let module_files = resolve_module_files(self.rust, &self.file, &star.module_specifier);
+            let module_files =
+                resolve_module_files(self.rust, self.token, &self.file, &star.module_specifier);
             if !self.export_closure_exports(&module_files, name)? {
                 continue;
             }
@@ -441,7 +481,7 @@ impl<'a> RustReferenceContext<'a> {
             }
             self.going().then_some(())?;
             let module_files =
-                resolve_module_files(self.rust, &self.file, &binding.module_specifier);
+                resolve_module_files(self.rust, self.token, &self.file, &binding.module_specifier);
             if self.export_closure_exports(&module_files, name)?
                 && let Some(fqn) = self.canonical_export_fqn(&module_files, name)
             {
@@ -462,7 +502,8 @@ impl<'a> RustReferenceContext<'a> {
         if binding.kind != ImportKind::Namespace {
             return None;
         }
-        let module_files = resolve_module_files(self.rust, &self.file, &binding.module_specifier);
+        let module_files =
+            resolve_module_files(self.rust, self.token, &self.file, &binding.module_specifier);
         self.export_closure_exports(&module_files, name)?
             .then(|| self.canonical_export_fqn(&module_files, name))
             .flatten()
@@ -471,6 +512,7 @@ impl<'a> RustReferenceContext<'a> {
     fn canonical_export_fqn(&self, module_files: &[ProjectFile], name: &str) -> Option<String> {
         canonical_export_fqn_from_files(
             self.rust,
+            self.token,
             module_files,
             name,
             self.forward,
@@ -489,13 +531,19 @@ impl<'a> RustReferenceContext<'a> {
         if self.forward {
             forward_exported_targets_from_files_with_progress(
                 self.rust,
+                self.token,
                 module_files,
                 name,
                 &*self.keep_going,
             )
             .ok()
         } else {
-            Some(exported_targets_from_files(self.rust, module_files, name))
+            Some(exported_targets_from_files(
+                self.rust,
+                self.token,
+                module_files,
+                name,
+            ))
         }
     }
 
@@ -528,6 +576,7 @@ impl<'a> RustReferenceContext<'a> {
             for star in &index.reexport_stars {
                 pending.extend(resolve_module_files(
                     self.rust,
+                    self.token,
                     &file,
                     &star.module_specifier,
                 ));
@@ -539,32 +588,36 @@ impl<'a> RustReferenceContext<'a> {
 
 pub fn reference_context_of<'a>(
     rust: &'a dyn RustFactSource,
+    token: QueryToken<'a>,
     file: &ProjectFile,
 ) -> RustReferenceContext<'a> {
-    RustReferenceContext::new(rust, file, false, Box::new(|| true))
+    RustReferenceContext::new(rust, token, file, false, Box::new(|| true))
 }
 
 pub fn reference_context_of_while<'a>(
     rust: &'a dyn RustFactSource,
+    token: QueryToken<'a>,
     file: &ProjectFile,
     keep_going: impl Fn() -> bool + 'a,
 ) -> RustReferenceContext<'a> {
-    RustReferenceContext::new(rust, file, false, Box::new(keep_going))
+    RustReferenceContext::new(rust, token, file, false, Box::new(keep_going))
 }
 
 pub fn forward_reference_context_of<'a>(
     rust: &'a dyn RustFactSource,
+    token: QueryToken<'a>,
     file: &ProjectFile,
 ) -> RustReferenceContext<'a> {
-    RustReferenceContext::new(rust, file, true, Box::new(|| true))
+    RustReferenceContext::new(rust, token, file, true, Box::new(|| true))
 }
 
 pub fn forward_reference_context_of_while<'a>(
     rust: &'a dyn RustFactSource,
+    token: QueryToken<'a>,
     file: &ProjectFile,
     keep_going: impl Fn() -> bool + 'a,
 ) -> RustReferenceContext<'a> {
-    RustReferenceContext::new(rust, file, true, Box::new(keep_going))
+    RustReferenceContext::new(rust, token, file, true, Box::new(keep_going))
 }
 
 fn join_rust_fqn(package: &str, name: &str) -> String {
@@ -747,18 +800,20 @@ fn rust_declaration_targets_in_files_with_progress(
 
 pub fn resolve_visible_import_targets_forward(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     binder: &ImportBinder,
     reference: &str,
 ) -> Vec<(ProjectFile, String)> {
-    let mut targets = resolve_imported_export_from_binder_forward(rust, file, binder, reference);
+    let mut targets =
+        resolve_imported_export_from_binder_forward(rust, token, file, binder, reference);
     for (local_name, binding) in &binder.bindings {
         if local_name != reference || binding.kind != ImportKind::Named {
             continue;
         }
         let imported = binding.imported_name.as_deref().unwrap_or(reference);
         targets.extend(
-            resolve_module_files(rust, file, &binding.module_specifier)
+            resolve_module_files(rust, token, file, &binding.module_specifier)
                 .into_iter()
                 .map(|target_file| (target_file, imported.to_string())),
         );
@@ -770,6 +825,7 @@ pub fn resolve_visible_import_targets_forward(
 
 pub fn export_index_of_declarations(
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     declarations: &BTreeSet<CodeUnit>,
 ) -> ExportIndex {
@@ -801,7 +857,7 @@ pub fn export_index_of_declarations(
         );
     }
 
-    if let Some(prepared) = rust.prepared_syntax(file) {
+    if let Some(prepared) = rust.prepared_syntax(token, file) {
         let source = prepared.source();
         let root = prepared.tree().root_node();
         for index_in_root in 0..root.named_child_count() {
@@ -853,6 +909,7 @@ pub fn export_index_of_declarations(
 /// rather than duplicating it.
 fn resolve_imported_export_from_binder_with_mode(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     binder: &ImportBinder,
     reference: &str,
@@ -866,11 +923,11 @@ fn resolve_imported_export_from_binder_with_mode(
             ImportKind::Named if local_name == reference => {
                 saw_explicit_binding = true;
                 let imported = binding.imported_name.as_deref().unwrap_or(reference);
-                let files = resolve_module_files(rust, file, &binding.module_specifier);
+                let files = resolve_module_files(rust, token, file, &binding.module_specifier);
                 targets.extend(if forward {
-                    forward_exported_targets_from_files(rust, &files, imported)
+                    forward_exported_targets_from_files(rust, token, &files, imported)
                 } else {
-                    exported_targets_from_files(rust, &files, imported)
+                    exported_targets_from_files(rust, token, &files, imported)
                 });
                 if targets.is_empty() {
                     targets.extend(rust_declaration_targets_in_files(index, &files, imported));
@@ -882,11 +939,11 @@ fn resolve_imported_export_from_binder_with_mode(
                 else {
                     continue;
                 };
-                let files = resolve_module_files(rust, file, module_specifier);
+                let files = resolve_module_files(rust, token, file, module_specifier);
                 targets.extend(if forward {
-                    forward_exported_targets_from_files(rust, &files, imported)
+                    forward_exported_targets_from_files(rust, token, &files, imported)
                 } else {
-                    exported_targets_from_files(rust, &files, imported)
+                    exported_targets_from_files(rust, token, &files, imported)
                 });
                 if targets.is_empty() {
                     targets.extend(rust_declaration_targets_in_files(index, &files, imported));
@@ -906,11 +963,11 @@ fn resolve_imported_export_from_binder_with_mode(
     }
     for binding in binder.bindings.values() {
         if matches!(binding.kind, ImportKind::Glob) {
-            let files = resolve_module_files(rust, file, &binding.module_specifier);
+            let files = resolve_module_files(rust, token, file, &binding.module_specifier);
             targets.extend(if forward {
-                forward_exported_targets_from_files(rust, &files, reference)
+                forward_exported_targets_from_files(rust, token, &files, reference)
             } else {
-                exported_targets_from_files(rust, &files, reference)
+                exported_targets_from_files(rust, token, &files, reference)
             });
         }
     }
@@ -921,20 +978,22 @@ fn resolve_imported_export_from_binder_with_mode(
 
 pub fn resolve_imported_export_from_binder_forward(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     binder: &ImportBinder,
     reference: &str,
 ) -> Vec<(ProjectFile, String)> {
-    resolve_imported_export_from_binder_with_mode(rust, file, binder, reference, true)
+    resolve_imported_export_from_binder_with_mode(rust, token, file, binder, reference, true)
 }
 
 pub fn resolve_imported_export_from_binder(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     binder: &ImportBinder,
     reference: &str,
 ) -> Vec<(ProjectFile, String)> {
-    resolve_imported_export_from_binder_with_mode(rust, file, binder, reference, false)
+    resolve_imported_export_from_binder_with_mode(rust, token, file, binder, reference, false)
 }
 
 /// Resolve a `use`-path module specifier (e.g. `crate::util`, `crate::svc`)
@@ -944,10 +1003,11 @@ pub fn resolve_imported_export_from_binder(
 /// callee fqn without re-deriving the path arithmetic.
 pub fn resolve_module_package(
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     importing_file: &ProjectFile,
     module_specifier: &str,
 ) -> Option<String> {
-    resolve_module_package_traced(rust, importing_file, module_specifier, None)
+    resolve_module_package_traced(rust, token, importing_file, module_specifier, None)
 }
 
 /// [`resolve_module_package`], recording the import-alias chase into `trace`.
@@ -964,6 +1024,7 @@ pub fn resolve_module_package(
 /// converged, cycle, or exceeded-budget.
 pub fn resolve_module_package_traced(
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     importing_file: &ProjectFile,
     module_specifier: &str,
     mut trace: Option<&mut RewriteTrace>,
@@ -1049,7 +1110,7 @@ pub fn resolve_module_package_traced(
             });
         }
         if let Some(package) =
-            resolve_import_alias_exported_module_package(rust, importing_file, &aliased)
+            resolve_import_alias_exported_module_package(rust, token, importing_file, &aliased)
         {
             finish_converged(trace, &aliased);
             return Some(package);
@@ -1098,6 +1159,7 @@ fn finish_converged(trace: Option<&mut RewriteTrace>, fixed_point: &str) {
 
 fn resolve_import_alias_exported_module_package(
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     importing_file: &ProjectFile,
     aliased_specifier: &str,
 ) -> Option<String> {
@@ -1107,15 +1169,15 @@ fn resolve_import_alias_exported_module_package(
     if rust_apply_import_alias(rust, importing_file, root).is_some() {
         return None;
     }
-    let mut files = resolve_module_files(rust, importing_file, root);
+    let mut files = resolve_module_files(rust, token, importing_file, root);
     if files.is_empty() {
         return None;
     }
     let mut package = None;
     for segment in suffix {
-        let target = forward_exported_module_fqn(rust, &files, segment)?;
+        let target = forward_exported_module_fqn(rust, token, &files, segment)?;
         package = Some(target.clone());
-        files = resolve_module_files(rust, importing_file, &target);
+        files = resolve_module_files(rust, token, importing_file, &target);
         if files.is_empty() {
             return None;
         }
@@ -1125,6 +1187,7 @@ fn resolve_import_alias_exported_module_package(
 
 fn forward_exported_module_fqn(
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     module_files: &[ProjectFile],
     name: &str,
 ) -> Option<String> {
@@ -1153,7 +1216,7 @@ fn forward_exported_module_fqn(
                 imported_name,
             }) => {
                 pending.extend(
-                    resolve_module_files(rust, &file, module_specifier)
+                    resolve_module_files(rust, token, &file, module_specifier)
                         .into_iter()
                         .map(|target| (target, imported_name.clone(), true)),
                 );
@@ -1170,7 +1233,7 @@ fn forward_exported_module_fqn(
         }
         for ReexportStar { module_specifier } in &export_index.reexport_stars {
             pending.extend(
-                resolve_module_files(rust, &file, module_specifier)
+                resolve_module_files(rust, token, &file, module_specifier)
                     .into_iter()
                     .map(|target| (target, name.clone(), true)),
             );
@@ -1188,6 +1251,7 @@ fn forward_exported_module_fqn(
 #[doc(hidden)]
 pub fn canonical_export_fqn_from_files(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     module_files: &[ProjectFile],
     name: &str,
     forward: bool,
@@ -1195,20 +1259,28 @@ pub fn canonical_export_fqn_from_files(
 ) -> ReferenceContextResult<Option<String>> {
     rust.note_export_name_canonicalization();
     let targets = if forward {
-        forward_exported_targets_from_files_with_progress(rust, module_files, name, progress)?
+        forward_exported_targets_from_files_with_progress(
+            rust,
+            token,
+            module_files,
+            name,
+            progress,
+        )?
     } else {
-        exported_targets_from_files(rust, module_files, name)
+        exported_targets_from_files(rust, token, module_files, name)
     };
     single_rust_target_fqn(rust.code_units(), targets, progress)
 }
 
 pub fn forward_export_fqn_from_files(
     rust: &dyn RustFactSource,
+    token: QueryToken<'_>,
     module_files: &[ProjectFile],
     name: &str,
 ) -> Option<String> {
-    if let Some(fqn) = canonical_export_fqn_from_files(rust, module_files, name, true, &|| true)
-        .expect("uninterrupted Rust export traversal")
+    if let Some(fqn) =
+        canonical_export_fqn_from_files(rust, token, module_files, name, true, &|| true)
+            .expect("uninterrupted Rust export traversal")
     {
         return Some(fqn);
     }
@@ -1222,7 +1294,7 @@ pub fn forward_export_fqn_from_files(
         else {
             continue;
         };
-        let Some(owner_fqn) = resolve_module_package(rust, file, module_specifier) else {
+        let Some(owner_fqn) = resolve_module_package(rust, token, file, module_specifier) else {
             continue;
         };
         let target_fqn = join_rust_fqn(&owner_fqn, imported_name);
@@ -1237,15 +1309,23 @@ pub fn forward_export_fqn_from_files(
 
 pub fn forward_exported_targets_from_files(
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     module_files: &[ProjectFile],
     export_name: &str,
 ) -> BTreeSet<(ProjectFile, String)> {
-    forward_exported_targets_from_files_with_progress(rust, module_files, export_name, &|| true)
-        .expect("uninterrupted Rust export traversal")
+    forward_exported_targets_from_files_with_progress(
+        rust,
+        token,
+        module_files,
+        export_name,
+        &|| true,
+    )
+    .expect("uninterrupted Rust export traversal")
 }
 
 fn forward_exported_targets_from_files_with_progress(
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     module_files: &[ProjectFile],
     export_name: &str,
     progress: &dyn Fn() -> bool,
@@ -1271,10 +1351,11 @@ fn forward_exported_targets_from_files_with_progress(
                 module_specifier,
                 imported_name,
             }) => {
-                let module_files = resolve_module_files(rust, &file, module_specifier);
+                let module_files = resolve_module_files(rust, token, &file, module_specifier);
                 if module_files.is_empty() {
                     targets.extend(rust_member_reexport_targets(
                         rust,
+                        token,
                         &file,
                         module_specifier,
                         imported_name,
@@ -1308,7 +1389,7 @@ fn forward_exported_targets_from_files_with_progress(
         }
         for star in &index.reexport_stars {
             pending.extend(
-                resolve_module_files(rust, &file, &star.module_specifier)
+                resolve_module_files(rust, token, &file, &star.module_specifier)
                     .into_iter()
                     .map(|target_file| (target_file, name.clone(), true)),
             );
@@ -1319,11 +1400,12 @@ fn forward_exported_targets_from_files_with_progress(
 
 pub fn rust_member_reexport_targets(
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     owner_path: &str,
     member_name: &str,
 ) -> BTreeSet<(ProjectFile, String)> {
-    let Some(owner_fqn) = resolve_module_package(rust, file, owner_path) else {
+    let Some(owner_fqn) = resolve_module_package(rust, token, file, owner_path) else {
         return BTreeSet::new();
     };
     let target_fqn = join_rust_fqn(&owner_fqn, member_name);
@@ -1388,6 +1470,7 @@ fn rewrite_import_alias_binding(
 
 pub fn resolve_module_files(
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     importing_file: &ProjectFile,
     module_specifier: &str,
 ) -> Vec<ProjectFile> {
@@ -1410,7 +1493,7 @@ pub fn resolve_module_files(
     let Some(resolved_module) = (if rooted {
         resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
     } else {
-        resolve_module_package(rust, importing_file, module_specifier)
+        resolve_module_package(rust, token, importing_file, module_specifier)
     }) else {
         return rust_module_files_from_path(importing_file, module_specifier);
     };
@@ -1428,7 +1511,7 @@ pub fn resolve_module_files(
         rust.definitions(&resolved_module)
             .filter(|code_unit| {
                 code_unit.is_module()
-                    && !is_external_module_declaration(rust, code_unit)
+                    && !is_external_module_declaration(rust, token, code_unit)
                     && (code_unit.source() == importing_file
                         || is_visible_module_path(rust.code_units(), code_unit))
             })
@@ -1468,6 +1551,7 @@ pub fn resolve_module_files(
 /// never admitted here.
 fn resolve_target_kind_root_module(
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     importing_file: &ProjectFile,
     resolved: &str,
 ) -> Option<String> {
@@ -1476,7 +1560,7 @@ fn resolve_target_kind_root_module(
     if files.files_in_package(resolved).next().is_some()
         || rust.definitions(resolved).any(|unit| {
             unit.is_module()
-                && !is_external_module_declaration(rust, &unit)
+                && !is_external_module_declaration(rust, token, &unit)
                 && unit.source() == importing_file
         })
     {
@@ -1484,7 +1568,7 @@ fn resolve_target_kind_root_module(
     }
     let declares_external_module = rust.definitions(resolved).any(|unit| {
         unit.is_module()
-            && is_external_module_declaration(rust, &unit)
+            && is_external_module_declaration(rust, token, &unit)
             && unit.source() == importing_file
     });
     if !declares_external_module {
@@ -1541,6 +1625,7 @@ pub fn rust_usage_candidate_files(
 
 pub fn trait_implementer_names(
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     trait_owner: &CodeUnit,
     _importer_file: &ProjectFile,
 ) -> HashSet<String> {
@@ -1553,13 +1638,14 @@ pub fn trait_implementer_names(
         })
         .flat_map(|(file, source)| {
             let binder = rust.import_binder_of(&file);
-            trait_implementer_names_from_source(rust, trait_owner, &file, &source, &binder)
+            trait_implementer_names_from_source(rust, token, trait_owner, &file, &source, &binder)
         })
         .collect()
 }
 
 pub fn rust_trait_member_implementations(
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     trait_member: &CodeUnit,
 ) -> Option<Vec<CodeUnit>> {
     let trait_owner = rust.parent_of(trait_member)?;
@@ -1583,7 +1669,7 @@ pub fn rust_trait_member_implementations(
                 continue;
             };
             let binder = visible_import_binder_at(&source, impl_item.start_byte());
-            if !trait_reference_matches(rust, &trait_owner, &file, &trait_ref, &binder) {
+            if !trait_reference_matches(rust, token, &trait_owner, &file, &trait_ref, &binder) {
                 continue;
             }
             for member_node in rust_impl_member_nodes(impl_item, &source, member_name, member_kind)
@@ -1677,8 +1763,12 @@ pub fn is_rust_public_like_declaration(index: &dyn CodeUnitIndex, code_unit: &Co
     })
 }
 
-pub fn rust_declaration_visibility(rust: &dyn RustSource, code_unit: &CodeUnit) -> RustVisibility {
-    let Some(prepared) = rust.prepared_syntax(code_unit.source()) else {
+pub fn rust_declaration_visibility(
+    rust: &dyn RustSource,
+    token: QueryToken<'_>,
+    code_unit: &CodeUnit,
+) -> RustVisibility {
+    let Some(prepared) = rust.prepared_syntax(token, code_unit.source()) else {
         return RustVisibility::Private;
     };
     inspect_rust_named_declaration_node(
@@ -1822,11 +1912,15 @@ pub fn is_visible_module_path(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -
 /// Reads the cached prepared syntax rather than `rust_declaration_node_is`'s
 /// own read-and-parse: `resolve_module_files` asks this per resolution, and
 /// #1230 made that path per-call cheap.
-pub fn is_external_module_declaration(rust: &dyn RustSource, code_unit: &CodeUnit) -> bool {
+pub fn is_external_module_declaration(
+    rust: &dyn RustSource,
+    token: QueryToken<'_>,
+    code_unit: &CodeUnit,
+) -> bool {
     if !code_unit.is_module() {
         return false;
     }
-    let Some(prepared) = rust.prepared_syntax(code_unit.source()) else {
+    let Some(prepared) = rust.prepared_syntax(token, code_unit.source()) else {
         return false;
     };
     inspect_rust_named_declaration_node(
@@ -2314,6 +2408,7 @@ fn named_descendants_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<Node<'
 
 fn trait_implementer_names_from_source(
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     trait_owner: &CodeUnit,
     impl_file: &ProjectFile,
     source: &str,
@@ -2326,6 +2421,7 @@ fn trait_implementer_names_from_source(
     collect_trait_implementer_names(
         tree.root_node(),
         rust,
+        token,
         trait_owner,
         impl_file,
         source,
@@ -2335,9 +2431,11 @@ fn trait_implementer_names_from_source(
     implementers
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_trait_implementer_names(
     node: Node<'_>,
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     trait_owner: &CodeUnit,
     impl_file: &ProjectFile,
     source: &str,
@@ -2346,7 +2444,7 @@ fn collect_trait_implementer_names(
 ) {
     if node.kind() == "impl_item"
         && let Some((trait_ref, implementer)) = trait_impl_parts(node, source)
-        && trait_reference_matches(rust, trait_owner, impl_file, &trait_ref, binder)
+        && trait_reference_matches(rust, token, trait_owner, impl_file, &trait_ref, binder)
     {
         implementers.push(implementer);
     }
@@ -2356,6 +2454,7 @@ fn collect_trait_implementer_names(
         collect_trait_implementer_names(
             child,
             rust,
+            token,
             trait_owner,
             impl_file,
             source,
@@ -2403,6 +2502,7 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 
 fn trait_reference_matches(
     rust: &dyn RustSource,
+    token: QueryToken<'_>,
     trait_owner: &CodeUnit,
     impl_file: &ProjectFile,
     trait_ref: &str,
@@ -2410,7 +2510,7 @@ fn trait_reference_matches(
 ) -> bool {
     if let Some((module_specifier, imported_name)) = trait_ref.rsplit_once("::") {
         return imported_name == trait_owner.identifier()
-            && resolve_module_files(rust, impl_file, module_specifier)
+            && resolve_module_files(rust, token, impl_file, module_specifier)
                 .into_iter()
                 .any(|file| file == *trait_owner.source());
     }
@@ -2424,7 +2524,7 @@ fn trait_reference_matches(
         .get(trait_ref)
         .filter(|binding| binding.imported_name.as_deref() == Some(trait_owner.identifier()))
         .is_some_and(|binding| {
-            resolve_module_files(rust, impl_file, &binding.module_specifier)
+            resolve_module_files(rust, token, impl_file, &binding.module_specifier)
                 .into_iter()
                 .any(|file| file == *trait_owner.source())
         })
