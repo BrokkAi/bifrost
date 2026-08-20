@@ -33,6 +33,7 @@ use super::return_type::{
 use crate::java::graph_support::{JavaSource, resolve_java_usage_type_name_in};
 use crate::java::hierarchy::java_nearest_declaring_ancestors;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageReferenceKind, classify_reference_node,
@@ -60,6 +61,7 @@ pub struct JavaEdgeScanCaches<'a> {
 /// into its outbound edges.
 pub fn scan_file(
     java: &dyn JavaSource,
+    token: QueryToken<'_>,
     graph: &JavaGraphSource<'_>,
     file: &ProjectFile,
     input: &FileEdgeScanInput<'_>,
@@ -80,7 +82,7 @@ pub fn scan_file(
         edges: PerFileEdges::default(),
     };
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    walk(input.root(), &mut ctx, &mut bindings);
+    walk(input.root(), token, &mut ctx, &mut bindings);
     ctx.edges
 }
 
@@ -100,27 +102,34 @@ struct JavaScan<'a> {
 
 impl JavaScan<'_> {
     /// Resolve the nominal identity carried by a structured type node to its fqn.
-    fn resolve_type_fqn(&self, node: Node<'_>) -> Option<String> {
-        self.resolve_type(node).map(|unit| unit.fq_name())
+    fn resolve_type_fqn(&self, token: QueryToken<'_>, node: Node<'_>) -> Option<String> {
+        self.resolve_type(token, node).map(|unit| unit.fq_name())
     }
 
-    fn resolve_type(&self, node: Node<'_>) -> Option<CodeUnit> {
+    fn resolve_type(&self, token: QueryToken<'_>, node: Node<'_>) -> Option<CodeUnit> {
         if matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
             return resolve_type_segments(
                 node,
                 self.source,
-                |candidate| self.resolve_non_nested_type(candidate),
+                |candidate| self.resolve_non_nested_type(token, candidate),
                 |owner, name| self.resolve_nested_type(owner, name),
             )
             .into_iter()
             .last()
             .map(|(resolved, _)| resolved);
         }
-        self.resolve_non_nested_type(node)
+        self.resolve_non_nested_type(token, node)
     }
 
-    fn resolve_non_nested_type(&self, node: Node<'_>) -> Option<CodeUnit> {
-        match java_lexical_type_from_node(self.java, self.graph, self.file, self.source, node) {
+    fn resolve_non_nested_type(&self, token: QueryToken<'_>, node: Node<'_>) -> Option<CodeUnit> {
+        match java_lexical_type_from_node(
+            self.java,
+            token,
+            self.graph,
+            self.file,
+            self.source,
+            node,
+        ) {
             LexicalTypeResolution::Resolved(unit) => return Some(unit),
             LexicalTypeResolution::Blocked => return None,
             LexicalTypeResolution::NotFound => {}
@@ -142,7 +151,13 @@ impl JavaScan<'_> {
     /// of declarations those rules search.
     fn resolve_realm_type_name(&self, type_name: &str) -> Option<CodeUnit> {
         self.graph.with_definitions(|definitions| {
-            resolve_java_usage_type_name_in(self.java, definitions, self.file, type_name)
+            resolve_java_usage_type_name_in(
+                self.java,
+                self.graph.token,
+                definitions,
+                self.file,
+                type_name,
+            )
         })
     }
 
@@ -220,13 +235,18 @@ const SCOPE_NODES: &[&str] = &[
     "for_statement",
 ];
 
-fn walk(node: Node<'_>, ctx: &mut JavaScan<'_>, bindings: &mut LocalInferenceEngine<String>) {
+fn walk(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut JavaScan<'_>,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
     let mut state = (ctx, bindings);
     walk_tree_iterative(
         node,
         &mut state,
         |node, (ctx, bindings)| {
-            if walk_enter(node, ctx, bindings) {
+            if walk_enter(node, token, ctx, bindings) {
                 TreeWalkAction::DescendWithExit
             } else {
                 TreeWalkAction::Descend
@@ -238,28 +258,30 @@ fn walk(node: Node<'_>, ctx: &mut JavaScan<'_>, bindings: &mut LocalInferenceEng
 
 fn walk_enter(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &mut JavaScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) -> bool {
     let enters_scope = SCOPE_NODES.contains(&node.kind());
     if enters_scope {
         bindings.enter_scope();
-        seed_declarations(node, ctx, bindings);
+        seed_declarations(node, token, ctx, bindings);
     } else {
-        seed_inline_declarations(node, ctx, bindings);
+        seed_inline_declarations(node, token, ctx, bindings);
     }
 
-    record_reference(node, ctx, bindings);
+    record_reference(node, token, ctx, bindings);
     enters_scope
 }
 
 fn record_reference(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &mut JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) {
     match node.kind() {
-        "object_creation_expression" => record_constructor_reference(node, ctx),
+        "object_creation_expression" => record_constructor_reference(node, token, ctx),
         // `new Foo()` and generics resolve via the type_identifier children, so
         // a scoped parent handles all of its semantic type segments (avoids
         // double counting while retaining outer-owner references).
@@ -279,7 +301,7 @@ fn record_reference(
             for (resolved, segment) in resolve_type_segments(
                 node,
                 ctx.source,
-                |candidate| ctx.resolve_type(candidate),
+                |candidate| ctx.resolve_type(token, candidate),
                 |owner, name| ctx.resolve_nested_type(owner, name),
             ) {
                 ctx.record(resolved.fq_name(), segment);
@@ -289,7 +311,7 @@ fn record_reference(
             for (resolved, segment) in resolve_type_segments(
                 node,
                 ctx.source,
-                |candidate| ctx.resolve_type(candidate),
+                |candidate| ctx.resolve_type(token, candidate),
                 |owner, name| ctx.resolve_nested_type(owner, name),
             ) {
                 ctx.record(resolved.fq_name(), segment);
@@ -310,7 +332,8 @@ fn record_reference(
             // method reachable only through same-owner calls is reported as
             // inconclusive (its receivers could not be proven external), never
             // confidently dead.
-            let is_same_owner = method_invocation_receiver_is_same_owner(node, ctx, bindings);
+            let is_same_owner =
+                method_invocation_receiver_is_same_owner(node, token, ctx, bindings);
             route_same_owner(
                 ctx,
                 is_same_owner,
@@ -324,7 +347,7 @@ fn record_reference(
                     // node -- so the call left the graph entirely (#2044:
                     // Guava's `ImmutableSupplier.get` and
                     // `ImmutableList.internalArray`).
-                    match method_owner_fqn(node, ctx, bindings) {
+                    match method_owner_fqn(node, token, ctx, bindings) {
                         Some(owner) => match method_callee(&owner, name, ctx) {
                             MethodCallee::Resolved(callee) => ctx.record(callee, name_node),
                             // No workspace declaration answers the name: the
@@ -344,7 +367,7 @@ fn record_reference(
         }
         "method_reference" => {
             if let Some(receiver) = constructor_method_reference_receiver(node) {
-                record_constructor_reference_for_type(receiver, node, ctx);
+                record_constructor_reference_for_type(receiver, token, node, ctx);
                 return;
             }
             let Some((receiver, member_node)) = method_reference_parts(node) else {
@@ -360,7 +383,7 @@ fn record_reference(
             // Unlike an invocation, a reference whose member no workspace
             // declaration answers stays unproven rather than nominal: there is
             // no receiver-typed call to attribute to an outside declaration.
-            if let Some(owner) = receiver_type_fqn(receiver, ctx, bindings)
+            if let Some(owner) = receiver_type_fqn(receiver, token, ctx, bindings)
                 && let MethodCallee::Resolved(callee) = method_callee(&owner, member, ctx)
             {
                 ctx.record(callee, member_node);
@@ -377,7 +400,7 @@ fn record_reference(
                 return;
             };
             if !field.is_empty()
-                && let Some(owner) = receiver_type_fqn(object, ctx, bindings)
+                && let Some(owner) = receiver_type_fqn(object, token, ctx, bindings)
             {
                 ctx.record(format!("{owner}.{field}"), field_node);
             } else if !field.is_empty() {
@@ -388,19 +411,20 @@ fn record_reference(
     }
 }
 
-fn record_constructor_reference(node: Node<'_>, ctx: &mut JavaScan<'_>) {
+fn record_constructor_reference(node: Node<'_>, token: QueryToken<'_>, ctx: &mut JavaScan<'_>) {
     let Some(type_node) = node.child_by_field_name("type") else {
         return;
     };
-    record_constructor_reference_for_type(type_node, node, ctx);
+    record_constructor_reference_for_type(type_node, token, node, ctx);
 }
 
 fn record_constructor_reference_for_type(
     type_node: Node<'_>,
+    token: QueryToken<'_>,
     reference_node: Node<'_>,
     ctx: &mut JavaScan<'_>,
 ) {
-    let Some(owner) = ctx.resolve_type(type_node) else {
+    let Some(owner) = ctx.resolve_type(token, type_node) else {
         return;
     };
     ctx.record(owner.fq_name().to_string(), type_node);
@@ -492,6 +516,7 @@ fn method_callee(owner_fq_name: &str, member: &str, ctx: &JavaScan<'_>) -> Metho
 /// through a differently-named variable/type, stays external (#1014 facet B).
 fn method_invocation_receiver_is_same_owner(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> bool {
@@ -511,7 +536,7 @@ fn method_invocation_receiver_is_same_owner(
                 }
                 // Own-type static call: the receiver resolves to the enclosing
                 // class's own type.
-                ctx.resolve_type_fqn(object)
+                ctx.resolve_type_fqn(token, object)
                     .is_some_and(|receiver_fqn| receiver_fqn == enclosing_owner)
             }
             _ => false,
@@ -523,20 +548,22 @@ fn method_invocation_receiver_is_same_owner(
 /// for an unqualified call — the enclosing class (`this`/inherited).
 fn method_owner_fqn(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
-    method_owner_fqn_at_depth(node, ctx, bindings, 0)
+    method_owner_fqn_at_depth(node, token, ctx, bindings, 0)
 }
 
 fn method_owner_fqn_at_depth(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
     depth: usize,
 ) -> Option<String> {
     match node.child_by_field_name("object") {
-        Some(object) => receiver_type_fqn_at_depth(object, ctx, bindings, depth + 1),
+        Some(object) => receiver_type_fqn_at_depth(object, token, ctx, bindings, depth + 1),
         None => ctx
             .class_ranges
             .enclosing(node.start_byte())
@@ -548,14 +575,16 @@ fn method_owner_fqn_at_depth(
 /// return-type inference.
 fn receiver_type_fqn(
     object: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
-    receiver_type_fqn_at_depth(object, ctx, bindings, 0)
+    receiver_type_fqn_at_depth(object, token, ctx, bindings, 0)
 }
 
 fn receiver_type_fqn_at_depth(
     object: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
     depth: usize,
@@ -567,7 +596,7 @@ fn receiver_type_fqn_at_depth(
             // known to be a value, so don't reinterpret its name as a static type.
             single_precise_binding(bindings, name).or_else(|| {
                 (!bindings.is_shadowed(name))
-                    .then(|| ctx.resolve_type_fqn(object))
+                    .then(|| ctx.resolve_type_fqn(token, object))
                     .flatten()
             })
         }
@@ -576,7 +605,7 @@ fn receiver_type_fqn_at_depth(
             .enclosing(object.start_byte())
             .map(str::to_string),
         "type_identifier" | "scoped_identifier" | "scoped_type_identifier" | "generic_type" => {
-            ctx.resolve_type_fqn(object)
+            ctx.resolve_type_fqn(token, object)
         }
         "field_access" => resolve_field_access_type(
             object,
@@ -586,7 +615,7 @@ fn receiver_type_fqn_at_depth(
                 if bindings.is_shadowed(name) {
                     Err(())
                 } else {
-                    Ok(ctx.resolve_type(base))
+                    Ok(ctx.resolve_type(token, base))
                 }
             },
             |qualified| ctx.resolve_realm_type_name(qualified),
@@ -595,23 +624,26 @@ fn receiver_type_fqn_at_depth(
         .map(|owner| owner.fq_name()),
         "object_creation_expression" => object
             .child_by_field_name("type")
-            .and_then(|type_node| ctx.resolve_type_fqn(type_node)),
-        "method_invocation" => match receiver_type_outcome_at_depth(object, ctx, bindings, depth) {
-            ReceiverAnalysisOutcome::Precise(values) if values.len() == 1 => {
-                values.into_iter().next()
+            .and_then(|type_node| ctx.resolve_type_fqn(token, type_node)),
+        "method_invocation" => {
+            match receiver_type_outcome_at_depth(object, token, ctx, bindings, depth) {
+                ReceiverAnalysisOutcome::Precise(values) if values.len() == 1 => {
+                    values.into_iter().next()
+                }
+                ReceiverAnalysisOutcome::Precise(_)
+                | ReceiverAnalysisOutcome::Ambiguous(_)
+                | ReceiverAnalysisOutcome::Unsupported { .. }
+                | ReceiverAnalysisOutcome::ExceededBudget { .. }
+                | ReceiverAnalysisOutcome::Unknown => None,
             }
-            ReceiverAnalysisOutcome::Precise(_)
-            | ReceiverAnalysisOutcome::Ambiguous(_)
-            | ReceiverAnalysisOutcome::Unsupported { .. }
-            | ReceiverAnalysisOutcome::ExceededBudget { .. }
-            | ReceiverAnalysisOutcome::Unknown => None,
-        },
+        }
         _ => None,
     }
 }
 
 fn seed_declarations(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &JavaScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
@@ -621,14 +653,14 @@ fn seed_declarations(
                 let mut cursor = parameters.walk();
                 for child in parameters.named_children(&mut cursor) {
                     if child.kind() == "formal_parameter" {
-                        seed_typed_binding(child, ctx, bindings);
+                        seed_typed_binding(child, token, ctx, bindings);
                     }
                 }
             }
         }
         "catch_clause" => {
             if let Some(parameter) = node.child_by_field_name("parameter") {
-                seed_typed_binding(parameter, ctx, bindings);
+                seed_typed_binding(parameter, token, ctx, bindings);
             }
         }
         "enhanced_for_statement" => {
@@ -642,26 +674,28 @@ fn seed_declarations(
 
 fn seed_inline_declarations(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &JavaScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     match node.kind() {
         "local_variable_declaration" | "field_declaration" => {
-            seed_variable_declaration(node, ctx, bindings)
+            seed_variable_declaration(node, token, ctx, bindings)
         }
-        "formal_parameter" => seed_typed_binding(node, ctx, bindings),
+        "formal_parameter" => seed_typed_binding(node, token, ctx, bindings),
         _ => {}
     }
 }
 
 fn seed_variable_declaration(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &JavaScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     let resolved_type = node
         .child_by_field_name("type")
-        .and_then(|type_node| ctx.resolve_type_fqn(type_node));
+        .and_then(|type_node| ctx.resolve_type_fqn(token, type_node));
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if child.kind() != "variable_declarator" {
@@ -680,7 +714,7 @@ fn seed_variable_declaration(
         }
         match child
             .child_by_field_name("value")
-            .map(|value| receiver_type_outcome(value, ctx, bindings))
+            .map(|value| receiver_type_outcome(value, token, ctx, bindings))
         {
             Some(ReceiverAnalysisOutcome::Precise(values)) if values.len() == 1 => {
                 bindings.seed_symbol(binding_name.to_string(), values[0].clone());
@@ -699,6 +733,7 @@ fn seed_variable_declaration(
 
 fn seed_typed_binding(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &JavaScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
@@ -711,7 +746,7 @@ fn seed_typed_binding(
     }
     match node
         .child_by_field_name("type")
-        .and_then(|type_node| ctx.resolve_type_fqn(type_node))
+        .and_then(|type_node| ctx.resolve_type_fqn(token, type_node))
     {
         Some(fqn) => bindings.seed_symbol(binding_name.to_string(), fqn),
         None => bindings.declare_shadow(binding_name.to_string()),
@@ -725,14 +760,16 @@ fn single_precise_binding(bindings: &LocalInferenceEngine<String>, name: &str) -
 
 fn receiver_type_outcome(
     expression: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> ReceiverAnalysisOutcome<String> {
-    receiver_type_outcome_at_depth(expression, ctx, bindings, 0)
+    receiver_type_outcome_at_depth(expression, token, ctx, bindings, 0)
 }
 
 fn receiver_type_outcome_at_depth(
     expression: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
     depth: usize,
@@ -745,11 +782,11 @@ fn receiver_type_outcome_at_depth(
     match expression.kind() {
         "object_creation_expression" => expression
             .child_by_field_name("type")
-            .and_then(|type_node| ctx.resolve_type_fqn(type_node))
+            .and_then(|type_node| ctx.resolve_type_fqn(token, type_node))
             .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
             .unwrap_or(ReceiverAnalysisOutcome::Unknown),
         "method_invocation" => {
-            method_invocation_return_type_outcome(expression, ctx, bindings, depth)
+            method_invocation_return_type_outcome(expression, token, ctx, bindings, depth)
         }
         "identifier" => {
             let name = node_text(expression, ctx.source);
@@ -761,13 +798,13 @@ fn receiver_type_outcome_at_depth(
             let outcomes: Vec<_> = ["consequence", "alternative"]
                 .into_iter()
                 .filter_map(|field| expression.child_by_field_name(field))
-                .map(|branch| receiver_type_outcome_at_depth(branch, ctx, bindings, depth))
+                .map(|branch| receiver_type_outcome_at_depth(branch, token, ctx, bindings, depth))
                 .collect();
             merge_receiver_type_outcomes(outcomes)
         }
         "parenthesized_expression" => expression
             .named_child(0)
-            .map(|child| receiver_type_outcome_at_depth(child, ctx, bindings, depth))
+            .map(|child| receiver_type_outcome_at_depth(child, token, ctx, bindings, depth))
             .unwrap_or(ReceiverAnalysisOutcome::Unknown),
         _ => ReceiverAnalysisOutcome::Unknown,
     }
@@ -775,6 +812,7 @@ fn receiver_type_outcome_at_depth(
 
 fn method_invocation_return_type_outcome(
     invocation: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &JavaScan<'_>,
     bindings: &LocalInferenceEngine<String>,
     depth: usize,
@@ -791,10 +829,10 @@ fn method_invocation_return_type_outcome(
     if name.is_empty() {
         return ReceiverAnalysisOutcome::Unknown;
     }
-    let Some(owner) = method_owner_fqn_at_depth(invocation, ctx, bindings, depth) else {
+    let Some(owner) = method_owner_fqn_at_depth(invocation, token, ctx, bindings, depth) else {
         return ReceiverAnalysisOutcome::Unknown;
     };
-    method_return_type_for_owner_fqn(&owner, name, argument_count(invocation), ctx)
+    method_return_type_for_owner_fqn(&owner, token, name, argument_count(invocation), ctx)
 }
 
 fn argument_count(invocation: Node<'_>) -> usize {

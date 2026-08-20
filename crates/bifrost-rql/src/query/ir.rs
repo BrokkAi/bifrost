@@ -13,7 +13,8 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
     ALL_OCCURRENCE_ROLES, Namespace, OccurrenceClass, OccurrenceRole,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
-    BindingKind, BoundaryStatus, CandidateOutcome, HoistingClass, PrecedenceTier, RejectionReason,
+    BindingKind, BoundaryStatus, CandidateOutcome, DeclaredVisibility, HoistingClass,
+    PrecedenceTier, RejectionReason,
 };
 use brokk_bifrost_core::analyzer::structural::rewrite_path::{
     RewriteDomainKind, RewriteOutcomeKind,
@@ -1381,6 +1382,26 @@ pub struct CodeQuerySeed {
     pub not_inside: Option<Pattern>,
 }
 
+impl CodeQuerySeed {
+    /// Whether any pattern in this seed filters on recorded callable
+    /// visibility or parameter-type spellings.
+    pub fn constrains_callable_signature(&self) -> bool {
+        self.root.constrains_callable_signature()
+            || self
+                .inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_callable_signature)
+            || self
+                .inside_decl
+                .as_ref()
+                .is_some_and(Pattern::constrains_callable_signature)
+            || self
+                .not_inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_callable_signature)
+    }
+}
+
 /// The source of values entering one typed pipeline suffix.
 #[derive(Debug, Clone)]
 pub enum CodeQueryPlanSource {
@@ -1797,6 +1818,15 @@ pub struct Pattern {
     /// leaves arity unconstrained. Meaningful on `call` facts, whose `args`
     /// role edges carry the count; a fact without argument edges has arity 0.
     pub arity: Option<ArityConstraint>,
+    /// Recorded modifier visibility of a callable declaration. Empty means
+    /// unconstrained. A fact matches when its adapter-recorded visibility is
+    /// one of these labels. `unknown` is a real recorded value, never equal
+    /// to `public`.
+    pub visibility: Vec<DeclaredVisibility>,
+    /// Existential constraint on a callable's recorded parameter-type
+    /// spellings. A fact matches when any parameter spelling satisfies the
+    /// predicate. The spelling is a discriminator, not a resolved type.
+    pub parameter_type: Option<StringPredicate>,
     pub capture: Option<String>,
     pub has: Option<Box<Pattern>>,
     /// Verifier-only: never used for candidate pruning.
@@ -1827,6 +1857,8 @@ impl Pattern {
             && self.name.is_none()
             && self.text.is_none()
             && self.arity.is_none()
+            && self.visibility.is_empty()
+            && self.parameter_type.is_none()
             && self.capture.is_none()
             && self.has.is_none()
             && self.not_has.is_none()
@@ -1873,6 +1905,45 @@ impl Pattern {
 
     pub fn has_role_constraints(&self) -> bool {
         self.constrains_roles()
+    }
+
+    /// Whether this pattern or any nested sub-pattern filters on recorded
+    /// callable visibility or parameter-type spellings.
+    pub fn constrains_callable_signature(&self) -> bool {
+        if !self.visibility.is_empty() || self.parameter_type.is_some() {
+            return true;
+        }
+        if self
+            .has
+            .as_deref()
+            .is_some_and(Self::constrains_callable_signature)
+            || self
+                .not_has
+                .as_deref()
+                .is_some_and(Self::constrains_callable_signature)
+        {
+            return true;
+        }
+        for &role in Role::single_target_roles() {
+            if self
+                .single_role_pattern(role)
+                .is_some_and(Self::constrains_callable_signature)
+            {
+                return true;
+            }
+        }
+        for &role in Role::list_target_roles() {
+            if self
+                .list_role_patterns(role)
+                .iter()
+                .any(Self::constrains_callable_signature)
+            {
+                return true;
+            }
+        }
+        self.kwargs
+            .iter()
+            .any(|(_, pattern)| pattern.constrains_callable_signature())
     }
 }
 

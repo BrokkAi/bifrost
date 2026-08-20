@@ -7,6 +7,7 @@
 
 use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ImportInfo, ProjectFile};
 use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_rust::declarations::rust_package_name;
 use brokk_bifrost_rust::imports::{
     resolve_rust_import_fq_name, rust_could_import_file, rust_imported_code_units,
@@ -14,9 +15,12 @@ use brokk_bifrost_rust::imports::{
 use std::sync::Arc;
 
 use super::RustAnalyzer;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
 impl ImportAnalysisProvider for RustAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         if let Some(cached) = self.imported_code_units.get(file) {
             return cached;
         }
@@ -24,7 +28,7 @@ impl ImportAnalysisProvider for RustAnalyzer {
         let resolved = Arc::new(rust_imported_code_units(
             self,
             file,
-            &self.inner.import_info_of(file),
+            &self.inner.import_info_of(token, file),
         ));
 
         self.imported_code_units
@@ -51,8 +55,8 @@ impl ImportAnalysisProvider for RustAnalyzer {
         referencing
     }
 
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
-        self.inner.import_info_of(file)
+    fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
+        self.inner.import_info_of(token, file)
     }
 
     fn imported_files_from_infos(
@@ -96,6 +100,8 @@ impl ImportAnalysisProvider for RustAnalyzer {
         import_infos: Option<&crate::hash::HashMap<ProjectFile, Vec<ImportInfo>>>,
         cancellation: &crate::cancellation::CancellationToken,
     ) {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         use rayon::prelude::*;
 
         let mut fq_names: Vec<String> = files
@@ -107,7 +113,7 @@ impl ImportAnalysisProvider for RustAnalyzer {
                 let package = rust_package_name(file);
                 let imports = import_infos
                     .and_then(|infos| infos.get(file).cloned())
-                    .unwrap_or_else(|| self.inner.import_info_of(file));
+                    .unwrap_or_else(|| self.inner.import_info_of(token, file));
                 imports
                     .iter()
                     .filter_map(|import| {

@@ -10,10 +10,13 @@ use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{GoAnalyzer, IAnalyzer, ProjectFile, resolve_analyzer};
 use crate::cancellation::CancellationToken;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use tree_sitter::Tree;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_go_type_bounded(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -30,12 +33,14 @@ pub(crate) fn resolve_go_type_bounded(
     };
     let support =
         AnalyzerGoDefinitionProvider::bounded(go, &session, analyzer.semantic_model_overlay());
-    let outcome = resolve_go_type_with_provider(analyzer, &support, file, source, tree, site);
+    let outcome =
+        resolve_go_type_with_provider(analyzer, token, &support, file, source, tree, site);
     session.finish(outcome)
 }
 
 fn resolve_go_type_with_provider(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -45,9 +50,15 @@ fn resolve_go_type_with_provider(
     let Some(tree) = tree else {
         return no_type("go_parse_failed", "Go source could not be parsed");
     };
-    let Some(resolution) =
-        go_type_lookup_resolution(analyzer, support, file, source, tree.root_node(), site)
-    else {
+    let Some(resolution) = go_type_lookup_resolution(
+        analyzer,
+        token,
+        support,
+        file,
+        source,
+        tree.root_node(),
+        site,
+    ) else {
         return no_type(
             "go_no_supported_type",
             format!("`{}` does not have a supported explicit Go type", site.text),

@@ -53,6 +53,7 @@ use brokk_bifrost_core::analyzer::model::{
     Range, SemanticAbsenceProof, SemanticDiagnostic, SemanticDiagnosticDomain,
     SemanticDiagnosticIncompleteReason, SemanticDiagnosticReport,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{node_range, node_text};
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
@@ -174,7 +175,7 @@ pub fn collect_ruby_semantic_diagnostics(
         );
         return report;
     }
-    if let Some(reason) = unresolved_load_directive_reason(ruby, gems, file) {
+    if let Some(reason) = unresolved_load_directive_reason(ruby, graph.token, gems, file) {
         report.push_incomplete(None, vec![reason]);
         return report;
     }
@@ -567,10 +568,11 @@ fn defines_const_missing_dynamically(node: Node<'_>, source: &str) -> bool {
 /// retained discovery could see.
 fn unresolved_load_directive_reason(
     ruby: &dyn RubySource,
+    token: QueryToken<'_>,
     gems: &dyn RubyGemSurface,
     file: &ProjectFile,
 ) -> Option<SemanticDiagnosticIncompleteReason> {
-    for import in ruby.import_info_of(file).iter() {
+    for import in ruby.import_info_of(token, file).iter() {
         if crate::imports::resolve_required_file(file, import).is_some() {
             continue;
         }
@@ -613,7 +615,8 @@ fn visible_surface_reason(
         // closure was built; every other visible file is classified here
         // against the same activated packs.
         if visible_file != file
-            && let Some(reason) = unresolved_load_directive_reason(ruby, gems, visible_file)
+            && let Some(reason) =
+                unresolved_load_directive_reason(ruby, graph.token, gems, visible_file)
         {
             return Some(reason);
         }

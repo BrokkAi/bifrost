@@ -128,6 +128,7 @@ impl CountingAnalyzer {
 }
 
 use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
 impl CodeUnitIndex for CountingAnalyzer {
     fn enclosing_code_unit(&self, _file: &ProjectFile, _range: &Range) -> Option<CodeUnit> {
@@ -347,6 +348,8 @@ fn complete_symbol_index_skips_enclosing_owner_regex_scan() {
         ambiguous: Vec::new(),
         ambiguous_paths: Vec::new(),
         too_broad: Vec::new(),
+        complete: true,
+        incomplete: Vec::new(),
     };
 
     let files = symbol_source_candidate_files(&analyzer, &result);
@@ -379,8 +382,12 @@ fn definition_outcome_key_reuses_declaration_context() {
     };
     let mut render_cache = DefinitionCandidateRenderCache::default();
 
-    let first = super::definitions::semantic_outcome_key(analyzer, &outcome, &mut render_cache);
-    let second = super::definitions::semantic_outcome_key(analyzer, &outcome, &mut render_cache);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let first =
+        super::definitions::semantic_outcome_key(analyzer, token, &outcome, &mut render_cache);
+    let second =
+        super::definitions::semantic_outcome_key(analyzer, token, &outcome, &mut render_cache);
 
     assert_eq!(first, second);
     assert_eq!(render_cache.declaration_context_count(), 1);
@@ -1114,8 +1121,11 @@ fn issue_1228_source_budget_never_reports_verified_absence() {
         1_000,
     );
 
+    let scope = AnalyzerQueryScope::new(&analyzer);
+    let token = scope.token();
     let result = scan_usages_by_location_with_context(
         &analyzer,
+        token,
         ScanUsagesByLocationParams {
             targets: vec![ScanUsagesTarget {
                 path: "lib.rs".to_string(),
@@ -1165,8 +1175,11 @@ fn issue_1228_time_budget_is_explicit_and_never_reports_verified_absence() {
         1_000,
     );
 
+    let scope = AnalyzerQueryScope::new(&analyzer);
+    let token = scope.token();
     let result = scan_usages_by_location_with_context(
         &analyzer,
+        token,
         ScanUsagesByLocationParams {
             targets: vec![ScanUsagesTarget {
                 path: "lib.rs".to_string(),
@@ -1503,7 +1516,7 @@ impl Service {
     }
 }
 
-pub fn helper() {}
+pub fn helper( token: QueryToken<'_>) {}
 "#,
             ),
             ("src/prelude.rs", "pub fn globbed() {}\n"),

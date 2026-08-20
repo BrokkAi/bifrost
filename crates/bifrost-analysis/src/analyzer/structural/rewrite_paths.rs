@@ -24,10 +24,12 @@
 //! not answer: a cancelled run, a missing Rust analyzer, a file whose source
 //! the analyzer no longer holds.
 
+use crate::analyzer::AnalyzerQueryScope;
 use crate::analyzer::QueryScope;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::rewrite_path::{
     RewriteDomainKind, RewriteOrigin, RewriteOutcome, RewritePath, RewriteTrace,
 };
@@ -137,18 +139,21 @@ pub fn rewrite_paths_for_file(
     file: &ProjectFile,
     request: &mut RewritePathRequest<'_>,
 ) -> FileRewritePaths {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let generation = analyzer.project().analysis_generation();
     if crate::analyzer::common::language_for_file(file) != Language::Rust {
         // The only declared domain does not apply here. That is an answer, not
         // a gap: there is nothing this derivation failed to compute.
         return FileRewritePaths::complete(Vec::new(), generation);
     }
-    rust_import_alias_paths(analyzer, file, generation, request)
+    rust_import_alias_paths(analyzer, token, file, generation, request)
 }
 
 /// The `rust_import_alias` domain over one Rust file.
 fn rust_import_alias_paths(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     generation: u64,
     request: &mut RewritePathRequest<'_>,
@@ -174,7 +179,7 @@ fn rust_import_alias_paths(
     let mut paths = Vec::new();
     let mut seen_origins: HashSet<String> = HashSet::default();
     for import in brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider::import_info_of(
-        rust, file,
+        rust, token, file,
     ) {
         if request.cancellation.is_cancelled() {
             reasons.push(RewritePathIncompleteReason::Cancelled);

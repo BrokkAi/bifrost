@@ -1,6 +1,6 @@
 //! PyTorch SDPA embedding sidecar client.
 //!
-//! Each [`SingleSidecar`] owns one child process (`scripts/voyage_sidecar.py`) pinned to
+//! Each [`SingleSidecar`] owns one child process (`scripts/public/voyage_sidecar.py`) pinned to
 //! one GPU; the child runs the selected Muninn model under PyTorch with fused
 //! SDPA attention. N sidecars are wrapped in the existing [`ScheduledEmbedder`] so a
 //! batch fans across every GPU.
@@ -25,7 +25,7 @@ use super::engine::{
 const SCRIPT_ENV: &str = "BIFROST_SIDECAR_SCRIPT";
 const DEVICES_ENV: &str = "BIFROST_SIDECAR_DEVICES";
 const READY_TIMEOUT_ENV: &str = "BIFROST_SIDECAR_READY_TIMEOUT_SECS";
-const DEFAULT_SCRIPT: &str = "scripts/embedding_sidecar.py";
+const DEFAULT_SCRIPT: &str = "scripts/public/embedding_sidecar.py";
 const DEFAULT_READY_TIMEOUT_SECS: u64 = 900;
 
 /// One sidecar child process bound to one device.

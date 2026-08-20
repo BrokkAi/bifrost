@@ -51,10 +51,10 @@ use crate::usage::{
     Domain, ModuleKey, RustImportEdge, RustImportEdgeKind, RustImportExtent, RustMacroScopeEdge,
     RustMacroScopeKey, RustMacroScopeRanges, RustModuleAliasRoute, RustOriginRoute,
     RustResolvedModuleRoute, RustRouteProvenance, RustSymbolIdentity, RustSymbolNamespace,
-    direct_import_scope_for_module, edge_matches_single_seed, edge_target_matches_exact_module,
-    imported_identity_domain, rust_mod_item_has_macro_use,
+    direct_import_scope_for_module, edge_target_matches_exact_module, imported_identity_domain,
+    rust_mod_item_has_macro_use,
 };
-use crate::usage_queries::RustUsageQueries;
+use crate::usage_queries::{RustImportBinding, RustUsageQueries};
 use brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_CODE;
 
 /// One module's bindings are asked for by `(file, module)`.
@@ -1167,71 +1167,7 @@ impl<'a> RustUsageWalks<'a> {
             if self.cancelled() {
                 break;
             }
-            let owner = &binding.owner_module;
-            let propagate_alias = matches!(binding.extent, RustImportExtent::Module { .. });
-            let Some(edge_domain) = direct_import_scope_for_module(
-                file,
-                owner,
-                binding.visibility.clone(),
-                self.cargo_routes.target_roots_for_file(file).contains(file),
-            ) else {
-                continue;
-            };
-            let template = |target: RustResolvedModuleRoute,
-                            local_name: String,
-                            kind: RustImportEdgeKind| RustImportEdge {
-                importer: file.clone(),
-                importer_module: binding.importer_module.clone(),
-                extent: binding.extent.clone(),
-                local_name,
-                target_file: target.target_file,
-                target_module: target.target_module,
-                kind,
-                propagate_alias,
-                domain: edge_domain.clone(),
-                namespace: None,
-                provenance: target.provenance,
-                cfg_condition: binding.cfg_condition.clone(),
-            };
-            if binding.is_glob {
-                for resolved in self.resolve_segments(file, owner, &binding.path) {
-                    self.admit_import_edge(
-                        &mut edges,
-                        template(resolved, String::new(), RustImportEdgeKind::Glob),
-                    );
-                }
-                continue;
-            }
-            let Some(imported_name) = binding.path.last().cloned() else {
-                continue;
-            };
-            // `extern crate dep as tk;` binds only the crate namespace. Giving
-            // it a named edge would also bind whatever `dep` names in this
-            // module, so `tk::Item` would reach a same-named local `mod dep`.
-            if !binding.is_extern_crate {
-                for resolved in
-                    self.resolve_segments(file, owner, &binding.path[..binding.path.len() - 1])
-                {
-                    self.admit_import_edge(
-                        &mut edges,
-                        template(
-                            resolved,
-                            binding.local_name.clone(),
-                            RustImportEdgeKind::Named(imported_name.clone()),
-                        ),
-                    );
-                }
-            }
-            for resolved in self.resolve_segments(file, owner, &binding.path) {
-                self.admit_import_edge(
-                    &mut edges,
-                    template(
-                        resolved,
-                        binding.local_name.clone(),
-                        RustImportEdgeKind::Namespace,
-                    ),
-                );
-            }
+            self.append_forward_import_edges(file, &binding, &mut edges);
         }
         let edges = Arc::new(edges);
         if !self.cancelled() {
@@ -1240,6 +1176,169 @@ impl<'a> RustUsageWalks<'a> {
                 .insert(file.clone(), Arc::clone(&edges));
         }
         edges
+    }
+
+    fn append_forward_import_edges(
+        &self,
+        file: &ProjectFile,
+        binding: &RustImportBinding,
+        edges: &mut Vec<RustImportEdge>,
+    ) {
+        let owner = &binding.owner_module;
+        let propagate_alias = matches!(binding.extent, RustImportExtent::Module { .. });
+        let Some(edge_domain) = direct_import_scope_for_module(
+            file,
+            owner,
+            binding.visibility.clone(),
+            self.cargo_routes.target_roots_for_file(file).contains(file),
+        ) else {
+            return;
+        };
+        let template = |target: RustResolvedModuleRoute,
+                        local_name: String,
+                        kind: RustImportEdgeKind| RustImportEdge {
+            importer: file.clone(),
+            importer_module: binding.importer_module.clone(),
+            extent: binding.extent.clone(),
+            local_name,
+            target_file: target.target_file,
+            target_module: target.target_module,
+            kind,
+            propagate_alias,
+            domain: edge_domain.clone(),
+            namespace: None,
+            provenance: target.provenance,
+            cfg_condition: binding.cfg_condition.clone(),
+        };
+        if binding.is_glob {
+            for resolved in self.resolve_segments(file, owner, &binding.path) {
+                self.admit_import_edge(
+                    edges,
+                    template(resolved, String::new(), RustImportEdgeKind::Glob),
+                );
+            }
+            return;
+        }
+        let Some(imported_name) = binding.path.last().cloned() else {
+            return;
+        };
+        // `extern crate dep as tk;` binds only the crate namespace. Giving
+        // it a named edge would also bind whatever `dep` names in this
+        // module, so `tk::Item` would reach a same-named local `mod dep`.
+        if !binding.is_extern_crate {
+            for resolved in
+                self.resolve_segments(file, owner, &binding.path[..binding.path.len() - 1])
+            {
+                self.admit_import_edge(
+                    edges,
+                    template(
+                        resolved,
+                        binding.local_name.clone(),
+                        RustImportEdgeKind::Named(imported_name.clone()),
+                    ),
+                );
+            }
+        }
+        for resolved in self.resolve_segments(file, owner, &binding.path) {
+            self.admit_import_edge(
+                edges,
+                template(
+                    resolved,
+                    binding.local_name.clone(),
+                    RustImportEdgeKind::Namespace,
+                ),
+            );
+        }
+    }
+
+    /// Import edges from one binding that can bind `identity`.
+    ///
+    /// A named edge can only bind the requested imported name. Glob and
+    /// namespace edges still use the full alias-aware resolver, then retain
+    /// only the requested target module. This avoids resolving every named
+    /// prefix in a candidate file merely to discard its edges afterward.
+    fn append_import_edges_binding_identity(
+        &self,
+        file: &ProjectFile,
+        binding: &RustImportBinding,
+        identity: &RustSymbolIdentity,
+        edges: &mut Vec<RustImportEdge>,
+    ) {
+        let owner = &binding.owner_module;
+        let propagate_alias = matches!(binding.extent, RustImportExtent::Module { .. });
+        let Some(edge_domain) = direct_import_scope_for_module(
+            file,
+            owner,
+            binding.visibility.clone(),
+            self.cargo_routes.target_roots_for_file(file).contains(file),
+        ) else {
+            return;
+        };
+        let template = |target: RustResolvedModuleRoute,
+                        local_name: String,
+                        kind: RustImportEdgeKind| RustImportEdge {
+            importer: file.clone(),
+            importer_module: binding.importer_module.clone(),
+            extent: binding.extent.clone(),
+            local_name,
+            target_file: target.target_file,
+            target_module: target.target_module,
+            kind,
+            propagate_alias,
+            domain: edge_domain.clone(),
+            namespace: None,
+            provenance: target.provenance,
+            cfg_condition: binding.cfg_condition.clone(),
+        };
+        let targets_identity_module = |resolved: &RustResolvedModuleRoute| {
+            resolved.target_file == identity.file && resolved.target_module == identity.module
+        };
+        if binding.is_glob {
+            for resolved in self
+                .resolve_segments(file, owner, &binding.path)
+                .into_iter()
+                .filter(targets_identity_module)
+            {
+                self.admit_import_edge(
+                    edges,
+                    template(resolved, String::new(), RustImportEdgeKind::Glob),
+                );
+            }
+            return;
+        }
+        let Some(imported_name) = binding.path.last() else {
+            return;
+        };
+        if !binding.is_extern_crate && imported_name == &identity.name {
+            for resolved in self
+                .resolve_segments(file, owner, &binding.path[..binding.path.len() - 1])
+                .into_iter()
+                .filter(targets_identity_module)
+            {
+                self.admit_import_edge(
+                    edges,
+                    template(
+                        resolved,
+                        binding.local_name.clone(),
+                        RustImportEdgeKind::Named(imported_name.clone()),
+                    ),
+                );
+            }
+        }
+        for resolved in self
+            .resolve_segments(file, owner, &binding.path)
+            .into_iter()
+            .filter(targets_identity_module)
+        {
+            self.admit_import_edge(
+                edges,
+                template(
+                    resolved,
+                    binding.local_name.clone(),
+                    RustImportEdgeKind::Namespace,
+                ),
+            );
+        }
     }
 
     /// `add_import_edge`: an edge only exists when the two files can actually
@@ -1299,10 +1398,23 @@ impl<'a> RustUsageWalks<'a> {
         target_file: Option<&ProjectFile>,
     ) {
         match module.components.last() {
-            // A written module path ends in the module's own name.
-            Some(last) => {
-                candidates.extend(self.queries.files_mentioning(last, RUST_OCCURRENCE_CODE))
-            }
+            // A structured import either imports the module by this name or
+            // writes a module path ending in it. Ordinary code mentions cannot
+            // produce an import edge and need not enter semantic verification.
+            Some(last) => candidates.extend(
+                self.queries
+                    .files_importing_module_component(last)
+                    .into_iter()
+                    .filter(|candidate| {
+                        self.queries
+                            .import_bindings_of(candidate)
+                            .iter()
+                            .any(|binding| {
+                                binding_names_module_component(binding, last)
+                                    && self.binding_could_reach_module(candidate, binding, module)
+                            })
+                    }),
+            ),
             // A crate root has no name to mention: `use crate::*` and
             // `use other_crate;` are the shapes that reach it.
             None => {
@@ -1316,9 +1428,79 @@ impl<'a> RustUsageWalks<'a> {
         }
         // `self::` and `super::` name a module without spelling it. The first
         // can only come from a file backing the module itself; the second is an
-        // indexed lookup over the written path.
+        // indexed lookup over the written path, then a structured owner check.
         candidates.extend(self.files_for_module(module).iter().cloned());
-        candidates.extend(self.queries.files_importing_module_path("super"));
+        candidates.extend(self.parent_module_importer_candidates(module));
+    }
+
+    /// Files with an exact `super` import whose lexical module is a child of
+    /// `module`.
+    ///
+    /// The inverted lookup is deliberately only the first step: `super` is
+    /// common across a workspace, but its meaning is completely determined by
+    /// the persisted import owner's composed module key. Inspecting those rows
+    /// is much cheaper than resolving every candidate's full forward edges.
+    fn parent_module_importer_candidates(&self, module: &ModuleKey) -> Vec<ProjectFile> {
+        self.queries
+            .files_importing_module_path("super")
+            .into_iter()
+            .filter(|candidate| {
+                let file_module = ModuleKey::new(candidate, &rust_package_name(candidate));
+                file_module == *module || file_module.parent().as_ref() == Some(module)
+            })
+            .filter(|candidate| {
+                self.queries
+                    .import_bindings_of(candidate)
+                    .iter()
+                    .any(|binding| {
+                        let imports_from_parent = if binding.is_glob {
+                            binding.path.as_slice() == ["super"]
+                        } else {
+                            binding.path.len() == 2 && binding.path[0] == "super"
+                        };
+                        imports_from_parent
+                            && binding.importer_module.parent().as_ref() == Some(module)
+                    })
+            })
+            .collect()
+    }
+
+    /// Whether a binding's module-bearing path can reach `module` without
+    /// performing the full alias and file-resolution walk.
+    ///
+    /// Rooted paths have one structural interpretation, so a mismatch is a
+    /// proof that the binding is irrelevant. Bare paths may resolve through a
+    /// visible alias or an ancestor module and remain candidates for the full
+    /// verifier.
+    fn binding_could_reach_module(
+        &self,
+        candidate: &ProjectFile,
+        binding: &RustImportBinding,
+        module: &ModuleKey,
+    ) -> bool {
+        if !matches!(
+            binding.path.first().map(String::as_str),
+            Some("crate" | "self" | "super")
+        ) {
+            return true;
+        }
+        let crate_package = rust_crate_root_package(candidate);
+        let module_path_end = if binding.is_glob {
+            binding.path.len()
+        } else {
+            binding.path.len().saturating_sub(1)
+        };
+        [module_path_end, binding.path.len()]
+            .into_iter()
+            .filter(|end| *end > 0)
+            .any(|end| {
+                resolve_rust_module_segments_with_crate(
+                    &binding.owner_module,
+                    &crate_package,
+                    &binding.path[..end],
+                )
+                .is_some_and(|resolved| ModuleKey::new(candidate, &resolved) == *module)
+            })
     }
 
     /// The import edges that bind `identity`, computed from candidate files
@@ -1334,23 +1516,43 @@ impl<'a> RustUsageWalks<'a> {
         // the longest single region a usage query spends in the walk layer,
         // so it is the one that most has to stop when the budget expires.
         let candidates = self.importer_candidates_for(identity);
+        let name_candidates: HashSet<ProjectFile> = self
+            .queries
+            .files_mentioning(&identity.name, RUST_OCCURRENCE_CODE)
+            .into_iter()
+            .collect();
         brokk_bifrost_core::profiling::note_with(|| {
             format!(
-                "rust binding identity={} candidates={}",
+                "rust binding identity={} candidates={} name_candidates={}",
                 identity.name,
-                candidates.len()
+                candidates.len(),
+                name_candidates.len(),
             )
         });
         for candidate in candidates {
             if self.cancelled() {
                 break;
             }
-            edges.extend(
-                self.forward_import_edges_of(&candidate)
-                    .iter()
-                    .filter(|edge| edge_matches_single_seed(edge, identity))
-                    .cloned(),
-            );
+            let inspect_all_bindings = name_candidates.contains(&candidate);
+            for binding in self.queries.import_bindings_of(&candidate) {
+                if self.cancelled() {
+                    break;
+                }
+                let relative_module_path_reaches_target =
+                    matches!(
+                        binding.path.first().map(String::as_str),
+                        Some("self" | "super")
+                    ) && self.binding_could_reach_module(&candidate, &binding, &identity.module);
+                if !inspect_all_bindings
+                    && !relative_module_path_reaches_target
+                    && !binding_can_bind_identity_by_written_name(&binding, identity)
+                {
+                    continue;
+                }
+                self.append_import_edges_binding_identity(
+                    &candidate, &binding, identity, &mut edges,
+                );
+            }
         }
         if !self.cancelled() {
             self.caches
@@ -1903,6 +2105,30 @@ fn push_unique(routes: &mut Vec<RustModuleAliasRoute>, route: RustModuleAliasRou
     if !routes.contains(&route) {
         routes.push(route);
     }
+}
+
+fn binding_names_module_component(binding: &RustImportBinding, component: &str) -> bool {
+    binding
+        .path
+        .last()
+        .is_some_and(|path_component| path_component == component)
+        || (!binding.is_glob
+            && binding.path.len() > 1
+            && binding.path[binding.path.len() - 2] == component)
+}
+
+fn binding_can_bind_identity_by_written_name(
+    binding: &RustImportBinding,
+    identity: &RustSymbolIdentity,
+) -> bool {
+    binding.path.last().is_some_and(|component| {
+        component == &identity.name
+            || identity
+                .module
+                .components
+                .last()
+                .is_some_and(|module_component| component == module_component)
+    })
 }
 
 /// The v1 worklist visited each `(target, origin, domain)` triple once; the

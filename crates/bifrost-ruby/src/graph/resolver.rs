@@ -179,12 +179,16 @@ impl<'a> RubySemanticIndex<'a> {
         {
             visible.extend(zeitwerk_files.iter().cloned());
         }
-        let mut stack = crate::imports::ruby_required_files(self.ruby, file);
+        let mut stack = crate::imports::ruby_required_files(self.ruby, self.graph.token, file);
         while let Some(next) = stack.pop() {
             if !visible.insert(next.clone()) {
                 continue;
             }
-            stack.extend(crate::imports::ruby_required_files(self.ruby, &next));
+            stack.extend(crate::imports::ruby_required_files(
+                self.ruby,
+                self.graph.token,
+                &next,
+            ));
         }
         visible
     }
@@ -202,7 +206,7 @@ impl<'a> RubySemanticIndex<'a> {
     ) -> Option<HashSet<ProjectFile>> {
         let mut visible = HashSet::default();
         visible.insert(file.clone());
-        let mut stack = crate::imports::ruby_required_files(self.ruby, file);
+        let mut stack = crate::imports::ruby_required_files(self.ruby, self.graph.token, file);
         while let Some(next) = stack.pop() {
             if !visible.insert(next.clone()) {
                 continue;
@@ -210,7 +214,11 @@ impl<'a> RubySemanticIndex<'a> {
             if visible.len() > max_files {
                 return None;
             }
-            stack.extend(crate::imports::ruby_required_files(self.ruby, &next));
+            stack.extend(crate::imports::ruby_required_files(
+                self.ruby,
+                self.graph.token,
+                &next,
+            ));
         }
         Some(visible)
     }

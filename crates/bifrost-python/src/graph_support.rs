@@ -136,7 +136,11 @@ pub fn resolve_module_code_units_batch(
     results
 }
 
-pub fn compute_export_index_of(python: &dyn PythonSource, file: &ProjectFile) -> ExportIndex {
+pub fn compute_export_index_of(
+    python: &dyn PythonSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+) -> ExportIndex {
     let mut index = ExportIndex::empty();
     let mut events = Vec::new();
     let declarations = python.top_level_declarations(file);
@@ -165,7 +169,7 @@ pub fn compute_export_index_of(python: &dyn PythonSource, file: &ProjectFile) ->
             &mut index,
         );
     } else {
-        let imports = python.import_info_of(file);
+        let imports = python.import_info_of(token, file);
         collect_reexport_events_from_imports(python, file, &imports, &mut events, &mut index);
     }
 
@@ -507,6 +511,7 @@ pub fn public_declarations_in_module(python: &dyn PythonSource, module_fq: &str)
 
 pub fn resolve_base_class(
     python: &dyn PythonSource,
+    token: QueryToken<'_>,
     code_unit: &CodeUnit,
     raw: &str,
 ) -> Option<CodeUnit> {
@@ -544,10 +549,11 @@ pub fn resolve_base_class(
     }
 
     if python
-        .import_info_of(code_unit.source())
+        .import_info_of(token, code_unit.source())
         .iter()
         .any(|import| import.is_wildcard)
-        && let Some(imported) = resolve_import_bindings(python, code_unit.source()).get(trimmed)
+        && let Some(imported) =
+            resolve_import_bindings(python, token, code_unit.source()).get(trimmed)
     {
         return Some(imported.clone());
     }

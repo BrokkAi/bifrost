@@ -6,8 +6,9 @@ use crate::searchtools::{
     ScanUsagesInput, ScanUsagesResult, ScanUsagesStatus, SearchSymbolHit, SearchSymbolsFile,
     SearchSymbolsResult, SkimFile, SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement,
     SummaryResult, SymbolAncestors, SymbolAncestorsResult, SymbolLocation, SymbolLocationsResult,
-    SymbolSourcesResult, TooBroadMatch, TooBroadScope, TooManySymbolMatches, UsageFileGroup,
-    UsageGraphResult, UsageLocation, scan_usages_target_label,
+    SymbolSourcesIncomplete, SymbolSourcesIncompleteReason, SymbolSourcesResult, TooBroadMatch,
+    TooBroadScope, TooManySymbolMatches, UsageFileGroup, UsageGraphResult, UsageLocation,
+    scan_usages_target_label,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +224,20 @@ impl RenderText for SummaryResult {
     }
 }
 
+fn render_symbol_sources_incomplete(items: &[SymbolSourcesIncomplete]) -> String {
+    let targets = items
+        .iter()
+        .map(|item| {
+            let reason = match item.reason {
+                SymbolSourcesIncompleteReason::Cancelled => "cancelled",
+            };
+            format!("{} ({reason})", escape_markdown_inline_code(&item.target))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Incomplete: {targets}")
+}
+
 fn render_container_listing(listing: &ContainerListing, options: RenderOptions) -> String {
     let label = match listing.kind {
         ContainerKind::Directory => "Directory",
@@ -305,6 +320,14 @@ impl RenderText for SymbolSourcesResult {
         }
         if !self.ambiguous_paths.is_empty() {
             blocks.push(render_ambiguous_paths(&self.ambiguous_paths));
+        }
+        if !self.incomplete.is_empty() {
+            blocks.push(render_symbol_sources_incomplete(&self.incomplete));
+        } else if !self.complete {
+            blocks.push(
+                "Incomplete: source lookup was cancelled before all selectors reached a verdict."
+                    .to_string(),
+            );
         }
         blocks.extend(self.too_broad.iter().map(render_too_broad_scope));
         blocks.extend(
@@ -1254,6 +1277,8 @@ mod tests {
                 matches: vec!["app/Foo.java".to_string(), "lib/Foo.java".to_string()],
             }],
             too_broad: Vec::new(),
+            complete: true,
+            incomplete: Vec::new(),
         };
 
         let text = result.render_text(RenderOptions::default());
@@ -1277,6 +1302,41 @@ mod tests {
             text.contains("| Foo | crate::foo::Foo, other::Foo | Ambiguous; re-call with one selector from `matches` (e.g. crate::foo::Foo). |"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn symbol_sources_renders_incomplete_targets_without_not_found_claim() {
+        let result = SymbolSourcesResult {
+            sources: vec![SourceBlock {
+                label: "Ready".to_string(),
+                path: "src/Ready.java".to_string(),
+                start_line: 1,
+                end_line: 1,
+                text: "class Ready {}".to_string(),
+                canonical_selector: None,
+                occurrence_role: None,
+                presentation: None,
+                note: None,
+                semantic_model: None,
+            }],
+            not_found: Vec::new(),
+            ambiguous: Vec::new(),
+            ambiguous_paths: Vec::new(),
+            too_broad: Vec::new(),
+            complete: false,
+            incomplete: vec![SymbolSourcesIncomplete {
+                target: "Slow".to_string(),
+                reason: SymbolSourcesIncompleteReason::Cancelled,
+            }],
+        };
+
+        let text = result.render_text(RenderOptions::default());
+
+        assert!(text.contains("Incomplete:"), "{text}");
+        assert!(text.contains("Ready"), "{text}");
+        assert!(text.contains("Slow"), "{text}");
+        assert!(text.contains("cancelled"), "{text}");
+        assert!(!text.contains("Not found"), "{text}");
     }
 
     #[test]

@@ -47,6 +47,17 @@ pub struct ParsedFile {
     pub navigation_ranges: HashMap<CodeUnit, Vec<Range>>,
     pub navigation_ranges_truncated: HashSet<CodeUnit>,
     pub children: HashMap<CodeUnit, Vec<CodeUnit>>,
+    /// The inverse of `children`: for each unit, the owners whose child list
+    /// names it.
+    ///
+    /// Kept so that removing a unit can unlink it from the one or two lists
+    /// that actually name it. Without the inverse edge the only way to find
+    /// them is to `retain` over every vec in `children`, which costs the whole
+    /// file per removal; a generated C header that declares one aggregate per
+    /// type -- pwru's 2.5MB `vmlinux-x86.h` yields 75,899 declarations under a
+    /// single module -- then spends quadratic time comparing `CodeUnit`s
+    /// against each other (#2358).
+    child_owners: HashMap<CodeUnit, Vec<CodeUnit>>,
     /// Declarations that lie in a structurally-evidenced test region: a
     /// test-attributed item or any declaration nested inside a `#[cfg(test)]`
     /// (or otherwise test-attributed) module/item. Populated by language walks
@@ -118,6 +129,45 @@ pub fn finish_declaration_identity_comparison_probe() -> usize {
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static CODE_UNIT_REMOVAL_SCAN_PROBE: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Begins counting the `CodeUnit`s that [`ParsedFile::remove_code_unit`] walks
+/// past while unlinking a unit.
+///
+/// This is the work that made a generated type header quadratic (#2358): the
+/// count is deterministic for a given source, so a test can pin it directly
+/// instead of timing the walk.
+#[cfg(any(test, feature = "test-support"))]
+pub fn start_code_unit_removal_scan_probe() {
+    CODE_UNIT_REMOVAL_SCAN_PROBE.with(|probe| probe.set(Some(0)));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn finish_code_unit_removal_scan_probe() -> usize {
+    CODE_UNIT_REMOVAL_SCAN_PROBE.with(|probe| {
+        probe
+            .replace(None)
+            .expect("code unit removal scan probe should be active")
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn record_removal_scan(scanned: usize) {
+    CODE_UNIT_REMOVAL_SCAN_PROBE.with(|probe| {
+        if let Some(total) = probe.get() {
+            probe.set(Some(total + scanned));
+        }
+    });
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn record_removal_scan(_scanned: usize) {}
+
 impl ParsedFile {
     pub fn new(package_name: String) -> Self {
         Self {
@@ -142,6 +192,7 @@ impl ParsedFile {
             navigation_ranges: HashMap::default(),
             navigation_ranges_truncated: HashSet::default(),
             children: HashMap::default(),
+            child_owners: HashMap::default(),
             test_region_units: HashSet::default(),
             rust_usage_facts: RustUsageFacts::default(),
             materialization_records: Vec::new(),
@@ -192,10 +243,7 @@ impl ParsedFile {
         }
 
         if let Some(parent) = parent {
-            let children = self.children.entry(parent).or_default();
-            if !children.contains(&code_unit) {
-                children.push(code_unit.clone());
-            }
+            self.link_child(parent, code_unit, true);
         }
 
         if let Some(top_level) = top_level {
@@ -235,10 +283,7 @@ impl ParsedFile {
         }
 
         if let Some(parent) = parent {
-            let children = self.children.entry(parent).or_default();
-            if !children.contains(&code_unit) {
-                children.push(code_unit.clone());
-            }
+            self.link_child(parent, code_unit, true);
         }
 
         if let Some(top_level) = top_level {
@@ -382,7 +427,27 @@ impl ParsedFile {
     }
 
     pub fn add_child(&mut self, parent: CodeUnit, child: CodeUnit) {
-        self.children.entry(parent).or_default().push(child);
+        self.link_child(parent, child, false);
+    }
+
+    /// Records `parent -> child` and the inverse edge that lets
+    /// [`Self::remove_code_unit`] find this list again.
+    ///
+    /// `deduplicate` reflects the two callers' existing contracts: the
+    /// `add_code_unit` family refuses to name the same child twice under one
+    /// parent, while `add_child` appends unconditionally. The inverse edge is
+    /// always deduplicated -- it answers "which lists name this unit?", and one
+    /// answer per owner is enough to unlink every copy.
+    fn link_child(&mut self, parent: CodeUnit, child: CodeUnit, deduplicate: bool) {
+        let children = self.children.entry(parent.clone()).or_default();
+        if deduplicate && children.contains(&child) {
+            return;
+        }
+        children.push(child.clone());
+        let owners = self.child_owners.entry(child).or_default();
+        if !owners.contains(&parent) {
+            owners.push(parent);
+        }
     }
 
     pub fn mark_type_alias(&mut self, code_unit: CodeUnit) {
@@ -399,30 +464,48 @@ impl ParsedFile {
             .and_then(|ranges| ranges.iter().map(|range| range.start_byte).min())
     }
 
+    /// Drops `code_unit` and everything it owns from every collection here.
+    ///
+    /// Iterative rather than recursive: the pending set is an explicit stack,
+    /// so a deeply nested declaration chain cannot overflow the Rust stack.
     fn remove_code_unit(&mut self, code_unit: &CodeUnit) {
-        if let Some(children) = self.children.remove(code_unit) {
-            for child in children {
-                self.remove_code_unit(&child);
+        let mut pending = vec![code_unit.clone()];
+        while let Some(unit) = pending.pop() {
+            if let Some(children) = self.children.remove(&unit) {
+                pending.extend(children);
             }
-        }
 
-        for siblings in self.children.values_mut() {
-            siblings.retain(|child| child != code_unit);
-        }
+            // Only the owners that actually name this unit are touched. The
+            // alternative -- scanning every child list in the file -- is what
+            // made a generated type header quadratic (#2358).
+            if let Some(owners) = self.child_owners.remove(&unit) {
+                for owner in owners {
+                    if let Some(siblings) = self.children.get_mut(&owner) {
+                        record_removal_scan(siblings.len());
+                        siblings.retain(|child| child != &unit);
+                    }
+                }
+            }
 
-        self.top_level_declarations
-            .retain(|existing| existing != code_unit);
-        self.remove_declaration(code_unit);
-        self.definition_lookup_units.remove(code_unit);
-        self.raw_supertypes.remove(code_unit);
-        self.supertype_lookup_paths.remove(code_unit);
-        self.signatures.remove(code_unit);
-        self.signature_metadata.remove(code_unit);
-        self.cpp_template_metadata.remove(code_unit);
-        self.ruby_method_dispatch_modes.remove(code_unit);
-        self.scala_traits.remove(code_unit);
-        self.type_aliases.remove(code_unit);
-        self.ranges.remove(code_unit);
+            // A unit reaches `top_level_declarations` only on the insertion
+            // that also adds it to `declarations`, so a unit absent from
+            // `declarations` cannot be in that vec and needs no scan.
+            if self.remove_declaration(&unit) {
+                record_removal_scan(self.top_level_declarations.len());
+                self.top_level_declarations
+                    .retain(|existing| existing != &unit);
+            }
+            self.definition_lookup_units.remove(&unit);
+            self.raw_supertypes.remove(&unit);
+            self.supertype_lookup_paths.remove(&unit);
+            self.signatures.remove(&unit);
+            self.signature_metadata.remove(&unit);
+            self.cpp_template_metadata.remove(&unit);
+            self.ruby_method_dispatch_modes.remove(&unit);
+            self.scala_traits.remove(&unit);
+            self.type_aliases.remove(&unit);
+            self.ranges.remove(&unit);
+        }
     }
 
     fn insert_declaration(&mut self, code_unit: CodeUnit) -> bool {

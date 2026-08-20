@@ -21,6 +21,7 @@ use crate::syntax::{
 };
 use crate::ts_owners::ts_resolve_type_text_to_property_owners;
 use crate::type_text::ts_type_annotation_text;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine,
@@ -46,6 +47,7 @@ const TARGET_OBJECT_BINDING: &str = "__target_object__";
 #[allow(clippy::too_many_arguments)]
 pub fn scan_files_for_seeds(
     host: &dyn JsTsSource,
+    token: QueryToken<'_>,
     analyzer: &dyn CodeUnitIndex,
     index: &JsTsUsageIndex,
     files: &HashSet<ProjectFile>,
@@ -220,7 +222,7 @@ pub fn scan_files_for_seeds(
                 );
                 (!definitions.is_empty()).then_some(definitions)
             });
-        let definitions = host.usage_definitions();
+        let definitions = host.usage_definitions(token);
         let receiver_facts = JsTsReceiverFactProvider::new(
             host,
             definitions,
@@ -239,6 +241,7 @@ pub fn scan_files_for_seeds(
             line_starts: &line_starts,
             analyzer,
             host,
+            token,
             target,
             target_short: &target_short,
             target_member: target_member.as_deref(),
@@ -391,6 +394,9 @@ pub struct ScanCtx<'a> {
     /// The JS/TS host for `language`, resolved once by `scan_files_for_seeds`, for the
     /// parts of the scan that call the host-parameterized owner resolution.
     host: &'a dyn JsTsSource,
+    /// Proof that the request scope this per-file scan runs under is open, so
+    /// the usage-graph lookups below take it from here (issue #2423).
+    token: QueryToken<'a>,
     target: &'a CodeUnit,
     /// Top-level identifier (the class/function/field's own name component).
     target_short: &'a str,
@@ -1798,7 +1804,7 @@ fn local_function_target_for_reference(reference: Node<'_>, ctx: &ScanCtx<'_>) -
         .binding_scope_at(name, reference.start_byte())?;
     let mut candidates = ctx
         .host
-        .usage_definitions()
+        .usage_definitions(ctx.token)
         .file_identifier(ctx.file, name)
         .into_iter()
         .filter(|candidate| candidate.source() == ctx.file && candidate.is_function())
@@ -1829,7 +1835,7 @@ fn local_function_target_for_declaration(
     };
     let mut candidates = ctx
         .host
-        .usage_definitions()
+        .usage_definitions(ctx.token)
         .file_identifier(ctx.file, name)
         .into_iter()
         .filter(|candidate| candidate.source() == ctx.file && candidate.is_function())
@@ -2350,7 +2356,7 @@ fn contextual_object_literal_owners(node: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Co
     {
         return ts_resolve_type_text_to_property_owners(
             ctx.host,
-            ctx.host.usage_definitions(),
+            ctx.host.usage_definitions(ctx.token),
             ctx.file,
             ctx.source,
             &ctx.imports,
@@ -2382,7 +2388,7 @@ fn contextual_object_literal_owners(node: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Co
     };
     ts_resolve_type_text_to_property_owners(
         ctx.host,
-        ctx.host.usage_definitions(),
+        ctx.host.usage_definitions(ctx.token),
         ctx.file,
         ctx.source,
         &ctx.imports,

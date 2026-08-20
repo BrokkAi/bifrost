@@ -9,10 +9,13 @@ use crate::analyzer::{
     BoundedDefinitionLookup, IAnalyzer, ProjectFile, ScalaAnalyzer, resolve_analyzer,
 };
 use crate::cancellation::CancellationToken;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use tree_sitter::Tree;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_scala_type_bounded(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -36,6 +39,7 @@ pub(crate) fn resolve_scala_type_bounded(
     };
     let resolution = scala_type_lookup_resolution_in_session(
         analyzer,
+        token,
         &support,
         file,
         source,
@@ -101,6 +105,7 @@ mod tests {
     use crate::analyzer::usages::get_definition::parse_tree_for_language;
     use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
     use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{Language, Range};
     use crate::path_utils::rel_path_string;
     use crate::test_support::AnalyzerFixture;
@@ -211,8 +216,11 @@ object Caller {
     #[test]
     fn bounded_same_file_singleton_factory_call_has_declared_result_type() {
         let (fixture, file, source, tree) = factory_fixture();
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let outcome = resolve_scala_type_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &file,
             source,
             Some(&tree),
@@ -249,8 +257,11 @@ object Caller {
     fn bounded_scala_factory_lookup_reports_scope_budget_without_partial_result() {
         let (fixture, file, source, tree) = factory_fixture();
         let budget = ReceiverAnalysisBudget::tiny();
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let outcome = resolve_scala_type_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &file,
             source,
             Some(&tree),
@@ -284,8 +295,11 @@ object Caller {
             ..ReceiverAnalysisBudget::default()
         };
 
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let outcome = resolve_scala_type_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &file,
             &source,
             Some(&tree),
@@ -332,8 +346,11 @@ object Caller {
         };
         let target = format!("service{}", ALIASES - 1);
 
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let outcome = resolve_scala_type_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &file,
             &source,
             Some(&tree),
@@ -362,8 +379,11 @@ object Caller {
         let (fixture, file, source, tree) = factory_fixture();
         let cancellation = CancellationToken::new();
         cancellation.cancel();
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let outcome = resolve_scala_type_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &file,
             source,
             Some(&tree),

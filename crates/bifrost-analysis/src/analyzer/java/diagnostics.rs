@@ -10,9 +10,11 @@
 
 use crate::analyzer::jvm::JvmOverlayModel;
 use crate::analyzer::{IAnalyzer, JavaAnalyzer, ProjectFile, SemanticDiagnosticReport};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 pub(crate) fn collect_java_semantic_diagnostics(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
 ) -> SemanticDiagnosticReport {
@@ -21,6 +23,7 @@ pub(crate) fn collect_java_semantic_diagnostics(
     };
     let report = brokk_bifrost_jvm::java::diagnostics::collect_java_semantic_diagnostics(
         java,
+        token,
         &analyzer.global_usage_definition_index(),
         &JvmOverlayModel(analyzer.semantic_model_overlay()),
         file,

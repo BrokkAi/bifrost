@@ -500,6 +500,7 @@ impl FoundryEntry {
             locations: Vec::new(),
             transfers: self.transfers.clone(),
             effects: Vec::new(),
+            declared_effects: Vec::new(),
         })
     }
 

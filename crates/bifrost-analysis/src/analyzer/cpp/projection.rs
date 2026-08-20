@@ -20,6 +20,7 @@ use super::*;
 use crate::analyzer::cpp::adapter::CPP_C_STORAGE_LANGUAGE_KEY;
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use brokk_bifrost_core::analyzer::Range;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_cpp::graph::resolver::is_c_source_file;
 
 /// The identity of one declaration site: a file and the byte span the
@@ -168,10 +169,14 @@ impl CppAnalyzer {
     /// because its own extension already settles the question -- the two
     /// halves meet in
     /// [`brokk_bifrost_cpp::graph::resolver::reference_uses_c_semantics`].
-    pub(crate) fn header_uses_c_semantics(&self, file: &ProjectFile) -> bool {
+    pub(crate) fn header_uses_c_semantics(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> bool {
         !is_c_source_file(file)
             && !imports::is_cpp_translation_unit(file)
-            && self.header_language_attribution(file) == HeaderLanguageAttribution::C
+            && self.header_language_attribution(token, file) == HeaderLanguageAttribution::C
     }
 
     /// The declarations of `file` as the reading named by `c_semantics` sees
@@ -208,10 +213,14 @@ impl CppAnalyzer {
     /// [`Self::declarations_in_reading`] deliberately does NOT go through this
     /// gate: it is asked for the C reading only when the reference's own root
     /// compiles as C, which already implies this attribution.
-    fn published_c_reading(&self, file: &ProjectFile) -> Option<Arc<CppCReading>> {
+    fn published_c_reading(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Arc<CppCReading>> {
         if is_c_source_file(file)
             || matches!(
-                self.header_language_attribution(file),
+                self.header_language_attribution(token, file),
                 HeaderLanguageAttribution::Cpp | HeaderLanguageAttribution::Unknown
             )
         {
@@ -227,8 +236,12 @@ impl CppAnalyzer {
     /// Matched on `(source file, declaration byte range)`. A caller unions
     /// inverse results across these so a query against either identity of one
     /// declaration reports every reference found under both.
-    pub(crate) fn site_equivalent_units(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        let Some(reading) = self.published_c_reading(code_unit.source()) else {
+    pub(crate) fn site_equivalent_units(
+        &self,
+        token: QueryToken<'_>,
+        code_unit: &CodeUnit,
+    ) -> Vec<CodeUnit> {
+        let Some(reading) = self.published_c_reading(token, code_unit.source()) else {
             return Vec::new();
         };
         reading
@@ -239,8 +252,12 @@ impl CppAnalyzer {
     }
 
     /// The identities the C reading of `file` adds to the workspace index.
-    pub(crate) fn c_reading_index_additions(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        self.published_c_reading(file)
+    pub(crate) fn c_reading_index_additions(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Vec<CodeUnit> {
+        self.published_c_reading(token, file)
             .map(|reading| reading.c_only.clone())
             .unwrap_or_default()
     }
@@ -252,17 +269,17 @@ impl CppAnalyzer {
     /// like the include target index beside it. It is cheap on a C++ workspace
     /// -- no header is attributed C or Mixed, so no blob is probed at all --
     /// and bounded by the headers a C translation unit reaches otherwise.
-    pub(crate) fn c_reading_index(&self) -> Arc<CppCReadingIndex> {
+    pub(crate) fn c_reading_index(&self, token: QueryToken<'_>) -> Arc<CppCReadingIndex> {
         self.c_reading_index.get_or_build(
-            || self.build_c_reading_index(),
-            || self.build_c_reading_index(),
+            || self.build_c_reading_index(token),
+            || self.build_c_reading_index(token),
         )
     }
 
-    fn build_c_reading_index(&self) -> CppCReadingIndex {
+    fn build_c_reading_index(&self, token: QueryToken<'_>) -> CppCReadingIndex {
         let mut index = CppCReadingIndex::default();
         for file in self.inner.analyzed_files() {
-            for unit in self.c_reading_index_additions(&file) {
+            for unit in self.c_reading_index_additions(token, &file) {
                 index
                     .by_identifier
                     .entry(unit.identifier().to_string())
@@ -281,26 +298,41 @@ impl CppAnalyzer {
 
     /// Every C-reading identity the workspace index carries, over all files
     /// this analyzer serves.
-    pub(crate) fn c_reading_index_additions_for_workspace(&self) -> Vec<CodeUnit> {
-        self.c_reading_index().all.clone()
+    pub(crate) fn c_reading_index_additions_for_workspace(
+        &self,
+        token: QueryToken<'_>,
+    ) -> Vec<CodeUnit> {
+        self.c_reading_index(token).all.clone()
     }
 
     /// Declaration ranges for a unit the C reading mints and the `cpp` row-set
     /// therefore has none for. `None` leaves the store's answer alone.
-    pub(crate) fn c_reading_ranges(&self, code_unit: &CodeUnit) -> Option<Vec<Range>> {
-        let reading = self.published_c_reading(code_unit.source())?;
+    pub(crate) fn c_reading_ranges(
+        &self,
+        token: QueryToken<'_>,
+        code_unit: &CodeUnit,
+    ) -> Option<Vec<Range>> {
+        let reading = self.published_c_reading(token, code_unit.source())?;
         reading.ranges.get(code_unit).cloned()
     }
 
     /// The C reading's child edges for `code_unit`, for the same reason.
-    pub(crate) fn c_reading_children(&self, code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
-        let reading = self.published_c_reading(code_unit.source())?;
+    pub(crate) fn c_reading_children(
+        &self,
+        token: QueryToken<'_>,
+        code_unit: &CodeUnit,
+    ) -> Option<Vec<CodeUnit>> {
+        let reading = self.published_c_reading(token, code_unit.source())?;
         reading.children.get(code_unit).cloned()
     }
 
     /// The C reading's syntactic owner of `code_unit`.
-    pub(crate) fn c_reading_parent(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
-        let reading = self.published_c_reading(code_unit.source())?;
+    pub(crate) fn c_reading_parent(
+        &self,
+        token: QueryToken<'_>,
+        code_unit: &CodeUnit,
+    ) -> Option<CodeUnit> {
+        let reading = self.published_c_reading(token, code_unit.source())?;
         reading.children.iter().find_map(|(parent, children)| {
             children
                 .iter()

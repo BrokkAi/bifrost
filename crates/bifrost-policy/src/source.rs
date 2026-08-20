@@ -1163,6 +1163,7 @@ impl Decoder {
         path: &str,
     ) -> Result<AssertionPolicySpec, PolicySourceError> {
         let mut bindings = Vec::new();
+        let mut derivations = Vec::new();
         let mut joins = Vec::new();
         let mut sugar_joins = Vec::new();
         let mut groups = Vec::new();
@@ -1173,6 +1174,8 @@ impl Decoder {
                 entry,
                 &[
                     PolicyRecord::Bind,
+                    PolicyRecord::Filter,
+                    PolicyRecord::Project,
                     PolicyRecord::Join,
                     PolicyRecord::Group,
                     PolicyRecord::RowAssert,
@@ -1181,6 +1184,12 @@ impl Decoder {
                 "relational assertion plan entry",
             )? {
                 PolicyRecord::Bind => bindings.push(self.decode_row_binding(entry, &entry_path)?),
+                PolicyRecord::Filter => {
+                    derivations.push(RowDerivation::Filter(decode_row_filter(entry)?));
+                }
+                PolicyRecord::Project => {
+                    derivations.push(RowDerivation::Project(decode_row_projection(entry)?));
+                }
                 PolicyRecord::Join => joins.push(decode_row_join(entry)?),
                 PolicyRecord::Group => groups.push(decode_row_group(entry)?),
                 PolicyRecord::RowAssert => assertions.push(decode_row_assertion(entry)?),
@@ -1213,6 +1222,7 @@ impl Decoder {
             })?;
         let plan = RelationalAssertionPlan {
             bindings,
+            derivations,
             joins,
             groups,
             assertions,
@@ -4449,6 +4459,7 @@ fn decode_row_join(expr: &Expr) -> Result<RowJoin, PolicySourceError> {
         None => RowJoinKind::Inner,
         Some(value) => match expect_atom(value, AtomDomain::RowJoinKind, "row join kind")? {
             PolicyAtomValue::RowJoinInner => RowJoinKind::Inner,
+            PolicyAtomValue::RowJoinSemi => RowJoinKind::Semi,
             PolicyAtomValue::RowJoinAnti => RowJoinKind::Anti,
             value => unreachable!("RowJoinKind registry returned {value:?}"),
         },
@@ -4506,8 +4517,11 @@ fn decode_row_aggregate(expr: &Expr) -> Result<RowAggregate, PolicySourceError> 
         "row aggregate operation",
     )? {
         PolicyAtomValue::RowAggregateMin => RowAggregateOp::Min,
+        PolicyAtomValue::RowAggregateMax => RowAggregateOp::Max,
         PolicyAtomValue::RowAggregateCount => RowAggregateOp::Count,
         PolicyAtomValue::RowAggregateCountDistinct => RowAggregateOp::CountDistinct,
+        PolicyAtomValue::RowAggregateAny => RowAggregateOp::Any,
+        PolicyAtomValue::RowAggregateAll => RowAggregateOp::All,
         PolicyAtomValue::RowAggregateOrderedEqual => RowAggregateOp::OrderedEqual,
         value => unreachable!("RowAggregateOp registry returned {value:?}"),
     };
@@ -4557,39 +4571,163 @@ fn decode_row_ordered_sequence(
     })
 }
 
+/// Decode one `(filter :over NAME :where (...))` record.
+fn decode_row_filter(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::Filter,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let over = parse_identifier(fields.required("over"), "filtered row relation name")?;
+    let predicates = decode_row_predicates(fields.required("where"))?;
+    if predicates.is_empty() {
+        return Err(source_error(
+            "empty-row-filter",
+            expr.range.clone(),
+            "a filter must state at least one predicate",
+        ));
+    }
+    Ok(RowFilter { over, predicates })
+}
+
+/// Decode one `(project :name NEW :from NAME :columns (...))` record.
+fn decode_row_projection(expr: &Expr) -> Result<RowProjection, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::Project,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let name = parse_identifier(fields.required("name"), "projected row relation name")?;
+    let from = parse_identifier(fields.required("from"), "projected row relation source")?;
+    let entries = expect_sequence(fields.required("columns"), "row projection columns", 1, 32)?;
+    let mut columns = Vec::with_capacity(entries.len());
+    for entry in entries {
+        // A bare `BINDING.FIELD` keeps its field name; a two-element list
+        // renames it. Keeping the bare form is what makes the common
+        // select-and-requalify case readable.
+        let column = match &entry.kind {
+            ExprKind::List(_) | ExprKind::Vector(_) => {
+                let pair = expect_sequence(entry, "row projection column", 2, 2)?;
+                RowProjectionColumn {
+                    source: decode_row_field_ref(&pair[0], "row projection source field")?,
+                    name: decode_row_field_name(&pair[1], "row projection column name")?,
+                }
+            }
+            _ => {
+                let source = decode_row_field_ref(entry, "row projection source field")?;
+                RowProjectionColumn {
+                    name: source.field.clone(),
+                    source,
+                }
+            }
+        };
+        columns.push(column);
+    }
+    Ok(RowProjection {
+        name,
+        from,
+        columns,
+    })
+}
+
+/// Decode one bounded conjunction of row tests.
+///
+/// Three shapes are admitted, and the operator alone decides which:
+/// `(BINDING.FIELD OP VALUE-OR-FIELD)` for the six comparisons,
+/// `(BINDING.FIELD is-null|is-not-null)` for the two null tests, and
+/// `(BINDING.FIELD in (VALUE...))` for a bounded membership test.
 fn decode_row_predicates(expr: &Expr) -> Result<Vec<RowPredicate>, PolicySourceError> {
     let entries = expect_sequence(expr, "row predicates", 0, 16)?;
     let mut predicates = Vec::with_capacity(entries.len());
     for entry in entries {
-        let values = expect_sequence(entry, "row predicate", 3, 3)?;
-        if expect_token(&values[1], "row predicate operator")? != "eq" {
+        let values = expect_sequence(entry, "row predicate", 2, 3)?;
+        let field = decode_row_field_ref(&values[0], "row predicate field")?;
+        let operator_token = expect_token(&values[1], "row predicate operator")?;
+        let Some(op) = RowPredicateOp::from_label(operator_token) else {
             return Err(source_error(
                 "unknown-row-predicate-operator",
                 values[1].range.clone(),
-                "row predicate operator must be eq",
+                format!(
+                    "row predicate operator must be one of {}",
+                    RowPredicateOp::ALL
+                        .iter()
+                        .map(|op| op.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             ));
-        }
-        let value = match &values[2].kind {
-            ExprKind::String(value) => RowLiteral::String(value.clone()),
-            ExprKind::Number(value) => RowLiteral::Integer(*value),
-            ExprKind::Symbol(value) if value == "true" => RowLiteral::Boolean(true),
-            ExprKind::Symbol(value) if value == "false" => RowLiteral::Boolean(false),
-            ExprKind::Symbol(value) => RowLiteral::ConstrainedEnum(value.clone()),
-            ExprKind::List(_) | ExprKind::Vector(_) => {
-                return Err(source_error(
-                    "invalid-row-literal",
-                    values[2].range.clone(),
-                    "row predicate literal must be a string, integer, boolean, or constrained atom",
-                ));
+        };
+        let operand = match op {
+            RowPredicateOp::IsNull | RowPredicateOp::IsNotNull => {
+                if values.len() != 2 {
+                    return Err(source_error(
+                        "invalid-row-predicate-operand",
+                        values[2].range.clone(),
+                        format!("`{}` takes no value", op.label()),
+                    ));
+                }
+                RowPredicateOperand::None
+            }
+            RowPredicateOp::In => {
+                let Some(value) = values.get(2) else {
+                    return Err(source_error(
+                        "invalid-row-predicate-operand",
+                        entry.range.clone(),
+                        "`in` requires a bounded literal set",
+                    ));
+                };
+                let members = expect_sequence(
+                    value,
+                    "row membership set",
+                    1,
+                    MAX_ROW_PREDICATE_SET_MEMBERS,
+                )?;
+                RowPredicateOperand::Set(
+                    members
+                        .iter()
+                        .map(decode_row_literal)
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            }
+            _ => {
+                let Some(value) = values.get(2) else {
+                    return Err(source_error(
+                        "invalid-row-predicate-operand",
+                        entry.range.clone(),
+                        format!("`{}` requires a value or a second field", op.label()),
+                    ));
+                };
+                // A symbol carrying a `.` is a `BINDING.FIELD` reference, and
+                // nothing else: no registry-constrained row value spells a
+                // dot, so the two readings never collide.
+                match &value.kind {
+                    ExprKind::Symbol(symbol) if symbol.contains('.') => RowPredicateOperand::Field(
+                        decode_row_field_ref(value, "row predicate comparison field")?,
+                    ),
+                    _ => RowPredicateOperand::Literal(decode_row_literal(value)?),
+                }
             }
         };
-        predicates.push(RowPredicate {
-            field: decode_row_field_ref(&values[0], "row predicate field")?,
-            op: RowPredicateOp::Eq,
-            value,
-        });
+        predicates.push(RowPredicate { field, op, operand });
     }
     Ok(predicates)
+}
+
+fn decode_row_literal(expr: &Expr) -> Result<RowLiteral, PolicySourceError> {
+    Ok(match &expr.kind {
+        ExprKind::String(value) => RowLiteral::String(value.clone()),
+        ExprKind::Number(value) => RowLiteral::Integer(*value),
+        ExprKind::Symbol(value) if value == "true" => RowLiteral::Boolean(true),
+        ExprKind::Symbol(value) if value == "false" => RowLiteral::Boolean(false),
+        ExprKind::Symbol(value) => RowLiteral::ConstrainedEnum(value.clone()),
+        ExprKind::List(_) | ExprKind::Vector(_) => {
+            return Err(source_error(
+                "invalid-row-literal",
+                expr.range.clone(),
+                "row predicate literal must be a string, integer, boolean, or constrained atom",
+            ));
+        }
+    })
 }
 
 fn decode_row_assertion(expr: &Expr) -> Result<RowAssertion, PolicySourceError> {
@@ -4697,7 +4835,7 @@ fn lower_selected_in_winning_tier(
                         field: "selected".to_string(),
                     },
                     op: RowPredicateOp::Eq,
-                    value: RowLiteral::Boolean(true),
+                    operand: RowPredicateOperand::Literal(RowLiteral::Boolean(true)),
                 },
                 RowPredicate {
                     field: RowFieldRef {
@@ -4705,7 +4843,9 @@ fn lower_selected_in_winning_tier(
                         field: "verdict".to_string(),
                     },
                     op: RowPredicateOp::Eq,
-                    value: RowLiteral::ConstrainedEnum("applicable".to_string()),
+                    operand: RowPredicateOperand::Literal(RowLiteral::ConstrainedEnum(
+                        "applicable".to_string(),
+                    )),
                 },
             ],
         }],
@@ -5784,6 +5924,309 @@ mod tests {
         assert_eq!(plan.assertions[0].id.as_str(), "by-site-winners");
     }
 
+    /// One inner-joined plan whose fold carries the predicate under test, so
+    /// a predicate can name a field of either joined relation.
+    fn extended_plan(predicate: &str) -> String {
+        format!(
+            r#"(policy
+              :id "test.relational.extended"
+              :name "Extended relational assertion"
+              :message "M"
+              :severity warning
+              :analysis
+                (analysis :type assertion
+                  (bind :name site :query
+                    (rql (occurrences :role [member_position])))
+                  (bind :name cand :query
+                    (rql (occurrences :role [member_position])))
+                  (join :left site :right cand :on ((ast_id ast_id)))
+                  (group :name by-site :by (site.ast_id)
+                    (aggregate :name reach :op max :value site.target_count
+                      :where (({predicate}))))
+                  (assert :group by-site :value reach
+                    :cardinality (at-most 1))))"#
+        )
+    }
+
+    /// The same invariant written with a standalone filter and a semi join. A
+    /// filter reads only the relation it narrows, so its predicates name that
+    /// relation and nothing else.
+    fn filter_plan(predicate: &str) -> String {
+        format!(
+            r#"(policy
+              :id "test.relational.filtered"
+              :name "Filtered relational assertion"
+              :message "M"
+              :severity warning
+              :analysis
+                (analysis :type assertion
+                  (bind :name site :query
+                    (rql (occurrences :role [member_position])))
+                  (bind :name cand :query
+                    (rql (occurrences :role [member_position])))
+                  (filter :over cand :where (({predicate})))
+                  (join :left site :right cand :kind semi :on ((ast_id ast_id)))
+                  (group :name by-site :by (site.ast_id)
+                    (aggregate :name reach :op max :value site.target_count))
+                  (assert :group by-site :value reach
+                    :cardinality (at-most 1))))"#
+        )
+    }
+
+    fn extended_relational_plan(source: &str) -> RelationalAssertionPlan {
+        let parsed = parse(source).expect("the extended relational policy parses");
+        let RqlpDocument::Policy { definition } = parsed.document else {
+            panic!("expected policy")
+        };
+        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
+            panic!("expected assertion policy")
+        };
+        spec.relational.expect("relational plan")
+    }
+
+    /// A semi join, a standalone filter, and the `max` fold decode into the
+    /// authored model the lowering reads, and nothing about them is inferred.
+    #[test]
+    fn decodes_semi_joins_standalone_filters_and_the_new_folds() {
+        let plan = extended_relational_plan(&filter_plan("cand.target_count gt 0"));
+
+        assert_eq!(plan.joins.len(), 1);
+        assert_eq!(plan.joins[0].kind, RowJoinKind::Semi);
+        assert_eq!(plan.groups[0].aggregates[0].op, RowAggregateOp::Max);
+
+        assert_eq!(plan.derivations.len(), 1);
+        let RowDerivation::Filter(filter) = &plan.derivations[0] else {
+            panic!("expected a filter derivation");
+        };
+        assert_eq!(filter.over.as_str(), "cand");
+        assert_eq!(filter.predicates.len(), 1);
+        assert_eq!(filter.predicates[0].op, RowPredicateOp::Gt);
+        assert_eq!(filter.predicates[0].field.field, "target_count");
+        assert!(matches!(
+            filter.predicates[0].operand,
+            RowPredicateOperand::Literal(RowLiteral::Integer(0))
+        ));
+    }
+
+    /// The operator alone decides the operand: a comparison takes a literal or
+    /// a second field, `in` takes a set, and the null tests take nothing.
+    #[test]
+    fn decodes_every_extended_predicate_operand_form() {
+        let cases: &[(&str, RowPredicateOp, &str)] = &[
+            ("cand.target_count ne 0", RowPredicateOp::Ne, "literal"),
+            ("cand.target_count lt 2", RowPredicateOp::Lt, "literal"),
+            ("cand.target_count le 2", RowPredicateOp::Le, "literal"),
+            ("cand.target_count gt 2", RowPredicateOp::Gt, "literal"),
+            ("cand.target_count ge 2", RowPredicateOp::Ge, "literal"),
+            // A symbol carrying a dot is the second field of the same tuple,
+            // and the two relations the join brought in are both addressable.
+            ("cand.ast_id eq site.ast_id", RowPredicateOp::Eq, "field"),
+            (
+                "cand.target_count lt site.target_count",
+                RowPredicateOp::Lt,
+                "field",
+            ),
+            ("cand.target_id is-null", RowPredicateOp::IsNull, "none"),
+            (
+                "cand.target_id is-not-null",
+                RowPredicateOp::IsNotNull,
+                "none",
+            ),
+            (
+                "cand.role in (member_position value_reference)",
+                RowPredicateOp::In,
+                "set",
+            ),
+        ];
+        for (spelling, op, operand) in cases {
+            let plan = extended_relational_plan(&extended_plan(spelling));
+            let predicate = &plan.groups[0].aggregates[0].predicate[0];
+            assert_eq!(&predicate.op, op, "{spelling}");
+            let actual = match &predicate.operand {
+                RowPredicateOperand::Literal(_) => "literal",
+                RowPredicateOperand::Field(_) => "field",
+                RowPredicateOperand::Set(_) => "set",
+                RowPredicateOperand::None => "none",
+            };
+            assert_eq!(&actual, operand, "{spelling}");
+        }
+
+        // A membership set keeps its authored order and every literal.
+        let plan = extended_relational_plan(&extended_plan(
+            "cand.role in (member_position value_reference)",
+        ));
+        let RowPredicateOperand::Set(values) = &plan.groups[0].aggregates[0].predicate[0].operand
+        else {
+            panic!("expected a membership set");
+        };
+        assert_eq!(
+            values,
+            &vec![
+                RowLiteral::ConstrainedEnum("member_position".to_string()),
+                RowLiteral::ConstrainedEnum("value_reference".to_string()),
+            ]
+        );
+    }
+
+    /// A projection publishes a new relation and takes the place of the one it
+    /// reads: the projected columns are addressable under the new name, and
+    /// the old name is not addressable at all.
+    #[test]
+    fn a_projection_replaces_the_relation_it_reads() {
+        let policy = |plan: &str| {
+            format!(
+                r#"(policy
+                  :id "test.relational.project" :name "Project" :message "M" :severity warning
+                  :analysis (analysis :type assertion
+                    (bind :name site :query
+                      (rql (occurrences :role [member_position])))
+                    (bind :name cand :query
+                      (rql (occurrences :role [member_position])))
+                    {plan}))"#
+            )
+        };
+        let source = policy(
+            r#"(project :name narrow :from cand :columns (cand.ast_id (cand.target_count hits)))
+                    (join :left site :right narrow :on ((ast_id ast_id)))
+                    (group :name by-site :by (site.ast_id)
+                      (aggregate :name reach :op max :value narrow.hits))
+                    (assert :group by-site :value reach :cardinality (at-most 1))"#,
+        );
+        let plan = extended_relational_plan(&source);
+        let RowDerivation::Project(projection) = &plan.derivations[0] else {
+            panic!("expected a projection derivation");
+        };
+        assert_eq!(projection.name.as_str(), "narrow");
+        assert_eq!(projection.from.as_str(), "cand");
+        assert_eq!(projection.columns.len(), 2);
+        assert_eq!(projection.columns[0].source.field, "ast_id");
+        assert_eq!(projection.columns[0].name, "ast_id");
+        assert_eq!(projection.columns[1].source.field, "target_count");
+        assert_eq!(projection.columns[1].name, "hits");
+
+        // The consumed name is gone, so a later record that still uses it is
+        // an authoring error reported at load time.
+        let stale = policy(
+            r#"(project :name narrow :from cand :columns (cand.ast_id))
+                    (join :left site :right cand :on ((ast_id ast_id)))
+                    (group :name by-site :by (site.ast_id)
+                      (aggregate :name reach :op count))
+                    (assert :group by-site :value reach :cardinality (at-most 1))"#,
+        );
+        let error = parse(&stale).unwrap_err().diagnostic;
+        assert_eq!(error.code, "invalid-relational-assertion-plan");
+        assert!(
+            error.message.contains("unknown binding `cand`"),
+            "{}",
+            error.message
+        );
+    }
+
+    /// The IR validator's typing rules reach the author through the ordinary
+    /// invalid-plan diagnostic, so a mistyped new predicate or fold is a load
+    /// error and never a runtime surprise.
+    #[test]
+    fn extended_predicate_and_fold_typing_is_rejected_at_load() {
+        let cases: &[(&str, &str)] = &[
+            // No registry scalar but Integer carries an order.
+            ("cand.role gt member_position", "is not defined over"),
+            // A null test over a field the registry always populates would be
+            // a constant, not a question.
+            ("cand.ast_id is-null", "always present"),
+            // Comparing two different scalar types is false at every row.
+            ("cand.ast_id eq site.target_count", "predicate compares"),
+        ];
+        for (spelling, needle) in cases {
+            let error = parse(&extended_plan(spelling)).unwrap_err().diagnostic;
+            assert_eq!(
+                error.code, "invalid-relational-assertion-plan",
+                "{spelling}"
+            );
+            assert!(
+                error.message.contains(needle),
+                "{spelling}: {}",
+                error.message
+            );
+        }
+
+        // `max` folds an integer column, so an enum one is refused.
+        let mistyped = extended_plan("cand.target_count gt 0").replace(
+            ":op max :value site.target_count",
+            ":op max :value site.role",
+        );
+        let error = parse(&mistyped).unwrap_err().diagnostic;
+        assert_eq!(error.code, "invalid-relational-assertion-plan");
+        assert!(error.message.contains("Integer"), "{}", error.message);
+
+        // `any` and `all` fold a boolean column, so an integer one is refused.
+        let mistyped = extended_plan("cand.target_count gt 0").replace(
+            ":op max :value site.target_count",
+            ":op any :value site.target_count",
+        );
+        let error = parse(&mistyped).unwrap_err().diagnostic;
+        assert_eq!(error.code, "invalid-relational-assertion-plan");
+        assert!(error.message.contains("Boolean"), "{}", error.message);
+    }
+
+    /// An unknown operator names every operator that exists, at the token that
+    /// was written.
+    #[test]
+    fn an_unknown_row_predicate_operator_is_reported_at_its_token() {
+        assert_error_token(
+            &extended_plan("cand.target_count between 0"),
+            "unknown-row-predicate-operator",
+            "between",
+        );
+    }
+
+    /// A membership test is bounded by the registry, and an empty one states
+    /// nothing at all.
+    #[test]
+    fn a_membership_test_is_bounded_and_non_empty() {
+        let error = parse(&extended_plan("cand.role in ()"))
+            .unwrap_err()
+            .diagnostic;
+        assert_eq!(error.code, "collection-size");
+
+        let members = (0..65)
+            .map(|index| format!("value{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let error = parse(&extended_plan(&format!("cand.role in ({members})")))
+            .unwrap_err()
+            .diagnostic;
+        assert_eq!(error.code, "collection-size");
+    }
+
+    /// The new vocabulary is registered, so hover and completion describe it
+    /// the same way the documentation does.
+    #[test]
+    fn the_extended_relational_vocabulary_is_registered_for_hover() {
+        let source = filter_plan("cand.target_count gt 0");
+        for (spelling, needle) in [("semi", "left rows"), ("max", "maximum")] {
+            let offset = source.find(spelling).expect("spelling is present") + 1;
+            let help =
+                rqlp_source_help_at(&source, offset).expect("registered atom has hover help");
+            assert_eq!(help.signature, spelling);
+            assert!(
+                help.description.to_lowercase().contains(needle),
+                "{spelling}: {}",
+                help.description
+            );
+        }
+
+        let offset = source
+            .find("(filter")
+            .expect("the filter record is present")
+            + 2;
+        let help = rqlp_source_help_at(&source, offset).expect("registered record has hover help");
+        assert!(
+            help.signature.starts_with("(filter :over NAME"),
+            "{}",
+            help.signature
+        );
+    }
+
     /// The ordered-list predicate the #1478 Milestone 4 requires: two ordered
     /// sequences named by their own position columns, compared position by
     /// position rather than as sets.
@@ -5930,15 +6373,29 @@ mod tests {
         let predicates = aggregate
             .predicate
             .iter()
-            .map(|predicate| (predicate.field.field.as_str(), predicate.value.clone()))
+            .map(|predicate| (predicate.field.field.as_str(), predicate.operand.clone()))
             .collect::<Vec<_>>();
         assert_eq!(
-            predicates,
+            predicates
+                .iter()
+                .map(|(field, operand)| (*field, format!("{operand:?}")))
+                .collect::<Vec<_>>(),
             vec![
-                ("selected", RowLiteral::Boolean(true)),
+                (
+                    "selected",
+                    format!(
+                        "{:?}",
+                        RowPredicateOperand::Literal(RowLiteral::Boolean(true))
+                    )
+                ),
                 (
                     "verdict",
-                    RowLiteral::ConstrainedEnum("applicable".to_string())
+                    format!(
+                        "{:?}",
+                        RowPredicateOperand::Literal(RowLiteral::ConstrainedEnum(
+                            "applicable".to_string()
+                        ))
+                    )
                 ),
             ]
         );

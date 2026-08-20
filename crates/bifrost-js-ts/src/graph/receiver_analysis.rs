@@ -10,12 +10,13 @@ use crate::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
     resolve_js_ts_module_specifier,
 };
-use crate::providers::JsTsSource;
+use crate::providers::{JsTsSource, compute_direct_ancestors};
 use crate::syntax::compute_import_binder as compute_jsts_import_binder;
 use crate::syntax::parse_js_ts_tree;
 use crate::syntax::{JsTsImportBinder, inline_object_type, slice};
 use crate::ts_owners::{
-    jsts_identifier_candidates, jsts_indexed_callable_node, ts_resolve_type_text_to_property_owners,
+    jsts_identifier_candidates, jsts_indexed_callable_node,
+    ts_resolve_type_node_to_property_owner_outcome, ts_resolve_type_text_to_property_owners,
 };
 use crate::tsconfig::AliasResolver;
 use crate::type_text::ts_type_annotation_text;
@@ -44,6 +45,7 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 const MAX_JSTS_RECEIVER_RECURSION: usize = 8;
+const MAX_JSTS_MEMBER_FRONTIER: usize = 512;
 
 /// How many module or default-export steps a JSX component binding may take
 /// before its props count as unproven. `lazy(() => import("./panel"))` costs
@@ -967,12 +969,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                     .is_some_and(|name| node_text_matches(name, self.source, receiver))
                 && let Some(type_node) = node.child_by_field_name("type")
             {
-                let values = self.type_annotation_receiver_values(type_node, budget);
-                latest = Some(if values.is_empty() {
-                    ReceiverAnalysisOutcome::Unknown
-                } else {
-                    ReceiverAnalysisOutcome::single_precise_or_ambiguous(values, budget)
-                });
+                latest = Some(self.type_annotation_receiver_outcome(type_node, budget));
             } else if binding_node_shadows_receiver(node, self.source, receiver) {
                 latest = Some(ReceiverAnalysisOutcome::Unknown);
             } else if node.kind() == "variable_declarator"
@@ -1016,9 +1013,9 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         if self.language == Language::TypeScript
             && let Some(type_node) = declarator.child_by_field_name("type")
         {
-            let owners = self.type_annotation_receiver_values(type_node, budget);
-            if !owners.is_empty() {
-                return ReceiverAnalysisOutcome::single_precise_or_ambiguous(owners, budget);
+            let owners = self.type_annotation_receiver_outcome(type_node, budget);
+            if !matches!(owners, ReceiverAnalysisOutcome::Unknown) {
+                return owners;
             }
         }
         declarator
@@ -1027,25 +1024,44 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             .unwrap_or(ReceiverAnalysisOutcome::Unknown)
     }
 
-    fn type_annotation_receiver_values(
+    fn type_annotation_receiver_outcome(
         &self,
         type_node: Node<'tree>,
         budget: ReceiverAnalysisBudget,
-    ) -> Vec<ReceiverValue> {
-        ts_resolve_type_text_to_property_owners(
+    ) -> ReceiverAnalysisOutcome<ReceiverValue> {
+        match ts_resolve_type_node_to_property_owner_outcome(
             self.host,
             self.support,
             self.file,
             self.source,
             &self.imports,
             &self.aliases,
-            ts_type_annotation_text(type_node, self.source).as_str(),
+            type_node,
             0,
-        )
-        .into_iter()
-        .take(budget.max_targets)
-        .map(ReceiverValue::InstanceType)
-        .collect()
+            budget,
+        ) {
+            ReceiverAnalysisOutcome::Precise(values) => ReceiverAnalysisOutcome::Precise(
+                values
+                    .into_iter()
+                    .take(budget.max_targets)
+                    .map(ReceiverValue::InstanceType)
+                    .collect(),
+            ),
+            ReceiverAnalysisOutcome::Ambiguous(values) => ReceiverAnalysisOutcome::Ambiguous(
+                values
+                    .into_iter()
+                    .take(budget.max_targets)
+                    .map(ReceiverValue::InstanceType)
+                    .collect(),
+            ),
+            ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
+            ReceiverAnalysisOutcome::Unsupported { reason } => {
+                ReceiverAnalysisOutcome::Unsupported { reason }
+            }
+            ReceiverAnalysisOutcome::ExceededBudget { limit } => {
+                ReceiverAnalysisOutcome::ExceededBudget { limit }
+            }
+        }
     }
 
     fn iterable_element_type_outcome(
@@ -1053,14 +1069,9 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         type_node: Node<'tree>,
         budget: ReceiverAnalysisBudget,
     ) -> ReceiverAnalysisOutcome<ReceiverValue> {
-        let values = iterable_element_type(type_node, self.source)
-            .map(|element_type| self.type_annotation_receiver_values(element_type, budget))
-            .unwrap_or_default();
-        if values.is_empty() {
-            ReceiverAnalysisOutcome::Unknown
-        } else {
-            ReceiverAnalysisOutcome::single_precise_or_ambiguous(values, budget)
-        }
+        iterable_element_type(type_node, self.source)
+            .map(|element_type| self.type_annotation_receiver_outcome(element_type, budget))
+            .unwrap_or(ReceiverAnalysisOutcome::Unknown)
     }
 
     fn contextual_object_literal_receiver_values(
@@ -1076,7 +1087,11 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 .is_some_and(|value| value.id() == object.id())
             && let Some(type_node) = variable.child_by_field_name("type")
         {
-            return self.type_annotation_receiver_values(type_node, budget);
+            return self
+                .type_annotation_receiver_outcome(type_node, budget)
+                .values()
+                .map(|values| values.to_vec())
+                .unwrap_or_default();
         }
 
         let Some(return_statement) = object
@@ -1099,7 +1114,10 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         let Some(type_node) = function.child_by_field_name("return_type") else {
             return Vec::new();
         };
-        self.type_annotation_receiver_values(type_node, budget)
+        self.type_annotation_receiver_outcome(type_node, budget)
+            .values()
+            .map(|values| values.to_vec())
+            .unwrap_or_default()
     }
 
     fn resolve_static_object_expression(
@@ -1360,9 +1378,9 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         if self.language == Language::TypeScript
             && let Some(type_node) = function.child_by_field_name("return_type")
         {
-            let values = self.type_annotation_receiver_values(type_node, budget);
-            if !values.is_empty() {
-                return ReceiverAnalysisOutcome::single_precise_or_ambiguous(values, budget);
+            let outcome = self.type_annotation_receiver_outcome(type_node, budget);
+            if !matches!(outcome, ReceiverAnalysisOutcome::Unknown) {
+                return outcome;
             }
             if inline_object_type(type_node).is_some() {
                 return ReceiverAnalysisOutcome::Precise(vec![ReceiverValue::InstanceType(
@@ -1416,6 +1434,45 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
     }
 
     fn member_targets(&self, owner: &CodeUnit, member: &str) -> Vec<CodeUnit> {
+        let direct = self.member_targets_on_owner(owner, member);
+        if !direct.is_empty() {
+            return direct;
+        }
+
+        let mut seen = HashSet::default();
+        seen.insert(owner.clone());
+        let mut level = vec![owner.clone()];
+        let mut visited = 0usize;
+        while !level.is_empty() && visited < MAX_JSTS_MEMBER_FRONTIER {
+            let mut next_level = Vec::new();
+            let mut inherited = Vec::new();
+            for current in level {
+                for ancestor in compute_direct_ancestors(self.host, &current) {
+                    if !seen.insert(ancestor.clone()) {
+                        continue;
+                    }
+                    if visited == MAX_JSTS_MEMBER_FRONTIER {
+                        break;
+                    }
+                    visited += 1;
+                    let found = self.member_targets_on_owner(&ancestor, member);
+                    if !found.is_empty() {
+                        inherited.extend(found);
+                    }
+                    next_level.push(ancestor);
+                }
+            }
+            if !inherited.is_empty() {
+                sort_units(&mut inherited);
+                inherited.dedup();
+                return inherited;
+            }
+            level = next_level;
+        }
+        Vec::new()
+    }
+
+    fn member_targets_on_owner(&self, owner: &CodeUnit, member: &str) -> Vec<CodeUnit> {
         let fqn = format!("{}.{}", owner.fq_name(), member);
         let mut units = self
             .host

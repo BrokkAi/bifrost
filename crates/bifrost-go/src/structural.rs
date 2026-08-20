@@ -3,7 +3,7 @@
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
-    first_named_child,
+    field_name_in_parent, first_named_child,
 };
 use brokk_bifrost_core::analyzer::structural::edges::{
     INVERSE_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
@@ -14,7 +14,7 @@ use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT,
 };
 use brokk_bifrost_core::analyzer::structural::occurrences::{
-    NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport,
+    OccurrenceRole, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
     LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
@@ -184,6 +184,29 @@ fn attach_value_field_targets<'tree>(
         .and_then(|target| attach_role_targets(sink, role, target))
 }
 
+static GO_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport =
+    OccurrenceRoleSupport::NONE.supported(OccurrenceRole::MemberPosition);
+
+/// Classify the selector member token in a Go `selector_expression`.
+///
+/// The Go grammar gives a selector its two semantic positions as named
+/// fields: `operand` is the receiver and `field` is the member. Keeping this
+/// check on the field relationship means a declaration, keyed literal, label,
+/// or ordinary identifier with the same spelling cannot be mistaken for a
+/// member occurrence.
+fn go_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
+    if !matches!(
+        node.kind(),
+        "identifier" | "field_identifier" | "package_identifier" | "type_identifier"
+    ) {
+        return None;
+    }
+
+    let parent = node.parent()?;
+    (parent.kind() == "selector_expression" && field_name_in_parent(parent, node) == Some("field"))
+        .then_some(OccurrenceRole::MemberPosition)
+}
+
 impl StructuralSpec for GoStructuralSpec {
     fn language(&self) -> Language {
         Language::Go
@@ -203,11 +226,8 @@ impl StructuralSpec for GoStructuralSpec {
         !matches!(role, Role::Kwarg | Role::Decorator)
     }
 
-    /// Go has not learned occurrence-role classification yet (#1473).
-    /// The empty table is the honest answer: queries and assertions that ask
-    /// for an occurrence role here report incomplete rather than clean-empty.
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
-        &NO_OCCURRENCE_ROLE_SUPPORT
+        &GO_OCCURRENCE_ROLE_SUPPORT
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
@@ -227,6 +247,9 @@ impl StructuralSpec for GoStructuralSpec {
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
+        if let Some(role) = go_occurrence_role(node) {
+            sink.occurrence_role(node, role);
+        }
         match kind {
             NormalizedKind::Call => {
                 if let Some(function) = node.child_by_field_name("function") {
@@ -296,6 +319,14 @@ impl StructuralSpec for GoStructuralSpec {
 mod structural_spec_tests {
     use super::*;
 
+    fn parse(source: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .expect("Go grammar is valid");
+        parser.parse(source, None).expect("source parses")
+    }
+
     #[test]
     fn go_kind_table_matches_grammar() {
         let grammar: tree_sitter::Language = tree_sitter_go::LANGUAGE.into();
@@ -306,5 +337,100 @@ mod structural_spec_tests {
                 "node type {name:?} (mapped to {kind:?}) does not exist in tree-sitter-go"
             );
         }
+    }
+
+    #[test]
+    fn selector_members_are_member_positions_and_near_misses_are_not() {
+        let source = concat!(
+            "package example\n\n",
+            "type Widget struct {\n",
+            "\tMember int\n",
+            "}\n\n",
+            "func render(receiver Widget, label string) int {\n",
+            "\tvalue := receiver.Member\n",
+            "\tkeyed := Widget{Member: value}\n",
+            "label: for value < 2 {\n",
+            "\t\tbreak label\n",
+            "\t}\n",
+            "\treturn value + unrelated\n",
+            "}\n",
+        );
+        let tree = parse(source);
+        let mut selectors = Vec::new();
+        let mut identifiers = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "selector_expression" {
+                selectors.push(node);
+            }
+            if matches!(
+                node.kind(),
+                "identifier" | "field_identifier" | "package_identifier" | "type_identifier"
+            ) {
+                identifiers.push(node);
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    stack.push(child);
+                }
+            }
+        }
+
+        assert_eq!(selectors.len(), 1, "fixture should contain one selector");
+        let selector = selectors[0];
+        let member = selector
+            .child_by_field_name("field")
+            .expect("selector member");
+        let receiver = selector
+            .child_by_field_name("operand")
+            .expect("selector receiver");
+        assert_eq!(
+            go_occurrence_role(member),
+            Some(OccurrenceRole::MemberPosition)
+        );
+        assert_eq!(go_occurrence_role(receiver), None);
+
+        let keyed_member = identifiers
+            .iter()
+            .copied()
+            .find(|node| {
+                node.parent().is_some_and(|literal| {
+                    literal.parent().is_some_and(|keyed| {
+                        keyed.kind() == "keyed_element"
+                            && keyed.child_by_field_name("key") == Some(literal)
+                    })
+                })
+            })
+            .expect("keyed literal member name");
+        assert_eq!(go_occurrence_role(keyed_member), None);
+
+        for identifier in identifiers {
+            let parent = identifier.parent();
+            let is_selector_member = parent.is_some_and(|parent| {
+                parent.kind() == "selector_expression"
+                    && field_name_in_parent(parent, identifier) == Some("field")
+            });
+            if !is_selector_member {
+                assert_eq!(
+                    go_occurrence_role(identifier),
+                    None,
+                    "non-selector identifier at {} must not be classified",
+                    identifier.start_byte()
+                );
+            }
+        }
+
+        assert!(
+            GO_STRUCTURAL_SPEC
+                .occurrence_role_support()
+                .is_supported(OccurrenceRole::MemberPosition)
+        );
+        assert!(
+            GO_STRUCTURAL_SPEC
+                .occurrence_role_support()
+                .iter()
+                .filter(|(_, support)| support.is_supported())
+                .all(|(role, _)| role == OccurrenceRole::MemberPosition)
+        );
     }
 }

@@ -29,6 +29,7 @@ use crate::syntax::{
     is_lexically_nested_type_declaration, is_object_in_member_expression,
     is_property_key_in_member, nested_type_identifier_parts, slice,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     FileEdgeScanInput, JsTsScopedNodeStatus, PerFileEdges, UsageNodeKey, classify_reference_node,
@@ -58,6 +59,7 @@ use tree_sitter::Node;
 /// is the JS/TS analyzer for `language`.
 pub fn scan_file(
     host: &dyn JsTsSource,
+    token: QueryToken<'_>,
     declarations_index: &dyn CodeUnitIndex,
     language: Language,
     file: &ProjectFile,
@@ -107,7 +109,7 @@ pub fn scan_file(
         source,
         receiver_provider: JsTsReceiverFactProvider::new(
             host,
-            host.usage_definitions(),
+            host.usage_definitions(token),
             language,
             file,
             source,
@@ -192,6 +194,7 @@ pub fn prepare_scoped_file(
 #[allow(clippy::too_many_arguments)]
 pub fn scan_scoped_file(
     host: &dyn JsTsSource,
+    token: QueryToken<'_>,
     index: &JsTsUsageIndex,
     prep: &ScopedScanPrep,
     file_prep: ScopedFilePrep,
@@ -206,7 +209,7 @@ pub fn scan_scoped_file(
         source: input.source,
         receiver_provider: JsTsReceiverFactProvider::new(
             host,
-            host.usage_definitions(),
+            host.usage_definitions(token),
             language,
             file,
             input.source,

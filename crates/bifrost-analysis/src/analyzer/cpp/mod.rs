@@ -466,9 +466,13 @@ impl CppAnalyzer {
 }
 
 impl CppAnalyzer {
-    pub(crate) fn import_statements_from_projection(&self, file: &ProjectFile) -> Vec<String> {
+    pub(crate) fn import_statements_from_projection(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Vec<String> {
         self.inner
-            .import_info_of(file)
+            .import_info_of(token, file)
             .into_iter()
             .map(|import| import.raw_snippet)
             .collect()
@@ -629,12 +633,16 @@ impl CppAnalyzer {
         self.inner.full_hydration_count_for_test()
     }
 
-    pub fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+    pub fn structural_parent_of(
+        &self,
+        token: QueryToken<'_>,
+        code_unit: &CodeUnit,
+    ) -> Option<CodeUnit> {
         self.inner
             .structural_parent_of(code_unit)
             // #1970: a unit only the C reading of a header mints has no `cpp`
             // rows, so its owner edge lives in that reading.
-            .or_else(|| self.c_reading_parent(code_unit))
+            .or_else(|| self.c_reading_parent(token, code_unit))
     }
 
     pub(crate) fn template_metadata(
@@ -919,7 +927,9 @@ impl CppSource for CppAnalyzer {
     }
 
     fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
-        CppAnalyzer::structural_parent_of(self, code_unit)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        CppAnalyzer::structural_parent_of(self, token, code_unit)
     }
 
     fn template_metadata(
@@ -934,8 +944,10 @@ impl CppSource for CppAnalyzer {
     }
 
     fn reaching_translation_units(&self, file: &ProjectFile) -> Vec<ProjectFile> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         let mut translation_units = self
-            .transitive_reaching_translation_units(file)
+            .transitive_reaching_translation_units(token, file)
             .iter()
             .cloned()
             .collect::<Vec<_>>();
@@ -944,7 +956,9 @@ impl CppSource for CppAnalyzer {
     }
 
     fn header_uses_c_semantics(&self, file: &ProjectFile) -> bool {
-        CppAnalyzer::header_uses_c_semantics(self, file)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        CppAnalyzer::header_uses_c_semantics(self, token, file)
     }
 
     fn declarations_in_reading(&self, file: &ProjectFile, c_semantics: bool) -> BTreeSet<CodeUnit> {
@@ -952,7 +966,9 @@ impl CppSource for CppAnalyzer {
     }
 
     fn site_equivalent_units(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        CppAnalyzer::site_equivalent_units(self, code_unit)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        CppAnalyzer::site_equivalent_units(self, token, code_unit)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -981,10 +997,12 @@ impl CppSource for CppAnalyzer {
 /// what that coercion did.
 impl CppWorkspaceSource for CppAnalyzer {
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.import_statements_from_projection(file)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        self.import_statements_from_projection(token, file)
     }
 
-    fn definitions_by_fqn(&self, fqn: &str) -> Vec<&CodeUnit> {
+    fn definitions_by_fqn(&self, _token: QueryToken<'_>, fqn: &str) -> Vec<&CodeUnit> {
         // `into_shards` for the same reason as the `CppDispatch` impl: the
         // matches outlive the per-call handle, so they must borrow the shards.
         <Self as IAnalyzer>::global_usage_definition_index(self)
@@ -1057,10 +1075,12 @@ impl CodeUnitIndex for CppAnalyzer {
     /// second, C-reading identity for each tag its C++ reading nested. Both
     /// identities are real declarations of one site, so both are listed.
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         Box::new(
             self.inner
                 .all_declarations()
-                .chain(self.c_reading_index_additions_for_workspace()),
+                .chain(self.c_reading_index_additions_for_workspace(token)),
         )
     }
 
@@ -1076,6 +1096,8 @@ impl CodeUnitIndex for CppAnalyzer {
     }
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         let _scope = crate::profiling::scope(format!("cpp.definitions[{fq_name}]"));
         let inner: Vec<CodeUnit> = {
             let _inner = crate::profiling::scope(format!("cpp.definitions.inner[{fq_name}]"));
@@ -1088,7 +1110,7 @@ impl CodeUnitIndex for CppAnalyzer {
         let reconciled = self.reconciled_definitions(fq_name);
         // #1970: likewise for a C-attributed header's C-reading identities,
         // which have no `cpp` rows to be found under.
-        let c_reading_index = self.c_reading_index();
+        let c_reading_index = self.c_reading_index(token);
         let c_reading_units = c_reading_index
             .by_fq_name
             .get(fq_name)
@@ -1107,16 +1129,21 @@ impl CodeUnitIndex for CppAnalyzer {
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         let children = self.inner.direct_children(code_unit);
         if !children.is_empty() {
             return children;
         }
         // #1970: a unit only the C reading of a header mints has no `cpp` rows
         // at all, so the store cannot answer for it.
-        self.c_reading_children(code_unit).unwrap_or(children)
+        self.c_reading_children(token, code_unit)
+            .unwrap_or(children)
     }
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         let ranges = self.inner.ranges(code_unit);
         if !ranges.is_empty() {
             return ranges;
@@ -1132,7 +1159,7 @@ impl CodeUnitIndex for CppAnalyzer {
             return self.inner.ranges(provisional);
         }
         // #1970: likewise for a unit only the C reading of a header mints.
-        self.c_reading_ranges(code_unit).unwrap_or(ranges)
+        self.c_reading_ranges(token, code_unit).unwrap_or(ranges)
     }
 
     fn ranges_with_limit(
@@ -1186,12 +1213,16 @@ impl CodeUnitIndex for CppAnalyzer {
     /// See [`CodeUnitIndex::all_declarations`] above: both identities of a
     /// C-attributed header's declaration site are listed (#1970).
     fn get_all_declarations(&self) -> Vec<CodeUnit> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         let mut declarations = self.inner.get_all_declarations();
-        declarations.extend(self.c_reading_index_additions_for_workspace());
+        declarations.extend(self.c_reading_index_additions_for_workspace(token));
         declarations
     }
 
     fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         let mut definitions = self.inner.get_definitions(fq_name);
         // #1134: fold in out-of-line member definitions whose per-file identity
         // extraction could not reconcile with this canonical `fq_name`, but the
@@ -1200,7 +1231,7 @@ impl CodeUnitIndex for CppAnalyzer {
         {
             let reconciled = self.reconciled_definitions(fq_name);
             // #1970: and a C-attributed header's C-reading identities.
-            let c_reading_index = self.c_reading_index();
+            let c_reading_index = self.c_reading_index(token);
             let c_reading_units = c_reading_index
                 .by_fq_name
                 .get(fq_name)
@@ -1256,8 +1287,10 @@ impl CodeUnitIndex for CppAnalyzer {
     /// #1970: a C-attributed header's C-reading identities are not in the
     /// store's `cpp` rows, so the identifier index cannot answer for them.
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         let mut candidates = self.inner.lookup_declarations_by_identifier(identifier);
-        if let Some(units) = self.c_reading_index().by_identifier.get(identifier) {
+        if let Some(units) = self.c_reading_index(token).by_identifier.get(identifier) {
             candidates.extend(units.iter().cloned());
         }
         candidates
@@ -1307,11 +1340,16 @@ impl IAnalyzer for CppAnalyzer {
     }
 
     fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
+        // Trait signature is fixed, so this boundary opens the scope the
+        // usage-graph funnel now demands proof of (issue #2423 milestone B).
+        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        self.inner.global_usage_definition_index(scope.token())
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.import_statements_from_projection(file)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        self.import_statements_from_projection(token, file)
     }
 
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {

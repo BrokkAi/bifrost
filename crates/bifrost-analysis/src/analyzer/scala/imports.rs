@@ -10,6 +10,7 @@ use crate::analyzer::{
     CodeUnit, ImportAnalysisProvider, ImportInfo, Language, ProjectFile, build_reverse_file_index,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use std::sync::Arc;
 
 pub(crate) use brokk_bifrost_jvm::scala::imports::scala_import_infos_from_node;
@@ -24,10 +25,12 @@ use brokk_bifrost_jvm::scala::wildcard_imports::{
 };
 
 use super::{ScalaAnalyzer, scala_enclosing_template_owner_fq_names};
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
 impl ScalaAnalyzer {
     fn resolve_import_info(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         import_index: usize,
         info: &ImportInfo,
@@ -43,7 +46,7 @@ impl ScalaAnalyzer {
                 .iter()
                 .filter(|owner| owner.import_index == import_index)
             {
-                imported.extend(self.resolve_wildcard_owner(owner));
+                imported.extend(self.resolve_wildcard_owner(token, owner));
             }
             imported.sort();
             imported.dedup();
@@ -78,7 +81,11 @@ impl ScalaAnalyzer {
         imported
     }
 
-    fn resolve_wildcard_owner(&self, owner: &ScalaWildcardImportOwner) -> Vec<CodeUnit> {
+    fn resolve_wildcard_owner(
+        &self,
+        token: QueryToken<'_>,
+        owner: &ScalaWildcardImportOwner,
+    ) -> Vec<CodeUnit> {
         match owner.kind {
             ScalaWildcardOwnerKind::Package => self
                 .importable_declarations_by_package()
@@ -98,9 +105,9 @@ impl ScalaAnalyzer {
                             .into_iter()
                             .filter(is_scala_importable_direct_member),
                     );
-                    for (_, target_fqn) in self
-                        .project_types()
-                        .exported_member_bindings(self, &declaration)
+                    for (_, target_fqn) in
+                        self.project_types()
+                            .exported_member_bindings(self, token, &declaration)
                     {
                         imported.extend(
                             self.inner
@@ -252,18 +259,20 @@ impl ScalaAnalyzer {
 
 impl ImportAnalysisProvider for ScalaAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         if let Some(cached) = self.imported_code_units.get(file) {
             return cached;
         }
         if file_language(file) != Language::Scala {
             return Arc::new(HashSet::default());
         }
-        let imports = self.inner.import_info_of(file);
+        let imports = self.inner.import_info_of(token, file);
         let wildcard_environment = self.wildcard_import_environment(file, &imports);
         let mut imported = HashSet::default();
         for (import_index, info) in imports.iter().enumerate() {
             for code_unit in
-                self.resolve_import_info(file, import_index, info, &wildcard_environment)
+                self.resolve_import_info(token, file, import_index, info, &wildcard_environment)
             {
                 imported.insert(code_unit);
             }
@@ -299,8 +308,8 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         result
     }
 
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
-        self.inner.import_info_of(file)
+    fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
+        self.inner.import_info_of(token, file)
     }
 
     fn could_import_file(
@@ -309,6 +318,8 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         imports: &[ImportInfo],
         target: &ProjectFile,
     ) -> bool {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         if source_file == target {
             return false;
         }
@@ -334,7 +345,7 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
             .any(|owner| match owner.kind {
                 ScalaWildcardOwnerKind::Package => owner.fqn == target_package,
                 ScalaWildcardOwnerKind::StableSingleton => self
-                    .resolve_wildcard_owner(owner)
+                    .resolve_wildcard_owner(token, owner)
                     .iter()
                     .any(|declaration| declaration.source() == target),
             })

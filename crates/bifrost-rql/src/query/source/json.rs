@@ -307,6 +307,24 @@ fn validate_json_pattern(value: &spanned::Value, path: &str, analysis: &mut Anal
                     validate_string_predicate(child, &child_path, false, analysis)
                 }
                 PatternField::Arity => validate_json_arity(child, &child_path, analysis),
+                PatternField::Visibility => {
+                    reject_json_callable_signature(
+                        &declared_kinds,
+                        key.range(),
+                        "visibility",
+                        analysis,
+                    );
+                    validate_json_visibility(child, &child_path, analysis)
+                }
+                PatternField::ParameterType => {
+                    reject_json_callable_signature(
+                        &declared_kinds,
+                        key.range(),
+                        "parameter_type",
+                        analysis,
+                    );
+                    validate_string_predicate(child, &child_path, true, analysis)
+                }
                 PatternField::Capture => validate_json_capture(child, analysis),
                 PatternField::Has | PatternField::NotHas => {
                     validate_json_pattern(child, &child_path, analysis);
@@ -907,6 +925,84 @@ fn validate_json_arity_bound(value: &spanned::Value, analysis: &mut Analysis) ->
         return None;
     }
     Some(count)
+}
+
+fn reject_json_callable_signature(
+    declared_kinds: &[NormalizedKind],
+    range: Range<usize>,
+    field: &str,
+    analysis: &mut Analysis,
+) {
+    if declared_kinds.is_empty() {
+        return;
+    }
+    let invalid: Vec<&str> = declared_kinds
+        .iter()
+        .filter(|kind| !kind.satisfies(NormalizedKind::Callable))
+        .map(|kind| kind.label())
+        .collect();
+    if invalid.is_empty() {
+        return;
+    }
+    analysis.error(
+        range,
+        "invalid-query",
+        format!(
+            "{field} is only valid on callable kinds (function, method, constructor, lambda, callable); not valid for {}",
+            invalid.join(", ")
+        ),
+    );
+}
+
+fn validate_json_visibility(value: &spanned::Value, path: &str, analysis: &mut Analysis) {
+    if let Some(label) = value.as_string() {
+        validate_json_visibility_label(label, value.range(), analysis);
+    } else if let Some(values) = value.as_array() {
+        if values.is_empty() {
+            analysis.error(
+                value.range(),
+                "wrong-value-shape",
+                "visibility array must not be empty",
+            );
+        }
+        for (index, child) in values.iter().enumerate() {
+            let child_path = format!("{path}[{index}]");
+            analysis.path(&child_path, child.range());
+            if let Some(label) = child.as_string() {
+                validate_json_visibility_label(label, child.range(), analysis);
+            } else {
+                analysis.error(
+                    child.range(),
+                    "wrong-value-shape",
+                    "expected a visibility label string",
+                );
+            }
+        }
+    } else {
+        analysis.error(
+            value.range(),
+            "wrong-value-shape",
+            "expected a visibility label string or an array of visibility labels",
+        );
+    }
+}
+
+fn validate_json_visibility_label(label: &str, range: Range<usize>, analysis: &mut Analysis) {
+    let canonical = label.replace('-', "_");
+    if DeclaredVisibility::from_label(&canonical).is_none() {
+        analysis.error(
+            range,
+            "invalid-query",
+            format!(
+                "unknown visibility '{label}'; expected one of: {}",
+                ALL_DECLARED_VISIBILITIES
+                    .iter()
+                    .map(|visibility| visibility.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
 }
 
 fn validate_json_environment_filter(

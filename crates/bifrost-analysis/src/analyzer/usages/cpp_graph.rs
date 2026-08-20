@@ -113,7 +113,7 @@ impl CppWorkspaceSource for CppDispatch<'_> {
         self.analyzer.import_statements(file)
     }
 
-    fn definitions_by_fqn(&self, fqn: &str) -> Vec<&CodeUnit> {
+    fn definitions_by_fqn(&self, _token: QueryToken<'_>, fqn: &str) -> Vec<&CodeUnit> {
         // `into_shards` rather than a query on the handle: the matches are
         // returned to a caller that outlives this lookup, so they must borrow
         // the analyzer rather than a handle that dies with this call.

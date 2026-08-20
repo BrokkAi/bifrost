@@ -1,5 +1,7 @@
 use super::selectors::*;
 use super::*;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetDefinitionByReferenceParams {
@@ -38,12 +40,14 @@ pub fn get_definitions_by_reference(
     analyzer: &dyn IAnalyzer,
     params: GetDefinitionByReferenceParams,
 ) -> GetDefinitionByReferenceResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let _scope = profiling::scope("searchtools::get_definitions_by_reference");
 
     let mut results = Vec::with_capacity(params.references.len());
 
     for query in params.references {
-        results.push(resolve_definition_context_query(analyzer, query));
+        results.push(resolve_definition_context_query(analyzer, token, query));
     }
 
     GetDefinitionByReferenceResult { results }
@@ -51,9 +55,10 @@ pub fn get_definitions_by_reference(
 
 pub(super) fn resolve_definition_context_query(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     query: DefinitionContextReferenceQuery,
 ) -> DefinitionByReferenceLookupResult {
-    let units = match resolve_definition_context_symbol(analyzer, &query.symbol) {
+    let units = match resolve_definition_context_symbol(analyzer, token, &query.symbol) {
         Ok(units) => units,
         Err(diagnostics) => {
             return DefinitionByReferenceLookupResult {
@@ -142,7 +147,7 @@ pub(super) fn resolve_definition_context_query(
             )
         })
         .collect();
-    collapse_context_outcomes(analyzer, query, outcomes)
+    collapse_context_outcomes(analyzer, token, query, outcomes)
 }
 
 /// Group a resolved candidate set for the `definitions` (reference) surface the
@@ -155,10 +160,11 @@ pub(super) fn resolve_definition_context_query(
 /// the diagnostic vocabulary here.
 pub(super) fn group_definition_context_symbols(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     symbol: &str,
     units: Vec<CodeUnit>,
 ) -> Result<Vec<CodeUnit>, Vec<DefinitionDiagnostic>> {
-    let groups = distinct_definitions(analyzer, units);
+    let groups = distinct_definitions(analyzer, token, units);
     match groups.as_slice() {
         [(_, _)] => Ok(groups.into_iter().flat_map(|(_, units)| units).collect()),
         [] => Err(vec![DefinitionDiagnostic {
@@ -181,6 +187,7 @@ pub(super) fn group_definition_context_symbols(
 
 pub(super) fn resolve_definition_context_symbol(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     symbol: &str,
 ) -> Result<Vec<CodeUnit>, Vec<DefinitionDiagnostic>> {
     if symbol.trim().is_empty() {
@@ -202,7 +209,7 @@ pub(super) fn resolve_definition_context_symbol(
     if !is_bare_symbol_query(analyzer, symbol) {
         let exact = resolve_codeunit_exact(analyzer, symbol);
         if !exact.is_empty() {
-            return group_definition_context_symbols(analyzer, symbol, exact);
+            return group_definition_context_symbols(analyzer, token, symbol, exact);
         }
     }
 
@@ -245,13 +252,13 @@ pub(super) fn resolve_definition_context_symbol(
             .filter(|unit| rel_path_string(unit.source()) == anchor)
             .collect();
         if !(anchored_is_dotted_guess && narrowed.is_empty()) {
-            return group_definition_context_symbols(analyzer, symbol, narrowed);
+            return group_definition_context_symbols(analyzer, token, symbol, narrowed);
         }
     }
 
     match resolve_codeunit_fuzzy(analyzer, symbol) {
         CodeUnitResolution::Resolved(units) | CodeUnitResolution::Ambiguous(units) => {
-            group_definition_context_symbols(analyzer, symbol, units)
+            group_definition_context_symbols(analyzer, token, symbol, units)
         }
         CodeUnitResolution::NotFound => Err(vec![DefinitionDiagnostic {
             kind: "symbol_not_found".to_string(),
@@ -282,6 +289,7 @@ pub(super) fn invalid_context_lookup(
 
 pub(super) fn collapse_context_outcomes(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     query: DefinitionContextReferenceQuery,
     outcomes: Vec<crate::analyzer::usages::get_definition::DefinitionLookupOutcome>,
 ) -> DefinitionByReferenceLookupResult {
@@ -289,14 +297,13 @@ pub(super) fn collapse_context_outcomes(
         return invalid_context_lookup(query, "target_not_found", "no target candidates found");
     };
     let mut render_cache = DefinitionCandidateRenderCache::default();
-    let first_key = semantic_outcome_key(analyzer, first, &mut render_cache);
-    if outcomes
-        .iter()
-        .skip(1)
-        .all(|outcome| semantic_outcome_key(analyzer, outcome, &mut render_cache) == first_key)
-    {
+    let first_key = semantic_outcome_key(analyzer, token, first, &mut render_cache);
+    if outcomes.iter().skip(1).all(|outcome| {
+        semantic_outcome_key(analyzer, token, outcome, &mut render_cache) == first_key
+    }) {
         return render_definition_reference_lookup(
             analyzer,
+            token,
             query,
             first.clone(),
             &mut render_cache,
@@ -317,6 +324,7 @@ pub(super) fn collapse_context_outcomes(
 
 pub(super) fn render_definition_reference_lookup(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     query: DefinitionContextReferenceQuery,
     outcome: crate::analyzer::usages::get_definition::DefinitionLookupOutcome,
     render_cache: &mut DefinitionCandidateRenderCache,
@@ -341,7 +349,12 @@ pub(super) fn render_definition_reference_lookup(
     DefinitionByReferenceLookupResult {
         query,
         status: outcome.status.as_str().to_string(),
-        definitions: definition_candidates_with_cache(analyzer, &outcome.definitions, render_cache),
+        definitions: definition_candidates_with_cache(
+            analyzer,
+            token,
+            &outcome.definitions,
+            render_cache,
+        ),
         diagnostics,
     }
 }
@@ -384,13 +397,14 @@ pub(super) fn definition_by_reference_diagnostic(
 
 pub(super) fn semantic_outcome_key(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     outcome: &crate::analyzer::usages::get_definition::DefinitionLookupOutcome,
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> DefinitionOutcomeKey {
     let definition = outcome
         .definitions
         .iter()
-        .filter_map(|unit| definition_candidate_with_cache(analyzer, unit, render_cache))
+        .filter_map(|unit| definition_candidate_with_cache(analyzer, token, unit, render_cache))
         .map(|candidate| definition_candidate_key(&candidate))
         .collect();
     (outcome.status.as_str().to_string(), definition)

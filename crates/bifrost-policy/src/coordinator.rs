@@ -18,6 +18,7 @@ use brokk_bifrost_analysis::analyzer::packs_document::{
     WORKSPACE_PACKS_DOCUMENT_PATH, WorkspacePacksActivation, WorkspacePacksConfig,
     activate_workspace_packs, load_workspace_packs_config, load_workspace_packs_config_at,
 };
+use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActiveSemanticModelShard, SemanticModelActivationExplanation,
     SemanticModelActivationPersistence, SemanticModelActivationRequest,
@@ -42,7 +43,8 @@ use super::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEv
 use super::finding::{FindingDiffDisposition, PolicyFindingDiff};
 use super::finding::{
     PolicyDiagnostic, PolicyDiagnosticCode, PolicyDiagnosticImpact, PolicyDiagnosticSeverity,
-    PolicyFailureReason, PolicyIncompleteReason, PolicyRun, PolicyRunCompletion, PolicyWorkReport,
+    PolicyFailureReason, PolicyFinding, PolicyIncompleteReason, PolicyRun, PolicyRunCompletion,
+    PolicyWorkReport,
 };
 use super::finding_identity::{FindingIdentityStability, PolicyFindingId};
 use super::loading::{PolicyDocumentLoadError, read_rqlp_document};
@@ -69,10 +71,11 @@ use super::source::{
     PolicySourceRelatedDiagnostic, parse_rqlp_source, validate_policy_source_identity,
 };
 use super::suppression::{
-    PolicyEvaluationDate, PolicyReportEvaluationContext, PolicySuppressionDocument,
-    PolicySuppressionDocumentState, PolicySuppressionMatchState, PolicySuppressionOptions,
-    PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicySuppressionTemporalState,
-    load_policy_suppressions_from_root,
+    MAX_SUPPRESSION_REKEY_CANDIDATES, PolicyEvaluationDate, PolicyReportEvaluationContext,
+    PolicySuppressionDocument, PolicySuppressionDocumentState, PolicySuppressionMatchState,
+    PolicySuppressionOptions, PolicySuppressionOrphanState, PolicySuppressionPolicyHashState,
+    PolicySuppressionRecord, PolicySuppressionReview, PolicySuppressionSourceState,
+    PolicySuppressionTemporalState, load_policy_suppressions_from_root,
 };
 use super::taint_policy::ProductionTaintPolicyEvaluator;
 use super::typestate_policy::ProductionTypestatePolicyEvaluator;
@@ -544,7 +547,9 @@ pub fn workspace_snapshot_deadline_outcome(
     deadline_before_evaluation_outcome(
         options,
         PolicyBatchBudget::default(),
-        PolicySuppressionDocumentState::NotEvaluated,
+        options
+            .suppressions()
+            .source_states(PolicySuppressionDocumentState::NotEvaluated),
         PolicyScopeDocumentState::NotEvaluated,
         vec![
             PolicyStageTiming::from_duration(
@@ -566,7 +571,7 @@ pub fn workspace_snapshot_deadline_outcome(
 fn deadline_before_evaluation_outcome(
     options: &PolicyEvaluationOptions,
     batch_budget: PolicyBatchBudget,
-    suppression_document_state: PolicySuppressionDocumentState,
+    suppression_sources: Vec<PolicySuppressionSourceState>,
     scope_document_state: PolicyScopeDocumentState,
     stage_timings: Vec<PolicyStageTiming>,
     terminal_stage: PolicyExecutionStage,
@@ -575,8 +580,7 @@ fn deadline_before_evaluation_outcome(
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
     let evaluation = PolicyReportEvaluationContext::new(
         options.evaluation_date(),
-        options.suppressions(),
-        suppression_document_state,
+        suppression_sources,
         options.scope(),
         scope_document_state,
     );
@@ -899,7 +903,9 @@ fn evaluate_prepared_policy_inputs(
         return deadline_before_evaluation_outcome(
             options,
             batch_budget,
-            PolicySuppressionDocumentState::NotEvaluated,
+            options
+                .suppressions()
+                .source_states(PolicySuppressionDocumentState::NotEvaluated),
             PolicyScopeDocumentState::NotEvaluated,
             vec![PolicyStageTiming::from_duration(
                 PolicyExecutionStage::PolicyRegistration,
@@ -911,23 +917,18 @@ fn evaluate_prepared_policy_inputs(
         );
     }
     let mut secondary_diagnostics = Vec::new();
-    let (suppression_document, suppression_document_state) =
-        match load_policy_suppressions_from_root(read_root, options.suppressions()) {
-            Ok(Some(document)) => (Some(document), PolicySuppressionDocumentState::Loaded),
-            Ok(None) => (None, PolicySuppressionDocumentState::NotFound),
-            Err(error) => {
-                secondary_diagnostics.push(report_diagnostic(
-                    PolicyReportDiagnosticCode::SuppressionLoadFailed,
-                    format!("failed to load policy suppressions: {error}"),
-                    Some(PolicySourceIdentity::new(
-                        options.suppressions().source().relative_path(),
-                    )),
-                    None,
-                    Vec::new(),
-                )?);
-                (None, PolicySuppressionDocumentState::Invalid)
-            }
-        };
+    let suppression_load = load_policy_suppressions_from_root(read_root, options.suppressions());
+    for failure in &suppression_load.failures {
+        secondary_diagnostics.push(report_diagnostic(
+            PolicyReportDiagnosticCode::SuppressionLoadFailed,
+            format!("failed to load policy suppressions: {}", failure.error),
+            Some(PolicySourceIdentity::new(&failure.path)),
+            None,
+            Vec::new(),
+        )?);
+    }
+    let suppression_document = suppression_load.document;
+    let suppression_sources = suppression_load.sources;
     let (scope_document, scope_document_state) =
         match load_policy_scope_from_root(read_root, options.scope()) {
             Ok(Some(document)) => (Some(document), PolicyScopeDocumentState::Loaded),
@@ -983,7 +984,7 @@ fn evaluate_prepared_policy_inputs(
         return deadline_before_evaluation_outcome(
             options,
             batch_budget,
-            suppression_document_state,
+            suppression_sources.clone(),
             scope_document_state,
             vec![PolicyStageTiming::from_duration(
                 PolicyExecutionStage::PolicyRegistration,
@@ -1009,7 +1010,7 @@ fn evaluate_prepared_policy_inputs(
         return deadline_before_evaluation_outcome(
             options,
             batch_budget,
-            suppression_document_state,
+            suppression_sources.clone(),
             scope_document_state,
             vec![PolicyStageTiming::from_duration(
                 PolicyExecutionStage::PolicyRegistration,
@@ -1048,7 +1049,7 @@ fn evaluate_prepared_policy_inputs(
             return deadline_before_evaluation_outcome(
                 options,
                 batch_budget,
-                suppression_document_state,
+                suppression_sources.clone(),
                 scope_document_state,
                 vec![PolicyStageTiming::from_duration(
                     PolicyExecutionStage::PolicyRegistration,
@@ -1115,7 +1116,7 @@ fn evaluate_prepared_policy_inputs(
         return deadline_before_evaluation_outcome(
             options,
             batch_budget,
-            suppression_document_state,
+            suppression_sources.clone(),
             scope_document_state,
             vec![PolicyStageTiming::from_duration(
                 PolicyExecutionStage::PolicyRegistration,
@@ -1144,7 +1145,7 @@ fn evaluate_prepared_policy_inputs(
         return deadline_before_evaluation_outcome(
             options,
             batch_budget,
-            suppression_document_state,
+            suppression_sources.clone(),
             scope_document_state,
             vec![
                 PolicyStageTiming::from_duration(
@@ -1283,7 +1284,7 @@ fn evaluate_prepared_policy_inputs(
         return deadline_before_evaluation_outcome(
             options,
             batch_budget,
-            suppression_document_state,
+            suppression_sources.clone(),
             scope_document_state,
             vec![
                 PolicyStageTiming::from_duration(
@@ -1404,9 +1405,13 @@ fn evaluate_prepared_policy_inputs(
     }
 
     let suppression_reviews = match suppression_document.as_ref() {
-        Some(document) => {
-            apply_policy_suppressions(document, options.evaluation_date(), &registry, &mut runs)?
-        }
+        Some(document) => apply_policy_suppressions(
+            document,
+            options.evaluation_date(),
+            &registry,
+            workspace,
+            &mut runs,
+        )?,
         None => Vec::new(),
     };
     let scope_reviews = match scope_document.as_ref() {
@@ -1415,8 +1420,7 @@ fn evaluate_prepared_policy_inputs(
     };
     let evaluation = PolicyReportEvaluationContext::new(
         options.evaluation_date(),
-        options.suppressions(),
-        suppression_document_state,
+        suppression_sources,
         options.scope(),
         scope_document_state,
     );
@@ -1437,7 +1441,7 @@ fn evaluate_prepared_policy_inputs(
                 PolicyReportDiagnosticCode::SuppressionAuditRetentionExceeded,
                 "suppression and scope audits exceed the report retention budget; no suppressions or scopes were applied",
                 Some(PolicySourceIdentity::new(
-                    options.suppressions().source().relative_path(),
+                    options.suppressions().primary_relative_path(),
                 )),
                 None,
                 Vec::new(),
@@ -1629,7 +1633,7 @@ fn evaluate_prepared_policy_inputs(
             PolicyReportDiagnosticCode::SuppressionAuditRetentionExceeded,
             "one or more applied suppression results exceeded the report retention budget",
             Some(PolicySourceIdentity::new(
-                options.suppressions().source().relative_path(),
+                options.suppressions().primary_relative_path(),
             )),
             None,
             Vec::new(),
@@ -1953,10 +1957,69 @@ fn apply_policy_diff(
     ))
 }
 
+/// The workspace-relative paths one run actually analyzed.
+///
+/// This is the oracle that separates a suppression identity that rotated under
+/// an edit from one whose file this run never saw (#2418). It is deliberately
+/// the analyzed set rather than on-disk existence: a file the analyzer skipped
+/// can no more produce a finding than one that is absent, so treating it as
+/// present would gate the run on a record it cannot possibly resolve.
+///
+/// Built at most once per run, and only when some record actually needs it.
+struct AnalyzedPaths(HashSet<Box<str>>);
+
+impl AnalyzedPaths {
+    fn collect(workspace: Option<&WorkspaceAnalyzer>) -> Self {
+        let Some(workspace) = workspace else {
+            return Self(HashSet::new());
+        };
+        Self(
+            workspace
+                .analyzer()
+                .analyzed_files()
+                .iter()
+                .filter_map(|file| {
+                    WorkspaceRelativePath::try_from_path(file.rel_path())
+                        .ok()
+                        .map(|path| path.as_str().into())
+                })
+                .collect(),
+        )
+    }
+
+    fn contains(&self, path: &WorkspaceRelativePath) -> bool {
+        self.0.contains(path.as_str())
+    }
+}
+
+/// Unclaimed identities this run reported for `policy_id` in `path`.
+///
+/// A record orphaned by rotation still has its finding in the run under a new
+/// identity, so these are its re-key targets. Identities another record in the
+/// same document already claims are excluded: offering an identity that is
+/// already accepted elsewhere would invite a duplicate record.
+fn rekey_candidates(
+    run: &PolicyRun,
+    path: &WorkspaceRelativePath,
+    claimed: &HashSet<PolicyFindingId>,
+) -> Vec<PolicyFindingId> {
+    run.findings()
+        .iter()
+        .filter(|finding| {
+            finding.identity_stability() == FindingIdentityStability::Strong
+                && finding.primary().path() == path.as_str()
+                && !claimed.contains(&finding.id())
+        })
+        .map(PolicyFinding::id)
+        .take(MAX_SUPPRESSION_REKEY_CANDIDATES)
+        .collect()
+}
+
 fn apply_policy_suppressions(
     document: &PolicySuppressionDocument,
     evaluation_date: PolicyEvaluationDate,
     registry: &PolicyRegistry,
+    workspace: Option<&WorkspaceAnalyzer>,
     runs: &mut HashMap<PolicyId, PolicyRun>,
 ) -> Result<Vec<PolicySuppressionReview>, PolicyCoordinatorError> {
     let policy_hashes = registry
@@ -1968,6 +2031,12 @@ fn apply_policy_suppressions(
             )
         })
         .collect::<HashMap<_, _>>();
+    let claimed_identities = document
+        .suppressions()
+        .iter()
+        .map(PolicySuppressionRecord::finding_id)
+        .collect::<HashSet<_>>();
+    let mut analyzed_paths = None;
     let mut reviews = Vec::with_capacity(document.suppressions().len());
     for record in document.suppressions() {
         let policy_hash_state = PolicySuppressionPolicyHashState::compare(
@@ -1997,8 +2066,35 @@ fn apply_policy_suppressions(
             }
             None => (PolicySuppressionMatchState::PolicyNotEvaluated, None),
         };
-        let review =
-            PolicySuppressionReview::new(record, match_state, temporal_state, policy_hash_state);
+        let (orphan_state, candidates) =
+            if match_state == PolicySuppressionMatchState::FindingAbsent {
+                match record.path() {
+                    None => (PolicySuppressionOrphanState::PathUnrecorded, Vec::new()),
+                    Some(path) => {
+                        let analyzed =
+                            analyzed_paths.get_or_insert_with(|| AnalyzedPaths::collect(workspace));
+                        if analyzed.contains(path) {
+                            let candidates =
+                                runs.get(record.policy_id()).map_or_else(Vec::new, |run| {
+                                    rekey_candidates(run, path, &claimed_identities)
+                                });
+                            (PolicySuppressionOrphanState::Orphaned, candidates)
+                        } else {
+                            (PolicySuppressionOrphanState::PathNotAnalyzed, Vec::new())
+                        }
+                    }
+                }
+            } else {
+                (PolicySuppressionOrphanState::Resolved, Vec::new())
+            };
+        let review = PolicySuppressionReview::new(
+            record,
+            match_state,
+            temporal_state,
+            policy_hash_state,
+            orphan_state,
+            candidates,
+        );
         if let (Some(finding_index), Some(suppression)) =
             (finding_index, review.finding_suppression())
         {
@@ -2583,7 +2679,24 @@ fn failed_evaluation_run(
     })
 }
 
+/// A run's exit status.
+///
+/// `threshold_exceeded` is the finding gate. The suppression gate is read off
+/// the report here rather than passed in, so it survives the audit-retention
+/// rollback that drops every review: a rollback leaves no orphan evidence, and
+/// a gate must not fire on evidence the report does not carry.
 fn report_exit_status(report: &PolicyReportDocument, threshold_exceeded: bool) -> u8 {
+    // An accepted decision that no longer resolves to any finding is a defect
+    // in the decision record, not in the code (#2418). Without this the
+    // rotation is silent: the record stops matching, the finding it covered
+    // starts gating as new on exactly one push, and after any merge or
+    // projection whose base already contains the rotation it goes quiet again
+    // with the dead record still in the document.
+    let threshold_exceeded = threshold_exceeded
+        || report
+            .suppressions()
+            .iter()
+            .any(PolicySuppressionReview::is_orphaned);
     let unreliable = report.execution().termination().is_some()
         || !report.diagnostics().is_empty()
         || report.diagnostics_truncated()
@@ -2677,6 +2790,10 @@ mod tests {
 
     use super::*;
     use crate::source::MAX_POLICY_SOURCE_IDENTITY_BYTES;
+    use crate::suppression::{
+        DEFAULT_POLICY_SUPPRESSION_PATH, LOCAL_POLICY_SUPPRESSION_PATH,
+        PRIVATE_POLICY_SUPPRESSION_PATH,
+    };
     use crate::write_policy_json;
 
     fn evaluation_options() -> PolicyEvaluationOptions {
@@ -2785,7 +2902,35 @@ mod tests {
         output
     }
 
-    fn write_test_suppression(root: &Path, policy_id: &str, policy_hash: &str, finding_id: &str) {
+    /// One accepted record. `path` is the optional file the decision was made
+    /// against, which is what lets a run tell a rotated identity from a file it
+    /// never analyzed.
+    fn suppression_record(
+        policy_id: &str,
+        policy_hash: &str,
+        finding_id: &str,
+        path: Option<&str>,
+    ) -> serde_json::Value {
+        let mut record = json!({
+            "policy_id": policy_id,
+            "finding_id": finding_id,
+            "identity_stability": "strong",
+            "status": "accepted",
+            "reason": "Reviewed exact finding",
+            "policy_hash_at_acceptance": policy_hash,
+            "accepted_at": "2026-07-01",
+            "expires_at": null
+        });
+        if let Some(path) = path {
+            record
+                .as_object_mut()
+                .expect("record object")
+                .insert("path".to_owned(), json!(path));
+        }
+        record
+    }
+
+    fn write_suppressions(root: &Path, records: Vec<serde_json::Value>) {
         let path = root.join(".bifrost/suppressions.json");
         fs::create_dir_all(path.parent().expect("suppression parent"))
             .expect("create suppression directory");
@@ -2793,20 +2938,367 @@ mod tests {
             path,
             serde_json::to_vec(&json!({
                 "schema_version": 1,
-                "suppressions": [{
-                    "policy_id": policy_id,
-                    "finding_id": finding_id,
-                    "identity_stability": "strong",
-                    "status": "accepted",
-                    "reason": "Reviewed exact finding",
-                    "policy_hash_at_acceptance": policy_hash,
-                    "accepted_at": "2026-07-01",
-                    "expires_at": null
-                }]
+                "suppressions": records,
             }))
             .expect("suppression JSON"),
         )
         .expect("write suppression document");
+    }
+
+    fn write_test_suppression(root: &Path, policy_id: &str, policy_hash: &str, finding_id: &str) {
+        write_suppressions(
+            root,
+            vec![suppression_record(policy_id, policy_hash, finding_id, None)],
+        );
+    }
+
+    /// A workspace holding one `target` function per named file, plus a policy
+    /// that reports each of them, evaluated with warnings below the failure
+    /// threshold so only the suppression gate can change the exit status.
+    struct OrphanFixture {
+        workspace: tempfile::TempDir,
+        policy_paths: [PathBuf; 1],
+    }
+
+    impl OrphanFixture {
+        fn new(sources: &[&str]) -> Self {
+            let workspace = tempfile::tempdir().expect("workspace");
+            for source in sources {
+                fs::write(
+                    workspace.path().join(source),
+                    "export function target() {}\n",
+                )
+                .expect("source fixture");
+            }
+            write_policy(
+                workspace.path(),
+                "policies/orphan.rqlp",
+                &match_policy("test.orphan", "Orphan"),
+            );
+            Self {
+                workspace,
+                policy_paths: [PathBuf::from("policies/orphan.rqlp")],
+            }
+        }
+
+        fn evaluate(&self) -> PolicyBatchOutcome {
+            evaluate_policy_files(
+                self.workspace.path(),
+                &self.policy_paths,
+                &evaluation_options().with_fail_on(PolicyFailOn::Error),
+            )
+            .expect("policy report")
+        }
+
+        fn root(&self) -> &Path {
+            self.workspace.path()
+        }
+    }
+
+    /// The policy hash and the identity of the finding reported in `path`.
+    fn identity_in(outcome: &PolicyBatchOutcome, path: &str) -> (String, String) {
+        let policy_hash = outcome.report().rules()[0].policy_hash().to_string();
+        let finding = outcome.report().runs()[0]
+            .findings()
+            .iter()
+            .find(|finding| finding.primary().path() == path)
+            .unwrap_or_else(|| panic!("no finding in {path}"));
+        (policy_hash, finding.id().to_string())
+    }
+
+    fn write_suppressions_to(root: &Path, relative: &str, records: Vec<serde_json::Value>) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().expect("suppression parent"))
+            .expect("create suppression directory");
+        fs::write(
+            path,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "suppressions": records,
+            }))
+            .expect("suppression JSON"),
+        )
+        .expect("write suppression document");
+    }
+
+    #[test]
+    fn every_conventional_source_contributes_and_each_is_reported() {
+        let fixture = OrphanFixture::new(&["app.ts", "other.ts"]);
+        let baseline = fixture.evaluate();
+        let (policy_hash, first) = identity_in(&baseline, "app.ts");
+        let (_, second) = identity_in(&baseline, "other.ts");
+
+        // The published document accepts one finding; the uncommitted local
+        // document accepts the other. The private document is absent, which is
+        // the ordinary case and must not be an error.
+        write_suppressions_to(
+            fixture.root(),
+            DEFAULT_POLICY_SUPPRESSION_PATH,
+            vec![suppression_record(
+                "test.orphan",
+                &policy_hash,
+                &first,
+                Some("app.ts"),
+            )],
+        );
+        write_suppressions_to(
+            fixture.root(),
+            LOCAL_POLICY_SUPPRESSION_PATH,
+            vec![suppression_record(
+                "test.orphan",
+                &policy_hash,
+                &second,
+                Some("other.ts"),
+            )],
+        );
+
+        let outcome = fixture.evaluate();
+        assert_eq!(outcome.report().suppressions().len(), 2);
+        assert!(
+            outcome
+                .report()
+                .suppressions()
+                .iter()
+                .all(PolicySuppressionReview::applied),
+            "a record from any configured source applies"
+        );
+        let states = outcome
+            .report()
+            .evaluation()
+            .suppression_sources()
+            .iter()
+            .map(|source| (source.path(), source.state()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            states,
+            vec![
+                (
+                    DEFAULT_POLICY_SUPPRESSION_PATH,
+                    PolicySuppressionDocumentState::Loaded
+                ),
+                (
+                    PRIVATE_POLICY_SUPPRESSION_PATH,
+                    PolicySuppressionDocumentState::NotFound
+                ),
+                (
+                    LOCAL_POLICY_SUPPRESSION_PATH,
+                    PolicySuppressionDocumentState::Loaded
+                ),
+            ],
+            "an absent source is reported, not omitted"
+        );
+        assert_eq!(outcome.exit_status(), POLICY_EXIT_CLEAN);
+    }
+
+    #[test]
+    fn two_sources_claiming_one_finding_are_rejected_rather_than_resolved() {
+        let fixture = OrphanFixture::new(&["app.ts"]);
+        let baseline = fixture.evaluate();
+        let (policy_hash, claimed) = identity_in(&baseline, "app.ts");
+
+        let mut divergent =
+            suppression_record("test.orphan", &policy_hash, &claimed, Some("app.ts"));
+        divergent
+            .as_object_mut()
+            .expect("record object")
+            .insert("reason".to_owned(), json!("A different justification"));
+        write_suppressions_to(
+            fixture.root(),
+            DEFAULT_POLICY_SUPPRESSION_PATH,
+            vec![suppression_record(
+                "test.orphan",
+                &policy_hash,
+                &claimed,
+                Some("app.ts"),
+            )],
+        );
+        write_suppressions_to(
+            fixture.root(),
+            PRIVATE_POLICY_SUPPRESSION_PATH,
+            vec![divergent],
+        );
+
+        // Choosing a winner silently is the failure this document exists to
+        // prevent, so neither record applies and the run is unreliable.
+        let outcome = fixture.evaluate();
+        assert_eq!(outcome.exit_status(), POLICY_EXIT_UNRELIABLE);
+        assert!(
+            outcome.report().suppressions().is_empty(),
+            "an ambiguous record set applies nothing"
+        );
+        let diagnostic = outcome
+            .report()
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code() == PolicyReportDiagnosticCode::SuppressionLoadFailed
+            })
+            .expect("a load failure naming the collision");
+        assert!(
+            diagnostic.message().contains("different terms")
+                && diagnostic
+                    .message()
+                    .contains(DEFAULT_POLICY_SUPPRESSION_PATH),
+            "the diagnostic must name the other source: {}",
+            diagnostic.message()
+        );
+    }
+
+    /// A well-formed identity that no finding carries, standing in for the one
+    /// an edit rotated away from.
+    const ROTATED_AWAY_IDENTITY: &str =
+        "0000000000000000000000000000000000000000000000000000000000000001";
+
+    #[test]
+    fn a_record_whose_analyzed_file_no_longer_carries_it_gates_the_run() {
+        let fixture = OrphanFixture::new(&["app.ts"]);
+        let baseline = fixture.evaluate();
+        assert_eq!(baseline.exit_status(), POLICY_EXIT_CLEAN);
+        let (policy_hash, _) = identity_in(&baseline, "app.ts");
+
+        // The record was accepted against a file this run analyzes, and no
+        // finding carries its identity: exactly the shape an edit that rotates
+        // a canonical identity leaves behind.
+        write_suppressions(
+            fixture.root(),
+            vec![suppression_record(
+                "test.orphan",
+                &policy_hash,
+                ROTATED_AWAY_IDENTITY,
+                Some("app.ts"),
+            )],
+        );
+
+        let outcome = fixture.evaluate();
+        let review = &outcome.report().suppressions()[0];
+        assert_eq!(
+            review.match_state(),
+            PolicySuppressionMatchState::FindingAbsent
+        );
+        assert_eq!(
+            review.orphan_state(),
+            PolicySuppressionOrphanState::Orphaned
+        );
+        assert!(review.is_orphaned());
+        assert!(!review.applied());
+        // Nothing gates on severity here, so the failure is the orphan alone.
+        assert_eq!(outcome.exit_status(), POLICY_EXIT_FINDING);
+    }
+
+    #[test]
+    fn an_orphaned_record_reports_the_unclaimed_identities_in_its_own_file() {
+        let fixture = OrphanFixture::new(&["app.ts", "other.ts"]);
+        let baseline = fixture.evaluate();
+        let (policy_hash, claimed) = identity_in(&baseline, "app.ts");
+        let (_, unclaimed) = identity_in(&baseline, "other.ts");
+
+        write_suppressions(
+            fixture.root(),
+            vec![
+                suppression_record("test.orphan", &policy_hash, &claimed, Some("app.ts")),
+                suppression_record(
+                    "test.orphan",
+                    &policy_hash,
+                    ROTATED_AWAY_IDENTITY,
+                    Some("other.ts"),
+                ),
+                // A second orphan in the file whose only finding the first
+                // record already claims: no candidate is left to offer.
+                suppression_record(
+                    "test.orphan",
+                    &policy_hash,
+                    "0000000000000000000000000000000000000000000000000000000000000002",
+                    Some("app.ts"),
+                ),
+            ],
+        );
+
+        let outcome = fixture.evaluate();
+        let reviews = outcome.report().suppressions();
+        let unclaimed = unclaimed
+            .parse::<PolicyFindingId>()
+            .expect("unclaimed identity");
+        assert!(
+            reviews
+                .iter()
+                .any(|review| review.is_orphaned() && review.rekey_candidates() == [unclaimed]),
+            "the orphan in other.ts must offer that file's unclaimed identity"
+        );
+        assert!(
+            reviews
+                .iter()
+                .any(|review| review.is_orphaned() && review.rekey_candidates().is_empty()),
+            "an orphan whose file has no unclaimed finding must offer nothing"
+        );
+        assert_eq!(outcome.exit_status(), POLICY_EXIT_FINDING);
+    }
+
+    #[test]
+    fn a_record_for_a_file_this_run_did_not_analyze_never_gates() {
+        let fixture = OrphanFixture::new(&["app.ts"]);
+        let baseline = fixture.evaluate();
+        let (policy_hash, claimed) = identity_in(&baseline, "app.ts");
+
+        // This is the projected-document case: `.bifrost/suppressions.json`
+        // travels verbatim to a tree that does not contain every file it names,
+        // and such a record reports `finding_absent` in every run there.
+        write_suppressions(
+            fixture.root(),
+            vec![
+                suppression_record("test.orphan", &policy_hash, &claimed, Some("app.ts")),
+                suppression_record(
+                    "test.orphan",
+                    &policy_hash,
+                    ROTATED_AWAY_IDENTITY,
+                    Some("private/only.ts"),
+                ),
+            ],
+        );
+
+        let outcome = fixture.evaluate();
+        let review = outcome
+            .report()
+            .suppressions()
+            .iter()
+            .find(|review| !review.applied())
+            .expect("the unresolved record");
+        assert_eq!(
+            review.match_state(),
+            PolicySuppressionMatchState::FindingAbsent
+        );
+        assert_eq!(
+            review.orphan_state(),
+            PolicySuppressionOrphanState::PathNotAnalyzed
+        );
+        assert!(!review.is_orphaned());
+        assert!(review.rekey_candidates().is_empty());
+        assert_eq!(outcome.exit_status(), POLICY_EXIT_CLEAN);
+    }
+
+    #[test]
+    fn a_record_with_no_recorded_path_cannot_be_classified_and_never_gates() {
+        let fixture = OrphanFixture::new(&["app.ts"]);
+        let baseline = fixture.evaluate();
+        let (policy_hash, _) = identity_in(&baseline, "app.ts");
+
+        write_test_suppression(
+            fixture.root(),
+            "test.orphan",
+            &policy_hash,
+            ROTATED_AWAY_IDENTITY,
+        );
+
+        let outcome = fixture.evaluate();
+        let review = &outcome.report().suppressions()[0];
+        assert_eq!(
+            review.match_state(),
+            PolicySuppressionMatchState::FindingAbsent
+        );
+        assert_eq!(
+            review.orphan_state(),
+            PolicySuppressionOrphanState::PathUnrecorded
+        );
+        assert_eq!(outcome.exit_status(), POLICY_EXIT_CLEAN);
     }
 
     #[test]
@@ -3005,7 +3497,9 @@ mod tests {
         let outcome = deadline_before_evaluation_outcome(
             &evaluation_options(),
             PolicyBatchBudget::default(),
-            PolicySuppressionDocumentState::NotEvaluated,
+            evaluation_options()
+                .suppressions()
+                .source_states(PolicySuppressionDocumentState::NotEvaluated),
             PolicyScopeDocumentState::NotEvaluated,
             vec![PolicyStageTiming::new(
                 PolicyExecutionStage::ReportConstruction,

@@ -13,6 +13,8 @@
 
 use super::*;
 use crate::analyzer::ImportInfo;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_ruby::imports::{
     build_autoload_constant_files, build_zeitwerk_autoload_code_units,
     build_zeitwerk_autoload_files, build_zeitwerk_consumer_files, build_zeitwerk_reference_files,
@@ -24,8 +26,12 @@ use std::sync::Arc;
 
 impl RubyAnalyzer {
     /// Project files this file pulls in via supported Ruby require forms.
-    pub(crate) fn required_files(&self, file: &ProjectFile) -> Vec<ProjectFile> {
-        ruby_required_files(self, file)
+    pub(crate) fn required_files(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Vec<ProjectFile> {
+        ruby_required_files(self, token, file)
     }
 
     pub(crate) fn zeitwerk_autoload_files(&self) -> &HashSet<ProjectFile> {
@@ -54,21 +60,24 @@ impl RubyAnalyzer {
 
     pub(super) fn build_reverse_import_index(
         &self,
+        token: QueryToken<'_>,
     ) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
         crate::analyzer::memoized_reverse_file_index(
             &self.reverse_import_index,
             || self.inner.all_files(),
-            |file| self.required_files(file),
+            |file| self.required_files(token, file),
         )
     }
 }
 
 impl ImportAnalysisProvider for RubyAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         if let Some(cached) = self.imported_code_units.get(file) {
             return cached;
         }
-        let units = Arc::new(ruby_effective_imported_code_units(self, file));
+        let units = Arc::new(ruby_effective_imported_code_units(self, token, file));
         self.imported_code_units
             .insert(file.clone(), Arc::clone(&units));
         units
@@ -84,8 +93,8 @@ impl ImportAnalysisProvider for RubyAnalyzer {
         referencing
     }
 
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
-        self.inner.import_info_of(file)
+    fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
+        self.inner.import_info_of(token, file)
     }
 
     fn imported_files_from_infos(
@@ -133,7 +142,9 @@ impl brokk_bifrost_ruby::graph_support::RubySource for RubyAnalyzer {
     }
 
     fn reverse_import_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
-        self.build_reverse_import_index()
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        self.build_reverse_import_index(token)
     }
 
     fn mixin_relations(&self) -> &[TypeRelation] {

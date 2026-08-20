@@ -21,6 +21,7 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 use super::{FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageProof, UsageQueryCompletion};
 
@@ -408,6 +409,7 @@ impl CallRelationService {
     /// resolution core is used by legacy outgoing call relations below.
     pub(crate) fn dispatch_at_bounded(
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         location: &ExactCallLocation,
         exact_source: Arc<str>,
         limits: CallRelationLimits,
@@ -484,6 +486,7 @@ impl CallRelationService {
         };
         let batch = resolve_call_references_with_source(
             analyzer,
+            token,
             &location.file,
             Arc::clone(&exact_source),
             &tree,
@@ -528,12 +531,14 @@ impl CallRelationService {
 
     pub fn incoming(
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         target: &CodeUnit,
         max_files: usize,
         max_sites: usize,
     ) -> CallRelationResult {
         Self::incoming_bounded(
             analyzer,
+            token,
             target,
             CallRelationLimits {
                 max_files,
@@ -546,6 +551,7 @@ impl CallRelationService {
 
     pub(crate) fn incoming_bounded(
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         target: &CodeUnit,
         limits: CallRelationLimits,
         cancellation: Option<&CancellationToken>,
@@ -644,6 +650,7 @@ impl CallRelationService {
         if !cancelled {
             let recursive = Self::outgoing_bounded(
                 analyzer,
+                token,
                 target,
                 CallRelationLimits {
                     max_files: limits.max_files.saturating_sub(work.scanned_files),
@@ -695,11 +702,13 @@ impl CallRelationService {
 
     pub fn outgoing(
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         caller: &CodeUnit,
         max_sites: usize,
     ) -> CallRelationResult {
         Self::outgoing_bounded(
             analyzer,
+            token,
             caller,
             CallRelationLimits {
                 max_files: 1,
@@ -712,6 +721,7 @@ impl CallRelationService {
 
     pub(crate) fn outgoing_bounded(
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         caller: &CodeUnit,
         limits: CallRelationLimits,
         cancellation: Option<&CancellationToken>,
@@ -809,6 +819,7 @@ impl CallRelationService {
             .collect::<Vec<_>>();
         let batch = resolve_call_references_with_source(
             analyzer,
+            token,
             caller.source(),
             Arc::clone(&source),
             &tree,
@@ -915,6 +926,7 @@ struct CallReferenceResolutionBatch {
 /// one outcome per request.
 fn resolve_call_references_with_source(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: Arc<str>,
     tree: &tree_sitter::Tree,
@@ -934,6 +946,7 @@ fn resolve_call_references_with_source(
         .collect();
     let outcomes = resolve_call_target_batch_with_source(
         analyzer,
+        token,
         requests,
         file.clone(),
         source,
@@ -1518,6 +1531,7 @@ mod tests {
     use crate::analyzer::usages::get_definition::{
         DefinitionLookupDiagnostic, DefinitionLookupOutcome,
     };
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{
         CodeUnitType, Language, PythonAnalyzer, TestProject, TypescriptAnalyzer,
     };
@@ -1547,8 +1561,11 @@ mod tests {
         let fixture =
             AnalyzerFixture::new_for_language(Language::TypeScript, &[("nested.ts", source)]);
         let file = ProjectFile::new(fixture.project_root(), "nested.ts");
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let lookup = CallRelationService::dispatch_at_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &ExactCallLocation {
                 file,
                 call_span: call_span(source, "inner()"),
@@ -1573,8 +1590,11 @@ mod tests {
         let source = "class Example { static void helper() {} static void caller() { helper(); } }";
         let fixture =
             AnalyzerFixture::new_for_language(Language::Java, &[("Example.java", source)]);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let lookup = CallRelationService::dispatch_at_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &ExactCallLocation {
                 file: ProjectFile::new(fixture.project_root(), "Example.java"),
                 call_span: call_span(source, "helper()"),
@@ -1599,8 +1619,11 @@ mod tests {
         let source = "import { work } from \"third-party\";\nexport function caller(): number { return work(); }\n";
         let fixture =
             AnalyzerFixture::new_for_language(Language::TypeScript, &[("external.ts", source)]);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let lookup = CallRelationService::dispatch_at_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &ExactCallLocation {
                 file: ProjectFile::new(fixture.project_root(), "external.ts"),
                 call_span: call_span(source, "work()"),
@@ -1656,8 +1679,11 @@ void caller(ns::Widget& receiver) {
             ("receiver.operator+(1)", "operator+"),
             ("receiver.~Widget()", "~Widget"),
         ] {
+            let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+            let token = scope.token();
             let lookup = CallRelationService::dispatch_at_bounded(
                 fixture.analyzer.analyzer(),
+                token,
                 &ExactCallLocation {
                     file: ProjectFile::new(fixture.project_root(), "calls.cpp"),
                     call_span: call_span(source, call),
@@ -1688,8 +1714,11 @@ void caller() {
 }
 "#;
         let fixture = AnalyzerFixture::new_for_language(Language::Cpp, &[("calls.cpp", source)]);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let lookup = CallRelationService::dispatch_at_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &ExactCallLocation {
                 file: ProjectFile::new(fixture.project_root(), "calls.cpp"),
                 call_span: call_span(source, "callable()"),
@@ -1730,8 +1759,11 @@ int caller() { return local_target(1); }
                 ("unrelated.c", unrelated_source),
             ],
         );
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let lookup = CallRelationService::dispatch_at_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &ExactCallLocation {
                 file: ProjectFile::new(fixture.project_root(), "caller.c"),
                 call_span: call_span(caller_source, "local_target(1)"),
@@ -1765,8 +1797,11 @@ int caller() { return local_target(1); }
             ],
         );
 
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let lookup = CallRelationService::dispatch_at_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &ExactCallLocation {
                 file: ProjectFile::new(fixture.project_root(), "caller.cpp"),
                 call_span: call_span(caller_source, "relay(value)"),
@@ -1868,8 +1903,11 @@ int caller() { return local_target(1); }
             ],
         );
 
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let lookup = CallRelationService::dispatch_at_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &ExactCallLocation {
                 file: ProjectFile::new(fixture.project_root(), "caller.cpp"),
                 call_span: call_span(caller_source, "relay(value)"),
@@ -1933,8 +1971,11 @@ int caller() { return local_target(1); }
 end
 "#;
         let fixture = AnalyzerFixture::new_for_language(Language::Ruby, &[("example.rb", source)]);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let lookup = CallRelationService::dispatch_at_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &ExactCallLocation {
                 file: ProjectFile::new(fixture.project_root(), "example.rb"),
                 call_span: call_span(source, "target"),
@@ -1967,8 +2008,11 @@ end
 "#;
         let call = "service&.run(1) { |value| value }";
         let fixture = AnalyzerFixture::new_for_language(Language::Ruby, &[("example.rb", source)]);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let lookup = CallRelationService::dispatch_at_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &ExactCallLocation {
                 file: ProjectFile::new(fixture.project_root(), "example.rb"),
                 call_span: call_span(source, call),
@@ -1998,8 +2042,11 @@ end
 "#;
         let call = "public_send(:target)";
         let fixture = AnalyzerFixture::new_for_language(Language::Ruby, &[("example.rb", source)]);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let lookup = CallRelationService::dispatch_at_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &ExactCallLocation {
                 file: ProjectFile::new(fixture.project_root(), "example.rb"),
                 call_span: call_span(source, call),
@@ -2046,8 +2093,11 @@ end
         let fixture = AnalyzerFixture::new_for_language(Language::Ruby, &[("example.rb", source)]);
 
         for (call, target) in [("self.+(1)", "Example.+"), ("self.[](2)", "Example.[]")] {
+            let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+            let token = scope.token();
             let lookup = CallRelationService::dispatch_at_bounded(
                 fixture.analyzer.analyzer(),
+                token,
                 &ExactCallLocation {
                     file: ProjectFile::new(fixture.project_root(), "example.rb"),
                     call_span: call_span(source, call),
@@ -2075,8 +2125,11 @@ end
 "#;
         let call = "callable.(1)";
         let fixture = AnalyzerFixture::new_for_language(Language::Ruby, &[("example.rb", source)]);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let lookup = CallRelationService::dispatch_at_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &ExactCallLocation {
                 file: ProjectFile::new(fixture.project_root(), "example.rb"),
                 call_span: call_span(source, call),
@@ -2130,8 +2183,15 @@ end
             .next()
             .expect("Ruby caller");
 
-        let relation =
-            CallRelationService::outgoing_bounded(analyzer, &caller, generous_limits(), None);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let relation = CallRelationService::outgoing_bounded(
+            analyzer,
+            token,
+            &caller,
+            generous_limits(),
+            None,
+        );
         let callees = relation
             .sites
             .iter()
@@ -2171,8 +2231,15 @@ object Calls {
             .next()
             .expect("Scala caller");
 
-        let relation =
-            CallRelationService::outgoing_bounded(analyzer, &caller, generous_limits(), None);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let relation = CallRelationService::outgoing_bounded(
+            analyzer,
+            token,
+            &caller,
+            generous_limits(),
+            None,
+        );
         let callees = relation
             .sites
             .iter()
@@ -2200,8 +2267,11 @@ object Calls {
         };
         let cancellation = CancellationToken::default();
         cancellation.cancel();
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let cancelled = CallRelationService::dispatch_at_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &location,
             Arc::clone(&source),
             generous_limits(),
@@ -2213,6 +2283,7 @@ object Calls {
 
         let exhausted = CallRelationService::dispatch_at_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &location,
             source,
             CallRelationLimits {

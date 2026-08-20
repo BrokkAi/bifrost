@@ -75,7 +75,7 @@ procedure-summary IR, compiles every translated entry back through the
 production pack compiler, and joins the corpora into one deterministic report:
 
 ```text
-scripts/fetch-pinned-summary-corpora.sh /path/to/work-dir
+scripts/public/fetch-pinned-summary-corpora.sh /path/to/work-dir
 bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE report.json
 ```
 

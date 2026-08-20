@@ -25,6 +25,7 @@ use crate::lsp::handlers::hierarchy_support::{
     cursor_byte_range, hierarchy_item_data, resolve_hierarchy_item_code_unit,
 };
 use crate::lsp::handlers::util::{FileContentCache, read_document_for_uri};
+use brokk_bifrost_analysis::analyzer::QueryScope;
 
 pub fn prepare(
     workspace: &WorkspaceAnalyzer,
@@ -135,12 +136,19 @@ pub fn incoming_calls(
     project: &dyn Project,
     params: &CallHierarchyIncomingCallsParams,
 ) -> Option<Vec<CallHierarchyIncomingCall>> {
+    let scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let token = scope.token();
     let analyzer = workspace.analyzer();
     let _query_scope = AnalyzerQueryScope::new(analyzer);
     let target = resolve_item_code_unit(analyzer, project, &params.item)?;
 
-    let relation =
-        CallRelationService::incoming(analyzer, &target, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES);
+    let relation = CallRelationService::incoming(
+        analyzer,
+        token,
+        &target,
+        DEFAULT_MAX_FILES,
+        DEFAULT_MAX_USAGES,
+    );
 
     let mut grouped: BTreeMap<String, (CodeUnit, Vec<LspRange>)> = BTreeMap::new();
     let mut content_cache = FileContentCache::default();
@@ -179,13 +187,15 @@ pub fn outgoing_calls(
     project: &dyn Project,
     params: &CallHierarchyOutgoingCallsParams,
 ) -> Option<Vec<CallHierarchyOutgoingCall>> {
+    let scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let token = scope.token();
     let analyzer = workspace.analyzer();
     let _query_scope = AnalyzerQueryScope::new(analyzer);
     let caller = resolve_item_code_unit(analyzer, project, &params.item)?;
     if !is_call_relation_unit(&caller) {
         return Some(Vec::new());
     }
-    let relation = CallRelationService::outgoing(analyzer, &caller, DEFAULT_MAX_USAGES);
+    let relation = CallRelationService::outgoing(analyzer, token, &caller, DEFAULT_MAX_USAGES);
 
     let mut grouped: BTreeMap<String, (CodeUnit, Vec<LspRange>)> = BTreeMap::new();
     let mut content_cache = FileContentCache::default();

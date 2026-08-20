@@ -12,6 +12,7 @@
 use crate::analyzer::usages::csharp_graph::csharp_graph_source;
 use crate::analyzer::usages::get_definition::BoundedResolution;
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverBudgetLimit};
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, Language, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use crate::test_support::AnalyzerFixture;
@@ -64,8 +65,11 @@ fn bounded_receiver_hierarchy_stops_before_materializing_a_wide_walk() {
     let leaf_fqn = "Demo.Level12".to_string();
 
     let complete_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let compatible = compatible_receiver_type_names(
         csharp,
+        token,
         &csharp_graph_source(analyzer),
         std::slice::from_ref(&leaf_fqn),
         false,
@@ -85,6 +89,7 @@ fn bounded_receiver_hierarchy_stops_before_materializing_a_wide_walk() {
     let bounded_session = ResolutionSession::bounded(budget, None);
     let compatible = compatible_receiver_type_names(
         csharp,
+        token,
         &csharp_graph_source(analyzer),
         std::slice::from_ref(&leaf_fqn),
         false,
@@ -111,9 +116,12 @@ fn bounded_member_hierarchy_observes_mid_walk_cancellation() {
     let leaf = type_definition(analyzer, "Demo.Level12");
 
     let exact_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let members = nearest_member_candidates_for_owner_inner(
         &csharp_graph_source(analyzer),
         csharp,
+        token,
         &leaf,
         "RootMethod",
         None,
@@ -137,6 +145,7 @@ fn bounded_member_hierarchy_observes_mid_walk_cancellation() {
         let members = nearest_member_candidates_for_owner_inner(
             &csharp_graph_source(analyzer),
             csharp,
+            token,
             &leaf,
             "RootMethod",
             None,

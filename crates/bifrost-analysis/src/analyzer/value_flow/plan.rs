@@ -13,7 +13,8 @@ use crate::analyzer::semantic::{
     CandidateCoverage, DeclarationLocator, DispatchBoundaryKind, EvidenceCompleteness,
     IcfgEdgeKind, MemoryLocationKind, ObjectCardinality, ProcedureHandle, ProgramPointHandle,
     ProgramPointId, ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticEffect,
-    SemanticGapImpact, SemanticGapKind, SemanticLocator, ValueFlowRelationKind, ValueFlowSnapshot,
+    SemanticGapImpact, SemanticGapKind, SemanticLocator, SemanticValueKind, ValueFlowRelationKind,
+    ValueFlowSnapshot,
 };
 use crate::hash::HashMap;
 
@@ -363,6 +364,18 @@ fn sanitize_removed_labels<'a>(
 enum SummaryProofRequirement {
     Derived,
     AcceptAuthoredComplete,
+}
+
+/// How one summary transfer input binds at a concrete call.
+///
+/// Constants deliberately have no value-flow carrier: no caller fact can flow
+/// into a literal. A transfer sourced by such a parameter is therefore an
+/// empty, vacuously modeled transfer rather than a missing-model gap (#2455).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummaryInputBinding {
+    Carrier(ValueFlowCarrierId),
+    VacuousConstant,
+    Unbound,
 }
 
 /// One residual dispatch arm closed by an authored-complete external summary
@@ -2045,10 +2058,13 @@ impl ValueFlowPlan {
                 SummaryProofRequirement::AcceptAuthoredComplete => evidence.is_complete(),
             };
             evidence_ok
-                && self.summary_port_carrier(call, transfer.input()).is_some()
-                && self
-                    .summary_port_carrier(call, transfer.exit().port())
-                    .is_some()
+                && match self.summary_input_binding(call, transfer.input()) {
+                    SummaryInputBinding::Carrier(_) => self
+                        .summary_port_carrier(call, transfer.exit().port())
+                        .is_some(),
+                    SummaryInputBinding::VacuousConstant => true,
+                    SummaryInputBinding::Unbound => false,
+                }
         })
     }
 
@@ -2328,6 +2344,32 @@ impl ValueFlowPlan {
         self.carrier_id(&ValueFlowCarrier::Value(value))
     }
 
+    fn summary_input_binding(
+        &self,
+        call: &CallSiteHandle,
+        port: &SummaryPort,
+    ) -> SummaryInputBinding {
+        if let Some(carrier) = self.summary_port_carrier(call, port) {
+            return SummaryInputBinding::Carrier(carrier);
+        }
+        let Some(row) = call.procedure().semantics().call_site(call.id()) else {
+            return SummaryInputBinding::Unbound;
+        };
+        let value_kind = match port {
+            SummaryPort::Parameter(index) => row
+                .arguments
+                .get(*index as usize)
+                .and_then(|argument| call.procedure().semantics().value(argument.value))
+                .map(|value| &value.kind),
+            _ => None,
+        };
+        if carrierless_summary_input_is_vacuous(port, value_kind) {
+            SummaryInputBinding::VacuousConstant
+        } else {
+            SummaryInputBinding::Unbound
+        }
+    }
+
     pub(crate) fn visit_boundary_transfers<'a>(
         &'a self,
         call: &CallSiteHandle,
@@ -2416,9 +2458,16 @@ impl ValueFlowPlan {
             .iter()
             .filter(|transfer| transfer.exit().kind() == exit)
         {
-            let Some(source) = self.summary_port_carrier(call, transfer.input()) else {
-                complete = false;
-                continue;
+            let source = match self.summary_input_binding(call, transfer.input()) {
+                SummaryInputBinding::Carrier(source) => source,
+                SummaryInputBinding::VacuousConstant => {
+                    complete &= summary_evidence_is_proven_complete(transfer.evidence());
+                    continue;
+                }
+                SummaryInputBinding::Unbound => {
+                    complete = false;
+                    continue;
+                }
             };
             let Some(target) = self.summary_port_carrier(call, transfer.exit().port()) else {
                 complete = false;
@@ -2636,6 +2685,39 @@ impl ValueFlowPlan {
     ) -> impl Iterator<Item = (ValueFlowSinkId, ValueFlowCarrierId)> {
         self.sinks_at(point, phase)
             .map(|sink| (sink.id, sink.carrier))
+    }
+}
+
+fn carrierless_summary_input_is_vacuous(
+    port: &SummaryPort,
+    value_kind: Option<&SemanticValueKind>,
+) -> bool {
+    matches!(port, SummaryPort::Parameter(_))
+        && matches!(value_kind, Some(SemanticValueKind::Constant))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_carrierless_constant_parameters_are_vacuous_summary_inputs() {
+        assert!(carrierless_summary_input_is_vacuous(
+            &SummaryPort::Parameter(0),
+            Some(&SemanticValueKind::Constant),
+        ));
+        assert!(!carrierless_summary_input_is_vacuous(
+            &SummaryPort::Parameter(0),
+            Some(&SemanticValueKind::Local),
+        ));
+        assert!(!carrierless_summary_input_is_vacuous(
+            &SummaryPort::Receiver,
+            Some(&SemanticValueKind::Constant),
+        ));
+        assert!(!carrierless_summary_input_is_vacuous(
+            &SummaryPort::Parameter(0),
+            None,
+        ));
     }
 }
 

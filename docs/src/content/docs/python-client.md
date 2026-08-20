@@ -117,7 +117,7 @@ retained bytes, cancellation/unavailability, and request-local fallbacks.
 Run the Python test suite with:
 
 ```bash
-scripts/test_python.sh
+scripts/public/test_python.sh
 ```
 
-`scripts/test_python.sh` provisions Python 3.12 through `uv`; the default Xcode Python may be older than the package test requirements.
+`scripts/public/test_python.sh` provisions Python 3.12 through `uv`; the default Xcode Python may be older than the package test requirements.

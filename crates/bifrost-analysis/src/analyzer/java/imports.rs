@@ -15,6 +15,7 @@ use crate::analyzer::ImportInfo;
 use crate::analyzer::jvm::external::{JvmExternalDeclarations, JvmExternalMember, JvmExternalType};
 use crate::analyzer::structural::resolution::{PrecedenceTier, RejectionReason};
 use crate::analyzer::usages::get_definition::trace;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_jvm::java::graph_support::{
     compute_java_relevant_imports, compute_java_same_package_reference_index,
     java_could_import_file, java_could_import_file_without_source, java_same_package_fqn,
@@ -31,7 +32,14 @@ pub(crate) enum JavaTypeResolution {
 
 impl ImportAnalysisProvider for JavaAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        Arc::new(self.resolve_imports(file).values().cloned().collect())
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        Arc::new(
+            self.resolve_imports(token, file)
+                .values()
+                .cloned()
+                .collect(),
+        )
     }
 
     fn import_infos_for_files(
@@ -72,8 +80,8 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         result
     }
 
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
-        self.inner.import_info_of(file)
+    fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
+        self.inner.import_info_of(token, file)
     }
 
     fn imported_code_units_from_infos(
@@ -81,17 +89,22 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         _file: &ProjectFile,
         imports: &[ImportInfo],
     ) -> Option<Arc<HashSet<CodeUnit>>> {
+        let scope = AnalyzerQueryScope::new(self);
         Some(Arc::new(
-            self.resolve_import_infos(imports).into_values().collect(),
+            self.resolve_import_infos(scope.token(), imports)
+                .into_values()
+                .collect(),
         ))
     }
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         if let Some(cached) = self.memo_caches.relevant_imports.get(code_unit) {
             return (*cached).clone();
         }
 
-        let matched_imports = compute_java_relevant_imports(self, code_unit);
+        let matched_imports = compute_java_relevant_imports(self, token, code_unit);
         self.memo_caches
             .relevant_imports
             .insert(code_unit.clone(), Arc::new(matched_imports.clone()));
@@ -128,25 +141,37 @@ impl JavaAnalyzer {
         java_could_import_file_without_source(self, imports, target)
     }
 
-    pub(super) fn resolve_imports(&self, file: &ProjectFile) -> Arc<HashMap<String, CodeUnit>> {
+    pub(super) fn resolve_imports(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Arc<HashMap<String, CodeUnit>> {
         if let Some(cached) = self.memo_caches.resolved_imports.get(file) {
             return cached;
         }
 
-        let resolved = Arc::new(self.resolve_imports_uncached(file));
+        let resolved = Arc::new(self.resolve_imports_uncached(token, file));
         self.memo_caches
             .resolved_imports
             .insert(file.clone(), Arc::clone(&resolved));
         resolved
     }
 
-    fn resolve_imports_uncached(&self, file: &ProjectFile) -> HashMap<String, CodeUnit> {
-        let imports = self.inner.import_info_of(file);
-        self.resolve_import_infos(&imports)
+    fn resolve_imports_uncached(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> HashMap<String, CodeUnit> {
+        let imports = self.inner.import_info_of(token, file);
+        self.resolve_import_infos(token, &imports)
     }
 
-    pub(crate) fn resolve_import_infos(&self, imports: &[ImportInfo]) -> HashMap<String, CodeUnit> {
-        resolve_java_import_infos(self, imports)
+    pub(crate) fn resolve_import_infos(
+        &self,
+        token: QueryToken<'_>,
+        imports: &[ImportInfo],
+    ) -> HashMap<String, CodeUnit> {
+        resolve_java_import_infos(self, token, imports)
     }
 
     /// Resolve `raw_name` in `file` against the workspace and then the external
@@ -160,6 +185,7 @@ impl JavaAnalyzer {
     /// `None` and reads the artifact half alone.
     pub(crate) fn resolve_type_name_with_external(
         &self,
+        token: QueryToken<'_>,
         packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
         file: &ProjectFile,
         raw_name: &str,
@@ -169,7 +195,7 @@ impl JavaAnalyzer {
             return None;
         }
 
-        if let Some(code_unit) = resolve_java_type_name(self, file, normalized) {
+        if let Some(code_unit) = resolve_java_type_name(self, token, file, normalized) {
             return Some(JavaTypeResolution::Source(code_unit));
         }
 
@@ -187,14 +213,19 @@ impl JavaAnalyzer {
         }
 
         if let Some(external_type) =
-            self.resolve_external_imports(&external, file, normalized, &access_package)
+            self.resolve_external_imports(token, &external, file, normalized, &access_package)
         {
             return Some(JavaTypeResolution::External(external_type));
         }
 
         if let Some((first, rest)) = normalized.split_once('.')
-            && let Some(owner) =
-                self.resolve_visible_external_simple_type(&external, file, first, &access_package)
+            && let Some(owner) = self.resolve_visible_external_simple_type(
+                token,
+                &external,
+                file,
+                first,
+                &access_package,
+            )
         {
             let nested_fqn = format!("{}.{}", owner.fqn(), rest);
             if let Some(external_type) =
@@ -234,6 +265,7 @@ impl JavaAnalyzer {
     /// one.
     pub(crate) fn explicit_imported_type_fqn(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         simple_name: &str,
     ) -> Option<String> {
@@ -241,7 +273,7 @@ impl JavaAnalyzer {
             return None;
         }
         let mut match_fqn = None;
-        for import in self.inner.import_info_of(file) {
+        for import in self.inner.import_info_of(token, file) {
             if import.is_wildcard {
                 continue;
             }
@@ -281,6 +313,7 @@ impl JavaAnalyzer {
     /// onto the dispatching analyzer, never onto this Java delegate.
     pub(crate) fn resolve_member_name_with_external(
         &self,
+        token: QueryToken<'_>,
         packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
         file: &ProjectFile,
         raw_name: &str,
@@ -295,7 +328,7 @@ impl JavaAnalyzer {
         }
         let access_package = self.package_name_of(file).unwrap_or_default();
         external.resolve_member_spelling(normalized, &access_package, |owner_spelling| {
-            match self.resolve_type_name_with_external(packs, file, owner_spelling) {
+            match self.resolve_type_name_with_external(token, packs, file, owner_spelling) {
                 Some(JavaTypeResolution::External(external_type)) => Some(external_type),
                 Some(JavaTypeResolution::Source(_)) | None => None,
             }
@@ -304,13 +337,14 @@ impl JavaAnalyzer {
 
     fn resolve_visible_external_simple_type(
         &self,
+        token: QueryToken<'_>,
         external: &JvmExternalDeclarations<'_>,
         file: &ProjectFile,
         name: &str,
         access_package: &str,
     ) -> Option<JvmExternalType> {
         if let Some(external_type) =
-            self.resolve_external_imports(external, file, name, access_package)
+            self.resolve_external_imports(token, external, file, name, access_package)
         {
             return Some(external_type);
         }
@@ -322,12 +356,13 @@ impl JavaAnalyzer {
 
     fn resolve_external_imports(
         &self,
+        token: QueryToken<'_>,
         external: &JvmExternalDeclarations<'_>,
         file: &ProjectFile,
         name: &str,
         access_package: &str,
     ) -> Option<JvmExternalType> {
-        for import in self.inner.import_info_of(file) {
+        for import in self.inner.import_info_of(token, file) {
             let Some(import_path) = non_static_import_path(&import) else {
                 continue;
             };
@@ -344,7 +379,7 @@ impl JavaAnalyzer {
         }
 
         let mut wildcard_match: Option<JvmExternalType> = None;
-        for import in self.inner.import_info_of(file) {
+        for import in self.inner.import_info_of(token, file) {
             let Some(import_path) = non_static_import_path(&import) else {
                 continue;
             };

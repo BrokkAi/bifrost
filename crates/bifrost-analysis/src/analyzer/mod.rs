@@ -220,7 +220,8 @@ pub use source_ingestion::{
     IngestedSource, SourceIngestionError, SourceIngestionKind, ingest_source_bytes,
 };
 pub(crate) use tree_sitter_analyzer::{
-    AnalyzerStoreContext, BulkFileStateSource, default_store_context, persistent_store_context,
+    AnalyzerStoreContext, BuildAbort, BulkFileStateSource, default_store_context,
+    persistent_store_context,
 };
 pub use tree_sitter_analyzer::{
     BuildProgress, BuildProgressEvent, BuildProgressPhase, LanguageAdapter, TreeSitterAnalyzer,

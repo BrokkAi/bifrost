@@ -17,11 +17,13 @@ use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{
     BulkFileStateSource, CodeUnit, IAnalyzer, KotlinAnalyzer, Language, ProjectFile,
     resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_jvm::kotlin::graph::extractor::{ScanState, scan_file};
 use brokk_bifrost_jvm::kotlin::graph::inverted::scan_file as scan_inverted_file;
 use brokk_bifrost_jvm::kotlin::graph::resolver::TargetSpec;
@@ -48,12 +50,14 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
         let _spec_scope = crate::profiling::scope("kotlin_graph::target_spec");
         let Some(spec) = with_kotlin_graph_source(analyzer, |graph| {
-            TargetSpec::from_targets(&graph, overloads)
+            TargetSpec::from_targets(&graph, token, overloads)
         }) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
@@ -103,7 +107,7 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
                     break;
                 }
                 let _file_scope = crate::profiling::scope("kotlin_graph::scan_file");
-                scan_file(&graph, &file, &spec, &mut state);
+                scan_file(&graph, token, &file, &spec, &mut state);
                 if *state.limit_exceeded {
                     break;
                 }
@@ -117,6 +121,7 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
             let _cross_scope = crate::profiling::scope("kotlin_graph::scan_jvm_files");
             crate::analyzer::usages::java_graph::scan_jvm_files_for_foreign_type(
                 analyzer,
+                token,
                 scan_scope.candidate_files(),
                 target,
                 max_usages,
@@ -173,6 +178,8 @@ pub(crate) fn scan_kotlin_files_for_jvm_type(
     raw_match_count: &mut usize,
     limit_exceeded: &mut bool,
 ) {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     if *limit_exceeded || !target.is_class() {
         return;
     }
@@ -180,7 +187,7 @@ pub(crate) fn scan_kotlin_files_for_jvm_type(
         return;
     }
     let Some(spec) = with_kotlin_graph_source(analyzer, |graph| {
-        TargetSpec::from_targets(&graph, std::slice::from_ref(target))
+        TargetSpec::from_targets(&graph, token, std::slice::from_ref(target))
     }) else {
         return;
     };
@@ -199,7 +206,7 @@ pub(crate) fn scan_kotlin_files_for_jvm_type(
     };
     with_kotlin_graph_source(analyzer, |graph| {
         for file in ordered {
-            scan_file(&graph, &file, &spec, &mut state);
+            scan_file(&graph, token, &file, &spec, &mut state);
             if *state.limit_exceeded {
                 break;
             }
@@ -244,25 +251,41 @@ impl<'a> KotlinEdgeResolver<'a> {
     pub(crate) fn build_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         nodes: &HashSet<String>,
         keep_file: F,
     ) -> UsageEdges
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        build_kotlin_edges(analyzer, &self.files, &self.file_states, nodes, keep_file)
+        build_kotlin_edges(
+            analyzer,
+            token,
+            &self.files,
+            &self.file_states,
+            nodes,
+            keep_file,
+        )
     }
 
     pub(crate) fn build_edge_weights<F>(
         &self,
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         nodes: &HashSet<String>,
         keep_file: F,
     ) -> UsageEdgeWeights
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        build_kotlin_edges(analyzer, &self.files, &self.file_states, nodes, keep_file)
+        build_kotlin_edges(
+            analyzer,
+            token,
+            &self.files,
+            &self.file_states,
+            nodes,
+            keep_file,
+        )
     }
 }
 
@@ -276,6 +299,7 @@ impl<'a> KotlinEdgeResolver<'a> {
 /// the decoded facts across).
 fn build_kotlin_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     files: &[ProjectFile],
     file_states: &HashMap<ProjectFile, FileState>,
     nodes: &HashSet<String>,
@@ -306,7 +330,7 @@ where
                 nodes,
                 ParseSpec::whole(&language),
                 declarations,
-                |input| scan_inverted_file(&graph, file, input, class_ranges),
+                |input| scan_inverted_file(&graph, token, file, input, class_ranges),
             )
         })
     })

@@ -530,6 +530,7 @@ fn build_summary(candidate: GoldenCandidate, realm: GoldenRealm) -> AuthoredProc
         locations: Vec::new(),
         transfers: candidate.transfers,
         effects: Vec::new(),
+        declared_effects: Vec::new(),
     }
 }
 

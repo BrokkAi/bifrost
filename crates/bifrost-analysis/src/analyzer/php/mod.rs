@@ -25,6 +25,7 @@ pub use external::{
     ComposerPackagePackProducer, ComposerPinnedAutoloadRule, PhpDependencyPackAdapter,
 };
 
+use crate::analyzer::QueryScope;
 use crate::analyzer::QueryToken;
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
@@ -522,7 +523,10 @@ impl IAnalyzer for PhpAnalyzer {
     }
 
     fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
+        // Trait signature is fixed, so this boundary opens the scope the
+        // usage-graph funnel now demands proof of (issue #2423 milestone B).
+        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        self.inner.global_usage_definition_index(scope.token())
     }
 
     fn usage_facts_index(&self) -> &UsageFactsIndex {

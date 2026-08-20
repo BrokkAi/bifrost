@@ -25,6 +25,7 @@ use crate::scala::graph_support::{ScalaSource, ScalaWorkspaceSource};
 use crate::scala::wildcard_imports::scala_import_path;
 use crate::scala::{scala_nested_type_candidates, scala_short_name_terminal_segment};
 use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::common::{
     SNIPPET_CONTEXT_LINES, external_usage_hit_count, usage_hit,
 };
@@ -137,6 +138,7 @@ fn ensure_catalog_active(
 impl ScalaQueryTargetCatalog {
     pub fn build(
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         targets: &[CodeUnit],
         cancellation: Option<&CancellationToken>,
     ) -> Result<Self, ScalaCatalogBuildError> {
@@ -162,7 +164,7 @@ impl ScalaQueryTargetCatalog {
         let mut specs = Vec::with_capacity(targets.len());
         for (target_id, target) in targets.iter().enumerate() {
             ensure_catalog_active(cancellation)?;
-            let spec = TargetSpec::from_target(scala, target)
+            let spec = TargetSpec::from_target(scala, token, target)
                 .ok_or_else(|| ScalaCatalogBuildError::UnsupportedTarget(target.clone()))?;
             if matches!(spec.kind, TargetKind::Method | TargetKind::Field) {
                 let role = if spec.kind == TargetKind::Field {
@@ -238,7 +240,7 @@ impl ScalaQueryTargetCatalog {
                         if !apply.is_function()
                             || !scala
                                 .project_types()
-                                .callable_alternatives_for(scala, &apply)
+                                .callable_alternatives_for(scala, token, &apply)
                                 .iter()
                                 .any(|alternative| {
                                     alternative

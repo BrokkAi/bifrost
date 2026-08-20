@@ -21,6 +21,7 @@ use crate::packages::{GO_MODULE_SCOPE_SEGMENT, GoWorkspacePathIndex};
 use brokk_bifrost_core::analyzer::capabilities::{ImportAnalysisProvider, TypeAliasProvider};
 use brokk_bifrost_core::analyzer::common::language_for_file;
 use brokk_bifrost_core::analyzer::model::{ImportInfo, StructuredTypeIdentity};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 pub use brokk_bifrost_core::analyzer::usages::common::node_text;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
 use brokk_bifrost_core::analyzer::usages::{ImportEdge, ImportEdgeKind};
@@ -39,6 +40,9 @@ use tree_sitter::{Node, Parser, Tree};
 /// each field is a reference the caller already holds.
 #[derive(Clone, Copy)]
 pub struct GoGraphSource<'a> {
+    /// Proof that a request scope is open: the import accessors below cross
+    /// the import tier's storage (issue #2423).
+    pub token: QueryToken<'a>,
     pub index: &'a dyn CodeUnitIndex,
     pub imports: &'a dyn ImportAnalysisProvider,
     pub type_aliases: &'a dyn TypeAliasProvider,
@@ -1070,7 +1074,7 @@ fn namespace_packages_from(
     workspace_paths: &GoWorkspacePathIndex,
     target_package_name: impl Fn(&ProjectFile) -> Option<String>,
 ) -> NamespacePackages {
-    let imports = source.imports.import_info_of(file);
+    let imports = source.imports.import_info_of(source.token, file);
     namespace_packages_from_imports(
         file,
         &imports,
@@ -1259,7 +1263,7 @@ pub fn resolve_go_import_bindings(
     declared_package_name: impl Fn(&str) -> Option<String>,
 ) -> GoImportBindings {
     let dir_index = build_parent_dir_index(package_names.keys());
-    let imports = source.imports.import_info_of(file);
+    let imports = source.imports.import_info_of(source.token, file);
     import_bindings_from_imports(
         file,
         &imports,

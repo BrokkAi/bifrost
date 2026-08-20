@@ -83,6 +83,7 @@ pub enum ValueShape {
     StringPredicate,
     RegexPredicate,
     KindList,
+    DeclaredVisibilityList,
     LanguageList,
     PositiveInteger,
     NonNegativeInteger,
@@ -147,6 +148,9 @@ impl ValueShape {
             Self::StringPredicate => "an exact string or regex predicate",
             Self::RegexPredicate => "a regex predicate object",
             Self::KindList => "a normalized kind or list of kinds",
+            Self::DeclaredVisibilityList => {
+                "a declared-visibility label or list of labels (public, protected, internal, package_private, private, crate_or_module, unknown)"
+            }
             Self::LanguageList => "one or more language labels",
             Self::PositiveInteger => "a positive integer",
             Self::NonNegativeInteger => "a non-negative integer",
@@ -690,6 +694,9 @@ macro_rules! rql_forms {
                     Self::NotHas => Some(RqlProperty::NotHas),
                     Self::NotKind => Some(RqlProperty::NotKind),
                     Self::Arity => Some(RqlProperty::Arity),
+                    Self::Visibility => Some(RqlProperty::Visibility),
+                    Self::ParameterType => Some(RqlProperty::ParameterType),
+                    Self::ParameterTypeRegex => Some(RqlProperty::ParameterTypeRegex),
                 }
             }
         }
@@ -1447,6 +1454,27 @@ rql_forms! {
         signature: "(arity count | :min count :max count)",
         description: "Match a call by its positional argument count: an exact count, or inclusive :min/:max bounds.",
     }
+    Visibility {
+        labels: ["visibility"],
+        class: Predicate,
+        shape: DeclaredVisibilityList,
+        signature: "(visibility public|[public protected ...])",
+        description: "Match a callable declaration by the visibility its adapter recorded from modifiers. unknown means the adapter looked and could not classify; it is never equal to public.",
+    }
+    ParameterType {
+        labels: ["parameter-type", "parameter_type"],
+        class: Predicate,
+        shape: String,
+        signature: "(parameter-type \"String\")",
+        description: "Match a callable that has a parameter whose recorded type spelling equals this string. The spelling is a discriminator, not a resolved type identity.",
+    }
+    ParameterTypeRegex {
+        labels: ["parameter-type/regex", "parameter_type/regex"],
+        class: Predicate,
+        shape: String,
+        signature: "(parameter-type/regex \"pattern\")",
+        description: "Match a callable that has a parameter whose recorded type spelling matches this regular expression.",
+    }
 }
 
 macro_rules! rql_properties {
@@ -1542,6 +1570,24 @@ rql_properties! {
         shape: Arity,
         signature: ":arity count",
         description: "Match a call by its exact positional argument count.",
+    }
+    Visibility {
+        labels: ["visibility"],
+        shape: DeclaredVisibilityList,
+        signature: ":visibility public|[public protected ...]",
+        description: "Match a callable declaration by recorded modifier visibility.",
+    }
+    ParameterType {
+        labels: ["parameter-type", "parameter_type"],
+        shape: String,
+        signature: ":parameter-type \"String\"",
+        description: "Match a callable that has a parameter whose recorded type spelling equals this string.",
+    }
+    ParameterTypeRegex {
+        labels: ["parameter-type/regex", "parameter_type/regex"],
+        shape: RegexString,
+        signature: ":parameter-type/regex \"pattern\"",
+        description: "Match a callable that has a parameter whose recorded type spelling matches this regular expression.",
     }
     Has {
         labels: ["has"],
@@ -2162,6 +2208,8 @@ json_fields! {
     Text { label: "text", shape: RegexPredicate, signature: "\"text\": { \"regex\": \"pattern\" }", description: "Match the node's source text with a regular expression." }
     Capture { label: "capture", shape: String, signature: "\"capture\": \"label\"", description: "Capture the matching node under a result label." }
     Arity { label: "arity", shape: Arity, signature: "\"arity\": count | { \"min\": count, \"max\": count }", description: "Match a call by its positional argument count: an exact count, or inclusive min/max bounds." }
+    Visibility { label: "visibility", shape: DeclaredVisibilityList, signature: "\"visibility\": \"public\" | [\"public\", \"protected\", ...]", description: "Match a callable declaration by the visibility its adapter recorded from modifiers." }
+    ParameterType { label: "parameter_type", shape: StringPredicate, signature: "\"parameter_type\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match a callable that has a parameter whose recorded type spelling satisfies this predicate. The spelling is a discriminator, not a resolved type identity." }
     Has { label: "has", shape: Pattern, signature: "\"has\": { pattern }", description: "Require a matching descendant." }
     NotHas { label: "not_has", shape: Pattern, signature: "\"not_has\": { pattern }", description: "Exclude nodes containing a matching descendant." }
 }

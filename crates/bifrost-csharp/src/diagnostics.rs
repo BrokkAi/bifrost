@@ -29,6 +29,7 @@ use brokk_bifrost_core::analyzer::model::{
     SemanticAbsenceProof, SemanticDiagnostic, SemanticDiagnosticDomain,
     SemanticDiagnosticIncompleteReason, SemanticDiagnosticReport,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{node_range, node_text, same_node};
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
@@ -132,6 +133,7 @@ pub trait CSharpExternalEvidence {
 /// Collect C# semantic diagnostics and the proof behind each one.
 pub fn collect_csharp_semantic_diagnostics(
     csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
     external: &dyn CSharpExternalEvidence,
     file: &ProjectFile,
     source: &str,
@@ -197,9 +199,9 @@ pub fn collect_csharp_semantic_diagnostics(
     // The `using` directives are checked first and in one pass: whether the
     // namespaces a file opens are all visible decides whether an unqualified
     // reference that misses everywhere was checked against a complete surface.
-    collector.check_using_directives(&tree);
+    collector.check_using_directives(token, &tree);
     collector.collect_partial_declarations(&tree);
-    collector.scan_tree(tree.root_node());
+    collector.scan_tree(token, tree.root_node());
     collector.report
 }
 
@@ -275,7 +277,7 @@ enum ScanFrame<'tree> {
 impl CSharpDiagnosticCollector<'_> {
     // -- using directives ---------------------------------------------------
 
-    fn check_using_directives(&mut self, tree: &Tree) {
+    fn check_using_directives(&mut self, token: QueryToken<'_>, tree: &Tree) {
         let mut cursor = tree.root_node().walk();
         let mut stack = vec![tree.root_node()];
         let mut directives = Vec::new();
@@ -299,11 +301,11 @@ impl CSharpDiagnosticCollector<'_> {
         }
         directives.sort_by_key(Node::start_byte);
         for directive in directives {
-            self.check_using_directive(directive);
+            self.check_using_directive(token, directive);
         }
     }
 
-    fn check_using_directive(&mut self, node: Node<'_>) {
+    fn check_using_directive(&mut self, token: QueryToken<'_>, node: Node<'_>) {
         let range = self.range_of(node);
         // The namespace form is read off the directive node, not off its text:
         // the parser already tells a plain `using` apart from `using static`
@@ -318,7 +320,7 @@ impl CSharpDiagnosticCollector<'_> {
             let Some(target) = csharp_using_directive_target_identity(node, self.source) else {
                 return;
             };
-            self.check_type_identity(range, &target);
+            self.check_type_identity(token, range, &target);
             return;
         }
         let Some((_, target)) = csharp_using_alias_from_node(node, self.source) else {
@@ -331,7 +333,7 @@ impl CSharpDiagnosticCollector<'_> {
                 .push_resolved(range, self.namespace_boundary(&target));
             return;
         }
-        self.check_type_identity(range, &target);
+        self.check_type_identity(token, range, &target);
     }
 
     fn check_using_namespace(&mut self, range: Range, namespace: &str) {
@@ -435,7 +437,7 @@ impl CSharpDiagnosticCollector<'_> {
 
     // -- the tree walk ------------------------------------------------------
 
-    fn scan_tree(&mut self, root: Node<'_>) {
+    fn scan_tree(&mut self, token: QueryToken<'_>, root: Node<'_>) {
         let mut stack = vec![ScanFrame::Node(root)];
         while let Some(frame) = stack.pop() {
             if self.diagnostic_count >= MAX_CSHARP_SEMANTIC_DIAGNOSTICS {
@@ -444,7 +446,7 @@ impl CSharpDiagnosticCollector<'_> {
                 break;
             }
             match frame {
-                ScanFrame::Node(node) => self.scan_node(node, &mut stack),
+                ScanFrame::Node(node) => self.scan_node(token, node, &mut stack),
                 ScanFrame::ExitTypeParameters => {
                     self.type_parameters.pop();
                 }
@@ -452,7 +454,12 @@ impl CSharpDiagnosticCollector<'_> {
         }
     }
 
-    fn scan_node<'tree>(&mut self, node: Node<'tree>, stack: &mut Vec<ScanFrame<'tree>>) {
+    fn scan_node<'tree>(
+        &mut self,
+        token: QueryToken<'_>,
+        node: Node<'tree>,
+        stack: &mut Vec<ScanFrame<'tree>>,
+    ) {
         // A `using` directive was already checked in its own pass; descending
         // into one here would check its target a second time.
         if node.kind() == "using_directive" {
@@ -463,21 +470,21 @@ impl CSharpDiagnosticCollector<'_> {
             stack.push(ScanFrame::ExitTypeParameters);
         }
         if node.kind() == "member_access_expression" {
-            self.check_member_access(node);
+            self.check_member_access(token, node);
         } else if is_type_reference_position(node) {
-            self.check_type_reference(node);
+            self.check_type_reference(token, node);
         }
         push_named_children(stack, node);
     }
 
     // -- type references ----------------------------------------------------
 
-    fn check_type_reference(&mut self, node: Node<'_>) {
+    fn check_type_reference(&mut self, token: QueryToken<'_>, node: Node<'_>) {
         let identity = csharp_type_node_identity(node, self.source);
         if self.is_uncheckable_type_identity(&identity) {
             return;
         }
-        self.check_type_identity(self.range_of(node), &identity);
+        self.check_type_identity(token, self.range_of(node), &identity);
     }
 
     /// Names that are not lookups: a predefined keyword type, the inferred
@@ -495,8 +502,8 @@ impl CSharpDiagnosticCollector<'_> {
             .any(|frame| frame.contains(head.as_str()))
     }
 
-    fn check_type_identity(&mut self, range: Range, identity: &str) {
-        match self.workspace_types(identity) {
+    fn check_type_identity(&mut self, token: QueryToken<'_>, range: Range, identity: &str) {
+        match self.workspace_types(token, identity) {
             WorkspaceTypes::One => {
                 self.report
                     .push_resolved(range, BoundaryStatus::WorkspaceLocal);
@@ -514,19 +521,19 @@ impl CSharpDiagnosticCollector<'_> {
     /// The same helper `get_definition` resolves a C# type reference with, so a
     /// name this pass calls absent is one the definition route also fails to
     /// find.
-    fn visible_types(&self, identity: &str) -> Vec<CodeUnit> {
+    fn visible_types(&self, token: QueryToken<'_>, identity: &str) -> Vec<CodeUnit> {
         if let Some(known) = self.visible_types.borrow().get(identity) {
             return known.clone();
         }
-        let candidates = visible_type_candidates(self.csharp, self.file, identity);
+        let candidates = visible_type_candidates(self.csharp, token, self.file, identity);
         self.visible_types
             .borrow_mut()
             .insert(identity.to_string(), candidates.clone());
         candidates
     }
 
-    fn workspace_types(&self, identity: &str) -> WorkspaceTypes {
-        let candidates = self.visible_types(identity);
+    fn workspace_types(&self, token: QueryToken<'_>, identity: &str) -> WorkspaceTypes {
+        let candidates = self.visible_types(token, identity);
         match logical_type_count(&candidates) {
             0 => WorkspaceTypes::None,
             1 => WorkspaceTypes::One,
@@ -619,7 +626,7 @@ impl CSharpDiagnosticCollector<'_> {
 
     // -- member accesses ----------------------------------------------------
 
-    fn check_member_access(&mut self, node: Node<'_>) {
+    fn check_member_access(&mut self, token: QueryToken<'_>, node: Node<'_>) {
         let (Some(receiver), Some(name_node)) = (
             node.child_by_field_name("expression"),
             node.child_by_field_name("name"),
@@ -638,8 +645,10 @@ impl CSharpDiagnosticCollector<'_> {
         if !receiver_identity.is_empty() && self.namespace_is_visible(&receiver_identity) {
             return;
         }
-        match self.member_owner(receiver, &receiver_identity) {
-            Ok(MemberOwner::Workspace { fqn }) => self.check_workspace_member(range, &fqn, &member),
+        match self.member_owner(token, receiver, &receiver_identity) {
+            Ok(MemberOwner::Workspace { fqn }) => {
+                self.check_workspace_member(token, range, &fqn, &member)
+            }
             Ok(MemberOwner::External { fqn }) => self.check_external_member(range, &fqn, &member),
             Err(reason) => self.report.push_incomplete(Some(range), vec![reason]),
         }
@@ -648,6 +657,7 @@ impl CSharpDiagnosticCollector<'_> {
     /// Prove what a member access reads through, or say why this pass cannot.
     fn member_owner(
         &self,
+        token: QueryToken<'_>,
         receiver: Node<'_>,
         receiver_identity: &str,
     ) -> Result<MemberOwner, SemanticDiagnosticIncompleteReason> {
@@ -660,7 +670,7 @@ impl CSharpDiagnosticCollector<'_> {
                     detail: "`this` appears outside a type declaration".to_string(),
                 });
             };
-            return self.type_owner(&enclosing).ok_or_else(|| {
+            return self.type_owner(token, &enclosing).ok_or_else(|| {
                 SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
                     detail: format!("enclosing type `{enclosing}` does not resolve uniquely"),
                 }
@@ -673,12 +683,12 @@ impl CSharpDiagnosticCollector<'_> {
         // value does have as absent.
         if receiver.kind() == "identifier" {
             let symbol = node_text(receiver, self.source).trim();
-            match self.declared_type_of_binding(receiver, symbol) {
+            match self.declared_type_of_binding(token, receiver, symbol) {
                 // The seeder proved this identity against the workspace, so it
                 // is looked up as an identity rather than re-read as a written
                 // name.
                 Ok(CSharpDeclaredType::Resolved { fqn }) => {
-                    return self.resolved_type_owner(&fqn, symbol);
+                    return self.resolved_type_owner(token, &fqn, symbol);
                 }
                 Ok(CSharpDeclaredType::Spelling(spelling)) => {
                     // Only a written spelling can say `dynamic`; a resolved
@@ -688,7 +698,7 @@ impl CSharpDiagnosticCollector<'_> {
                             detail: format!("`{symbol}` is declared `dynamic`"),
                         });
                     }
-                    return self.type_owner(&spelling).ok_or_else(|| {
+                    return self.type_owner(token, &spelling).ok_or_else(|| {
                         SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
                             detail: format!("receiver `{symbol}` has no uniquely resolved type"),
                         }
@@ -698,7 +708,7 @@ impl CSharpDiagnosticCollector<'_> {
                 // this is a static access.
                 Err(unbound) => {
                     return self
-                        .type_owner(symbol)
+                        .type_owner(token, symbol)
                         .filter(|_| !self.is_uncheckable_type_identity(symbol))
                         .ok_or(unbound);
                 }
@@ -714,7 +724,7 @@ impl CSharpDiagnosticCollector<'_> {
                 ),
             });
         }
-        self.type_owner(receiver_identity).ok_or_else(|| {
+        self.type_owner(token, receiver_identity).ok_or_else(|| {
             SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
                 detail: format!("receiver `{receiver_identity}` has no uniquely resolved type"),
             }
@@ -730,6 +740,7 @@ impl CSharpDiagnosticCollector<'_> {
     /// body instead would miss a field declared after the method that reads it.
     fn declared_type_of_binding(
         &self,
+        token: QueryToken<'_>,
         receiver: Node<'_>,
         symbol: &str,
     ) -> Result<CSharpDeclaredType, SemanticDiagnosticIncompleteReason> {
@@ -738,6 +749,7 @@ impl CSharpDiagnosticCollector<'_> {
             file_root(receiver),
             receiver.start_byte(),
             self.csharp,
+            token,
             self.file,
             self.source,
             &mut bindings,
@@ -770,10 +782,11 @@ impl CSharpDiagnosticCollector<'_> {
     /// the declaration it names, or this request cannot say what it names.
     fn resolved_type_owner(
         &self,
+        token: QueryToken<'_>,
         fqn: &str,
         symbol: &str,
     ) -> Result<MemberOwner, SemanticDiagnosticIncompleteReason> {
-        let candidates = self.visible_types(&format!("global::{fqn}"));
+        let candidates = self.visible_types(token, &format!("global::{fqn}"));
         // The seeder resolved this fq name against the same generation this
         // lookup reads, so it names exactly one logical declaration.
         debug_assert_eq!(
@@ -792,8 +805,8 @@ impl CSharpDiagnosticCollector<'_> {
     }
 
     /// The unique declaration a type name identifies, workspace first.
-    fn type_owner(&self, identity: &str) -> Option<MemberOwner> {
-        let candidates = self.visible_types(identity);
+    fn type_owner(&self, token: QueryToken<'_>, identity: &str) -> Option<MemberOwner> {
+        let candidates = self.visible_types(token, identity);
         if logical_type_count(&candidates) == 1 {
             return first_logical_type_fqn(&candidates).map(|fqn| MemberOwner::Workspace { fqn });
         }
@@ -806,7 +819,13 @@ impl CSharpDiagnosticCollector<'_> {
         }
     }
 
-    fn check_workspace_member(&mut self, range: Range, owner_fqn: &str, member: &str) {
+    fn check_workspace_member(
+        &mut self,
+        token: QueryToken<'_>,
+        range: Range,
+        owner_fqn: &str,
+        member: &str,
+    ) {
         if !self
             .csharp
             .member_candidates_for_owner(owner_fqn, member)
@@ -819,7 +838,7 @@ impl CSharpDiagnosticCollector<'_> {
         // The owner's own declarations are only part of its surface. Walking
         // its ancestors is what makes a miss a proof rather than a guess, and
         // an ancestor this pass cannot resolve leaves the rest unknown (#1789).
-        match self.inherited_member(owner_fqn, member) {
+        match self.inherited_member(token, owner_fqn, member) {
             InheritedMember::Found { boundary } => self.report.push_resolved(range, boundary),
             InheritedMember::IncompleteSurface { detail } => self.report.push_incomplete(
                 Some(range),
@@ -953,12 +972,17 @@ impl CSharpDiagnosticCollector<'_> {
     }
 
     /// Walk the owner's ancestors for `member`.
-    fn inherited_member(&self, owner_fqn: &str, member: &str) -> InheritedMember {
+    fn inherited_member(
+        &self,
+        token: QueryToken<'_>,
+        owner_fqn: &str,
+        member: &str,
+    ) -> InheritedMember {
         let mut seen: HashSet<String> = HashSet::default();
         seen.insert(owner_fqn.to_string());
         let mut queue: Vec<String> = vec![owner_fqn.to_string()];
         while let Some(current) = queue.pop() {
-            let Some(unit) = self.workspace_type_unit(&current) else {
+            let Some(unit) = self.workspace_type_unit(token, &current) else {
                 // The chain leaves the workspace. Only the index can say what
                 // the rest of the surface holds.
                 if let Some(reason) = &self.unreadable_external {
@@ -982,7 +1006,7 @@ impl CSharpDiagnosticCollector<'_> {
                 }
             };
             for raw in self.csharp.raw_supertypes_of(&unit) {
-                let candidates = self.visible_types(&raw);
+                let candidates = self.visible_types(token, &raw);
                 match logical_type_count(&candidates) {
                     1 => {
                         let Some(fqn) = first_logical_type_fqn(&candidates) else {
@@ -1023,8 +1047,8 @@ impl CSharpDiagnosticCollector<'_> {
         InheritedMember::Absent
     }
 
-    fn workspace_type_unit(&self, fqn: &str) -> Option<CodeUnit> {
-        let candidates = self.visible_types(fqn);
+    fn workspace_type_unit(&self, token: QueryToken<'_>, fqn: &str) -> Option<CodeUnit> {
+        let candidates = self.visible_types(token, fqn);
         (logical_type_count(&candidates) == 1)
             .then(|| {
                 candidates

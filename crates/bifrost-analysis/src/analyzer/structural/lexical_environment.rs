@@ -41,7 +41,9 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::semantic::ContentIdentity;
 use crate::analyzer::structural_spec_for;
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CodeUnit, FqName, IAnalyzer, ImportInfo, Language, ProjectFile, Range};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 /// The axes this producer answers. The two candidate axes
 /// ([`EnvironmentAxis::CandidateSelection`] and
@@ -370,6 +372,8 @@ pub enum BindingOfOutcome {
 /// One file's lexical environment, derived from its structural facts plus the
 /// adapter's binding-activation hook.
 pub fn environment_for_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> EnvironmentFileResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let language = language_for_file(file);
     let Some(spec) = structural_spec_for(language) else {
         return unavailable(file, EnvironmentIncompleteReason::NoStructuralAdapter);
@@ -414,6 +418,7 @@ pub fn environment_for_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Env
     if support.is_supported(EnvironmentAxis::ImportBinders) && !scopes.is_empty() {
         bindings.extend(import_binder_rows(
             analyzer,
+            token,
             file,
             &facts,
             &scopes,
@@ -622,6 +627,7 @@ fn binding_rows(
 /// the two row sources are disjoint by construction.
 fn import_binder_rows(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     facts: &FileFacts,
     scopes: &[ScopeRow],
@@ -631,7 +637,7 @@ fn import_binder_rows(
     let Some(provider) = analyzer.import_analysis_provider_for_file(file) else {
         return Vec::new();
     };
-    let imports = provider.import_info_of(file);
+    let imports = provider.import_info_of(token, file);
     let wildcard_count = imports.iter().filter(|import| import.is_wildcard).count();
     let content_identity = facts.source_identity();
 

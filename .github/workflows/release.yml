@@ -105,7 +105,7 @@ jobs:
           if [[ -n "${QUALIFICATION_RUN_ID_INPUT:-}" ]]; then
             selection_args+=(--run-id "$QUALIFICATION_RUN_ID_INPUT")
           fi
-          node scripts/release-qualification.mjs "${selection_args[@]}" > "$RUNNER_TEMP/qualification-selection.json"
+          node scripts/public/release-qualification.mjs "${selection_args[@]}" > "$RUNNER_TEMP/qualification-selection.json"
           artifact_id="$(jq -r '.artifactId' "$RUNNER_TEMP/qualification-selection.json")"
           run_id="$(jq -r '.runId' "$RUNNER_TEMP/qualification-selection.json")"
           run_attempt="$(jq -r '.runAttempt' "$RUNNER_TEMP/qualification-selection.json")"
@@ -196,7 +196,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node scripts/verify-qualified-release.mjs verify \
+          node scripts/public/verify-qualified-release.mjs verify \
             --bundle qualification \
             --manifest qualification/release-qualification.json \
             --repository "$PUBLIC_REPOSITORY" \
@@ -571,7 +571,7 @@ jobs:
       - name: Sync the action into the alias repository
         env:
           POLICY_SCAN_SYNC_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: bash scripts/sync-policy-scan-action.sh
+        run: bash scripts/public/sync-policy-scan-action.sh
 
   attach-vscode:
     name: verify qualified VSIX asset

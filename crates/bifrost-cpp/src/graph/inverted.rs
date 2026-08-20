@@ -43,11 +43,12 @@ use crate::graph::resolver::{
     cpp_template_reference_arguments, cpp_type_name_components, declarator_name_node,
     designated_initializer_owner, extract_variable_name, first_type_child, function_terminal_node,
     has_ancestor_kind, infer_cpp_initializer_binding, infer_cpp_initializer_type,
-    is_cpp_template_argument_type_leaf, is_declaration_name, is_declarator_node,
-    is_globally_qualified_cpp_name, is_nested_type_node,
+    initialized_type_declaration_with_cast, is_cpp_template_argument_type_leaf,
+    is_declaration_name, is_declarator_node, is_globally_qualified_cpp_name, is_nested_type_node,
     is_recovered_qualified_friend_class_type_reference, normalize_type_text,
     out_of_line_destructor_type_reference, out_of_line_member_definition_owner,
-    parameter_belongs_to_callable_scope, qualified_owner_components,
+    parameter_belongs_to_callable_scope, qualified_alias_reference_preserves_target,
+    qualified_alias_reference_requires_terminal, qualified_owner_components,
     recovered_macro_decorated_type_node, recovered_relational_template_member_call,
     resolve_declaring_callable_owner, resolve_declaring_member_owner, same_logical_symbol,
     same_visible_symbol, type_reference_hit_node,
@@ -381,9 +382,9 @@ fn record_reference(
                         cpp_callable_arity(&ctx.analyzer, constructor).accepts(call_arity)
                     })
                 {
-                    ctx.record(constructor.fq_name(), function_terminal_node(node));
+                    ctx.record(constructor.fq_name(), node);
                 } else {
-                    ctx.record(unit.fq_name(), function_terminal_node(node));
+                    ctx.record(unit.fq_name(), node);
                 }
                 return;
             }
@@ -509,7 +510,29 @@ fn record_type_reference(node: Node<'_>, ctx: &mut CppScan<'_>) {
     let resolution = resolve_inverted_type_node(node, ctx, resolution);
     match resolution {
         LexicalTypeResolution::Resolved { unit, .. } => {
-            ctx.record(unit.fq_name(), type_reference_hit_node(node))
+            let callee = unit.fq_name();
+            let hit = type_reference_hit_node(node);
+            ctx.record(callee.clone(), hit);
+            if initialized_type_declaration_with_cast(node) {
+                ctx.record(callee.clone(), function_terminal_node(hit));
+            }
+            if qualified_alias_reference_requires_terminal(
+                qualified_alias_reference_preserves_target(
+                    node,
+                    &unit,
+                    &ctx.analyzer,
+                    ctx.visibility,
+                    ctx.file,
+                    ctx.source,
+                ),
+            ) {
+                let terminal = function_terminal_node(node);
+                if terminal.start_byte() != node.start_byte()
+                    || terminal.end_byte() != node.end_byte()
+                {
+                    ctx.record(callee, terminal);
+                }
+            }
         }
         LexicalTypeResolution::Missing => {
             if let Some(unit) = ctx.visibility.unique_visible_parameter_type_fallback(

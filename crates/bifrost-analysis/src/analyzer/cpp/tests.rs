@@ -359,9 +359,11 @@ mod header_language_attribution_tests {
         let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
         let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "shared.h");
 
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
         assert_eq!(
             HeaderLanguageAttribution::C,
-            analyzer.header_language_attribution(&header)
+            analyzer.header_language_attribution(token, &header)
         );
     }
 
@@ -378,9 +380,11 @@ mod header_language_attribution_tests {
         let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
         let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "shared.h");
 
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
         assert_eq!(
             HeaderLanguageAttribution::Cpp,
-            analyzer.header_language_attribution(&header)
+            analyzer.header_language_attribution(token, &header)
         );
     }
 
@@ -400,9 +404,11 @@ mod header_language_attribution_tests {
         let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
         let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "shared.h");
 
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
         assert_eq!(
             HeaderLanguageAttribution::Mixed,
-            analyzer.header_language_attribution(&header)
+            analyzer.header_language_attribution(token, &header)
         );
     }
 
@@ -419,13 +425,15 @@ mod header_language_attribution_tests {
         let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
         let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "orphan.h");
 
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
         assert_eq!(
             HeaderLanguageAttribution::Unknown,
-            analyzer.header_language_attribution(&header)
+            analyzer.header_language_attribution(token, &header)
         );
         assert!(
             analyzer
-                .transitive_reaching_translation_units(&header)
+                .transitive_reaching_translation_units(token, &header)
                 .is_empty()
         );
     }
@@ -451,13 +459,15 @@ mod header_language_attribution_tests {
         let leaf = ProjectFile::new(project_root.clone(), "y.h");
         let translation_unit = ProjectFile::new(project_root, "a.c");
 
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
         assert_eq!(
             HeaderLanguageAttribution::C,
-            analyzer.header_language_attribution(&leaf)
+            analyzer.header_language_attribution(token, &leaf)
         );
         assert!(
             analyzer
-                .transitive_reaching_translation_units(&leaf)
+                .transitive_reaching_translation_units(token, &leaf)
                 .contains(&translation_unit),
             "the transitive closure must reach through the intermediate header"
         );
@@ -485,9 +495,11 @@ mod header_language_attribution_tests {
         let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
         let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "shared.h");
 
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
         assert_eq!(
             HeaderLanguageAttribution::C,
-            analyzer.header_language_attribution(&header)
+            analyzer.header_language_attribution(token, &header)
         );
     }
 
@@ -511,9 +523,11 @@ mod header_language_attribution_tests {
         let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
         let header = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "shared.h");
 
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
         assert_eq!(
             HeaderLanguageAttribution::C,
-            analyzer.header_language_attribution(&header)
+            analyzer.header_language_attribution(token, &header)
         );
     }
 }
@@ -575,14 +589,16 @@ mod header_c_projection_storage_tests {
             .iter()
             .find(|unit| unit.is_class())
             .expect("the C++ reading mints a nested class");
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
         assert_eq!(
             vec![nested_tag.clone()],
-            analyzer.site_equivalent_units(file_scope_tag),
+            analyzer.site_equivalent_units(token, file_scope_tag),
             "the two identities share one declaration site"
         );
         assert_eq!(
             vec![file_scope_tag.clone()],
-            analyzer.site_equivalent_units(nested_tag)
+            analyzer.site_equivalent_units(token, nested_tag)
         );
     }
 
@@ -614,8 +630,10 @@ mod header_c_projection_storage_tests {
         let unit = ProjectFile::new(analyzer.inner.project().root().to_path_buf(), "unit.c");
 
         assert!(analyzer.c_reading(&unit).is_none());
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
         assert!(
-            !analyzer.header_uses_c_semantics(&unit),
+            !analyzer.header_uses_c_semantics(token, &unit),
             "a translation unit's dialect is settled by its own extension"
         );
     }

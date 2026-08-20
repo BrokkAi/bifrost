@@ -587,6 +587,7 @@ pub(super) fn java_field_access_is_type_qualifier(
     node: Node<'_>,
     source: &str,
     root_is_value: impl Fn(&str) -> bool,
+    root_is_type: impl Fn(&str) -> bool,
 ) -> bool {
     if node.kind() != "field_access" || !java_field_access_is_selector_object(node) {
         return false;
@@ -596,10 +597,18 @@ pub(super) fn java_field_access_is_type_qualifier(
     if segments.is_empty() {
         return false;
     }
-    if segments
-        .first()
-        .is_some_and(|root| root_is_value(root) || *root == "this" || *root == "super")
-    {
+    let Some(root) = segments.first().copied() else {
+        return false;
+    };
+    if root_is_value(root) || root == "this" || root == "super" {
+        return false;
+    }
+    // An uppercase root can name either a type or a value. Negative value
+    // evidence is not enough to discard heap flow: inherited fields are not
+    // present in this file's value inventory. Require a declared or explicitly
+    // imported type root; lowercase package roots retain qualified-name
+    // handling such as `java.net.URLDecoder` (#2452).
+    if java_type_name_spelling(root) && !root_is_type(root) {
         return false;
     }
     let type_prefix = java_type_name_prefix_len(&segments);

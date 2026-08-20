@@ -1,3 +1,6 @@
+use brokk_bifrost_analysis::analyzer::structural::edges::EdgeProvenance;
+use brokk_bifrost_analysis::analyzer::usages::UsageHitKind;
+
 use super::*;
 
 /// One subject row: the node an assertion is evaluated at, plus every capture
@@ -1323,6 +1326,7 @@ fn evaluate_relational_assertion_policy(
     use super::super::definition::{
         RowBindingName, RowBindingSource, RowExpansionStep, relational_binding_selector_path,
     };
+    use super::super::relational::RelationCoverage;
 
     let mut binding_queries: Vec<CodeQuery> = Vec::with_capacity(plan.bindings.len());
     let mut binding_index_by_name: HashMap<&RowBindingName, usize> = HashMap::new();
@@ -1451,6 +1455,7 @@ fn evaluate_relational_assertion_policy(
     let mut run_failures: Vec<PolicyFailureReason> = Vec::new();
     let mut query_diagnostics: Vec<CodeQueryDiagnostic> = Vec::new();
     let mut executed = Vec::with_capacity(binding_queries.len());
+    let mut binding_coverage: Vec<RelationCoverage> = Vec::with_capacity(binding_queries.len());
     let mut total_work: Option<CodeQueryExecutionWork> = None;
 
     /// Whether this row states that the producer suppressed the row *set* it
@@ -1502,14 +1507,30 @@ fn evaluate_relational_assertion_policy(
                 context.cancellation,
             ),
         };
-        run_incomplete.extend(incomplete_reasons(
-            &outcome.result.completion(),
-            outcome.result.truncated,
-        ));
-        if outcome.result.results.iter().any(suppressed_row_set) {
+        let completion = outcome.result.completion();
+        let reasons = incomplete_reasons(&completion, outcome.result.truncated);
+        run_incomplete.extend(reasons.iter().copied());
+        // One binding's rows, one coverage. This is the mapping issue 2435 is
+        // about: `ProvenSubset` is not "not exhaustive", and a suppressed row
+        // set is not a partial one -- it is a relation the producer refused to
+        // describe at all.
+        let coverage = if outcome.result.results.iter().any(suppressed_row_set) {
             run_incomplete.push(PolicyIncompleteReason::CapabilityIncomplete);
-        }
-        run_failures.extend(failure_reasons(&outcome.result.completion()));
+            RelationCoverage::unsupported_row_set()
+        } else {
+            match &completion {
+                CodeQueryCompletion::Complete if !outcome.result.truncated => {
+                    RelationCoverage::Exhaustive
+                }
+                CodeQueryCompletion::ProvenSubset { .. } => RelationCoverage::ProvenSubset,
+                CodeQueryCompletion::Complete
+                | CodeQueryCompletion::Incomplete { .. }
+                | CodeQueryCompletion::Cancelled
+                | CodeQueryCompletion::Invalid { .. } => RelationCoverage::incomplete(reasons),
+            }
+        };
+        binding_coverage.push(coverage);
+        run_failures.extend(failure_reasons(&completion));
         query_diagnostics.extend(outcome.result.diagnostics.iter().cloned());
         total_work = Some(match total_work {
             Some(work) => work.saturating_add(outcome.work),
@@ -1551,11 +1572,11 @@ fn evaluate_relational_assertion_policy(
         .bindings
         .iter()
         .zip(&executed)
-        .map(|(binding, outcome)| RelationalInput {
+        .zip(&binding_coverage)
+        .map(|((binding, outcome), coverage)| RelationalInput {
             binding: &binding.name,
             rows: &outcome.result.results,
-            exhaustive: matches!(outcome.result.completion(), CodeQueryCompletion::Complete)
-                && !outcome.result.truncated,
+            coverage: coverage.clone(),
         })
         .collect::<Vec<_>>();
     let evaluation = match evaluate_relational_assertion_rows(plan, &inputs) {
@@ -1592,21 +1613,40 @@ fn evaluate_relational_assertion_policy(
     if evaluation.limit_exceeded {
         run_incomplete.push(PolicyIncompleteReason::PipelineRowBudget);
     }
+    // An assertion whose verdict the coverage rules blocked makes the run
+    // non-reliable, which is what keeps status 0 impossible. It does not
+    // discard the verdicts the same evaluation did prove.
+    for obligation in &evaluation.unmet_obligations {
+        run_incomplete.extend(obligation.reasons.iter().copied());
+    }
     if !evaluation.exhaustive && run_incomplete.is_empty() {
         run_incomplete.push(PolicyIncompleteReason::PartialDiscovery);
     }
     run_incomplete.sort();
     run_incomplete.dedup();
-    if !run_incomplete.is_empty() {
-        return inconclusive_policy_run_many(
-            policy,
-            PolicyAnalysisType::Assertion,
-            run_incomplete,
+    let completion = if run_incomplete.is_empty() {
+        PolicyRunCompletion::Complete
+    } else {
+        retain_incomplete_run_diagnostic(
+            &mut diagnostics,
+            &mut diagnostics_truncated,
+            budget.max_diagnostics(),
             "relational assertion evaluation could not observe a complete row set",
-            work,
-            budget,
         );
-    }
+        // One diagnostic per blocked verdict, so a reader sees which
+        // assertion could not conclude and why, not only that something
+        // could not. Every obligation states at least one reason, so this
+        // list is non-empty exactly when the run is inconclusive, which is
+        // the completion a `RunIncomplete` diagnostic requires.
+        retain_relational_obligation_diagnostics(
+            &mut diagnostics,
+            &mut diagnostics_truncated,
+            budget.max_diagnostics(),
+            &evaluation,
+        );
+        PolicyRunCompletion::inconclusive(run_incomplete)
+            .expect("typed relational incomplete reasons are canonical")
+    };
 
     let metadata = &policy.definition().metadata;
     let message = match &metadata.message {
@@ -1827,7 +1867,7 @@ fn evaluate_relational_assertion_policy(
     finish_assembled_run(
         policy,
         PolicyAnalysisType::Assertion,
-        PolicyRunCompletion::Complete,
+        completion,
         findings,
         diagnostics,
         diagnostics_truncated,
@@ -1835,6 +1875,98 @@ fn evaluate_relational_assertion_policy(
         "relational assertion evaluation produced an invalid policy run",
         budget,
     )
+}
+
+/// Retain the one diagnostic that says this relational run could not observe
+/// everything it needed to.
+///
+/// Separate from `retain_incomplete_diagnostic` because that helper reports a
+/// retention-budget cause; this one reports an evaluation cause, which is the
+/// code the inconclusive relational path has always published.
+fn retain_incomplete_run_diagnostic(
+    diagnostics: &mut Vec<PolicyDiagnostic>,
+    diagnostics_truncated: &mut bool,
+    max_diagnostics: usize,
+    message: &str,
+) {
+    if diagnostics.len() >= max_diagnostics {
+        *diagnostics_truncated = true;
+        return;
+    }
+    match PolicyDiagnostic::try_new(
+        PolicyDiagnosticCode::EvaluationFailure,
+        PolicyDiagnosticSeverity::Warning,
+        PolicyDiagnosticImpact::RunIncomplete,
+        message,
+        None,
+        Vec::new(),
+    ) {
+        Ok(diagnostic) => diagnostics.push(diagnostic),
+        Err(_) => *diagnostics_truncated = true,
+    }
+}
+
+/// Name every unmet proof obligation on the run's diagnostics.
+///
+/// One diagnostic per blocked verdict, in the evaluation's own deterministic
+/// order, bounded by the same per-policy diagnostic cap every other channel
+/// respects. The reason family is the obligation kind rather than the whole
+/// message, so a capped list still reports how many verdicts each kind
+/// blocked (#2356); the message carries the assertion, the group and the group
+/// key, which is what makes the blocked claim addressable.
+///
+/// Truncation is recorded, never silent: the run's typed incomplete reasons
+/// are folded in before this runs, so a dropped diagnostic costs detail and
+/// never soundness.
+fn retain_relational_obligation_diagnostics(
+    diagnostics: &mut Vec<PolicyDiagnostic>,
+    diagnostics_truncated: &mut bool,
+    max_diagnostics: usize,
+    evaluation: &super::super::assertion_policy::RelationalAssertionEvaluation,
+) {
+    if evaluation.obligations_truncated {
+        *diagnostics_truncated = true;
+    }
+    for obligation in &evaluation.unmet_obligations {
+        if diagnostics.len() >= max_diagnostics {
+            *diagnostics_truncated = true;
+            return;
+        }
+        // The reasons are already canonical and sorted on the obligation, and
+        // their serialized spelling is the same one the report publishes.
+        let reasons = obligation
+            .reasons
+            .iter()
+            .map(|reason| match serde_json::to_value(reason) {
+                Ok(serde_json::Value::String(label)) => label,
+                _ => format!("{reason:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let key = render_relational_key(&obligation.key);
+        let scope = if key.is_empty() {
+            format!("group `{}`", obligation.group)
+        } else {
+            format!("group `{}` key `{key}`", obligation.group)
+        };
+        let message = format!(
+            "relational assertion `{}` published no verdict for {scope}: {} ({reasons})",
+            obligation.assertion,
+            obligation.kind.label(),
+        );
+        match PolicyDiagnostic::try_new_in_family(
+            PolicyDiagnosticCode::EvaluationFailure,
+            PolicyDiagnosticSeverity::Warning,
+            PolicyDiagnosticImpact::RunIncomplete,
+            format!("relational_obligation/{}", obligation.kind.label()),
+            message,
+            None,
+            Vec::new(),
+        ) {
+            Ok(diagnostic) => diagnostics.push(diagnostic),
+            Err(_) => *diagnostics_truncated = true,
+        }
+    }
 }
 
 /// Render one group key as a stable, human-readable correlation string. Group
@@ -2082,6 +2214,15 @@ fn edge_sites_match(left: &ReferenceEdgeRow, right: &ReferenceEdgeRow) -> bool {
         }
 }
 
+/// A forward `Reference` row is the honest fallback when the occurrence role
+/// and owner evidence do not prove a more specific usage kind. Only a
+/// non-`Reference` forward row can make a field-level usage-kind claim that
+/// parity should enforce; an inverse-only classification must not manufacture
+/// a finding against that fallback.
+fn forward_usage_kind_is_classified(row: &ReferenceEdgeRow) -> bool {
+    row.provenance == EdgeProvenance::Forward && row.usage_kind != UsageHitKind::Reference
+}
+
 /// The explicit field-for-field comparison. Returns the labels of the fields
 /// that disagree; empty means parity.
 fn edge_field_mismatches(left: &ReferenceEdgeRow, right: &ReferenceEdgeRow) -> Vec<String> {
@@ -2096,13 +2237,20 @@ fn edge_field_mismatches(left: &ReferenceEdgeRow, right: &ReferenceEdgeRow) -> V
     if left.proof != right.proof {
         mismatches.push("proof".to_string());
     }
-    // usage_kind is deliberately NOT a compared field: the forward producer
-    // cannot classify usage kinds (it states `reference` unconditionally), so
-    // a raw comparison would fire on every self call and import. Usage-surface
-    // classification is compared explicitly instead, through the assert's
-    // :surface option: a row that belongs to the compared surface on one side
-    // and not the other is a missing counterpart, which is the honest form of
-    // the disagreement.
+    // Compare usage kinds only when the forward producer made a structured
+    // non-fallback classification. When it says `reference`, the inverse
+    // producer may still have stronger self/import knowledge; that is an
+    // honest abstention, not a parity mismatch. Surface membership remains an
+    // explicit comparison through the assert's :surface option.
+    if (forward_usage_kind_is_classified(left) || forward_usage_kind_is_classified(right))
+        && left.usage_kind != right.usage_kind
+    {
+        mismatches.push(format!(
+            "usage_kind {} != {}",
+            left.usage_kind.wire_label(),
+            right.usage_kind.wire_label()
+        ));
+    }
     if left.site_class != right.site_class {
         mismatches.push(format!(
             "site_class {} != {}",

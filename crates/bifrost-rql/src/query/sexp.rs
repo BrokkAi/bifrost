@@ -1179,7 +1179,10 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::Has
         | RqlForm::NotHas
         | RqlForm::NotKind
-        | RqlForm::Arity => unreachable!("predicate filtered above"),
+        | RqlForm::Arity
+        | RqlForm::Visibility
+        | RqlForm::ParameterType
+        | RqlForm::ParameterTypeRegex => unreachable!("predicate filtered above"),
     }
 }
 
@@ -1535,6 +1538,28 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         RqlForm::Arity => {
             insert_unique(&mut object, "arity", arity_value(expr, &items[1..])?).at(expr)?;
         }
+        RqlForm::Visibility => {
+            expect_len(expr, items, 2, "visibility")?;
+            insert_unique(&mut object, "visibility", visibility_value(&items[1])?).at(expr)?;
+        }
+        RqlForm::ParameterType => {
+            expect_len(expr, items, 2, "parameter-type")?;
+            insert_unique(
+                &mut object,
+                "parameter_type",
+                Value::String(string_arg(&items[1])?),
+            )
+            .at(expr)?;
+        }
+        RqlForm::ParameterTypeRegex => {
+            expect_len(expr, items, 2, "parameter-type/regex")?;
+            insert_unique(
+                &mut object,
+                "parameter_type".to_string(),
+                json!({ "regex": string_arg(&items[1])? }),
+            )
+            .at(expr)?;
+        }
         RqlForm::Where
         | RqlForm::Language
         | RqlForm::Limit
@@ -1686,6 +1711,19 @@ fn insert_keyword(
             RqlProperty::Arity => {
                 insert_unique(object, "arity", arity_property_value(value)?).at(key_expr)
             }
+            RqlProperty::Visibility => {
+                insert_unique(object, "visibility", visibility_value(value)?).at(key_expr)
+            }
+            RqlProperty::ParameterType => {
+                insert_unique(object, "parameter_type", Value::String(string_arg(value)?))
+                    .at(key_expr)
+            }
+            RqlProperty::ParameterTypeRegex => insert_unique(
+                object,
+                "parameter_type".to_string(),
+                json!({ "regex": string_arg(value)? }),
+            )
+            .at(key_expr),
             RqlProperty::Has => insert_unique(object, "has", pattern_to_json(value)?).at(key_expr),
             RqlProperty::NotHas => {
                 insert_unique(object, "not_has", pattern_to_json(value)?).at(key_expr)
@@ -1862,6 +1900,38 @@ fn arity_value(expr: &Expr, tail: &[Expr]) -> LowerResult<Value> {
         insert_unique(&mut object, field, Value::Number(count.into())).at(&pair[0])?;
     }
     Ok(Value::Object(object))
+}
+
+fn visibility_value(expr: &Expr) -> LowerResult<Value> {
+    if let Some(items) = expr.as_sequence() {
+        if items.is_empty() {
+            return Err(lower_error(expr, "visibility list must not be empty"));
+        }
+        let mut labels = Vec::with_capacity(items.len());
+        for item in items {
+            labels.push(Value::String(visibility_label(item)?));
+        }
+        return Ok(Value::Array(labels));
+    }
+    match &expr.kind {
+        ExprKind::Symbol(label) | ExprKind::String(label) => {
+            Ok(Value::String(label.replace('-', "_")))
+        }
+        _ => Err(lower_error(
+            expr,
+            "visibility must be a label or a non-empty vector of labels",
+        )),
+    }
+}
+
+fn visibility_label(expr: &Expr) -> LowerResult<String> {
+    let Some(label) = expr.as_symbol().or_else(|| expr.as_string()) else {
+        return Err(lower_error(
+            expr,
+            "visibility must be a symbol or string label",
+        ));
+    };
+    Ok(label.replace('-', "_"))
 }
 
 /// Lower an inline `:arity` property value: a single non-negative integer
@@ -2372,6 +2442,34 @@ mod tests {
                     "module": { "name": "os" }
                 }
             }))
+        );
+    }
+
+    /// `:visibility` accepts a bare label, a vector of labels, and a list of
+    /// labels, matching the sequence handling the editor validator already
+    /// allows. Hyphenated spellings canonicalize to their underscore form.
+    #[test]
+    fn structural_query_sexp_lowers_visibility_label_and_sequences() {
+        assert_eq!(
+            canonical("(method :visibility package-private)"),
+            canonical_json(json!({
+                "match": { "kind": "method", "visibility": "package_private" }
+            }))
+        );
+        let expected = canonical_json(json!({
+            "match": { "kind": "method", "visibility": ["public", "protected"] }
+        }));
+        assert_eq!(
+            canonical("(method :visibility [public protected])"),
+            expected
+        );
+        assert_eq!(
+            canonical("(method :visibility (public protected))"),
+            expected
+        );
+        assert_eq!(
+            canonical("(method (visibility (public protected)))"),
+            expected
         );
     }
 

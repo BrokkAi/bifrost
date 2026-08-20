@@ -9,9 +9,10 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ActivationSelector, CatalogCoordinate, CatalogMiss, CatalogPackSourceKind,
-    CompiledPackManifest, CompiledProcedureSummary, CompiledShard, DeclarationGuard, GeneratorRule,
-    MemberFact, PayloadKind, RelationFact, RuleTrigger, SemanticModelOverlay,
-    SemanticModelOverlayBuildError, SemanticPackCatalog, SemanticPackSelectorQuery, TypeFact,
+    CompiledDeclaredEffect, CompiledPackManifest, CompiledProcedureSummary, CompiledShard,
+    DeclarationGuard, GeneratorRule, MemberFact, PayloadKind, RelationFact, RuleTrigger,
+    SemanticModelOverlay, SemanticModelOverlayBuildError, SemanticPackCatalog,
+    SemanticPackSelectorQuery, TypeFact,
 };
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::is_lower_sha256;
@@ -466,6 +467,20 @@ pub struct ActivatedProcedureSummary<'a> {
 impl<'a> ActivatedProcedureSummary<'a> {
     pub fn summary_with_id(&self, id: &str) -> Option<&'a CompiledProcedureSummary> {
         self.payload.iter().find(|summary| summary.id == id)
+    }
+
+    /// The namespaced effects the activated pack declares for this procedure
+    /// (#2437), in the compiler's canonical order (sorted by id).
+    pub fn declared_effects(&self) -> &'a [CompiledDeclaredEffect] {
+        &self.record.declared_effects
+    }
+
+    /// Whether the activated pack declares the named effect for this procedure.
+    pub fn declares_effect(&self, id: &str) -> bool {
+        self.record
+            .declared_effects
+            .iter()
+            .any(|effect| effect.id == id)
     }
 }
 
@@ -932,8 +947,8 @@ where
 }
 
 /// Whether two activated records make the same observable claim: the same
-/// completeness, the same named locations, the same transfers, and the same
-/// effects. Identity fields (`id`, `model_id`, `content_sha256`) and the target
+/// completeness, the same named locations, the same transfers, the same
+/// effects, and the same declared effects (#2437). Identity fields (`id`, `model_id`, `content_sha256`) and the target
 /// spelling are excluded, because they differ between records that nevertheless
 /// propagate identically.
 ///
@@ -953,6 +968,7 @@ fn procedure_claims_agree(
         && left.locations == right.locations
         && left.transfers == right.transfers
         && left.effects == right.effects
+        && left.declared_effects == right.declared_effects
 }
 
 fn resolve_procedure_posting<'a>(
@@ -2499,6 +2515,7 @@ mod semantic_diagnostic_runtime_tests {
 mod procedure_claim_agreement_tests {
     use super::*;
     use crate::analyzer::semantic_model::{
+        CompiledDeclaredEffect, CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming,
         CompiledProcedureSummary, CompiledProcedureTarget, CompiledSummaryExitKind,
         CompiledSummaryInput, CompiledSummaryLocation, CompiledSummaryLocationKind,
         CompiledSummaryOutput, CompiledSummaryTransfer, Completeness,
@@ -2532,6 +2549,7 @@ mod procedure_claim_agreement_tests {
             locations: Vec::new(),
             transfers: vec![transfer(CompiledSummaryInput::Parameter { ordinal: 0 })],
             effects: Vec::new(),
+            declared_effects: Vec::new(),
         }
     }
 
@@ -2594,6 +2612,51 @@ mod procedure_claim_agreement_tests {
         assert!(
             !procedure_claims_agree(&left, &right),
             "named locations are ports the transfers bind, so they are part of the claim"
+        );
+    }
+
+    /// #2437: a declared effect is a claim a policy can read, so two records
+    /// that disagree about it must refuse rather than resolve to whichever one
+    /// the index happened to reach first.
+    #[test]
+    fn a_different_declared_effect_set_is_a_disagreement() {
+        let left = overload("valueof-int", "java.lang.String.valueOf(int)");
+        let mut right = overload(
+            "valueof-object",
+            "java.lang.String.valueOf(java.lang.Object)",
+        );
+        right.declared_effects = vec![CompiledDeclaredEffect {
+            id: "acme.network_io".to_owned(),
+            timing: CompiledDeclaredEffectTiming::Immediate,
+            certainty: CompiledDeclaredEffectCertainty::Definite,
+        }];
+        assert!(
+            !procedure_claims_agree(&left, &right),
+            "one record claiming an effect the other does not is a disagreement"
+        );
+
+        let mut same_id_different_certainty = right.clone();
+        same_id_different_certainty.declared_effects[0].certainty =
+            CompiledDeclaredEffectCertainty::Possible;
+        assert!(
+            !procedure_claims_agree(&right, &same_id_different_certainty),
+            "certainty is part of the claim, not decoration"
+        );
+
+        let mut same_id_different_timing = right.clone();
+        same_id_different_timing.declared_effects[0].timing =
+            CompiledDeclaredEffectTiming::Deferred;
+        assert!(
+            !procedure_claims_agree(&right, &same_id_different_timing),
+            "timing is part of the claim, not decoration"
+        );
+
+        let mut identical = right.clone();
+        identical.id = "valueof-charseq".to_owned();
+        identical.model_id = "model.valueof-charseq".to_owned();
+        assert!(
+            procedure_claims_agree(&right, &identical),
+            "two records declaring the same effects still make one claim"
         );
     }
 }

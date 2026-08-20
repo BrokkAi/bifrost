@@ -33,6 +33,7 @@ use std::sync::Arc;
 use brokk_bifrost_core::analyzer::capabilities::build_reverse_file_index;
 use brokk_bifrost_core::analyzer::common::language_for_file;
 use brokk_bifrost_core::analyzer::model::{ImportInfo, StructuredImportPath};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{
     first_named_child_of_kind as first_named_child, named_children,
 };
@@ -181,11 +182,12 @@ pub fn is_kotlin_importable_top_level(unit: &CodeUnit) -> bool {
 /// `import a.b.C`, with no need to split the path and walk owners.
 pub fn kotlin_declarations_named(
     source: &dyn KotlinSource,
+    token: QueryToken<'_>,
     fqn: &str,
     realm: Option<&JvmSourceRealm<'_>>,
 ) -> Vec<CodeUnit> {
     let mut units: Vec<CodeUnit> = source
-        .usage_definitions()
+        .usage_definitions(token)
         .fqn(fqn)
         .into_iter()
         .filter(|unit| unit.fq_name() == fqn && !unit.is_synthetic())
@@ -232,13 +234,14 @@ pub fn build_kotlin_top_level_declarations_by_package(
 /// workspace actually declares, not by guessing from the spelling.
 pub fn kotlin_star_imported_declarations(
     source: &dyn KotlinSource,
+    token: QueryToken<'_>,
     path: &str,
     realm: Option<&JvmSourceRealm<'_>>,
 ) -> Vec<CodeUnit> {
     if let Some(units) = source.top_level_declarations_by_package().get(path) {
         return units.as_ref().clone();
     }
-    kotlin_declarations_named(source, path, realm)
+    kotlin_declarations_named(source, token, path, realm)
         .iter()
         .filter(|owner| owner.is_class())
         .flat_map(|owner| source.direct_children(owner))
@@ -250,6 +253,7 @@ pub fn kotlin_star_imported_declarations(
 /// when a realm view is supplied.
 pub fn resolve_kotlin_import_infos(
     source: &dyn KotlinSource,
+    token: QueryToken<'_>,
     imports: &[ImportInfo],
     realm: Option<&JvmSourceRealm<'_>>,
 ) -> HashSet<CodeUnit> {
@@ -259,9 +263,11 @@ pub fn resolve_kotlin_import_infos(
             continue;
         };
         if import.is_wildcard {
-            resolved.extend(kotlin_star_imported_declarations(source, &path, realm));
+            resolved.extend(kotlin_star_imported_declarations(
+                source, token, &path, realm,
+            ));
         } else {
-            resolved.extend(kotlin_declarations_named(source, &path, realm));
+            resolved.extend(kotlin_declarations_named(source, token, &path, realm));
         }
     }
     resolved
@@ -317,6 +323,7 @@ pub fn compute_kotlin_same_package_reference_index(
 /// visible.
 pub fn kotlin_could_import_file(
     source: &dyn KotlinSource,
+    token: QueryToken<'_>,
     source_file: &ProjectFile,
     imports: &[ImportInfo],
     target: &ProjectFile,
@@ -342,11 +349,11 @@ pub fn kotlin_could_import_file(
         };
         if import.is_wildcard {
             return path == target_package
-                || kotlin_star_imported_declarations(source, &path, None)
+                || kotlin_star_imported_declarations(source, token, &path, None)
                     .iter()
                     .any(|unit| unit.source() == target);
         }
-        kotlin_declarations_named(source, &path, None)
+        kotlin_declarations_named(source, token, &path, None)
             .iter()
             .any(|unit| unit.source() == target)
     })

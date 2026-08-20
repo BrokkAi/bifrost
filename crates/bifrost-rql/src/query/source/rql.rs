@@ -687,7 +687,10 @@ fn validate_wrapper(
         | RqlForm::Has
         | RqlForm::NotHas
         | RqlForm::NotKind
-        | RqlForm::Arity => unreachable!("predicate cannot be a query wrapper"),
+        | RqlForm::Arity
+        | RqlForm::Visibility
+        | RqlForm::ParameterType
+        | RqlForm::ParameterTypeRegex => unreachable!("predicate cannot be a query wrapper"),
     }
     validate_rql_query(query, path, analysis, depth, plan_budget);
 }
@@ -1760,6 +1763,7 @@ fn validate_rql_property(
 ) {
     if let Some(property) = RqlProperty::from_label(label) {
         analysis.add_help(range.clone(), property.signature(), property.description());
+        reject_callable_signature_property(property, kind, &range, analysis);
         validate_property_value(property, value, path, analysis);
         record_duplicate(property.label(), range, seen, analysis);
     } else if let Some(role) = Role::from_label(label) {
@@ -1880,6 +1884,9 @@ fn validate_property_value(
         }
         super::schema::ValueShape::RegexString => validate_rql_regex(value, &child, analysis),
         super::schema::ValueShape::KindList => validate_kind_value(value, &child, analysis),
+        super::schema::ValueShape::DeclaredVisibilityList => {
+            validate_visibility_value(value, &child, analysis)
+        }
         super::schema::ValueShape::Arity => {
             validate_arity_scalar(value, analysis);
         }
@@ -1949,6 +1956,9 @@ fn rql_property_path(path: &str, property: RqlProperty) -> String {
         RqlProperty::Capture => "capture",
         RqlProperty::NotKind => "not_kind",
         RqlProperty::Arity => "arity",
+        RqlProperty::Visibility => "visibility",
+        RqlProperty::ParameterType => "parameter_type",
+        RqlProperty::ParameterTypeRegex => "parameter_type.regex",
         RqlProperty::Has => "has",
         RqlProperty::NotHas => "not_has",
     };
@@ -1970,12 +1980,16 @@ fn validate_plain_string(property: RqlProperty, value: &Expr, analysis: &mut Ana
         return;
     }
     let (label, max, reject_empty) = match property {
-        RqlProperty::Name => ("exact string", MAX_STRING_PREDICATE_LENGTH, false),
+        RqlProperty::Name | RqlProperty::ParameterType => {
+            ("exact string", MAX_STRING_PREDICATE_LENGTH, false)
+        }
         RqlProperty::Capture => unreachable!("capture handled above"),
         RqlProperty::NameRegex
         | RqlProperty::TextRegex
+        | RqlProperty::ParameterTypeRegex
         | RqlProperty::NotKind
         | RqlProperty::Arity
+        | RqlProperty::Visibility
         | RqlProperty::Has
         | RqlProperty::NotHas => unreachable!("property is not a plain string"),
     };
@@ -2129,6 +2143,86 @@ fn validate_glob(value: &Expr, path: &str, analysis: &mut Analysis) {
         );
     } else {
         analysis.path(path, value.range.clone());
+    }
+}
+
+fn reject_callable_signature_property(
+    property: RqlProperty,
+    kind: NormalizedKind,
+    range: &Range<usize>,
+    analysis: &mut Analysis,
+) {
+    if !matches!(
+        property,
+        RqlProperty::Visibility | RqlProperty::ParameterType | RqlProperty::ParameterTypeRegex
+    ) {
+        return;
+    }
+    if kind.satisfies(NormalizedKind::Callable) {
+        return;
+    }
+    analysis.error(
+        range.clone(),
+        "invalid-query",
+        format!(
+            "{} is only valid on callable kinds (function, method, constructor, lambda, callable); not valid for {}",
+            property.label(),
+            kind.label()
+        ),
+    );
+}
+
+fn validate_visibility_value(value: &Expr, path: &str, analysis: &mut Analysis) {
+    match &value.kind {
+        ExprKind::Symbol(label) | ExprKind::String(label) => {
+            validate_visibility_label(label, value.range.clone(), analysis);
+        }
+        ExprKind::Vector(items) | ExprKind::List(items) => {
+            if items.is_empty() {
+                analysis.error(
+                    value.range.clone(),
+                    "wrong-value-shape",
+                    "visibility list must not be empty",
+                );
+                return;
+            }
+            for (index, item) in items.iter().enumerate() {
+                let child = format!("{path}[{index}]");
+                analysis.path(&child, item.range.clone());
+                let Some(label) = item.as_symbol().or_else(|| item.as_string()) else {
+                    analysis.error(
+                        item.range.clone(),
+                        "wrong-value-shape",
+                        "visibility must be a symbol or string label",
+                    );
+                    continue;
+                };
+                validate_visibility_label(label, item.range.clone(), analysis);
+            }
+        }
+        _ => analysis.error(
+            value.range.clone(),
+            "wrong-value-shape",
+            "visibility must be a label or a non-empty vector of labels",
+        ),
+    }
+}
+
+fn validate_visibility_label(label: &str, range: Range<usize>, analysis: &mut Analysis) {
+    let canonical = label.replace('-', "_");
+    if DeclaredVisibility::from_label(&canonical).is_none() {
+        analysis.error(
+            range,
+            "invalid-query",
+            format!(
+                "unknown visibility '{label}'; expected one of: {}",
+                ALL_DECLARED_VISIBILITIES
+                    .iter()
+                    .map(|visibility| visibility.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
     }
 }
 

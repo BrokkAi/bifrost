@@ -3,6 +3,7 @@ pub mod gc;
 pub mod liveness;
 pub mod query;
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt;
 use std::fmt::Write as _;
@@ -38,6 +39,7 @@ use brokk_bifrost_core::analyzer::rust_facts::{
 
 use crate::CancellationToken;
 use crate::analyzer::fq_name::{FqName, segment_interner};
+use crate::analyzer::model::MAX_SIGNATURE_METADATA_COLUMN_BYTES;
 use crate::analyzer::structural::DeclaredVisibility;
 use crate::analyzer::structural::materialization::{
     MaterializationRecord, MaterializationRecordPayload,
@@ -3812,6 +3814,22 @@ impl AnalyzerStore {
         )
     }
 
+    /// Blobs whose structured imports can name a module component.
+    ///
+    /// The exact identifier occurrence is the selective outer relation. For
+    /// each matching blob, the primary key range reads only that blob's import
+    /// rows and confirms that the component is either the imported name or the
+    /// final component of the written module path. This avoids both a suffix
+    /// scan of the import table and offering ordinary code mentions to the
+    /// semantic import verifier.
+    pub(crate) fn rust_module_import_candidate_blobs(
+        &self,
+        lang: &str,
+        component: &str,
+    ) -> Result<Vec<Oid>> {
+        self.rust_fact_blobs(RUST_MODULE_IMPORT_CANDIDATE_BLOBS_SQL, lang, component)
+    }
+
     /// Blobs that re-export `exported_name`. The inverted direction of
     /// `rust_exports`, and the seed of an export-chain walk.
     pub(crate) fn rust_export_blobs(&self, lang: &str, exported_name: &str) -> Result<Vec<Oid>> {
@@ -4114,6 +4132,17 @@ impl AnalyzerStore {
         Ok(out)
     }
 }
+
+const RUST_MODULE_IMPORT_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT occurrence.blob_oid
+     FROM rust_identifier_occurrences AS occurrence
+     JOIN rust_import_targets AS import_target
+       ON import_target.blob_oid = occurrence.blob_oid
+      AND import_target.lang = occurrence.lang
+     WHERE occurrence.lang = ?1
+       AND occurrence.identifier = ?2
+       AND (import_target.imported_name = ?2
+            OR import_target.module_path = ?2
+            OR import_target.module_path LIKE '%::' || ?2)";
 
 fn declaration_candidate_sql(predicate: &str) -> String {
     declaration_candidate_sql_with_order(predicate, "units.blob_oid, units.unit_key")
@@ -10756,9 +10785,10 @@ struct SignatureMetadataColumns {
 impl SignatureMetadataColumns {
     fn encode(value: &SignatureMetadata) -> Result<Self> {
         let arity = value.callable_arity();
+        let (label, parameters) = bounded_signature_label(value.label(), value.parameters());
         Ok(Self {
-            label: value.label().to_string(),
-            parameters: encode_signature_metadata_json("parameters", value.parameters())?,
+            label: label.into_owned(),
+            parameters: encode_signature_metadata_json("parameters", parameters.as_ref())?,
             return_type_text: value.return_type_text().map(str::to_string),
             return_type_identity: value
                 .return_type_identity()
@@ -10886,6 +10916,56 @@ impl SignatureMetadataColumns {
         ])?;
         Ok(())
     }
+}
+
+/// The marker an elided label carries in place of the text it lost.
+///
+/// It is inside the stored value on purpose: a reader that sees a label needs
+/// no side channel to learn that the rendering is partial.
+const SIGNATURE_LABEL_ELISION: &str = " /* label elided */";
+
+/// A declaration label and its parameter spans, clamped to the label column's
+/// byte cap.
+///
+/// Every language adapter renders a label from the declaration's source text,
+/// so a generated source with a megabyte-scale initializer can hand the store
+/// a label larger than the schema allows. That row fails its CHECK, and
+/// because the CHECK is the write-time admission gate the failure takes the
+/// file's whole parsed blob with it -- which is right for a row nobody can
+/// bound, and much too expensive for a rendering that can simply be shorter.
+/// One pathological declaration must not cost a repository its index
+/// (issue #2351).
+///
+/// The cap itself is unchanged and stays the interface. `label` is the only
+/// column clamped here because it is the only one built by copying an
+/// arbitrarily large declaration body; the type spellings beside it are
+/// bounded by the type grammar, and a megabyte-scale one is an analyzer defect
+/// that must stay loud.
+///
+/// [`ParameterMetadata`] spans are byte offsets *into* the label, so a clamped
+/// label keeps only the parameters that still lie inside what it retained. A
+/// span pointing past the end of the value it indexes is worse than a missing
+/// one.
+fn bounded_signature_label<'a>(
+    label: &'a str,
+    parameters: &'a [ParameterMetadata],
+) -> (Cow<'a, str>, Cow<'a, [ParameterMetadata]>) {
+    if label.len() <= MAX_SIGNATURE_METADATA_COLUMN_BYTES {
+        return (Cow::Borrowed(label), Cow::Borrowed(parameters));
+    }
+    let mut end = MAX_SIGNATURE_METADATA_COLUMN_BYTES - SIGNATURE_LABEL_ELISION.len();
+    while end > 0 && !label.is_char_boundary(end) {
+        end -= 1;
+    }
+    let retained = parameters
+        .iter()
+        .filter(|parameter| parameter.end_byte() <= end)
+        .cloned()
+        .collect();
+    (
+        Cow::Owned(format!("{}{SIGNATURE_LABEL_ELISION}", &label[..end])),
+        Cow::Owned(retained),
+    )
 }
 
 fn encode_signature_metadata_json<T: serde::Serialize + ?Sized>(
@@ -11112,9 +11192,7 @@ mod tests {
     use crate::analyzer::cpp::CppAdapter;
     use crate::analyzer::go::GoAdapter;
     use crate::analyzer::java::JavaAdapter;
-    use crate::analyzer::model::{
-        MAX_SIGNATURE_METADATA_COLUMN_BYTES, StructuredTypeIdentityBuilder, StructuredTypeName,
-    };
+    use crate::analyzer::model::{StructuredTypeIdentityBuilder, StructuredTypeName};
     use crate::analyzer::php::PhpAdapter;
     use crate::analyzer::python::PythonAdapter;
     use crate::analyzer::ruby::RubyAdapter;
@@ -11387,6 +11465,11 @@ mod tests {
     /// transaction with it. The previous shape of this test corrupted a stored
     /// blob with `zeroblob` and asserted the readers nulled it out; there is no
     /// longer a column that can hold such a value.
+    ///
+    /// The column under test is `return_type_text` rather than `label`: since
+    /// issue #2351 the encoder clamps an oversized label, because a label is a
+    /// rendering that can always be made shorter. Every other oversized column
+    /// still fails loudly, which is what this pins.
     #[test]
     fn oversized_signature_metadata_is_rejected_by_the_schema_and_publishes_nothing() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -11406,10 +11489,11 @@ mod tests {
             .expect("fixture should produce signature metadata");
         state.signature_metadata.insert(
             target,
-            vec![SignatureMetadata::new(
-                "x".repeat(MAX_SIGNATURE_METADATA_COLUMN_BYTES + 1),
-                Vec::new(),
-            )],
+            vec![
+                SignatureMetadata::new("make(value)", Vec::new()).with_return_type_text(Some(
+                    "x".repeat(MAX_SIGNATURE_METADATA_COLUMN_BYTES + 1),
+                )),
+            ],
         );
         let state = Arc::new(state);
         let store = AnalyzerStore::open_in_memory().unwrap();
@@ -11440,7 +11524,7 @@ mod tests {
             .to_string();
         assert!(
             prepared_error.contains("CHECK constraint failed"),
-            "SQLite must reject the oversized label itself: {prepared_error}"
+            "SQLite must reject the oversized column itself: {prepared_error}"
         );
 
         let write_error = store
@@ -11449,13 +11533,87 @@ mod tests {
             .to_string();
         assert!(
             write_error.contains("CHECK constraint failed"),
-            "SQLite must reject the oversized label itself: {write_error}"
+            "SQLite must reject the oversized column itself: {write_error}"
         );
         assert!(
             !store
                 .contains_parsed_blob_at_generation(oid, "ruby", generation)
                 .unwrap(),
             "a rejected metadata row must roll back instead of publishing a complete omission"
+        );
+    }
+
+    /// Issue #2351: a label is a rendering, so an oversized one is clamped and
+    /// the file still indexes. The parameter spans index the label, so the
+    /// clamp must drop the ones that no longer land inside it.
+    #[test]
+    fn an_oversized_label_is_clamped_instead_of_failing_the_blob() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "factory.rb",
+            "class Factory\n  def make(value)\n    value\n  end\nend\n",
+        );
+        let source = file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let mut state = parse_state(&RubyAdapter, &file);
+        let target = state
+            .signature_metadata
+            .keys()
+            .next()
+            .cloned()
+            .expect("fixture should produce signature metadata");
+        let oversized = format!(
+            "make({})",
+            "x".repeat(MAX_SIGNATURE_METADATA_COLUMN_BYTES + 1)
+        );
+        let far_end = oversized.len() - 1;
+        state.signature_metadata.insert(
+            target,
+            vec![SignatureMetadata::new(
+                oversized,
+                vec![
+                    ParameterMetadata::new("mak", 0, 3),
+                    ParameterMetadata::new("tail", far_end - 4, far_end),
+                ],
+            )],
+        );
+        let state = Arc::new(state);
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation = store
+            .ensure_language_epoch_value("ruby", "clamped-signature-label-write-v1")
+            .unwrap();
+
+        store
+            .write_parsed_blob_at_generation(oid, "ruby", generation, &RubyAdapter, state.as_ref())
+            .expect("a clamped label must not fail the blob");
+        assert!(
+            store
+                .contains_parsed_blob_at_generation(oid, "ruby", generation)
+                .unwrap(),
+            "the file must still index despite one pathological declaration"
+        );
+
+        let conn = store.conn.lock().expect("store mutex");
+        let (label, parameters): (String, String) = conn
+            .query_row(
+                "SELECT label, parameters FROM unit_signature_metadata",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            label.len() <= MAX_SIGNATURE_METADATA_COLUMN_BYTES,
+            "the stored label must respect the column cap, got {} bytes",
+            label.len()
+        );
+        assert!(
+            label.ends_with(SIGNATURE_LABEL_ELISION),
+            "a clamped label must say so in the value itself"
+        );
+        assert!(
+            parameters.contains("\"mak\"") && !parameters.contains("\"tail\""),
+            "only spans inside the retained prefix may survive: {parameters}"
         );
     }
 
@@ -18089,6 +18247,12 @@ mod tests {
         );
         assert_eq!(
             store
+                .rust_module_import_candidate_blobs("rust", "delta")
+                .unwrap(),
+            vec![oid]
+        );
+        assert_eq!(
+            store
                 .rust_identifier_occurrence_blobs("rust", "helper")
                 .unwrap(),
             vec![(
@@ -18109,6 +18273,42 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "identifier lookups are scoped to one language"
+        );
+    }
+
+    #[test]
+    fn rust_module_import_candidates_seek_occurrences_then_blob_import_rows() {
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let mut statement = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {RUST_MODULE_IMPORT_CANDIDATE_BLOBS_SQL}"
+            ))
+            .expect("prepare plan");
+        let plan = statement
+            .query_map(params!["rust", "semantic"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains(
+                    "SEARCH occurrence USING COVERING INDEX idx_rust_identifier_occurrences",
+                )
+            }),
+            "the exact component must seek the occurrence index: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("SEARCH import_target USING PRIMARY KEY")),
+            "each candidate blob must range-read its own import rows: {plan:#?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|detail| detail.contains("SCAN import_target")),
+            "the query must not scan the workspace import table: {plan:#?}"
         );
     }
 

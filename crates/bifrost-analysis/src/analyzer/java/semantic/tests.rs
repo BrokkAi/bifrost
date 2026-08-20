@@ -84,20 +84,19 @@ fn qualified_stdlib_method_object_is_a_type_qualifier() {
         .expect("qualified call object");
     let segments = java_field_access_segments(access, source);
     assert_eq!(segments, ["java", "net", "URLDecoder"]);
-    assert!(java_field_access_is_type_qualifier(access, source, |_| {
-        false
-    }));
+    assert!(java_field_access_is_type_qualifier(
+        access,
+        source,
+        |_| false,
+        |_| false,
+    ));
 }
 
-/// The accepted residual of the spelling-based JLS 6.5 reclassification
-/// (#2363, recorded on #2452): a PascalCase field inherited from another file
-/// is invisible to the intrafile `root_is_value` check, so a chain of
-/// type-spelled segments through it reads as a type qualifier and its heap
-/// identity is dropped. A scope that CAN name the root as a value keeps the
-/// Field lowering. If the first assertion ever starts failing, the residual
-/// has been fixed; retire the issue rather than this pin.
+/// #2452: an uppercase field inherited from another file is invisible to the
+/// intrafile value inventory. Unknown roots must retain heap identity; positive
+/// type evidence may still classify the same spelling as a qualifier.
 #[test]
-fn pascal_case_cross_file_inherited_field_is_the_accepted_qualifier_residual() {
+fn uppercase_cross_file_inherited_field_requires_positive_type_evidence() {
     let source = r#"class App {
   void run() {
     CONFIG.DEFAULTS.value();
@@ -110,12 +109,16 @@ fn pascal_case_cross_file_inherited_field_is_the_accepted_qualifier_residual() {
         .child_by_field_name("object")
         .expect("selector object");
     assert!(
-        java_field_access_is_type_qualifier(access, source, |_| false),
-        "a cross-file inherited PascalCase chain currently reads as a type qualifier"
+        !java_field_access_is_type_qualifier(access, source, |_| false, |_| false),
+        "an unknown uppercase root must keep its Field lowering"
     );
     assert!(
-        !java_field_access_is_type_qualifier(access, source, |root| root == "CONFIG"),
+        !java_field_access_is_type_qualifier(access, source, |root| root == "CONFIG", |_| false,),
         "a root the scope knows as a value must keep its Field lowering"
+    );
+    assert!(
+        java_field_access_is_type_qualifier(access, source, |_| false, |root| root == "CONFIG",),
+        "a root proven to be a type may omit qualifier-only Field lowering"
     );
 }
 
@@ -130,7 +133,7 @@ fn inherited_field_chain_is_not_a_type_qualifier() {
     let tree = parse_java(source);
     let access = first_kind(tree.root_node(), "field_access");
     assert!(
-        !java_field_access_is_type_qualifier(access, source, |_| false),
+        !java_field_access_is_type_qualifier(access, source, |_| false, |_| false),
         "an inherited field chain must keep Field lowering"
     );
 }

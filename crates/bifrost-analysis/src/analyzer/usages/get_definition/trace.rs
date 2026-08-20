@@ -620,12 +620,14 @@ pub fn resolve_definition_batch_with_trace(
     let completeness = trace_completeness_for(&file);
     let session = TraceSession::install();
     let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let mut context =
         super::DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
     context.sources.insert(file.clone(), Ok(source));
     let mut per_request = Vec::with_capacity(requests.len());
     let outcomes = resolve_definition_requests_traced(
         analyzer,
+        token,
         &mut context,
         requests,
         Some(cancellation),
@@ -775,6 +777,8 @@ pub fn boundary_evidence(
     file: &ProjectFile,
     name: &str,
 ) -> (BoundaryStatus, Option<String>) {
+    let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     use crate::analyzer::common::language_for_file;
     use crate::analyzer::semantic_model::SemanticModelSymbolKind;
     use crate::analyzer::{
@@ -797,16 +801,31 @@ pub fn boundary_evidence(
             // its `JvmOverlayModel` as a parameter (#1893).
             let evidence = match language {
                 Language::Java => resolve_analyzer::<JavaAnalyzer>(analyzer).map(|java| {
-                    java.external_boundary_evidence(analyzer.semantic_model_overlay(), file, name)
+                    java.external_boundary_evidence(
+                        token,
+                        analyzer.semantic_model_overlay(),
+                        file,
+                        name,
+                    )
                 }),
                 Language::Kotlin => resolve_analyzer::<KotlinAnalyzer>(analyzer).map(|kotlin| {
-                    kotlin.external_boundary_evidence(analyzer.semantic_model_overlay(), file, name)
+                    kotlin.external_boundary_evidence(
+                        token,
+                        analyzer.semantic_model_overlay(),
+                        file,
+                        name,
+                    )
                 }),
                 Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer).map(|scala| {
-                    scala.external_boundary_evidence(analyzer.semantic_model_overlay(), file, name)
+                    scala.external_boundary_evidence(
+                        token,
+                        analyzer.semantic_model_overlay(),
+                        file,
+                        name,
+                    )
                 }),
                 Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer)
-                    .map(|csharp| csharp.external_boundary_evidence(file, name)),
+                    .map(|csharp| csharp.external_boundary_evidence(token, file, name)),
                 _ => unreachable!("the arm pattern admits exactly these four languages"),
             };
             match evidence {
@@ -1136,6 +1155,8 @@ fn declared_import_route(
     name: &str,
     evidence: &crate::analyzer::semantic_model::DependencyDiscoveryEvidence,
 ) -> bool {
+    let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     use crate::analyzer::Language;
 
     // `name` is the resolved reference site's rendered text; its leading
@@ -1148,7 +1169,7 @@ fn declared_import_route(
             let Some(provider) = analyzer.import_analysis_provider_for_file(file) else {
                 return false;
             };
-            provider.import_info_of(file).iter().any(|import| {
+            provider.import_info_of(token, file).iter().any(|import| {
                 let binds = import.is_wildcard || import.local_name() == Some(leading);
                 binds
                     && import.path.as_ref().is_some_and(|path| {
@@ -1306,6 +1327,7 @@ mod boundary_evidence_tests {
     };
     use crate::analyzer::usages::get_definition::DefinitionLookupRequest;
     use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject, WorkspaceAnalyzer};
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -2743,10 +2765,13 @@ mod boundary_evidence_tests {
             activation_evidence("java", "jdk", "java.base"),
         );
         let analyzer = kotlin.workspace.analyzer();
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let evidence =
             crate::analyzer::resolve_analyzer::<crate::analyzer::KotlinAnalyzer>(analyzer)
                 .expect("the Kotlin fixture has a Kotlin analyzer")
                 .external_boundary_evidence(
+                    token,
                     analyzer.semantic_model_overlay(),
                     &kotlin.file,
                     "Collections.sort",
@@ -2777,6 +2802,7 @@ mod boundary_evidence_tests {
             crate::analyzer::resolve_analyzer::<crate::analyzer::ScalaAnalyzer>(analyzer)
                 .expect("the Scala fixture has a Scala analyzer")
                 .external_boundary_evidence(
+                    token,
                     analyzer.semantic_model_overlay(),
                     &scala.file,
                     "Collections.sort",

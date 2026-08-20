@@ -8,6 +8,8 @@ mod imports;
 pub(crate) mod package_identity;
 mod semantic;
 use crate::analyzer::Range;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
@@ -152,10 +154,11 @@ impl GoAnalyzer {
 
     pub(crate) fn import_info_limited(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         limit: usize,
     ) -> LimitedQueryRows<crate::analyzer::ImportInfo> {
-        self.inner.import_info_of_limited(file, limit)
+        self.inner.import_info_of_limited(token, file, limit)
     }
 
     pub(crate) fn signature_metadata_limited(
@@ -254,7 +257,11 @@ impl GoAnalyzer {
             .into_iter()
             .filter(|file| file_language(file) == Language::Go)
             .collect();
+        // The Go edge index is built from import facts, so the build owns a
+        // request scope for the whole pass (issue #2423).
+        let scope = AnalyzerQueryScope::new(self);
         let source = GoGraphSource {
+            token: scope.token(),
             index: self,
             imports: self,
             type_aliases: self,
@@ -330,21 +337,30 @@ impl TypeHierarchyProvider for GoAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.memo_caches
             .hierarchy_index
-            .get_or_init(|| GoHierarchyIndex::build(&self.inner, self))
+            .get_or_init(|| {
+                let scope = AnalyzerQueryScope::new(self);
+                GoHierarchyIndex::build(scope.token(), &self.inner, self)
+            })
             .direct_ancestors(code_unit)
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> crate::hash::HashSet<CodeUnit> {
         self.memo_caches
             .hierarchy_index
-            .get_or_init(|| GoHierarchyIndex::build(&self.inner, self))
+            .get_or_init(|| {
+                let scope = AnalyzerQueryScope::new(self);
+                GoHierarchyIndex::build(scope.token(), &self.inner, self)
+            })
             .direct_descendants(code_unit)
     }
 
     fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {
         self.memo_caches
             .hierarchy_index
-            .get_or_init(|| GoHierarchyIndex::build(&self.inner, self))
+            .get_or_init(|| {
+                let scope = AnalyzerQueryScope::new(self);
+                GoHierarchyIndex::build(scope.token(), &self.inner, self)
+            })
             .supports(code_unit)
     }
 }
@@ -614,7 +630,10 @@ impl IAnalyzer for GoAnalyzer {
     }
 
     fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
+        // Trait signature is fixed, so this boundary opens the scope the
+        // usage-graph funnel now demands proof of (issue #2423 milestone B).
+        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        self.inner.global_usage_definition_index(scope.token())
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -648,10 +667,12 @@ impl IAnalyzer for GoAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         // The Go collector builds the complete report itself: it is the only
         // caller that knows which of its lookups checked a workspace lexical
         // scope, an indexed external package surface, or nothing at all.
-        diagnostics::collect_go_semantic_diagnostics(self, file, source)
+        diagnostics::collect_go_semantic_diagnostics(self, token, file, source)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
@@ -879,11 +900,15 @@ impl LanguageEdgePass for GoEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        build_go_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        let scope = AnalyzerQueryScope::new(ctx.analyzer);
+        let token = scope.token();
+        build_go_usage_edges(ctx.analyzer, token, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
-        build_go_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+        let scope = AnalyzerQueryScope::new(ctx.analyzer);
+        let token = scope.token();
+        build_go_usage_edge_weights(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
             .map(LanguageEdgeWeights::Fqn)
     }
 }
@@ -893,8 +918,10 @@ impl StructuralReceiverResolver for GoSupport {
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<TypeLookupOutcome> {
+        let scope = AnalyzerQueryScope::new(query.analyzer);
         resolve_go_type_bounded(
             query.analyzer,
+            scope.token(),
             query.file,
             query.source,
             query.tree,
@@ -945,13 +972,15 @@ impl DeadCodeBulkProof for GoDeadCodeBulk {
         analyzer: &dyn IAnalyzer,
         candidates: &[CodeUnit],
     ) -> Option<DeadCodeBulkEdges> {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let nodes = fqn_bulk_nodes(
             analyzer,
             Language::Go,
             |unit| unit.is_function() || unit.is_class() || go_module_level_field(unit),
             candidates,
         );
-        build_go_usage_edges(analyzer, &nodes, |_| true)
+        build_go_usage_edges(analyzer, token, &nodes, |_| true)
             .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
     }
 }
@@ -991,7 +1020,9 @@ mod hierarchy_tests {
             "service.go",
             "package app\ntype Runner interface { Run() error }\ntype Worker struct{}\nfunc (Worker) Run() error { return nil }\n",
         )]);
-        let index = GoHierarchyIndex::build(&analyzer, &analyzer);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        let index = GoHierarchyIndex::build(token, &analyzer, &analyzer);
         assert!(index.relations().iter().any(|relation| {
             relation.kind == TypeRelationKind::StructuralSatisfaction
                 && relation.from.identifier() == "Worker"

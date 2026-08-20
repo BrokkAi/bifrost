@@ -1249,3 +1249,68 @@ fn arity_frontends_validate_ranges_at_exact_positions() {
         .expect("root anchor diagnostic");
     assert!(diagnostic.message.contains("kind"), "{diagnostic:?}");
 }
+
+#[test]
+fn visibility_help_covers_the_predicate_form_property_and_json_field() {
+    let form = "(method (visibility public))";
+    let form_help =
+        query_source_help_at(form, form.find("visibility").unwrap()).expect("visibility form help");
+    assert_eq!(&form[form_help.range.clone()], "visibility");
+    assert!(
+        form_help.description.contains("visibility"),
+        "{form_help:?}"
+    );
+
+    let property = "(method :visibility public)";
+    let property_help = query_source_help_at(property, property.find(":visibility").unwrap())
+        .expect("visibility property");
+    assert_eq!(&property[property_help.range], ":visibility");
+
+    let json = r#"{"match":{"kind":"method","visibility":"public"}}"#;
+    let json_help = query_source_help_at(json, json.find("\"visibility\"").unwrap())
+        .expect("visibility json help");
+    assert_eq!(&json[json_help.range], "\"visibility\"");
+}
+
+#[test]
+fn visibility_and_parameter_type_frontends_validate_at_exact_positions() {
+    for source in [
+        "(method :visibility public)",
+        "(method :visibility [public protected])",
+        "(method :visibility (public protected))",
+        "(method (visibility package-private))",
+        r#"(method :parameter-type "String")"#,
+        r#"(method :parameter-type/regex "String")"#,
+        r#"{"match":{"kind":"method","visibility":"public"}}"#,
+        r#"{"match":{"kind":"method","visibility":["public","protected"]}}"#,
+        r#"{"match":{"kind":"method","parameter_type":"String"}}"#,
+        r#"{"match":{"kind":"method","parameter_type":{"regex":"String"}}}"#,
+    ] {
+        assert!(
+            validate_query_source(source).is_empty(),
+            "well-formed callable signature predicate should validate: {source}: {:#?}",
+            validate_query_source(source)
+        );
+    }
+
+    let rql = "(call :visibility public)";
+    let diagnostic = validate_query_source(rql)
+        .pop()
+        .expect("visibility on call");
+    assert!(diagnostic.message.contains("callable"), "{diagnostic:?}");
+
+    let json = r#"{"match":{"kind":"call","parameter_type":"String"}}"#;
+    let diagnostic = validate_query_source(json)
+        .pop()
+        .expect("parameter_type on call");
+    assert!(diagnostic.message.contains("callable"), "{diagnostic:?}");
+
+    let rql = "(method :visibility banana)";
+    let diagnostic = validate_query_source(rql)
+        .pop()
+        .expect("unknown visibility");
+    assert!(
+        diagnostic.message.contains("unknown visibility"),
+        "{diagnostic:?}"
+    );
+}

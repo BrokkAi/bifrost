@@ -450,8 +450,9 @@ impl PackIdentity {
                     name: "jdk".to_owned(),
                     requirement: JDK_TOOLCHAIN_REQUIREMENT.to_owned(),
                 }],
-                provenance_source: "hand-authored JDK framework declarations (java.lang, java.sql)"
-                    .to_owned(),
+                provenance_source:
+                    "hand-authored JDK framework declarations (java.io, java.lang, java.sql)"
+                        .to_owned(),
                 staged_reason: None,
             });
         }

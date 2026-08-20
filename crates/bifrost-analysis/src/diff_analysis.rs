@@ -1,5 +1,6 @@
 use crate::analyzer::test_paths;
 use crate::analyzer::{AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::searchtools::{
     UsageGraphCallSite, UsageGraphEdge, UsageGraphParams, UsageGraphTruncatedSymbol, usage_graph,
 };
@@ -1829,6 +1830,8 @@ fn import_changes(
 }
 
 fn imports_for_path(analyzer: &dyn IAnalyzer, path: &Path) -> BTreeSet<String> {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let Some(file) = analyzer.project().file_by_rel_path(path) else {
         return BTreeSet::new();
     };
@@ -1836,7 +1839,7 @@ fn imports_for_path(analyzer: &dyn IAnalyzer, path: &Path) -> BTreeSet<String> {
         .import_analysis_provider()
         .map(|provider| {
             provider
-                .import_info_of(&file)
+                .import_info_of(token, &file)
                 .iter()
                 .map(|info| info.raw_snippet.clone())
                 .collect::<BTreeSet<_>>()

@@ -32,6 +32,7 @@ use crate::analyzer::usages::{
     CallDispatchBoundaryKind, CallDispatchTarget, CallRelationLimits, CallRelationService,
     ExactCallLocation, UsageProof, call_dispatch_equivalence_source,
 };
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{
     CodeUnit, CodeUnitType, IAnalyzer, LanguageDialect, ProjectFile, Range, WorkspaceAnalyzer,
 };
@@ -190,8 +191,10 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
         // therefore a semantic-budget partial, not an oracle-target cap.
         let max_exploration_candidates = request.budget.remaining().nested_entries.max(1);
         let mut staged_budget = request.budget.clone();
+        let scope = AnalyzerQueryScope::new(self.workspace.analyzer());
         let lookup = CallRelationService::dispatch_at_bounded(
             self.workspace.analyzer(),
+            scope.token(),
             &location,
             Arc::clone(&exact_source),
             CallRelationLimits {

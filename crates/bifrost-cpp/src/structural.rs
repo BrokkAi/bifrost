@@ -17,7 +17,7 @@ use brokk_bifrost_core::analyzer::structural::materialization::{
     CPP_MATERIALIZATION_SUPPORT, DeclarationMaterializationSupport,
 };
 use brokk_bifrost_core::analyzer::structural::occurrences::{
-    NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport,
+    OccurrenceRole, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
     CALLABLE_APPLICABILITY_ONLY_SUPPORT, LexicalEnvironmentSupport,
@@ -254,6 +254,55 @@ fn function_like_macro_names(root: Node<'_>, source: &str) -> HashSet<String> {
     names
 }
 
+fn cpp_member_terminal_name<'tree>(field: Node<'tree>) -> Option<Node<'tree>> {
+    let field = if field.kind() == "dependent_name" {
+        first_named_child(field)?
+    } else {
+        field
+    };
+    expression_name_node(field)
+}
+
+/// Return the one identifier-bearing node that spells a member in a C++
+/// `field_expression`.
+///
+/// The grammar permits the `field` child to be a qualified name, a dependent
+/// name, a template method, or a destructor name. `expression_name_node`
+/// already follows those wrappers to their terminal name. Walking upward from
+/// the candidate and comparing that terminal node keeps receiver identifiers,
+/// declaration names, field-designator labels, and path prefixes out of the
+/// member role without looking at source text.
+fn cpp_member_position(node: Node<'_>) -> Option<OccurrenceRole> {
+    if !matches!(
+        node.kind(),
+        "identifier" | "field_identifier" | "type_identifier" | "operator_name" | "destructor_name"
+    ) {
+        return None;
+    }
+
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "field_expression" {
+            let field = parent.child_by_field_name("field")?;
+            return cpp_member_terminal_name(field)
+                .filter(|name| name.id() == node.id())
+                .map(|_| OccurrenceRole::MemberPosition);
+        }
+
+        // These are the only named wrappers that can occur between the
+        // terminal field name and its owning field expression.
+        if matches!(
+            parent.kind(),
+            "qualified_identifier" | "dependent_name" | "template_method" | "destructor_name"
+        ) {
+            current = parent;
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
 impl StructuralSpec for CppStructuralSpec {
     fn language(&self) -> Language {
         Language::Cpp
@@ -328,11 +377,10 @@ impl StructuralSpec for CppStructuralSpec {
         .then(|| CallSiteFacts::of_coverage(CallShapeCoverage::UnknownMacroDerived))
     }
 
-    /// C++ has not learned occurrence-role classification yet (#1473).
-    /// The empty table is the honest answer: queries and assertions that ask
-    /// for an occurrence role here report incomplete rather than clean-empty.
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
-        &NO_OCCURRENCE_ROLE_SUPPORT
+        static SUPPORT: OccurrenceRoleSupport =
+            OccurrenceRoleSupport::NONE.supported(OccurrenceRole::MemberPosition);
+        &SUPPORT
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
@@ -365,6 +413,10 @@ impl StructuralSpec for CppStructuralSpec {
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
+        if let Some(role) = cpp_member_position(node) {
+            sink.occurrence_role(node, role);
+        }
+
         match kind {
             NormalizedKind::Call => {
                 let function_field = if node.kind() == "new_expression" {
@@ -479,6 +531,120 @@ impl StructuralSpec for CppStructuralSpec {
                 None => sink.set_name(node),
             },
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cpp_member_position;
+    use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
+    use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
+    use tree_sitter::Parser;
+
+    fn member_occurrences(source: &str) -> Vec<(usize, &str, OccurrenceRole)> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("C++ parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let mut found = Vec::new();
+        let mut pending = vec![tree.root_node()];
+        while let Some(node) = pending.pop() {
+            if let Some(role) = cpp_member_position(node) {
+                found.push((
+                    node.start_byte(),
+                    &source[node.start_byte()..node.end_byte()],
+                    role,
+                ));
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    pending.push(child);
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn cpp_member_position_is_limited_to_member_access_and_calls() {
+        let source = concat!(
+            "struct Widget {\n",
+            "    int value;\n",
+            "    int method(int label) {\n",
+            "        return this->value + label.value + label.method()\n",
+            "            + label.template convert<int>() + label.ns::member;\n",
+            "    }\n",
+            "};\n",
+            "int build(Widget widget) {\n",
+            "    Widget result{.value = widget.value};\n",
+            "    return widget.method(result.value);\n",
+            "}\n",
+        );
+        let found = member_occurrences(source);
+        let member_texts = found
+            .iter()
+            .map(|(_, text, role)| (*text, *role))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            member_texts,
+            vec![
+                ("value", OccurrenceRole::MemberPosition),
+                ("value", OccurrenceRole::MemberPosition),
+                ("method", OccurrenceRole::MemberPosition),
+                ("convert", OccurrenceRole::MemberPosition),
+                ("member", OccurrenceRole::MemberPosition),
+                ("value", OccurrenceRole::MemberPosition),
+                ("method", OccurrenceRole::MemberPosition),
+                ("value", OccurrenceRole::MemberPosition),
+            ]
+        );
+
+        let at = |needle: &str| source.find(needle).expect("fixture token");
+        for receiver in ["this->", "label.value", "widget.value", "result.value"] {
+            let receiver_start = at(receiver);
+            assert!(
+                found.iter().all(|(offset, _, _)| *offset != receiver_start),
+                "receiver was classified: {receiver:?}"
+            );
+        }
+        let non_members = [
+            at("Widget {"),
+            at("int value") + "int ".len(),
+            at("int method") + "int ".len(),
+            at(".value =") + 1,
+        ];
+        for unrelated_start in non_members {
+            assert!(
+                found
+                    .iter()
+                    .all(|(offset, _, _)| *offset != unrelated_start),
+                "non-member identifier at byte {unrelated_start} was classified"
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_member_position_support_declares_only_member_position() {
+        let support = super::CPP_STRUCTURAL_SPEC.occurrence_role_support();
+        assert!(support.is_supported(OccurrenceRole::MemberPosition));
+        for role in [
+            OccurrenceRole::ReceiverPosition,
+            OccurrenceRole::LabelOrKey,
+            OccurrenceRole::DeclarationName,
+            OccurrenceRole::ValueReference,
+        ] {
+            assert!(
+                !support.is_supported(role),
+                "unexpected C++ support for {role:?}"
+            );
         }
     }
 }

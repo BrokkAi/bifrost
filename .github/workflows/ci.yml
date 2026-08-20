@@ -54,7 +54,7 @@ jobs:
         run: node crates/bifrost-mcp/tests/conformance/run.mjs --ci
 
       - name: Check release metadata
-        run: node scripts/release-version.mjs check
+        run: node scripts/public/release-version.mjs check
 
       # The published MCP and LSP suites plus the conformance gate above now
       # cover those two protocol surfaces. Before v0.10.0, add deliberately

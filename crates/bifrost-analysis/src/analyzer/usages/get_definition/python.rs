@@ -11,6 +11,7 @@ use crate::analyzer::{
     BoundedDefinitionLookup, resolve_fqn_candidates, resolve_module_code_unit,
     usage_resolve_module_files,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_python::bindings::{
     PythonLexicalNameResolution, python_unambiguous_module_class_binding_bounded,
@@ -81,8 +82,13 @@ impl<'a> PythonDefinitionProvider<'a> {
     }
 
     /// The import bindings `file` declares, charged as one indexed query.
-    fn import_binder(&self, file: &ProjectFile) -> Option<Arc<ImportBinder>> {
-        self.session.query(|| self.python.import_binder_of(file))
+    fn import_binder(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Option<Arc<ImportBinder>> {
+        self.session
+            .query(|| self.python.import_binder_of(token, file))
     }
 
     fn scope_step(&self) -> bool {
@@ -96,8 +102,10 @@ pub(crate) struct PythonTypeLookupResolution {
     pub(crate) target_kind: TypeLookupTargetKind,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_python_bounded(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -144,6 +152,7 @@ pub(crate) fn resolve_python_bounded(
             let member = python_slice(attribute, source);
             let receiver = python_type_for_expression_bounded(
                 &support,
+                token,
                 file,
                 source,
                 tree.root_node(),
@@ -217,6 +226,7 @@ pub(crate) fn resolve_python_bounded(
 
 pub(crate) fn python_type_lookup_resolution_bounded(
     support: &PythonDefinitionProvider<'_>,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -233,6 +243,7 @@ pub(crate) fn python_type_lookup_resolution_bounded(
         && !python_has_lexical_binding_bounded(support, expression, source)
         && python_class_candidate_for_name(
             support,
+            token,
             file,
             source,
             expression,
@@ -244,7 +255,8 @@ pub(crate) fn python_type_lookup_resolution_bounded(
     } else {
         TypeLookupTargetKind::ValueExpression
     };
-    let unit = python_type_for_expression_bounded(support, file, source, root, expression, 0)?;
+    let unit =
+        python_type_for_expression_bounded(support, token, file, source, root, expression, 0)?;
     Some(PythonTypeLookupResolution { unit, target_kind })
 }
 
@@ -409,6 +421,7 @@ fn node_range(node: Node<'_>) -> Range {
 
 fn python_type_for_expression_bounded(
     support: &PythonDefinitionProvider<'_>,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -421,13 +434,23 @@ fn python_type_for_expression_bounded(
     match node.kind() {
         "identifier" => {
             let name = python_slice(node, source);
-            if let Some(receiver) = python_current_receiver_class(support, file, source, node, name)
+            if let Some(receiver) =
+                python_current_receiver_class(support, token, file, source, node, name)
             {
                 Some(receiver)
             } else if python_has_lexical_binding_bounded(support, node, source) {
-                python_bound_type_for_identifier(support, file, source, root, node, name, depth + 1)
+                python_bound_type_for_identifier(
+                    support,
+                    token,
+                    file,
+                    source,
+                    root,
+                    node,
+                    name,
+                    depth + 1,
+                )
             } else {
-                python_class_candidate_for_name(support, file, source, node, name)
+                python_class_candidate_for_name(support, token, file, source, node, name)
             }
         }
         "call" => {
@@ -441,6 +464,7 @@ fn python_type_for_expression_bounded(
                         PythonLexicalBinding::LocalFunction(declaration) => {
                             return python_function_return_type_from_node_bounded(
                                 support,
+                                token,
                                 file,
                                 source,
                                 root,
@@ -450,7 +474,7 @@ fn python_type_for_expression_bounded(
                         }
                         PythonLexicalBinding::UnboundOrGlobal => {
                             if let Some(class) = python_class_candidate_for_name(
-                                support, file, source, function, name,
+                                support, token, file, source, function, name,
                             ) {
                                 return Some(class);
                             }
@@ -475,6 +499,7 @@ fn python_type_for_expression_bounded(
                     let member = python_slice(function.child_by_field_name("attribute")?, source);
                     let receiver = python_type_for_expression_bounded(
                         support,
+                        token,
                         file,
                         source,
                         root,
@@ -491,7 +516,15 @@ fn python_type_for_expression_bounded(
                 }
                 _ => None,
             }?;
-            python_callable_return_type_in_tree(support, file, source, root, &callable, depth + 1)
+            python_callable_return_type_in_tree(
+                support,
+                token,
+                file,
+                source,
+                root,
+                &callable,
+                depth + 1,
+            )
         }
         // `value.paint` outside a call: the receiver's type owns the member, so
         // the member declaration's own type is the expression's type.
@@ -501,13 +534,21 @@ fn python_type_for_expression_bounded(
             if member.is_empty() {
                 return None;
             }
-            let receiver =
-                python_type_for_expression_bounded(support, file, source, root, object, depth + 1)?;
+            let receiver = python_type_for_expression_bounded(
+                support,
+                token,
+                file,
+                source,
+                root,
+                object,
+                depth + 1,
+            )?;
             let declaration = unique_python_candidate(
                 support.members_for_owner_name(&receiver.fq_name(), member),
             )?;
             python_member_declared_type_bounded(
                 support,
+                token,
                 file,
                 source,
                 root,
@@ -517,7 +558,7 @@ fn python_type_for_expression_bounded(
         }
         "parenthesized_expression" => {
             let child = node.named_child(0)?;
-            python_type_for_expression_bounded(support, file, source, root, child, depth + 1)
+            python_type_for_expression_bounded(support, token, file, source, root, child, depth + 1)
         }
         _ => None,
     }
@@ -534,6 +575,7 @@ fn python_type_for_expression_bounded(
 /// cold-parses a second file to finish a step.
 fn python_member_declared_type_bounded(
     support: &PythonDefinitionProvider<'_>,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -573,6 +615,7 @@ fn python_member_declared_type_bounded(
             {
                 types.extend(python_function_return_type_from_node_bounded(
                     support,
+                    token,
                     file,
                     source,
                     root,
@@ -595,6 +638,7 @@ fn python_member_declared_type_bounded(
                 let declared = match node.child_by_field_name("type") {
                     Some(annotation) => python_type_from_annotation_bounded(
                         support,
+                        token,
                         file,
                         source,
                         annotation,
@@ -603,6 +647,7 @@ fn python_member_declared_type_bounded(
                     None => node.child_by_field_name("right").and_then(|value| {
                         python_type_for_expression_bounded(
                             support,
+                            token,
                             file,
                             source,
                             root,
@@ -625,6 +670,7 @@ fn python_member_declared_type_bounded(
 
 fn python_class_candidate_for_name(
     support: &PythonDefinitionProvider<'_>,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     site: Node<'_>,
@@ -646,7 +692,7 @@ fn python_class_candidate_for_name(
     }
     // A same-file declaration shadows an import, so the binder is consulted only
     // after the file's own classes cannot answer the name.
-    if let Some(candidate) = python_imported_class_candidate(support, file, name) {
+    if let Some(candidate) = python_imported_class_candidate(support, token, file, name) {
         return Some(candidate);
     }
     if !name.contains('.') {
@@ -669,10 +715,11 @@ fn python_class_candidate_for_name(
 /// names a module, not a type.
 fn python_imported_class_candidate(
     support: &PythonDefinitionProvider<'_>,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     name: &str,
 ) -> Option<CodeUnit> {
-    let binder = support.import_binder(file)?;
+    let binder = support.import_binder(token, file)?;
     let binding = binder.bindings.get(name)?;
     if binding.kind != ImportKind::Named {
         return None;
@@ -986,6 +1033,7 @@ fn unique_python_candidate(mut candidates: Vec<CodeUnit>) -> Option<CodeUnit> {
 
 fn python_current_receiver_class(
     support: &PythonDefinitionProvider<'_>,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     node: Node<'_>,
@@ -1019,6 +1067,7 @@ fn python_current_receiver_class(
             let class_name = candidate.child_by_field_name("name")?;
             return python_class_candidate_for_name(
                 support,
+                token,
                 file,
                 source,
                 node,
@@ -1033,8 +1082,10 @@ fn python_current_receiver_class(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn python_bound_type_for_identifier(
     support: &PythonDefinitionProvider<'_>,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1047,7 +1098,14 @@ fn python_bound_type_for_identifier(
         && let Some(annotation) =
             python_parameter_annotation_bounded(support, parameters, source, name)
     {
-        return python_type_from_annotation_bounded(support, file, source, annotation, depth + 1);
+        return python_type_from_annotation_bounded(
+            support,
+            token,
+            file,
+            source,
+            annotation,
+            depth + 1,
+        );
     }
 
     let body = function.child_by_field_name("body")?;
@@ -1081,10 +1139,17 @@ fn python_bound_type_for_identifier(
     }
     let assignment = best?;
     if let Some(annotation) = assignment.child_by_field_name("type") {
-        return python_type_from_annotation_bounded(support, file, source, annotation, depth + 1);
+        return python_type_from_annotation_bounded(
+            support,
+            token,
+            file,
+            source,
+            annotation,
+            depth + 1,
+        );
     }
     let value = assignment.child_by_field_name("right")?;
-    python_type_for_expression_bounded(support, file, source, root, value, depth + 1)
+    python_type_for_expression_bounded(support, token, file, source, root, value, depth + 1)
 }
 
 fn python_parameter_annotation_bounded<'tree>(
@@ -1123,6 +1188,7 @@ fn python_parameter_annotation_bounded<'tree>(
 
 fn python_type_from_annotation_bounded(
     support: &PythonDefinitionProvider<'_>,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     annotation: Node<'_>,
@@ -1134,6 +1200,7 @@ fn python_type_from_annotation_bounded(
     match annotation.kind() {
         "identifier" | "string_content" => python_class_candidate_for_name(
             support,
+            token,
             file,
             source,
             annotation,
@@ -1153,7 +1220,7 @@ fn python_type_from_annotation_bounded(
             let content = python_named_children_bounded(support, annotation)?
                 .into_iter()
                 .find(|child| child.kind() == "string_content")?;
-            python_type_from_annotation_bounded(support, file, source, content, depth + 1)
+            python_type_from_annotation_bounded(support, token, file, source, content, depth + 1)
         }
         _ => {
             let mut candidates = Vec::new();
@@ -1164,8 +1231,14 @@ fn python_type_from_annotation_bounded(
                 }
                 if node != annotation
                     && matches!(node.kind(), "identifier" | "attribute" | "string")
-                    && let Some(candidate) =
-                        python_type_from_annotation_bounded(support, file, source, node, depth + 1)
+                    && let Some(candidate) = python_type_from_annotation_bounded(
+                        support,
+                        token,
+                        file,
+                        source,
+                        node,
+                        depth + 1,
+                    )
                 {
                     candidates.push(candidate);
                     continue;
@@ -1180,6 +1253,7 @@ fn python_type_from_annotation_bounded(
 
 fn python_callable_return_type_in_tree(
     support: &PythonDefinitionProvider<'_>,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1211,11 +1285,14 @@ fn python_callable_return_type_in_tree(
         stack.extend(children.into_iter().rev());
     }
     let function = (functions.len() == 1).then(|| functions.remove(0))?;
-    python_function_return_type_from_node_bounded(support, file, source, root, function, depth)
+    python_function_return_type_from_node_bounded(
+        support, token, file, source, root, function, depth,
+    )
 }
 
 fn python_function_return_type_from_node_bounded(
     support: &PythonDefinitionProvider<'_>,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1223,7 +1300,14 @@ fn python_function_return_type_from_node_bounded(
     depth: usize,
 ) -> Option<CodeUnit> {
     if let Some(annotation) = function.child_by_field_name("return_type") {
-        return python_type_from_annotation_bounded(support, file, source, annotation, depth + 1);
+        return python_type_from_annotation_bounded(
+            support,
+            token,
+            file,
+            source,
+            annotation,
+            depth + 1,
+        );
     }
 
     let body = function.child_by_field_name("body")?;
@@ -1243,8 +1327,15 @@ fn python_function_return_type_from_node_bounded(
         }
         if node.kind() == "return_statement"
             && let Some(value) = node.named_child(0)
-            && let Some(candidate) =
-                python_type_for_expression_bounded(support, file, source, root, value, depth + 1)
+            && let Some(candidate) = python_type_for_expression_bounded(
+                support,
+                token,
+                file,
+                source,
+                root,
+                value,
+                depth + 1,
+            )
         {
             returns.push(candidate);
             continue;
@@ -1380,6 +1471,7 @@ fn python_enclosing_body_callable_bounded<'tree>(
 
 pub(super) fn resolve_python(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     context: &mut DefinitionBatchContext<'_>,
     file: &ProjectFile,
     source: &str,
@@ -1434,7 +1526,7 @@ pub(super) fn resolve_python(
         };
     }
 
-    let ctx = context.python_context(py, file);
+    let ctx = context.python_context(token, py, file);
     let support = context.bounded_support();
     let reference = python_reference_node(node);
     match reference {
@@ -1461,6 +1553,7 @@ pub(super) fn resolve_python(
             }
             if let Some(receiver_type) = python_receiver_type_unit(
                 analyzer,
+                token,
                 py,
                 support,
                 &ctx,
@@ -1477,12 +1570,18 @@ pub(super) fn resolve_python(
                     format!("`{object_text}` is a local Python value"),
                 );
             }
-            if python_unresolved_import_boundary(file, analyzer, object_text, Some(attribute_text))
-            {
+            if python_unresolved_import_boundary(
+                file,
+                analyzer,
+                token,
+                object_text,
+                Some(attribute_text),
+            ) {
                 return gated_boundary(
                     || {
                         python_import_binding_is_workspace_internal(
                             py,
+                            token,
                             support,
                             file,
                             object_text,
@@ -1572,9 +1671,13 @@ pub(super) fn resolve_python(
                     return candidates_outcome(candidates);
                 }
             }
-            if python_unresolved_import_boundary(file, analyzer, text, None) {
+            if python_unresolved_import_boundary(file, analyzer, token, text, None) {
                 return gated_boundary(
-                    || python_import_binding_is_workspace_internal(py, support, file, text, None),
+                    || {
+                        python_import_binding_is_workspace_internal(
+                            py, token, support, file, text, None,
+                        )
+                    },
                     format!(
                         "`{text}` crosses a Python import boundary not indexed in this workspace"
                     ),
@@ -1600,6 +1703,7 @@ pub(super) fn resolve_python(
             // member.
             if let Some(receiver_type) = python_receiver_type_unit(
                 analyzer,
+                token,
                 py,
                 support,
                 &ctx,
@@ -2069,10 +2173,11 @@ impl PythonDefinitionContext {
     pub(super) fn build(
         py: &PythonAnalyzer,
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         #[cfg(test)] build_counters: Arc<PythonDefinitionBuildCounters>,
     ) -> Self {
-        let binder = py.import_binder_of(file);
+        let binder = py.import_binder_of(token, file);
         let mut named = HashMap::default();
         let mut namespace = HashMap::default();
         for (local, binding) in &binder.bindings {
@@ -2709,6 +2814,7 @@ fn python_workspace_module_exists(support: &dyn BoundedDefinitionLookup, module:
 #[allow(clippy::too_many_arguments)]
 fn python_receiver_type_unit(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     py: &PythonAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     context: &PythonDefinitionContext,
@@ -2743,7 +2849,7 @@ fn python_receiver_type_unit(
             if class.is_some() {
                 return class;
             }
-            let binder = py.import_binder_of(file);
+            let binder = py.import_binder_of(token, file);
             let binding = binder.bindings.get(receiver)?;
             let imported = binding.imported_name.as_ref()?;
             let fqn = format!("{}.{}", binding.module_specifier, imported);
@@ -2751,9 +2857,9 @@ fn python_receiver_type_unit(
         }
         // A call receiver: `Foo().bar` (construction) or `make().bar` (the
         // called function/method's return type).
-        "call" => {
-            python_call_result_type(analyzer, py, support, context, file, source, root, object)
-        }
+        "call" => python_call_result_type(
+            analyzer, token, py, support, context, file, source, root, object,
+        ),
         _ => None,
     }
 }
@@ -2764,6 +2870,7 @@ fn python_receiver_type_unit(
 #[allow(clippy::too_many_arguments)]
 fn python_call_result_type(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     py: &PythonAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     context: &PythonDefinitionContext,
@@ -2773,8 +2880,9 @@ fn python_call_result_type(
     call: Node<'_>,
 ) -> Option<CodeUnit> {
     let function = call.child_by_field_name("function")?;
-    let callee =
-        python_resolve_callable(analyzer, py, support, context, file, source, root, function)?;
+    let callee = python_resolve_callable(
+        analyzer, token, py, support, context, file, source, root, function,
+    )?;
     if callee.is_class() {
         return Some(callee);
     }
@@ -2786,6 +2894,7 @@ fn python_call_result_type(
 #[allow(clippy::too_many_arguments)]
 fn python_resolve_callable(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     py: &PythonAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     context: &PythonDefinitionContext,
@@ -2809,7 +2918,7 @@ fn python_resolve_callable(
             let receiver = function.child_by_field_name("object")?;
             let method = python_slice(function.child_by_field_name("attribute")?, source);
             let receiver_type = python_receiver_type_unit(
-                analyzer, py, support, context, file, source, root, receiver,
+                analyzer, token, py, support, context, file, source, root, receiver,
             )?;
             analyzer
                 .definitions(&format!("{}.{}", receiver_type.fq_name(), method))
@@ -2913,13 +3022,14 @@ fn python_self_receiver_type(
 fn python_unresolved_import_boundary(
     file: &ProjectFile,
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     local: &str,
     attribute: Option<&str>,
 ) -> bool {
     let Some(provider) = analyzer.import_analysis_provider() else {
         return false;
     };
-    for import in provider.import_info_of(file) {
+    for import in provider.import_info_of(token, file) {
         let alias_or_identifier = import.alias.as_deref().or(import.identifier.as_deref());
         if alias_or_identifier == Some(local) {
             return provider
@@ -2948,12 +3058,13 @@ fn python_unresolved_import_boundary(
 /// `python_crosses_unindexed_boundary`, which the import-binding paths lacked.
 fn python_import_binding_is_workspace_internal(
     py: &PythonAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     local: &str,
     attribute: Option<&str>,
 ) -> bool {
-    let binder = py.import_binder_of(file);
+    let binder = py.import_binder_of(token, file);
     let Some(binding) = binder
         .bindings
         .get(local)
@@ -3074,8 +3185,11 @@ mod bounded_tests {
     #[test]
     fn bounded_python_wide_deep_walk_stops_without_partial_result() {
         let (fixture, file, source, tree, site) = wide_deep_member_fixture();
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let outcome = resolve_python_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &file,
             &source,
             Some(&tree),
@@ -3097,8 +3211,11 @@ mod bounded_tests {
     fn bounded_python_wide_deep_walk_honors_mid_walk_cancellation() {
         let (fixture, file, source, tree, site) = wide_deep_member_fixture();
         let cancellation = CancellationToken::cancel_after_checks_for_test(12);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let outcome = resolve_python_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &file,
             &source,
             Some(&tree),
@@ -3130,8 +3247,11 @@ mod bounded_tests {
             focus_start_byte: start_byte,
             focus_end_byte: start_byte + "Widget".len(),
         };
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let outcome = resolve_python_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &file,
             source,
             Some(&tree),
@@ -3180,8 +3300,11 @@ def caller() -> None:
             focus_start_byte: start_byte,
             focus_end_byte: start_byte + "run".len(),
         };
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let outcome = resolve_python_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &file,
             source,
             Some(&tree),
@@ -3269,8 +3392,11 @@ def outer() -> None:
                 focus_start_byte: start_byte,
                 focus_end_byte: start_byte + "run".len(),
             };
+            let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+            let token = scope.token();
             let outcome = resolve_python_bounded(
                 fixture.analyzer.analyzer(),
+                token,
                 &file,
                 source,
                 Some(&tree),

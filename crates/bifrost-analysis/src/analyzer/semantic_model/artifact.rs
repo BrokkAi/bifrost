@@ -160,6 +160,36 @@ pub struct CompiledProcedureSummary {
     pub locations: Vec<CompiledSummaryLocation>,
     pub transfers: Vec<CompiledSummaryTransfer>,
     pub effects: Vec<CompiledSummaryEffect>,
+    /// Namespaced effect identifiers declared for this exact procedure (#2437).
+    /// Serialized only when non-empty, so a summary that declares none keeps the
+    /// compiled bytes -- and therefore the shard digests -- it had before the
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_effects: Vec<CompiledDeclaredEffect>,
+}
+
+/// Compiled mirror of `AuthoredDeclaredEffect` (#2437).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledDeclaredEffect {
+    pub id: String,
+    pub timing: CompiledDeclaredEffectTiming,
+    pub certainty: CompiledDeclaredEffectCertainty,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledDeclaredEffectTiming {
+    Immediate,
+    Deferred,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledDeclaredEffectCertainty {
+    Definite,
+    Possible,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1178,6 +1208,28 @@ fn authored_procedure_summary_from_compiled(
             .iter()
             .map(authored_summary_effect_from_compiled)
             .collect(),
+        declared_effects: summary
+            .declared_effects
+            .iter()
+            .map(authored_declared_effect_from_compiled)
+            .collect(),
+    }
+}
+
+fn authored_declared_effect_from_compiled(
+    effect: &CompiledDeclaredEffect,
+) -> AuthoredDeclaredEffect {
+    AuthoredDeclaredEffect {
+        id: effect.id.clone(),
+        timing: match effect.timing {
+            CompiledDeclaredEffectTiming::Immediate => DeclaredEffectTiming::Immediate,
+            CompiledDeclaredEffectTiming::Deferred => DeclaredEffectTiming::Deferred,
+            CompiledDeclaredEffectTiming::Unknown => DeclaredEffectTiming::Unknown,
+        },
+        certainty: match effect.certainty {
+            CompiledDeclaredEffectCertainty::Definite => DeclaredEffectCertainty::Definite,
+            CompiledDeclaredEffectCertainty::Possible => DeclaredEffectCertainty::Possible,
+        },
     }
 }
 

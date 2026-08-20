@@ -208,8 +208,24 @@ mod tests {
             "the prose mention is still recorded: {prose:?}"
         );
 
-        assert_eq!(queries.files_importing_module_path("crate"), vec![worker]);
-        assert_eq!(queries.files_importing_module_path("worker"), vec![lib]);
+        assert_eq!(
+            queries.files_importing_module_path("crate"),
+            vec![worker.clone()]
+        );
+        assert_eq!(
+            queries.files_importing_module_path("worker"),
+            vec![lib.clone()]
+        );
+        assert_eq!(
+            queries.files_importing_module_component("worker"),
+            vec![lib],
+            "the module component is the written path for a named import"
+        );
+        assert_eq!(
+            queries.files_importing_module_component("root"),
+            vec![worker],
+            "a namespace import records the module as its imported name"
+        );
     }
 
     /// An inverted hit is a candidate, never an answer. The store's short-name

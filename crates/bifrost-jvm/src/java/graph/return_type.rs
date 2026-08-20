@@ -2,6 +2,7 @@ use super::JavaGraphSource;
 use super::resolver::java_callable_arity;
 use crate::java::graph_support::{JavaSource, resolve_java_usage_type_name};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile, Range};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::common::node_text;
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome,
@@ -54,6 +55,7 @@ pub trait JavaReturnTypeContext {
 
 pub fn method_return_type_for_owner_fqns<'a, C, I>(
     owners: I,
+    token: QueryToken<'_>,
     name: &str,
     arity: usize,
     ctx: &C,
@@ -65,7 +67,7 @@ where
     merge_receiver_type_outcomes(
         owners
             .into_iter()
-            .map(|owner| method_return_type_for_owner_fqn(owner, name, arity, ctx)),
+            .map(|owner| method_return_type_for_owner_fqn(owner, token, name, arity, ctx)),
     )
 }
 
@@ -75,12 +77,18 @@ where
 /// One reading of "this type answers this call" serves both the return-type
 /// question and the hierarchy walk that decides which type answers it, so a
 /// level the walk skips can never be a level whose return type is then read.
-pub fn java_call_answering_units<C>(owner: &str, name: &str, arity: usize, ctx: &C) -> Vec<CodeUnit>
+pub fn java_call_answering_units<C>(
+    owner: &str,
+    token: QueryToken<'_>,
+    name: &str,
+    arity: usize,
+    ctx: &C,
+) -> Vec<CodeUnit>
 where
     C: JavaReturnTypeContext + ?Sized,
 {
     ctx.java()
-        .usage_definitions()
+        .usage_definitions(token)
         .fqn(&format!("{owner}.{name}"))
         .iter()
         .filter(|unit| unit.is_function() && java_callable_arity(ctx.java(), unit).accepts(arity))
@@ -90,6 +98,7 @@ where
 
 pub fn method_return_type_for_owner_fqn<C>(
     owner: &str,
+    token: QueryToken<'_>,
     name: &str,
     arity: usize,
     ctx: &C,
@@ -97,19 +106,20 @@ pub fn method_return_type_for_owner_fqn<C>(
 where
     C: JavaReturnTypeContext + ?Sized,
 {
-    let units = java_call_answering_units(owner, name, arity, ctx);
+    let units = java_call_answering_units(owner, token, name, arity, ctx);
     if units.is_empty() {
         return ReceiverAnalysisOutcome::Unknown;
     }
     merge_receiver_type_outcomes(
         units
             .into_iter()
-            .map(|unit| method_unit_declared_return_type(&unit, ctx)),
+            .map(|unit| method_unit_declared_return_type(&unit, token, ctx)),
     )
 }
 
 fn method_unit_declared_return_type<C>(
     method: &CodeUnit,
+    token: QueryToken<'_>,
     ctx: &C,
 ) -> ReceiverAnalysisOutcome<String>
 where
@@ -129,7 +139,7 @@ where
     {
         return cached;
     }
-    let outcome = method_unit_declared_return_type_uncached(method, ctx);
+    let outcome = method_unit_declared_return_type_uncached(method, token, ctx);
     ctx.method_return_cache()
         .lock()
         .expect("java return type cache poisoned")
@@ -139,6 +149,7 @@ where
 
 fn method_unit_declared_return_type_uncached<C>(
     method: &CodeUnit,
+    token: QueryToken<'_>,
     ctx: &C,
 ) -> ReceiverAnalysisOutcome<String>
 where
@@ -150,12 +161,19 @@ where
     if method.source() == ctx.file() {
         return java_return_type_node_covering(ctx.root(), &range)
             .and_then(|type_node| {
-                java_declared_type_fqn(ctx.java(), ctx.file(), ctx.source(), type_node, method)
+                java_declared_type_fqn(
+                    ctx.java(),
+                    token,
+                    ctx.file(),
+                    ctx.source(),
+                    type_node,
+                    method,
+                )
             })
             .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
             .unwrap_or(ReceiverAnalysisOutcome::Unknown);
     }
-    java_file_return_facts(ctx, method.source())
+    java_file_return_facts(ctx, token, method.source())
         .declared_types
         .get(&FileReturnCacheKey {
             fq_name: method.fq_name(),
@@ -167,6 +185,7 @@ where
 
 pub fn method_anonymous_return_type_for_owner_fqn<C>(
     owner: &str,
+    token: QueryToken<'_>,
     name: &str,
     arity: usize,
     ctx: &C,
@@ -174,18 +193,19 @@ pub fn method_anonymous_return_type_for_owner_fqn<C>(
 where
     C: JavaReturnTypeContext + ?Sized,
 {
-    let units = java_call_answering_units(owner, name, arity, ctx);
+    let units = java_call_answering_units(owner, token, name, arity, ctx);
     (!units.is_empty()).then(|| {
         merge_receiver_type_outcomes(
             units
                 .iter()
-                .map(|unit| method_unit_anonymous_return_type(unit, ctx)),
+                .map(|unit| method_unit_anonymous_return_type(unit, token, ctx)),
         )
     })
 }
 
 fn method_unit_anonymous_return_type<C>(
     method: &CodeUnit,
+    token: QueryToken<'_>,
     ctx: &C,
 ) -> ReceiverAnalysisOutcome<String>
 where
@@ -205,7 +225,7 @@ where
     {
         return cached;
     }
-    let outcome = method_unit_anonymous_return_type_uncached(method, ctx);
+    let outcome = method_unit_anonymous_return_type_uncached(method, token, ctx);
     ctx.method_anonymous_return_cache()
         .lock()
         .expect("java anonymous return cache poisoned")
@@ -215,6 +235,7 @@ where
 
 fn method_unit_anonymous_return_type_uncached<C>(
     method: &CodeUnit,
+    token: QueryToken<'_>,
     ctx: &C,
 ) -> ReceiverAnalysisOutcome<String>
 where
@@ -228,6 +249,7 @@ where
             .map(|declaration| {
                 method_declaration_anonymous_return_type(
                     ctx.java(),
+                    token,
                     ctx.file(),
                     ctx.source(),
                     declaration,
@@ -236,7 +258,7 @@ where
             })
             .unwrap_or(ReceiverAnalysisOutcome::Unknown);
     }
-    java_file_return_facts(ctx, method.source())
+    java_file_return_facts(ctx, token, method.source())
         .anonymous_return_types
         .get(&FileReturnCacheKey {
             fq_name: method.fq_name(),
@@ -246,7 +268,11 @@ where
         .unwrap_or(ReceiverAnalysisOutcome::Unknown)
 }
 
-fn java_file_return_facts<C>(ctx: &C, file: &ProjectFile) -> JavaFileReturnFacts
+fn java_file_return_facts<C>(
+    ctx: &C,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+) -> JavaFileReturnFacts
 where
     C: JavaReturnTypeContext + ?Sized,
 {
@@ -260,7 +286,7 @@ where
         return cached;
     }
 
-    let index = build_java_file_return_facts(ctx, file);
+    let index = build_java_file_return_facts(ctx, token, file);
     ctx.file_return_cache()
         .lock()
         .expect("java file return cache poisoned")
@@ -268,7 +294,11 @@ where
     index
 }
 
-fn build_java_file_return_facts<C>(ctx: &C, file: &ProjectFile) -> JavaFileReturnFacts
+fn build_java_file_return_facts<C>(
+    ctx: &C,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+) -> JavaFileReturnFacts
 where
     C: JavaReturnTypeContext + ?Sized,
 {
@@ -305,13 +335,20 @@ where
         let declared_type = declaration
             .and_then(|method| method.child_by_field_name("type"))
             .and_then(|type_node| {
-                java_declared_type_fqn(ctx.java(), file, &source, type_node, &unit)
+                java_declared_type_fqn(ctx.java(), token, file, &source, type_node, &unit)
             })
             .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
             .unwrap_or(ReceiverAnalysisOutcome::Unknown);
         let anonymous_return_type = declaration
             .map(|method| {
-                method_declaration_anonymous_return_type(ctx.java(), file, &source, method, &unit)
+                method_declaration_anonymous_return_type(
+                    ctx.java(),
+                    token,
+                    file,
+                    &source,
+                    method,
+                    &unit,
+                )
             })
             .unwrap_or(ReceiverAnalysisOutcome::Unknown);
         facts.declared_types.insert(key.clone(), declared_type);
@@ -324,17 +361,18 @@ where
 
 fn java_declared_type_fqn(
     java: &dyn JavaSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     type_node: Node<'_>,
     declaration: &CodeUnit,
 ) -> Option<String> {
     let components = java_type_name_components(type_node, source)?;
-    match java_lexical_type_from_declaration(java, declaration, &components) {
+    match java_lexical_type_from_declaration(java, token, declaration, &components) {
         LexicalTypeResolution::Resolved(unit) => Some(unit.fq_name()),
         LexicalTypeResolution::Blocked => None,
         LexicalTypeResolution::NotFound => {
-            resolve_java_usage_type_name(java, file, &components.join("."))
+            resolve_java_usage_type_name(java, token, file, &components.join("."))
                 .map(|unit| unit.fq_name())
         }
     }
@@ -402,6 +440,7 @@ pub enum LexicalTypeResolution {
 
 pub fn java_lexical_type_from_node(
     java: &dyn JavaSource,
+    token: QueryToken<'_>,
     graph: &JavaGraphSource<'_>,
     file: &ProjectFile,
     source: &str,
@@ -423,7 +462,7 @@ pub fn java_lexical_type_from_node(
         LexicalTypeResolution::NotFound => {}
         resolution => return resolution,
     }
-    java_lexical_type_from_declaration(java, &declaration, &components)
+    java_lexical_type_from_declaration(java, token, &declaration, &components)
 }
 
 fn java_local_type_from_node(
@@ -544,6 +583,7 @@ pub fn is_java_local_type_scope_node(kind: &str) -> bool {
 
 pub fn java_lexical_type_from_declaration(
     java: &dyn JavaSource,
+    token: QueryToken<'_>,
     declaration: &CodeUnit,
     components: &[String],
 ) -> LexicalTypeResolution {
@@ -566,7 +606,7 @@ pub fn java_lexical_type_from_declaration(
 
         let mut first_binding = (owner.identifier() == first_component).then(|| owner.clone());
         let nested_fqn = format!("{}.{}", owner.fq_name(), first_component);
-        match unique_java_class_by_fqn_in_file(java, &nested_fqn, owner.source()) {
+        match unique_java_class_by_fqn_in_file(java, token, &nested_fqn, owner.source()) {
             Ok(Some(nested)) if first_binding.as_ref().is_some_and(|bound| bound != &nested) => {
                 return LexicalTypeResolution::Blocked;
             }
@@ -582,7 +622,7 @@ pub fn java_lexical_type_from_declaration(
             return LexicalTypeResolution::Resolved(first_binding);
         }
         let qualified_fqn = format!("{}.{}", first_binding.fq_name(), components[1..].join("."));
-        return match unique_java_class_by_fqn_in_file(java, &qualified_fqn, owner.source()) {
+        return match unique_java_class_by_fqn_in_file(java, token, &qualified_fqn, owner.source()) {
             Ok(Some(unit)) => LexicalTypeResolution::Resolved(unit),
             Ok(None) | Err(()) => LexicalTypeResolution::Blocked,
         };
@@ -592,10 +632,11 @@ pub fn java_lexical_type_from_declaration(
 
 fn unique_java_class_by_fqn_in_file(
     java: &dyn JavaSource,
+    token: QueryToken<'_>,
     fqn: &str,
     file: &ProjectFile,
 ) -> Result<Option<CodeUnit>, ()> {
-    let units = java.usage_definitions().fqn(fqn);
+    let units = java.usage_definitions(token).fqn(fqn);
     let mut candidates = units
         .iter()
         .filter(|unit| unit.is_class() && unit.source() == file);
@@ -649,6 +690,7 @@ fn method_declaration_covering<'tree>(root: Node<'tree>, range: &Range) -> Optio
 
 fn method_declaration_anonymous_return_type(
     java: &dyn JavaSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     method: Node<'_>,
@@ -673,7 +715,8 @@ fn method_declaration_anonymous_return_type(
             let Some(type_node) = value.child_by_field_name("type") else {
                 return ReceiverAnalysisOutcome::Unknown;
             };
-            let Some(fqn) = java_declared_type_fqn(java, file, source, type_node, declaration)
+            let Some(fqn) =
+                java_declared_type_fqn(java, token, file, source, type_node, declaration)
             else {
                 return ReceiverAnalysisOutcome::Unknown;
             };

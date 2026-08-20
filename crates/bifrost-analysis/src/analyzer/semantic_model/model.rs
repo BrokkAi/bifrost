@@ -20,6 +20,10 @@ pub const MAX_PROCEDURE_SUMMARY_MODEL_ID_BYTES: usize = MAX_EXTERNAL_SUMMARY_MOD
 /// Upper bound on the labels one `sanitize` effect removes. It mirrors the
 /// policy-local `(sanitize :removes [LABEL...])` bound (#1923).
 pub const MAX_PROCEDURE_SUMMARY_SANITIZE_LABELS: usize = 64;
+/// Upper bound on the namespaced effect identifiers one summary declares
+/// (#2437). Declared effects are a small, reviewed vocabulary per procedure,
+/// not a log, so the bound stays at the same order as the sanitize-label bound.
+pub const MAX_PROCEDURE_SUMMARY_DECLARED_EFFECTS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -136,6 +140,58 @@ pub struct AuthoredProcedureSummary {
     pub transfers: Vec<AuthoredSummaryTransfer>,
     #[serde(default)]
     pub effects: Vec<AuthoredSummaryEffect>,
+    /// Namespaced effect identifiers the reviewed pack attributes to this exact
+    /// procedure identity (#2437), for example `acme.network_io`.
+    ///
+    /// These are declarations *about* the procedure, not dataflow ports: unlike
+    /// `effects`, they carry no input, output, or callee and are never lowered
+    /// into the summary's transfer graph. They exist so a policy can ask "does
+    /// this call perform this effect?" without new analyzer code.
+    ///
+    /// Serialized only when non-empty, so adding the field leaves the content
+    /// digest of every summary that does not declare an effect unchanged --
+    /// the same discipline `covers_overrides` uses above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_effects: Vec<AuthoredDeclaredEffect>,
+}
+
+/// One namespaced effect a reviewed pack attributes to a procedure (#2437).
+///
+/// `id` is a namespaced identifier (`vendor.effect`); the namespace separator is
+/// required so two vendors can ship packs without colliding on bare words like
+/// `write`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredDeclaredEffect {
+    pub id: String,
+    pub timing: DeclaredEffectTiming,
+    pub certainty: DeclaredEffectCertainty,
+}
+
+/// When the declared effect happens relative to the call that triggers it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclaredEffectTiming {
+    /// The effect happens before the call returns.
+    Immediate,
+    /// The call schedules the effect; it happens after the call returns.
+    Deferred,
+    /// The pack asserts the effect without claiming when it happens.
+    Unknown,
+}
+
+/// How firmly the reviewed pack claims the effect occurs.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclaredEffectCertainty {
+    /// Every execution of the procedure performs the effect.
+    Definite,
+    /// Some execution of the procedure may perform the effect.
+    Possible,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

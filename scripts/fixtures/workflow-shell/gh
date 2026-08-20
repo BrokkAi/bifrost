@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+
+# Test double for the GitHub CLI, on PATH in place of the real one.
+#
+# It implements the three call shapes the release workflow scripts make --
+# `gh api`, `gh workflow run`, `gh run watch` -- and runs the real jq over a
+# canned response body, so the --jq filters in those scripts are exercised
+# rather than stubbed out.
+#
+# Environment:
+#   FAKE_GH_ROUTES            JSON file mapping endpoint to response body
+#   FAKE_GH_CALLS             file each invocation's NUL-separated argv is
+#                             appended to
+#   FAKE_GH_WORKFLOW_RUN_EXIT exit status for `gh workflow run` (default 0)
+#   FAKE_GH_RUN_WATCH_EXIT    exit status for `gh run watch` (default 0)
+
+set -uo pipefail
+
+if [[ -n "${FAKE_GH_CALLS:-}" ]]; then
+  {
+    printf '%s\0' "$@"
+    printf '\n'
+  } >> "$FAKE_GH_CALLS"
+fi
+
+case "${1:-} ${2:-}" in
+  "workflow run") exit "${FAKE_GH_WORKFLOW_RUN_EXIT:-0}" ;;
+  "run watch") exit "${FAKE_GH_RUN_WATCH_EXIT:-0}" ;;
+esac
+
+if [[ "${1:-}" != api ]]; then
+  echo "fake gh does not implement: $*" >&2
+  exit 1
+fi
+
+endpoint="$2"
+routes="${FAKE_GH_ROUTES:?FAKE_GH_ROUTES is required}"
+if ! jq -e --arg endpoint "$endpoint" 'has($endpoint)' "$routes" >/dev/null; then
+  echo "fake gh has no route for $endpoint" >&2
+  exit 1
+fi
+body="$(jq --arg endpoint "$endpoint" '.[$endpoint]' "$routes")"
+
+filter=""
+for ((index = 1; index <= $#; index += 1)); do
+  if [[ "${!index}" == "--jq" ]]; then
+    next=$((index + 1))
+    filter="${!next}"
+  fi
+done
+
+if [[ -n "$filter" ]]; then
+  printf '%s' "$body" | jq -r "$filter"
+else
+  printf '%s' "$body"
+fi

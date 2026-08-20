@@ -97,13 +97,15 @@ impl TestDetectionProvider for CppAnalyzer {}
 
 impl ImportAnalysisProvider for CppAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         if let Some(cached) = self.imported_code_units.get(file) {
             return cached;
         }
 
         let mut resolved = HashSet::default();
         let include_targets = self.include_target_index();
-        let imports = self.import_statements_from_projection(file);
+        let imports = self.import_statements_from_projection(token, file);
         for path in include_paths(&imports) {
             for target in resolve_include_targets_with_index(file, &path, include_targets) {
                 resolved.extend(self.inner.top_level_declarations(&target));
@@ -117,12 +119,14 @@ impl ImportAnalysisProvider for CppAnalyzer {
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         if let Some(cached) = self.referencing_files.get(file) {
             return (*cached).clone();
         }
 
         let references = self
-            .reverse_include_index()
+            .reverse_include_index(token)
             .get(file)
             .map(|files| (**files).clone())
             .unwrap_or_default();
@@ -132,8 +136,8 @@ impl ImportAnalysisProvider for CppAnalyzer {
         references
     }
 
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
-        self.inner.import_info_of(file)
+    fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
+        self.inner.import_info_of(token, file)
     }
 
     fn imported_files_from_infos(
@@ -152,11 +156,13 @@ impl ImportAnalysisProvider for CppAnalyzer {
     }
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         let source = code_unit.source();
         let identifiers = brokk_bifrost_cpp::imports::extract_type_identifiers(
             &self.inner.get_source(code_unit, true).unwrap_or_default(),
         );
-        self.import_statements_from_projection(source)
+        self.import_statements_from_projection(token, source)
             .iter()
             .filter(|line| {
                 parse_include_path(line).is_some_and(|path| {
@@ -227,19 +233,26 @@ impl CppAnalyzer {
         })
     }
 
-    fn reverse_include_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
+    fn reverse_include_index(
+        &self,
+        token: QueryToken<'_>,
+    ) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
         crate::analyzer::memoized_reverse_file_index(
             &self.reverse_include_index,
             || self.inner.all_files(),
-            |candidate| self.include_targets_for_file(candidate),
+            |candidate| self.include_targets_for_file(token, candidate),
         )
     }
 
-    fn include_targets_for_file(&self, candidate: &ProjectFile) -> Vec<ProjectFile> {
+    fn include_targets_for_file(
+        &self,
+        token: QueryToken<'_>,
+        candidate: &ProjectFile,
+    ) -> Vec<ProjectFile> {
         let include_targets = self.include_target_index();
         let mut matched_targets = HashSet::default();
         let mut resolved_targets = Vec::new();
-        let imports = self.import_statements_from_projection(candidate);
+        let imports = self.import_statements_from_projection(token, candidate);
         for include in include_paths(&imports) {
             for target in include_targets.resolve_indexed(&include) {
                 if matched_targets.insert(target.clone()) {
@@ -256,10 +269,13 @@ impl CppAnalyzer {
     /// exactly like `reverse_include_index`, and reset at the same points
     /// (`from_inner`, `with_updated_inner`) since it is invalidated only when
     /// the whole analyzer generation turns over.
-    fn transitive_reverse_tu_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
+    fn transitive_reverse_tu_index(
+        &self,
+        token: QueryToken<'_>,
+    ) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
         self.transitive_reverse_tu_index.get_or_build(
-            || self.build_transitive_reverse_tu_index_data(),
-            || self.build_transitive_reverse_tu_index_data(),
+            || self.build_transitive_reverse_tu_index_data(token),
+            || self.build_transitive_reverse_tu_index_data(token),
         )
     }
 
@@ -268,8 +284,9 @@ impl CppAnalyzer {
     /// already-built memo never re-scans the workspace.
     fn build_transitive_reverse_tu_index_data(
         &self,
+        token: QueryToken<'_>,
     ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
-        let direct_reverse = self.reverse_include_index();
+        let direct_reverse = self.reverse_include_index(token);
         let translation_units = self
             .inner
             .all_files()
@@ -283,9 +300,10 @@ impl CppAnalyzer {
     /// reaches `file`, empty when none does.
     pub(crate) fn transitive_reaching_translation_units(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> Arc<HashSet<ProjectFile>> {
-        self.transitive_reverse_tu_index()
+        self.transitive_reverse_tu_index(token)
             .get(file)
             .cloned()
             .unwrap_or_default()
@@ -309,6 +327,7 @@ impl CppAnalyzer {
     /// hierarchy at the call site.
     pub(crate) fn header_language_attribution(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> HeaderLanguageAttribution {
         let direct_contexts = self.compile_contexts_for(file);
@@ -320,7 +339,7 @@ impl CppAnalyzer {
             );
         }
 
-        let reaching_translation_units = self.transitive_reaching_translation_units(file);
+        let reaching_translation_units = self.transitive_reaching_translation_units(token, file);
 
         let database_languages = reaching_translation_units
             .iter()

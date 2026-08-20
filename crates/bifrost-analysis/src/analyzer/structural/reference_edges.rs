@@ -23,10 +23,13 @@
 
 use super::edges::{EdgeAxis, EdgeProvenance, OwnerRelation, SiteClass};
 use super::kinds::NormalizedKind;
+use super::lexical_environment::environment_for_file;
 use super::occurrence_rows::{
-    OccurrenceCompleteness, OccurrenceTarget, OccurrencesCancelled, ast_id, occurrences_for_file,
+    OccurrenceCompleteness, OccurrenceRow, OccurrenceTarget, OccurrencesCancelled, ast_id,
+    occurrences_for_file,
 };
 use super::occurrences::{ALL_OCCURRENCE_ROLES, OccurrenceClass, OccurrenceRole};
+use super::resolution::EnvironmentAxis;
 use super::search::expansions::{classify_reference_kind, reference_hits_for_target};
 use crate::analyzer::usages::{
     ReferenceHit, ReferenceKind, UsageFinder, UsageHitKind, UsageHitSurface, UsageProof,
@@ -34,7 +37,7 @@ use crate::analyzer::usages::{
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 
 /// Bounds for one inverse derivation. The file bound matches the reference
 /// traversal's scan bound; the hit bound is per seed declaration.
@@ -286,6 +289,84 @@ pub fn classify_owner_relation(
     }
 }
 
+/// Classify a forward edge from the structured occurrence role and the owner
+/// relation already computed for the row.
+///
+/// An `ImportTarget` row is an import binding only when its exact facts node
+/// belongs to a lexical-environment import binder. A re-export has the same
+/// occurrence role but no import-binder fact, so it deliberately makes no
+/// `Reexport` claim. A `SelfReference` owner relation proves recursion for
+/// member, receiver, and value occurrences. `SameOwner` is intentionally not
+/// enough: `other.helper()` and `this.helper()` share that relation, while
+/// only the latter is a self receiver. Type/path/pattern occurrences remain
+/// references even when the target happens to share an owner.
+fn classify_forward_usage_kind(
+    row: &OccurrenceRow,
+    import_target_nodes: &HashSet<u32>,
+    owner_relation: OwnerRelation,
+) -> UsageHitKind {
+    let import_binder_selected =
+        row.role == OccurrenceRole::ImportTarget && import_target_nodes.contains(&row.node);
+    classify_forward_usage_kind_from_evidence(row.role, import_binder_selected, owner_relation)
+}
+
+/// Return the exact occurrence nodes whose enclosing import fact has a
+/// structured lexical-environment import binder. Export/re-export facts are
+/// not import facts, so an `ImportTarget` row outside this set retains the
+/// ordinary `Reference` fallback.
+fn import_target_nodes_for_file(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Option<HashSet<u32>> {
+    let environment = environment_for_file(analyzer, file);
+    if !environment
+        .completeness
+        .covers(EnvironmentAxis::ImportBinders)
+    {
+        return None;
+    }
+    let facts = analyzer
+        .structural_search_providers()
+        .into_iter()
+        .find(|provider| {
+            provider.structural_language() == crate::analyzer::common::language_for_file(file)
+        })
+        .and_then(|provider| provider.structural_facts(file))?;
+    Some(
+        environment
+            .bindings
+            .iter()
+            .filter(|binding| binding.import.is_some())
+            .filter_map(|binding| binding.node)
+            .filter(|node| {
+                facts
+                    .occurrence_roles(*node)
+                    .contains(&OccurrenceRole::ImportTarget)
+            })
+            .collect(),
+    )
+}
+
+fn classify_forward_usage_kind_from_evidence(
+    role: OccurrenceRole,
+    import_binder_selected: bool,
+    owner_relation: OwnerRelation,
+) -> UsageHitKind {
+    if role == OccurrenceRole::ImportTarget && import_binder_selected {
+        return UsageHitKind::Import;
+    }
+    if matches!(
+        role,
+        OccurrenceRole::ReceiverPosition
+            | OccurrenceRole::MemberPosition
+            | OccurrenceRole::ValueReference
+    ) && matches!(owner_relation, OwnerRelation::SelfReference)
+    {
+        return UsageHitKind::SelfReceiver;
+    }
+    UsageHitKind::Reference
+}
+
 /// Per-file map from an identifier token's exact byte range to its
 /// facts-arena AST identity, built once per file so a batch of inverse hits
 /// pays one arena pass instead of one per hit.
@@ -335,10 +416,31 @@ fn edge_rows_from_reference_hits(
     analyzer: &dyn IAnalyzer,
     hits: impl IntoIterator<Item = ReferenceHit>,
     generation: u64,
+    cancellation: Option<&CancellationToken>,
 ) -> Vec<ReferenceEdgeRow> {
+    let hits: Vec<ReferenceHit> = hits.into_iter().collect();
+    let mut import_target_ranges: HashMap<ProjectFile, Option<Vec<ExactImportTarget>>> =
+        HashMap::default();
+    for hit in hits
+        .iter()
+        .filter(|hit| hit.usage_kind == UsageHitKind::Import)
+    {
+        import_target_ranges
+            .entry(hit.file.clone())
+            .or_insert_with(|| {
+                exact_import_target_ranges_for_file(analyzer, &hit.file, cancellation)
+            });
+    }
     let mut site_identities: HashMap<ProjectFile, SiteIdentityIndex> = HashMap::default();
     hits.into_iter()
         .map(|hit| {
+            let range = import_target_ranges
+                .get(&hit.file)
+                .map_or(hit.range, |ranges| {
+                    ranges
+                        .as_deref()
+                        .map_or(hit.range, |ranges| exact_import_target_range(ranges, &hit))
+                });
             let site_class = match hit.usage_kind {
                 UsageHitKind::Definition | UsageHitKind::OverrideDeclaration => {
                     SiteClass::DeclarationSite
@@ -353,11 +455,11 @@ fn edge_rows_from_reference_hits(
             let ast_id = site_identities
                 .entry(hit.file.clone())
                 .or_insert_with(|| SiteIdentityIndex::build(analyzer, &hit.file))
-                .ast_id(&hit.range);
+                .ast_id(&range);
             ReferenceEdgeRow {
                 site: EdgeSite {
                     file: hit.file,
-                    range: hit.range,
+                    range,
                     ast_id,
                     enclosing: Some(hit.enclosing_unit),
                 },
@@ -372,6 +474,73 @@ fn edge_rows_from_reference_hits(
             }
         })
         .collect()
+}
+
+/// Usage scanners can report a Java import hit over the whole qualified path,
+/// while the forward occurrence surface identifies the exact `ImportTarget`
+/// token. Narrow the inverse site only when the structured occurrence rows
+/// prove one matching target; an incomplete or ambiguous result retains the
+/// scanner's original range instead of guessing from source text.
+struct ExactImportTarget {
+    range: Range,
+    target: CodeUnit,
+}
+
+fn exact_import_target_ranges_for_file(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    cancellation: Option<&CancellationToken>,
+) -> Option<Vec<ExactImportTarget>> {
+    let owned_cancellation;
+    let cancellation = match cancellation {
+        Some(cancellation) => cancellation,
+        None => {
+            owned_cancellation = CancellationToken::new();
+            &owned_cancellation
+        }
+    };
+    let rows = match occurrences_for_file(analyzer, file, cancellation) {
+        Ok(rows) => rows,
+        Err(OccurrencesCancelled) => return None,
+    };
+    if !rows.completeness.covers(OccurrenceRole::ImportTarget) {
+        return None;
+    }
+    Some(
+        rows.rows
+            .iter()
+            .filter_map(|row| {
+                (row.role == OccurrenceRole::ImportTarget)
+                    .then_some(&row.target)
+                    .and_then(|target| match target {
+                        OccurrenceTarget::Resolved(units) => Some(
+                            units
+                                .iter()
+                                .cloned()
+                                .map(|target| ExactImportTarget {
+                                    range: row.range,
+                                    target,
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => None,
+                    })
+            })
+            .flatten()
+            .collect(),
+    )
+}
+
+fn exact_import_target_range(targets: &[ExactImportTarget], hit: &ReferenceHit) -> Range {
+    let mut matching_ranges = targets.iter().filter(|target| {
+        target.target == hit.resolved
+            && target.range.start_byte >= hit.range.start_byte
+            && target.range.end_byte <= hit.range.end_byte
+    });
+    let Some(range) = matching_ranges.next() else {
+        return hit.range;
+    };
+    matching_ranges.next().map_or(range.range, |_| hit.range)
 }
 
 /// Every inverse edge of one seed declaration: the sites the usage index can
@@ -445,7 +614,7 @@ pub fn inverse_edges_for_declaration(
     }
 
     EdgeDerivationResult {
-        edges: edge_rows_from_reference_hits(analyzer, hits, generation),
+        edges: edge_rows_from_reference_hits(analyzer, hits, generation, cancellation),
         completeness: if reasons.is_empty() {
             EdgeCompleteness::Complete
         } else {
@@ -493,6 +662,7 @@ pub fn forward_edges_for_file(
     }
 
     let occurrences = occurrences_for_file(analyzer, file, cancellation)?;
+    let import_target_nodes = import_target_nodes_for_file(analyzer, file).unwrap_or_default();
     let mut edges = Vec::new();
     for row in &occurrences.rows {
         let OccurrenceTarget::Resolved(units) = &row.target else {
@@ -511,6 +681,7 @@ pub fn forward_edges_for_file(
                 row.range.end_byte,
                 unit,
             );
+            let owner_relation = classify_owner_relation(analyzer, row.enclosing.as_ref(), unit);
             edges.push(ReferenceEdgeRow {
                 site: EdgeSite {
                     file: file.clone(),
@@ -521,9 +692,9 @@ pub fn forward_edges_for_file(
                 target: unit.clone(),
                 reference_kind: kind,
                 proof,
-                usage_kind: UsageHitKind::Reference,
+                usage_kind: classify_forward_usage_kind(row, &import_target_nodes, owner_relation),
                 site_class: SiteClass::UseSite,
-                owner_relation: classify_owner_relation(analyzer, row.enclosing.as_ref(), unit),
+                owner_relation,
                 provenance: EdgeProvenance::Forward,
                 generation,
             });
@@ -722,6 +893,190 @@ mod tests {
         );
     }
 
+    #[test]
+    fn forward_usage_kind_uses_only_role_and_owner_evidence() {
+        assert_eq!(
+            classify_forward_usage_kind_from_evidence(
+                OccurrenceRole::ImportTarget,
+                true,
+                OwnerRelation::External,
+            ),
+            UsageHitKind::Import
+        );
+        assert_eq!(
+            classify_forward_usage_kind_from_evidence(
+                OccurrenceRole::MemberPosition,
+                false,
+                OwnerRelation::SameOwner,
+            ),
+            UsageHitKind::Reference
+        );
+        assert_eq!(
+            classify_forward_usage_kind_from_evidence(
+                OccurrenceRole::ValueReference,
+                false,
+                OwnerRelation::SelfReference
+            ),
+            UsageHitKind::SelfReceiver
+        );
+        assert_eq!(
+            classify_forward_usage_kind_from_evidence(
+                OccurrenceRole::ImportTarget,
+                false,
+                OwnerRelation::External,
+            ),
+            UsageHitKind::Reference
+        );
+
+        // A type/path reference can share an owner without being a
+        // self/this receiver, and an inherited or unknown owner does not prove
+        // recursion. Those cases retain the public fallback.
+        for role in [
+            OccurrenceRole::TypeOperand,
+            OccurrenceRole::PathSegment,
+            OccurrenceRole::PatternPosition,
+        ] {
+            assert_eq!(
+                classify_forward_usage_kind_from_evidence(role, false, OwnerRelation::SameOwner),
+                UsageHitKind::Reference
+            );
+        }
+        assert_eq!(
+            classify_forward_usage_kind_from_evidence(
+                OccurrenceRole::MemberPosition,
+                false,
+                OwnerRelation::InheritedOwner
+            ),
+            UsageHitKind::Reference
+        );
+        assert_eq!(
+            classify_forward_usage_kind_from_evidence(
+                OccurrenceRole::MemberPosition,
+                false,
+                OwnerRelation::Unknown,
+            ),
+            UsageHitKind::Reference
+        );
+    }
+
+    #[test]
+    fn forward_and_inverse_classify_import_binding() {
+        let fixture = Fixture::new(
+            Language::Java,
+            &[
+                ("src/Registry.java", JAVA_TARGET),
+                (
+                    "src/client/Startup.java",
+                    "package client;\n\nimport fixture.Registry;\n\nclass Startup {\n    Registry registry;\n}\n",
+                ),
+            ],
+        );
+        let analyzer = fixture.analyzer();
+        let target = fixture.declaration("Registry");
+        let forward =
+            forward_edges_for_file(analyzer, &fixture.files[1], &CancellationToken::new())
+                .expect("not cancelled");
+        let import_edge = forward
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.target == target
+                    && edge.site.range.start_byte
+                        == fixture.files[1]
+                            .read_to_string()
+                            .expect("fixture source")
+                            .find("Registry;")
+                            .expect("import target")
+            })
+            .expect("the import target must appear as a forward edge");
+        assert_eq!(import_edge.usage_kind, UsageHitKind::Import);
+
+        let inverse = inverse_edges_for_declaration(analyzer, &target, None);
+        let inverse_import = inverse
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.site.file == fixture.files[1] && edge.site.range == import_edge.site.range
+            })
+            .expect("the import target must appear as an inverse edge");
+        assert_eq!(inverse_import.usage_kind, UsageHitKind::Import);
+    }
+
+    #[test]
+    fn forward_and_inverse_classify_recursive_self_reference() {
+        let fixture = Fixture::new(
+            Language::Java,
+            &[(
+                "src/Registry.java",
+                "package fixture;\n\nclass Registry {\n    void register() {\n        register();\n    }\n}\n",
+            )],
+        );
+        let analyzer = fixture.analyzer();
+        let target = fixture.declaration("Registry.register");
+        let call_start = fixture.files[0]
+            .read_to_string()
+            .expect("fixture source")
+            .rfind("register();")
+            .expect("recursive call");
+        let forward =
+            forward_edges_for_file(analyzer, &fixture.files[0], &CancellationToken::new())
+                .expect("not cancelled");
+        let forward_self = forward
+            .edges
+            .iter()
+            .find(|edge| edge.target == target && edge.site.range.start_byte == call_start)
+            .expect("recursive call must appear as a forward edge");
+        assert_eq!(forward_self.usage_kind, UsageHitKind::SelfReceiver);
+
+        let inverse = inverse_edges_for_declaration(analyzer, &target, None);
+        let inverse_self = inverse
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.site.file == fixture.files[0] && edge.site.range == forward_self.site.range
+            })
+            .expect("recursive call must appear as an inverse edge");
+        assert_eq!(inverse_self.usage_kind, UsageHitKind::SelfReceiver);
+    }
+
+    #[test]
+    fn forward_keeps_same_owner_different_receiver_as_reference() {
+        let fixture = Fixture::new(
+            Language::Java,
+            &[(
+                "src/Registry.java",
+                "package fixture;\n\nclass Registry {\n    void helper() {}\n    void invoke(Registry other) {\n        other.helper();\n    }\n}\n",
+            )],
+        );
+        let analyzer = fixture.analyzer();
+        let target = fixture.declaration("Registry.helper");
+        let call_start = fixture.files[0]
+            .read_to_string()
+            .expect("fixture source")
+            .rfind("helper();")
+            .expect("member call");
+        let forward =
+            forward_edges_for_file(analyzer, &fixture.files[0], &CancellationToken::new())
+                .expect("not cancelled");
+        let forward_call = forward
+            .edges
+            .iter()
+            .find(|edge| edge.target == target && edge.site.range.start_byte == call_start)
+            .expect("the member call must appear as a forward edge");
+        assert_eq!(forward_call.owner_relation, OwnerRelation::SameOwner);
+        assert_eq!(forward_call.usage_kind, UsageHitKind::Reference);
+
+        let inverse = inverse_edges_for_declaration(analyzer, &target, None);
+        let inverse_call = inverse
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.site.file == fixture.files[0] && edge.site.range == forward_call.site.range
+            })
+            .expect("the member call must appear as an inverse edge");
+        assert_eq!(inverse_call.usage_kind, UsageHitKind::Reference);
+    }
+
     /// An adapter without a forward surface answers with a typed abstention,
     /// never an empty complete set.
     #[test]
@@ -786,6 +1141,7 @@ mod tests {
             fixture.analyzer(),
             [hit(UsageProof::Proven), hit(UsageProof::Unproven)],
             7,
+            None,
         );
         assert_eq!(rows.len(), 2);
         assert_ne!(rows[0], rows[1]);

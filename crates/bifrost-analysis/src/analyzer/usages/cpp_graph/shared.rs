@@ -222,10 +222,14 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
 impl CppQueryResolver<'_> {
     /// The other-reading identities of every requested overload's declaration
     /// site (#1970), with the requested overloads themselves excluded.
-    fn site_equivalent_overloads(&self, overloads: &[CodeUnit]) -> Vec<CodeUnit> {
+    fn site_equivalent_overloads(
+        &self,
+        token: QueryToken<'_>,
+        overloads: &[CodeUnit],
+    ) -> Vec<CodeUnit> {
         let mut equivalents: Vec<CodeUnit> = Vec::new();
         for overload in overloads {
-            for equivalent in self.cpp.site_equivalent_units(overload) {
+            for equivalent in self.cpp.site_equivalent_units(token, overload) {
                 if !overloads.contains(&equivalent) && !equivalents.contains(&equivalent) {
                     equivalents.push(equivalent);
                 }
@@ -272,7 +276,7 @@ impl CppQueryResolver<'_> {
         // Leniently: an equivalent whose shape yields no `TargetSpec` is
         // dropped rather than failing the whole query, because the caller
         // asked about the requested overloads, not about it.
-        let site_equivalents = self.site_equivalent_overloads(overloads);
+        let site_equivalents = self.site_equivalent_overloads(token, overloads);
         for equivalent in &site_equivalents {
             if let Some(spec) = TargetSpec::from_target(&source, equivalent)
                 && retain_scan_spec(&mut seen_type_specs, &spec)

@@ -213,6 +213,19 @@ mod imp {
             mandatory: true,
             pinned_to_esapi_digest: false,
         },
+        // #2354: the summary half of `bifrost.jdk-framework-decls`. #2454
+        // declared `java.io.PrintWriter` and gave a chained receiver an
+        // identity, so `response.getWriter().println(x)` now names a target;
+        // this pack is what models it.
+        PackDescriptor {
+            pack_id: "bifrost.jdk-framework-summaries",
+            file: "framework-decls/staged/bifrost.jdk-framework-summaries.json",
+            ecosystem: "jdk",
+            package: None,
+            package_version: None,
+            mandatory: true,
+            pinned_to_esapi_digest: false,
+        },
         PackDescriptor {
             pack_id: "bifrost.encoder-sanitizers",
             file: "sanitizers/staged/bifrost.encoder-sanitizers.json",

@@ -38,6 +38,9 @@ use brokk_bifrost_core::analyzer::structural::kinds::{
 use brokk_bifrost_core::analyzer::structural::materialization::{
     ALL_EXPORT_FORMS, ALL_GENERATION_INPUT_CLASSES, ALL_GENERATION_KINDS,
 };
+use brokk_bifrost_core::analyzer::structural::resolution::{
+    ALL_DECLARED_VISIBILITIES, DeclaredVisibility,
+};
 use brokk_bifrost_core::schema_version::SchemaVersionRegistry;
 use json_spanned_value::{ErrorExt, spanned};
 use regex::Regex;

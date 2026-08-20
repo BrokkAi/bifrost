@@ -16,7 +16,7 @@ publish = true
 name = "brokk_bifrost_rql"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.10.4" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.10.5" }
 glob = "0.3.3"
 json-spanned-value = "0.2.2"
 regex = "1.12.2"

@@ -33,7 +33,7 @@ Once enabled, a background build starts when the workspace is activated. `semant
 Embeddings use `brokkai/Muninn` when CUDA or Apple Metal is available. Bifrost truncates Muninn output to 512 dimensions. Without an accelerator, Bifrost uses the native 384-dimensional `brokkai/Muninn-small` model. The selected model downloads from the Hugging Face hub on first use and runs in a PyTorch SDPA sidecar launched with:
 
 ```bash
-uv run scripts/voyage_sidecar.py
+uv run scripts/public/voyage_sidecar.py
 ```
 
 Rust keeps the indexing pipeline and token counting in-process. The sidecar owns model forward passes and selects CUDA, Apple Metal, or CPU at runtime.

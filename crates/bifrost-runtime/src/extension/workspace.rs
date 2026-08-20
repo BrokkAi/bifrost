@@ -1268,9 +1268,13 @@ pub struct StructuralResult {
 mod tests {
     use super::*;
     use brokk_bifrost_analysis::analyzer::structural::StructuralSearchProvider;
-    use std::path::Path;
+    use std::{
+        path::Path,
+        time::{Duration, Instant},
+    };
 
     const SOURCE: &str = "export function answer() { return 42; }\n";
+    const SMALL_PERSISTED_OPEN_LATENCY_LIMIT: Duration = Duration::from_secs(5);
 
     fn write_project(root: &Path) {
         std::fs::write(root.join("app.ts"), SOURCE).unwrap();
@@ -1327,7 +1331,13 @@ mod tests {
         write_project(&root);
         let file = ProjectFile::new(root.clone(), "app.ts");
 
+        let first_started = Instant::now();
         let first = open(&root, true);
+        let first_elapsed = first_started.elapsed();
+        assert!(
+            first_elapsed < SMALL_PERSISTED_OPEN_LATENCY_LIMIT,
+            "first persisted open took {first_elapsed:?}; expected under {SMALL_PERSISTED_OPEN_LATENCY_LIMIT:?}"
+        );
         let store = first.store().clone();
         assert_eq!(store.requested, ExtensionPersistenceMode::Persisted);
         assert_eq!(store.engaged, ExtensionPersistenceMode::Persisted);
@@ -1344,7 +1354,13 @@ mod tests {
         // Reuse evidence is counter-based, not timing-based: the reopened
         // provider must answer from a hydrated snapshot without a single
         // parse-and-normalize extraction.
+        let second_started = Instant::now();
         let second = open(&root, true);
+        let second_elapsed = second_started.elapsed();
+        assert!(
+            second_elapsed < SMALL_PERSISTED_OPEN_LATENCY_LIMIT,
+            "persisted reopen took {second_elapsed:?}; expected under {SMALL_PERSISTED_OPEN_LATENCY_LIMIT:?}"
+        );
         assert_eq!(second.generation(), &generation);
         assert_eq!(second.store(), &store);
         let provider = provider(&second);

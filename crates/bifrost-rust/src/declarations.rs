@@ -102,6 +102,55 @@ pub fn rust_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     node_ident_text(node, source, false, &RUST_IDENTIFIER_SIGIL)
 }
 
+/// The largest declaration label this frontend renders.
+///
+/// A label is a rendering for a reader, not a second copy of the declaration's
+/// value. Functions and type headers already stop at the body, but a `const`,
+/// a `static`, a field, and a type alias have no body to stop at, so their
+/// label was the declaration node's whole source text. Generated dictionary
+/// sources declare statics whose initializer alone runs to megabytes
+/// (`crate-ci/typos` ships a 12 MB `codegen.rs`), and one of those exceeded the
+/// analyzer store's 8 MiB label column cap: the row failed its CHECK, the
+/// file's whole parsed blob rolled back, and the recorded store error aborted
+/// the entire repository audit (issue #2351).
+///
+/// 8 KiB is far above any label a reader can use and far below the store cap,
+/// so the elision below only ever fires on a declaration that was already
+/// unreadable.
+const MAX_RUST_DECLARATION_LABEL_BYTES: usize = 8 * 1024;
+
+/// `node`'s declaration text rendered as a label, eliding an oversized
+/// initializer.
+///
+/// The elision is structural: the `value` field says exactly where the
+/// declaration stops describing itself and starts spelling its value, so an
+/// oversized label keeps the whole header and drops only the value. The byte
+/// truncation below it is the last resort for a declaration with no `value`
+/// child whose header is itself oversized.
+fn rust_bounded_declaration_label(node: Node<'_>, source: &str) -> String {
+    let text = rust_node_text(node, source);
+    let full = text.trim().trim_end_matches(',');
+    if full.len() <= MAX_RUST_DECLARATION_LABEL_BYTES {
+        return full.to_string();
+    }
+
+    if let Some(value) = node.child_by_field_name("value") {
+        let header_len = value.start_byte().saturating_sub(node.start_byte());
+        if let Some(header) = text.get(..header_len) {
+            let header = header.trim_end();
+            if header.len() <= MAX_RUST_DECLARATION_LABEL_BYTES {
+                return format!("{header} /* ... */;");
+            }
+        }
+    }
+
+    let mut end = MAX_RUST_DECLARATION_LABEL_BYTES;
+    while end > 0 && !full.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} /* ... */", &full[..end])
+}
+
 /// Whether `item` is directly preceded by a test-evidence attribute
 /// (`#[test]`, `#[cfg(test)]`, `#[tokio::test]`, `#[sqlx::test]`, ...).
 ///
@@ -1481,19 +1530,13 @@ fn visit_rust_field(
     }
     parsed.add_signature_with_metadata(
         code_unit.clone(),
-        SignatureMetadata::new(
-            rust_node_text(node, source)
-                .trim()
-                .trim_end_matches(',')
-                .to_string(),
-            Vec::new(),
-        )
-        .with_return_type_text(
-            node.child_by_field_name("type")
-                .map(|r#type| rust_node_text(r#type, source).trim().to_owned()),
-        )
-        .with_return_type_identity(rust_enum_variant_owner_identity(node, source))
-        .with_dispatch_extensibility(DispatchExtensibility::Closed),
+        SignatureMetadata::new(rust_bounded_declaration_label(node, source), Vec::new())
+            .with_return_type_text(
+                node.child_by_field_name("type")
+                    .map(|r#type| rust_node_text(r#type, source).trim().to_owned()),
+            )
+            .with_return_type_identity(rust_enum_variant_owner_identity(node, source))
+            .with_dispatch_extensibility(DispatchExtensibility::Closed),
     );
 
     // A struct-like enum variant owns its named fields just as a struct owns
@@ -1609,7 +1652,7 @@ fn visit_rust_alias(
     }
     parsed.add_signature(
         code_unit.clone(),
-        rust_node_text(node, source).trim().to_string(),
+        rust_bounded_declaration_label(node, source),
     );
     parsed.mark_type_alias(code_unit.clone());
     Some(code_unit)
@@ -2029,7 +2072,7 @@ fn rust_impl_member_identity_signature(node: Node<'_>, source: &str) -> Option<S
     let item_signature = match node.kind() {
         "function_item" | "function_signature_item" => rust_function_signature(node, source),
         "const_item" | "type_item" | "associated_type" => {
-            rust_node_text(node, source).trim().to_string()
+            rust_bounded_declaration_label(node, source)
         }
         _ => return None,
     };

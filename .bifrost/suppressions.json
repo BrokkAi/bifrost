@@ -3,7 +3,8 @@
   "suppressions": [
     {
       "policy_id": "bifrost.correctness.dynamic-evaluation",
-      "finding_id": "98f782385c18ee62e413f2452567f2b2fc9e24491726f8b7cf6a8596d891dc45",
+      "finding_id": "df27cd01d80cd767b947a34576022f1f0e4a0c439fc992cebd5bfee291369f07",
+      "path": "scripts/public/voyage_sidecar.py",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate: loading the voyage embedding model requires trust_remote_code in the sidecar; reviewed and accepted.",
@@ -15,6 +16,7 @@
     {
       "policy_id": "bifrost.performance.expensive-operation-in-nested-loop",
       "finding_id": "0148f080c0a175799f611282026a9eeadd5bc0a9e7b5bf691fafe5e633b404bf",
+      "path": "tools/rename-eval/extract_pairs.py",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "The nested walk visits each distinct Java file once and extracts that file's methods. The operation depends on both loop variables and cannot be hoisted.",
@@ -26,6 +28,7 @@
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "063dd3cdf02e9252812f94fff21c0f12615bf074d2b33152ae7663a4c1202d88",
+      "path": "tools/rename-eval/e2e_corpus.py",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration writes a distinct fixture file for a different revision. The file operation depends on the loop item and cannot be hoisted.",
@@ -37,6 +40,7 @@
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "59912940245dfa0a29fb4c972807745583eb59c479dc471851b542a51ab3adca",
+      "path": "tools/rename-eval/extract_pairs.py",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "The fallback reads the one source file for the current method label. Each iteration has a different file and method, so the read cannot be hoisted.",
@@ -47,7 +51,8 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "34f2f87a26b2058bccf802c0cc8fe515a980b32d8328cf077c76cc441c91c44b",
+      "finding_id": "4d3afc5f77e7c4283752ba927a461881de60d87439bdca5d1d04c7a891433ada",
+      "path": "scripts/public/prepare-vscode-extension-manifest.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -59,6 +64,7 @@
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "7a7822f95a60a390623ca3d0983536cb74ca7c49744876818699d3615efb5dda",
+      "path": "tools/rename-eval/extract_pairs.py",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each commit iteration reads its distinct metadata sidecar. The file path depends on that commit and cannot be hoisted.",
@@ -70,6 +76,7 @@
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "5e10e580c936887ca9f0000734dee7e5d1b8601099a969f07ba540f28274942d",
+      "path": "crates/bifrost-mcp/src/searchtools_service.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -81,6 +88,7 @@
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "f12287edac77c4a41d87881ee258fb88642e6d418bf0948939940c74c1372a46",
+      "path": "tools/rename-eval/e2e_corpus.py",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration writes a distinct fixture file for a different revision. The file operation depends on the loop item and cannot be hoisted.",
@@ -91,18 +99,8 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "7a7e27d810f46ea7d508d798e9a552119586676112bd748af415cf536cc678a0",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
-      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "7ea63f94e72a86a4eb3895825c0a5a99052e00d2623be70634869921e1e8e9f8",
+      "path": "crates/bifrost-semantic-packs/src/release_bundle.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -113,7 +111,8 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "b2c0b0fb48794508698a288aae1248fbda0a703c89191fdbd06aeafe48476cfe",
+      "finding_id": "36ed9ca90306476056ab858173979fb6b083b4615982cbfa220d43db61e6e8da",
+      "path": "scripts/public/voyage_sidecar.py",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -125,6 +124,7 @@
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "dfd71ddf978dc0f877c180bc47f6987b836a69da7a2cabd09a2a6ea4d39f52d9",
+      "path": "crates/bifrost-analysis/src/analyzer/semantic_model/authoring.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -136,6 +136,7 @@
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "f94e8f1a1cc064a54d62d567e2fc9515d9a5afc995ebc972228e49419a31ecff",
+      "path": "crates/bifrost-analysis/src/analyzer/benchmark_provenance.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
@@ -146,7 +147,8 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "0d460343cc0e6f4737841aee0862007236e93f729652f0f098f0707bd70628f3",
+      "finding_id": "abf19512e9549af4b4d3353087c8a0d960541f48c29f113b12f2e1955de9993e",
+      "path": "scripts/public/voyage_sidecar.py",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
@@ -157,18 +159,8 @@
     },
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "4b484b788db9dd7159993641868796143a720b4392f66fe9141bba00aa8af94a",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
-      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "5a2a3a7003707471da7715a74fc76ab884e1a2c2f60345d265eca76470c45c78",
+      "finding_id": "f36c1539f5d70aca396be0874d86917832ba1671294bfe418840dd6cd13e4fd7",
+      "path": "scripts/public/mcp-replay.py",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
@@ -180,17 +172,7 @@
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
       "finding_id": "6c8eec8e88d14f9a8948cbb487aec3bd450efd1da2377f7d57d3826ce1a41e03",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
-      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "800b7d428a3f7f1223ea7436f86998bbcb03d4e5b7aa11103fb5572ec78b6641",
+      "path": "src/bin/bifrost.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
@@ -202,17 +184,7 @@
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
       "finding_id": "e279acdbe20c148b67d364ecbd9a983412310005e3ee91d7f3d88ee9d01afc8d",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
-      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.parsing-in-loop",
-      "finding_id": "f018627c489874ba3794ef39e02f1fa78ceafde7a74e9afd95db1b5dd0258ba9",
+      "path": "crates/bifrost-analysis/src/analyzer/rust/dependency_discovery.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration parses a distinct payload/line/file; the parse work is inherent to the loop and cannot be hoisted.",
@@ -223,40 +195,8 @@
     },
     {
       "policy_id": "bifrost.performance.regex-compile-in-loop",
-      "finding_id": "2a4ffce1107f39ee56d5c27c37c66cac935772c9dbe712696085eb3f7767cb31",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Regex pattern depends on the loop variable, so compilation cannot be hoisted out of the loop.",
-      "policy_hash_at_acceptance": "cf97c430a496547a9ffc0731e412d5426e2d5d39effa872c433cbc7dd3c61578",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.regex-compile-in-loop",
-      "finding_id": "78f7237ac9978abb35fdfb921e3039ba2ba9af5c0167630cf0ce762d7dac55c1",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Regex pattern depends on the loop variable, so compilation cannot be hoisted out of the loop.",
-      "policy_hash_at_acceptance": "cf97c430a496547a9ffc0731e412d5426e2d5d39effa872c433cbc7dd3c61578",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.regex-compile-in-loop",
-      "finding_id": "dbc3181435de4e5e1c3c9be70b3bd3a1886b89571c37883fda157aba7f3bcb83",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Regex pattern depends on the loop variable, so compilation cannot be hoisted out of the loop.",
-      "policy_hash_at_acceptance": "cf97c430a496547a9ffc0731e412d5426e2d5d39effa872c433cbc7dd3c61578",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.regex-compile-in-loop",
-      "finding_id": "eada80be33e9f41e1bff1bcce5633b88d342824f936e16949b756e86743b2e52",
+      "finding_id": "f022a7bc7f614bd42d07e4a6ee4628024016afa094ea167c909e581e805aed5f",
+      "path": "scripts/public/prepare-vscode-extension-manifest.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Regex pattern depends on the loop variable, so compilation cannot be hoisted out of the loop.",
@@ -268,6 +208,7 @@
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
       "finding_id": "126ed189acaf5c391a45741b36aed0b1d02c60538d421e9105b5995e43307ae8",
+      "path": "plugins/bifrost-agent/test/sync-release-version.test.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
@@ -279,6 +220,7 @@
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
       "finding_id": "44a0e63ac251ccfe84741f809f989b07e9daf8dab467096b14bc88a1b4707bc3",
+      "path": "crates/bifrost-analysis/src/analyzer/go/dependency_discovery.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
@@ -290,6 +232,7 @@
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
       "finding_id": "538456d265fb67a34ed0f8c5aeb49e4f4a6953d08ddae5dea65440afdbce94fe",
+      "path": "crates/bifrost-analysis/src/analyzer/typestate/binding.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
@@ -301,6 +244,7 @@
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
       "finding_id": "63451b3ed6687fdbaac1364c9a8598e6b091f7ee2687cabbf659795b91c2051a",
+      "path": "crates/bifrost-analysis/src/analyzer/structural/search/mod.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
@@ -312,6 +256,7 @@
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
       "finding_id": "8331ecad617e49aeedb23f90fdc30937812ea6d529478958ea813118519c1f39",
+      "path": "crates/bifrost-policy/src/catalog.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
@@ -323,6 +268,7 @@
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
       "finding_id": "93bc9ec9e1bdba890601598400bd2854571c96538c3954cec2d31b6ecf9c8f87",
+      "path": "crates/bifrost-analysis/src/searchtools/scan_usages.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
@@ -334,6 +280,7 @@
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
       "finding_id": "cf0279d757349d59ab654d860faf8edfe5397757d7781bdb14cd088d5d9ce2ec",
+      "path": "crates/bifrost-policy/src/catalog.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
@@ -344,7 +291,8 @@
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "0c9a74fbe1bf66548f250abf85da2d035bed867a501d4f4f8ea2efd528d2dd91",
+      "finding_id": "743e68db4ca9d2a6dde2ad28e5f1785add463454c3c74668fdaf1aaf66e3feef",
+      "path": "scripts/public/mcp-replay.py",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
@@ -356,6 +304,7 @@
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
       "finding_id": "5d6e566bc594a4f4a0e0f796f3d51ac6d5ffb816baadcc8de719f85a75c3a63d",
+      "path": "crates/bifrost-analysis/src/analyzer/usages/workspace_graph_cache.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
@@ -367,6 +316,7 @@
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
       "finding_id": "60a8e1939348da29e01130e01b5aaa81c007a119f6535cddd7a0ea058a0853ab",
+      "path": "crates/bifrost-mcp/src/project_watcher.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
@@ -378,6 +328,7 @@
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
       "finding_id": "672fe0666a27b12d59248b1a2aba9ffa24cfebbce574a7f3c55fdb1d1c7e7642",
+      "path": "crates/bifrost-analysis/src/analyzer/tree_sitter_analyzer.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
@@ -389,6 +340,7 @@
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
       "finding_id": "9f5432c9703743e41742935912c1c2826bb4baec4234e346de0f664e6b04a4c2",
+      "path": "crates/bifrost-analysis/src/process.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
@@ -400,6 +352,7 @@
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
       "finding_id": "c5d10534d87007e0f0c0e1f7e4d2a695cf5c73cb87a61bebe104d3958d2e1805",
+      "path": "crates/bifrost-analysis/src/analyzer/tree_sitter_analyzer.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
@@ -411,6 +364,7 @@
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
       "finding_id": "ccbb7473c29730e9b91da63037e31c9e85af2f42f0eb6a2bd977650b218f5696",
+      "path": "crates/bifrost-analysis/src/analyzer/tree_sitter_analyzer.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
@@ -421,7 +375,8 @@
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "e91fe15ed04206ea4e5eba20d498c65e6732e1a5d1bcdf53304a8e973fb6a4a4",
+      "finding_id": "780ffbda6e3057c7e3bcdc1a0215d6a11ab014a830b32ae7a1655029c79ff764",
+      "path": "scripts/public/voyage_sidecar.py",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
@@ -433,6 +388,7 @@
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
       "finding_id": "ea94296f573b7889f5d6bec64824debee53f7c3ce245204a8c3f6aeac7e2e281",
+      "path": "crates/bifrost-analysis/src/analyzer/store/mod.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
@@ -443,18 +399,8 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "b70d3ca6e98fb348587114de3145c84ee0b95adb4e1845eaf84d283c6783b602",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration reads a different .model.yml file selected by the current path. The read depends on that path and cannot be hoisted.",
-      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
-      "accepted_by": "jbellis",
-      "accepted_at": "2026-08-10",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "0a8a852ba6a85f934a129817394ae8ae9ce04648fc1f98df4dc63f88f5217d30",
+      "path": "crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration reads a different sanitizer candidate file selected by the current path. The read depends on that path and cannot be hoisted.",
@@ -466,6 +412,7 @@
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
       "finding_id": "0e2e50e3f90d5709eee56bc470003a8a3e2f05646f8bd1b3d0b07357c4085f54",
+      "path": "crates/bifrost-semantic-packs/src/summary_foundry/sanitizer_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration parses the bytes from a different sanitizer candidate file. The parse depends on that file and cannot be hoisted.",
@@ -477,6 +424,7 @@
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "6c905b718e15056814758f36cd7b3269febb98d304b729dd1817781f07951348",
+      "path": "crates/bifrost-semantic-packs/src/summary_foundry/framework_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration reads a different framework candidate file selected by its path. The read depends on that path and cannot be hoisted.",
@@ -488,6 +436,7 @@
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "c96d9b41bd33ef172cd036a53dd099b1cc577510a7c11682b11db5641c8c4c1d",
+      "path": "crates/bifrost-semantic-packs/src/summary_foundry/golden_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration reads a different golden candidate file selected by its path. The read depends on that path and cannot be hoisted.",
@@ -499,6 +448,7 @@
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
       "finding_id": "46bafe8d230ba861165268b4f8979c2964e26c2dd1a0d72c37b3969bb8a1248e",
+      "path": "crates/bifrost-semantic-packs/src/summary_foundry/golden_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration parses a different golden candidate file. The parse depends on that file and cannot be hoisted.",
@@ -510,6 +460,7 @@
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
       "finding_id": "a636a431ff5a4d4635c5797b438e22a81370d090bad99231779150447730298a",
+      "path": "crates/bifrost-semantic-packs/src/summary_foundry/framework_pack.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration parses a different framework candidate file. The parse depends on that file and cannot be hoisted.",
@@ -521,6 +472,7 @@
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
       "finding_id": "4c603ec10c0b6ecedd922d9c659aafd2ac7d253375f2bb494baa6e1fdf9e3a1c",
+      "path": "crates/bifrost-analysis/src/analyzer/value_flow/client.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Worklist idiom: the active-flow set is extended with newly generated flows on every rule view, and the sort is what makes the following dedup correct. The receiver is not re-established each iteration, so the rule is right that its value is loop-invariant by identity; the per-iteration canonicalization is semantically load-bearing and cannot be hoisted.",
@@ -531,7 +483,8 @@
     },
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
-      "finding_id": "b9a6edc26bccc8bca694f5d83794dcc04b77464f4b873f0873df100a3ded1762",
+      "finding_id": "db3a69197c80657cd993744f627dc6b9f704195ba9f58f89492a7b73abaa69ef",
+      "path": "crates/bifrost-analysis/src/analyzer/usages/get_definition/scala.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Worklist idiom: each candidate prefix extends the selected-owner set, and the sort+dedup must run before the loop's own emptiness test decides whether to break. Hoisting the sort past the loop would change which candidate wins and would leave duplicates in the ambiguity verdict.",
@@ -543,6 +496,7 @@
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
       "finding_id": "29a8ef68a9897a11ec3f6be3b943d5348ed28f05e1357a0c3c9551dcbe5389dc",
+      "path": "crates/bifrost-analysis/src/analyzer/reference_candidates.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "The sort runs inside a guard that returns from the function on the same pass, so it executes at most once per call. Lexical containment cannot see the return, and the #1598 value-origin refinement does not address control flow, so the rule reports it correctly on the evidence it has. Accepted rather than restructured.",
@@ -554,6 +508,7 @@
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
       "finding_id": "94fbed1c56d9568dc2e7bbb0327ab7dc59311c413bac694c6a6136fa3ce01611",
+      "path": "crates/bifrost-analysis/src/analyzer/reference_candidates.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "The sort runs inside a guard that returns from the function on the same pass, so it executes at most once per call. Lexical containment cannot see the return, and the #1598 value-origin refinement does not address control flow, so the rule reports it correctly on the evidence it has. Accepted rather than restructured.",
@@ -565,6 +520,7 @@
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "2d8527b894ff0a1a90261bd0b2b7317555da0c7117621b6a40d91099656e7061",
+      "path": "crates/bifrost-mcp/tests/conformance/run.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "MCP conformance harness, run.mjs loadTriage: each iteration reads a different one of the three triage files. The read depends on the loop item and cannot be hoisted; the loop runs three times per gate invocation.",
@@ -576,6 +532,7 @@
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
       "finding_id": "58cb5cfdd4906422709075fba9e3ec322396407cec63e39a835ff09265a5f966",
+      "path": "crates/bifrost-mcp/tests/conformance/run.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "MCP conformance harness, run.mjs loadTriage: parses the distinct triage file read in the same iteration. Depends on the loop item; three iterations per gate invocation.",
@@ -587,6 +544,7 @@
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "fa3614bbbd77452b2d5c6a6ed43902f4bc15daaeb4fd65376f56bc0a8a951c3a",
+      "path": "crates/bifrost-mcp/tests/conformance/run.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "MCP conformance harness, run.mjs readChecks: probes each per-scenario results subdirectory for its checks.json and returns on the first hit. The path depends on the loop item and cannot be hoisted.",
@@ -598,6 +556,7 @@
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
       "finding_id": "c45367633856b8f460261c6466950e6df2145f460a8e5cbd1c2527f45b63595e",
+      "path": "crates/bifrost-mcp/tests/conformance/run.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "MCP conformance harness, run.mjs readChecks: parses the distinct checks.json found in the same iteration, then returns. Depends on the loop item.",
@@ -609,6 +568,7 @@
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "95d9d7e5d4369a02bc036498b1042639d838977cf21f787b5499ee6fe1a04db9",
+      "path": "crates/bifrost-mcp/tests/conformance/extract-schemas.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "MCP conformance harness, extract-schemas.mjs compareSchemas: each iteration reads a different committed schema file to byte-compare it with the fresh extraction for that revision. Depends on the loop item; four iterations.",
@@ -620,6 +580,7 @@
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
       "finding_id": "dfaa7eaabf6a176d010e2de3a3f89f4751b295adb550dfb8e4e795486086c92d",
+      "path": "crates/bifrost-mcp/tests/conformance/extract-schemas.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "MCP conformance harness, extract-schemas.mjs extractSchemas: pretty-prints each revision's freshly parsed schema exactly once. The value depends on the loop item and cannot be hoisted; four iterations.",
@@ -631,6 +592,7 @@
     {
       "policy_id": "bifrost.performance.parsing-in-loop",
       "finding_id": "c4f7abf641d03d6d52aacaeb17295411b44bfb1c666d410b8abe28dc7883430e",
+      "path": "crates/bifrost-mcp/tests/conformance/extract-schemas.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "MCP conformance harness, extract-schemas.mjs --write: re-parses each revision's just-written schema text to print its defs count. Depends on the loop item; four iterations, only in the manual regeneration path.",
@@ -642,6 +604,7 @@
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
       "finding_id": "fd741af979a212816211fb181b16128ed0661b91a150d6db4ce4c6fe5d859fd0",
+      "path": "crates/bifrost-mcp/tests/conformance/bridge.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "MCP conformance harness, bridge.mjs writeToChild: serializes each distinct relayed JSON-RPC message once onto the child's stdin. The message is the loop item; nothing is invariant.",
@@ -653,6 +616,7 @@
     {
       "policy_id": "bifrost.performance.serialization-in-loop",
       "finding_id": "446b8344f3d3d29ede7359f2bab13427dbaa08371ee75fa9f7448b9845649ae9",
+      "path": "crates/bifrost-mcp/tests/conformance/bridge.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "MCP conformance harness, bridge.mjs POST handler: stringifies each distinct request id in the batch to build its routing key. The id is the loop item; batches are tiny.",
@@ -663,7 +627,8 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "f1b44c7c7c507fd1b56ea6911354e863988190e8fb6dce63d3016c0d1a58bb6a",
+      "finding_id": "e11ba5861712d38a5341495e46261d9fad28c39dcbeb8f3c00f55084fb855d2e",
+      "path": "scripts/public/sync-release-checksums.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "collectSidecarChecksums reads one .sha256 sidecar per SUPPORTED_TARGETS entry. Each iteration reads a different file, named for that target's archive, so the read depends on the loop item and cannot be hoisted or batched.",
@@ -675,6 +640,7 @@
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "e8f41b88971aaa0ade3fea442a2292529afdb021a527e906235be9ce98378553",
+      "path": "plugins/bifrost-dsh/scripts/sync-launcher.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "The launcher sync copies one vendored file per SYNCED_FILES entry. This read takes the entry's own source path and cannot be hoisted.",
@@ -686,6 +652,7 @@
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "0a012003252b64be0560bac0e027d7301699bcf193e9619dc7feca22f87a7da0",
+      "path": "plugins/bifrost-dsh/scripts/sync-launcher.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "The --check branch reads the entry's own target path to compare it with the source. Each iteration reads a different file, so the read cannot be hoisted.",
@@ -696,7 +663,8 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "cd624f716ff73ec9fc34847b7bf45b9a5d6d25ea77d05b8f79f8f23b09371565",
+      "finding_id": "0e803061b040a116ffc07e3f94816c32cc308c37469fbe7880bac19b441df8a2",
+      "path": "scripts/public/check-codex-plugin-manifest.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "The vendored-launcher drift check reads the canonical file of the current pair. The path is the loop item, so the read cannot be hoisted.",
@@ -707,7 +675,8 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "db6ab38cc79d03c58d186c1bbef761ff0d7e8f3a76a2ebadd60ed94f4dad300f",
+      "finding_id": "a0ad4d5b37e04a9f33e2d35964662c424446069b17e83f382fa52f70c4d52db4",
+      "path": "scripts/public/check-codex-plugin-manifest.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "The vendored-launcher drift check reads the vendored copy of the current pair. The path is the loop item, so the read cannot be hoisted.",
@@ -718,7 +687,8 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "77e1d14f9e552a198ad7421ae9af9298334d0657c097c069b39327fb0b295180",
+      "finding_id": "c649f4cd94284ec64a8a0c559e15fd0ced56cd91e61f0839a93551b55ebd3349",
+      "path": "scripts/public/export-release-metadata.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "The metadata export copies one file per EXPORTED_FILES entry. The read takes that entry's own path and cannot be hoisted.",
@@ -729,7 +699,8 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "fe64f1afd8326dafc3412d5c2ce192599e35026e232b2e8e7075fb62e7fd5ac7",
+      "finding_id": "0516d5a7c3d7868a413fe8801e286af9aa881864735a2540f2c8b81a9fd20d13",
+      "path": "scripts/public/release-qualification.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "The qualification bundle walk hashes every regular file it discovers, so it must read each file it visits. The read is the work of the loop, not a hoistable invariant.",
@@ -740,7 +711,8 @@
     },
     {
       "policy_id": "bifrost.performance.regex-compile-in-loop",
-      "finding_id": "27332ff815f0eaec96ef3f5d1d40737e76e70dc8fa51e5d8262e1b0f1b33919f",
+      "finding_id": "04f56533d4261d38cef60f90edff988bf750096b712e4585dcb9d1765f3cdbb5",
+      "path": "scripts/public/release-promotion-workflow.test.mjs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration builds a pattern for a different OIDC claim name, so the compiled expression differs per iteration and cannot be hoisted. Assertion-only workflow test over a seven-element claim list.",

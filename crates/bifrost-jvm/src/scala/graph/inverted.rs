@@ -79,6 +79,7 @@ use brokk_bifrost_core::analyzer::model::{
     CallableArity, CallableFacts, ImportInfo, ScalaExportInfo, ScalaExportSelector,
     SignatureMetadata,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageReferenceKind, classify_reference_node,
 };
@@ -685,6 +686,7 @@ impl ProjectTypes {
     fn imports_for_export_owner(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner: &CodeUnit,
     ) -> Vec<ImportInfo> {
         match &self.bulk_file_states {
@@ -692,7 +694,7 @@ impl ProjectTypes {
                 .get(owner.source())
                 .map(|state| state.imports.clone())
                 .unwrap_or_default(),
-            None => scala.import_info_of(owner.source()),
+            None => scala.import_info_of(token, owner.source()),
         }
     }
 
@@ -763,6 +765,7 @@ impl ProjectTypes {
     pub fn exported_member_bindings(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         exporter: &CodeUnit,
     ) -> Vec<(String, String)> {
         let exporter_fqn = exporter.fq_name();
@@ -786,7 +789,7 @@ impl ProjectTypes {
                 continue;
             }
             owners.insert(current_fqn.clone(), current.clone());
-            let imports = self.imports_for_export_owner(scala, &current);
+            let imports = self.imports_for_export_owner(scala, token, &current);
             for export in self.export_infos_for_owner(scala, &current) {
                 if export.owner_path.is_empty() {
                     continue;
@@ -799,6 +802,7 @@ impl ProjectTypes {
                     visible_imports_at_byte(&imports, Some(export.declaration_start_byte));
                 let resolver = NameResolver::for_file_with_facts_impl(
                     scala,
+                    token,
                     Some(current.source()),
                     &[current.package_name().to_string()],
                     &visible_imports,
@@ -1059,6 +1063,7 @@ impl ProjectTypes {
     pub fn exact_owner_inherits(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner: &CodeUnit,
         target: &CodeUnit,
     ) -> bool {
@@ -1071,7 +1076,7 @@ impl ProjectTypes {
             if &current == target {
                 return true;
             }
-            let ancestors = match self.exact_direct_ancestor_resolution(scala, &current) {
+            let ancestors = match self.exact_direct_ancestor_resolution(scala, token, &current) {
                 ScalaDirectAncestorResolution::Resolved(ancestors)
                 | ScalaDirectAncestorResolution::Incomplete(ancestors)
                     if !ancestors.is_empty() =>
@@ -1092,6 +1097,7 @@ impl ProjectTypes {
     pub fn exact_direct_ancestor_resolution(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner: &CodeUnit,
     ) -> ScalaDirectAncestorResolution {
         if self
@@ -1110,7 +1116,7 @@ impl ProjectTypes {
         let Some(facts) = scala.forward_owner_facts(owner) else {
             return ScalaDirectAncestorResolution::Resolved(Vec::new());
         };
-        let resolver = NameResolver::for_file_types(scala, owner, self);
+        let resolver = NameResolver::for_file_types(scala, token, owner, self);
         let mut ancestors = Vec::new();
         let mut seen = HashSet::default();
         for path in facts.supertype_lookup_paths {
@@ -1134,6 +1140,7 @@ impl ProjectTypes {
     pub fn exact_lexical_type_namespace(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owners_nearest_first: impl IntoIterator<Item = CodeUnit>,
         name: &str,
         authoritative_local_barrier: bool,
@@ -1152,7 +1159,7 @@ impl ProjectTypes {
                     .cloned()
                     .collect()
             },
-            |owner| self.exact_direct_ancestor_resolution(scala, owner),
+            |owner| self.exact_direct_ancestor_resolution(scala, token, owner),
         )
     }
 
@@ -1177,6 +1184,7 @@ impl ProjectTypes {
     pub fn field_for_owner_member(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner_fqn: &str,
         member: &str,
     ) -> FieldResolution {
@@ -1208,7 +1216,7 @@ impl ProjectTypes {
                     return FieldResolution::Unresolved;
                 }
                 let declaration = matches.pop().expect("one exact Scala field");
-                let declared_type = self.field_declared_type(scala, &declaration);
+                let declared_type = self.field_declared_type(scala, token, &declaration);
                 return FieldResolution::Resolved(ResolvedField {
                     declaration,
                     declared_type,
@@ -1222,6 +1230,7 @@ impl ProjectTypes {
     pub fn field_for_owner_unit(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner: &CodeUnit,
         member: &str,
     ) -> FieldResolution {
@@ -1240,7 +1249,7 @@ impl ProjectTypes {
                         .filter(|unit| self.has_term_field_declaration(unit))
                         .cloned(),
                 );
-                let ancestors = match self.exact_direct_ancestor_resolution(scala, &owner) {
+                let ancestors = match self.exact_direct_ancestor_resolution(scala, token, &owner) {
                     ScalaDirectAncestorResolution::Resolved(ancestors)
                     | ScalaDirectAncestorResolution::Incomplete(ancestors)
                         if !ancestors.is_empty() =>
@@ -1268,7 +1277,7 @@ impl ProjectTypes {
                 [field] => {
                     return FieldResolution::Resolved(ResolvedField {
                         declaration: field.clone(),
-                        declared_type: self.field_declared_type(scala, field),
+                        declared_type: self.field_declared_type(scala, token, field),
                     });
                 }
                 [_, _, ..] => return FieldResolution::Unresolved,
@@ -1281,6 +1290,7 @@ impl ProjectTypes {
     pub fn stable_type_member_for_owner_unit(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner: &CodeUnit,
         member: &str,
     ) -> FieldResolution {
@@ -1315,7 +1325,7 @@ impl ProjectTypes {
                     // unique exporter and require one physical target for every
                     // selected binding.
                     let exported_bindings = self
-                        .exported_member_bindings(scala, &owner)
+                        .exported_member_bindings(scala, token, &owner)
                         .into_iter()
                         .filter(|(visible_name, _)| visible_name == member)
                         .collect::<Vec<_>>();
@@ -1344,14 +1354,15 @@ impl ProjectTypes {
                         };
                         matches.push((*exported).clone());
                     }
-                    let ancestors = match self.exact_direct_ancestor_resolution(scala, &owner) {
-                        ScalaDirectAncestorResolution::Resolved(ancestors)
-                        | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
-                        ScalaDirectAncestorResolution::Ambiguous => {
-                            next_is_ambiguous = true;
-                            Vec::new()
-                        }
-                    };
+                    let ancestors =
+                        match self.exact_direct_ancestor_resolution(scala, token, &owner) {
+                            ScalaDirectAncestorResolution::Resolved(ancestors)
+                            | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
+                            ScalaDirectAncestorResolution::Ambiguous => {
+                                next_is_ambiguous = true;
+                                Vec::new()
+                            }
+                        };
                     next.extend(ancestors);
                 }
             }
@@ -1385,10 +1396,11 @@ impl ProjectTypes {
     fn field_declared_type(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         declaration: &CodeUnit,
     ) -> Option<String> {
         let source_facts = self.source_facts_for_file(scala, declaration.source());
-        let resolver = NameResolver::for_file_types(scala, declaration, self);
+        let resolver = NameResolver::for_file_types(scala, token, declaration, self);
         let mut resolved = HashSet::default();
         for range in self.declaration_ranges_for(scala, declaration) {
             if let Some(path) = source_facts
@@ -1396,7 +1408,7 @@ impl ProjectTypes {
                 .get(&(range.start_byte, range.end_byte))
                 && let Some(field_type) =
                     self.resolve_type_in_declaration_context(scala, &resolver, path)
-                && let Some(field_type) = self.canonical_receiver_type(scala, &field_type)
+                && let Some(field_type) = self.canonical_receiver_type(scala, token, &field_type)
             {
                 resolved.insert(field_type);
             }
@@ -1409,12 +1421,13 @@ impl ProjectTypes {
         self.facts
             .fact_for_declaration(declaration)
             .and_then(|facts| facts.return_type_fqn.as_deref())
-            .and_then(|field_type| self.canonical_receiver_type(scala, field_type))
+            .and_then(|field_type| self.canonical_receiver_type(scala, token, field_type))
     }
 
     fn canonical_receiver_type(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         receiver_type: &str,
     ) -> Option<String> {
         let mut current = receiver_type.to_string();
@@ -1436,7 +1449,7 @@ impl ProjectTypes {
             }
             let underlying = aliases
                 .into_iter()
-                .filter_map(|alias| self.type_alias_underlying_type(scala, alias))
+                .filter_map(|alias| self.type_alias_underlying_type(scala, token, alias))
                 .collect::<HashSet<_>>();
             if underlying.len() != 1 {
                 return None;
@@ -1449,10 +1462,11 @@ impl ProjectTypes {
     fn type_alias_underlying_type(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         alias: &CodeUnit,
     ) -> Option<String> {
         let source_facts = self.source_facts_for_file(scala, alias.source());
-        let resolver = NameResolver::for_file_types(scala, alias, self);
+        let resolver = NameResolver::for_file_types(scala, token, alias, self);
         let resolved = self
             .declaration_ranges_for(scala, alias)
             .into_iter()
@@ -1484,11 +1498,13 @@ impl ProjectTypes {
     fn method_declarations_for_members(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         members: &[&CodeUnit],
         call_arities: Option<&[usize]>,
     ) -> Vec<CodeUnit> {
         self.method_declarations_for_members_matching(
             scala,
+            token,
             members,
             ScalaCallMatch::Arities(call_arities),
             ScalaCallableSiteRole::Ordinary,
@@ -1498,11 +1514,13 @@ impl ProjectTypes {
     fn method_declarations_for_members_with_shape(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         members: &[&CodeUnit],
         call_shape: &ScalaCallSiteShape,
     ) -> Vec<CodeUnit> {
         self.method_declarations_for_members_matching(
             scala,
+            token,
             members,
             ScalaCallMatch::Shape(call_shape),
             ScalaCallableSiteRole::Ordinary,
@@ -1512,12 +1530,14 @@ impl ProjectTypes {
     fn callable_declarations_for_members_with_shape(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         members: &[&CodeUnit],
         call_shape: &ScalaCallSiteShape,
         site_role: ScalaCallableSiteRole,
     ) -> Vec<CodeUnit> {
         self.method_declarations_for_members_matching(
             scala,
+            token,
             members,
             ScalaCallMatch::Shape(call_shape),
             site_role,
@@ -1527,16 +1547,18 @@ impl ProjectTypes {
     fn callable_declarations_for_members(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         members: &[&CodeUnit],
         call_shape: Option<&ScalaCallSiteShape>,
         site_role: ScalaCallableSiteRole,
     ) -> Vec<CodeUnit> {
         match call_shape {
-            Some(shape) => {
-                self.callable_declarations_for_members_with_shape(scala, members, shape, site_role)
-            }
+            Some(shape) => self.callable_declarations_for_members_with_shape(
+                scala, token, members, shape, site_role,
+            ),
             None => self.method_declarations_for_members_matching(
                 scala,
+                token,
                 members,
                 ScalaCallMatch::Arities(None),
                 site_role,
@@ -1547,6 +1569,7 @@ impl ProjectTypes {
     fn method_declarations_for_members_matching(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         members: &[&CodeUnit],
         call: ScalaCallMatch<'_>,
         site_role: ScalaCallableSiteRole,
@@ -1559,7 +1582,7 @@ impl ProjectTypes {
                     (
                         *method,
                         facts,
-                        self.effective_callable_alternatives_for(scala, method),
+                        self.effective_callable_alternatives_for(scala, token, method),
                     )
                 })
             })
@@ -1659,6 +1682,7 @@ impl ProjectTypes {
     fn imported_member_targets_with_shape(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         member_fqn: &str,
         call_shape: &ScalaCallSiteShape,
     ) -> Vec<CodeUnit> {
@@ -1668,18 +1692,20 @@ impl ProjectTypes {
             .iter()
             .filter(|unit| unit.is_function())
             .collect::<Vec<_>>();
-        self.method_declarations_for_members_with_shape(scala, &members, call_shape)
+        self.method_declarations_for_members_with_shape(scala, token, &members, call_shape)
     }
 
     pub fn bare_member_declarations_for_owner(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner: &CodeUnit,
         member: &str,
         call_arities: Option<&[usize]>,
     ) -> BareMemberResolution {
         self.bare_member_declarations_for_owner_matching(
             scala,
+            token,
             owner,
             member,
             ScalaCallMatch::Arities(call_arities),
@@ -1754,6 +1780,7 @@ impl ProjectTypes {
     fn bare_member_declarations_for_owner_matching(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner: &CodeUnit,
         member: &str,
         call: ScalaCallMatch<'_>,
@@ -1784,11 +1811,12 @@ impl ProjectTypes {
                 }
                 let methods = match call {
                     ScalaCallMatch::Arities(call_arities) => {
-                        self.method_declarations_for_members(scala, &members, call_arities)
+                        self.method_declarations_for_members(scala, token, &members, call_arities)
                     }
-                    ScalaCallMatch::Shape(call_shape) => {
-                        self.method_declarations_for_members_with_shape(scala, &members, call_shape)
-                    }
+                    ScalaCallMatch::Shape(call_shape) => self
+                        .method_declarations_for_members_with_shape(
+                            scala, token, &members, call_shape,
+                        ),
                 };
                 if !methods.is_empty() {
                     declaring_owners.insert(owner.clone());
@@ -1819,12 +1847,14 @@ impl ProjectTypes {
     pub fn ordinary_class_member_declarations_for_owner(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner: &CodeUnit,
         member: &str,
         call_arities: Option<&[usize]>,
     ) -> BareMemberResolution {
         self.ordinary_class_member_declarations_for_owner_matching(
             scala,
+            token,
             owner,
             member,
             ScalaCallMatch::Arities(call_arities),
@@ -1834,6 +1864,7 @@ impl ProjectTypes {
     fn ordinary_class_member_declarations_for_owner_matching(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner: &CodeUnit,
         member: &str,
         call: ScalaCallMatch<'_>,
@@ -1843,6 +1874,7 @@ impl ProjectTypes {
         }
         self.ordinary_class_member_declarations_for_owners_matching(
             scala,
+            token,
             std::slice::from_ref(owner),
             member,
             call,
@@ -1852,12 +1884,14 @@ impl ProjectTypes {
     pub fn ordinary_class_member_declarations_for_owners(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         direct_owners: &[CodeUnit],
         member: &str,
         call_arities: Option<&[usize]>,
     ) -> BareMemberResolution {
         self.ordinary_class_member_declarations_for_owners_matching(
             scala,
+            token,
             direct_owners,
             member,
             ScalaCallMatch::Arities(call_arities),
@@ -1867,6 +1901,7 @@ impl ProjectTypes {
     fn ordinary_class_member_declarations_for_owners_matching(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         direct_owners: &[CodeUnit],
         member: &str,
         call: ScalaCallMatch<'_>,
@@ -1902,11 +1937,12 @@ impl ProjectTypes {
                 }
                 let methods = match call {
                     ScalaCallMatch::Arities(call_arities) => {
-                        self.method_declarations_for_members(scala, &members, call_arities)
+                        self.method_declarations_for_members(scala, token, &members, call_arities)
                     }
-                    ScalaCallMatch::Shape(call_shape) => {
-                        self.method_declarations_for_members_with_shape(scala, &members, call_shape)
-                    }
+                    ScalaCallMatch::Shape(call_shape) => self
+                        .method_declarations_for_members_with_shape(
+                            scala, token, &members, call_shape,
+                        ),
                 };
                 if !methods.is_empty() {
                     if self.is_scala_trait_declaration(scala, &owner) {
@@ -1916,10 +1952,10 @@ impl ProjectTypes {
                         {
                             blocked = true;
                         }
-                    } else if methods
-                        .iter()
-                        .any(|method| self.extension_method_for_unit(scala, method).is_some())
-                    {
+                    } else if methods.iter().any(|method| {
+                        self.extension_method_for_unit(scala, token, method)
+                            .is_some()
+                    }) {
                         blocked = true;
                     } else {
                         declaring_owners.insert(owner.clone());
@@ -1981,12 +2017,13 @@ impl ProjectTypes {
     pub fn callable_parameter_function_shape(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         method: &CodeUnit,
         call_arities: &[usize],
         parameter_list: usize,
         parameter_index: usize,
     ) -> Option<ScalaFunctionParameterShape> {
-        let alternatives = self.callable_alternatives_for(scala, method);
+        let alternatives = self.callable_alternatives_for(scala, token, method);
         let mut resolved = None;
         for alternative in alternatives.iter().filter(|alternative| {
             alternative.role == ScalaCallableRole::Ordinary
@@ -2015,12 +2052,14 @@ impl ProjectTypes {
     fn effective_method_declarations_for_owner(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner_fqn: &str,
         member: &str,
         call_arities: Option<&[usize]>,
     ) -> BareMemberResolution {
         self.effective_method_declarations_for_owner_matching(
             scala,
+            token,
             owner_fqn,
             member,
             ScalaCallMatch::Arities(call_arities),
@@ -2030,12 +2069,14 @@ impl ProjectTypes {
     fn effective_method_declarations_for_owner_with_shape(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner_fqn: &str,
         member: &str,
         call_shape: &ScalaCallSiteShape,
     ) -> BareMemberResolution {
         self.effective_method_declarations_for_owner_matching(
             scala,
+            token,
             owner_fqn,
             member,
             ScalaCallMatch::Shape(call_shape),
@@ -2045,6 +2086,7 @@ impl ProjectTypes {
     fn effective_method_declarations_for_owner_matching(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner_fqn: &str,
         member: &str,
         call: ScalaCallMatch<'_>,
@@ -2061,18 +2103,22 @@ impl ProjectTypes {
             return BareMemberResolution::Unresolved;
         }
 
-        self.effective_method_declarations_for_exact_owner_matching(scala, owner, member, call)
+        self.effective_method_declarations_for_exact_owner_matching(
+            scala, token, owner, member, call,
+        )
     }
 
     fn effective_method_declarations_for_exact_owner_with_shape(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner: &CodeUnit,
         member: &str,
         call_shape: &ScalaCallSiteShape,
     ) -> BareMemberResolution {
         self.effective_method_declarations_for_exact_owner_matching(
             scala,
+            token,
             owner,
             member,
             ScalaCallMatch::Shape(call_shape),
@@ -2082,12 +2128,14 @@ impl ProjectTypes {
     fn effective_method_declarations_for_exact_owner(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner: &CodeUnit,
         member: &str,
         call_arities: Option<&[usize]>,
     ) -> BareMemberResolution {
         self.effective_method_declarations_for_exact_owner_matching(
             scala,
+            token,
             owner,
             member,
             ScalaCallMatch::Arities(call_arities),
@@ -2097,6 +2145,7 @@ impl ProjectTypes {
     fn effective_method_declarations_for_exact_owner_matching(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner: &CodeUnit,
         member: &str,
         call: ScalaCallMatch<'_>,
@@ -2125,10 +2174,10 @@ impl ProjectTypes {
             }
             let methods = match call {
                 ScalaCallMatch::Arities(call_arities) => {
-                    self.method_declarations_for_members(scala, &members, call_arities)
+                    self.method_declarations_for_members(scala, token, &members, call_arities)
                 }
                 ScalaCallMatch::Shape(shape) => {
-                    self.method_declarations_for_members_with_shape(scala, &members, shape)
+                    self.method_declarations_for_members_with_shape(scala, token, &members, shape)
                 }
             };
             if !methods.is_empty() {
@@ -2151,11 +2200,17 @@ impl ProjectTypes {
                     }
                     match call {
                         ScalaCallMatch::Arities(call_arities) => !self
-                            .method_declarations_for_members(scala, &replica_members, call_arities)
+                            .method_declarations_for_members(
+                                scala,
+                                token,
+                                &replica_members,
+                                call_arities,
+                            )
                             .is_empty(),
                         ScalaCallMatch::Shape(shape) => !self
                             .method_declarations_for_members_with_shape(
                                 scala,
+                                token,
                                 &replica_members,
                                 shape,
                             )
@@ -2191,6 +2246,7 @@ impl ProjectTypes {
     fn super_method_declarations(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner: &CodeUnit,
         member: &str,
         call: ScalaCallMatch<'_>,
@@ -2208,10 +2264,10 @@ impl ProjectTypes {
             }
             let methods = match call {
                 ScalaCallMatch::Arities(call_arities) => {
-                    self.method_declarations_for_members(scala, &members, call_arities)
+                    self.method_declarations_for_members(scala, token, &members, call_arities)
                 }
                 ScalaCallMatch::Shape(shape) => {
-                    self.method_declarations_for_members_with_shape(scala, &members, shape)
+                    self.method_declarations_for_members_with_shape(scala, token, &members, shape)
                 }
             };
             if !methods.is_empty() {
@@ -2303,10 +2359,11 @@ impl ProjectTypes {
     fn concrete_type_expression_owner(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         declaration: &CodeUnit,
         expression: &ScalaTypeExpressionPath,
     ) -> Option<CodeUnit> {
-        let resolver = NameResolver::for_file_types(scala, declaration, self);
+        let resolver = NameResolver::for_file_types(scala, token, declaration, self);
         let fqn = self.resolve_type_in_callable_declaration_context(
             scala,
             &resolver,
@@ -2324,6 +2381,7 @@ impl ProjectTypes {
     fn generic_environments_for_linearization(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         root: &CodeUnit,
     ) -> Option<HashMap<CodeUnit, HashMap<String, CodeUnit>>> {
         let mut environments = HashMap::<CodeUnit, HashMap<String, CodeUnit>>::default();
@@ -2336,14 +2394,15 @@ impl ProjectTypes {
             }
             let environment = environments.get(&owner)?.clone();
             let owner_facts = self.generic_owner_source_facts(scala, &owner)?;
-            let direct_ancestors = match self.exact_direct_ancestor_resolution(scala, &owner) {
+            let direct_ancestors = match self.exact_direct_ancestor_resolution(scala, token, &owner)
+            {
                 ScalaDirectAncestorResolution::Resolved(ancestors)
                 | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
                 ScalaDirectAncestorResolution::Ambiguous => return None,
             };
             for ancestor in direct_ancestors {
                 let mut matching_expressions = owner_facts.supertypes.iter().filter(|expression| {
-                    self.concrete_type_expression_owner(scala, &owner, expression)
+                    self.concrete_type_expression_owner(scala, token, &owner, expression)
                         .as_ref()
                         == Some(&ancestor)
                 });
@@ -2370,7 +2429,7 @@ impl ProjectTypes {
                     {
                         environment.get(&argument.segments[0]).cloned()
                     } else {
-                        self.concrete_type_expression_owner(scala, &owner, argument)
+                        self.concrete_type_expression_owner(scala, token, &owner, argument)
                     }?;
                     ancestor_environment.insert(parameter.clone(), value);
                 }
@@ -2394,6 +2453,7 @@ impl ProjectTypes {
     fn callable_return_value_from_path(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         method: &CodeUnit,
         declaring_owner: &CodeUnit,
         environment: &HashMap<String, CodeUnit>,
@@ -2413,7 +2473,7 @@ impl ProjectTypes {
         {
             return None;
         }
-        let resolver = NameResolver::for_file_types(scala, method, self);
+        let resolver = NameResolver::for_file_types(scala, token, method, self);
         let fqn = self.resolve_type_in_callable_declaration_context(
             scala,
             &resolver,
@@ -2431,6 +2491,7 @@ impl ProjectTypes {
     fn callable_value_resolution_for_members(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         declaring_owner: &CodeUnit,
         members: &[&CodeUnit],
         call_shape: Option<&ScalaCallSiteShape>,
@@ -2494,6 +2555,7 @@ impl ProjectTypes {
                 .and_then(|return_path| {
                     self.callable_return_value_from_path(
                         scala,
+                        token,
                         method,
                         declaring_owner,
                         environment,
@@ -2531,6 +2593,7 @@ impl ProjectTypes {
     fn inherited_apply_value_resolution(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         root: &CodeUnit,
         call_shape: Option<&ScalaCallSiteShape>,
     ) -> ScalaApplyValueResolution {
@@ -2542,6 +2605,7 @@ impl ProjectTypes {
             // with an empty substitution environment.
             return match self.callable_value_resolution_for_members(
                 scala,
+                token,
                 root,
                 &root_members,
                 call_shape,
@@ -2569,11 +2633,12 @@ impl ProjectTypes {
         // The first declaring tier is authoritative even if its overloads,
         // return type, or generic substitution cannot be proven.
         let resolution = self
-            .generic_environments_for_linearization(scala, root)
+            .generic_environments_for_linearization(scala, token, root)
             .and_then(|environments| {
                 let environment = environments.get(&owner)?;
                 Some(self.callable_value_resolution_for_members(
                     scala,
+                    token,
                     &owner,
                     &members,
                     call_shape,
@@ -2594,6 +2659,7 @@ impl ProjectTypes {
     pub fn member_return_type(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         resolver: &NameResolver,
         member_fqn: &str,
     ) -> Option<String> {
@@ -2605,7 +2671,7 @@ impl ProjectTypes {
             .iter()
             .filter(|unit| unit.is_function())
         {
-            let alternatives = self.callable_alternatives_for(scala, unit);
+            let alternatives = self.callable_alternatives_for(scala, token, unit);
             if alternatives.is_empty() {
                 let return_type = self
                     .facts
@@ -2645,29 +2711,32 @@ impl ProjectTypes {
     pub fn member_return_type_for_owner_member(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         resolver: &NameResolver,
         owner_fqn: &str,
         member: &str,
         call_arities: Option<&[usize]>,
     ) -> Option<String> {
         let members = self.members_for_exact_owner_name(owner_fqn, member);
-        self.member_return_type_for_members(scala, resolver, &members, call_arities)
+        self.member_return_type_for_members(scala, token, resolver, &members, call_arities)
     }
 
     pub fn member_return_type_for_fqn_call(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         resolver: &NameResolver,
         member_fqn: &str,
         call_arities: Option<&[usize]>,
     ) -> Option<String> {
         let members = self.index.by_fqn(member_fqn).iter().collect::<Vec<_>>();
-        self.member_return_type_for_members(scala, resolver, &members, call_arities)
+        self.member_return_type_for_members(scala, token, resolver, &members, call_arities)
     }
 
     fn member_return_type_for_members(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         resolver: &NameResolver,
         members: &[&CodeUnit],
         call_arities: Option<&[usize]>,
@@ -2675,6 +2744,7 @@ impl ProjectTypes {
         let call_shape = call_arities.map(ScalaCallSiteShape::ordinary);
         self.member_return_type_for_members_with_shape(
             scala,
+            token,
             resolver,
             members,
             call_shape.as_ref(),
@@ -2684,6 +2754,7 @@ impl ProjectTypes {
     fn member_return_type_for_members_with_shape(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         resolver: &NameResolver,
         members: &[&CodeUnit],
         call_shape: Option<&ScalaCallSiteShape>,
@@ -2696,7 +2767,7 @@ impl ProjectTypes {
                     (
                         *method,
                         facts,
-                        self.callable_alternatives_for(scala, method),
+                        self.callable_alternatives_for(scala, token, method),
                     )
                 })
             })
@@ -2789,6 +2860,7 @@ impl ProjectTypes {
     pub fn unqualified_member_return_type(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         resolver: &NameResolver,
         owner: &CodeUnit,
         member: &str,
@@ -2799,6 +2871,7 @@ impl ProjectTypes {
         }
         self.unqualified_member_return_type_for_owners(
             scala,
+            token,
             resolver,
             std::slice::from_ref(owner),
             member,
@@ -2809,6 +2882,7 @@ impl ProjectTypes {
     pub fn unqualified_member_return_type_for_owners(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         resolver: &NameResolver,
         direct_owners: &[CodeUnit],
         member: &str,
@@ -2847,12 +2921,13 @@ impl ProjectTypes {
                     return MemberReturnResolution::Unresolved;
                 }
                 if !self
-                    .method_declarations_for_members(scala, &members, call_arities)
+                    .method_declarations_for_members(scala, token, &members, call_arities)
                     .is_empty()
                 {
                     matched = true;
                     let Some(return_type) = self.member_return_type_for_members(
                         scala,
+                        token,
                         resolver,
                         &members,
                         call_arities,
@@ -3955,6 +4030,7 @@ impl ProjectTypes {
     pub fn wildcard_member_declarations(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         owner: &CodeUnit,
     ) -> PackageTypeEntries {
         let owner_fqn = owner.fq_name();
@@ -3975,7 +4051,7 @@ impl ProjectTypes {
             // owner's own children and pre-seeding their names would drop them.
             let declared = self.direct_member_bindings(&owner_fqn);
             let aliases = self
-                .exported_member_bindings(scala, owner)
+                .exported_member_bindings(scala, token, owner)
                 .into_iter()
                 .map(|(visible_name, _)| visible_name)
                 .filter(|visible_name| !declared.contains_key(visible_name))
@@ -4212,11 +4288,12 @@ impl ProjectTypes {
     pub fn constructor_target_matches(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         target: &CodeUnit,
         call_shape: Option<&ScalaCallSiteShape>,
         site_role: ScalaCallableSiteRole,
     ) -> bool {
-        let alternatives = self.callable_alternatives_for(scala, target);
+        let alternatives = self.callable_alternatives_for(scala, token, target);
         if alternatives.is_empty() {
             return scala_callable_alternative_matches(
                 ScalaCallableRole::PrimaryConstructor,
@@ -4244,6 +4321,7 @@ impl ProjectTypes {
     pub fn callable_alternatives_for(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         target: &CodeUnit,
     ) -> CachedCallableAlternatives {
         let cell = self
@@ -4255,7 +4333,7 @@ impl ProjectTypes {
             .clone();
         cell.get_or_init(|| {
             let source_facts = self.source_facts_for_file(scala, target.source());
-            let declaration_resolver = NameResolver::for_file_types(scala, target, self);
+            let declaration_resolver = NameResolver::for_file_types(scala, token, target, self);
             let ranges = self.declaration_ranges_for(scala, target);
             let mut exact = ranges
                 .iter()
@@ -4368,7 +4446,7 @@ impl ProjectTypes {
                 })
                 .collect::<Vec<_>>();
             if let Some(case_class) = self.exact_case_class_for_companion_apply(scala, target) {
-                for constructor in self.callable_alternatives_for(scala, &case_class).iter() {
+                for constructor in self.callable_alternatives_for(scala, token, &case_class).iter() {
                     if exact
                         .iter()
                         .any(|alternative| alternative.shape == constructor.shape)
@@ -4448,6 +4526,7 @@ impl ProjectTypes {
     pub fn effective_callable_alternatives_for(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         target: &CodeUnit,
     ) -> CachedCallableAlternatives {
         let cell = self
@@ -4458,13 +4537,13 @@ impl ProjectTypes {
             .or_insert_with(|| Arc::new(OnceLock::new()))
             .clone();
         cell.get_or_init(|| {
-            let declared = self.callable_alternatives_for(scala, target);
+            let declared = self.callable_alternatives_for(scala, token, target);
             let Some(owner) = self.exact_structural_parent(scala, target) else {
                 return declared;
             };
             if !target.is_function()
                 || declared.is_empty()
-                || !self.hierarchy_is_unambiguous(scala, &owner)
+                || !self.hierarchy_is_unambiguous(scala, token, &owner)
             {
                 return declared;
             }
@@ -4484,6 +4563,7 @@ impl ProjectTypes {
                 let declared_alternative = alternative.clone();
                 let Some(defaults) = self.inherited_default_mask_for_alternative(
                     scala,
+                    token,
                     &linearized[1..],
                     target.identifier(),
                     &declared_alternative,
@@ -4498,14 +4578,19 @@ impl ProjectTypes {
         .clone()
     }
 
-    fn hierarchy_is_unambiguous(&self, scala: &dyn ScalaSource, root: &CodeUnit) -> bool {
+    fn hierarchy_is_unambiguous(
+        &self,
+        scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
+        root: &CodeUnit,
+    ) -> bool {
         let mut pending = vec![root.clone()];
         let mut seen = HashSet::default();
         while let Some(owner) = pending.pop() {
             if !seen.insert(owner.clone()) {
                 continue;
             }
-            match self.exact_direct_ancestor_resolution(scala, &owner) {
+            match self.exact_direct_ancestor_resolution(scala, token, &owner) {
                 ScalaDirectAncestorResolution::Resolved(ancestors)
                 | ScalaDirectAncestorResolution::Incomplete(ancestors) => pending.extend(ancestors),
                 ScalaDirectAncestorResolution::Ambiguous => return false,
@@ -4517,6 +4602,7 @@ impl ProjectTypes {
     fn inherited_default_mask_for_alternative(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         ancestors: &[CodeUnit],
         member: &str,
         declared: &CallableAlternative,
@@ -4531,7 +4617,7 @@ impl ProjectTypes {
                 .into_iter()
                 .filter(|unit| unit.is_function())
             {
-                for alternative in self.callable_alternatives_for(scala, method).iter() {
+                for alternative in self.callable_alternatives_for(scala, token, method).iter() {
                     match override_family_relation(declared, alternative) {
                         OverrideFamilyRelation::Exact => exact.push(alternative.clone()),
                         OverrideFamilyRelation::Unknown => unknown = true,
@@ -4549,8 +4635,8 @@ impl ProjectTypes {
         }
         for (index, (left, _)) in inherited.iter().enumerate() {
             for (right, _) in &inherited[index + 1..] {
-                if !self.exact_owner_inherits(scala, left, right)
-                    && !self.exact_owner_inherits(scala, right, left)
+                if !self.exact_owner_inherits(scala, token, left, right)
+                    && !self.exact_owner_inherits(scala, token, right, left)
                 {
                     return None;
                 }
@@ -4925,11 +5011,14 @@ impl ProjectTypes {
     fn class_application_matches_with_shape(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         resolver: &NameResolver,
         target: &CodeUnit,
         call_shape: Option<&ScalaCallSiteShape>,
     ) -> bool {
-        if self.class_companion_apply_call_matches_with_shape(scala, resolver, target, call_shape) {
+        if self.class_companion_apply_call_matches_with_shape(
+            scala, token, resolver, target, call_shape,
+        ) {
             return true;
         }
         if self
@@ -4944,6 +5033,7 @@ impl ProjectTypes {
                                 !self
                                     .callable_declarations_for_members_with_shape(
                                         scala,
+                                        token,
                                         &[*unit],
                                         shape,
                                         ScalaCallableSiteRole::Ordinary,
@@ -4957,6 +5047,7 @@ impl ProjectTypes {
         }
         self.constructor_target_matches(
             scala,
+            token,
             target,
             call_shape,
             ScalaCallableSiteRole::PrimaryConstruction,
@@ -4967,6 +5058,7 @@ impl ProjectTypes {
     pub fn resolve_type_application(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         resolver: &NameResolver,
         class_fqn: Option<&str>,
         object_fqn: Option<&str>,
@@ -5042,6 +5134,7 @@ impl ProjectTypes {
                                 .collect::<Vec<_>>();
                             self.callable_declarations_for_members(
                                 scala,
+                                token,
                                 &members,
                                 call_shape,
                                 ScalaCallableSiteRole::PrimaryConstruction,
@@ -5076,6 +5169,7 @@ impl ProjectTypes {
                         .collect::<Vec<_>>();
                     self.callable_declarations_for_members(
                         scala,
+                        token,
                         &members,
                         call_shape,
                         ScalaCallableSiteRole::ExplicitConstruction,
@@ -5095,6 +5189,7 @@ impl ProjectTypes {
                     !self
                         .callable_declarations_for_members(
                             scala,
+                            token,
                             &members,
                             call_shape,
                             ScalaCallableSiteRole::ExplicitConstruction,
@@ -5102,6 +5197,7 @@ impl ProjectTypes {
                         .is_empty()
                         || self.constructor_target_matches(
                             scala,
+                            token,
                             target,
                             call_shape,
                             ScalaCallableSiteRole::ExplicitConstruction,
@@ -5165,7 +5261,7 @@ impl ProjectTypes {
         let apply_resolution = apply_owners
             .first()
             .filter(|_| !synthetic_companion_apply)
-            .map(|owner| self.inherited_apply_value_resolution(scala, owner, call_shape))
+            .map(|owner| self.inherited_apply_value_resolution(scala, token, owner, call_shape))
             .unwrap_or(ScalaApplyValueResolution::NoDeclaration);
         let apply_resolution = match apply_resolution {
             ScalaApplyValueResolution::NoDeclaration => {
@@ -5174,6 +5270,7 @@ impl ProjectTypes {
                     && !self.is_case_class(scala, type_target)
                     && let Some(callable) = self.unresolved_inherited_companion_apply_fallback(
                         scala,
+                        token,
                         type_target,
                         companion,
                         call_shape,
@@ -5242,6 +5339,7 @@ impl ProjectTypes {
                     .collect::<Vec<_>>();
                 self.callable_declarations_for_members(
                     scala,
+                    token,
                     &members,
                     call_shape,
                     ScalaCallableSiteRole::PrimaryConstruction,
@@ -5255,12 +5353,16 @@ impl ProjectTypes {
             value_result: type_target
                 .as_ref()
                 .filter(|target| {
-                    self.class_application_matches_with_shape(scala, resolver, target, call_shape)
+                    self.class_application_matches_with_shape(
+                        scala, token, resolver, target, call_shape,
+                    )
                 })
                 .cloned()
                 .map(ScalaValueOwner::Exact),
             type_target: type_target.filter(|target| {
-                self.class_application_matches_with_shape(scala, resolver, target, call_shape)
+                self.class_application_matches_with_shape(
+                    scala, token, resolver, target, call_shape,
+                )
             }),
             callable_targets,
         }
@@ -5269,6 +5371,7 @@ impl ProjectTypes {
     fn unresolved_inherited_companion_apply_fallback(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         type_target: &CodeUnit,
         companion: &CodeUnit,
         call_shape: Option<&ScalaCallSiteShape>,
@@ -5293,6 +5396,7 @@ impl ProjectTypes {
         let members = self.members_for_exact_owner_unit(scala, type_target, "apply");
         let mut callables = self.callable_declarations_for_members(
             scala,
+            token,
             &members,
             call_shape,
             ScalaCallableSiteRole::Ordinary,
@@ -5320,6 +5424,7 @@ impl ProjectTypes {
     fn class_companion_apply_call_matches_with_shape(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         resolver: &NameResolver,
         target: &CodeUnit,
         call_shape: Option<&ScalaCallSiteShape>,
@@ -5327,6 +5432,7 @@ impl ProjectTypes {
         if self.is_case_class(scala, target)
             && self.constructor_target_matches(
                 scala,
+                token,
                 target,
                 call_shape,
                 ScalaCallableSiteRole::PrimaryConstruction,
@@ -5342,6 +5448,7 @@ impl ProjectTypes {
                         let members = self.members_for_exact_owner_unit(scala, companion, "apply");
                         self.member_return_type_for_members_with_shape(
                             scala,
+                            token,
                             resolver,
                             &members,
                             Some(shape),
@@ -5357,13 +5464,14 @@ impl ProjectTypes {
     pub fn class_companion_apply_method_value_matches(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         target: &CodeUnit,
         contextual_arities: Option<&[usize]>,
     ) -> bool {
         let mut alternatives = Vec::new();
         if self.is_case_class(scala, target) {
             alternatives.extend(
-                self.callable_alternatives_for(scala, target)
+                self.callable_alternatives_for(scala, token, target)
                     .iter()
                     .filter(|alternative| alternative.role == ScalaCallableRole::PrimaryConstructor)
                     .cloned()
@@ -5381,7 +5489,7 @@ impl ProjectTypes {
                 .filter(|unit| unit.is_function())
             {
                 alternatives.extend(
-                    self.callable_alternatives_for(scala, apply)
+                    self.callable_alternatives_for(scala, token, apply)
                         .iter()
                         .filter(|alternative| {
                             alternative.role == ScalaCallableRole::Ordinary
@@ -5411,6 +5519,7 @@ impl ProjectTypes {
     fn unique_companion_apply_method_value_target(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         resolver: &NameResolver,
         name: &str,
         contextual_arities: Option<&[usize]>,
@@ -5423,7 +5532,12 @@ impl ProjectTypes {
             .filter(|unit| unit.is_class() && !unit.short_name().ends_with('$'));
         let target = targets.next()?.clone();
         if targets.next().is_some()
-            || !self.class_companion_apply_method_value_matches(scala, &target, contextual_arities)
+            || !self.class_companion_apply_method_value_matches(
+                scala,
+                token,
+                &target,
+                contextual_arities,
+            )
         {
             return None;
         }
@@ -5515,19 +5629,21 @@ impl ProjectTypes {
     fn direct_extension_method(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         normalized_fqn: &str,
     ) -> Vec<ExtensionMethod> {
         self.index
             .by_normalized_fqn(normalized_fqn)
             .iter()
             .filter(|unit| unit.is_function() || unit.is_field())
-            .filter_map(|unit| self.extension_method_for_unit(scala, unit))
+            .filter_map(|unit| self.extension_method_for_unit(scala, token, unit))
             .collect()
     }
 
     fn extension_methods_for_owner_member(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         normalized_owner_fqn: &str,
         member: &str,
     ) -> ExtensionMethodEntries {
@@ -5547,7 +5663,7 @@ impl ProjectTypes {
             .members_for_owner_name(normalized_owner_fqn, normalized_owner_fqn, member)
             .into_iter()
             .filter(|unit| unit.is_function() || unit.is_field())
-            .filter_map(|unit| self.extension_method_for_unit(scala, unit))
+            .filter_map(|unit| self.extension_method_for_unit(scala, token, unit))
             .collect::<Vec<_>>();
         methods.sort_by(|left, right| left.declaration.cmp(&right.declaration));
         methods.dedup_by(|left, right| left.declaration == right.declaration);
@@ -5562,9 +5678,10 @@ impl ProjectTypes {
     fn extension_method_for_unit(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         unit: &CodeUnit,
     ) -> Option<ExtensionMethod> {
-        let alternatives = self.callable_alternatives_for(scala, unit);
+        let alternatives = self.callable_alternatives_for(scala, token, unit);
         if !alternatives
             .iter()
             .any(|alternative| alternative.extension_receiver_type.is_some())
@@ -6227,17 +6344,26 @@ impl NameResolver {
 
     pub fn for_file_with_facts(
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         source_file: Option<&ProjectFile>,
         package: Option<&str>,
         imports: &[ImportInfo],
         types: &ProjectTypes,
     ) -> Self {
         let package_prefixes = package.into_iter().map(str::to_string).collect::<Vec<_>>();
-        Self::for_file_with_package_context(scala, source_file, &package_prefixes, imports, types)
+        Self::for_file_with_package_context(
+            scala,
+            token,
+            source_file,
+            &package_prefixes,
+            imports,
+            types,
+        )
     }
 
     pub fn for_file_with_package_context(
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         source_file: Option<&ProjectFile>,
         package_prefixes: &[String],
         imports: &[ImportInfo],
@@ -6245,6 +6371,7 @@ impl NameResolver {
     ) -> Self {
         Self::for_file_with_package_context_and_owner_scopes(
             scala,
+            token,
             source_file,
             package_prefixes,
             imports,
@@ -6255,6 +6382,7 @@ impl NameResolver {
 
     fn for_file_with_package_context_and_owner_scopes(
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         source_file: Option<&ProjectFile>,
         package_prefixes: &[String],
         imports: &[ImportInfo],
@@ -6263,6 +6391,7 @@ impl NameResolver {
     ) -> Self {
         Self::for_file_with_facts_impl(
             scala,
+            token,
             source_file,
             package_prefixes,
             imports,
@@ -6455,6 +6584,7 @@ impl NameResolver {
 
     pub fn for_file_types(
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         target: &CodeUnit,
         types: &ProjectTypes,
     ) -> Self {
@@ -6472,6 +6602,7 @@ impl NameResolver {
                     let imports = visible_imports_at_byte(&state.imports, reference_byte);
                     Self::for_file_with_facts_impl(
                         scala,
+                        token,
                         Some(file),
                         &[target.package_name().to_string()],
                         &imports,
@@ -6482,6 +6613,7 @@ impl NameResolver {
                 }
                 None => Self::for_file_with_facts_impl(
                     scala,
+                    token,
                     Some(file),
                     &[target.package_name().to_string()],
                     &[],
@@ -6491,7 +6623,7 @@ impl NameResolver {
                 ),
             },
             None => {
-                let imports = scala.import_info_of(file);
+                let imports = scala.import_info_of(token, file);
                 let reference_byte = scala
                     .ranges(target)
                     .into_iter()
@@ -6500,6 +6632,7 @@ impl NameResolver {
                 let imports = visible_imports_at_byte(&imports, reference_byte);
                 Self::for_file_with_facts_impl(
                     scala,
+                    token,
                     Some(file),
                     &[target.package_name().to_string()],
                     &imports,
@@ -6511,8 +6644,10 @@ impl NameResolver {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn for_file_with_facts_impl(
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         source_file: Option<&ProjectFile>,
         package_prefixes: &[String],
         imports: &[ImportInfo],
@@ -6665,13 +6800,13 @@ impl NameResolver {
                         types.object_by_normalized_fqn(scala, &normalized_owner)
                     {
                         for (visible_name, member) in types
-                            .wildcard_member_declarations(scala, declaration)
+                            .wildcard_member_declarations(scala, token, declaration)
                             .iter()
                         {
                             member_names.add_declaration(visible_name.clone(), member, 128);
                         }
                         for (visible_name, member_fqn) in
-                            types.exported_member_bindings(scala, declaration)
+                            types.exported_member_bindings(scala, token, declaration)
                         {
                             member_names.add_candidate(
                                 visible_name,
@@ -6746,13 +6881,13 @@ impl NameResolver {
                             types.object_by_normalized_fqn(scala, &normalized_owner)
                         {
                             for (visible_name, member) in types
-                                .wildcard_member_declarations(scala, declaration)
+                                .wildcard_member_declarations(scala, token, declaration)
                                 .iter()
                             {
                                 member_names.add_declaration(visible_name.clone(), member, 128);
                             }
                             for (visible_name, member_fqn) in
-                                types.exported_member_bindings(scala, declaration)
+                                types.exported_member_bindings(scala, token, declaration)
                             {
                                 member_names.add_candidate(
                                     visible_name,
@@ -6895,7 +7030,7 @@ impl NameResolver {
                     for member in members {
                         member_names.add_declaration(local_name.clone(), member, 192);
                     }
-                    for method in types.direct_extension_method(scala, &normalized) {
+                    for method in types.direct_extension_method(scala, token, &normalized) {
                         direct_extension_methods
                             .entry(local_name.clone())
                             .or_default()
@@ -7073,6 +7208,7 @@ impl NameResolver {
     pub fn visible_extension_methods(
         &self,
         scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
         types: &ProjectTypes,
         member: &str,
     ) -> Vec<ExtensionMethod> {
@@ -7084,7 +7220,7 @@ impl NameResolver {
         for owner in self.wildcard_extension_owners() {
             methods.extend(
                 types
-                    .extension_methods_for_owner_member(scala, owner, member)
+                    .extension_methods_for_owner_member(scala, token, owner, member)
                     .iter()
                     .cloned(),
             );
@@ -7392,6 +7528,7 @@ impl ScalaReferenceSink for ScalaEdgeSink<'_> {
 /// of which the driver needs anyway to build the file's declarations.
 pub fn scan_edge_file(
     scala: &dyn ScalaSource,
+    token: QueryToken<'_>,
     types: &ProjectTypes,
     file: &ProjectFile,
     state: &ScalaFileFacts,
@@ -7406,6 +7543,7 @@ pub fn scan_edge_file(
     };
     let resolver = Arc::new(NameResolver::for_file_with_facts(
         scala,
+        token,
         Some(file),
         Some(&state.package_name),
         &[],
@@ -7415,6 +7553,7 @@ pub fn scan_edge_file(
         scala_import_owner_scopes(&state.imports, &class_ranges, scala, types);
     let mut ctx = ScalaScan {
         scala,
+        token,
         workspace: None,
         source: input.source,
         source_file: file,
@@ -7435,7 +7574,7 @@ pub fn scan_edge_file(
         invocation_callables: HashMap::default(),
     };
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    walk(input.root(), &mut ctx, &mut bindings);
+    walk(input.root(), token, &mut ctx, &mut bindings);
     sink.edges
 }
 
@@ -7448,8 +7587,10 @@ pub fn scan_edge_file(
 /// type whose written name has no Scala declaration one logical chance through
 /// the realm before giving up on it (#1859); per-file `ScalaSource` state is
 /// never used for that (#1805).
+#[allow(clippy::too_many_arguments)]
 pub fn scan_scala_query_file(
     scala: &dyn ScalaSource,
+    token: QueryToken<'_>,
     analyzer: &dyn CodeUnitIndex,
     workspace: &dyn ScalaWorkspaceSource,
     file: &ProjectFile,
@@ -7477,10 +7618,11 @@ pub fn scan_scala_query_file(
     scala.record_query_parse();
     let types = scala.project_types();
     let package = super::resolver::package_name_of(scala, file).unwrap_or_default();
-    let imports = scala.import_info_of(file);
+    let imports = scala.import_info_of(token, file);
     sink.register_imports(&imports);
     let resolver = Arc::new(NameResolver::for_file_with_facts(
         scala,
+        token,
         Some(file),
         Some(&package),
         &[],
@@ -7490,6 +7632,7 @@ pub fn scan_scala_query_file(
     let import_owner_scopes = scala_import_owner_scopes(&imports, &class_ranges, scala, &types);
     let mut ctx = ScalaScan {
         scala,
+        token,
         workspace: Some(workspace),
         source,
         source_file: file,
@@ -7512,12 +7655,15 @@ pub fn scan_scala_query_file(
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     #[cfg(any(test, feature = "test-support"))]
     scala.record_query_walk();
-    walk(tree.root_node(), &mut ctx, &mut bindings);
+    walk(tree.root_node(), token, &mut ctx, &mut bindings);
     true
 }
 
 struct ScalaScan<'a, 'b> {
     scala: &'a dyn ScalaSource,
+    /// Proof that a request scope is open: this scan reaches import-tier
+    /// storage through `scala` (issue #2423).
+    token: QueryToken<'a>,
     /// The all-language definition view (#1859). Present only on the query
     /// path: the edge build runs inside the Scala analyzer's own indexing and
     /// has no merged index to consult, and its behavior must not change here.
@@ -7548,7 +7694,7 @@ struct ScalaScan<'a, 'b> {
 }
 
 impl ScalaScan<'_, '_> {
-    fn activate_import_context(&mut self, node: Node<'_>) {
+    fn activate_import_context(&mut self, token: QueryToken<'_>, node: Node<'_>) {
         let visible_imports = self
             .import_contexts
             .advance_to(node.start_byte(), &mut self.import_context_cursor);
@@ -7579,6 +7725,7 @@ impl ScalaScan<'_, '_> {
         let resolver = Arc::new(
             NameResolver::for_file_with_package_context_and_owner_scopes(
                 self.scala,
+                token,
                 Some(self.source_file),
                 &key.0,
                 &imports,
@@ -7709,10 +7856,14 @@ impl ScalaScan<'_, '_> {
             .any(|template| template.fq_name() == owner_fqn)
     }
 
-    fn exact_lexically_visible_type(&self, node: Node<'_>) -> ScalaTypeNamespaceResolution {
+    fn exact_lexically_visible_type(
+        &self,
+        token: QueryToken<'_>,
+        node: Node<'_>,
+    ) -> ScalaTypeNamespaceResolution {
         let lookup_node = scala_qualified_type_root(node);
         let segments = scala_type_lookup_segments(lookup_node, self.source);
-        let resolution = self.exact_lexically_visible_type_root(node);
+        let resolution = self.exact_lexically_visible_type_root(token, node);
         if segments.len() == 1 {
             return resolution;
         }
@@ -7725,7 +7876,11 @@ impl ScalaScan<'_, '_> {
         }
     }
 
-    fn exact_lexically_visible_type_root(&self, node: Node<'_>) -> ScalaTypeNamespaceResolution {
+    fn exact_lexically_visible_type_root(
+        &self,
+        token: QueryToken<'_>,
+        node: Node<'_>,
+    ) -> ScalaTypeNamespaceResolution {
         let lookup_node = scala_qualified_type_root(node);
         if scala_type_reference_is_singleton(lookup_node) {
             return ScalaTypeNamespaceResolution::NoMatch;
@@ -7742,7 +7897,12 @@ impl ScalaScan<'_, '_> {
                     ScalaTypeNamespaceResolution::AuthoritativeMiss
                 }
                 ScalaUnindexedTypeBinding::AnonymousRefinement(instance) => self
-                    .exact_type_member_before_anonymous_binding(lookup_node, instance, root_name),
+                    .exact_type_member_before_anonymous_binding(
+                        token,
+                        lookup_node,
+                        instance,
+                        root_name,
+                    ),
             };
         }
         let mut owners = Vec::new();
@@ -7755,6 +7915,7 @@ impl ScalaScan<'_, '_> {
         }
         let lexical = self.types.exact_lexical_type_namespace(
             self.scala,
+            self.token,
             owners.iter().cloned(),
             root_name,
             false,
@@ -7777,7 +7938,7 @@ impl ScalaScan<'_, '_> {
             }
             match self
                 .types
-                .exact_lexical_type_namespace(self.scala, companions, root_name, false)
+                .exact_lexical_type_namespace(self.scala, self.token, companions, root_name, false)
             {
                 ScalaTypeNamespaceResolution::NoMatch => {}
                 other => return other,
@@ -7791,6 +7952,7 @@ impl ScalaScan<'_, '_> {
     /// and named templates both have higher precedence than the outer alias.
     fn exact_type_member_before_anonymous_binding(
         &self,
+        token: QueryToken<'_>,
         lookup_node: Node<'_>,
         binding_instance: Node<'_>,
         name: &str,
@@ -7799,13 +7961,15 @@ impl ScalaScan<'_, '_> {
         while let Some(node) = current {
             if node.kind() == "template_body" {
                 if let Some(instance) = scala_anonymous_instance_for_template(node) {
-                    let Some(owner) = self.constructed_type_declaration_for_boundary(instance)
+                    let Some(owner) =
+                        self.constructed_type_declaration_for_boundary(token, instance)
                     else {
                         return ScalaTypeNamespaceResolution::AuthoritativeMiss;
                     };
                     if instance != binding_instance {
                         match self.types.exact_lexical_type_namespace(
                             self.scala,
+                            self.token,
                             std::iter::once(owner),
                             name,
                             false,
@@ -7825,7 +7989,7 @@ impl ScalaScan<'_, '_> {
                     }
                     match self
                         .types
-                        .stable_type_member_for_owner_unit(self.scala, &owner, name)
+                        .stable_type_member_for_owner_unit(self.scala, token, &owner, name)
                     {
                         FieldResolution::Resolved(member)
                             if self.types.is_type_alias(self.scala, &member.declaration) =>
@@ -7849,6 +8013,7 @@ impl ScalaScan<'_, '_> {
                     };
                     match self.types.exact_lexical_type_namespace(
                         self.scala,
+                        self.token,
                         std::iter::once(owner),
                         name,
                         false,
@@ -7871,7 +8036,11 @@ impl ScalaScan<'_, '_> {
 
     /// Resolve an anonymous base which may itself be a nested type inherited
     /// from a surrounding anonymous base (for example `Metric.UnsafeAPI`).
-    fn constructed_type_declaration_for_boundary(&self, instance: Node<'_>) -> Option<CodeUnit> {
+    fn constructed_type_declaration_for_boundary(
+        &self,
+        token: QueryToken<'_>,
+        instance: Node<'_>,
+    ) -> Option<CodeUnit> {
         let mut templates = Vec::new();
         let mut current = instance.parent();
         while let Some(node) = current {
@@ -7885,8 +8054,11 @@ impl ScalaScan<'_, '_> {
         let mut exact_owners = Vec::new();
         for template in templates {
             if let Some(outer_instance) = scala_anonymous_instance_for_template(template) {
-                let owner = self
-                    .constructed_type_declaration_against_owners(outer_instance, &exact_owners)?;
+                let owner = self.constructed_type_declaration_against_owners(
+                    token,
+                    outer_instance,
+                    &exact_owners,
+                )?;
                 exact_owners.push(owner);
             } else if let Some(named_owner) = scala_named_template_owner(template) {
                 let owner = self
@@ -7896,18 +8068,19 @@ impl ScalaScan<'_, '_> {
                 exact_owners.push(owner);
             }
         }
-        self.constructed_type_declaration_against_owners(instance, &exact_owners)
+        self.constructed_type_declaration_against_owners(token, instance, &exact_owners)
     }
 
     fn constructed_type_declaration_against_owners(
         &self,
+        token: QueryToken<'_>,
         instance: Node<'_>,
         exact_owners_outer_first: &[CodeUnit],
     ) -> Option<CodeUnit> {
         let type_node = constructed_type_node(instance)?;
         let path = scala_type_lookup_segments(type_node, self.source);
         let [name] = path.as_slice() else {
-            return constructed_type_declaration(instance, self);
+            return constructed_type_declaration(instance, token, self);
         };
         let local_binding = scala_nearest_unindexed_type_binding(self.source, type_node, name);
         if local_binding.is_some() {
@@ -7917,23 +8090,24 @@ impl ScalaScan<'_, '_> {
         for owner in exact_owners_outer_first.iter().rev() {
             match self.types.exact_lexical_type_namespace(
                 self.scala,
+                self.token,
                 std::iter::once(owner.clone()),
                 name,
                 false,
             ) {
                 ScalaTypeNamespaceResolution::Resolved(target) => {
-                    return exact_constructed_type_target(type_node, target, name, self);
+                    return exact_constructed_type_target(type_node, token, target, name, self);
                 }
                 ScalaTypeNamespaceResolution::NoMatch => {}
                 ScalaTypeNamespaceResolution::AuthoritativeMiss
                 | ScalaTypeNamespaceResolution::Ambiguous(_) => return None,
             }
         }
-        constructed_type_declaration(instance, self)
+        constructed_type_declaration(instance, token, self)
     }
 
-    fn visible_type(&self, node: Node<'_>, name: &str) -> Option<String> {
-        match self.exact_lexically_visible_type(node) {
+    fn visible_type(&self, token: QueryToken<'_>, node: Node<'_>, name: &str) -> Option<String> {
+        match self.exact_lexically_visible_type(token, node) {
             ScalaTypeNamespaceResolution::Resolved(declaration) => Some(declaration.fq_name()),
             ScalaTypeNamespaceResolution::NoMatch => self.resolver.resolve(name),
             ScalaTypeNamespaceResolution::AuthoritativeMiss
@@ -7941,8 +8115,13 @@ impl ScalaScan<'_, '_> {
         }
     }
 
-    fn visible_type_reference(&self, node: Node<'_>, name: &str) -> Option<ScalaResolvedReference> {
-        match self.exact_lexically_visible_type(node) {
+    fn visible_type_reference(
+        &self,
+        token: QueryToken<'_>,
+        node: Node<'_>,
+        name: &str,
+    ) -> Option<ScalaResolvedReference> {
+        match self.exact_lexically_visible_type(token, node) {
             ScalaTypeNamespaceResolution::Resolved(declaration) => {
                 Some(ScalaResolvedReference::Exact(declaration))
             }
@@ -8344,6 +8523,7 @@ const SCOPE_NODES: &[&str] = &[
 
 fn walk(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
@@ -8365,7 +8545,7 @@ fn walk(
         }
         match event {
             WalkEvent::Enter(node) => {
-                let enters_scope = walk_enter(node, ctx, bindings);
+                let enters_scope = walk_enter(node, token, ctx, bindings);
                 if enters_scope {
                     stack.push(WalkEvent::ExitScope);
                 }
@@ -8392,7 +8572,7 @@ fn walk(
                 }
             }
             WalkEvent::RefreshAssignment(assignment) => {
-                refresh_assignment_binding(assignment, ctx, bindings);
+                refresh_assignment_binding(assignment, token, ctx, bindings);
             }
             WalkEvent::ExitScope => bindings.exit_scope(),
         }
@@ -8401,21 +8581,22 @@ fn walk(
 
 fn walk_enter(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) -> bool {
-    ctx.activate_import_context(node);
+    ctx.activate_import_context(token, node);
     seed_parent_scope_declaration(node, ctx, bindings);
     let enters_scope = SCOPE_NODES.contains(&node.kind());
     if enters_scope {
         bindings.enter_scope();
     }
-    seed_declaration(node, ctx, bindings);
+    seed_declaration(node, token, ctx, bindings);
     if node.kind() == "import_declaration" {
         record_import_declaration(node, ctx);
     }
     record_override_declaration(node, ctx);
-    record_reference(node, ctx, bindings);
+    record_reference(node, token, ctx, bindings);
     enters_scope
 }
 
@@ -8869,13 +9050,15 @@ fn scala_reference_is_invoked(node: Node<'_>) -> bool {
 /// declares or inherits, innermost template first.
 fn scala_enclosing_chain_field(
     ctx: &ScalaScan<'_, '_>,
+    token: QueryToken<'_>,
     byte: usize,
     member: &str,
 ) -> Option<CodeUnit> {
     let mut enclosing = ctx.enclosing_class_unit(byte).cloned();
     while let Some(owner) = enclosing {
-        if let FieldResolution::Resolved(field) =
-            ctx.types.field_for_owner_unit(ctx.scala, &owner, member)
+        if let FieldResolution::Resolved(field) = ctx
+            .types
+            .field_for_owner_unit(ctx.scala, token, &owner, member)
         {
             return Some(field.declaration);
         }
@@ -8886,6 +9069,7 @@ fn scala_enclosing_chain_field(
 
 fn record_reference(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) {
@@ -8925,25 +9109,25 @@ fn record_reference(
                 // `#`, so this shape owns the name either way: falling through
                 // would look the member up as a bare type name and attribute it
                 // to an unrelated top-level declaration of the same spelling.
-                if let Some(target) = projected_type_member_declaration(node, ctx) {
+                if let Some(target) = projected_type_member_declaration(node, token, ctx) {
                     ctx.record_exact(target, ScalaReferenceRole::Type, node);
                 }
                 return;
             }
-            if record_qualified_root_owner_reference(node, text, ctx, bindings) {
+            if record_qualified_root_owner_reference(node, token, text, ctx, bindings) {
                 return;
             }
             if record_intermediate_stable_object_reference(node, ctx, bindings) {
                 return;
             }
-            if record_qualified_stable_reference(node, ctx, bindings) {
+            if record_qualified_stable_reference(node, token, ctx, bindings) {
                 return;
             }
             if is_stable_type_qualifier(node)
                 && bindings.resolve_symbol(text).is_unknown()
                 && !bindings.is_shadowed(text)
                 && let Some(ScalaResolvedReference::Exact(target)) =
-                    ctx.visible_type_reference(node, text)
+                    ctx.visible_type_reference(token, node, text)
                 && target.is_class()
                 && !target.short_name().ends_with('$')
                 && ctx.types.type_is_stable_owner(ctx.scala, &target)
@@ -8961,7 +9145,8 @@ fn record_reference(
             if (is_extractor_reference(node) || is_infix_pattern_operator(node))
                 && precise_scala_binding(bindings, text)
                     .is_some_and(|binding| binding.declaration_owner.is_some())
-                && let Some(field) = scala_enclosing_chain_field(ctx, node.start_byte(), text)
+                && let Some(field) =
+                    scala_enclosing_chain_field(ctx, token, node.start_byte(), text)
             {
                 ctx.record_exact(field, ScalaReferenceRole::Field, node);
                 return;
@@ -8982,13 +9167,16 @@ fn record_reference(
                 // against it from nested classes of that object. Forward
                 // lookup answers the same chain in the same order, so both
                 // ends agree on which template's value a nested class sees.
-                if let Some(field) = scala_enclosing_chain_field(ctx, node.start_byte(), text) {
+                if let Some(field) =
+                    scala_enclosing_chain_field(ctx, token, node.start_byte(), text)
+                {
                     ctx.record_exact(field, ScalaReferenceRole::Field, node);
                     return;
                 }
-                let class_fqn = ctx.visible_type(node, text);
+                let class_fqn = ctx.visible_type(token, node, text);
                 let resolution = ctx.types.resolve_type_application(
                     ctx.scala,
+                    token,
                     &ctx.resolver,
                     class_fqn.as_deref(),
                     ctx.lexically_visible_object(node.start_byte(), text)
@@ -9020,14 +9208,14 @@ fn record_reference(
                     .then(|| ctx.visible_object_reference(node.start_byte(), text))
                     .flatten()
             } else if is_scala_class_reference(node, ctx.source) {
-                ctx.visible_type_reference(node, text)
+                ctx.visible_type_reference(token, node, text)
             } else {
                 None
             };
             // A type the Scala index does not hold gets one structured chance
             // through the realm before the reference goes unrecorded (#1859).
             if resolved.is_none() {
-                record_foreign_type_reference(node, text, ctx, bindings);
+                record_foreign_type_reference(node, token, text, ctx, bindings);
                 return;
             }
             if let Some(resolved) = resolved {
@@ -9044,6 +9232,7 @@ fn record_reference(
                     };
                     let resolution = ctx.types.resolve_type_application(
                         ctx.scala,
+                        token,
                         &ctx.resolver,
                         Some(&fqn),
                         None,
@@ -9093,7 +9282,7 @@ fn record_reference(
                     // answers it, and no other receiver rule may reinterpret
                     // the selection when it does not.
                     if node_text(receiver, ctx.source).trim() == "super" {
-                        record_super_member(field, name, ctx);
+                        record_super_member(field, token, name, ctx);
                         return;
                     }
                     // `C.apply(..)` on a case class selects the synthetic apply
@@ -9102,7 +9291,7 @@ fn record_reference(
                     // declares no `apply` of its own, and an `apply` it inherits
                     // is not the callee.
                     if name == "apply"
-                        && record_explicit_case_class_apply(receiver, field, ctx, bindings)
+                        && record_explicit_case_class_apply(receiver, token, field, ctx, bindings)
                     {
                         return;
                     }
@@ -9112,7 +9301,7 @@ fn record_reference(
                     // Resolve that namespace form before ordinary receiver
                     // method lookup can consume the terminal as a member.
                     if qualified_stable_type_reference(field, ctx.source).is_some()
-                        && record_qualified_stable_reference(field, ctx, bindings)
+                        && record_qualified_stable_reference(field, token, ctx, bindings)
                     {
                         return;
                     }
@@ -9134,6 +9323,7 @@ fn record_reference(
                                 .types
                                 .effective_method_declarations_for_owner_with_shape(
                                     ctx.scala,
+                                    token,
                                     owner,
                                     name,
                                     &call_shape,
@@ -9153,14 +9343,20 @@ fn record_reference(
                         }
                         return;
                     }
-                    if let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) {
+                    if let Some(owner) = receiver_type_fqn(receiver, token, ctx, bindings) {
                         let Some(call_shape) = call_site_shape_for_reference(field) else {
                             return;
                         };
-                        let exact_owner = receiver_type_declaration(receiver, ctx, bindings);
+                        let exact_owner = receiver_type_declaration(receiver, token, ctx, bindings);
                         let field_resolution = exact_owner.as_ref().map_or_else(
-                            || ctx.types.field_for_owner_member(ctx.scala, &owner, name),
-                            |owner| ctx.types.field_for_owner_unit(ctx.scala, owner, name),
+                            || {
+                                ctx.types
+                                    .field_for_owner_member(ctx.scala, token, &owner, name)
+                            },
+                            |owner| {
+                                ctx.types
+                                    .field_for_owner_unit(ctx.scala, token, owner, name)
+                            },
                         );
                         match field_resolution {
                             FieldResolution::Resolved(resolved) => {
@@ -9179,7 +9375,7 @@ fn record_reference(
                             FieldResolution::NoMatch => {}
                         }
                         let method_value_shape =
-                            match companion_method_value_context(node, ctx, bindings) {
+                            match companion_method_value_context(node, token, ctx, bindings) {
                                 ScalaMethodValueContext::Function(shape) => Some(shape),
                                 ScalaMethodValueContext::Unknown
                                 | ScalaMethodValueContext::Incompatible => None,
@@ -9195,6 +9391,7 @@ fn record_reference(
                                 ctx.types
                                     .effective_method_declarations_for_owner_with_shape(
                                         ctx.scala,
+                                        token,
                                         &owner,
                                         name,
                                         &call_shape,
@@ -9204,6 +9401,7 @@ fn record_reference(
                                 ctx.types
                                     .effective_method_declarations_for_exact_owner_with_shape(
                                         ctx.scala,
+                                        token,
                                         exact_owner,
                                         name,
                                         &call_shape,
@@ -9222,11 +9420,12 @@ fn record_reference(
                             }
                             BareMemberResolution::Unresolved => {}
                             BareMemberResolution::NoMatch => {
-                                if record_qualified_stable_reference(field, ctx, bindings) {
+                                if record_qualified_stable_reference(field, token, ctx, bindings) {
                                     return;
                                 }
                                 let extensions = visible_extensions(
                                     ctx,
+                                    token,
                                     name,
                                     Some(&owner),
                                     Some(call_arities.as_slice()),
@@ -9254,12 +9453,12 @@ fn record_reference(
                                 }
                             }
                         }
-                    } else if !record_qualified_stable_reference(field, ctx, bindings)
-                        && !record_qualified_package_call(field, ctx)
+                    } else if !record_qualified_stable_reference(field, token, ctx, bindings)
+                        && !record_qualified_package_call(field, token, ctx)
                     {
                         let call_arities = call_arities_for_reference(field);
                         let extensions =
-                            visible_extensions(ctx, name, None, call_arities.as_deref());
+                            visible_extensions(ctx, token, name, None, call_arities.as_deref());
                         if extensions.is_empty() {
                             // A receiver the value bindings cannot type may
                             // still spell a foreign type itself
@@ -9300,25 +9499,26 @@ fn record_reference(
                         return;
                     };
                     let method_value_shape =
-                        match companion_method_value_context(node, ctx, bindings) {
+                        match companion_method_value_context(node, token, ctx, bindings) {
                             ScalaMethodValueContext::Function(shape) => Some(shape),
                             ScalaMethodValueContext::Unknown
                             | ScalaMethodValueContext::Incompatible => None,
                         };
                     let call_shape = call_shape.with_method_value_shape(method_value_shape);
-                    let lexical_callable_bound =
-                        match record_unqualified_applied_field(function, name, ctx, bindings) {
-                            LexicalFieldReferenceResolution::Consumed => return,
-                            LexicalFieldReferenceResolution::CallableBound => true,
-                            LexicalFieldReferenceResolution::NoMatch => false,
-                        };
+                    let lexical_callable_bound = match record_unqualified_applied_field(
+                        function, token, name, ctx, bindings,
+                    ) {
+                        LexicalFieldReferenceResolution::Consumed => return,
+                        LexicalFieldReferenceResolution::CallableBound => true,
+                        LexicalFieldReferenceResolution::NoMatch => false,
+                    };
                     if !lexical_callable_bound
                         && (!bindings.resolve_symbol(name).is_unknown()
                             || bindings.is_shadowed(name))
                     {
                         return;
                     }
-                    if record_lexically_visible_call(function, name, &call_shape, ctx) {
+                    if record_lexically_visible_call(function, token, name, &call_shape, ctx) {
                         return;
                     }
                     if lexical_callable_bound {
@@ -9337,12 +9537,12 @@ fn record_reference(
                         .collect::<Vec<_>>();
                     if !imported_units.is_empty()
                         && imported_units.iter().all(|unit| unit.is_synthetic())
-                        && (ctx.visible_type(function, name).is_some()
+                        && (ctx.visible_type(token, function, name).is_some()
                             || ctx
                                 .visible_object_reference(function.start_byte(), name)
                                 .is_some())
                     {
-                        record_unqualified_type_application(function, name, ctx, bindings);
+                        record_unqualified_type_application(function, token, name, ctx, bindings);
                         return;
                     }
                     if !imported_units.is_empty() {
@@ -9367,6 +9567,7 @@ fn record_reference(
                         let imported_refs = imported_units.iter().collect::<Vec<_>>();
                         for target in ctx.types.method_declarations_for_members_with_shape(
                             ctx.scala,
+                            token,
                             &imported_refs,
                             &call_shape,
                         ) {
@@ -9374,12 +9575,12 @@ fn record_reference(
                         }
                         return;
                     }
-                    if ctx.visible_type(function, name).is_some()
+                    if ctx.visible_type(token, function, name).is_some()
                         || ctx
                             .visible_object_reference(function.start_byte(), name)
                             .is_some()
                     {
-                        record_unqualified_type_application(function, name, ctx, bindings);
+                        record_unqualified_type_application(function, token, name, ctx, bindings);
                         return;
                     }
                     if !imported_type_alias_only
@@ -9387,6 +9588,7 @@ fn record_reference(
                     {
                         for target in ctx.types.imported_member_targets_with_shape(
                             ctx.scala,
+                            token,
                             &imported,
                             &call_shape,
                         ) {
@@ -9397,7 +9599,7 @@ fn record_reference(
                         // instead of reinterpreting it as a type application.
                         return;
                     }
-                    record_unqualified_type_application(function, name, ctx, bindings);
+                    record_unqualified_type_application(function, token, name, ctx, bindings);
                 }
                 _ => {}
             }
@@ -9425,14 +9627,15 @@ fn record_reference(
             } else {
                 left
             };
-            let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) else {
+            let Some(owner) = receiver_type_fqn(receiver, token, ctx, bindings) else {
                 return;
             };
             let call_arities = call_arities_for_reference(operator);
-            let resolution = receiver_type_declaration(receiver, ctx, bindings).map_or_else(
+            let resolution = receiver_type_declaration(receiver, token, ctx, bindings).map_or_else(
                 || {
                     ctx.types.effective_method_declarations_for_owner(
                         ctx.scala,
+                        token,
                         &owner,
                         member,
                         call_arities.as_deref(),
@@ -9441,6 +9644,7 @@ fn record_reference(
                 |exact_owner| {
                     ctx.types.effective_method_declarations_for_exact_owner(
                         ctx.scala,
+                        token,
                         &exact_owner,
                         member,
                         call_arities.as_deref(),
@@ -9464,17 +9668,19 @@ fn record_reference(
             if member.is_empty() {
                 return;
             }
-            let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) else {
+            let Some(owner) = receiver_type_fqn(receiver, token, ctx, bindings) else {
                 return;
             };
-            let resolution = receiver_type_declaration(receiver, ctx, bindings).map_or_else(
+            let resolution = receiver_type_declaration(receiver, token, ctx, bindings).map_or_else(
                 || {
-                    ctx.types
-                        .effective_method_declarations_for_owner(ctx.scala, &owner, member, None)
+                    ctx.types.effective_method_declarations_for_owner(
+                        ctx.scala, token, &owner, member, None,
+                    )
                 },
                 |exact_owner| {
                     ctx.types.effective_method_declarations_for_exact_owner(
                         ctx.scala,
+                        token,
                         &exact_owner,
                         member,
                         None,
@@ -9493,7 +9699,7 @@ fn record_reference(
                 return;
             }
             if has_ancestor_kind(node, "import_declaration") {
-                record_local_stable_imported_member(node, name, ctx, bindings);
+                record_local_stable_imported_member(node, token, name, ctx, bindings);
                 return;
             }
             if let Some(owner_node) =
@@ -9502,7 +9708,7 @@ fn record_reference(
                 let owner_name = node_text(owner_node, ctx.source).trim();
                 let declaring_callables = named_argument_callable_targets(owner_node, name, ctx);
                 if let Some(ScalaResolvedReference::Exact(owner)) =
-                    ctx.visible_type_reference(owner_node, owner_name)
+                    ctx.visible_type_reference(token, owner_node, owner_name)
                 {
                     let callable_matches_owner = declaring_callables.iter().any(|callable| {
                         ctx.scala.structural_parent_of(callable).as_ref() == Some(&owner)
@@ -9539,10 +9745,10 @@ fn record_reference(
             // A parameterless `super.m`, the selection form of the up-call the
             // `call_expression` arm resolves.
             if is_super_selection(node, ctx.source) {
-                record_super_member(node, name, ctx);
+                record_super_member(node, token, name, ctx);
                 return;
             }
-            if record_qualified_root_owner_reference(node, name, ctx, bindings) {
+            if record_qualified_root_owner_reference(node, token, name, ctx, bindings) {
                 return;
             }
             if record_intermediate_stable_object_reference(node, ctx, bindings) {
@@ -9553,7 +9759,7 @@ fn record_reference(
                     && reference.segments.first().is_none_or(|root| {
                         bindings.resolve_symbol(root).is_unknown() && !bindings.is_shadowed(root)
                     })
-            }) && record_qualified_stable_reference(node, ctx, bindings)
+            }) && record_qualified_stable_reference(node, token, ctx, bindings)
             {
                 return;
             }
@@ -9566,28 +9772,28 @@ fn record_reference(
             if is_call_function_reference(node) || reference_is_owned_by_invocation(node) {
                 return;
             }
-            if record_local_stable_imported_member(node, name, ctx, bindings)
-                || record_local_stable_field_reference(node, ctx, bindings)
-                || record_enclosing_field_qualifier(node, name, ctx, bindings)
+            if record_local_stable_imported_member(node, token, name, ctx, bindings)
+                || record_local_stable_field_reference(node, token, ctx, bindings)
+                || record_enclosing_field_qualifier(node, token, name, ctx, bindings)
             {
                 return;
             }
             if !is_terminal_stable_field_reference(node) && !is_field_expression_value(node) {
-                if record_lexically_visible_field_reference(node, name, ctx, bindings)
+                if record_lexically_visible_field_reference(node, token, name, ctx, bindings)
                     == LexicalFieldReferenceResolution::Consumed
                 {
                     return;
                 }
                 if !matches!(
-                    companion_method_value_context(node, ctx, bindings),
+                    companion_method_value_context(node, token, ctx, bindings),
                     ScalaMethodValueContext::Function(_)
-                ) && record_lexically_visible_parameterless_method(node, name, ctx)
+                ) && record_lexically_visible_parameterless_method(node, token, name, ctx)
                 {
                     return;
                 }
             }
             if !is_terminal_stable_field_reference(node)
-                && record_qualified_stable_reference(node, ctx, bindings)
+                && record_qualified_stable_reference(node, token, ctx, bindings)
             {
                 return;
             }
@@ -9618,7 +9824,7 @@ fn record_reference(
                 && !bindings.is_shadowed(name)
             {
                 if let Some(ScalaResolvedReference::Exact(target)) =
-                    ctx.visible_type_reference(node, name)
+                    ctx.visible_type_reference(token, node, name)
                     && ctx.types.type_is_stable_owner(ctx.scala, &target)
                 {
                     ctx.record_exact(target, ScalaReferenceRole::Type, node);
@@ -9633,20 +9839,20 @@ fn record_reference(
             if (is_extractor_reference(node) || is_infix_pattern_operator(node))
                 && bindings.resolve_symbol(name).is_unknown()
                 && !bindings.is_shadowed(name)
-                && names_extractor_owner(node, name, ctx)
+                && names_extractor_owner(node, token, name, ctx)
             {
-                record_unqualified_type_application(node, name, ctx, bindings);
+                record_unqualified_type_application(node, token, name, ctx, bindings);
                 return;
             }
             if is_scala_class_reference(node, ctx.source)
                 && !bare_companion_method_value
-                && let Some(target) = ctx.visible_type_reference(node, name)
+                && let Some(target) = ctx.visible_type_reference(token, node, name)
             {
                 ctx.record_resolved(target, ScalaReferenceRole::Type, node);
                 return;
             }
             if let ScalaMethodValueContext::Function(shape) =
-                companion_method_value_context(node, ctx, bindings)
+                companion_method_value_context(node, token, ctx, bindings)
             {
                 let call_shape = ScalaCallSiteShape {
                     lists: Vec::new(),
@@ -9656,12 +9862,13 @@ fn record_reference(
                     method_value_parameter_types_authoritative: shape.parameter_types_authoritative,
                     type_arguments_only: false,
                 };
-                if record_lexically_visible_call(node, name, &call_shape, ctx) {
+                if record_lexically_visible_call(node, token, name, &call_shape, ctx) {
                     return;
                 }
                 if let Some(imported) = ctx.resolver.resolve_member(name) {
                     let targets = ctx.types.imported_member_targets_with_shape(
                         ctx.scala,
+                        token,
                         &imported,
                         &call_shape,
                     );
@@ -9715,12 +9922,13 @@ fn record_reference(
                 && let Some(call_shape) = call_site_shape_for_reference(node)
                 && call_shape.type_arguments_only
             {
-                if record_lexically_visible_call(node, name, &call_shape, ctx) {
+                if record_lexically_visible_call(node, token, name, &call_shape, ctx) {
                     return;
                 }
                 if let Some(imported) = ctx.resolver.resolve_member(name) {
                     for target in ctx.types.imported_member_targets_with_shape(
                         ctx.scala,
+                        token,
                         &imported,
                         &call_shape,
                     ) {
@@ -9728,7 +9936,7 @@ fn record_reference(
                     }
                     return;
                 }
-                record_unqualified_type_application(node, name, ctx, bindings);
+                record_unqualified_type_application(node, token, name, ctx, bindings);
                 return;
             }
             if bare_companion_method_value {
@@ -9744,7 +9952,7 @@ fn record_reference(
                     );
                     return;
                 }
-                let target = match companion_method_value_context(node, ctx, bindings) {
+                let target = match companion_method_value_context(node, token, ctx, bindings) {
                     ScalaMethodValueContext::Unknown => {
                         // An explicit companion object is a stable term in an
                         // ordinary value argument.  Do not reinterpret a
@@ -9763,6 +9971,7 @@ fn record_reference(
                         }
                         ctx.types.unique_companion_apply_method_value_target(
                             ctx.scala,
+                            token,
                             &ctx.resolver,
                             name,
                             None,
@@ -9771,6 +9980,7 @@ fn record_reference(
                     ScalaMethodValueContext::Function(shape) => {
                         ctx.types.unique_companion_apply_method_value_target(
                             ctx.scala,
+                            token,
                             &ctx.resolver,
                             name,
                             Some(&[shape.arity]),
@@ -9852,6 +10062,7 @@ fn record_reference(
                 });
                 let method_value_context = companion_method_value_context(
                     method_value_argument.unwrap_or(node),
+                    token,
                     ctx,
                     bindings,
                 );
@@ -9877,15 +10088,22 @@ fn record_reference(
                             type_arguments_only: false,
                         })
                     });
-                if record_union_receiver_parameterless_methods(qualifier, name, node, ctx, bindings)
-                {
+                if record_union_receiver_parameterless_methods(
+                    qualifier, token, name, node, ctx, bindings,
+                ) {
                     return;
                 }
-                if let Some(owner) = receiver_type_fqn(qualifier, ctx, bindings) {
-                    let exact_owner = receiver_type_declaration(qualifier, ctx, bindings);
+                if let Some(owner) = receiver_type_fqn(qualifier, token, ctx, bindings) {
+                    let exact_owner = receiver_type_declaration(qualifier, token, ctx, bindings);
                     let field_resolution = exact_owner.as_ref().map_or_else(
-                        || ctx.types.field_for_owner_member(ctx.scala, &owner, name),
-                        |owner| ctx.types.field_for_owner_unit(ctx.scala, owner, name),
+                        || {
+                            ctx.types
+                                .field_for_owner_member(ctx.scala, token, &owner, name)
+                        },
+                        |owner| {
+                            ctx.types
+                                .field_for_owner_unit(ctx.scala, token, owner, name)
+                        },
                     );
                     match field_resolution {
                         FieldResolution::Resolved(field) => {
@@ -9927,7 +10145,7 @@ fn record_reference(
                                     || {
                                         ctx.types.bare_member_declarations_for_owner(
                                             ctx.scala,
-                                            exact_owner,
+                                            token, exact_owner,
                                             name,
                                             None,
                                         )
@@ -9936,7 +10154,7 @@ fn record_reference(
                                         ctx.types
                                             .effective_method_declarations_for_exact_owner_with_shape(
                                                 ctx.scala,
-                                                exact_owner,
+                                                token, exact_owner,
                                                 name,
                                                 shape,
                                             )
@@ -9962,7 +10180,7 @@ fn record_reference(
                                 match ctx
                                     .types
                                     .effective_method_declarations_for_owner_with_shape(
-                                        ctx.scala, &owner, name, shape,
+                                        ctx.scala, token, &owner, name, shape,
                                     ) {
                                     BareMemberResolution::Resolved(methods) => {
                                         for method in methods {
@@ -9975,10 +10193,13 @@ fn record_reference(
                                     BareMemberResolution::Unresolved => return,
                                     BareMemberResolution::NoMatch => {}
                                 }
-                            } else if record_ordinary_class_methods(&owner, name, None, node, ctx) {
+                            } else if record_ordinary_class_methods(
+                                &owner, token, name, None, node, ctx,
+                            ) {
                                 return;
                             }
-                            let extensions = visible_extensions(ctx, name, Some(&owner), None);
+                            let extensions =
+                                visible_extensions(ctx, token, name, Some(&owner), None);
                             if !extensions.is_empty() {
                                 for extension in extensions {
                                     ctx.record_exact(
@@ -10051,7 +10272,7 @@ fn record_reference(
                 }
                 return;
             }
-            if record_lexically_visible_parameterless_method(node, name, ctx) {
+            if record_lexically_visible_parameterless_method(node, token, name, ctx) {
                 return;
             }
             if is_scala_object_reference(node)
@@ -10081,6 +10302,7 @@ fn record_reference(
 
 fn record_qualified_root_owner_reference(
     node: Node<'_>,
+    token: QueryToken<'_>,
     name: &str,
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
@@ -10108,7 +10330,7 @@ fn record_qualified_root_owner_reference(
         }
         recorded = true;
     }
-    let type_reference = ctx.visible_type_reference(node, name);
+    let type_reference = ctx.visible_type_reference(token, node, name);
     if let Some(ScalaResolvedReference::Exact(target)) = &type_reference
         && (ctx.types.type_is_stable_owner(ctx.scala, target)
             || ctx.types.type_accepts_object_roles(ctx.scala, target))
@@ -10157,6 +10379,7 @@ fn record_qualified_root_owner_reference(
 /// type binding is never a foreign type.
 fn record_foreign_type_reference(
     node: Node<'_>,
+    token: QueryToken<'_>,
     text: &str,
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
@@ -10173,7 +10396,7 @@ fn record_foreign_type_reference(
     // locally bound name is a deliberate physical answer that no lower tier
     // may overrule.
     if !matches!(
-        ctx.exact_lexically_visible_type(node),
+        ctx.exact_lexically_visible_type(token, node),
         ScalaTypeNamespaceResolution::NoMatch
     ) {
         return;
@@ -10277,6 +10500,7 @@ fn reference_lookup_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str>
 /// falling through to an unrelated global member with the same spelling.
 fn record_local_stable_imported_member(
     node: Node<'_>,
+    token: QueryToken<'_>,
     visible_name: &str,
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
@@ -10333,7 +10557,10 @@ fn record_local_stable_imported_member(
             owner = nested;
         }
 
-        let mut targets = match ctx.types.field_for_owner_unit(ctx.scala, &owner, member) {
+        let mut targets = match ctx
+            .types
+            .field_for_owner_unit(ctx.scala, token, &owner, member)
+        {
             FieldResolution::Resolved(field) => vec![field.declaration],
             FieldResolution::Unresolved => return true,
             FieldResolution::NoMatch => {
@@ -10345,7 +10572,7 @@ fn record_local_stable_imported_member(
                 } else {
                     match ctx
                         .types
-                        .bare_member_declarations_for_owner(ctx.scala, &owner, member, None)
+                        .bare_member_declarations_for_owner(ctx.scala, token, &owner, member, None)
                     {
                         BareMemberResolution::Resolved(methods) if !methods.is_empty() => methods,
                         BareMemberResolution::Resolved(_)
@@ -10445,6 +10672,7 @@ fn record_explicit_imported_member(
 
 fn record_union_receiver_parameterless_methods(
     receiver: Node<'_>,
+    token: QueryToken<'_>,
     member: &str,
     node: Node<'_>,
     ctx: &mut ScalaScan<'_, '_>,
@@ -10467,11 +10695,14 @@ fn record_union_receiver_parameterless_methods(
         };
         let resolution = ctx
             .types
-            .effective_method_declarations_for_owner(ctx.scala, owner, member, None);
+            .effective_method_declarations_for_owner(ctx.scala, token, owner, member, None);
         let mut resolved = match resolution {
             BareMemberResolution::Resolved(resolved) => resolved,
             BareMemberResolution::NoMatch | BareMemberResolution::Unresolved => {
-                match ctx.types.field_for_owner_member(ctx.scala, owner, member) {
+                match ctx
+                    .types
+                    .field_for_owner_member(ctx.scala, token, owner, member)
+                {
                     FieldResolution::Resolved(field) => vec![field.declaration],
                     FieldResolution::NoMatch | FieldResolution::Unresolved => return true,
                 }
@@ -10539,7 +10770,11 @@ fn record_union_receiver_parameterless_methods(
 /// exact workspace callables. Receiver inference intentionally treats package
 /// roots as namespaces rather than value types, so this path is handled only
 /// after ordinary receiver/member resolution has failed.
-fn record_qualified_package_call(field: Node<'_>, ctx: &mut ScalaScan<'_, '_>) -> bool {
+fn record_qualified_package_call(
+    field: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut ScalaScan<'_, '_>,
+) -> bool {
     let Some(reference) = qualified_stable_type_reference(field, ctx.source) else {
         return false;
     };
@@ -10552,7 +10787,7 @@ fn record_qualified_package_call(field: Node<'_>, ctx: &mut ScalaScan<'_, '_>) -
     let fqn = reference.segments.join(".");
     let methods = ctx
         .types
-        .imported_member_targets_with_shape(ctx.scala, &fqn, &call_shape);
+        .imported_member_targets_with_shape(ctx.scala, token, &fqn, &call_shape);
     if methods.is_empty() {
         return false;
     }
@@ -10571,11 +10806,12 @@ fn record_qualified_package_call(field: Node<'_>, ctx: &mut ScalaScan<'_, '_>) -
 /// and local values remain authoritative shadows.
 fn record_unqualified_applied_field(
     function: Node<'_>,
+    token: QueryToken<'_>,
     name: &str,
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> LexicalFieldReferenceResolution {
-    match record_lexically_visible_field_reference(function, name, ctx, bindings) {
+    match record_lexically_visible_field_reference(function, token, name, ctx, bindings) {
         LexicalFieldReferenceResolution::Consumed => {
             return LexicalFieldReferenceResolution::Consumed;
         }
@@ -10640,8 +10876,13 @@ fn scala_postfix_receiver_node<'tree>(
 /// class -- `object Split { def unapply(..) }`, the shape the infix pattern
 /// `case left Split right` writes -- owns the pattern even though the type
 /// namespace knows nothing by that name (#2078).
-fn names_extractor_owner(node: Node<'_>, name: &str, ctx: &ScalaScan<'_, '_>) -> bool {
-    if let Some(fqn) = ctx.visible_type(node, name)
+fn names_extractor_owner(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    name: &str,
+    ctx: &ScalaScan<'_, '_>,
+) -> bool {
+    if let Some(fqn) = ctx.visible_type(token, node, name)
         && let Some(target) = ctx
             .types
             .type_by_normalized_fqn(&scala_normalized_fq_name(&fqn))
@@ -10656,6 +10897,7 @@ fn names_extractor_owner(node: Node<'_>, name: &str, ctx: &ScalaScan<'_, '_>) ->
 
 fn record_unqualified_type_application(
     function: Node<'_>,
+    token: QueryToken<'_>,
     name: &str,
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
@@ -10666,9 +10908,14 @@ fn record_unqualified_type_application(
         } else {
             TypeApplicationRole::BareApplication
         };
-    let Some((resolution, call_shape)) =
-        resolve_unqualified_type_application(function, name, application_role, ctx, bindings)
-    else {
+    let Some((resolution, call_shape)) = resolve_unqualified_type_application(
+        function,
+        token,
+        name,
+        application_role,
+        ctx,
+        bindings,
+    ) else {
         return false;
     };
     if let Some(target) = resolution.type_target {
@@ -10689,6 +10936,7 @@ fn record_unqualified_type_application(
                 .filter(|constructor| {
                     ctx.types.constructor_target_matches(
                         ctx.scala,
+                        token,
                         constructor,
                         call_shape.as_ref(),
                         ScalaCallableSiteRole::PrimaryConstruction,
@@ -10719,6 +10967,7 @@ fn record_unqualified_type_application(
 
 fn resolve_unqualified_type_application(
     function: Node<'_>,
+    token: QueryToken<'_>,
     name: &str,
     role: TypeApplicationRole,
     ctx: &ScalaScan<'_, '_>,
@@ -10727,7 +10976,7 @@ fn resolve_unqualified_type_application(
     if !bindings.resolve_symbol(name).is_unknown() || bindings.is_shadowed(name) {
         return None;
     }
-    let class_fqn = ctx.visible_type(function, name);
+    let class_fqn = ctx.visible_type(token, function, name);
     let object_fqn = ctx
         .lexically_visible_object(function.start_byte(), name)
         .or_else(|| ctx.resolver.resolve_object(name));
@@ -10737,6 +10986,7 @@ fn resolve_unqualified_type_application(
     let call_shape = call_site_shape_for_reference(function);
     let resolution = ctx.types.resolve_type_application(
         ctx.scala,
+        token,
         &ctx.resolver,
         class_fqn.as_deref(),
         object_fqn.as_deref(),
@@ -10764,7 +11014,12 @@ fn is_super_selection(field: Node<'_>, source: &str) -> bool {
 /// is answered by the template's parent linearization, never by its own
 /// override, and an unresolved one records nothing rather than falling through
 /// to a receiver rule that would read `super` as an ordinary value.
-fn record_super_member(node: Node<'_>, name: &str, ctx: &mut ScalaScan<'_, '_>) {
+fn record_super_member(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    name: &str,
+    ctx: &mut ScalaScan<'_, '_>,
+) {
     let Some(owner) = ctx.enclosing_class_unit(node.start_byte()).cloned() else {
         return;
     };
@@ -10775,7 +11030,7 @@ fn record_super_member(node: Node<'_>, name: &str, ctx: &mut ScalaScan<'_, '_>) 
     };
     if let BareMemberResolution::Resolved(methods) = ctx
         .types
-        .super_method_declarations(ctx.scala, &owner, name, call)
+        .super_method_declarations(ctx.scala, token, &owner, name, call)
     {
         for method in methods {
             match call_shape.as_ref() {
@@ -10793,11 +11048,12 @@ fn record_super_member(node: Node<'_>, name: &str, ctx: &mut ScalaScan<'_, '_>) 
 /// `apply` the companion inherits from a supertype is not the callee.
 fn record_explicit_case_class_apply(
     receiver: Node<'_>,
+    token: QueryToken<'_>,
     field: Node<'_>,
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> bool {
-    let Some(owner) = receiver_type_declaration(receiver, ctx, bindings).or_else(|| {
+    let Some(owner) = receiver_type_declaration(receiver, token, ctx, bindings).or_else(|| {
         let name = node_text(receiver, ctx.source).trim();
         if receiver.kind() != "identifier"
             || !bindings.resolve_symbol(name).is_unknown()
@@ -10805,7 +11061,7 @@ fn record_explicit_case_class_apply(
         {
             return None;
         }
-        match ctx.visible_type_reference(receiver, name) {
+        match ctx.visible_type_reference(token, receiver, name) {
             Some(ScalaResolvedReference::Exact(unit)) => Some(unit),
             Some(ScalaResolvedReference::Logical(_)) | None => None,
         }
@@ -10817,6 +11073,7 @@ fn record_explicit_case_class_apply(
     };
     let resolution = ctx.types.resolve_type_application(
         ctx.scala,
+        token,
         &ctx.resolver,
         Some(&class.fq_name()),
         None,
@@ -10882,7 +11139,11 @@ fn named_argument_callable_targets(
 /// owner as an ordinary type reference -- the parser gives it the
 /// `projected_type`'s `type` field, and `scala_type_lookup_segments` already
 /// drops its type arguments -- and read the member from its linearization.
-fn projected_type_member_declaration(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<CodeUnit> {
+fn projected_type_member_declaration(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &ScalaScan<'_, '_>,
+) -> Option<CodeUnit> {
     let owner_node = node
         .parent()
         .filter(|parent| parent.kind() == "projected_type")?
@@ -10895,15 +11156,15 @@ fn projected_type_member_declaration(node: Node<'_>, ctx: &ScalaScan<'_, '_>) ->
     // such as scalaz's `trait IterateeTF` inside `trait IterateeTHoist` needs
     // this tier before the ordinary namespace route.
     let owner = match scala_type_lookup_segments(owner_node, ctx.source).as_slice() {
-        [_] => match ctx.exact_lexically_visible_type_root(owner_node) {
+        [_] => match ctx.exact_lexically_visible_type_root(token, owner_node) {
             ScalaTypeNamespaceResolution::Resolved(declaration) => Some(declaration),
             ScalaTypeNamespaceResolution::AuthoritativeMiss
             | ScalaTypeNamespaceResolution::Ambiguous(_) => return None,
             ScalaTypeNamespaceResolution::NoMatch => {
-                resolve_receiver_type_declaration_node(owner_node, ctx)
+                resolve_receiver_type_declaration_node(owner_node, token, ctx)
             }
         },
-        _ => resolve_receiver_type_declaration_node(owner_node, ctx),
+        _ => resolve_receiver_type_declaration_node(owner_node, token, ctx),
     }?;
     ctx.types
         .projected_type_member(ctx.scala, &owner, node_text(node, ctx.source).trim())
@@ -10911,6 +11172,7 @@ fn projected_type_member_declaration(node: Node<'_>, ctx: &ScalaScan<'_, '_>) ->
 
 fn record_qualified_stable_reference(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> bool {
@@ -10935,7 +11197,7 @@ fn record_qualified_stable_reference(
         if let [owner] = matches.as_slice()
             && let FieldResolution::Resolved(field) = ctx
                 .types
-                .stable_type_member_for_owner_unit(ctx.scala, owner, member)
+                .stable_type_member_for_owner_unit(ctx.scala, token, owner, member)
         {
             let role = if ctx.types.is_type_alias(ctx.scala, &field.declaration) {
                 ScalaReferenceRole::Type
@@ -10989,7 +11251,7 @@ fn record_qualified_stable_reference(
     let lexical_type_root = if term_application_lexical_object {
         ScalaTypeNamespaceResolution::NoMatch
     } else {
-        ctx.exact_lexically_visible_type_root(node)
+        ctx.exact_lexically_visible_type_root(token, node)
     };
     let class_lookup_blocked = matches!(
         lexical_type_root,
@@ -11065,7 +11327,7 @@ fn record_qualified_stable_reference(
             owner_lexical_root,
         ) && let FieldResolution::Resolved(field) = ctx
             .types
-            .stable_type_member_for_owner_unit(ctx.scala, &owner, member)
+            .stable_type_member_for_owner_unit(ctx.scala, token, &owner, member)
         {
             let role = if ctx.types.is_type_alias(ctx.scala, &field.declaration) {
                 ScalaReferenceRole::Type
@@ -11125,6 +11387,7 @@ fn record_qualified_stable_reference(
     let object_fqn = object_unit.as_ref().map(CodeUnit::fq_name);
     let resolution = ctx.types.resolve_type_application(
         ctx.scala,
+        token,
         &ctx.resolver,
         class_fqn.as_deref(),
         object_fqn.as_deref(),
@@ -11150,6 +11413,7 @@ fn record_qualified_stable_reference(
                 .filter(|constructor| {
                     ctx.types.constructor_target_matches(
                         ctx.scala,
+                        token,
                         constructor,
                         call_site_shape_for_reference(reference.expression).as_ref(),
                         ScalaCallableSiteRole::PrimaryConstruction,
@@ -11278,6 +11542,7 @@ fn record_intermediate_stable_object_reference(
 /// fail-closed when that logical receiver has multiple physical declarations.
 fn record_local_stable_field_reference(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> bool {
@@ -11350,8 +11615,14 @@ fn record_local_stable_field_reference(
     });
     for segment in &owner_segments[1..] {
         let resolution = exact_owner.as_ref().map_or_else(
-            || ctx.types.field_for_owner_member(ctx.scala, &owner, segment),
-            |owner| ctx.types.field_for_owner_unit(ctx.scala, owner, segment),
+            || {
+                ctx.types
+                    .field_for_owner_member(ctx.scala, token, &owner, segment)
+            },
+            |owner| {
+                ctx.types
+                    .field_for_owner_unit(ctx.scala, token, owner, segment)
+            },
         );
         owner = match resolution {
             FieldResolution::Resolved(field) => match field.declared_type {
@@ -11390,8 +11661,14 @@ fn record_local_stable_field_reference(
         };
     }
     let resolution = exact_owner.as_ref().map_or_else(
-        || ctx.types.field_for_owner_member(ctx.scala, &owner, member),
-        |owner| ctx.types.field_for_owner_unit(ctx.scala, owner, member),
+        || {
+            ctx.types
+                .field_for_owner_member(ctx.scala, token, &owner, member)
+        },
+        |owner| {
+            ctx.types
+                .field_for_owner_unit(ctx.scala, token, owner, member)
+        },
     );
     match resolution {
         FieldResolution::Resolved(field) => {
@@ -11423,14 +11700,14 @@ fn record_local_stable_field_reference(
             if let Some(exact_owner) = exact_owner.as_ref() {
                 if let BareMemberResolution::Resolved(methods) = ctx
                     .types
-                    .bare_member_declarations_for_owner(ctx.scala, exact_owner, member, None)
+                    .bare_member_declarations_for_owner(ctx.scala, token, exact_owner, member, None)
                 {
                     for method in methods {
                         ctx.record_exact_callable(method, node);
                     }
                 }
             } else {
-                record_ordinary_class_methods(&owner, member, None, node, ctx);
+                record_ordinary_class_methods(&owner, token, member, None, node, ctx);
             }
         }
     }
@@ -11443,6 +11720,7 @@ fn record_local_stable_field_reference(
 /// local or parameter shadow of the same spelling.
 fn record_enclosing_field_qualifier(
     node: Node<'_>,
+    token: QueryToken<'_>,
     name: &str,
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
@@ -11452,7 +11730,7 @@ fn record_enclosing_field_qualifier(
     }) {
         return false;
     }
-    record_lexically_visible_field_reference(node, name, ctx, bindings)
+    record_lexically_visible_field_reference(node, token, name, ctx, bindings)
         == LexicalFieldReferenceResolution::Consumed
 }
 
@@ -11475,6 +11753,7 @@ enum LexicalFieldReferenceResolution {
 /// [`LexicalFieldReferenceResolution::CallableBound`].
 fn record_lexically_visible_field_reference(
     node: Node<'_>,
+    token: QueryToken<'_>,
     name: &str,
     ctx: &mut ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
@@ -11516,7 +11795,10 @@ fn record_lexically_visible_field_reference(
         {
             return LexicalFieldReferenceResolution::CallableBound;
         }
-        match ctx.types.field_for_owner_unit(ctx.scala, &current, name) {
+        match ctx
+            .types
+            .field_for_owner_unit(ctx.scala, token, &current, name)
+        {
             FieldResolution::Resolved(field) => {
                 ctx.record_exact(field.declaration, ScalaReferenceRole::Field, node);
                 return LexicalFieldReferenceResolution::Consumed;
@@ -11537,7 +11819,7 @@ fn record_lexically_visible_field_reference(
         else {
             continue;
         };
-        match self_type_field_resolution(*declaration, name, ctx) {
+        match self_type_field_resolution(*declaration, token, name, ctx) {
             FieldResolution::Resolved(field) => {
                 ctx.record_exact(field.declaration, ScalaReferenceRole::Field, node);
                 return LexicalFieldReferenceResolution::Consumed;
@@ -11568,15 +11850,19 @@ fn record_lexically_visible_field_reference(
 /// contributes nothing rather than blocking the ones it does index.
 fn self_type_field_resolution(
     declaration: Node<'_>,
+    token: QueryToken<'_>,
     name: &str,
     ctx: &ScalaScan<'_, '_>,
 ) -> FieldResolution {
     let mut matches = Vec::new();
     for self_type in template_self_types(declaration) {
-        let Some(owner) = resolve_receiver_type_declaration_node(self_type, ctx) else {
+        let Some(owner) = resolve_receiver_type_declaration_node(self_type, token, ctx) else {
             continue;
         };
-        match ctx.types.field_for_owner_unit(ctx.scala, &owner, name) {
+        match ctx
+            .types
+            .field_for_owner_unit(ctx.scala, token, &owner, name)
+        {
             FieldResolution::Resolved(field) => matches.push(field),
             FieldResolution::Unresolved => return FieldResolution::Unresolved,
             FieldResolution::NoMatch => {}
@@ -11594,6 +11880,7 @@ fn self_type_field_resolution(
 
 fn companion_method_value_context(
     mut node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> ScalaMethodValueContext {
@@ -11641,11 +11928,12 @@ fn companion_method_value_context(
             parameter_types.named_children(&mut cursor).count(),
         ));
     }
-    call_parameter_method_value_context(node, ctx, bindings)
+    call_parameter_method_value_context(node, token, ctx, bindings)
 }
 
 fn call_parameter_method_value_context(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> ScalaMethodValueContext {
@@ -11705,6 +11993,7 @@ fn call_parameter_method_value_context(
             };
             match ctx.types.bare_member_declarations_for_owner(
                 ctx.scala,
+                token,
                 owner,
                 function_name,
                 Some(&call_arities),
@@ -11733,14 +12022,15 @@ fn call_parameter_method_value_context(
             if function_name.is_empty() {
                 return ScalaMethodValueContext::Unknown;
             }
-            let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) else {
+            let Some(owner) = receiver_type_fqn(receiver, token, ctx, bindings) else {
                 return ScalaMethodValueContext::Unknown;
             };
-            let exact_owner = receiver_type_declaration(receiver, ctx, bindings);
+            let exact_owner = receiver_type_declaration(receiver, token, ctx, bindings);
             match exact_owner.as_ref().map_or_else(
                 || {
                     ctx.types.effective_method_declarations_for_owner(
                         ctx.scala,
+                        token,
                         &owner,
                         function_name,
                         Some(&call_arities),
@@ -11749,6 +12039,7 @@ fn call_parameter_method_value_context(
                 |exact_owner| {
                     ctx.types.effective_method_declarations_for_exact_owner(
                         ctx.scala,
+                        token,
                         exact_owner,
                         function_name,
                         Some(&call_arities),
@@ -11770,6 +12061,7 @@ fn call_parameter_method_value_context(
     for method in methods {
         let Some(shape) = ctx.types.callable_parameter_function_shape(
             ctx.scala,
+            token,
             &method,
             &call_arities,
             parameter_list,
@@ -11790,6 +12082,7 @@ fn call_parameter_method_value_context(
 
 fn record_ordinary_class_methods(
     owner_fq_name: &str,
+    token: QueryToken<'_>,
     member: &str,
     call_arities: Option<&[usize]>,
     node: Node<'_>,
@@ -11812,6 +12105,7 @@ fn record_ordinary_class_methods(
     }
     match ctx.types.effective_method_declarations_for_exact_owner(
         ctx.scala,
+        token,
         owner,
         member,
         call_arities,
@@ -11885,6 +12179,7 @@ fn scala_method_value_wrapper(mut node: Node<'_>) -> Option<Node<'_>> {
 
 fn record_lexically_visible_call(
     node: Node<'_>,
+    token: QueryToken<'_>,
     member: &str,
     call_shape: &ScalaCallSiteShape,
     ctx: &mut ScalaScan<'_, '_>,
@@ -11904,7 +12199,7 @@ fn record_lexically_visible_call(
             let resolution = ctx
                 .types
                 .effective_method_declarations_for_exact_owner_with_shape(
-                    ctx.scala, owner, member, call_shape,
+                    ctx.scala, token, owner, member, call_shape,
                 );
             match resolution {
                 BareMemberResolution::Resolved(methods) => {
@@ -11934,6 +12229,7 @@ fn record_lexically_visible_call(
         }
         match ordinary_class_member_declarations_for_template(
             declaration,
+            token,
             member,
             fallback_arities,
             ctx,
@@ -11948,8 +12244,15 @@ fn record_lexically_visible_call(
             BareMemberResolution::NoMatch => {}
         }
         for self_type in template_self_types(declaration) {
-            if let Some(self_owner) = resolve_receiver_type_node(self_type, ctx)
-                && record_ordinary_class_methods(&self_owner, member, fallback_arities, node, ctx)
+            if let Some(self_owner) = resolve_receiver_type_node(self_type, token, ctx)
+                && record_ordinary_class_methods(
+                    &self_owner,
+                    token,
+                    member,
+                    fallback_arities,
+                    node,
+                    ctx,
+                )
             {
                 return true;
             }
@@ -11980,6 +12283,7 @@ fn callable_name_is_bound_for_exact_owner(
 
 fn record_lexically_visible_parameterless_method(
     node: Node<'_>,
+    token: QueryToken<'_>,
     member: &str,
     ctx: &mut ScalaScan<'_, '_>,
 ) -> bool {
@@ -11989,7 +12293,7 @@ fn record_lexically_visible_parameterless_method(
     {
         return false;
     }
-    if record_extension_scope_parameterless_method(node, member, ctx) {
+    if record_extension_scope_parameterless_method(node, token, member, ctx) {
         return true;
     }
     for declaration in enclosing_template_declarations(node) {
@@ -11997,10 +12301,9 @@ fn record_lexically_visible_parameterless_method(
             .class_ranges
             .unit_for_exact_span(declaration.start_byte(), declaration.end_byte())
         {
-            match ctx
-                .types
-                .effective_method_declarations_for_exact_owner(ctx.scala, owner, member, None)
-            {
+            match ctx.types.effective_method_declarations_for_exact_owner(
+                ctx.scala, token, owner, member, None,
+            ) {
                 BareMemberResolution::Resolved(methods) => {
                     for method in methods {
                         record_exact_callable_reference(method, node, ctx);
@@ -12011,7 +12314,8 @@ fn record_lexically_visible_parameterless_method(
                 BareMemberResolution::NoMatch => {}
             }
         }
-        match ordinary_class_member_declarations_for_template(declaration, member, None, ctx) {
+        match ordinary_class_member_declarations_for_template(declaration, token, member, None, ctx)
+        {
             BareMemberResolution::Resolved(methods) => {
                 for method in methods {
                     record_exact_callable_reference(method, node, ctx);
@@ -12022,8 +12326,8 @@ fn record_lexically_visible_parameterless_method(
             BareMemberResolution::NoMatch => {}
         }
         for self_type in template_self_types(declaration) {
-            if let Some(self_owner) = resolve_receiver_type_node(self_type, ctx)
-                && record_ordinary_class_methods(&self_owner, member, None, node, ctx)
+            if let Some(self_owner) = resolve_receiver_type_node(self_type, token, ctx)
+                && record_ordinary_class_methods(&self_owner, token, member, None, node, ctx)
             {
                 return true;
             }
@@ -12034,6 +12338,7 @@ fn record_lexically_visible_parameterless_method(
 
 fn record_extension_scope_parameterless_method(
     node: Node<'_>,
+    token: QueryToken<'_>,
     member: &str,
     ctx: &mut ScalaScan<'_, '_>,
 ) -> bool {
@@ -12043,7 +12348,7 @@ fn record_extension_scope_parameterless_method(
         else {
             continue;
         };
-        let Some(receiver_owner) = resolve_receiver_type_node(receiver_type, ctx) else {
+        let Some(receiver_owner) = resolve_receiver_type_node(receiver_type, token, ctx) else {
             return true;
         };
         let mut methods = ctx
@@ -12054,7 +12359,10 @@ fn record_extension_scope_parameterless_method(
             .filter(|declaration| {
                 declaration.is_function() && declaration.source() == ctx.source_file
             })
-            .filter_map(|declaration| ctx.types.extension_method_for_unit(ctx.scala, declaration))
+            .filter_map(|declaration| {
+                ctx.types
+                    .extension_method_for_unit(ctx.scala, token, declaration)
+            })
             .filter(|method| declaration_within_node(ctx, &method.declaration, extension))
             .collect::<Vec<_>>();
         methods.sort_by(|left, right| left.declaration.cmp(&right.declaration));
@@ -12138,6 +12446,7 @@ fn declaration_within_node(
 
 fn ordinary_class_member_declarations_for_template(
     declaration: Node<'_>,
+    token: QueryToken<'_>,
     member: &str,
     call_arities: Option<&[usize]>,
     ctx: &ScalaScan<'_, '_>,
@@ -12148,6 +12457,7 @@ fn ordinary_class_member_declarations_for_template(
     {
         return ctx.types.ordinary_class_member_declarations_for_owner(
             ctx.scala,
+            token,
             owner,
             member,
             call_arities,
@@ -12156,7 +12466,7 @@ fn ordinary_class_member_declarations_for_template(
     if template_direct_term_member_named(declaration, member, ctx.source) {
         return BareMemberResolution::Unresolved;
     }
-    let Some(owners) = template_supertype_owners(declaration, ctx) else {
+    let Some(owners) = template_supertype_owners(declaration, token, ctx) else {
         return BareMemberResolution::Unresolved;
     };
     if owners.is_empty() {
@@ -12164,6 +12474,7 @@ fn ordinary_class_member_declarations_for_template(
     } else {
         ctx.types.ordinary_class_member_declarations_for_owners(
             ctx.scala,
+            token,
             &owners,
             member,
             call_arities,
@@ -12173,11 +12484,12 @@ fn ordinary_class_member_declarations_for_template(
 
 fn template_supertype_owners(
     declaration: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
 ) -> Option<Vec<CodeUnit>> {
     let mut owners = Vec::new();
     for (_, lookup_node) in scala_supertype_lookup_nodes(declaration) {
-        let fqn = resolve_receiver_type_node(lookup_node, ctx)?;
+        let fqn = resolve_receiver_type_node(lookup_node, token, ctx)?;
         let mut declarations = ctx
             .types
             .index
@@ -12197,6 +12509,7 @@ fn template_supertype_owners(
 /// return-type inference.
 fn receiver_type_declaration(
     receiver: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> Option<CodeUnit> {
@@ -12228,11 +12541,14 @@ fn receiver_type_declaration(
         "field_expression" => {
             let value = receiver.child_by_field_name("value")?;
             let member = receiver.child_by_field_name("field")?;
-            let Some(owner) = receiver_type_declaration(value, ctx, bindings) else {
+            let Some(owner) = receiver_type_declaration(value, token, ctx, bindings) else {
                 return stable_object_path_declaration(receiver, ctx, bindings);
             };
             let member = node_text(member, ctx.source).trim();
-            match ctx.types.field_for_owner_unit(ctx.scala, &owner, member) {
+            match ctx
+                .types
+                .field_for_owner_unit(ctx.scala, token, &owner, member)
+            {
                 FieldResolution::Resolved(field) => {
                     let declared_type = field.declared_type?;
                     let owner_context = ctx
@@ -12246,6 +12562,7 @@ fn receiver_type_declaration(
             }
             match ctx.types.unqualified_member_return_type(
                 ctx.scala,
+                token,
                 &ctx.resolver,
                 &owner,
                 member,
@@ -12287,6 +12604,7 @@ fn exact_receiver_type_declaration(
 
 fn receiver_type_fqn(
     receiver: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> Option<String> {
@@ -12308,7 +12626,10 @@ fn receiver_type_fqn(
                         return None;
                     }
                     let owner = ctx.enclosing_class(receiver.start_byte())?;
-                    match ctx.types.field_for_owner_member(ctx.scala, owner, name) {
+                    match ctx
+                        .types
+                        .field_for_owner_member(ctx.scala, token, owner, name)
+                    {
                         FieldResolution::Resolved(field) => field.declared_type,
                         FieldResolution::NoMatch | FieldResolution::Unresolved => None,
                     }
@@ -12328,7 +12649,7 @@ fn receiver_type_fqn(
                     (!bindings.is_shadowed(name)).then(|| {
                         ctx.resolver.resolve_member(name).and_then(|method| {
                             ctx.types
-                                .member_return_type(ctx.scala, &ctx.resolver, &method)
+                                .member_return_type(ctx.scala, token, &ctx.resolver, &method)
                         })
                     })?
                 })
@@ -12343,23 +12664,26 @@ fn receiver_type_fqn(
         "field_expression" if is_owner_qualified_this(receiver, ctx.source) => {
             let owner = receiver.child_by_field_name("value")?;
             let name = node_text(owner, ctx.source).trim();
-            ctx.visible_type(owner, name)
+            ctx.visible_type(token, owner, name)
         }
         "field_expression" => stable_object_expression_fqn(receiver, ctx, bindings).or_else(|| {
             let value = receiver.child_by_field_name("value")?;
             let field = receiver.child_by_field_name("field")?;
-            let owner = receiver_type_fqn(value, ctx, bindings)?;
+            let owner = receiver_type_fqn(value, token, ctx, bindings)?;
             let member = node_text(field, ctx.source).trim();
             if member.is_empty() {
                 return None;
             }
-            match ctx.types.field_for_owner_member(ctx.scala, &owner, member) {
+            match ctx
+                .types
+                .field_for_owner_member(ctx.scala, token, &owner, member)
+            {
                 FieldResolution::Resolved(field) => field.declared_type,
                 FieldResolution::NoMatch | FieldResolution::Unresolved => None,
             }
         }),
-        "instance_expression" => constructed_type(receiver, ctx),
-        "call_expression" => call_result_type(receiver, ctx, bindings),
+        "instance_expression" => constructed_type(receiver, token, ctx),
+        "call_expression" => call_result_type(receiver, token, ctx, bindings),
         kind => scala_literal_type_name(kind).map(|name| {
             let scala_fqn = format!("scala.{name}");
             let declarations = ctx.types.index.by_fqn(&scala_fqn);
@@ -12423,15 +12747,16 @@ fn stable_object_path_declaration(
 
 fn seed_declaration(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     match node.kind() {
         "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
-            seed_class_parameters(node, ctx, bindings);
-            preseed_direct_owner_fields(node, ctx, bindings);
+            seed_class_parameters(node, token, ctx, bindings);
+            preseed_direct_owner_fields(node, token, ctx, bindings);
         }
-        "extension_definition" => seed_parameters(node, ctx, bindings),
+        "extension_definition" => seed_parameters(node, token, ctx, bindings),
         "function_definition" => {
             // #1854: a method's own name is NOT a local binding inside its own
             // body. Declaring it here made every bare `name(..)` inside
@@ -12440,7 +12765,7 @@ fn seed_declaration(
             // lookup. A genuinely nested `def` still shadows, because
             // `seed_parent_scope_declaration` declares it in the ENCLOSING
             // scope, where the shadow belongs.
-            preseed_enclosing_owner_fields(node, ctx, bindings);
+            preseed_enclosing_owner_fields(node, token, ctx, bindings);
             if let Some(extension) = node
                 .parent()
                 .filter(|parent| parent.kind() == "extension_definition")
@@ -12448,17 +12773,18 @@ fn seed_declaration(
                 // An extension receiver is an implicit parameter of every
                 // directly enclosed method. It therefore wins over a method
                 // with the same term name inside that method's body.
-                seed_parameters(extension, ctx, bindings);
+                seed_parameters(extension, token, ctx, bindings);
             }
-            seed_parameters(node, ctx, bindings);
+            seed_parameters(node, token, ctx, bindings);
         }
-        "val_definition" | "var_definition" => seed_value_definition(node, ctx, bindings),
+        "val_definition" | "var_definition" => seed_value_definition(node, token, ctx, bindings),
         _ => {}
     }
 }
 
 fn preseed_enclosing_owner_fields(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
@@ -12466,7 +12792,7 @@ fn preseed_enclosing_owner_fields(
     while let Some(ancestor) = current {
         match ancestor.kind() {
             "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
-                preseed_direct_owner_fields(ancestor, ctx, bindings);
+                preseed_direct_owner_fields(ancestor, token, ctx, bindings);
                 return;
             }
             "function_definition"
@@ -12482,6 +12808,7 @@ fn preseed_enclosing_owner_fields(
 
 fn refresh_assignment_binding(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
@@ -12515,8 +12842,8 @@ fn refresh_assignment_binding(
         );
         return;
     }
-    let receiver = constructed_or_applied_type(right, ctx)
-        .or_else(|| call_result_type(right, ctx, bindings).map(ScalaValueOwner::Logical))
+    let receiver = constructed_or_applied_type(right, token, ctx)
+        .or_else(|| call_result_type(right, token, ctx, bindings).map(ScalaValueOwner::Logical))
         .or_else(|| {
             source_binding
                 .and_then(|binding| binding.receiver_type)
@@ -12573,6 +12900,7 @@ fn function_definition_arity(node: Node<'_>, source: &str) -> Option<usize> {
 
 fn seed_parameters(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
@@ -12584,7 +12912,7 @@ fn seed_parameters(
         let mut inner = child.walk();
         for parameter in child.named_children(&mut inner) {
             if parameter.kind() == "parameter" {
-                seed_parameter(parameter, ctx, None, bindings);
+                seed_parameter(parameter, token, ctx, None, bindings);
             }
         }
     }
@@ -12592,6 +12920,7 @@ fn seed_parameters(
 
 fn seed_class_parameters(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
@@ -12608,7 +12937,7 @@ fn seed_class_parameters(
                     .is_some()
                     .then(|| owner.clone())
                     .flatten();
-                seed_parameter(parameter, ctx, declaration_owner, bindings);
+                seed_parameter(parameter, token, ctx, declaration_owner, bindings);
             }
         }
     }
@@ -12616,6 +12945,7 @@ fn seed_class_parameters(
 
 fn seed_parameter(
     parameter: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
     declaration_owner: Option<CodeUnit>,
     bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
@@ -12653,7 +12983,7 @@ fn seed_parameter(
     }
     if let Some(receiver_declaration) = parameter
         .child_by_field_name("type")
-        .and_then(|type_node| resolve_receiver_type_declaration_node(type_node, ctx))
+        .and_then(|type_node| resolve_receiver_type_declaration_node(type_node, token, ctx))
     {
         seed_scala_binding_with_receiver_declaration(
             binding_name,
@@ -12665,7 +12995,7 @@ fn seed_parameter(
     }
     let resolved = parameter
         .child_by_field_name("type")
-        .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
+        .and_then(|type_node| resolve_receiver_type_node(type_node, token, ctx))
         .or_else(|| {
             parameter
                 .child_by_field_name("type")
@@ -12676,6 +13006,7 @@ fn seed_parameter(
 
 fn preseed_direct_owner_fields(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
@@ -12687,12 +13018,13 @@ fn preseed_direct_owner_fields(
         .named_children(&mut cursor)
         .filter(|child| matches!(child.kind(), "template_body" | "enum_body"))
     {
-        preseed_owner_fields_in(body, ctx, &owner, bindings);
+        preseed_owner_fields_in(body, token, ctx, &owner, bindings);
     }
 }
 
 fn preseed_owner_fields_in(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
     owner: &CodeUnit,
     bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
@@ -12702,7 +13034,13 @@ fn preseed_owner_fields_in(
         match child.kind() {
             "val_definition" | "var_definition" => {
                 if direct_owner_field_owner(child, ctx).as_ref() == Some(owner) {
-                    seed_value_definition_with_owner(child, ctx, Some(owner.clone()), bindings);
+                    seed_value_definition_with_owner(
+                        child,
+                        token,
+                        ctx,
+                        Some(owner.clone()),
+                        bindings,
+                    );
                 }
             }
             "function_definition"
@@ -12717,22 +13055,24 @@ fn preseed_owner_fields_in(
             | "case_clause"
             | "lambda_expression"
             | "anonymous_function" => {}
-            _ => preseed_owner_fields_in(child, ctx, owner, bindings),
+            _ => preseed_owner_fields_in(child, token, ctx, owner, bindings),
         }
     }
 }
 
 fn seed_value_definition(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
     bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
 ) {
     let declaration_owner = direct_owner_field_owner(node, ctx);
-    seed_value_definition_with_owner(node, ctx, declaration_owner, bindings);
+    seed_value_definition_with_owner(node, token, ctx, declaration_owner, bindings);
 }
 
 fn seed_value_definition_with_owner(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
     declaration_owner: Option<CodeUnit>,
     bindings: &mut LocalInferenceEngine<ScalaLocalBinding>,
@@ -12742,22 +13082,22 @@ fn seed_value_definition_with_owner(
     // declaration still binds when the realm proves it foreign (#1859).
     let receiver_declaration = node
         .child_by_field_name("type")
-        .and_then(|type_node| resolve_receiver_type_declaration_node(type_node, ctx));
+        .and_then(|type_node| resolve_receiver_type_declaration_node(type_node, token, ctx));
     let resolved = node
         .child_by_field_name("type")
         .filter(|_| receiver_declaration.is_none())
         .and_then(|type_node| {
-            resolve_receiver_type_node(type_node, ctx)
+            resolve_receiver_type_node(type_node, token, ctx)
                 .or_else(|| resolve_foreign_receiver_type_node(type_node, ctx))
         })
         .map(ScalaValueOwner::Logical)
         .or_else(|| {
             node.child_by_field_name("value")
-                .and_then(|value| constructed_or_applied_type(value, ctx))
+                .and_then(|value| constructed_or_applied_type(value, token, ctx))
         })
         .or_else(|| {
             node.child_by_field_name("value")
-                .and_then(|value| call_result_type(value, ctx, bindings))
+                .and_then(|value| call_result_type(value, token, ctx, bindings))
                 .map(ScalaValueOwner::Logical)
         });
     let Some(pattern) = node.child_by_field_name("pattern") else {
@@ -12821,22 +13161,31 @@ fn scala_named_template_owner(mut template: Node<'_>) -> Option<Node<'_>> {
 }
 
 /// The fqn of the type constructed by a `new Foo()` value expression.
-fn constructed_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
-    constructed_type_declaration(node, ctx).map(|target| target.fq_name())
+fn constructed_type(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &ScalaScan<'_, '_>,
+) -> Option<String> {
+    constructed_type_declaration(node, token, ctx).map(|target| target.fq_name())
 }
 
 /// The exact declaration constructed by a `new Foo()` value expression.
-fn constructed_type_declaration(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<CodeUnit> {
+fn constructed_type_declaration(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &ScalaScan<'_, '_>,
+) -> Option<CodeUnit> {
     let type_node = constructed_type_node(node)?;
     let path = scala_type_lookup_segments(type_node, ctx.source);
     let name = path.last()?;
-    if let Some(target) = resolve_receiver_type_declaration_node(type_node, ctx) {
-        return exact_constructed_type_target(type_node, target, name, ctx);
+    if let Some(target) = resolve_receiver_type_declaration_node(type_node, token, ctx) {
+        return exact_constructed_type_target(type_node, token, target, name, ctx);
     }
-    let class_fqn = resolve_receiver_type_node(type_node, ctx)?;
+    let class_fqn = resolve_receiver_type_node(type_node, token, ctx)?;
     ctx.types
         .resolve_type_application(
             ctx.scala,
+            token,
             &ctx.resolver,
             Some(&class_fqn),
             None,
@@ -12874,6 +13223,7 @@ fn constructed_type_node(mut node: Node<'_>) -> Option<Node<'_>> {
 
 fn exact_constructed_type_target(
     type_node: Node<'_>,
+    token: QueryToken<'_>,
     target: CodeUnit,
     name: &str,
     ctx: &ScalaScan<'_, '_>,
@@ -12882,6 +13232,7 @@ fn exact_constructed_type_target(
         .types
         .resolve_type_application(
             ctx.scala,
+            token,
             &ctx.resolver,
             Some(&target.fq_name()),
             None,
@@ -12925,12 +13276,16 @@ fn anonymous_template_declaration(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Op
         .cloned()
 }
 
-fn constructed_or_applied_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<ScalaValueOwner> {
+fn constructed_or_applied_type(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &ScalaScan<'_, '_>,
+) -> Option<ScalaValueOwner> {
     let node = unwrap_single_scala_expression(node);
     if let Some(template) = anonymous_template_declaration(node, ctx) {
         return Some(ScalaValueOwner::Exact(template));
     }
-    constructed_type(node, ctx)
+    constructed_type(node, token, ctx)
         .map(ScalaValueOwner::Logical)
         .or_else(|| {
             // `new Foreign()` with no Scala declaration: bind the value to the
@@ -12959,13 +13314,14 @@ fn constructed_or_applied_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Optio
             if name.is_empty() {
                 return None;
             }
-            let class_fqn = ctx.visible_type(function, name);
+            let class_fqn = ctx.visible_type(token, function, name);
             let object_fqn = ctx
                 .lexically_visible_object(function.start_byte(), name)
                 .or_else(|| ctx.resolver.resolve_object(name));
             ctx.types
                 .resolve_type_application(
                     ctx.scala,
+                    token,
                     &ctx.resolver,
                     class_fqn.as_deref(),
                     object_fqn.as_deref(),
@@ -12980,6 +13336,7 @@ fn constructed_or_applied_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Optio
 
 fn call_result_type(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
     bindings: &LocalInferenceEngine<ScalaLocalBinding>,
 ) -> Option<String> {
@@ -12992,11 +13349,12 @@ fn call_result_type(
         "field_expression" => {
             let receiver = function.child_by_field_name("value")?;
             let field = function.child_by_field_name("field")?;
-            let owner = receiver_type_fqn(receiver, ctx, bindings)?;
+            let owner = receiver_type_fqn(receiver, token, ctx, bindings)?;
             let method = node_text(field, ctx.source);
             let call_arities = call_arities_for_reference(field);
             ctx.types.member_return_type_for_owner_member(
                 ctx.scala,
+                token,
                 &ctx.resolver,
                 &owner,
                 method,
@@ -13006,7 +13364,7 @@ fn call_result_type(
         "identifier" => {
             let method = node_text(function, ctx.source);
             if bindings.is_shadowed(method) {
-                return recursive_enclosing_function_return_type(function, method, ctx);
+                return recursive_enclosing_function_return_type(function, token, method, ctx);
             }
             if !bindings.resolve_symbol(method).is_unknown() {
                 return None;
@@ -13014,6 +13372,7 @@ fn call_result_type(
             let call_arities = call_arities_for_reference(function);
             match lexically_visible_unqualified_member_return_type(
                 function,
+                token,
                 method,
                 call_arities.as_deref(),
                 ctx,
@@ -13023,6 +13382,7 @@ fn call_result_type(
                     ctx.resolver.resolve_member(method).and_then(|member| {
                         ctx.types.member_return_type_for_fqn_call(
                             ctx.scala,
+                            token,
                             &ctx.resolver,
                             &member,
                             call_arities.as_deref(),
@@ -13038,6 +13398,7 @@ fn call_result_type(
 
 fn recursive_enclosing_function_return_type(
     node: Node<'_>,
+    token: QueryToken<'_>,
     method: &str,
     ctx: &ScalaScan<'_, '_>,
 ) -> Option<String> {
@@ -13053,7 +13414,7 @@ fn recursive_enclosing_function_return_type(
             }
             return function
                 .child_by_field_name("return_type")
-                .and_then(|type_node| resolve_receiver_type_node(type_node, ctx));
+                .and_then(|type_node| resolve_receiver_type_node(type_node, token, ctx));
         }
         current = Some(function);
     }
@@ -13062,6 +13423,7 @@ fn recursive_enclosing_function_return_type(
 
 fn lexically_visible_unqualified_member_return_type(
     node: Node<'_>,
+    token: QueryToken<'_>,
     member: &str,
     call_arities: Option<&[usize]>,
     ctx: &ScalaScan<'_, '_>,
@@ -13073,6 +13435,7 @@ fn lexically_visible_unqualified_member_return_type(
         {
             ctx.types.unqualified_member_return_type(
                 ctx.scala,
+                token,
                 &ctx.resolver,
                 owner,
                 member,
@@ -13081,11 +13444,12 @@ fn lexically_visible_unqualified_member_return_type(
         } else if template_direct_term_member_named(declaration, member, ctx.source) {
             MemberReturnResolution::Unresolved
         } else {
-            let Some(owners) = template_supertype_owners(declaration, ctx) else {
+            let Some(owners) = template_supertype_owners(declaration, token, ctx) else {
                 return MemberReturnResolution::Unresolved;
             };
             ctx.types.unqualified_member_return_type_for_owners(
                 ctx.scala,
+                token,
                 &ctx.resolver,
                 &owners,
                 member,
@@ -13097,7 +13461,7 @@ fn lexically_visible_unqualified_member_return_type(
             resolution => return resolution,
         }
         for self_type in template_self_types(declaration) {
-            let Some(self_owner) = resolve_receiver_type_node(self_type, ctx) else {
+            let Some(self_owner) = resolve_receiver_type_node(self_type, token, ctx) else {
                 continue;
             };
             let mut declarations = ctx
@@ -13112,6 +13476,7 @@ fn lexically_visible_unqualified_member_return_type(
             }
             match ctx.types.unqualified_member_return_type(
                 ctx.scala,
+                token,
                 &ctx.resolver,
                 &declaration,
                 member,
@@ -13246,7 +13611,11 @@ fn realm_static_owner_fqn(
     ctx.realm_foreign_type_fqn(&segments, receiver.start_byte())
 }
 
-fn resolve_receiver_type_node(type_node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
+fn resolve_receiver_type_node(
+    type_node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &ScalaScan<'_, '_>,
+) -> Option<String> {
     let type_node = scala_capture_underlying_type(type_node, ctx.source);
     let path = scala_type_lookup_segments(type_node, ctx.source);
     if path.is_empty() {
@@ -13265,7 +13634,7 @@ fn resolve_receiver_type_node(type_node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> O
         ) {
         Some(declaration.fq_name())
     } else {
-        match ctx.exact_lexically_visible_type(type_node) {
+        match ctx.exact_lexically_visible_type(token, type_node) {
             ScalaTypeNamespaceResolution::Resolved(declaration) => Some(declaration.fq_name()),
             ScalaTypeNamespaceResolution::AuthoritativeMiss
             | ScalaTypeNamespaceResolution::Ambiguous(_) => return None,
@@ -13279,11 +13648,13 @@ fn resolve_receiver_type_node(type_node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> O
                 }),
         }
     }?;
-    ctx.types.canonical_receiver_type(ctx.scala, &resolved)
+    ctx.types
+        .canonical_receiver_type(ctx.scala, token, &resolved)
 }
 
 fn resolve_receiver_type_declaration_node(
     type_node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &ScalaScan<'_, '_>,
 ) -> Option<CodeUnit> {
     let type_node = scala_capture_underlying_type(type_node, ctx.source);
@@ -13301,7 +13672,7 @@ fn resolve_receiver_type_declaration_node(
         ) {
         declaration
     } else {
-        match ctx.exact_lexically_visible_type(type_node) {
+        match ctx.exact_lexically_visible_type(token, type_node) {
             ScalaTypeNamespaceResolution::Resolved(declaration) => declaration,
             ScalaTypeNamespaceResolution::AuthoritativeMiss
             | ScalaTypeNamespaceResolution::Ambiguous(_) => return None,
@@ -13319,9 +13690,9 @@ fn resolve_receiver_type_declaration_node(
     if !ctx.types.is_type_alias(ctx.scala, &declaration) {
         return Some(declaration);
     }
-    let receiver_type = ctx
-        .types
-        .canonical_receiver_type(ctx.scala, &declaration.fq_name())?;
+    let receiver_type =
+        ctx.types
+            .canonical_receiver_type(ctx.scala, token, &declaration.fq_name())?;
     let owner_context = ctx
         .types
         .exact_structural_parent(ctx.scala, &declaration)
@@ -13358,13 +13729,14 @@ fn scala_capture_underlying_type<'tree>(type_node: Node<'tree>, source: &str) ->
 
 fn visible_extensions(
     ctx: &ScalaScan<'_, '_>,
+    token: QueryToken<'_>,
     member: &str,
     receiver_owner: Option<&str>,
     call_arities: Option<&[usize]>,
 ) -> Vec<ExtensionMethod> {
     let mut visible = ctx
         .resolver
-        .visible_extension_methods(ctx.scala, ctx.types, member);
+        .visible_extension_methods(ctx.scala, token, ctx.types, member);
     visible.sort_by(|left, right| left.declaration.cmp(&right.declaration));
     visible.dedup_by(|left, right| left.declaration == right.declaration);
     let receiver_matches = |method: &ExtensionMethod| {

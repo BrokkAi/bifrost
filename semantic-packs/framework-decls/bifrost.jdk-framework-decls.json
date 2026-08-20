@@ -18,7 +18,7 @@
     ]
   },
   "provenance": {
-    "source": "hand-authored JDK framework declarations (java.lang, java.sql)",
+    "source": "hand-authored JDK framework declarations (java.io, java.lang, java.sql)",
     "revision": "framework-decls"
   },
   "license": "Apache-2.0",
@@ -45,6 +45,36 @@
       "payload": {
         "kind": "declaration_facts",
         "types": [
+          {
+            "id": "jdk.java-io-printwriter",
+            "name": "java.io.PrintWriter",
+            "type_kind": "class",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [
+              {
+                "hierarchy_kind": "extends",
+                "target": {
+                  "kind": "named",
+                  "name": "java.io.Writer",
+                  "arguments": [],
+                  "nullable": false
+                }
+              }
+            ],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/io/PrintWriter.java",
+              "symbol": "java.io.PrintWriter"
+            }
+          },
           {
             "id": "jdk.java-lang-processbuilder",
             "name": "java.lang.ProcessBuilder",
@@ -515,6 +545,332 @@
               "kind": "artifact",
               "path": "java.sql/java/sql/PreparedStatement.java",
               "symbol": "setString(int,java.lang.String)"
+            }
+          },
+          {
+            "id": "member.printwriter.format-format",
+            "owner": "jdk.java-io-printwriter",
+            "name": "format",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "format",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "args",
+                  "type": {
+                    "kind": "array",
+                    "element": {
+                      "kind": "named",
+                      "name": "java.lang.Object",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.io.PrintWriter",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/io/PrintWriter.java",
+              "symbol": "format(java.lang.String,java.lang.Object[])"
+            }
+          },
+          {
+            "id": "member.printwriter.format-locale-format",
+            "owner": "jdk.java-io-printwriter",
+            "name": "format",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "l",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.util.Locale",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "format",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "args",
+                  "type": {
+                    "kind": "array",
+                    "element": {
+                      "kind": "named",
+                      "name": "java.lang.Object",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.io.PrintWriter",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/io/PrintWriter.java",
+              "symbol": "format(java.util.Locale,java.lang.String,java.lang.Object[])"
+            }
+          },
+          {
+            "id": "member.printwriter.print-string",
+            "owner": "jdk.java-io-printwriter",
+            "name": "print",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "s",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/io/PrintWriter.java",
+              "symbol": "print(java.lang.String)"
+            }
+          },
+          {
+            "id": "member.printwriter.printf-format",
+            "owner": "jdk.java-io-printwriter",
+            "name": "printf",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "format",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "args",
+                  "type": {
+                    "kind": "array",
+                    "element": {
+                      "kind": "named",
+                      "name": "java.lang.Object",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.io.PrintWriter",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/io/PrintWriter.java",
+              "symbol": "printf(java.lang.String,java.lang.Object[])"
+            }
+          },
+          {
+            "id": "member.printwriter.printf-locale-format",
+            "owner": "jdk.java-io-printwriter",
+            "name": "printf",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "l",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.util.Locale",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "format",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "args",
+                  "type": {
+                    "kind": "array",
+                    "element": {
+                      "kind": "named",
+                      "name": "java.lang.Object",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "java.io.PrintWriter",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/io/PrintWriter.java",
+              "symbol": "printf(java.util.Locale,java.lang.String,java.lang.Object[])"
+            }
+          },
+          {
+            "id": "member.printwriter.println-string",
+            "owner": "jdk.java-io-printwriter",
+            "name": "println",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "x",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/io/PrintWriter.java",
+              "symbol": "println(java.lang.String)"
+            }
+          },
+          {
+            "id": "member.printwriter.write-string",
+            "owner": "jdk.java-io-printwriter",
+            "name": "write",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "s",
+                  "type": {
+                    "kind": "named",
+                    "name": "java.lang.String",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "java.base/java/io/PrintWriter.java",
+              "symbol": "write(java.lang.String)"
             }
           },
           {

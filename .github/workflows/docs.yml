@@ -8,7 +8,7 @@ on:
     paths:
       - '.github/workflows/docs.yml'
       - 'docs/**'
-      - 'scripts/resolve-docs-version.mjs'
+      - 'scripts/public/resolve-docs-version.mjs'
   workflow_dispatch:
     inputs:
       tag:
@@ -40,7 +40,7 @@ jobs:
         id: docs_version
         env:
           RELEASE_TAG_INPUT: ${{ inputs.tag }}
-        run: node scripts/resolve-docs-version.mjs
+        run: node scripts/public/resolve-docs-version.mjs
 
       - name: Set up Node
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0

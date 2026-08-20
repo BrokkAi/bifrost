@@ -1205,9 +1205,11 @@ export function leak_resource(): object {
         }),
     );
     assert!(suppressed["error"].is_null(), "{suppressed}");
+    // An explicit suppressionFile replaces the three-file convention, so one
+    // source is configured and it is the named one.
     assert_eq!(
-        suppressed["result"]["report"]["evaluation"]["suppression_path"],
-        "reviews/accepted.json"
+        suppressed["result"]["report"]["evaluation"]["suppression_sources"],
+        json!([{ "path": "reviews/accepted.json", "state": "loaded" }])
     );
     assert_eq!(
         suppressed["result"]["report"]["runs"][0]["findings"][0]["suppression"]["status"],
@@ -1249,8 +1251,8 @@ export function leak_resource(): object {
         "{invalid_suppression}"
     );
     assert_eq!(
-        invalid_suppression["result"]["report"]["evaluation"]["suppression_document_state"],
-        "invalid"
+        invalid_suppression["result"]["report"]["evaluation"]["suppression_sources"],
+        json!([{ "path": "reviews/accepted.json", "state": "invalid" }])
     );
     assert_eq!(
         invalid_suppression["result"]["report"]["diagnostics"][0]["code"],

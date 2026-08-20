@@ -26,6 +26,7 @@ use crate::analyzer::{
     IAnalyzer, Language, ProjectFile, PythonAnalyzer, SemanticDiagnosticIncompleteReason,
     SemanticDiagnosticReport, resolve_analyzer,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_python::diagnostics::{PythonEnvironmentBoundary, PythonEnvironmentSurface};
 
 /// The ecosystem every Python declaration identity is minted under, in the
@@ -41,6 +42,7 @@ const PYTHON_CLASS_GETATTRIBUTE: &str = "__getattribute__";
 
 pub(crate) fn collect_python_semantic_diagnostics(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
 ) -> SemanticDiagnosticReport {
@@ -61,6 +63,7 @@ pub(crate) fn collect_python_semantic_diagnostics(
     };
     let report = brokk_bifrost_python::diagnostics::collect_python_semantic_diagnostics(
         py,
+        token,
         &support,
         &environment,
         file,
@@ -333,6 +336,7 @@ fn python_declaration_id(name: &str) -> String {
 mod tests {
     use super::collect_python_semantic_diagnostics;
     use crate::analyzer::structural::BoundaryStatus;
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{
         Language, ProjectFile, PythonAnalyzer, SemanticDiagnostic, SemanticDiagnosticDomain,
         SemanticDiagnosticIncompleteReason, SemanticDiagnosticOutcome, SemanticDiagnosticReport,
@@ -353,7 +357,9 @@ mod tests {
         fn report_for(&self, rel_path: &str) -> SemanticDiagnosticReport {
             let file = self.file(rel_path);
             let source = file.read_to_string().expect("read source");
-            collect_python_semantic_diagnostics(&self.analyzer, &file, &source)
+            let scope = AnalyzerQueryScope::new(&self.analyzer);
+            let token = scope.token();
+            collect_python_semantic_diagnostics(&self.analyzer, token, &file, &source)
         }
 
         fn diagnostics_for(&self, rel_path: &str) -> Vec<SemanticDiagnostic> {

@@ -9,6 +9,7 @@ use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 
@@ -25,6 +26,7 @@ pub(crate) enum WorkspaceFileUsageGraphBuildOutcome {
 /// public `usage_graph` tool.
 pub(crate) fn build_workspace_file_usage_graph_with_cancellation(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     selected_ecosystems: &BTreeSet<UsageEcosystem>,
     cancellation: &CancellationToken,
 ) -> WorkspaceFileUsageGraphBuildOutcome {
@@ -69,7 +71,7 @@ pub(crate) fn build_workspace_file_usage_graph_with_cancellation(
                 }
                 let imported = import_infos.as_ref().map_or_else(
                     || {
-                        let imports = provider.import_info_of(file);
+                        let imports = provider.import_info_of(token, file);
                         resolve_imported_files_from_infos(provider, file, &imports)
                     },
                     |infos_by_file| {
@@ -77,7 +79,7 @@ pub(crate) fn build_workspace_file_usage_graph_with_cancellation(
                         let imports = if let Some(imports) = infos_by_file.get(file) {
                             imports.as_slice()
                         } else {
-                            owned_imports = provider.import_info_of(file);
+                            owned_imports = provider.import_info_of(token, file);
                             &owned_imports
                         };
                         resolve_imported_files_from_infos(provider, file, imports)

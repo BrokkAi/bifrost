@@ -9,6 +9,7 @@
 
 use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 use crate::analyzer::usages::common::{
     analyzed_files_for_language, classify_recursive_hits, language_for_target,
@@ -21,6 +22,7 @@ use crate::analyzer::usages::outcome::{
     CandidateUsageHits, GraphFailureReason, GraphUsageOutcome, union_candidate_usages,
 };
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 use brokk_bifrost_go::graph::extractor::scan_files_for_target;
@@ -100,25 +102,27 @@ where
 /// self-declarations are derived inside the shared driver.
 pub(crate) fn build_go_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> Option<UsageEdges>
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = GoEdgeResolver::try_new(analyzer)?;
+    let resolver = GoEdgeResolver::try_new(analyzer, token)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
 }
 
 pub(crate) fn build_go_usage_edge_weights<F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> Option<UsageEdgeWeights>
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
-    let resolver = GoEdgeResolver::try_new(analyzer)?;
+    let resolver = GoEdgeResolver::try_new(analyzer, token)?;
     Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
 }
 
@@ -132,8 +136,9 @@ pub(crate) struct GoQueryResolver<'a> {
 /// The Go crate takes its analyzer facts as core capability traits plus the Go
 /// workspace path index; this is the one place the concrete analyzer is
 /// unpacked into them.
-pub(crate) fn go_graph_source(go: &GoAnalyzer) -> GoGraphSource<'_> {
+pub(crate) fn go_graph_source<'a>(go: &'a GoAnalyzer, token: QueryToken<'a>) -> GoGraphSource<'a> {
     GoGraphSource {
+        token,
         index: go,
         imports: go,
         type_aliases: go,
@@ -199,7 +204,7 @@ pub(crate) struct GoEdgeResolver {
 /// analyzer once, then walk every file once and finalize into either site-bearing edges or
 /// reference-kind weights.
 impl GoEdgeResolver {
-    pub(crate) fn try_new(analyzer: &dyn IAnalyzer) -> Option<Self> {
+    pub(crate) fn try_new(analyzer: &dyn IAnalyzer, token: QueryToken<'_>) -> Option<Self> {
         let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
         let files = analyzed_files_for_language(analyzer, Language::Go);
         if files.is_empty() {
@@ -207,7 +212,7 @@ impl GoEdgeResolver {
         }
         // A tree-free resolution index; the per-file walk re-parses on demand and
         // drops each tree, so the whole-workspace build retains no syntax trees.
-        let index = build_go_edge_index(go_graph_source(go), &files)?;
+        let index = build_go_edge_index(go_graph_source(go, token), &files)?;
         Some(Self { index })
     }
 
@@ -297,7 +302,9 @@ fn scan_candidate_with_graph(
     candidate_files: &HashSet<ProjectFile>,
     scan_scope: &UsageScanScope<'_>,
 ) -> Result<CandidateUsageHits, UsageAnalysisDiagnostic> {
-    let target_spec = TargetSpec::new(go_graph_source(go), graph, target);
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let target_spec = TargetSpec::new(go_graph_source(go, token), graph, target);
     if !target_spec.has_scan_seed() {
         return Err(GraphFailureReason::NoGraphSeed("no graph seed resolved")
             .diagnostic(target.fq_name(), GO_STRATEGY));

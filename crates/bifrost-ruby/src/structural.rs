@@ -19,7 +19,7 @@ use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationMaterializationSupport, RUBY_MATERIALIZATION_SUPPORT,
 };
 use brokk_bifrost_core::analyzer::structural::occurrences::{
-    NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport,
+    OccurrenceRole, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
     LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
@@ -313,6 +313,36 @@ fn static_string_content_span(node: Node<'_>) -> Option<Span> {
     })
 }
 
+/// Classify the method token of a Ruby member call.
+///
+/// Ruby's tree-sitter grammar represents both ordinary (`receiver.member`)
+/// and safe-navigation (`receiver&.member`) access as `call` nodes. The
+/// receiver and member are separate named fields, so requiring both fields on
+/// the owning node keeps bare calls, receiver identifiers, declaration names,
+/// and hash keys or labels out of this occurrence role.
+fn ruby_member_position(node: Node<'_>) -> Option<OccurrenceRole> {
+    // Setter calls put the member identifier below a `setter` wrapper in the
+    // call's `method` field. Climb that one grammar-defined wrapper so the
+    // identifier fact receives the role during extraction as well.
+    let member = node
+        .parent()
+        .filter(|parent| {
+            parent.kind() == "setter"
+                && parent
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name == node)
+        })
+        .unwrap_or(node);
+    let call = member.parent()?;
+    (call.kind() == "call"
+        && call.child_by_field_name("receiver")?.id() != member.id()
+        && call.child_by_field_name("method")?.id() == member.id())
+    .then_some(OccurrenceRole::MemberPosition)
+}
+
+static RUBY_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport =
+    OccurrenceRoleSupport::NONE.supported(OccurrenceRole::MemberPosition);
+
 impl StructuralSpec for RubyStructuralSpec {
     fn language(&self) -> Language {
         Language::Ruby
@@ -386,11 +416,8 @@ impl StructuralSpec for RubyStructuralSpec {
         role != Role::Decorator
     }
 
-    /// Ruby has not learned occurrence-role classification yet (#1473).
-    /// The empty table is the honest answer: queries and assertions that ask
-    /// for an occurrence role here report incomplete rather than clean-empty.
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
-        &NO_OCCURRENCE_ROLE_SUPPORT
+        &RUBY_OCCURRENCE_ROLE_SUPPORT
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
@@ -410,6 +437,10 @@ impl StructuralSpec for RubyStructuralSpec {
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
+        if let Some(role) = ruby_member_position(node) {
+            sink.occurrence_role(node, role);
+        }
+
         match kind {
             NormalizedKind::Call => {
                 // An identifier fact only carries the Call kind through the
@@ -522,6 +553,28 @@ mod tests {
     fn bare_call_starts(source: &str) -> HashSet<usize> {
         let tree = parse(source);
         bare_call_identifier_starts(tree.root_node(), source)
+    }
+
+    fn member_positions(source: &str) -> Vec<(usize, String)> {
+        let tree = parse(source);
+        let mut found = Vec::new();
+        let mut walk = vec![tree.root_node()];
+        while let Some(node) = walk.pop() {
+            if ruby_member_position(node).is_some() {
+                found.push((
+                    node.start_byte(),
+                    node.utf8_text(source.as_bytes())
+                        .expect("member token is valid UTF-8")
+                        .to_owned(),
+                ));
+            }
+            for index in (0..node.named_child_count()).rev() {
+                if let Some(child) = node.named_child(index) {
+                    walk.push(child);
+                }
+            }
+        }
+        found
     }
 
     fn assert_bare_call(source: &str, needle: &str, occurrence: usize, expected: bool) {
@@ -688,5 +741,54 @@ mod tests {
         assert_bare_call(source, "outer", 1, false);
         assert_bare_call(source, "outer", 2, true);
         assert_bare_call(source, "outer", 3, true);
+    }
+
+    /// Ruby places ordinary and safe-navigation member names in the `method`
+    /// field of a `call` node. The receiver, declaration and parameter names,
+    /// hash key, bare call, and unrelated identifier in this fixture all have
+    /// different AST positions and must remain unclassified.
+    #[test]
+    fn member_positions_are_limited_to_receiver_calls() {
+        let source = concat!(
+            "class Widget\n",
+            "  def run(target, label:)\n",
+            "    declared = compute\n",
+            "    target.run\n",
+            "    target&.safe_call\n",
+            "    target.assigned = declared\n",
+            "    bare_call\n",
+            "    process(label: target)\n",
+            "    { label: target }\n",
+            "    unrelated_identifier\n",
+            "  end\n",
+            "end\n",
+        );
+        let expected = vec![
+            (
+                source.find("target.run").expect("ordinary member call") + "target.".len(),
+                "run".to_owned(),
+            ),
+            (
+                source
+                    .find("target&.safe_call")
+                    .expect("safe-navigation member call")
+                    + "target&.".len(),
+                "safe_call".to_owned(),
+            ),
+            (
+                source.find("target.assigned").expect("setter member call") + "target.".len(),
+                "assigned".to_owned(),
+            ),
+        ];
+        assert_eq!(member_positions(source), expected);
+
+        let support = RUBY_STRUCTURAL_SPEC.occurrence_role_support();
+        assert!(support.is_supported(OccurrenceRole::MemberPosition));
+        assert!(
+            support
+                .iter()
+                .filter(|(_, support)| support.is_supported())
+                .all(|(role, _)| role == OccurrenceRole::MemberPosition)
+        );
     }
 }

@@ -123,6 +123,10 @@ pub trait RustFactSource: RustSource {
     /// never answers -- see `usage_queries.rs` for the contract.
     fn rust_import_target_blobs(&self, module_path: &str) -> Vec<git2::Oid>;
 
+    /// Blobs whose structured imports name `component` as an imported module
+    /// or as the last component of the module path. Candidates, never answers.
+    fn rust_module_import_candidate_blobs(&self, component: &str) -> Vec<git2::Oid>;
+
     /// Blobs that re-export `exported_name`.
     fn rust_export_blobs(&self, exported_name: &str) -> Vec<git2::Oid>;
 
@@ -832,7 +836,22 @@ pub fn export_index_of_declarations(
     let _scope = profiling::scope("RustAnalyzer::export_index_of_declarations");
     let index_source = rust.code_units();
     let mut index = ExportIndex::empty();
-    let export_visible = export_visible_declarations(index_source, file, declarations);
+    // Declaration visibility and re-exports are two projections of the same
+    // file. Keep them on one prepared tree: the old path parsed the source
+    // independently for visibility, then immediately requested the analyzer's
+    // prepared syntax for `use` declarations.
+    let prepared = rust.prepared_syntax(token, file);
+    let export_visible = prepared.as_ref().map_or_else(
+        || export_visible_declarations(index_source, file, declarations),
+        |syntax| {
+            export_visible_declarations_from_syntax(
+                index_source,
+                declarations,
+                syntax.tree().root_node(),
+                syntax.source(),
+            )
+        },
+    );
     let mut external_visibility = HashMap::default();
 
     for code_unit in declarations {
@@ -857,7 +876,7 @@ pub fn export_index_of_declarations(
         );
     }
 
-    if let Some(prepared) = rust.prepared_syntax(token, file) {
+    if let Some(prepared) = prepared {
         let source = prepared.source();
         let root = prepared.tree().root_node();
         for index_in_root in 0..root.named_child_count() {
@@ -1806,11 +1825,20 @@ pub fn export_visible_declarations(
     let Some(tree) = parse_rust_tree(&source) else {
         return HashSet::default();
     };
+    export_visible_declarations_from_syntax(index, declarations, tree.root_node(), &source)
+}
+
+fn export_visible_declarations_from_syntax(
+    index: &dyn CodeUnitIndex,
+    declarations: &BTreeSet<CodeUnit>,
+    root: Node<'_>,
+    source: &str,
+) -> HashSet<CodeUnit> {
     declarations
         .iter()
         .filter(|code_unit| {
-            rust_declaration_node(index, code_unit, tree.root_node())
-                .and_then(|node| rust_visibility_text(node, &source))
+            rust_declaration_node(index, code_unit, root)
+                .and_then(|node| rust_visibility_text(node, source))
                 .is_some_and(is_export_visibility)
         })
         .cloned()

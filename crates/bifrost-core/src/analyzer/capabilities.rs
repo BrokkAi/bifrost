@@ -1,6 +1,7 @@
 use crate::analyzer::code_unit_index::CodeUnitIndex;
 use crate::analyzer::model::{CodeUnit, ImportInfo, ProjectFile};
 use crate::analyzer::pool_memo::{KeyedPoolSafeMemo, PoolSafeMemo};
+use crate::analyzer::query_token::QueryToken;
 use crate::cancellation::CancellationToken;
 use crate::compact_graph::{CompactRows, CompactRowsBuilder};
 use crate::hash::{HashMap, HashSet};
@@ -39,7 +40,11 @@ pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
         None
     }
 
-    fn import_info_of(&self, _file: &ProjectFile) -> Vec<ImportInfo> {
+    /// The file's import facts, which fall through to the import-tier store
+    /// read when nothing retained answers. Crossing that tier is only cheap
+    /// under an open request scope, so the caller proves one is open by
+    /// passing a [`QueryToken`] (issue #2423).
+    fn import_info_of(&self, _token: QueryToken<'_>, _file: &ProjectFile) -> Vec<ImportInfo> {
         Vec::new()
     }
 

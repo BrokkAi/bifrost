@@ -43,6 +43,7 @@ use crate::syntax::{
     csharp_relational_generic_call_for_argument, csharp_type_leftmost_identifier,
     csharp_type_reference_root, csharp_unqualified_invocation_for_name,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node, first_precise,
 };
@@ -62,6 +63,7 @@ use tree_sitter::Node;
 pub fn scan_file(
     graph: &CSharpGraphSource<'_>,
     csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     input: &FileEdgeScanInput<'_>,
 ) -> PerFileEdges {
@@ -78,7 +80,7 @@ pub fn scan_file(
         edges: PerFileEdges::default(),
     };
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    walk(input.root(), &mut ctx, &mut bindings);
+    walk(input.root(), token, &mut ctx, &mut bindings);
     ctx.edges
 }
 
@@ -100,9 +102,15 @@ type MemberCacheKey = (String, String, Option<usize>, Option<usize>);
 
 impl CsScan<'_> {
     /// Resolve a type reference's text to its fqn via lexical scope, then visible types.
-    fn resolve_type_fqn_at(&self, text: &str, node: Node<'_>) -> Option<String> {
+    fn resolve_type_fqn_at(
+        &self,
+        token: QueryToken<'_>,
+        text: &str,
+        node: Node<'_>,
+    ) -> Option<String> {
         resolve_type_fq_name_at(
             self.csharp,
+            token,
             self.file,
             &self.class_ranges,
             text,
@@ -136,8 +144,10 @@ impl CsScan<'_> {
             .record_unproven(self.input, callee, node.start_byte(), node.end_byte());
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record_nearest_member(
         &mut self,
+        token: QueryToken<'_>,
         owner_fqn: &str,
         name: &str,
         node: Node<'_>,
@@ -152,13 +162,14 @@ impl CsScan<'_> {
             call_arity,
         );
         if !self.member_cache.contains_key(&key) {
-            let candidates = class_unit_for_fq_name(self.csharp, owner_fqn)
+            let candidates = class_unit_for_fq_name(self.csharp, token, owner_fqn)
                 .map(|owner| {
                     call_arity.map_or_else(
                         || {
                             nearest_member_candidates_for_owner(
                                 self.graph,
                                 self.csharp,
+                                token,
                                 &owner,
                                 name,
                                 explicit_generic_arity,
@@ -168,6 +179,7 @@ impl CsScan<'_> {
                             invocation_member_candidates_for_owner(
                                 self.graph,
                                 self.csharp,
+                                token,
                                 &owner,
                                 name,
                                 explicit_generic_arity,
@@ -217,6 +229,7 @@ impl CsScan<'_> {
                     let receiver_types = [owner_fqn.to_string()];
                     let mut extensions = usage_visible_extension_method_candidates(
                         self.csharp,
+                        token,
                         self.graph,
                         self.source,
                         node,
@@ -275,17 +288,22 @@ const SCOPE_NODES: &[&str] = &[
     "catch_clause",
 ];
 
-fn walk(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &mut LocalInferenceEngine<String>) {
+fn walk(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut CsScan<'_>,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
     let enters_scope = SCOPE_NODES.contains(&node.kind());
     if enters_scope {
         bindings.enter_scope();
     }
-    seed_declaration(node, ctx, bindings);
-    record_reference(node, ctx, bindings);
+    seed_declaration(node, token, ctx, bindings);
+    record_reference(node, token, ctx, bindings);
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        walk(child, ctx, bindings);
+        walk(child, token, ctx, bindings);
     }
 
     if enters_scope {
@@ -293,13 +311,19 @@ fn walk(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &mut LocalInferenceEngin
     }
 }
 
-fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInferenceEngine<String>) {
+fn record_reference(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut CsScan<'_>,
+    bindings: &LocalInferenceEngine<String>,
+) {
     let recovered_method_group =
         csharp_relational_generic_call_for_argument(node).is_some_and(|call| {
             usage_relational_generic_call_has_type_argument(
                 call,
                 ctx.graph,
                 ctx.csharp,
+                token,
                 ctx.file,
                 &ctx.class_ranges,
                 ctx.source,
@@ -307,22 +331,22 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
             )
         });
     if let Some(candidate) = csharp_constant_pattern_type_candidate(node) {
-        record_structured_type_candidate(candidate, true, ctx, bindings);
+        record_structured_type_candidate(candidate, token, true, ctx, bindings);
     }
     if let Some(receiver) = csharp_member_access_type_receiver(node) {
-        record_structured_type_candidate(receiver, true, ctx, bindings);
+        record_structured_type_candidate(receiver, token, true, ctx, bindings);
     }
     if let Some((operand, qualified_owner)) = csharp_nameof_type_candidates(node, ctx.source)
-        && !record_structured_type_candidate(operand, true, ctx, bindings)
+        && !record_structured_type_candidate(operand, token, true, ctx, bindings)
         && let Some(owner) = qualified_owner
     {
-        record_structured_type_candidate(owner, true, ctx, bindings);
+        record_structured_type_candidate(owner, token, true, ctx, bindings);
     }
     if !recovered_method_group
         && let Some(root) = csharp_type_reference_root(node)
         && same_node(root, node)
     {
-        record_structured_type_candidate(root, false, ctx, bindings);
+        record_structured_type_candidate(root, token, false, ctx, bindings);
         return;
     }
     match node.kind() {
@@ -331,9 +355,9 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
                 return;
             };
             let names = csharp_attribute_type_names(name, ctx.source);
-            for candidate in
-                hierarchy::usage_unambiguous_attribute_type_candidates(ctx.csharp, ctx.file, &names)
-            {
+            for candidate in hierarchy::usage_unambiguous_attribute_type_candidates(
+                ctx.csharp, token, ctx.file, &names,
+            ) {
                 ctx.record(candidate.fq_name(), name);
             }
         }
@@ -351,13 +375,14 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
                     let name = node_text(node, ctx.source);
                     let names = csharp_attribute_type_names(attribute_name, ctx.source);
                     let owners = hierarchy::usage_unambiguous_attribute_type_candidates(
-                        ctx.csharp, ctx.file, &names,
+                        ctx.csharp, token, ctx.file, &names,
                     );
                     if owners.is_empty() {
                         ctx.record_unproven(name, node);
                     } else {
                         for owner in owners {
                             ctx.record_nearest_member(
+                                token,
                                 &owner.fq_name(),
                                 name,
                                 node,
@@ -375,10 +400,13 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
             {
                 let name = node_text(node, ctx.source);
                 if let Some(type_node) = object_initializer_owner_type_node(initializer)
-                    && let Some(owner) = ctx
-                        .resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
+                    && let Some(owner) = ctx.resolve_type_fqn_at(
+                        token,
+                        &reference_type_text(type_node, ctx.source),
+                        type_node,
+                    )
                 {
-                    ctx.record_nearest_member(&owner, name, node, None, None, false);
+                    ctx.record_nearest_member(token, &owner, name, node, None, None, false);
                 } else {
                     ctx.record_unproven(name, node);
                 }
@@ -401,6 +429,7 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
                     // unproven inbound. This is the inverted routing that unlocks
                     // the scan-side bare-implicit-this widening (#1014 deferral).
                     ctx.record_nearest_member(
+                        token,
                         &owner,
                         name,
                         node,
@@ -430,11 +459,12 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
                     let resolution = if let Some(cached) = ctx.method_group_cache.get(&key) {
                         cached.clone()
                     } else {
-                        let Some(owner) = class_unit_for_fq_name(ctx.csharp, &owner_fqn) else {
+                        let Some(owner) = class_unit_for_fq_name(ctx.csharp, token, &owner_fqn)
+                        else {
                             return;
                         };
                         let resolution = resolve_unqualified_method_group_for_owner(
-                            ctx.graph, ctx.csharp, &owner, &name,
+                            ctx.graph, ctx.csharp, token, &owner, &name,
                         );
                         ctx.method_group_cache.insert(key, resolution.clone());
                         resolution
@@ -465,7 +495,7 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
                 return;
             }
             let reference = reference_type_text(node, ctx.source);
-            if let Some(fqn) = ctx.resolve_type_fqn_at(&reference, node) {
+            if let Some(fqn) = ctx.resolve_type_fqn_at(token, &reference, node) {
                 ctx.record(fqn, node);
             }
         }
@@ -487,12 +517,13 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
             if name.is_empty() {
                 return;
             }
-            if let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) {
+            if let Some(owner) = receiver_type_fqn(receiver, token, ctx, bindings) {
                 let recovered_call = csharp_relational_generic_call(node).filter(|call| {
                     usage_relational_generic_call_has_type_argument(
                         *call,
                         ctx.graph,
                         ctx.csharp,
+                        token,
                         ctx.file,
                         &ctx.class_ranges,
                         ctx.source,
@@ -514,8 +545,9 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
                 // `Owner`) is a same-owner reference (#1138) → unproven inbound.
                 // `base.Member` and a call through another same-type variable stay
                 // external.
-                let same_owner = csharp_receiver_is_same_owner(receiver, ctx, bindings);
+                let same_owner = csharp_receiver_is_same_owner(receiver, token, ctx, bindings);
                 ctx.record_nearest_member(
+                    token,
                     &owner,
                     name,
                     name_shape.identifier,
@@ -533,6 +565,7 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
 
 fn record_structured_type_candidate(
     candidate: Node<'_>,
+    token: QueryToken<'_>,
     reject_value_receiver: bool,
     ctx: &mut CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
@@ -541,12 +574,12 @@ fn record_structured_type_candidate(
         let Some(leftmost) = csharp_type_leftmost_identifier(candidate) else {
             return false;
         };
-        if unqualified_value_shadows_type(leftmost, ctx, bindings) {
+        if unqualified_value_shadows_type(leftmost, token, ctx, bindings) {
             return false;
         }
     }
     let reference = reference_type_text(candidate, ctx.source);
-    if let Some(fqn) = ctx.resolve_type_fqn_at(&reference, candidate) {
+    if let Some(fqn) = ctx.resolve_type_fqn_at(token, &reference, candidate) {
         ctx.record(fqn, candidate);
         true
     } else {
@@ -556,6 +589,7 @@ fn record_structured_type_candidate(
 
 fn unqualified_value_shadows_type(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> bool {
@@ -563,7 +597,7 @@ fn unqualified_value_shadows_type(
     !bindings.resolve_symbol(name).is_unknown()
         || unqualified_member_has_structured_shadow(node, ctx.source)
         || usage_unqualified_value_member_shadows_type(
-            node, name, ctx.graph, ctx.csharp, ctx.file, ctx.source,
+            node, name, ctx.graph, ctx.csharp, token, ctx.file, ctx.source,
         )
 }
 
@@ -574,6 +608,7 @@ fn unqualified_value_shadows_type(
 /// stays external (#1138). Mirrors Java's `method_invocation_receiver_is_same_owner`.
 fn csharp_receiver_is_same_owner(
     receiver: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> bool {
@@ -593,7 +628,7 @@ fn csharp_receiver_is_same_owner(
             if first_precise(bindings, name).is_some() || bindings.is_shadowed(name) {
                 return false;
             }
-            ctx.resolve_type_fqn_at(&reference_type_text(receiver, ctx.source), receiver)
+            ctx.resolve_type_fqn_at(token, &reference_type_text(receiver, ctx.source), receiver)
                 .is_some_and(|receiver_fqn| receiver_fqn == enclosing_owner)
         }
         _ => false,
@@ -604,6 +639,7 @@ fn csharp_receiver_is_same_owner(
 /// return-type inference.
 fn receiver_type_fqn(
     receiver: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
@@ -616,8 +652,8 @@ fn receiver_type_fqn(
                 if bindings.is_shadowed(name) {
                     return None;
                 }
-                enclosing_member_type_fqn(receiver, name, ctx)
-                    .or_else(|| ctx.resolve_type_fqn_at(name, receiver))
+                enclosing_member_type_fqn(receiver, token, name, ctx)
+                    .or_else(|| ctx.resolve_type_fqn_at(token, name, receiver))
             })
         }
         "this" => ctx
@@ -625,13 +661,13 @@ fn receiver_type_fqn(
             .map(str::to_string),
         "base" => ctx
             .enclosing_class(receiver.start_byte())
-            .and_then(|owner| class_unit_for_fq_name(ctx.csharp, owner))
-            .and_then(|owner| usage_direct_base(ctx.graph, ctx.csharp, &owner))
+            .and_then(|owner| class_unit_for_fq_name(ctx.csharp, token, owner))
+            .and_then(|owner| usage_direct_base(ctx.graph, ctx.csharp, token, &owner))
             .map(|owner| owner.fq_name()),
-        "invocation_expression" => invocation_return_type_fqn(receiver, ctx, bindings),
+        "invocation_expression" => invocation_return_type_fqn(receiver, token, ctx, bindings),
         "parenthesized_expression" | "checked_expression" => receiver
             .named_child(0)
-            .and_then(|inner| receiver_type_fqn(inner, ctx, bindings)),
+            .and_then(|inner| receiver_type_fqn(inner, token, ctx, bindings)),
         "cast_expression" | "as_expression" => receiver
             .child_by_field_name(if receiver.kind() == "cast_expression" {
                 "type"
@@ -639,19 +675,28 @@ fn receiver_type_fqn(
                 "right"
             })
             .and_then(|type_node| {
-                ctx.resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
+                ctx.resolve_type_fqn_at(
+                    token,
+                    &reference_type_text(type_node, ctx.source),
+                    type_node,
+                )
             }),
         "member_access_expression" | "conditional_access_expression" => {
-            expression_type_fqn(receiver, ctx, bindings)
+            expression_type_fqn(receiver, token, ctx, bindings)
         }
         "qualified_name" | "generic_name" => {
-            ctx.resolve_type_fqn_at(&reference_type_text(receiver, ctx.source), receiver)
+            ctx.resolve_type_fqn_at(token, &reference_type_text(receiver, ctx.source), receiver)
         }
         _ => None,
     }
 }
 
-fn seed_declaration(node: Node<'_>, ctx: &CsScan<'_>, bindings: &mut LocalInferenceEngine<String>) {
+fn seed_declaration(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &CsScan<'_>,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
     match node.kind() {
         "parameter" => {
             let (Some(name), Some(type_node)) = (
@@ -662,18 +707,23 @@ fn seed_declaration(node: Node<'_>, ctx: &CsScan<'_>, bindings: &mut LocalInfere
             };
             seed_typed(
                 name,
-                ctx.resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node),
+                ctx.resolve_type_fqn_at(
+                    token,
+                    &reference_type_text(type_node, ctx.source),
+                    type_node,
+                ),
                 ctx,
                 bindings,
             );
         }
-        "variable_declaration" => seed_variable_declaration(node, ctx, bindings),
+        "variable_declaration" => seed_variable_declaration(node, token, ctx, bindings),
         _ => {}
     }
 }
 
 fn seed_variable_declaration(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &CsScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
@@ -696,11 +746,15 @@ fn seed_variable_declaration(
         let resolved = if type_text == "var" {
             object_created_type(child)
                 .and_then(|type_node| {
-                    ctx.resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
+                    ctx.resolve_type_fqn_at(
+                        token,
+                        &reference_type_text(type_node, ctx.source),
+                        type_node,
+                    )
                 })
-                .or_else(|| var_initializer_type(child, ctx, bindings))
+                .or_else(|| var_initializer_type(child, token, ctx, bindings))
         } else {
-            ctx.resolve_type_fqn_at(&type_text, type_node)
+            ctx.resolve_type_fqn_at(token, &type_text, type_node)
         };
         seed_typed(name, resolved, ctx, bindings);
     }
@@ -736,11 +790,12 @@ fn object_created_type(node: Node<'_>) -> Option<Node<'_>> {
 
 fn var_initializer_type(
     declarator: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
     let initializer = variable_declarator_initializer(declarator)?;
-    expression_type_fqn(initializer, ctx, bindings)
+    expression_type_fqn(initializer, token, ctx, bindings)
 }
 
 fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
@@ -769,17 +824,22 @@ fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
 
 fn expression_type_fqn(
     expression: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
     match expression.kind() {
         "object_creation_expression" => object_created_type(expression).and_then(|type_node| {
-            ctx.resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
+            ctx.resolve_type_fqn_at(
+                token,
+                &reference_type_text(type_node, ctx.source),
+                type_node,
+            )
         }),
-        "invocation_expression" => invocation_return_type_fqn(expression, ctx, bindings),
+        "invocation_expression" => invocation_return_type_fqn(expression, token, ctx, bindings),
         "parenthesized_expression" | "checked_expression" => expression
             .named_child(0)
-            .and_then(|inner| expression_type_fqn(inner, ctx, bindings)),
+            .and_then(|inner| expression_type_fqn(inner, token, ctx, bindings)),
         "cast_expression" | "as_expression" => expression
             .child_by_field_name(if expression.kind() == "cast_expression" {
                 "type"
@@ -787,7 +847,11 @@ fn expression_type_fqn(
                 "right"
             })
             .and_then(|type_node| {
-                ctx.resolve_type_fqn_at(&reference_type_text(type_node, ctx.source), type_node)
+                ctx.resolve_type_fqn_at(
+                    token,
+                    &reference_type_text(type_node, ctx.source),
+                    type_node,
+                )
             }),
         "member_access_expression" | "conditional_access_expression" => {
             let (receiver, name_node) = match expression.kind() {
@@ -800,11 +864,12 @@ fn expression_type_fqn(
                     (access.receiver, access.name)
                 }
             };
-            let owner_fqn = receiver_type_fqn(receiver, ctx, bindings)?;
-            let owner = class_unit_for_fq_name(ctx.csharp, &owner_fqn)?;
+            let owner_fqn = receiver_type_fqn(receiver, token, ctx, bindings)?;
+            let owner = class_unit_for_fq_name(ctx.csharp, token, &owner_fqn)?;
             let name = csharp_member_name(name_node)?;
             usage_member_declared_type_fq_name(
                 ctx.csharp,
+                token,
                 &owner,
                 node_text(name.identifier, ctx.source),
             )
@@ -813,7 +878,7 @@ fn expression_type_fqn(
             let name = node_text(expression, ctx.source);
             first_precise(bindings, name).or_else(|| {
                 (!bindings.is_shadowed(name))
-                    .then(|| enclosing_member_type_fqn(expression, name, ctx))
+                    .then(|| enclosing_member_type_fqn(expression, token, name, ctx))
                     .flatten()
             })
         }
@@ -821,14 +886,20 @@ fn expression_type_fqn(
     }
 }
 
-fn enclosing_member_type_fqn(node: Node<'_>, name: &str, ctx: &CsScan<'_>) -> Option<String> {
+fn enclosing_member_type_fqn(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    name: &str,
+    ctx: &CsScan<'_>,
+) -> Option<String> {
     let owner_fqn = ctx.enclosing_class(node.start_byte())?;
-    let owner = class_unit_for_fq_name(ctx.csharp, owner_fqn)?;
-    usage_member_declared_type_fq_name(ctx.csharp, &owner, name)
+    let owner = class_unit_for_fq_name(ctx.csharp, token, owner_fqn)?;
+    usage_member_declared_type_fq_name(ctx.csharp, token, &owner, name)
 }
 
 fn invocation_return_type_fqn(
     invocation: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
@@ -837,9 +908,10 @@ fn invocation_return_type_fqn(
         "identifier" => {
             let name = node_text(function, ctx.source);
             let owner_fqn = ctx.enclosing_class(invocation.start_byte())?;
-            let owner = class_unit_for_fq_name(ctx.csharp, owner_fqn)?;
+            let owner = class_unit_for_fq_name(ctx.csharp, token, owner_fqn)?;
             method_return_type_for_call(
                 ctx,
+                token,
                 &owner,
                 name,
                 argument_count(invocation, ctx.source),
@@ -849,11 +921,12 @@ fn invocation_return_type_fqn(
         }
         "generic_name" => {
             let name = csharp_member_name(function)?;
-            let type_arguments = resolved_type_arguments(name, ctx);
+            let type_arguments = resolved_type_arguments(name, token, ctx);
             let owner_fqn = ctx.enclosing_class(invocation.start_byte())?;
-            let owner = class_unit_for_fq_name(ctx.csharp, owner_fqn)?;
+            let owner = class_unit_for_fq_name(ctx.csharp, token, owner_fqn)?;
             method_return_type_for_call(
                 ctx,
+                token,
                 &owner,
                 node_text(name.identifier, ctx.source),
                 argument_count(invocation, ctx.source),
@@ -873,11 +946,12 @@ fn invocation_return_type_fqn(
                 }
             };
             let name = csharp_member_name(name_node)?;
-            let type_arguments = resolved_type_arguments(name, ctx);
-            let owner_fqn = receiver_type_fqn(receiver, ctx, bindings)?;
-            let owner = class_unit_for_fq_name(ctx.csharp, &owner_fqn)?;
+            let type_arguments = resolved_type_arguments(name, token, ctx);
+            let owner_fqn = receiver_type_fqn(receiver, token, ctx, bindings)?;
+            let owner = class_unit_for_fq_name(ctx.csharp, token, &owner_fqn)?;
             method_return_type_for_call(
                 ctx,
+                token,
                 &owner,
                 node_text(name.identifier, ctx.source),
                 argument_count(invocation, ctx.source),
@@ -891,6 +965,7 @@ fn invocation_return_type_fqn(
 
 fn method_return_type_for_call(
     ctx: &CsScan<'_>,
+    token: QueryToken<'_>,
     owner: &CodeUnit,
     method_name: &str,
     arity: usize,
@@ -899,6 +974,7 @@ fn method_return_type_for_call(
 ) -> Option<String> {
     usage_method_return_type_fq_name_for_arity(
         ctx.csharp,
+        token,
         owner,
         method_name,
         Some(arity),
@@ -907,13 +983,17 @@ fn method_return_type_for_call(
     )
 }
 
-fn resolved_type_arguments(name: CSharpMemberName<'_>, ctx: &CsScan<'_>) -> Option<Vec<String>> {
+fn resolved_type_arguments(
+    name: CSharpMemberName<'_>,
+    token: QueryToken<'_>,
+    ctx: &CsScan<'_>,
+) -> Option<Vec<String>> {
     let arguments = name.type_arguments?;
     let mut cursor = arguments.walk();
     arguments
         .named_children(&mut cursor)
         .map(|argument| {
-            ctx.resolve_type_fqn_at(&reference_type_text(argument, ctx.source), argument)
+            ctx.resolve_type_fqn_at(token, &reference_type_text(argument, ctx.source), argument)
         })
         .collect()
 }

@@ -601,6 +601,7 @@ fn build_summary(
         locations: Vec::new(),
         transfers: vec![transfer],
         effects: vec![effect],
+        declared_effects: Vec::new(),
     })
 }
 

@@ -48,8 +48,8 @@ use crate::analyzer::usages::traits::{
     GraphUsageAnalyzer, UsageAnalyzer, UsageQueryResolver, UsageScanScope,
 };
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, JavascriptAnalyzer, Language, ProjectFile, TypescriptAnalyzer,
-    resolve_analyzer,
+    AnalyzerQueryScope, CodeUnit, IAnalyzer, JavascriptAnalyzer, Language, ProjectFile, QueryScope,
+    QueryToken, TypescriptAnalyzer, resolve_analyzer,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
@@ -88,6 +88,7 @@ fn js_ts_hosts(analyzer: &dyn IAnalyzer) -> JsTsHosts<'_> {
 /// workspace has no JS/TS files. `nodes`/`keep_file` mirror the Go builder.
 pub(crate) fn build_jsts_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> Option<UsageEdges>
@@ -100,7 +101,7 @@ where
             let _ = prewarm_cached_jsts_index(analyzer, language);
         }
     }
-    Some(resolver.build_edges(analyzer, nodes, keep_file))
+    Some(resolver.build_edges(analyzer, token, nodes, keep_file))
 }
 
 /// Borrow the analyzer-cached [`JsTsUsageIndex`] for `language` off the concrete TS/JS
@@ -152,6 +153,9 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
         max_usages: usize,
     ) -> GraphUsageOutcome {
         let cancellation = scan_scope.cancellation();
+        // The trait method's signature is fixed, so this query boundary opens
+        // the scope every JS/TS usage-graph read below is proved against.
+        let scope = AnalyzerQueryScope::new(analyzer);
         // One host and resolution index per dialect, resolved the first time a
         // candidate needs it: a target group can hold a TypeScript and a
         // JavaScript declaration of the same name, and each is scanned against
@@ -188,6 +192,7 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                 .expect("host for this dialect was just resolved");
             Ok(scan_js_ts_target_usages(
                 *host,
+                scope.token(),
                 analyzer,
                 index.as_ref(),
                 target,
@@ -215,6 +220,7 @@ impl JsTsEdgeResolver {
     pub(crate) fn build_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         nodes: &HashSet<String>,
         keep_file: F,
     ) -> UsageEdges
@@ -231,7 +237,7 @@ impl JsTsEdgeResolver {
                 continue;
             }
             let result: UsageEdges =
-                build_jsts_edges(analyzer, &hosts, language, nodes, &keep_file);
+                build_jsts_edges(analyzer, token, &hosts, language, nodes, &keep_file);
             for (key, sites) in result.edges {
                 edges.entry(key).or_default().extend(sites);
             }
@@ -261,6 +267,7 @@ impl JsTsEdgeResolver {
 /// fan-out over files, driving [`inverted::scan_file`] per file.
 fn build_jsts_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     hosts: &JsTsHosts<'_>,
     language: Language,
     nodes: &HashSet<String>,
@@ -290,7 +297,7 @@ where
             file,
             nodes,
             ParseSpec::whole(&parser_language),
-            |input| inverted::scan_file(host, analyzer, language, file, nodes, input),
+            |input| inverted::scan_file(host, token, analyzer, language, file, nodes, input),
         )
     })
 }
@@ -299,6 +306,7 @@ where
 /// identity, so same-name exports in different files do not cross-match.
 pub(crate) fn build_jsts_scoped_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     nodes: &HashSet<UsageNodeKey>,
     keep_file: F,
 ) -> Option<JsTsScopedUsageEdges>
@@ -336,6 +344,7 @@ where
         }
         let result = build_jsts_scoped_edges(
             analyzer,
+            token,
             &hosts,
             &combined_index,
             language,
@@ -367,6 +376,7 @@ where
 /// The scoped inverted pass for one dialect, with the fan-out on this side.
 fn build_jsts_scoped_edges<F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     hosts: &JsTsHosts<'_>,
     index: &JsTsUsageIndex,
     language: Language,
@@ -410,7 +420,9 @@ where
             nodes,
             &parsed,
             |input| {
-                inverted::scan_scoped_file(host, index, &prep, file_prep, language, file, input)
+                inverted::scan_scoped_file(
+                    host, token, index, &prep, file_prep, language, file, input,
+                )
             },
         ))
     });

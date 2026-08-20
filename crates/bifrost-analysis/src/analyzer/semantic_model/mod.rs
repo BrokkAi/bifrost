@@ -18,12 +18,13 @@ mod summary_binding;
 mod validate;
 
 pub use artifact::{
-    ArtifactEncoding, ArtifactError, CompiledPackManifest, CompiledPayload,
-    CompiledProcedureSummary, CompiledProcedureTarget, CompiledSemanticModelPack, CompiledShard,
-    CompiledShardArtifact, CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind,
-    CompiledSummaryInput, CompiledSummaryLocation, CompiledSummaryLocationKind,
-    CompiledSummaryOutput, CompiledSummaryTransfer, DecodeLimits, PayloadKind, decode_manifest,
-    decode_shard, decode_shard_for_manifest,
+    ArtifactEncoding, ArtifactError, CompiledDeclaredEffect, CompiledDeclaredEffectCertainty,
+    CompiledDeclaredEffectTiming, CompiledPackManifest, CompiledPayload, CompiledProcedureSummary,
+    CompiledProcedureTarget, CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact,
+    CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
+    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryOutput,
+    CompiledSummaryTransfer, DecodeLimits, PayloadKind, decode_manifest, decode_shard,
+    decode_shard_for_manifest,
 };
 pub use authoring::*;
 pub use catalog::*;

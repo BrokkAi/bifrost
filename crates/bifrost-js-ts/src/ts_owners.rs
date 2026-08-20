@@ -23,7 +23,7 @@ use crate::imports::{
 };
 use crate::providers::JsTsSource;
 use crate::syntax::compute_import_binder as compute_jsts_import_binder;
-use crate::syntax::{JsTsImportBinder, parse_js_ts_tree};
+use crate::syntax::{JsTsImportBinder, nested_type_identifier_parts, parse_js_ts_tree, slice};
 use crate::tsconfig::AliasResolver;
 use crate::type_text::{
     jsts_type_space_candidates, jsts_unit_is_type_only, jsts_value_space_candidates,
@@ -32,6 +32,9 @@ use crate::type_text::{
 use brokk_bifrost_core::analyzer::definition_lookup::sort_units;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
+use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
+    ReceiverAnalysisBudget, ReceiverAnalysisOutcome,
+};
 use brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering;
 use brokk_bifrost_core::analyzer::{
     BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, Language, ProjectFile,
@@ -583,21 +586,28 @@ fn ts_collect_receiver_owners_from_bindings(
             && let Some(name) = node.child_by_field_name("name")
             && node_text_matches(name, source, receiver)
         {
-            let mut latest = Vec::new();
             if let Some(type_node) = node.child_by_field_name("type") {
-                latest.extend(ts_resolve_type_text_to_property_owners(
+                let latest = match ts_resolve_type_node_to_property_owner_outcome(
                     host,
                     support,
                     file,
                     source,
                     imports,
                     aliases,
-                    ts_type_annotation_text(type_node, source).as_str(),
+                    type_node,
                     depth + 1,
-                ));
-            }
-            if let Some(value) = node.child_by_field_name("value") {
-                latest.extend(ts_expression_property_owners(
+                    ReceiverAnalysisBudget::default(),
+                ) {
+                    ReceiverAnalysisOutcome::Precise(values)
+                    | ReceiverAnalysisOutcome::Ambiguous(values) => values,
+                    ReceiverAnalysisOutcome::Unknown
+                    | ReceiverAnalysisOutcome::Unsupported { .. }
+                    | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
+                };
+                out.clear();
+                out.extend(latest);
+            } else if let Some(value) = node.child_by_field_name("value") {
+                let latest = ts_expression_property_owners(
                     host,
                     support,
                     file,
@@ -607,10 +617,10 @@ fn ts_collect_receiver_owners_from_bindings(
                     value,
                     depth + 1,
                     resolution,
-                ));
+                );
+                out.clear();
+                out.extend(latest);
             }
-            out.clear();
-            out.extend(latest);
         }
 
         if node.kind() == "assignment_expression"
@@ -994,7 +1004,7 @@ pub fn ts_resolve_type_text_to_property_owners(
     host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
-    source: &str,
+    _source: &str,
     imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     type_text: &str,
@@ -1008,57 +1018,242 @@ pub fn ts_resolve_type_text_to_property_owners(
         return Vec::new();
     }
 
-    if let Some(name) = ts_typeof_target(&type_text) {
-        let candidates =
-            ts_identifier_candidates(host, support, file, source, imports, aliases, name, true);
-        return ts_expand_property_owners(host, support, candidates, depth + 1);
-    }
-
-    if let Some(inner) = ts_generic_type_argument(&type_text, "ReturnType") {
-        return ts_resolve_type_text_to_property_owners(
-            host,
-            support,
-            file,
-            source,
-            imports,
-            aliases,
-            inner,
-            depth + 1,
-        );
-    }
-
-    if let Some(inner) = ts_generic_type_argument(&type_text, "Promise") {
-        return ts_resolve_type_text_to_property_owners(
-            host,
-            support,
-            file,
-            source,
-            imports,
-            aliases,
-            inner,
-            depth + 1,
-        );
-    }
-
-    if let Some(inner) = ts_schema_infer_argument(&type_text) {
-        return ts_resolve_type_text_to_property_owners(
-            host,
-            support,
-            file,
-            source,
-            imports,
-            aliases,
-            inner,
-            depth + 1,
-        );
-    }
-
-    let Some(name) = ts_leading_type_identifier(&type_text) else {
+    // Parse textual type fragments back into the TypeScript AST before
+    // resolving them. The callers that only have text (for example type-alias
+    // metadata) still get the same entry point, while unions and intersections
+    // are handled by their actual syntax nodes instead of a leading-token
+    // approximation.
+    let synthetic_source = format!("type __BifrostType = {type_text};");
+    let Some(tree) = parse_js_ts_tree(file, &synthetic_source, Language::TypeScript) else {
         return Vec::new();
     };
+    let Some(type_node) = tree
+        .root_node()
+        .named_child(0)
+        .and_then(|declaration| declaration.child_by_field_name("value"))
+    else {
+        return Vec::new();
+    };
+    ts_resolve_type_node_to_property_owner_outcome(
+        host,
+        support,
+        file,
+        &synthetic_source,
+        imports,
+        aliases,
+        type_node,
+        depth,
+        ReceiverAnalysisBudget::default(),
+    )
+    .values()
+    .map(|values| values.to_vec())
+    .unwrap_or_default()
+}
+
+/// Resolve a TypeScript type node into the declarations that can own the
+/// receiver's members. Every union/intersection arm is visited structurally.
+/// An arm with no indexed owner contributes `Unknown`, so one resolved arm
+/// plus one open arm remains ambiguous instead of becoming falsely precise.
+/// Known non-object arms (`null`, `undefined`, and `never`) contribute no
+/// receiver evidence and therefore do not make a nullable receiver open.
+#[allow(clippy::too_many_arguments)]
+pub fn ts_resolve_type_node_to_property_owner_outcome(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    type_node: Node<'_>,
+    depth: usize,
+    budget: ReceiverAnalysisBudget,
+) -> ReceiverAnalysisOutcome<CodeUnit> {
+    if depth > 8 {
+        return ReceiverAnalysisOutcome::ExceededBudget {
+            limit: "type_resolution_depth",
+        };
+    }
+
+    let mut stack = vec![(type_node, depth)];
+    let mut outcomes = Vec::new();
+    while let Some((node, node_depth)) = stack.pop() {
+        if node_depth > 8 {
+            outcomes.push(ReceiverAnalysisOutcome::ExceededBudget {
+                limit: "type_resolution_depth",
+            });
+            continue;
+        }
+
+        match node.kind() {
+            "type_annotation" | "parenthesized_type" | "readonly_type" => {
+                let Some(child) = node.named_child(0) else {
+                    outcomes.push(ReceiverAnalysisOutcome::Unknown);
+                    continue;
+                };
+                stack.push((child, node_depth + 1));
+            }
+            "union_type" | "intersection_type" => {
+                let mut cursor = node.walk();
+                let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+                if children.is_empty() {
+                    outcomes.push(ReceiverAnalysisOutcome::Unknown);
+                } else {
+                    for child in children.into_iter().rev() {
+                        stack.push((child, node_depth + 1));
+                    }
+                }
+            }
+            "generic_type" => {
+                let Some(name) = node.child_by_field_name("name") else {
+                    outcomes.push(ReceiverAnalysisOutcome::Unknown);
+                    continue;
+                };
+                let terminal =
+                    type_identifier_terminal(name).map(|terminal| slice(terminal, source).trim());
+                let is_inner_type_wrapper = terminal.is_some_and(|terminal| {
+                    (name.kind() == "type_identifier"
+                        && matches!(terminal, "Promise" | "ReturnType"))
+                        || (name.kind() == "nested_type_identifier"
+                            && matches!(terminal, "infer" | "Infer"))
+                });
+                if is_inner_type_wrapper {
+                    let Some(argument) = node
+                        .child_by_field_name("type_arguments")
+                        .and_then(|arguments| arguments.named_child(0))
+                    else {
+                        outcomes.push(ReceiverAnalysisOutcome::Unknown);
+                        continue;
+                    };
+                    stack.push((argument, node_depth + 1));
+                } else {
+                    outcomes.push(ts_resolve_named_type_node(
+                        host, support, file, source, imports, aliases, name, node_depth, budget,
+                    ));
+                }
+            }
+            "type_query" => {
+                let Some(target) = node.named_child(0) else {
+                    outcomes.push(ReceiverAnalysisOutcome::Unknown);
+                    continue;
+                };
+                let candidates = ts_named_type_candidates(
+                    host, support, file, source, imports, aliases, target, true,
+                );
+                outcomes.push(ReceiverAnalysisOutcome::single_precise_or_ambiguous(
+                    ts_expand_property_owners(host, support, candidates, node_depth + 1),
+                    budget,
+                ));
+            }
+            "type_identifier" | "nested_type_identifier" => {
+                outcomes.push(ts_resolve_named_type_node(
+                    host, support, file, source, imports, aliases, node, node_depth, budget,
+                ));
+            }
+            "predefined_type" | "literal_type" if known_non_receiver_type(node, source) => {}
+            _ => outcomes.push(ReceiverAnalysisOutcome::Unknown),
+        }
+    }
+
+    ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, budget)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ts_resolve_named_type_node(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    node: Node<'_>,
+    depth: usize,
+    budget: ReceiverAnalysisBudget,
+) -> ReceiverAnalysisOutcome<CodeUnit> {
     let candidates =
-        ts_identifier_candidates(host, support, file, source, imports, aliases, name, false);
-    ts_expand_property_owners(host, support, candidates, depth + 1)
+        ts_named_type_candidates(host, support, file, source, imports, aliases, node, false);
+    let owners = ts_expand_property_owners(host, support, candidates, depth + 1);
+    ReceiverAnalysisOutcome::single_precise_or_ambiguous(owners, budget)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ts_named_type_candidates(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    node: Node<'_>,
+    value_position: bool,
+) -> Vec<CodeUnit> {
+    let mut segments = Vec::new();
+    let mut current = node;
+    while let Some((module, name)) = nested_type_identifier_parts(current) {
+        segments.push(name);
+        current = module;
+    }
+    segments.push(current);
+    segments.reverse();
+
+    let Some(root) = segments.first() else {
+        return Vec::new();
+    };
+    let root_name = slice(*root, source).trim();
+    let mut remaining = segments.into_iter().skip(1);
+    let mut candidates = if let Some(binding) = imports.binding(root_name).filter(|binding| {
+        matches!(
+            binding.kind,
+            ImportKind::Namespace | ImportKind::CommonJsRequire
+        )
+    }) {
+        let Some(segment) = remaining.next() else {
+            return Vec::new();
+        };
+        let member = slice(segment, source).trim();
+        resolve_js_ts_module_binding_candidates(
+            host,
+            support,
+            Language::TypeScript,
+            file,
+            &binding.module_specifier,
+            member,
+            Some(aliases),
+            value_position,
+        )
+    } else {
+        ts_identifier_candidates(
+            host,
+            support,
+            file,
+            source,
+            imports,
+            aliases,
+            root_name,
+            value_position,
+        )
+    };
+    for segment in remaining {
+        let member = slice(segment, source).trim();
+        if member.is_empty() {
+            return Vec::new();
+        }
+        candidates = jsts_member_candidates(host, support, candidates, member, value_position);
+    }
+    candidates
+}
+
+fn known_non_receiver_type(node: Node<'_>, source: &str) -> bool {
+    matches!(slice(node, source).trim(), "null" | "undefined" | "never")
+}
+
+fn type_identifier_terminal(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "type_identifier" => return Some(node),
+            "nested_type_identifier" => node = nested_type_identifier_parts(node)?.1,
+            _ => return None,
+        }
+    }
 }
 
 fn ts_expand_property_owners(
@@ -1442,50 +1637,6 @@ pub fn node_text_matches(node: Node<'_>, source: &str, expected: &str) -> bool {
     source
         .get(node.start_byte()..node.end_byte())
         .is_some_and(|text| text.trim() == expected)
-}
-
-fn ts_typeof_target(text: &str) -> Option<&str> {
-    text.trim().strip_prefix("typeof").map(str::trim)
-}
-
-fn ts_generic_type_argument<'a>(text: &'a str, generic: &str) -> Option<&'a str> {
-    let text = text.trim();
-    let rest = text.strip_prefix(generic)?;
-    let rest = rest.trim_start();
-    let inner = rest.strip_prefix('<')?.strip_suffix('>')?;
-    Some(inner.trim())
-}
-
-/// Recognizes a schema library's type-inference helper applied to a value, e.g. zod's
-/// `z.infer<typeof Schema>` (and the `Infer` alias other libraries expose), so navigation can
-/// follow the wrapped argument to the schema's shape. Matches the qualified `.infer`/`.Infer`
-/// member-name convention regardless of the namespace alias, rather than the literal `z.infer`.
-fn ts_schema_infer_argument(text: &str) -> Option<&str> {
-    let text = text.trim();
-    let open = text.find('<')?;
-    let head = text[..open].trim();
-    // `head` is a type-annotation qualifier chain (already sliced before any
-    // generic argument list), so re-tokenizing it with the shared structured
-    // splitter and taking the last segment reproduces `rsplit('.').next()`'s
-    // terminal split exactly (TS/JS have no per-segment normalization
-    // quirks, unlike Go/Rust/Cpp).
-    let last =
-        brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path(Language::TypeScript, head)
-            .pop()
-            .unwrap_or_default();
-    if !head.contains('.') || !(last == "infer" || last == "Infer") {
-        return None;
-    }
-    let inner = text[open..].strip_prefix('<')?.strip_suffix('>')?;
-    Some(inner.trim())
-}
-
-fn ts_leading_type_identifier(text: &str) -> Option<&str> {
-    let text = text.trim();
-    let end = text
-        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'))
-        .unwrap_or(text.len());
-    (end > 0).then_some(&text[..end])
 }
 
 fn ts_call_reference_name(node: Node<'_>, source: &str) -> Option<String> {

@@ -2,9 +2,9 @@
   "name": "bifrost-vscode",
   "displayName": "Bifrost: Multi-Language LSP & MCP Server",
   "description": "Tree-sitter-backed code intelligence for definitions, references, symbols, hierarchy, rename, diagnostics, and MCP workflows.",
-  "version": "0.10.4",
+  "version": "0.10.5",
   "bifrost": {
-    "binaryVersion": "0.10.4",
+    "binaryVersion": "0.10.5",
     "minimumBinaryVersion": "0.10.3",
     "allowPrerelease": false,
     "archiveSha256": {
@@ -350,7 +350,7 @@
   },
   "scripts": {
     "compile": "node esbuild.mjs",
-    "license:prepare": "node ../../scripts/prepare-vscode-license-artifacts.mjs",
+    "license:prepare": "node ../../scripts/public/prepare-vscode-license-artifacts.mjs",
     "compile:test": "tsc -p tsconfig.test.json",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"*.{json,mjs,md}\" \"syntaxes/*.json\"",
     "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"*.{json,mjs,md}\" \"syntaxes/*.json\"",

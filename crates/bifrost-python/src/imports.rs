@@ -14,6 +14,7 @@ use brokk_bifrost_core::analyzer::common::node_source_text;
 use brokk_bifrost_core::analyzer::model::{
     ImportInfo, StructuredImportPath, StructuredImportPathKind,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ImportBinding, ImportKind};
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -346,9 +347,10 @@ pub fn module_replacement_of(
 
 pub fn resolve_import_bindings(
     python: &dyn PythonSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
 ) -> HashMap<String, CodeUnit> {
-    let imports = python.import_info_of(file);
+    let imports = python.import_info_of(token, file);
     let mut bindings = HashMap::default();
     for resolved in resolve_imports_batched(python, file, &imports) {
         for (binding, code_unit) in resolved {

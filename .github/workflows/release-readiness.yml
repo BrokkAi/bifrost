@@ -20,6 +20,16 @@ on:
         required: false
         default: ''
         type: string
+      requalify_from_run:
+        description: >-
+          Re-qualify a metadata-only correction. Give the run ID of the
+          readiness run that already qualified this release. Its artifacts are
+          reused and re-labelled for public_commit; nothing is rebuilt. Refuses
+          unless the two commits differ only in the tracked checksum
+          projections.
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -42,6 +52,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       commit: ${{ steps.identity.outputs.commit }}
+      build_identity: ${{ steps.identity.outputs.build_identity }}
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
@@ -66,42 +77,13 @@ jobs:
           EXPECTED_PUBLIC_HEAD: ${{ inputs.expected_public_head }}
           PRIVATE_COMMIT: ${{ inputs.private_commit }}
           RELEASE_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          [[ "$PUBLIC_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$EXPECTED_PUBLIC_HEAD" =~ ^[0-9a-f]{40}$ ]]
-          if [[ -n "$PRIVATE_COMMIT" ]]; then
-            [[ "$PRIVATE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-          fi
-          test "$(git rev-parse HEAD)" = "$PUBLIC_COMMIT"
-          public_head="$(git ls-remote origin refs/heads/master | awk '{print $1}')"
-          test -n "$public_head"
-          test "$public_head" = "$EXPECTED_PUBLIC_HEAD"
-          set +e
-          tag_refs="$(git ls-remote --exit-code --tags origin "refs/tags/v${RELEASE_VERSION}" 2>&1)"
-          tag_status=$?
-          set -e
-          case "$tag_status" in
-            0)
-              echo "Release tag v${RELEASE_VERSION} already exists; readiness must precede tagging." >&2
-              exit 1
-              ;;
-            2)
-              test -z "$tag_refs"
-              ;;
-            *)
-              echo "Unable to prove release tag v${RELEASE_VERSION} is absent:" >&2
-              echo "$tag_refs" >&2
-              exit 1
-              ;;
-          esac
-          echo "commit=$PUBLIC_COMMIT" >> "$GITHUB_OUTPUT"
+        run: bash scripts/public/release-readiness-identity.sh
 
       - name: Validate synchronized release version
         id: release
         env:
           RELEASE_TAG: v${{ inputs.version }}
-        run: node scripts/release-version.mjs check --tag "$RELEASE_TAG" --github-output "$GITHUB_OUTPUT"
+        run: node scripts/public/release-version.mjs check --tag "$RELEASE_TAG" --github-output "$GITHUB_OUTPUT"
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
@@ -112,13 +94,14 @@ jobs:
         timeout-minutes: 2
 
       - name: Audit workflow action pins
-        run: bash scripts/check-github-actions-security.sh
+        run: bash scripts/public/check-github-actions-security.sh
 
       - name: Preflight npm trusted-publishing client contract
-        run: node scripts/check-npm-trusted-publishing.mjs
+        run: node scripts/public/check-npm-trusted-publishing.mjs
 
   notices:
     name: generate Rust notices
+    if: ${{ inputs.requalify_from_run == '' }}
     needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -150,7 +133,7 @@ jobs:
         run: cargo fetch --locked
 
       - name: Generate Rust notice report
-        run: scripts/generate-rust-third-party-notices.sh dist/THIRD_PARTY_LICENSES.html
+        run: scripts/public/generate-rust-third-party-notices.sh dist/THIRD_PARTY_LICENSES.html
 
       - name: Upload notice report
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -162,6 +145,7 @@ jobs:
 
   crate-package:
     name: package exact crates
+    if: ${{ inputs.requalify_from_run == '' }}
     needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -189,61 +173,7 @@ jobs:
 
       - name: Verify package contents and build exact archives
         shell: bash
-        run: |
-          set -euo pipefail
-          bash scripts/check-workspace-packages.sh
-          packages=(
-            brokk-bifrost-core brokk-bifrost-cpp brokk-bifrost-csharp
-            brokk-bifrost-go brokk-bifrost-js-ts brokk-bifrost-jvm
-            brokk-bifrost-php brokk-bifrost-python brokk-bifrost-ruby
-            brokk-bifrost-rust brokk-bifrost-rql brokk-bifrost-analysis
-            brokk-bifrost-nlp brokk-bifrost-policy brokk-bifrost-semantic-packs
-            brokk-bifrost-runtime brokk-bifrost-mcp brokk-bifrost-lsp
-            brokk-bifrost
-          )
-          patch_args=(
-            --config 'patch.crates-io.brokk-bifrost-core.path="crates/bifrost-core"'
-            --config 'patch.crates-io.brokk-bifrost-cpp.path="crates/bifrost-cpp"'
-            --config 'patch.crates-io.brokk-bifrost-csharp.path="crates/bifrost-csharp"'
-            --config 'patch.crates-io.brokk-bifrost-go.path="crates/bifrost-go"'
-            --config 'patch.crates-io.brokk-bifrost-js-ts.path="crates/bifrost-js-ts"'
-            --config 'patch.crates-io.brokk-bifrost-jvm.path="crates/bifrost-jvm"'
-            --config 'patch.crates-io.brokk-bifrost-php.path="crates/bifrost-php"'
-            --config 'patch.crates-io.brokk-bifrost-python.path="crates/bifrost-python"'
-            --config 'patch.crates-io.brokk-bifrost-ruby.path="crates/bifrost-ruby"'
-            --config 'patch.crates-io.brokk-bifrost-rust.path="crates/bifrost-rust"'
-            --config 'patch.crates-io.brokk-bifrost-rql.path="crates/bifrost-rql"'
-            --config 'patch.crates-io.brokk-bifrost-analysis.path="crates/bifrost-analysis"'
-            --config 'patch.crates-io.brokk-bifrost-nlp.path="crates/bifrost-nlp"'
-            --config 'patch.crates-io.brokk-bifrost-policy.path="crates/bifrost-policy"'
-            --config 'patch.crates-io.brokk-bifrost-semantic-packs.path="crates/bifrost-semantic-packs"'
-            --config 'patch.crates-io.brokk-bifrost-runtime.path="crates/bifrost-runtime"'
-            --config 'patch.crates-io.brokk-bifrost-mcp.path="crates/bifrost-mcp"'
-            --config 'patch.crates-io.brokk-bifrost-lsp.path="crates/bifrost-lsp"'
-          )
-          mkdir -p dist
-          metadata="${RUNNER_TEMP}/cargo-metadata.json"
-          badges="${RUNNER_TEMP}/crate-badges.json"
-          cargo metadata --format-version 1 --no-deps > "$metadata"
-          printf '{}\n' > "$badges"
-          for package in "${packages[@]}"; do
-            CARGO_TARGET_DIR="${RUNNER_TEMP}/crate-target" cargo package \
-              --quiet --locked --allow-dirty --no-verify --package "$package" \
-              --manifest-path Cargo.toml "${patch_args[@]}"
-            archive="${RUNNER_TEMP}/crate-target/package/${package}-${RELEASE_VERSION}.crate"
-            test -f "$archive"
-            cp "$archive" dist/
-            sha256sum "$archive" > "dist/$(basename "$archive").sha256"
-            node scripts/generate-crate-publish-metadata.mjs \
-              --cargo-metadata-file "$metadata" \
-              --package "$package" \
-              --version "$RELEASE_VERSION" \
-              --badges-file "$badges" \
-              --output-file "dist/$(basename "$archive").metadata.json"
-            test "$(jq -r '.name // empty' "dist/$(basename "$archive").metadata.json")" = "$package"
-            test "$(jq -r '.vers // empty' "dist/$(basename "$archive").metadata.json")" = "$RELEASE_VERSION"
-            jq -e '.deps | type == "array"' "dist/$(basename "$archive").metadata.json" >/dev/null
-          done
+        run: bash scripts/public/package-release-crates.sh
 
       - name: Upload exact crate archives and metadata
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -258,6 +188,7 @@ jobs:
 
   semantic-pack-bundle:
     name: generate semantic packs
+    if: ${{ inputs.requalify_from_run == '' }}
     needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -283,7 +214,7 @@ jobs:
 
       - name: Generate and verify semantic-pack bundle
         shell: bash
-        run: bash scripts/build-pinned-jvm-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs" "${RUNNER_TEMP}"
+        run: bash scripts/public/build-pinned-jvm-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs" "${RUNNER_TEMP}"
       - name: Package semantic-pack bundle
         shell: bash
         env:
@@ -395,10 +326,14 @@ jobs:
       - name: Build binary
         if: matrix.target != 'universal-apple-darwin'
         shell: bash
+        env:
+          BIFROST_BUILD_IDENTITY_OVERRIDE: ${{ needs.preflight.outputs.build_identity }}
         run: cargo build --release --locked --bin "$BIN_NAME" --target "${{ matrix.target }}"
       - name: Build macOS universal binary
         if: matrix.target == 'universal-apple-darwin'
         shell: bash
+        env:
+          BIFROST_BUILD_IDENTITY_OVERRIDE: ${{ needs.preflight.outputs.build_identity }}
         run: |
           cargo build --release --locked --bin "$BIN_NAME" --target x86_64-apple-darwin
           cargo build --release --locked --bin "$BIN_NAME" --target aarch64-apple-darwin
@@ -548,7 +483,7 @@ jobs:
         with:
           shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-uv-${{ matrix.target }}
       - name: Prepare uv CLI license files
-        run: node scripts/prepare-uv-cli-package.mjs
+        run: node scripts/public/prepare-uv-cli-package.mjs
       - name: Build uv CLI wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         env:
@@ -659,7 +594,7 @@ jobs:
           merge-multiple: true
       - name: Prepare agent plugin release metadata
         run: >
-          node scripts/prepare-vscode-extension-manifest.mjs
+          node scripts/public/prepare-vscode-extension-manifest.mjs
           --version "${{ needs.preflight.outputs.version }}"
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
@@ -668,7 +603,7 @@ jobs:
       - name: Test agent plugin launcher
         run: node --test plugins/bifrost-agent/test/launcher.test.mjs
       - name: Validate agent plugin manifests
-        run: node scripts/check-codex-plugin-manifest.mjs
+        run: node scripts/public/check-codex-plugin-manifest.mjs
       - name: Package exact agent plugin archive
         shell: bash
         env:
@@ -739,7 +674,7 @@ jobs:
       - name: Run real Codex and Claude list_policies smoke
         shell: bash
         run: >
-          node scripts/smoke-agent-plugin-release.mjs
+          node scripts/public/smoke-agent-plugin-release.mjs
           --plugin-dir "${{ steps.staged.outputs.plugin }}"
           --cache-dir "${RUNNER_TEMP}/bifrost-agent-smoke-cache"
           --binary-path "${{ steps.staged.outputs.binary }}"
@@ -806,7 +741,7 @@ jobs:
           merge-multiple: true
       - name: Prepare Pi metadata
         run: >
-          node scripts/prepare-vscode-extension-manifest.mjs
+          node scripts/public/prepare-vscode-extension-manifest.mjs
           --version "${{ needs.preflight.outputs.version }}"
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
@@ -856,7 +791,7 @@ jobs:
           merge-multiple: true
       - name: Prepare VSIX metadata
         run: >
-          node scripts/prepare-vscode-extension-manifest.mjs
+          node scripts/public/prepare-vscode-extension-manifest.mjs
           --version "${{ needs.preflight.outputs.version }}"
           --manifest editors/vscode/package.json
           --plugin-release plugins/bifrost-agent/bifrost-release.json
@@ -869,7 +804,7 @@ jobs:
       - name: Test agent plugin launcher
         run: node --test plugins/bifrost-agent/test/launcher.test.mjs
       - name: Validate agent plugin manifest
-        run: node scripts/check-codex-plugin-manifest.mjs
+        run: node scripts/public/check-codex-plugin-manifest.mjs
       - name: Test VS Code extension
         run: npm test
         working-directory: editors/vscode
@@ -933,6 +868,109 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # A metadata-only correction cannot be qualified by rebuilding. The binary
+  # compiles its identity in, so any rebuild of the corrected commit produces
+  # different bytes than the digests that commit records -- the cycle #2425
+  # describes, which has no fixed point. Since the identity now names the last
+  # compiled-input commit, the artifacts already built are correct for the
+  # corrected commit too: same compiled source, same reported identity. So this
+  # re-labels the existing qualification rather than producing a new one, and
+  # refuses if the two commits differ by anything that could have changed them.
+  requalify:
+    name: re-qualify a metadata-only correction
+    if: >-
+      ${{ github.repository == 'BrokkAi/bifrost' &&
+          github.event.repository.private == false &&
+          inputs.requalify_from_run != '' }}
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    env:
+      RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+      RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+      PUBLIC_COMMIT: ${{ needs.preflight.outputs.commit }}
+      PUBLIC_REPOSITORY: ${{ github.repository }}
+      SOURCE_RUN_ID: ${{ inputs.requalify_from_run }}
+    steps:
+      - name: Checkout the corrected commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Read the source qualification identity
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/public/read-source-qualification.sh
+
+      - name: Prove the correction changed nothing that was built
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+        run: bash scripts/public/check-requalification-correction.sh
+
+      - name: Download the qualified bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ steps.source.outputs.artifact_name }}
+          path: qualification-bundle
+          run-id: ${{ inputs.requalify_from_run }}
+          github-token: ${{ github.token }}
+
+      - name: Verify expected release inventory is present
+        shell: bash
+        run: bash scripts/public/check-qualification-inventory.sh qualification-bundle
+
+      - name: Write qualification identity for the corrected commit
+        env:
+          PRIVATE_COMMIT: ${{ inputs.private_commit }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+        run: |
+          rm -f qualification-bundle/release-qualification.json
+          node scripts/public/write-qualification-identity.mjs --output "${RUNNER_TEMP}/qualification-identity.json"
+
+      - name: Generate deterministic qualification manifest
+        env:
+          BUNDLE_DIR: qualification-bundle
+          IDENTITY_FILE: ${{ runner.temp }}/qualification-identity.json
+          MANIFEST_FILE: qualification-bundle/release-qualification.json
+        run: node scripts/public/release-qualification.mjs manifest --bundle "$BUNDLE_DIR" --identity "$IDENTITY_FILE" --output "$MANIFEST_FILE"
+
+      - name: Upload immutable qualification bundle
+        id: qualification-upload
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-qualification-${{ needs.preflight.outputs.commit }}-v${{ needs.preflight.outputs.version }}
+          path: qualification-bundle
+          retention-days: 14
+
+      - name: Record the re-qualification
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+          ARTIFACT_DIGEST: ${{ steps.qualification-upload.outputs.artifact-digest }}
+        run: |
+          {
+            echo "## Metadata-only re-qualification"
+            echo
+            echo "- Corrected commit: \`$PUBLIC_COMMIT\`"
+            echo "- Artifacts built by run \`$SOURCE_RUN_ID\` from \`$SOURCE_COMMIT\`, reused unchanged"
+            echo "- Artifact digest: \`$ARTIFACT_DIGEST\`"
+            echo
+            echo "Nothing was rebuilt. The correction touches only the tracked checksum projections, which are not compiled inputs, so the binaries already qualified report the same build identity at either commit."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   qualification:
     name: assemble and verify commit/version qualification bundle
     needs:
@@ -978,15 +1016,7 @@ jobs:
           merge-multiple: true
       - name: Verify expected release inventory is present
         shell: bash
-        run: |
-          set -euo pipefail
-          test "$(find qualification-bundle -type f -name '*.crate' | wc -l | tr -d ' ')" -eq 19
-          test "$(find qualification-bundle -type f -name '*.crate.metadata.json' | wc -l | tr -d ' ')" -eq 19
-          test "$(find qualification-bundle -type f -name '*.whl' | wc -l | tr -d ' ')" -eq 10
-          test "$(find qualification-bundle -type f -name '*.vsix' | wc -l | tr -d ' ')" -eq 1
-          test "$(find qualification-bundle -type f -name '*.tgz' | wc -l | tr -d ' ')" -gt 0
-          test "$(find qualification-bundle -type f -name '*.sha256' | wc -l | tr -d ' ')" -ge 8
-          test -f qualification-bundle/THIRD_PARTY_LICENSES.html
+        run: bash scripts/public/check-qualification-inventory.sh qualification-bundle
       - name: Write qualification identity
         shell: bash
         env:
@@ -996,30 +1026,13 @@ jobs:
           PRIVATE_COMMIT: ${{ inputs.private_commit }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
-        run: |
-          node --input-type=module -e '
-            import fs from "node:fs";
-            const identity = {
-              release: { version: process.env.RELEASE_VERSION, tag: process.env.RELEASE_TAG },
-              source: {
-                repository: process.env.PUBLIC_REPOSITORY,
-                publicCommit: process.env.PUBLIC_COMMIT,
-                ...(process.env.PRIVATE_COMMIT ? { privateCommit: process.env.PRIVATE_COMMIT } : {}),
-              },
-              qualification: {
-                workflow: "release-readiness.yml",
-                runId: Number(process.env.RUN_ID),
-                runAttempt: Number(process.env.RUN_ATTEMPT),
-              },
-            };
-            fs.writeFileSync(`${process.env.RUNNER_TEMP}/qualification-identity.json`, `${JSON.stringify(identity)}\n`);
-          '
+        run: node scripts/public/write-qualification-identity.mjs --output "${RUNNER_TEMP}/qualification-identity.json"
       - name: Generate deterministic qualification manifest
         env:
           BUNDLE_DIR: ${{ github.workspace }}/qualification-bundle
           IDENTITY_FILE: ${{ runner.temp }}/qualification-identity.json
           MANIFEST_FILE: ${{ github.workspace }}/qualification-bundle/release-qualification.json
-        run: node scripts/release-qualification.mjs manifest --bundle "$BUNDLE_DIR" --identity "$IDENTITY_FILE" --output "$MANIFEST_FILE"
+        run: node scripts/public/release-qualification.mjs manifest --bundle "$BUNDLE_DIR" --identity "$IDENTITY_FILE" --output "$MANIFEST_FILE"
       - name: Verify every qualified byte and identity
         env:
           BUNDLE_DIR: ${{ github.workspace }}/qualification-bundle
@@ -1027,7 +1040,7 @@ jobs:
           PUBLIC_COMMIT: ${{ needs.preflight.outputs.commit }}
           RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
         run: >-
-          node scripts/release-qualification.mjs verify
+          node scripts/public/release-qualification.mjs verify
           --bundle "$BUNDLE_DIR"
           --manifest "$MANIFEST_FILE"
           --repository "$PUBLIC_REPOSITORY"

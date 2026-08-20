@@ -3,23 +3,29 @@ use crate::analyzer::{
     Language, ProjectFile, ScalaAnalyzer, resolve_analyzer,
 };
 use brokk_bifrost_analysis::analyzer::CodeUnitIndex;
+use brokk_bifrost_analysis::analyzer::QueryToken;
+use brokk_bifrost_analysis::analyzer::{AnalyzerQueryScope, QueryScope};
 
 pub(super) fn is_ambiguous_imported_reference(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     identifier: &str,
 ) -> bool {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     if identifier.is_empty() || identifier.contains('.') {
         return false;
     }
 
     match crate::analyzer::common::language_for_file(file) {
         Language::Java => resolve_analyzer::<JavaAnalyzer>(analyzer)
-            .is_some_and(|java| java_wildcard_import_is_ambiguous(java, file, identifier)),
-        Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer)
-            .is_some_and(|csharp| csharp_using_import_is_ambiguous(csharp, file, identifier)),
-        Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer)
-            .is_some_and(|scala| scala_wildcard_import_is_ambiguous(scala, file, identifier)),
+            .is_some_and(|java| java_wildcard_import_is_ambiguous(java, token, file, identifier)),
+        Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer).is_some_and(|csharp| {
+            csharp_using_import_is_ambiguous(csharp, token, file, identifier)
+        }),
+        Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer).is_some_and(|scala| {
+            scala_wildcard_import_is_ambiguous(scala, token, file, identifier)
+        }),
         // PHP use-imports are explicit aliases; the current analyzer surface has
         // no wildcard import form to disambiguate at the LSP boundary.
         _ => false,
@@ -28,10 +34,11 @@ pub(super) fn is_ambiguous_imported_reference(
 
 fn java_wildcard_import_is_ambiguous(
     analyzer: &JavaAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     identifier: &str,
 ) -> bool {
-    let imports = analyzer.import_info_of(file);
+    let imports = analyzer.import_info_of(token, file);
     if imports
         .iter()
         .any(|import| !import.is_wildcard && import.identifier.as_deref() == Some(identifier))
@@ -58,10 +65,11 @@ fn java_wildcard_import_is_ambiguous(
 
 fn csharp_using_import_is_ambiguous(
     analyzer: &CSharpAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     identifier: &str,
 ) -> bool {
-    let imports = analyzer.import_info_of(file);
+    let imports = analyzer.import_info_of(token, file);
     if imports
         .iter()
         .any(|import| csharp_alias_identifier(&import.raw_snippet).as_deref() == Some(identifier))
@@ -78,7 +86,7 @@ fn csharp_using_import_is_ambiguous(
     }
 
     let mut candidates = Vec::new();
-    for namespace in analyzer.using_namespaces_of(file) {
+    for namespace in analyzer.using_namespaces_of(token, file) {
         candidates.extend(
             analyzer
                 .definitions(&format!("{namespace}.{identifier}"))
@@ -90,10 +98,11 @@ fn csharp_using_import_is_ambiguous(
 
 fn scala_wildcard_import_is_ambiguous(
     analyzer: &ScalaAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     identifier: &str,
 ) -> bool {
-    let imports = analyzer.import_info_of(file);
+    let imports = analyzer.import_info_of(token, file);
     if imports
         .iter()
         .any(|import| !import.is_wildcard && import.identifier.as_deref() == Some(identifier))

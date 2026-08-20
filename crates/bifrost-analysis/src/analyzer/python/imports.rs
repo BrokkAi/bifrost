@@ -7,8 +7,10 @@
 //! `TreeSitterAnalyzer`.
 
 use super::PythonAnalyzer;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CodeUnit, CodeUnitIndex, ImportAnalysisProvider, ImportInfo, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_python::declarations::python_module_name;
 use brokk_bifrost_python::graph_support::extract_type_identifiers;
 use brokk_bifrost_python::imports::{
@@ -19,11 +21,17 @@ use std::sync::Arc;
 
 impl ImportAnalysisProvider for PythonAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         if let Some(cached) = self.imported_code_units.get(file) {
             return cached;
         }
 
-        let resolved = Arc::new(resolve_import_bindings(self, file).into_values().collect());
+        let resolved = Arc::new(
+            resolve_import_bindings(self, token, file)
+                .into_values()
+                .collect(),
+        );
         self.imported_code_units
             .insert(file.clone(), Arc::clone(&resolved));
         resolved
@@ -44,8 +52,8 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         referencing
     }
 
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
-        self.inner.import_info_of(file)
+    fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
+        self.inner.import_info_of(token, file)
     }
 
     /// Flattens every import's resolved targets without collapsing by binding name -- unlike
@@ -80,6 +88,8 @@ impl ImportAnalysisProvider for PythonAnalyzer {
     }
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         let Some(source) = self.inner.get_source(code_unit, false) else {
             return HashSet::default();
         };
@@ -89,7 +99,7 @@ impl ImportAnalysisProvider for PythonAnalyzer {
             return HashSet::default();
         }
 
-        let imports = self.inner.import_info_of(code_unit.source());
+        let imports = self.inner.import_info_of(token, code_unit.source());
         if imports.is_empty() {
             return HashSet::default();
         }
@@ -163,6 +173,8 @@ impl ImportAnalysisProvider for PythonAnalyzer {
         imports: &[ImportInfo],
         target: &ProjectFile,
     ) -> bool {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         // Relative imports keep their own per-import resolution (including the conservative
         // "unresolvable -> assume yes" fallback) since that's specific to each import, not a
         // file-wide property. Non-relative imports are checked once against the cached, file-wide
@@ -187,7 +199,7 @@ impl ImportAnalysisProvider for PythonAnalyzer {
                 }
             }
         }
-        self.resolve_import_target_files(source_file)
+        self.resolve_import_target_files(token, source_file)
             .contains(target)
     }
 }

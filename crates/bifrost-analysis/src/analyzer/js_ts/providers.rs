@@ -20,6 +20,7 @@ use crate::analyzer::{
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_js_ts::graph::resolver::{
     JsTsUsageIndex, build_jsts_usage_index, build_jsts_usage_index_with_cancellation,
 };
@@ -74,6 +75,7 @@ pub(crate) fn resolve_js_ts_source(
 
 pub(crate) fn imported_code_units_of(
     host: &dyn JsTsMemoSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
 ) -> Arc<HashSet<CodeUnit>> {
     let caches = host.memo_caches();
@@ -84,7 +86,7 @@ pub(crate) fn imported_code_units_of(
     let resolved = Arc::new(resolve_imported_code_units(
         host,
         file,
-        host.import_info_of(file),
+        host.import_info_of(token, file),
     ));
 
     caches
@@ -99,14 +101,16 @@ pub(crate) fn imported_code_units_of(
 /// gets the caching this hook exists to provide, shared with `could_import_file` below.
 pub(crate) fn imported_code_units_from_infos(
     host: &dyn JsTsMemoSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     _imports: &[ImportInfo],
 ) -> Option<Arc<HashSet<CodeUnit>>> {
-    Some(imported_code_units_of(host, file))
+    Some(imported_code_units_of(host, token, file))
 }
 
 pub(crate) fn referencing_files_of(
     host: &dyn JsTsMemoSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
 ) -> HashSet<ProjectFile> {
     let caches = host.memo_caches();
@@ -117,7 +121,7 @@ pub(crate) fn referencing_files_of(
     let reverse_index = memoized_reverse_import_index(
         &caches.reverse_import_index,
         || host.all_files(),
-        |candidate| imported_code_units_of(host, candidate),
+        |candidate| imported_code_units_of(host, token, candidate),
     );
     let referencing = reverse_index
         .get(file)
@@ -147,6 +151,7 @@ pub(crate) fn imported_files_from_infos(
 
 pub(crate) fn relevant_imports_for(
     host: &dyn JsTsMemoSource,
+    token: QueryToken<'_>,
     code_unit: &CodeUnit,
 ) -> HashSet<String> {
     let caches = host.memo_caches();
@@ -154,7 +159,7 @@ pub(crate) fn relevant_imports_for(
         return (*cached).clone();
     }
 
-    let relevant = compute_relevant_imports(host, code_unit);
+    let relevant = compute_relevant_imports(host, token, code_unit);
 
     caches
         .relevant_imports
@@ -167,11 +172,12 @@ pub(crate) fn relevant_imports_for(
 /// of re-resolving from the passed-in slice) is correct and gets the caching this hook is for.
 pub(crate) fn could_import_file(
     host: &dyn JsTsMemoSource,
+    token: QueryToken<'_>,
     source_file: &ProjectFile,
     _imports: &[ImportInfo],
     target: &ProjectFile,
 ) -> bool {
-    resolved_import_target_files(host, source_file).contains(target)
+    resolved_import_target_files(host, token, source_file).contains(target)
 }
 
 /// The file-path resolution targets of `file`'s own imports (module specifier -> file), cached per
@@ -185,11 +191,12 @@ pub(crate) fn could_import_file(
 /// key, matching `PythonAnalyzer::resolve_import_target_files`'s equivalent fix.
 fn resolved_import_target_files(
     host: &dyn JsTsMemoSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
 ) -> Arc<HashSet<ProjectFile>> {
     let caches = host.memo_caches();
     caches.imported_target_files.get_with(file.clone(), || {
-        Arc::new(resolve_import_target_files(host, file))
+        Arc::new(resolve_import_target_files(host, token, file))
     })
 }
 

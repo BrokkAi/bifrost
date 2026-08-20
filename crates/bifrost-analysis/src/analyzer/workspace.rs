@@ -21,6 +21,7 @@ use crate::analyzer::{
 };
 use crate::profiling;
 use std::collections::{BTreeMap, BTreeSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -719,6 +720,13 @@ impl WorkspaceAnalyzer {
         revalidate_filesystem_paths: bool,
     ) -> Result<Self, StoreError> {
         let _scope = profiling::scope("WorkspaceAnalyzer::build");
+        // A fresh abort per fan-out. The caller's context may outlive this
+        // build and go on to serve lazy per-language delegate builds, and those
+        // must not inherit a flag this build set.
+        let store_context = crate::analyzer::AnalyzerStoreContext {
+            build_abort: Arc::new(crate::analyzer::BuildAbort::default()),
+            ..store_context
+        };
         let mut delegates = BTreeMap::new();
         let project_languages = project.analyzer_languages();
         let selected_languages: Vec<_> = match requested_languages {
@@ -733,6 +741,18 @@ impl WorkspaceAnalyzer {
         // serializes ahead of every other language's build and dominates cold
         // start (issue #1309). Store writes stay safe because every language
         // shares the store's single writer connection behind its mutex.
+        //
+        // A worker panic is caught rather than unwound through the join, for two
+        // reasons (issue #2359). `std::thread::scope` joins every spawned thread
+        // before it returns, so unwinding out of the first join still waits for
+        // the slowest sibling; catching lets the worker set the shared abort
+        // first, which is what makes the siblings stop instead of running to
+        // completion. And joining every handle before re-raising makes the
+        // choice of which panic wins deterministic -- the first language in
+        // selection order -- rather than whichever thread the join order
+        // happened to reach while another was still running. The payload is
+        // re-raised verbatim, so the original message and location survive.
+        let mut panics: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
         let built: Vec<(Language, Result<AnalyzerDelegate, StoreError>)> =
             std::thread::scope(|scope| {
                 let handles: Vec<_> = selected_languages
@@ -746,14 +766,21 @@ impl WorkspaceAnalyzer {
                         let handle = std::thread::Builder::new()
                             .name(format!("bifrost-build-{language:?}"))
                             .spawn_scoped(scope, move || {
-                                build_language_delegate(
-                                    language,
-                                    project,
-                                    cfg,
-                                    store_context,
-                                    progress,
-                                    revalidate_filesystem_paths,
-                                )
+                                let abort = Arc::clone(&store_context.build_abort);
+                                let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                    build_language_delegate(
+                                        language,
+                                        project,
+                                        cfg,
+                                        store_context,
+                                        progress,
+                                        revalidate_filesystem_paths,
+                                    )
+                                }));
+                                if built.is_err() {
+                                    abort.abort();
+                                }
+                                built
                             })
                             .expect("failed to spawn language build thread");
                         (language, handle)
@@ -761,14 +788,23 @@ impl WorkspaceAnalyzer {
                     .collect();
                 handles
                     .into_iter()
-                    .map(|(language, handle)| {
-                        let result = handle
+                    .filter_map(|(language, handle)| {
+                        match handle
                             .join()
-                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                        (language, result)
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                        {
+                            Ok(result) => Some((language, result)),
+                            Err(payload) => {
+                                panics.push(payload);
+                                None
+                            }
+                        }
                     })
                     .collect()
             });
+        if let Some(payload) = panics.into_iter().next() {
+            std::panic::resume_unwind(payload);
+        }
         for (language, delegate) in built {
             delegates.insert(language, delegate?);
         }

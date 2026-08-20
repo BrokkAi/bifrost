@@ -11,7 +11,7 @@ import {
   DEFAULT_TOOLSETS,
   name as pluginName,
 } from "../src/index.js";
-import { readCargoVersion } from "../../../scripts/release-version.mjs";
+import { readCargoVersion } from "../../../scripts/public/release-version.mjs";
 
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(packageDir, "..", "..");

@@ -72,6 +72,12 @@ where
 /// state, layer kind, exact projection/filter shape, resolver configuration,
 /// and representation version before acquisition. This type deliberately does
 /// not infer or partially bind any of those dimensions.
+///
+/// Moka eviction is logically immediate but physical destruction of its
+/// internal `Arc` can wait for an epoch-reclamation grace period. During that
+/// interval the live registry below can revive and reinsert the same allocation.
+/// The retention bound governs logical ready entries; rebuild after the last
+/// consumer drops is guaranteed once that internal grace period also ends.
 pub(crate) struct CompleteValueCache<K, V>
 where
     K: Eq + Hash,
@@ -132,9 +138,11 @@ where
     /// per validity key for as long as anyone holds it, and also skips the
     /// rebuild.
     ///
-    /// The registry holds `Weak` references only, so it never extends a
-    /// value's lifetime and the weight bound on `entries` still governs
-    /// retention.
+    /// The registry holds `Weak` references only, so the registry itself never
+    /// extends a value's lifetime and the weight bound on `entries` still
+    /// governs logical retention. Moka can retain an evicted entry internally
+    /// until epoch reclamation finishes; a request during that grace period may
+    /// upgrade the weak reference and make the same allocation resident again.
     fn revive(&self, key: &K) -> Option<Arc<V>> {
         let value = self
             .live
@@ -489,6 +497,21 @@ mod tests {
         }
     }
 
+    fn wait_for_physical_reclamation(
+        cache: &CompleteValueCache<String, usize>,
+        value: &Weak<usize>,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while value.upgrade().is_some() {
+            cache.entries.run_pending_tasks();
+            assert!(
+                Instant::now() < deadline,
+                "logically evicted value was not physically reclaimed"
+            );
+            thread::yield_now();
+        }
+    }
+
     #[test]
     fn same_key_has_one_leader_and_hands_off_the_same_arc() {
         let cache = cache(1024, 1);
@@ -688,8 +711,9 @@ mod tests {
         assert_eq!(cache.revivals_for_test(), 1);
     }
 
-    /// The registry holds weak references only: once the last holder drops the
-    /// value, the key rebuilds exactly as it did before.
+    /// The registry holds weak references only: after the last holder drops the
+    /// value and Moka physically reclaims its logically evicted entry, the key
+    /// rebuilds exactly as it did before (#2456).
     #[test]
     fn a_dropped_value_is_rebuilt_rather_than_revived() {
         let cache = cache(1, 1);
@@ -700,8 +724,12 @@ mod tests {
         else {
             panic!("a new key must lead")
         };
-        permit.publish_complete(Arc::new(33));
+        let built = Arc::new(33);
+        let dropped = Arc::downgrade(&built);
+        permit.publish_complete(Arc::clone(&built));
+        drop(built);
         cache.evict_for_test(&key);
+        wait_for_physical_reclamation(&cache, &dropped);
 
         assert!(
             matches!(

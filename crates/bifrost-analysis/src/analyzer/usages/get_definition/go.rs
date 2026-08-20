@@ -4,6 +4,7 @@ use crate::analyzer::{
     GlobalUsageDefinitionIndex, SignatureMetadata, StructuredTypeIdentity,
     go_internal_import_allowed,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use tree_sitter::Tree;
 
 pub(crate) trait GoDefinitionProvider {
@@ -12,8 +13,13 @@ pub(crate) trait GoDefinitionProvider {
     fn members_for_owner_name(&self, owner_fqn: &str, name: &str) -> Vec<CodeUnit> {
         self.fqn(&format!("{owner_fqn}.{name}"))
     }
-    fn import_infos(&self, go: &GoAnalyzer, file: &ProjectFile) -> Vec<ImportInfo> {
-        go.import_info_of(file)
+    fn import_infos(
+        &self,
+        token: QueryToken<'_>,
+        go: &GoAnalyzer,
+        file: &ProjectFile,
+    ) -> Vec<ImportInfo> {
+        go.import_info_of(token, file)
     }
     fn signature_metadata(
         &self,
@@ -132,12 +138,17 @@ impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
         units
     }
 
-    fn import_infos(&self, go: &GoAnalyzer, file: &ProjectFile) -> Vec<ImportInfo> {
+    fn import_infos(
+        &self,
+        token: QueryToken<'_>,
+        go: &GoAnalyzer,
+        file: &ProjectFile,
+    ) -> Vec<ImportInfo> {
         match self.session {
             Some(session) => {
-                session.query_limited_rows(|limit| go.import_info_limited(file, limit))
+                session.query_limited_rows(|limit| go.import_info_limited(token, file, limit))
             }
-            None => go.import_info_of(file),
+            None => go.import_info_of(token, file),
         }
     }
 
@@ -278,6 +289,8 @@ pub(super) fn resolve_go(
     selector: Option<&GoSelectorDescriptor<'_>>,
     resolution: Option<GoReferenceResolution>,
 ) -> DefinitionLookupOutcome {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
         return no_definition("go_analyzer_unavailable", "Go analyzer is unavailable");
     };
@@ -288,7 +301,15 @@ pub(super) fn resolve_go(
     let importer_package =
         go_package_name(support, file, source, tree.map(Tree::root_node)).unwrap_or_default();
     if let Some(outcome) = tree.and_then(|tree| {
-        go_keyed_composite_label_outcome(analyzer, support, file, source, tree.root_node(), site)
+        go_keyed_composite_label_outcome(
+            analyzer,
+            token,
+            support,
+            file,
+            source,
+            tree.root_node(),
+            site,
+        )
     }) {
         return outcome;
     }
@@ -300,6 +321,7 @@ pub(super) fn resolve_go(
             .and_then(|tree| {
                 resolve_go_local_selector_chain(
                     analyzer,
+                    token,
                     support,
                     file,
                     source,
@@ -325,6 +347,7 @@ pub(super) fn resolve_go(
                 selector.and_then(|selector| {
                     resolve_go_local_selector_chain(
                         analyzer,
+                        token,
                         support,
                         file,
                         source,
@@ -363,9 +386,9 @@ pub(super) fn resolve_go(
                     ),
                 );
             }
-            if let Some(outcome) =
-                go_package_selector_chain_outcome(analyzer, support, go, package, source, selector)
-            {
+            if let Some(outcome) = go_package_selector_chain_outcome(
+                analyzer, token, support, go, package, source, selector,
+            ) {
                 return outcome;
             }
             if go_internal_import_allowed(&importer_package, package)
@@ -399,10 +422,11 @@ pub(super) fn resolve_go(
         && let Some(qualifier) = selector.base_identifier(source)
     {
         let name = go_node_text(selector.focused_node(), source);
-        let imports = go_import_paths(support, go, file);
+        let imports = go_import_paths(support, token, go, file);
         if let Some(import_path) = imports.get(qualifier) {
             if let Some(outcome) = go_package_selector_chain_outcome(
                 analyzer,
+                token,
                 support,
                 go,
                 import_path,
@@ -427,6 +451,7 @@ pub(super) fn resolve_go(
         if let Some(outcome) = tree.and_then(|tree| {
             resolve_go_local_selector_chain(
                 analyzer,
+                token,
                 support,
                 file,
                 source,
@@ -455,7 +480,7 @@ pub(super) fn resolve_go(
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
-    let dot_imports = go_dot_import_paths(go, support, file);
+    let dot_imports = go_dot_import_paths(go, support, token, file);
     let mut dot_candidates = Vec::new();
     for import_path in &dot_imports {
         if !support.scope_step() {
@@ -517,6 +542,7 @@ pub(super) fn resolve_go(
 /// through an elided literal boundary, owns a struct-field label.
 fn go_keyed_composite_label_outcome(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -548,7 +574,8 @@ fn go_keyed_composite_label_outcome(
     }
 
     let label = go_node_text(label_node, source);
-    let Some(owner_fqn) = go_composite_label_owner_fqn(analyzer, support, file, source, keyed)
+    let Some(owner_fqn) =
+        go_composite_label_owner_fqn(analyzer, token, support, file, source, keyed)
     else {
         return Some(no_definition(
             GO_LITERAL_OWNER_UNRESOLVED_DIAGNOSTIC_KIND,
@@ -664,6 +691,7 @@ fn go_simple_composite_key_identifier<'tree>(
 
 fn go_composite_label_owner_fqn(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -758,13 +786,14 @@ fn go_composite_label_owner_fqn(
         }
         owner = match step {
             GoCompositeOwnerStep::ContainerElementOrValue => {
-                go_composite_owner_container_step(analyzer, support, file, source, owner)?
+                go_composite_owner_container_step(analyzer, token, support, file, source, owner)?
             }
             GoCompositeOwnerStep::MapKey => {
-                go_composite_owner_map_key_step(analyzer, support, file, source, owner)?
+                go_composite_owner_map_key_step(analyzer, token, support, file, source, owner)?
             }
             GoCompositeOwnerStep::KeyedValue(field) => go_composite_owner_keyed_value_step(
                 analyzer,
+                token,
                 support,
                 file,
                 source,
@@ -779,7 +808,7 @@ fn go_composite_label_owner_fqn(
             if matches!(owner_type.kind(), "map_type" | "array_type" | "slice_type") {
                 return None;
             }
-            go_resolve_type_fqn(analyzer, support, file, source, owner_type)
+            go_resolve_type_fqn(analyzer, token, support, file, source, owner_type)
         }
         GoCompositeOwnerRef::IndexedType {
             file,
@@ -787,6 +816,7 @@ fn go_composite_label_owner_fqn(
             identity,
         } => go_resolve_structured_type_fqn(
             support,
+            token,
             resolve_analyzer::<GoAnalyzer>(analyzer)?,
             &file,
             &package,
@@ -797,6 +827,7 @@ fn go_composite_label_owner_fqn(
 
 fn go_composite_owner_map_key_step<'tree>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -807,7 +838,7 @@ fn go_composite_owner_map_key_step<'tree>(
             if let Some(key) = go_composite_map_key_type(support, owner_type) {
                 return Some(GoCompositeOwnerRef::Syntax(key));
             }
-            go_named_underlying_composite_owner(analyzer, support, file, source, owner_type)?
+            go_named_underlying_composite_owner(analyzer, token, support, file, source, owner_type)?
                 .and_then_map_key(support)
         }
         GoCompositeOwnerRef::IndexedType {
@@ -826,6 +857,7 @@ fn go_composite_owner_map_key_step<'tree>(
 
 fn go_composite_owner_container_step<'tree>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -837,7 +869,7 @@ fn go_composite_owner_container_step<'tree>(
             {
                 return Some(GoCompositeOwnerRef::Syntax(element));
             }
-            go_named_underlying_composite_owner(analyzer, support, file, source, owner_type)?
+            go_named_underlying_composite_owner(analyzer, token, support, file, source, owner_type)?
                 .and_then_container_element(support)
         }
         GoCompositeOwnerRef::IndexedType {
@@ -892,12 +924,13 @@ impl<'tree> GoCompositeOwnerRef<'tree> {
 
 fn go_named_underlying_composite_owner<'tree>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     owner_type: Node<'tree>,
 ) -> Option<GoCompositeOwnerRef<'tree>> {
-    let owner_fqn = go_resolve_type_fqn(analyzer, support, file, source, owner_type)?;
+    let owner_fqn = go_resolve_type_fqn(analyzer, token, support, file, source, owner_type)?;
     let mut candidates = Vec::new();
     for unit in support
         .fqn(&owner_fqn)
@@ -933,6 +966,7 @@ fn go_named_underlying_composite_owner<'tree>(
 
 fn go_composite_owner_keyed_value_step<'tree>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -946,9 +980,9 @@ fn go_composite_owner_keyed_value_step<'tree>(
                     go_composite_container_element_or_value_type(support, owner_type)?,
                 ));
             }
-            if let Some(owner) =
-                go_named_underlying_composite_owner(analyzer, support, file, source, owner_type)
-            {
+            if let Some(owner) = go_named_underlying_composite_owner(
+                analyzer, token, support, file, source, owner_type,
+            ) {
                 owner
             } else {
                 let identity = crate::analyzer::go::go_structured_type_identity_bounded(
@@ -987,6 +1021,7 @@ fn go_composite_owner_keyed_value_step<'tree>(
             identity,
         } => go_resolve_structured_type_fqn(
             support,
+            token,
             resolve_analyzer::<GoAnalyzer>(analyzer)?,
             file,
             package,
@@ -996,7 +1031,7 @@ fn go_composite_owner_keyed_value_step<'tree>(
 
     if let Some(field) = field
         && let Some((field_unit, identity)) = owner_fqn.as_deref().and_then(|owner_fqn| {
-            go_indexed_field_type_identity(analyzer, support, owner_fqn, field)
+            go_indexed_field_type_identity(analyzer, token, support, owner_fqn, field)
         })
     {
         return Some(GoCompositeOwnerRef::IndexedType {
@@ -1071,6 +1106,7 @@ pub(crate) struct GoTypeLookupResolution {
 
 pub(crate) fn go_type_lookup_resolution(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -1092,6 +1128,7 @@ pub(crate) fn go_type_lookup_resolution(
     let expression = go_type_lookup_expression(support, node)?;
     let fqn = go_expression_type_fqn(
         analyzer,
+        token,
         support,
         file,
         source,
@@ -1155,11 +1192,12 @@ fn go_declared_package_name(
 
 fn go_import_paths(
     support: &dyn GoDefinitionProvider,
+    token: QueryToken<'_>,
     go: &crate::analyzer::GoAnalyzer,
     file: &ProjectFile,
 ) -> HashMap<String, String> {
     if support.session().is_none() {
-        return go_definition_import_namespaces(support, go, file)
+        return go_definition_import_namespaces(support, token, go, file)
             .0
             .into_iter()
             .filter_map(|(local, packages)| {
@@ -1168,7 +1206,7 @@ fn go_import_paths(
             .collect();
     }
     support
-        .import_infos(go, file)
+        .import_infos(token, go, file)
         .into_iter()
         .filter_map(|import| {
             let path = go_structured_import_path(support, &import)?;
@@ -1187,11 +1225,12 @@ fn go_import_paths(
 
 pub(super) fn go_definition_import_namespaces(
     support: &dyn GoDefinitionProvider,
+    token: QueryToken<'_>,
     go: &GoAnalyzer,
     file: &ProjectFile,
 ) -> (HashMap<String, Vec<String>>, Vec<String>) {
-    let (mut aliases, dot_imports) = go.definition_import_namespaces(file);
-    for import in go.import_info_of(file) {
+    let (mut aliases, dot_imports) = go.definition_import_namespaces(token, file);
+    for import in go.import_info_of(token, file) {
         if import.alias.is_some() {
             continue;
         }
@@ -1260,6 +1299,7 @@ fn go_package_member_candidates(
 
 fn go_package_selector_chain_outcome(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     go: &GoAnalyzer,
     package: &str,
@@ -1301,6 +1341,7 @@ fn go_package_selector_chain_outcome(
         ),
         GoLocalBinding::Value(value_node) => go_expression_inferred_type(
             analyzer,
+            token,
             support,
             &variable_file,
             &variable_source,
@@ -1313,6 +1354,7 @@ fn go_package_selector_chain_outcome(
     let Some(mut owner) = owner else {
         return go_external_import_in_expression(
             support,
+            token,
             go,
             &variable_file,
             &variable_source,
@@ -1324,9 +1366,10 @@ fn go_package_selector_chain_outcome(
             ))
         });
     };
-    let Some(mut owner_fqn) = go_resolve_inferred_type_fqn(support, go, &owner) else {
+    let Some(mut owner_fqn) = go_resolve_inferred_type_fqn(support, token, go, &owner) else {
         return go_external_import_in_expression(
             support,
+            token,
             go,
             &variable_file,
             &variable_source,
@@ -1346,6 +1389,7 @@ fn go_package_selector_chain_outcome(
         let member = go_node_text(*member_node, source);
         let lookup = go_indexed_field_lookup_with_method_set(
             analyzer,
+            token,
             support,
             &owner_fqn,
             member,
@@ -1357,9 +1401,9 @@ fn go_package_selector_chain_outcome(
                     return Some(candidates_outcome(vec![candidate]));
                 }
                 owner = go_field_inferred_type_for_receiver(
-                    analyzer, support, &owner, &owner_fqn, member,
+                    analyzer, token, support, &owner, &owner_fqn, member,
                 )?;
-                owner_fqn = go_resolve_inferred_type_fqn(support, go, &owner)?;
+                owner_fqn = go_resolve_inferred_type_fqn(support, token, go, &owner)?;
             }
             GoDefinitionMemberLookup::Ambiguous(candidates) => {
                 return Some(go_ambiguous_selector_outcome(support, member, candidates));
@@ -1397,12 +1441,13 @@ fn go_package_variable_binding<'tree>(
 
 fn go_external_import_in_expression(
     support: &dyn GoDefinitionProvider,
+    token: QueryToken<'_>,
     go: &GoAnalyzer,
     file: &ProjectFile,
     source: &str,
     expression: Node<'_>,
 ) -> Option<String> {
-    let imports = go_import_paths(support, go, file);
+    let imports = go_import_paths(support, token, go, file);
     let mut stack = vec![expression];
     while let Some(node) = stack.pop() {
         if !support.scope_step() {
@@ -1479,13 +1524,14 @@ fn go_model_symbol_outcome(
 fn go_dot_import_paths(
     go: &crate::analyzer::GoAnalyzer,
     support: &dyn GoDefinitionProvider,
+    token: QueryToken<'_>,
     file: &ProjectFile,
 ) -> Vec<String> {
     if support.session().is_none() {
-        return go.definition_import_namespaces(file).1;
+        return go.definition_import_namespaces(token, file).1;
     }
     support
-        .import_infos(go, file)
+        .import_infos(token, go, file)
         .into_iter()
         .filter_map(|import| {
             (import.alias.as_deref() == Some("."))
@@ -1498,6 +1544,7 @@ fn go_dot_import_paths(
 #[allow(clippy::too_many_arguments)]
 fn resolve_go_local_selector_chain(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -1515,6 +1562,7 @@ fn resolve_go_local_selector_chain(
     let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
     let mut owner_inferred = go_expression_inferred_type(
         analyzer,
+        token,
         support,
         file,
         source,
@@ -1524,11 +1572,12 @@ fn resolve_go_local_selector_chain(
     );
     let mut owner_fqn = owner_inferred
         .as_ref()
-        .and_then(|owner| go_resolve_inferred_type_fqn(support, go, owner))
+        .and_then(|owner| go_resolve_inferred_type_fqn(support, token, go, owner))
         .or_else(|| {
             selector.base_identifier(source).and_then(|base| {
                 go_binding_type_fqn(
                     analyzer,
+                    token,
                     support,
                     file,
                     source,
@@ -1552,12 +1601,13 @@ fn resolve_go_local_selector_chain(
         let lookup = match owner_inferred.as_ref() {
             Some(owner) => go_indexed_field_lookup_with_method_set(
                 analyzer,
+                token,
                 support,
                 &owner_fqn,
                 member,
                 Some(owner),
             ),
-            None => go_indexed_field_lookup(analyzer, support, &owner_fqn, member),
+            None => go_indexed_field_lookup(analyzer, token, support, &owner_fqn, member),
         };
         if let GoDefinitionMemberLookup::Ambiguous(candidates) = &lookup {
             return Some(go_ambiguous_selector_outcome(
@@ -1580,13 +1630,14 @@ fn resolve_go_local_selector_chain(
             };
         }
         if let Some(owner) = owner_inferred.take() {
-            let Some(next_owner) =
-                go_field_inferred_type_for_receiver(analyzer, support, &owner, &owner_fqn, member)
-            else {
+            let Some(next_owner) = go_field_inferred_type_for_receiver(
+                analyzer, token, support, &owner, &owner_fqn, member,
+            ) else {
                 return deepest_workspace_field
                     .map(|candidates| go_partial_selector_chain_outcome(candidates, member));
             };
-            let Some(next_owner_fqn) = go_resolve_inferred_type_fqn(support, go, &next_owner)
+            let Some(next_owner_fqn) =
+                go_resolve_inferred_type_fqn(support, token, go, &next_owner)
             else {
                 return deepest_workspace_field
                     .map(|candidates| go_partial_selector_chain_outcome(candidates, member));
@@ -1594,7 +1645,8 @@ fn resolve_go_local_selector_chain(
             owner_fqn = next_owner_fqn;
             owner_inferred = Some(next_owner);
         } else {
-            let Some(next_owner) = go_indexed_field_type_fqn(analyzer, support, &owner_fqn, member)
+            let Some(next_owner) =
+                go_indexed_field_type_fqn(analyzer, token, support, &owner_fqn, member)
             else {
                 return deepest_workspace_field
                     .map(|candidates| go_partial_selector_chain_outcome(candidates, member));
@@ -1636,8 +1688,10 @@ fn go_partial_selector_chain_outcome(
     outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 fn go_binding_type_fqn(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -1645,12 +1699,15 @@ fn go_binding_type_fqn(
     name: &str,
     byte: usize,
 ) -> Option<String> {
-    go_receiver_binding_type_fqn(analyzer, support, file, source, root, name, byte)
-        .or_else(|| go_local_binding_type_fqn(analyzer, support, file, source, root, name, byte))
+    go_receiver_binding_type_fqn(analyzer, token, support, file, source, root, name, byte).or_else(
+        || go_local_binding_type_fqn(analyzer, token, support, file, source, root, name, byte),
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn go_receiver_binding_type_fqn(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -1659,7 +1716,7 @@ fn go_receiver_binding_type_fqn(
     byte: usize,
 ) -> Option<String> {
     let type_node = go_receiver_binding_type_node(support, root, source, name, byte)?;
-    go_resolve_type_fqn(analyzer, support, file, source, type_node)
+    go_resolve_type_fqn(analyzer, token, support, file, source, type_node)
 }
 
 fn go_receiver_binding_type_node<'tree>(
@@ -1689,8 +1746,10 @@ fn go_receiver_binding_type_node<'tree>(
 /// preceding `:=` or `var` declaration of `name`; the innermost match wins, so
 /// shadowing is respected. An `if`/`for` initializer is a named child of the
 /// statement node we walk through, so those bindings are covered too.
+#[allow(clippy::too_many_arguments)]
 fn go_local_binding_type_fqn(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -1706,14 +1765,14 @@ fn go_local_binding_type_fqn(
         if let Some(binding) = go_nearest_binding_in_scope(support, scope, source, name, byte) {
             return match binding {
                 GoLocalBinding::Type(type_node) => {
-                    go_resolve_type_fqn(analyzer, support, file, source, type_node)
+                    go_resolve_type_fqn(analyzer, token, support, file, source, type_node)
                 }
-                GoLocalBinding::Value(value_node) => {
-                    go_value_type_fqn(analyzer, support, file, source, root, value_node, byte)
-                }
-                GoLocalBinding::RangeElement(range_node) => {
-                    go_range_binding_type_fqn(analyzer, support, file, source, root, range_node)
-                }
+                GoLocalBinding::Value(value_node) => go_value_type_fqn(
+                    analyzer, token, support, file, source, root, value_node, byte,
+                ),
+                GoLocalBinding::RangeElement(range_node) => go_range_binding_type_fqn(
+                    analyzer, token, support, file, source, root, range_node,
+                ),
             };
         }
         scope = scope.parent()?;
@@ -1986,6 +2045,7 @@ enum GoTypeInferenceFrame<'tree> {
 #[allow(clippy::too_many_arguments)]
 fn go_expression_inferred_type(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -2110,7 +2170,7 @@ fn go_expression_inferred_type(
                                 let method_name = go_node_text(method, source);
                                 let imported = (qualifier.kind() == "identifier")
                                     .then(|| {
-                                        go_import_paths(support, go, file)
+                                        go_import_paths(support, token, go, file)
                                             .remove(go_node_text(qualifier, source))
                                     })
                                     .flatten()
@@ -2182,19 +2242,19 @@ fn go_expression_inferred_type(
             }
             GoTypeInferenceFrame::Field(field) => {
                 let owner = values.pop()?;
-                let owner_fqn = go_resolve_inferred_type_fqn(support, go, &owner)?;
+                let owner_fqn = go_resolve_inferred_type_fqn(support, token, go, &owner)?;
                 values.push(go_field_inferred_type_for_receiver(
-                    analyzer, support, &owner, &owner_fqn, &field,
+                    analyzer, token, support, &owner, &owner_fqn, &field,
                 )?);
             }
             GoTypeInferenceFrame::Method(method) => {
                 let owner = values.pop()?;
-                let owner_fqn = go_resolve_inferred_type_fqn(support, go, &owner)?;
+                let owner_fqn = go_resolve_inferred_type_fqn(support, token, go, &owner)?;
                 values.push(go_callable_return_inferred_type(
                     analyzer,
                     support,
                     go_indexed_member_candidates_for_receiver(
-                        analyzer, support, &owner_fqn, &method, &owner,
+                        analyzer, token, support, &owner_fqn, &method, &owner,
                     )?,
                 )?);
             }
@@ -2344,13 +2404,15 @@ fn go_inferred_types_equal(
 
 fn go_field_inferred_type_for_receiver(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     owner: &GoInferredType,
     owner_fqn: &str,
     field: &str,
 ) -> Option<GoInferredType> {
-    let candidate =
-        go_indexed_member_candidate_for_receiver(analyzer, support, owner_fqn, field, owner)?;
+    let candidate = go_indexed_member_candidate_for_receiver(
+        analyzer, token, support, owner_fqn, field, owner,
+    )?;
     let identity = go_field_unit_type_identity(analyzer, support, &candidate)?;
     Some(GoInferredType {
         identity,
@@ -2362,11 +2424,13 @@ fn go_field_inferred_type_for_receiver(
 
 fn go_resolve_inferred_type_fqn(
     support: &dyn GoDefinitionProvider,
+    token: QueryToken<'_>,
     go: &GoAnalyzer,
     inferred: &GoInferredType,
 ) -> Option<String> {
     go_resolve_structured_type_fqn(
         support,
+        token,
         go,
         &inferred.file,
         &inferred.package,
@@ -2374,8 +2438,10 @@ fn go_resolve_inferred_type_fqn(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn go_value_type_fqn(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -2383,11 +2449,15 @@ fn go_value_type_fqn(
     value_node: Node<'_>,
     byte: usize,
 ) -> Option<String> {
-    go_expression_type_fqn(analyzer, support, file, source, root, value_node, byte)
+    go_expression_type_fqn(
+        analyzer, token, support, file, source, root, value_node, byte,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn go_expression_type_fqn(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -2396,9 +2466,10 @@ fn go_expression_type_fqn(
     byte: usize,
 ) -> Option<String> {
     let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
-    let inferred =
-        go_expression_inferred_type(analyzer, support, file, source, root, expression, byte)?;
-    go_resolve_inferred_type_fqn(support, go, &inferred)
+    let inferred = go_expression_inferred_type(
+        analyzer, token, support, file, source, root, expression, byte,
+    )?;
+    go_resolve_inferred_type_fqn(support, token, go, &inferred)
 }
 
 fn go_type_lookup_expression<'tree>(
@@ -2477,6 +2548,7 @@ fn go_interface_method_owner_type_fqn(
 
 fn go_range_binding_type_fqn(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -2495,6 +2567,7 @@ fn go_range_binding_type_fqn(
     // create an unbounded type-inference cycle.
     let mut iterable_type = go_expression_inferred_type(
         analyzer,
+        token,
         support,
         file,
         source,
@@ -2507,6 +2580,7 @@ fn go_range_binding_type_fqn(
         .into_container_element_with(|| support.scope_step())?;
     go_resolve_inferred_type_fqn(
         support,
+        token,
         resolve_analyzer::<GoAnalyzer>(analyzer)?,
         &iterable_type,
     )
@@ -2584,16 +2658,18 @@ fn go_parameter_declaration_type_for_name<'tree>(
 
 fn go_indexed_field_type_fqn(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     owner_fqn: &str,
     field: &str,
 ) -> Option<String> {
     let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
     if let Some((field_unit, identity)) =
-        go_indexed_field_type_identity(analyzer, support, owner_fqn, field)
+        go_indexed_field_type_identity(analyzer, token, support, owner_fqn, field)
     {
         return go_resolve_structured_type_fqn(
             support,
+            token,
             go,
             field_unit.source(),
             field_unit.package_name(),
@@ -2603,18 +2679,20 @@ fn go_indexed_field_type_fqn(
     if support.session().is_some() {
         return None;
     }
-    let (field_file, type_text) = go_indexed_field_type(analyzer, support, owner_fqn, field)?;
-    go_resolve_go_field_type_fqn(analyzer, support, owner_fqn, &field_file, &type_text)
+    let (field_file, type_text) =
+        go_indexed_field_type(analyzer, token, support, owner_fqn, field)?;
+    go_resolve_go_field_type_fqn(analyzer, token, support, owner_fqn, &field_file, &type_text)
 }
 
 fn go_indexed_field_type_identity(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     owner_fqn: &str,
     field: &str,
 ) -> Option<(CodeUnit, StructuredTypeIdentity)> {
     let GoDefinitionMemberLookup::Unique(field_unit) =
-        go_indexed_field_lookup(analyzer, support, owner_fqn, field)
+        go_indexed_field_lookup(analyzer, token, support, owner_fqn, field)
     else {
         return None;
     };
@@ -2624,6 +2702,7 @@ fn go_indexed_field_type_identity(
 
 fn go_indexed_field_type(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     owner_fqn: &str,
     field: &str,
@@ -2631,7 +2710,7 @@ fn go_indexed_field_type(
     if support.session().is_some() {
         return None;
     }
-    match go_indexed_field_lookup(analyzer, support, owner_fqn, field) {
+    match go_indexed_field_lookup(analyzer, token, support, owner_fqn, field) {
         GoDefinitionMemberLookup::Unique(field_unit) => {
             go_field_unit_type_text(analyzer, support, &field_unit, field)
                 .map(|type_text| (field_unit.source().clone(), type_text))
@@ -2648,15 +2727,17 @@ enum GoDefinitionMemberLookup {
 
 fn go_indexed_field_lookup(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     owner_fqn: &str,
     field: &str,
 ) -> GoDefinitionMemberLookup {
-    go_indexed_field_lookup_with_method_set(analyzer, support, owner_fqn, field, None)
+    go_indexed_field_lookup_with_method_set(analyzer, token, support, owner_fqn, field, None)
 }
 
 fn go_indexed_member_candidate_for_receiver(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     owner_fqn: &str,
     member: &str,
@@ -2664,6 +2745,7 @@ fn go_indexed_member_candidate_for_receiver(
 ) -> Option<CodeUnit> {
     let GoDefinitionMemberLookup::Unique(candidate) = go_indexed_field_lookup_with_method_set(
         analyzer,
+        token,
         support,
         owner_fqn,
         member,
@@ -2676,17 +2758,19 @@ fn go_indexed_member_candidate_for_receiver(
 
 fn go_indexed_member_candidates_for_receiver(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     owner_fqn: &str,
     member: &str,
     receiver: &GoInferredType,
 ) -> Option<Vec<CodeUnit>> {
-    go_indexed_member_candidate_for_receiver(analyzer, support, owner_fqn, member, receiver)
+    go_indexed_member_candidate_for_receiver(analyzer, token, support, owner_fqn, member, receiver)
         .map(|candidate| vec![candidate])
 }
 
 fn go_indexed_field_lookup_with_method_set(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     owner_fqn: &str,
     field: &str,
@@ -2769,18 +2853,19 @@ fn go_indexed_field_lookup_with_method_set(
             }
             let owner = paths[path_index].owner.clone();
             let pointer_receivers = paths[path_index].pointer_receivers;
-            let embedded: Vec<(String, Option<bool>)> =
-                if let Some(pointer_receivers) = pointer_receivers {
-                    go_embedded_method_set_types(analyzer, support, &owner, pointer_receivers)
-                        .into_iter()
-                        .map(|(owner, pointer_receivers)| (owner, Some(pointer_receivers)))
-                        .collect()
-                } else {
-                    go_embedded_field_types(analyzer, support, &owner)
-                        .into_iter()
-                        .map(|owner| (owner, None))
-                        .collect()
-                };
+            let embedded: Vec<(String, Option<bool>)> = if let Some(pointer_receivers) =
+                pointer_receivers
+            {
+                go_embedded_method_set_types(analyzer, token, support, &owner, pointer_receivers)
+                    .into_iter()
+                    .map(|(owner, pointer_receivers)| (owner, Some(pointer_receivers)))
+                    .collect()
+            } else {
+                go_embedded_field_types(analyzer, token, support, &owner)
+                    .into_iter()
+                    .map(|owner| (owner, None))
+                    .collect()
+            };
             for (embedded_owner, embedded_pointer_receivers) in embedded {
                 let mut ancestor = Some(path_index);
                 let mut cycle = false;
@@ -3061,6 +3146,7 @@ impl GoPromotionTrace {
 
 fn go_embedded_method_set_types(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     owner_fqn: &str,
     inherited_pointer_receivers: bool,
@@ -3085,6 +3171,7 @@ fn go_embedded_method_set_types(
             let pointer_receivers = inherited_pointer_receivers || identity.is_pointer();
             if let Some(fqn) = go_resolve_structured_type_fqn(
                 support,
+                token,
                 go,
                 owner.source(),
                 owner.package_name(),
@@ -3097,7 +3184,7 @@ fn go_embedded_method_set_types(
             continue;
         }
         embedded.extend(
-            go_embedded_field_types(analyzer, support, owner_fqn)
+            go_embedded_field_types(analyzer, token, support, owner_fqn)
                 .into_iter()
                 .map(|fqn| (fqn, inherited_pointer_receivers)),
         );
@@ -3109,6 +3196,7 @@ fn go_embedded_method_set_types(
 
 fn go_embedded_field_types(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     owner_fqn: &str,
 ) -> Vec<String> {
@@ -3130,6 +3218,7 @@ fn go_embedded_field_types(
                 };
                 if let Some(fqn) = go_resolve_structured_type_fqn(
                     support,
+                    token,
                     go,
                     owner.source(),
                     owner.package_name(),
@@ -3146,6 +3235,7 @@ fn go_embedded_field_types(
             }
             if let Some(fqn) = go_resolve_go_field_type_fqn(
                 analyzer,
+                token,
                 support,
                 owner_fqn,
                 owner.source(),
@@ -3221,6 +3311,7 @@ fn go_field_unit_type_text(
 
 fn go_resolve_go_field_type_fqn(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     owner_fqn: &str,
     field_file: &ProjectFile,
@@ -3231,7 +3322,9 @@ fn go_resolve_go_field_type_fqn(
     }
     let (qualifier, name) = go_type_name_parts(type_text)?;
     if qualifier.is_some() {
-        return go_resolve_qualified_type_from_file(analyzer, support, field_file, type_text);
+        return go_resolve_qualified_type_from_file(
+            analyzer, token, support, field_file, type_text,
+        );
     }
     // fqname-M4: this is a plain-string owner/name split (the `FqName` "pop the
     // last segment" equivalent), but Go's package prefix is `/`-joined and can
@@ -3251,6 +3344,7 @@ fn go_resolve_go_field_type_fqn(
 
 fn go_resolve_structured_type_fqn(
     support: &dyn GoDefinitionProvider,
+    token: QueryToken<'_>,
     go: &GoAnalyzer,
     file: &ProjectFile,
     default_package: &str,
@@ -3260,7 +3354,7 @@ fn go_resolve_structured_type_fqn(
     match name.path() {
         [name] => go_resolve_exact_type_name_in_package(support, default_package, name),
         [qualifier, name] => {
-            let import_path = go_import_paths(support, go, file).remove(qualifier)?;
+            let import_path = go_import_paths(support, token, go, file).remove(qualifier)?;
             let fqn = format!("{import_path}.{name}");
             support.fqn_exists(&fqn).then_some(fqn)
         }
@@ -3270,6 +3364,7 @@ fn go_resolve_structured_type_fqn(
 
 fn go_resolve_qualified_type_from_file(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     type_text: &str,
@@ -3281,13 +3376,14 @@ fn go_resolve_qualified_type_from_file(
         return None;
     };
     let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
-    let import_path = go_import_paths(support, go, file).remove(qualifier)?;
+    let import_path = go_import_paths(support, token, go, file).remove(qualifier)?;
     let fqn = format!("{import_path}.{name}");
     support.fqn_exists(&fqn).then_some(fqn)
 }
 
 fn go_resolve_type_fqn(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -3300,7 +3396,7 @@ fn go_resolve_type_fqn(
         crate::analyzer::go::go_structured_type_identity_bounded(type_node, source, || {
             support.scope_step()
         })?;
-    go_resolve_structured_type_fqn(support, go, file, &package, &identity)
+    go_resolve_structured_type_fqn(support, token, go, file, &package, &identity)
 }
 
 fn go_syntax_root<'tree>(
@@ -3599,8 +3695,10 @@ import (
 
         let complete_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
         let complete_provider = AnalyzerGoDefinitionProvider::bounded(go, &complete_session, None);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let resolved =
-            go_resolve_structured_type_fqn(&complete_provider, go, &file, "main", &identity);
+            go_resolve_structured_type_fqn(&complete_provider, token, go, &file, "main", &identity);
         assert!(matches!(
             complete_session.finish(resolved),
             BoundedResolution::Complete {
@@ -3612,7 +3710,7 @@ import (
         let tiny_session = ResolutionSession::bounded(ReceiverAnalysisBudget::tiny(), None);
         let tiny_provider = AnalyzerGoDefinitionProvider::bounded(go, &tiny_session, None);
         let unresolved =
-            go_resolve_structured_type_fqn(&tiny_provider, go, &file, "main", &identity);
+            go_resolve_structured_type_fqn(&tiny_provider, token, go, &file, "main", &identity);
         assert!(matches!(
             tiny_session.finish(unresolved),
             BoundedResolution::Exceeded {

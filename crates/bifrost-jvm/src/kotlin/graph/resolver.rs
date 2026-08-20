@@ -25,6 +25,7 @@ use crate::kotlin::syntax::{
 };
 use crate::kotlin::types::{KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name};
 use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo, SignatureMetadata};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::named_children;
 use brokk_bifrost_core::analyzer::usages::common::node_text;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
@@ -107,14 +108,18 @@ pub struct TargetSpec {
 }
 
 impl TargetSpec {
-    pub fn from_targets(graph: &KotlinGraphSource<'_>, targets: &[CodeUnit]) -> Option<Self> {
+    pub fn from_targets(
+        graph: &KotlinGraphSource<'_>,
+        token: QueryToken<'_>,
+        targets: &[CodeUnit],
+    ) -> Option<Self> {
         // Kotlin overloads collapse into one indexed identity: two functions
         // with the same fully-qualified name become a single `CodeUnit` carrying
         // several signatures. So the overload set a caller passes describes one
         // declaration, and the first entry is enough to identify it — but a
         // caller may still pass several distinct units (duplicate source copies
         // of one fully-qualified name), and every one of their arities counts.
-        let mut spec = Self::from_target(graph, targets.first()?)?;
+        let mut spec = Self::from_target(graph, token, targets.first()?)?;
         if let Some(arities) = spec.callable_arities.as_mut() {
             for extra in targets.iter().skip(1) {
                 if extra.fq_name() == spec.fq_name {
@@ -125,7 +130,11 @@ impl TargetSpec {
         Some(spec)
     }
 
-    pub fn from_target(graph: &KotlinGraphSource<'_>, target: &CodeUnit) -> Option<Self> {
+    pub fn from_target(
+        graph: &KotlinGraphSource<'_>,
+        token: QueryToken<'_>,
+        target: &CodeUnit,
+    ) -> Option<Self> {
         let fq_name = target.fq_name();
         if target.is_class() || is_kotlin_type_alias(graph, target) {
             return Some(Self {
@@ -175,7 +184,7 @@ impl TargetSpec {
         // the published signature metadata (issue #1345) is a structured check;
         // the spelling is resolved in the *declaring* file's scope, because a
         // spelled type means whatever the file that wrote it says it means.
-        if let Some(extended) = extension_receiver_fq_name(graph, target) {
+        if let Some(extended) = extension_receiver_fq_name(graph, token, target) {
             receiver_owner_fq_names.insert(extended);
         }
         if kind == TargetKind::Function
@@ -274,6 +283,7 @@ fn companion_host_of(graph: &KotlinGraphSource<'_>, unit: &CodeUnit) -> Option<S
 /// extension.
 pub fn extension_receiver_fq_name(
     graph: &KotlinGraphSource<'_>,
+    token: QueryToken<'_>,
     unit: &CodeUnit,
 ) -> Option<String> {
     let spelled = graph
@@ -282,7 +292,7 @@ pub fn extension_receiver_fq_name(
         .into_iter()
         .find_map(|entry| entry.extension_receiver_type().map(str::to_string))?;
     let byte = graph.index.ranges(unit).into_iter().min()?.start_byte;
-    KotlinNameResolver::for_declaration(graph, unit).resolve_type_fqn(&spelled, byte)
+    KotlinNameResolver::for_declaration(graph, token, unit).resolve_type_fqn(&spelled, byte)
 }
 
 // ---------------------------------------------------------------------------
@@ -342,8 +352,12 @@ pub trait KotlinResolutionCtx {
 }
 
 /// Whether a reference through `receiver` names the target.
-pub fn receiver_matches_target(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) -> ReceiverTargetMatch {
-    match receiver_type_fq_name(receiver, ctx, 0) {
+pub fn receiver_matches_target(
+    receiver: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut ScanCtx<'_>,
+) -> ReceiverTargetMatch {
+    match receiver_type_fq_name(receiver, token, ctx, 0) {
         Some(fqn) => receiver_type_matches_target(&fqn, ctx),
         None => ReceiverTargetMatch::Unresolved,
     }
@@ -483,6 +497,7 @@ pub fn receiver_is_same_owner(receiver: Node<'_>, ctx: &mut impl KotlinResolutio
 /// The fully-qualified name of the type the expression `node` evaluates to.
 pub fn receiver_type_fq_name(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &mut impl KotlinResolutionCtx,
     depth: usize,
 ) -> Option<String> {
@@ -522,7 +537,7 @@ pub fn receiver_type_fq_name(
             }
             ctx.resolve_type_fqn(&name, node.start_byte())
         }
-        "call_expression" => call_result_type_fq_name(node, ctx, depth),
+        "call_expression" => call_result_type_fq_name(node, token, ctx, depth),
         kind if kotlin_is_navigation_kind(kind) => {
             let member = kotlin_navigation_member(node)?;
             let member_name = node_text(member, ctx.source()).to_string();
@@ -532,8 +547,8 @@ pub fn receiver_type_fq_name(
             if let Some(fqn) = navigation_type_fq_name(node, ctx) {
                 return Some(fqn);
             }
-            let receiver_fqn = receiver_type_fq_name(receiver, ctx, depth + 1)?;
-            member_declared_type(&receiver_fqn, &member_name, None, ctx)
+            let receiver_fqn = receiver_type_fq_name(receiver, token, ctx, depth + 1)?;
+            member_declared_type(&receiver_fqn, token, &member_name, None, ctx)
         }
         "as_expression" => named_children(node)
             .into_iter()
@@ -594,6 +609,7 @@ fn navigation_type_fq_name(
 /// otherwise the callee's declared return type.
 fn call_result_type_fq_name(
     call: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &mut impl KotlinResolutionCtx,
     depth: usize,
 ) -> Option<String> {
@@ -613,7 +629,7 @@ fn call_result_type_fq_name(
                 return Some(fqn);
             }
             let unit = bare_callable_unit(&name, arity, callee, ctx)?;
-            declared_type_of(&unit, ctx)
+            declared_type_of(&unit, token, ctx)
         }
         kind if kotlin_is_navigation_kind(kind) => {
             let member = kotlin_navigation_member(callee)?;
@@ -623,8 +639,8 @@ fn call_result_type_fq_name(
             if let Some(fqn) = navigation_type_fq_name(callee, ctx) {
                 return Some(fqn);
             }
-            let receiver_fqn = receiver_type_fq_name(receiver, ctx, depth + 1)?;
-            member_declared_type(&receiver_fqn, &member_name, Some(arity), ctx)
+            let receiver_fqn = receiver_type_fq_name(receiver, token, ctx, depth + 1)?;
+            member_declared_type(&receiver_fqn, token, &member_name, Some(arity), ctx)
         }
         _ => None,
     }
@@ -742,6 +758,7 @@ fn declared_member_unit(
 /// disagree about whether a call is a usage of the extension.
 pub fn visible_extension_unit(
     member_name: &str,
+    token: QueryToken<'_>,
     owner_fqn: &str,
     byte: usize,
     ctx: &mut impl KotlinResolutionCtx,
@@ -753,13 +770,14 @@ pub fn visible_extension_unit(
         .iter()
         .find(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
         .cloned()?;
-    (extension_receiver_fq_name(graph, &unit)? == owner_fqn).then_some(unit)
+    (extension_receiver_fq_name(graph, token, &unit)? == owner_fqn).then_some(unit)
 }
 
 /// The declared type of the member `member_name` on a receiver of type
 /// `owner_fqn`.
 fn member_declared_type(
     owner_fqn: &str,
+    token: QueryToken<'_>,
     member_name: &str,
     arity: Option<usize>,
     ctx: &mut impl KotlinResolutionCtx,
@@ -771,7 +789,7 @@ fn member_declared_type(
         return Some(nested);
     }
     let unit = member_unit(owner_fqn, member_name, arity, ctx)?;
-    declared_type_of(&unit, ctx)
+    declared_type_of(&unit, token, ctx)
 }
 
 /// The fully-qualified name of the type `unit` declares, from the published
@@ -779,17 +797,25 @@ fn member_declared_type(
 ///
 /// Cached per declaration for the duration of one file scan: a chain expression
 /// asks the same question of the same callee once per link.
-pub fn declared_type_of(unit: &CodeUnit, ctx: &mut impl KotlinResolutionCtx) -> Option<String> {
+pub fn declared_type_of(
+    unit: &CodeUnit,
+    token: QueryToken<'_>,
+    ctx: &mut impl KotlinResolutionCtx,
+) -> Option<String> {
     let key = unit.fq_name();
     if let Some(cached) = ctx.declared_type_cache().get(&key) {
         return cached.clone();
     }
-    let resolved = declared_type_of_uncached(unit, ctx.graph());
+    let resolved = declared_type_of_uncached(unit, token, ctx.graph());
     ctx.declared_type_cache().insert(key, resolved.clone());
     resolved
 }
 
-fn declared_type_of_uncached(unit: &CodeUnit, graph: &KotlinGraphSource<'_>) -> Option<String> {
+fn declared_type_of_uncached(
+    unit: &CodeUnit,
+    token: QueryToken<'_>,
+    graph: &KotlinGraphSource<'_>,
+) -> Option<String> {
     // An enum entry writes no type: it is an instance of its own enum.
     if unit.is_field()
         && let Some(parent) = graph.index.parent_of(unit)
@@ -804,7 +830,7 @@ fn declared_type_of_uncached(unit: &CodeUnit, graph: &KotlinGraphSource<'_>) -> 
         .into_iter()
         .find_map(|entry| entry.return_type_text().map(str::to_string))?;
     let byte = graph.index.ranges(unit).into_iter().min()?.start_byte;
-    KotlinNameResolver::for_declaration(graph, unit).resolve_type_fqn(&spelled, byte)
+    KotlinNameResolver::for_declaration(graph, token, unit).resolve_type_fqn(&spelled, byte)
 }
 
 /// The workspace type declaration named `fqn`, if there is one.
@@ -881,6 +907,7 @@ pub struct KotlinNameResolver<'a> {
 impl<'a> KotlinNameResolver<'a> {
     pub fn new(
         graph: &'a KotlinGraphSource<'a>,
+        token: QueryToken<'_>,
         file: &'a ProjectFile,
         root: tree_sitter::Node<'_>,
         source: &str,
@@ -896,7 +923,7 @@ impl<'a> KotlinNameResolver<'a> {
                 package_name: kotlin_package_name(root, source),
                 imports: graph
                     .imports
-                    .map(|provider| provider.import_info_of(file))
+                    .map(|provider| provider.import_info_of(token, file))
                     .unwrap_or_default(),
             },
             owners_at: RefCell::new(Vec::new()),
@@ -910,7 +937,11 @@ impl<'a> KotlinNameResolver<'a> {
     /// receiver, a callee's return type — in the scope of the file that wrote it
     /// costs no parse. That is what makes issue #1345's published facts a
     /// saving rather than a reordering.
-    pub fn for_declaration(graph: &'a KotlinGraphSource<'a>, unit: &'a CodeUnit) -> Self {
+    pub fn for_declaration(
+        graph: &'a KotlinGraphSource<'a>,
+        token: QueryToken<'_>,
+        unit: &'a CodeUnit,
+    ) -> Self {
         Self {
             graph,
             file: unit.source(),
@@ -918,7 +949,7 @@ impl<'a> KotlinNameResolver<'a> {
                 package_name: unit.package_name().to_string(),
                 imports: graph
                     .imports
-                    .map(|provider| provider.import_info_of(unit.source()))
+                    .map(|provider| provider.import_info_of(token, unit.source()))
                     .unwrap_or_default(),
             },
             owners_at: RefCell::new(Vec::new()),

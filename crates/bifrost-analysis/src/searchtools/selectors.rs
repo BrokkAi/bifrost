@@ -4,7 +4,10 @@ use super::*;
 // evidence has no equivalent in another supported language. Bounded selector projections
 // use the generic language capability, which keeps the framework out of C++ analyzer internals.
 use crate::analyzer::languages::language_support;
+#[cfg(test)]
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CallableLinkage, CppCallableUnitRole, cpp_header_body_files_are_related};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 pub(super) type DefinitionCandidateKey = (
     String,
@@ -269,6 +272,7 @@ impl CppIdentityRenderCache {
     pub(super) fn canonical_selector(
         &mut self,
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         unit: &CodeUnit,
     ) -> Option<String> {
         if language_for_target(unit) != Language::Cpp || !unit.is_callable() {
@@ -281,7 +285,7 @@ impl CppIdentityRenderCache {
                 .filter(|candidate| language_for_target(candidate) == Language::Cpp)
                 .collect();
             self.canonical_selectors
-                .extend(cpp_canonical_selectors(analyzer, &definitions));
+                .extend(cpp_canonical_selectors(analyzer, token, &definitions));
         }
         self.canonical_selectors
             .get(unit)
@@ -415,13 +419,14 @@ impl DefinitionCandidateRenderCache {
     fn identity_metadata(
         &mut self,
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         unit: &CodeUnit,
         range: &Range,
     ) -> (Option<String>, Option<String>) {
         if language_for_target(unit) != Language::Cpp || !unit.is_callable() {
             return (None, None);
         }
-        let canonical_selector = self.cpp_identity.canonical_selector(analyzer, unit);
+        let canonical_selector = self.cpp_identity.canonical_selector(analyzer, token, unit);
         let occurrence_role = self.cpp_identity.occurrence_role(analyzer, unit, range);
         (canonical_selector, occurrence_role)
     }
@@ -429,13 +434,14 @@ impl DefinitionCandidateRenderCache {
     fn candidate_from_range(
         &mut self,
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         unit: &CodeUnit,
         range: Range,
         identity_range: &Range,
         columns: Option<(usize, usize)>,
     ) -> DefinitionCandidate {
         let (canonical_selector, occurrence_role) =
-            self.identity_metadata(analyzer, unit, identity_range);
+            self.identity_metadata(analyzer, token, unit, identity_range);
         let mut candidate = definition_candidate_from_range_base(analyzer, unit, range, columns);
         candidate.canonical_selector = canonical_selector;
         candidate.occurrence_role = occurrence_role;
@@ -445,25 +451,28 @@ impl DefinitionCandidateRenderCache {
 
 pub(super) fn definition_candidates(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     units: &[CodeUnit],
 ) -> Vec<DefinitionCandidate> {
     let mut render_cache = DefinitionCandidateRenderCache::default();
-    definition_candidates_with_cache(analyzer, units, &mut render_cache)
+    definition_candidates_with_cache(analyzer, token, units, &mut render_cache)
 }
 
 pub(super) fn definition_candidates_with_cache(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     units: &[CodeUnit],
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> Vec<DefinitionCandidate> {
     units
         .iter()
-        .filter_map(|unit| definition_candidate_with_cache(analyzer, unit, render_cache))
+        .filter_map(|unit| definition_candidate_with_cache(analyzer, token, unit, render_cache))
         .collect()
 }
 
 pub(super) fn navigation_candidates_with_cache(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     targets: &[crate::analyzer::usages::get_definition::NavigationTarget],
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> Vec<DefinitionCandidate> {
@@ -478,6 +487,7 @@ pub(super) fn navigation_candidates_with_cache(
             })?;
             Some(render_cache.candidate_from_range(
                 analyzer,
+                token,
                 &target.code_unit,
                 range,
                 &identity_range,
@@ -489,12 +499,13 @@ pub(super) fn navigation_candidates_with_cache(
 
 pub(super) fn definition_candidate_with_cache(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     unit: &CodeUnit,
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> Option<DefinitionCandidate> {
     let (range, columns) = render_cache.display_range(analyzer, unit)?;
     let identity_range = render_cache.cpp_identity.primary_range(analyzer, unit)?;
-    Some(render_cache.candidate_from_range(analyzer, unit, range, &identity_range, columns))
+    Some(render_cache.candidate_from_range(analyzer, token, unit, range, &identity_range, columns))
 }
 
 #[cfg(test)]
@@ -504,8 +515,10 @@ pub(super) fn definition_candidate_from_range(
     range: Range,
     columns: Option<(usize, usize)>,
 ) -> DefinitionCandidate {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     DefinitionCandidateRenderCache::default()
-        .candidate_from_range(analyzer, unit, range, &range, columns)
+        .candidate_from_range(analyzer, token, unit, range, &range, columns)
 }
 
 fn definition_candidate_from_range_base(
@@ -697,6 +710,14 @@ pub(super) fn anchor_scoped_codeunit_resolution(
     anchor: &str,
     lookup: &str,
 ) -> CodeUnitResolution {
+    let exact: Vec<_> = resolve_codeunit_exact(analyzer, lookup)
+        .into_iter()
+        .filter(|unit| rel_path_string(unit.source()) == anchor)
+        .collect();
+    if !exact.is_empty() {
+        return CodeUnitResolution::Resolved(exact);
+    }
+
     resolve_codeunit_fuzzy_with(analyzer, lookup, |unit| {
         rel_path_string(unit.source()) == anchor
     })
@@ -708,10 +729,11 @@ pub(super) fn anchor_scoped_codeunit_resolution(
 /// spans multiple selectors is ambiguous and returns requestable selectors.
 pub(super) fn resolve_selectable_definitions(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     input: &str,
     resolve: impl Fn(&dyn IAnalyzer, &str) -> CodeUnitResolution,
 ) -> SelectableDefinitionResolution {
-    resolve_selectable_definitions_bounded(analyzer, input, |analyzer, lookup| {
+    resolve_selectable_definitions_bounded(analyzer, token, input, |analyzer, lookup| {
         Ok(resolve(analyzer, lookup))
     })
     .expect("an unbounded selectable resolution has no stop condition")
@@ -724,11 +746,12 @@ pub(super) fn resolve_selectable_definitions(
 /// the whole fan-out the first call declined.
 pub(super) fn resolve_selectable_definitions_bounded(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     input: &str,
     resolve: impl Fn(&dyn IAnalyzer, &str) -> Result<CodeUnitResolution, FuzzyResolveStop>,
 ) -> Result<SelectableDefinitionResolution, FuzzyResolveStop> {
     Ok(
-        match resolve_selectable_definition_groups_bounded(analyzer, input, resolve)? {
+        match resolve_selectable_definition_groups_bounded(analyzer, token, input, resolve)? {
             SelectableDefinitionGroups::NotFound(missing) => {
                 SelectableDefinitionResolution::NotFound(missing)
             }
@@ -749,10 +772,11 @@ pub(super) fn resolve_selectable_definitions_bounded(
 /// distinct definition the selector names, each with its requestable selector.
 pub(super) fn resolve_selectable_definition_groups(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     input: &str,
     resolve: impl Fn(&dyn IAnalyzer, &str) -> CodeUnitResolution,
 ) -> SelectableDefinitionGroups {
-    resolve_selectable_definition_groups_bounded(analyzer, input, |analyzer, lookup| {
+    resolve_selectable_definition_groups_bounded(analyzer, token, input, |analyzer, lookup| {
         Ok(resolve(analyzer, lookup))
     })
     .expect("an unbounded selectable resolution has no stop condition")
@@ -760,6 +784,7 @@ pub(super) fn resolve_selectable_definition_groups(
 
 fn resolve_selectable_definition_groups_bounded(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     input: &str,
     resolve: impl Fn(&dyn IAnalyzer, &str) -> Result<CodeUnitResolution, FuzzyResolveStop>,
 ) -> Result<SelectableDefinitionGroups, FuzzyResolveStop> {
@@ -823,7 +848,7 @@ fn resolve_selectable_definition_groups_bounded(
                 ));
             }
             let candidate_names = if looks_like_extensionless_path_anchor(anchor) {
-                code_unit_match_names(analyzer, &global_candidates)
+                code_unit_match_names(analyzer, token, &global_candidates)
             } else {
                 Vec::new()
             };
@@ -843,7 +868,7 @@ fn resolve_selectable_definition_groups_bounded(
         None => code_units,
     };
 
-    let groups = distinct_definitions(analyzer, code_units);
+    let groups = distinct_definitions(analyzer, token, code_units);
     Ok(if groups.is_empty() {
         SelectableDefinitionGroups::NotFound(symbol_not_found_input(input))
     } else {
@@ -1221,6 +1246,7 @@ fn cpp_callable_linkage_from_metadata(
 
 fn cpp_selector_definitions_share_identity_evidence(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     facts: &CppSelectorFacts,
     left: &CodeUnit,
     right: &CodeUnit,
@@ -1230,11 +1256,12 @@ fn cpp_selector_definitions_share_identity_evidence(
             && left.signature() == right.signature()
             && matches!(facts.linkage(left), Some(CallableLinkage::External))
             && matches!(facts.linkage(right), Some(CallableLinkage::External))
-            && cpp_header_body_files_are_related(analyzer, left.source(), right.source()))
+            && cpp_header_body_files_are_related(analyzer, token, left.source(), right.source()))
 }
 
 fn cpp_callable_family_selectors(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     facts: &CppSelectorFacts,
     same_signature: &[CodeUnit],
 ) -> HashMap<CodeUnit, String> {
@@ -1266,6 +1293,7 @@ fn cpp_callable_family_selectors(
             .filter(|definition| {
                 cpp_selector_definitions_share_identity_evidence(
                     analyzer,
+                    token,
                     facts,
                     declaration,
                     definition,
@@ -1321,14 +1349,16 @@ fn cpp_callable_family_selectors(
 
 fn cpp_canonical_selectors(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     units: &[CodeUnit],
 ) -> HashMap<CodeUnit, String> {
     let facts = CppSelectorFacts::load(analyzer, units);
-    cpp_canonical_selectors_with_facts(analyzer, units, &facts)
+    cpp_canonical_selectors_with_facts(analyzer, token, units, &facts)
 }
 
 fn cpp_canonical_selectors_with_facts(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     units: &[CodeUnit],
     facts: &CppSelectorFacts,
 ) -> HashMap<CodeUnit, String> {
@@ -1346,7 +1376,7 @@ fn cpp_canonical_selectors_with_facts(
     let mut families_by_fqn_signature: HashMap<(String, Vec<String>), HashSet<String>> =
         HashMap::default();
     for ((fqn, signature), members) in &by_fqn_signature {
-        for (member, family) in cpp_callable_family_selectors(analyzer, facts, members) {
+        for (member, family) in cpp_callable_family_selectors(analyzer, token, facts, members) {
             family_by_unit.insert(member, family.clone());
             families_by_fqn_signature
                 .entry((fqn.clone(), signature.clone()))
@@ -1410,6 +1440,7 @@ fn cpp_canonical_selectors_with_facts(
 /// domain so each ambiguity candidate can be re-queried without looping.
 pub(super) fn distinct_definitions(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     overloads: Vec<CodeUnit>,
 ) -> Vec<(String, Vec<CodeUnit>)> {
     // An FQN's units are file-anchored into distinct `path#fqn` candidates for
@@ -1439,12 +1470,19 @@ pub(super) fn distinct_definitions(
     // languages still render file-anchored there).
     let mut domains_by_fqn: HashMap<String, HashSet<(Language, Option<String>)>> =
         HashMap::default();
+    let mut scala_fqns_by_display: HashMap<String, HashSet<String>> = HashMap::default();
     let cpp_facts = CppSelectorFacts::load(analyzer, &overloads);
-    let cpp_canonical = cpp_canonical_selectors_with_facts(analyzer, &overloads, &cpp_facts);
+    let cpp_canonical = cpp_canonical_selectors_with_facts(analyzer, token, &overloads, &cpp_facts);
     let mut files_by_fqn_signature: HashMap<(String, Vec<String>), HashSet<String>> =
         HashMap::default();
     for unit in &overloads {
         let language = language_for_target(unit);
+        if language == Language::Scala {
+            scala_fqns_by_display
+                .entry(display_symbol_for_target(unit))
+                .or_default()
+                .insert(unit.fq_name());
+        }
         let module_path = UsageEcosystem::of(language)
             .is_module_scoped()
             .then(|| rel_path_string(unit.source()));
@@ -1482,11 +1520,24 @@ pub(super) fn distinct_definitions(
         let cross_domain = domains_by_fqn
             .get(&fqn)
             .is_some_and(|domains| domains.len() > 1);
+        let scala_companion_display = (language_for_target(&unit) == Language::Scala)
+            .then(|| display_symbol_for_target(&unit))
+            .filter(|display| {
+                scala_fqns_by_display
+                    .get(display)
+                    .is_some_and(|fqns| fqns.len() > 1)
+            });
         let selector = if cross_domain || collision_split_fqns.contains(&fqn) {
             cpp_canonical
                 .get(&unit)
                 .cloned()
                 .unwrap_or_else(|| file_anchored_definition_selector(&unit))
+        } else if let Some(display) = scala_companion_display {
+            // Scala companion classes and objects have distinct indexed
+            // identities (`Atom` and `Atom$`) but one source-written,
+            // summary-visible name. Group only that pair under its addressable
+            // spelling; constructors retain their distinct selector (#2451).
+            display
         } else {
             definition_selector(&unit)
         };
@@ -1512,8 +1563,12 @@ pub(super) fn prefer_exact_lookup_matches(overloads: Vec<CodeUnit>, lookup: &str
     }
 }
 
-pub(super) fn code_unit_match_names(analyzer: &dyn IAnalyzer, matches: &[CodeUnit]) -> Vec<String> {
-    distinct_definitions(analyzer, matches.to_vec())
+pub(super) fn code_unit_match_names(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    matches: &[CodeUnit],
+) -> Vec<String> {
+    distinct_definitions(analyzer, token, matches.to_vec())
         .into_iter()
         .map(|(selector, _)| selector)
         .collect()
@@ -1842,12 +1897,14 @@ mod tests {
     ) {
         let fixture = AnalyzerFixture::new_for_language(language, files);
         let fresh = fixture.analyzer.analyzer();
+        let scope = AnalyzerQueryScope::new(fresh);
+        let token = scope.token();
         let fresh_definitions: Vec<_> = fresh.definitions(lookup).collect();
         assert!(
             fresh_definitions.len() >= 2,
             "{language:?} fixture must produce at least two definitions for `{lookup}`, got {fresh_definitions:?}"
         );
-        let expected = distinct_definitions(fresh, fresh_definitions);
+        let expected = distinct_definitions(fresh, token, fresh_definitions);
 
         let reopened = WorkspaceAnalyzer::build(
             Arc::new(fixture.test_project().clone()),
@@ -1862,7 +1919,7 @@ mod tests {
         );
 
         reset_full_hydration_count(analyzer);
-        let groups = distinct_definitions(analyzer, definitions);
+        let groups = distinct_definitions(analyzer, token, definitions);
         assert_eq!(
             expected, groups,
             "{language:?} selectors must match between a fresh and a reopened workspace"
@@ -2208,7 +2265,9 @@ mod tests {
         assert_eq!(2, definitions.len());
 
         cpp.reset_full_hydration_count_for_test();
-        let selectors = cpp_canonical_selectors(analyzer, &definitions);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let selectors = cpp_canonical_selectors(analyzer, token, &definitions);
         assert!(
             selectors
                 .values()

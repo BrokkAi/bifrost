@@ -14,7 +14,7 @@ use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT,
 };
 use brokk_bifrost_core::analyzer::structural::occurrences::{
-    NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport,
+    OccurrenceRole, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
     LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
@@ -301,6 +301,52 @@ fn const_element_value(node: Node<'_>) -> Option<Node<'_>> {
     first_child_not_named_kind(node, "name").map(expression_target_node)
 }
 
+static PHP_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport =
+    OccurrenceRoleSupport::NONE.supported(OccurrenceRole::MemberPosition);
+
+fn php_member_name_node(node: Node<'_>) -> Option<Node<'_>> {
+    let node = expression_target_node(node);
+    match node.kind() {
+        "name" => Some(node),
+        "variable_name" => first_named_child(node),
+        _ => None,
+    }
+}
+
+fn php_member_position(node: Node<'_>) -> Option<OccurrenceRole> {
+    if node.kind() != "name" {
+        return None;
+    }
+
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        let member = match parent.kind() {
+            "member_call_expression"
+            | "nullsafe_member_call_expression"
+            | "member_access_expression"
+            | "nullsafe_member_access_expression"
+            | "scoped_call_expression"
+            | "scoped_property_access_expression" => parent.child_by_field_name("name")?,
+            "class_constant_access_expression" => last_named_child(parent)?,
+            _ => {
+                if matches!(
+                    parent.kind(),
+                    "expression" | "parenthesized_expression" | "variable_name"
+                ) {
+                    current = parent;
+                    continue;
+                }
+                return None;
+            }
+        };
+
+        return php_member_name_node(member)
+            .is_some_and(|name| name.id() == node.id())
+            .then_some(OccurrenceRole::MemberPosition);
+    }
+    None
+}
+
 impl StructuralSpec for PhpStructuralSpec {
     fn language(&self) -> Language {
         Language::Php
@@ -356,11 +402,8 @@ impl StructuralSpec for PhpStructuralSpec {
                 .any(|(_, fact_kind)| fact_kind.satisfies(kind))
     }
 
-    /// PHP has not learned occurrence-role classification yet (#1473).
-    /// The empty table is the honest answer: queries and assertions that ask
-    /// for an occurrence role here report incomplete rather than clean-empty.
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
-        &NO_OCCURRENCE_ROLE_SUPPORT
+        &PHP_OCCURRENCE_ROLE_SUPPORT
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
@@ -380,6 +423,10 @@ impl StructuralSpec for PhpStructuralSpec {
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
+        if let Some(role) = php_member_position(node) {
+            sink.occurrence_role(node, role);
+        }
+
         match kind {
             NormalizedKind::Call => {
                 let function = if node.kind() == "object_creation_expression" {
@@ -510,5 +557,105 @@ impl StructuralSpec for PhpStructuralSpec {
             },
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::php_member_position;
+    use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
+    use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
+    use tree_sitter::Parser;
+
+    fn parse(source: &str) -> tree_sitter::Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .expect("PHP grammar is valid");
+        let tree = parser.parse(source, None).expect("PHP source parses");
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        tree
+    }
+
+    fn identifier_roles(source: &str) -> Vec<(String, Option<OccurrenceRole>)> {
+        let tree = parse(source);
+        let mut pending = vec![tree.root_node()];
+        let mut identifiers = Vec::new();
+        while let Some(node) = pending.pop() {
+            if node.kind() == "name" {
+                identifiers.push((
+                    node.utf8_text(source.as_bytes())
+                        .expect("name has valid source span")
+                        .to_owned(),
+                    php_member_position(node),
+                ));
+            }
+            pending.extend(
+                (0..node.named_child_count())
+                    .rev()
+                    .filter_map(|index| node.named_child(index)),
+            );
+        }
+        identifiers
+    }
+
+    #[test]
+    fn member_positions_follow_php_member_fields_only() {
+        let source = r#"<?php
+            class Service {
+                public string $field;
+                public function run(string $label): void {}
+                public static function build(): self { }
+            }
+
+            function caller(Service $service, string $label, array $items): void {
+                $service->run(label: $label);
+                $service?->field;
+                Service::build();
+                Service::$field;
+                Service::class;
+                $items['run'];
+                $service->field;
+            }
+        "#;
+
+        let identifiers = identifier_roles(source);
+        let members = identifiers
+            .iter()
+            .filter_map(|(spelling, role)| {
+                (*role == Some(OccurrenceRole::MemberPosition)).then_some(spelling.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            members,
+            ["run", "field", "build", "field", "class", "field"]
+        );
+
+        for spelling in ["Service", "service", "label", "items", "caller", "run"] {
+            let matching = identifiers
+                .iter()
+                .filter(|(name, _)| name == spelling)
+                .collect::<Vec<_>>();
+            assert!(
+                matching
+                    .iter()
+                    .any(|(_, role)| { *role != Some(OccurrenceRole::MemberPosition) }),
+                "{spelling} has a non-member occurrence in the fixture"
+            );
+        }
+    }
+
+    #[test]
+    fn php_support_advertises_only_member_position() {
+        let support = super::PHP_STRUCTURAL_SPEC.occurrence_role_support();
+        assert!(support.is_supported(OccurrenceRole::MemberPosition));
+        assert!(!support.is_supported(OccurrenceRole::ReceiverPosition));
+        assert!(!support.is_supported(OccurrenceRole::LabelOrKey));
+        assert!(!support.is_supported(OccurrenceRole::DeclarationName));
+        assert!(!support.is_supported(OccurrenceRole::ValueReference));
     }
 }

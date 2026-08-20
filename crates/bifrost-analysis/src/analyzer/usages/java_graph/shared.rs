@@ -5,6 +5,7 @@ use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{
     BulkFileStateSource, CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile, resolve_analyzer,
 };
@@ -36,11 +37,13 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
         let target_spec_scope = crate::profiling::scope("java_graph::target_spec");
-        let Some(spec) = TargetSpec::from_targets(self.java, overloads) else {
+        let Some(spec) = TargetSpec::from_targets(self.java, token, overloads) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
@@ -83,7 +86,15 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
         with_java_graph_source(analyzer, |graph| {
             for file in files {
                 let _scan_scope = crate::profiling::scope("java_graph::scan_file");
-                scan_file(self.java, &graph, &file, &spec, &return_caches, &mut state);
+                scan_file(
+                    self.java,
+                    token,
+                    &graph,
+                    &file,
+                    &spec,
+                    &return_caches,
+                    &mut state,
+                );
                 if *state.limit_exceeded {
                     break;
                 }

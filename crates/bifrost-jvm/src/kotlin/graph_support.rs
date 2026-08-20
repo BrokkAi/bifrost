@@ -27,6 +27,7 @@
 use std::sync::Arc;
 
 use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
@@ -48,7 +49,7 @@ pub trait KotlinSource: CodeUnitIndex + ImportAnalysisProvider {
     fn package_name_of(&self, file: &ProjectFile) -> Option<String>;
 
     /// The workspace's usage-definition index, as the bounded lookup contract.
-    fn usage_definitions(&self) -> &dyn BoundedDefinitionLookup;
+    fn usage_definitions(&self, token: QueryToken<'_>) -> &dyn BoundedDefinitionLookup;
 
     /// The type identifiers a file spells, from the analyzer's persisted parse.
     fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>>;

@@ -804,8 +804,11 @@ fn call_cache_profile_uses_typed_diagnostics_for_completeness() {
     let mut diagnostics = Vec::new();
     let mut profile = Some(QueryCacheProfile::default());
 
+    let scope = AnalyzerQueryScope::new(&analyzer);
+    let token = scope.token();
     let built = cached_call_relation(
         &analyzer,
+        token,
         &unit,
         false,
         &mut cache,
@@ -826,6 +829,7 @@ fn call_cache_profile_uses_typed_diagnostics_for_completeness() {
 
     let replayed = cached_call_relation(
         &analyzer,
+        token,
         &unit,
         false,
         &mut cache,
@@ -854,6 +858,7 @@ fn call_cache_profile_uses_typed_diagnostics_for_completeness() {
     );
     let incoming = cached_call_relation(
         &analyzer,
+        token,
         &unit,
         true,
         &mut cache,
@@ -1014,8 +1019,11 @@ fn call_declaration_projection_reports_retained_file_scope_target_as_omitted() {
     );
     let mut diagnostics = Vec::new();
 
+    let scope = AnalyzerQueryScope::new(&analyzer);
+    let token = scope.token();
     let (expansions, exhausted) = call_declaration_expansions(
         &analyzer,
+        token,
         &declaration,
         &QueryStep::Callees(CallTraversalFilter::default()),
         &CallTraversalFilter::default(),

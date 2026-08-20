@@ -19,6 +19,7 @@ mod semantic;
 mod structural;
 use crate::analyzer::Range;
 use crate::analyzer::structural::BoundaryStatus;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 // The language halves of the type-resolution and hierarchy logic moved to
 // `brokk-bifrost-csharp`; re-exporting the modules keeps every
@@ -71,6 +72,7 @@ use crate::{CloneSmell, CloneSmellWeights};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use adapter::CSharpAdapter;
 use brokk_bifrost_csharp::dead_code::{
     csharp_constructor_candidate, csharp_unsafe_using_member_forms_present,
@@ -274,14 +276,15 @@ impl CSharpAnalyzer {
 
     pub fn external_type_candidates(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         reference: &str,
     ) -> Vec<&CSharpExternalType> {
         self.external_declaration_index().resolve_in_file(
             reference,
             &self.namespace_of_file(file),
-            &self.using_namespaces_of(file),
-            &self.using_aliases_of(file),
+            &self.using_namespaces_of(token, file),
+            &self.using_aliases_of(token, file),
         )
     }
 
@@ -301,10 +304,11 @@ impl CSharpAnalyzer {
     /// diagnostics pass renders as its typed suppression reasons.
     pub(crate) fn external_boundary_evidence(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         name: &str,
     ) -> (BoundaryStatus, Option<String>) {
-        let candidates = self.external_type_candidates(file, name);
+        let candidates = self.external_type_candidates(token, file, name);
         // Two assemblies publishing the same identity are one type as far as a
         // name lookup is concerned; only distinct identities are an ambiguity.
         let distinct: HashSet<&str> = candidates.iter().map(|ty| ty.fqn()).collect();
@@ -329,11 +333,11 @@ impl CSharpAnalyzer {
         self.external_declaration_index().members_named(owner, name)
     }
 
-    pub fn using_namespaces_of(&self, file: &ProjectFile) -> Vec<String> {
+    pub fn using_namespaces_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<String> {
         if let Some(cached) = self.memo_caches.using_namespaces.get(file) {
             return (*cached).clone();
         }
-        let namespaces = graph_support::compute_using_namespaces_of(self, file);
+        let namespaces = graph_support::compute_using_namespaces_of(self, token, file);
         self.memo_caches
             .using_namespaces
             .insert(file.clone(), Arc::new(namespaces.clone()));
@@ -342,6 +346,7 @@ impl CSharpAnalyzer {
 
     pub(crate) fn using_namespaces_of_limited(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         limit: usize,
         mut continue_query: impl FnMut() -> bool,
@@ -351,6 +356,7 @@ impl CSharpAnalyzer {
         }
         let batch = graph_support::compute_using_namespaces_of_limited(
             self,
+            token,
             file,
             limit,
             &mut continue_query,
@@ -363,11 +369,15 @@ impl CSharpAnalyzer {
         batch
     }
 
-    pub fn using_aliases_of(&self, file: &ProjectFile) -> Arc<HashMap<String, String>> {
+    pub fn using_aliases_of(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Arc<HashMap<String, String>> {
         if let Some(cached) = self.memo_caches.using_aliases.get(file) {
             return cached;
         }
-        let aliases = Arc::new(graph_support::compute_using_aliases_of(self, file));
+        let aliases = Arc::new(graph_support::compute_using_aliases_of(self, token, file));
         self.memo_caches
             .using_aliases
             .insert(file.clone(), Arc::clone(&aliases));
@@ -376,6 +386,7 @@ impl CSharpAnalyzer {
 
     pub(crate) fn using_aliases_of_limited(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         limit: usize,
         mut continue_query: impl FnMut() -> bool,
@@ -389,8 +400,13 @@ impl CSharpAnalyzer {
                 limit,
             );
         }
-        let batch =
-            graph_support::compute_using_aliases_of_limited(self, file, limit, &mut continue_query);
+        let batch = graph_support::compute_using_aliases_of_limited(
+            self,
+            token,
+            file,
+            limit,
+            &mut continue_query,
+        );
         if batch.complete {
             self.memo_caches.using_aliases.insert(
                 file.clone(),
@@ -400,10 +416,10 @@ impl CSharpAnalyzer {
         batch
     }
 
-    pub(crate) fn global_using_namespaces(&self) -> &HashSet<String> {
+    pub(crate) fn global_using_namespaces(&self, token: QueryToken<'_>) -> &HashSet<String> {
         self.memo_caches
             .global_using_namespaces
-            .get_or_init(|| graph_support::compute_global_using_namespaces(self))
+            .get_or_init(|| graph_support::compute_global_using_namespaces(self, token))
     }
 
     pub(crate) fn global_using_namespaces_limited(
@@ -428,10 +444,10 @@ impl CSharpAnalyzer {
         batch
     }
 
-    fn global_using_aliases(&self) -> &HashMap<String, String> {
+    fn global_using_aliases(&self, token: QueryToken<'_>) -> &HashMap<String, String> {
         self.memo_caches
             .global_using_aliases
-            .get_or_init(|| graph_support::compute_global_using_aliases(self))
+            .get_or_init(|| graph_support::compute_global_using_aliases(self, token))
     }
 
     pub(crate) fn global_using_aliases_limited(
@@ -459,10 +475,10 @@ impl CSharpAnalyzer {
         batch
     }
 
-    pub(crate) fn global_static_using_type_names(&self) -> &[String] {
+    pub(crate) fn global_static_using_type_names(&self, token: QueryToken<'_>) -> &[String] {
         self.memo_caches
             .global_static_using_type_names
-            .get_or_init(|| graph_support::compute_global_static_using_type_names(self))
+            .get_or_init(|| graph_support::compute_global_static_using_type_names(self, token))
     }
 
     pub(crate) fn global_static_using_type_names_limited(
@@ -487,16 +503,16 @@ impl CSharpAnalyzer {
         batch
     }
 
-    pub(crate) fn global_static_using_types(&self) -> &[CodeUnit] {
+    pub(crate) fn global_static_using_types(&self, token: QueryToken<'_>) -> &[CodeUnit] {
         self.memo_caches
             .global_static_using_types
-            .get_or_init(|| graph_support::compute_global_static_using_types(self))
+            .get_or_init(|| graph_support::compute_global_static_using_types(self, token))
     }
 
-    pub(crate) fn usage_global_static_using_types(&self) -> &[CodeUnit] {
+    pub(crate) fn usage_global_static_using_types(&self, token: QueryToken<'_>) -> &[CodeUnit] {
         self.memo_caches
             .usage_global_static_using_types
-            .get_or_init(|| graph_support::compute_usage_global_static_using_types(self))
+            .get_or_init(|| graph_support::compute_usage_global_static_using_types(self, token))
     }
 }
 
@@ -571,8 +587,8 @@ impl CSharpSource for CSharpAnalyzer {
         self.inner.forward_definition_fqn(fqn)
     }
 
-    fn usage_definitions(&self) -> &dyn BoundedDefinitionLookup {
-        self.inner.global_usage_definition_index_ref()
+    fn usage_definitions(&self, token: QueryToken<'_>) -> &dyn BoundedDefinitionLookup {
+        self.inner.global_usage_definition_index_ref(token)
     }
 
     fn all_files(&self) -> Vec<ProjectFile> {
@@ -593,10 +609,11 @@ impl CSharpSource for CSharpAnalyzer {
 
     fn import_info_of_limited(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         limit: usize,
     ) -> LimitedQueryRows<crate::analyzer::ImportInfo> {
-        self.inner.import_info_of_limited(file, limit)
+        self.inner.import_info_of_limited(token, file, limit)
     }
 
     fn workspace_import_info_limited(
@@ -604,8 +621,10 @@ impl CSharpSource for CSharpAnalyzer {
         limit: usize,
         continue_query: &mut dyn FnMut() -> bool,
     ) -> LimitedQueryRows<crate::analyzer::ImportInfo> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         self.inner
-            .workspace_import_info_limited(limit, continue_query)
+            .workspace_import_info_limited(token, limit, continue_query)
     }
 
     fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
@@ -645,7 +664,9 @@ impl CSharpSource for CSharpAnalyzer {
     }
 
     fn using_namespaces_of(&self, file: &ProjectFile) -> Vec<String> {
-        CSharpAnalyzer::using_namespaces_of(self, file)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        CSharpAnalyzer::using_namespaces_of(self, token, file)
     }
 
     fn using_namespaces_of_limited(
@@ -654,11 +675,15 @@ impl CSharpSource for CSharpAnalyzer {
         limit: usize,
         continue_query: &mut dyn FnMut() -> bool,
     ) -> LimitedQueryRows<String> {
-        CSharpAnalyzer::using_namespaces_of_limited(self, file, limit, continue_query)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        CSharpAnalyzer::using_namespaces_of_limited(self, token, file, limit, continue_query)
     }
 
     fn using_aliases_of(&self, file: &ProjectFile) -> Arc<HashMap<String, String>> {
-        CSharpAnalyzer::using_aliases_of(self, file)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        CSharpAnalyzer::using_aliases_of(self, token, file)
     }
 
     fn using_aliases_of_limited(
@@ -667,11 +692,15 @@ impl CSharpSource for CSharpAnalyzer {
         limit: usize,
         continue_query: &mut dyn FnMut() -> bool,
     ) -> LimitedQueryRows<(String, String)> {
-        CSharpAnalyzer::using_aliases_of_limited(self, file, limit, continue_query)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        CSharpAnalyzer::using_aliases_of_limited(self, token, file, limit, continue_query)
     }
 
     fn global_static_using_type_names(&self) -> &[String] {
-        CSharpAnalyzer::global_static_using_type_names(self)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        CSharpAnalyzer::global_static_using_type_names(self, token)
     }
 
     fn global_static_using_type_names_limited(
@@ -683,15 +712,21 @@ impl CSharpSource for CSharpAnalyzer {
     }
 
     fn global_static_using_types(&self) -> &[CodeUnit] {
-        CSharpAnalyzer::global_static_using_types(self)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        CSharpAnalyzer::global_static_using_types(self, token)
     }
 
     fn usage_global_static_using_types(&self) -> &[CodeUnit] {
-        CSharpAnalyzer::usage_global_static_using_types(self)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        CSharpAnalyzer::usage_global_static_using_types(self, token)
     }
 
     fn global_using_namespaces(&self) -> &HashSet<String> {
-        CSharpAnalyzer::global_using_namespaces(self)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        CSharpAnalyzer::global_using_namespaces(self, token)
     }
 
     fn global_using_namespaces_limited(
@@ -703,7 +738,9 @@ impl CSharpSource for CSharpAnalyzer {
     }
 
     fn global_using_aliases(&self) -> &HashMap<String, String> {
-        CSharpAnalyzer::global_using_aliases(self)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        CSharpAnalyzer::global_using_aliases(self, token)
     }
 
     fn global_using_aliases_limited(
@@ -947,7 +984,8 @@ impl IAnalyzer for CSharpAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
-        diagnostics::collect_csharp_semantic_diagnostics(self, file, source)
+        let scope = AnalyzerQueryScope::new(self);
+        diagnostics::collect_csharp_semantic_diagnostics(self, scope.token(), file, source)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -991,7 +1029,10 @@ impl IAnalyzer for CSharpAnalyzer {
     }
 
     fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
+        // Trait signature is fixed, so this boundary opens the scope the
+        // usage-graph funnel now demands proof of (issue #2423 milestone B).
+        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        self.inner.global_usage_definition_index(scope.token())
     }
 
     fn usage_facts_index(&self) -> &UsageFactsIndex {
@@ -1312,11 +1353,16 @@ impl LanguageEdgePass for CSharpEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        build_csharp_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        let scope = AnalyzerQueryScope::new(ctx.analyzer);
+        let token = scope.token();
+        build_csharp_usage_edges(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeSites)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
-        build_csharp_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+        let scope = AnalyzerQueryScope::new(ctx.analyzer);
+        let token = scope.token();
+        build_csharp_usage_edge_weights(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
             .map(LanguageEdgeWeights::Fqn)
     }
 }
@@ -1326,8 +1372,11 @@ impl StructuralReceiverResolver for CSharpSupport {
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<TypeLookupOutcome> {
+        let scope = AnalyzerQueryScope::new(query.analyzer);
+        let token = scope.token();
         resolve_csharp_type_bounded(
             query.analyzer,
+            token,
             query.file,
             query.source,
             query.tree,
@@ -1341,8 +1390,11 @@ impl StructuralReceiverResolver for CSharpSupport {
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<DefinitionLookupOutcome> {
+        let scope = AnalyzerQueryScope::new(query.analyzer);
+        let token = scope.token();
         resolve_csharp_bounded(
             query.analyzer,
+            token,
             query.file,
             query.source,
             query.tree,
@@ -1423,13 +1475,15 @@ impl DeadCodeBulkProof for CSharpDeadCodeBulk {
         analyzer: &dyn IAnalyzer,
         candidates: &[CodeUnit],
     ) -> Option<DeadCodeBulkEdges> {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let nodes = fqn_bulk_nodes(
             analyzer,
             Language::CSharp,
             |unit| unit.is_function() || unit.is_class(),
             candidates,
         );
-        build_csharp_usage_edges(analyzer, &nodes, |_| true)
+        build_csharp_usage_edges(analyzer, token, &nodes, |_| true)
             .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
     }
 }

@@ -22,6 +22,7 @@ use brokk_bifrost_core::analyzer::model::{
     SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
     SemanticDiagnosticReport,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::node_range;
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
@@ -45,6 +46,7 @@ const MAX_DIAGNOSTICS: usize = 200;
 
 pub fn collect_java_semantic_diagnostics(
     java: &dyn JavaSource,
+    token: QueryToken<'_>,
     definitions: &dyn BoundedDefinitionLookup,
     model: &dyn JvmActiveSemanticModel,
     file: &ProjectFile,
@@ -101,15 +103,20 @@ pub fn collect_java_semantic_diagnostics(
             let name = node.utf8_text(source.as_bytes()).unwrap_or_default().trim();
             if !name.is_empty() {
                 let range = node_range(node, &line_starts);
-                let candidates =
-                    resolve_java_type_name_candidates_in_realm(java, definitions, file, name);
+                let candidates = resolve_java_type_name_candidates_in_realm(
+                    java,
+                    token,
+                    definitions,
+                    file,
+                    name,
+                );
                 let proof = match candidates.len() {
                     1 => JvmNameProof::Workspace,
                     n if n > 1 => JvmNameProof::Ambiguous {
                         boundaries: vec![BoundaryStatus::WorkspaceLocal; n],
                     },
                     _ => {
-                        let spellings = java_type_name_candidate_fqns(java, file, name);
+                        let spellings = java_type_name_candidate_fqns(java, token, file, name);
                         let indexed = retained.is_readable()
                             && spellings.iter().any(|fqn| {
                                 java.retained_external_holds_qualified_name(fqn, &package_name)

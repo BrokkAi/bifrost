@@ -7,6 +7,7 @@
 //! which declarations a type derives from, is language knowledge and lives
 //! here.
 
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
 
@@ -36,10 +37,11 @@ enum AttributeTypeResolution {
 /// attributes must not steal an attribute shorthand reference.
 pub fn attribute_type_candidates_with_ambiguity(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     names: &[String],
 ) -> (Vec<CodeUnit>, bool) {
-    match attribute_type_resolution(source, file, names) {
+    match attribute_type_resolution(source, token, file, names) {
         AttributeTypeResolution::Unresolved => (Vec::new(), false),
         AttributeTypeResolution::Resolved(candidates) => (candidates, false),
         AttributeTypeResolution::Ambiguous(candidates) => (candidates, true),
@@ -70,10 +72,11 @@ where
 /// annotation is not a proven reference to every declaration it might name.
 pub fn usage_unambiguous_attribute_type_candidates(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     names: &[String],
 ) -> Vec<CodeUnit> {
-    match attribute_type_resolution_inner(source, file, names, true) {
+    match attribute_type_resolution_inner(source, token, file, names, true) {
         AttributeTypeResolution::Resolved(candidates) => candidates,
         AttributeTypeResolution::Unresolved | AttributeTypeResolution::Ambiguous(_) => Vec::new(),
     }
@@ -81,28 +84,30 @@ pub fn usage_unambiguous_attribute_type_candidates(
 
 fn attribute_type_resolution(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     names: &[String],
 ) -> AttributeTypeResolution {
-    attribute_type_resolution_inner(source, file, names, false)
+    attribute_type_resolution_inner(source, token, file, names, false)
 }
 
 fn attribute_type_resolution_inner(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     names: &[String],
     usage: bool,
 ) -> AttributeTypeResolution {
     let mut visible = |name: &str| {
         Some(if usage {
-            usage_visible_type_candidates(source, file, name)
+            usage_visible_type_candidates(source, token, file, name)
         } else {
-            visible_type_candidates(source, file, name)
+            visible_type_candidates(source, token, file, name)
         })
     };
     let mut attribute_class_is_applicable = |candidate: &CodeUnit| {
         Some(
-            attribute_class_evidence(source, candidate, usage)
+            attribute_class_evidence(source, token, candidate, usage)
                 != AttributeClassEvidence::DefinitelyNot,
         )
     };
@@ -157,6 +162,7 @@ where
 
 fn attribute_class_evidence(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     candidate: &CodeUnit,
     usage: bool,
 ) -> AttributeClassEvidence {
@@ -176,7 +182,7 @@ fn attribute_class_evidence(
         }
 
         let mut parts = if usage {
-            usage_partial_type_parts(source, &current)
+            usage_partial_type_parts(source, token, &current)
         } else {
             partial_type_parts(source, &current)
         };
@@ -193,7 +199,7 @@ fn attribute_class_evidence(
                     decisive_non_attribute_base = true;
                     continue;
                 }
-                let ancestors = supertype_candidates(source, &part, &raw, usage);
+                let ancestors = supertype_candidates(source, token, &part, &raw, usage);
                 if ancestors.is_empty() {
                     unresolved_ancestry = true;
                     continue;
@@ -216,17 +222,22 @@ fn attribute_class_evidence(
     }
 }
 
-pub fn usage_direct_ancestors(source: &dyn CSharpSource, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-    logical_direct_ancestors(source, code_unit, true)
+pub fn usage_direct_ancestors(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    code_unit: &CodeUnit,
+) -> Vec<CodeUnit> {
+    logical_direct_ancestors(source, token, code_unit, true)
 }
 
 pub fn logical_direct_ancestors(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     code_unit: &CodeUnit,
     usage: bool,
 ) -> Vec<CodeUnit> {
     let mut parts = if usage {
-        usage_partial_type_parts(source, code_unit)
+        usage_partial_type_parts(source, token, code_unit)
     } else {
         partial_type_parts(source, code_unit)
     };
@@ -237,7 +248,7 @@ pub fn logical_direct_ancestors(
     let mut ancestors = Vec::new();
     for part in parts {
         ancestors.extend(source.raw_supertypes_of(&part).iter().filter_map(|raw| {
-            unique_logical_type(supertype_candidates(source, &part, raw, usage))
+            unique_logical_type(supertype_candidates(source, token, &part, raw, usage))
         }));
     }
     sort_dedup_type_candidates(&mut ancestors);

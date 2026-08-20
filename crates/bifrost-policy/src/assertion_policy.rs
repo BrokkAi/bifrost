@@ -1,1031 +1,80 @@
-//! Typed validation and bounded execution primitives for relational assertion
-//! plans. Policy source decoding builds the authoring model in `definition`;
-//! this module resolves its row domains against the analyzer-owned registry.
+//! The seam between authored assertion policies and the relational engine.
+//!
+//! Policy source decoding builds the authoring model in `definition`; this
+//! module is the two-function boundary the decoder and the evaluator call. Both
+//! functions lower the authored plan into the internal IR (`crate::relational`)
+//! and then validate or evaluate that, so the authored record set is never the
+//! thing being executed.
+//!
+//! The relational types stay re-exported here because they are this crate's
+//! published relational surface and every existing caller addresses them
+//! through this module.
 
-use std::collections::{HashMap, HashSet};
-use std::fmt;
-
-use brokk_bifrost_analysis::analyzer::structural::search::{
-    CodeQueryResultItem, DetailedCodeQueryDomain,
-};
-use brokk_bifrost_analysis::analyzer::structural::{
-    CodeQueryResultValue, CodeQueryRowScalarRef, CodeQueryRowScalarType,
-};
-
-use crate::definition::{
-    PolicyAssertId, PolicySelector, RelationalAssertionPlan, RowAggregateName, RowAggregateOp,
-    RowBindingName, RowBindingSource, RowFieldRef, RowGroupName, RowLiteral, RowPredicate,
+use crate::definition::RelationalAssertionPlan;
+use crate::relational::{
+    IrLimits, evaluate_plan_ir, lower_relational_assertion_plan, validate_limits, validate_plan_ir,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum RowScalar {
-    StableId(String),
-    String(String),
-    Integer(u64),
-    Boolean(bool),
-    ConstrainedEnum(String),
-    DeclarationIdentity(String),
-}
-
-impl From<CodeQueryRowScalarRef<'_>> for RowScalar {
-    fn from(value: CodeQueryRowScalarRef<'_>) -> Self {
-        match value {
-            CodeQueryRowScalarRef::StableId(value) => Self::StableId(value.to_string()),
-            CodeQueryRowScalarRef::String(value) => Self::String(value.to_string()),
-            CodeQueryRowScalarRef::Integer(value) => Self::Integer(value),
-            CodeQueryRowScalarRef::Boolean(value) => Self::Boolean(value),
-            CodeQueryRowScalarRef::ConstrainedEnum(value) => {
-                Self::ConstrainedEnum(value.to_string())
-            }
-            CodeQueryRowScalarRef::DeclarationIdentity(value) => {
-                Self::DeclarationIdentity(value.to_string())
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct RelationalInput<'a> {
-    pub binding: &'a RowBindingName,
-    pub rows: &'a [CodeQueryResultItem],
-    pub exhaustive: bool,
-}
-
-/// One row of one binding that contributed to a violated group, addressed by
-/// its index into that binding's executed row set.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelationalViolationRow {
-    pub binding: RowBindingName,
-    pub row: usize,
-}
-
-/// The number of contributing tuples a violation retains for diagnostics. The
-/// aggregate value already states the complete count; representatives exist so
-/// a finding can point at exact source ranges, not to enumerate the group.
-pub const MAX_VIOLATION_REPRESENTATIVE_TUPLES: usize = 8;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelationalAssertionViolation {
-    pub assertion: PolicyAssertId,
-    pub group: RowGroupName,
-    pub key: Vec<Option<RowScalar>>,
-    pub actual: u64,
-    /// Bounded contributing tuples of the violated group. Each tuple lists its
-    /// rows in binding declaration order.
-    pub representatives: Vec<Vec<RelationalViolationRow>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelationalAssertionEvaluation {
-    pub violations: Vec<RelationalAssertionViolation>,
-    pub exhaustive: bool,
-    pub limit_exceeded: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RelationalAssertionEvaluationError {
-    MissingInput { binding: String },
-    UnsupportedExpansion { binding: String },
-    DisconnectedJoin { binding: String },
-    MissingTupleBinding { binding: String },
-    MissingAggregate { group: String, aggregate: String },
-    RowField { binding: String, field: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RelationalAssertionPlanError {
-    DuplicateBinding {
-        name: String,
-    },
-    ForwardBinding {
-        binding: String,
-        referenced: String,
-    },
-    DuplicateGroup {
-        name: String,
-    },
-    DuplicateAggregate {
-        group: String,
-        name: String,
-    },
-    DuplicateAssertion {
-        id: String,
-    },
-    UnknownBinding {
-        name: String,
-    },
-    UnknownGroup {
-        name: String,
-    },
-    UnknownAggregate {
-        group: String,
-        name: String,
-    },
-    UnknownField {
-        binding: String,
-        field: String,
-    },
-    JoinTypeMismatch {
-        left: String,
-        left_type: CodeQueryRowScalarType,
-        right: String,
-        right_type: CodeQueryRowScalarType,
-    },
-    EmptyJoin {
-        left: String,
-        right: String,
-    },
-    EmptyGroupKey {
-        group: String,
-    },
-    AggregateValueRequired {
-        group: String,
-        aggregate: String,
-    },
-    AggregateValueForbidden {
-        group: String,
-        aggregate: String,
-    },
-    InvalidMinType {
-        group: String,
-        aggregate: String,
-        actual: CodeQueryRowScalarType,
-    },
-    OrderedSequencesRequired {
-        group: String,
-        aggregate: String,
-    },
-    OrderedSequencesForbidden {
-        group: String,
-        aggregate: String,
-    },
-    InvalidOrderedPositionType {
-        group: String,
-        aggregate: String,
-        field: String,
-        actual: CodeQueryRowScalarType,
-    },
-    OrderedValueTypeMismatch {
-        group: String,
-        aggregate: String,
-        left_type: CodeQueryRowScalarType,
-        right_type: CodeQueryRowScalarType,
-    },
-    PredicateTypeMismatch {
-        field: String,
-        actual: CodeQueryRowScalarType,
-        literal: &'static str,
-    },
-    DeferredSelectorDomain {
-        binding: String,
-    },
-    ExpansionDomainUnavailable {
-        binding: String,
-        step: &'static str,
-    },
-    InvalidQuery {
-        binding: String,
-        message: String,
-    },
-    ZeroLimit {
-        name: &'static str,
-    },
-}
-
-impl fmt::Display for RelationalAssertionPlanError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DuplicateBinding { name } => write!(formatter, "duplicate binding `{name}`"),
-            Self::ForwardBinding {
-                binding,
-                referenced,
-            } => write!(
-                formatter,
-                "binding `{binding}` references `{referenced}` before it is declared"
-            ),
-            Self::DuplicateGroup { name } => write!(formatter, "duplicate group `{name}`"),
-            Self::DuplicateAggregate { group, name } => {
-                write!(formatter, "duplicate aggregate `{group}.{name}`")
-            }
-            Self::DuplicateAssertion { id } => write!(formatter, "duplicate assertion `{id}`"),
-            Self::UnknownBinding { name } => write!(formatter, "unknown binding `{name}`"),
-            Self::UnknownGroup { name } => write!(formatter, "unknown group `{name}`"),
-            Self::UnknownAggregate { group, name } => {
-                write!(formatter, "unknown aggregate `{group}.{name}`")
-            }
-            Self::UnknownField { binding, field } => {
-                write!(formatter, "unknown field `{binding}.{field}`")
-            }
-            Self::JoinTypeMismatch {
-                left,
-                left_type,
-                right,
-                right_type,
-            } => write!(
-                formatter,
-                "join fields `{left}` ({left_type:?}) and `{right}` ({right_type:?}) have incompatible types"
-            ),
-            Self::EmptyJoin { left, right } => {
-                write!(
-                    formatter,
-                    "join `{left}` to `{right}` has no equality fields"
-                )
-            }
-            Self::EmptyGroupKey { group } => {
-                write!(formatter, "group `{group}` has no grouping fields")
-            }
-            Self::AggregateValueRequired { group, aggregate } => write!(
-                formatter,
-                "aggregate `{group}.{aggregate}` requires a value field"
-            ),
-            Self::AggregateValueForbidden { group, aggregate } => write!(
-                formatter,
-                "aggregate `{group}.{aggregate}` must not declare a value field"
-            ),
-            Self::InvalidMinType {
-                group,
-                aggregate,
-                actual,
-            } => write!(
-                formatter,
-                "aggregate `{group}.{aggregate}` requires an integer value, found {actual:?}"
-            ),
-            Self::OrderedSequencesRequired { group, aggregate } => write!(
-                formatter,
-                "aggregate `{group}.{aggregate}` requires both :left and :right ordered sequences"
-            ),
-            Self::OrderedSequencesForbidden { group, aggregate } => write!(
-                formatter,
-                "aggregate `{group}.{aggregate}` must not declare :left or :right ordered sequences"
-            ),
-            Self::InvalidOrderedPositionType {
-                group,
-                aggregate,
-                field,
-                actual,
-            } => write!(
-                formatter,
-                "aggregate `{group}.{aggregate}` position field `{field}` must be an integer, found {actual:?}"
-            ),
-            Self::OrderedValueTypeMismatch {
-                group,
-                aggregate,
-                left_type,
-                right_type,
-            } => write!(
-                formatter,
-                "aggregate `{group}.{aggregate}` compares a {left_type:?} value with a {right_type:?} value"
-            ),
-            Self::PredicateTypeMismatch {
-                field,
-                actual,
-                literal,
-            } => write!(
-                formatter,
-                "predicate field `{field}` ({actual:?}) cannot be compared with a {literal} literal"
-            ),
-            Self::DeferredSelectorDomain { binding } => write!(
-                formatter,
-                "binding `{binding}` uses an RQL file whose row domain is not resolved yet"
-            ),
-            Self::ExpansionDomainUnavailable { binding, step } => write!(
-                formatter,
-                "binding `{binding}` uses row expansion `{step}`, whose result domain is not registered yet"
-            ),
-            Self::InvalidQuery { binding, message } => {
-                write!(
-                    formatter,
-                    "binding `{binding}` has an invalid query: {message}"
-                )
-            }
-            Self::ZeroLimit { name } => {
-                write!(formatter, "assertion limit `{name}` must be positive")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RelationalAssertionPlanError {}
+pub use crate::relational::{
+    RelationalAssertionEvaluation, RelationalAssertionEvaluationError,
+    RelationalAssertionPlanError, RelationalInput, RelationalViolationRow, RowScalar,
+};
 
 /// Validate names, dependency order, row fields, scalar types and aggregate
 /// shapes before any workspace query executes.
+///
+/// Called from the source decoder, so every rejection here is an authoring
+/// error reported at load time rather than a runtime failure.
 pub fn validate_relational_assertion_plan(
     plan: &RelationalAssertionPlan,
 ) -> Result<(), RelationalAssertionPlanError> {
-    validate_limits(plan)?;
-
-    let mut domains: HashMap<&RowBindingName, DetailedCodeQueryDomain> = HashMap::new();
-    for binding in &plan.bindings {
-        if domains.contains_key(&binding.name) {
-            return Err(RelationalAssertionPlanError::DuplicateBinding {
-                name: binding.name.as_str().to_string(),
-            });
-        }
-        let domain = match &binding.source {
-            RowBindingSource::Query(PolicySelector::Inline { query, .. }) => query
-                .validate_steps()
-                .map(DetailedCodeQueryDomain::from_query_value_kind)
-                .map_err(|error| RelationalAssertionPlanError::InvalidQuery {
-                    binding: binding.name.as_str().to_string(),
-                    message: error.to_string(),
-                })?,
-            RowBindingSource::Query(PolicySelector::File { .. }) => {
-                return Err(RelationalAssertionPlanError::DeferredSelectorDomain {
-                    binding: binding.name.as_str().to_string(),
-                });
-            }
-            RowBindingSource::Expansion { from, step } => {
-                let Some(source_domain) = domains.get(from).copied() else {
-                    return Err(RelationalAssertionPlanError::ForwardBinding {
-                        binding: binding.name.as_str().to_string(),
-                        referenced: from.as_str().to_string(),
-                    });
-                };
-                match (source_domain, step) {
-                    (
-                        DetailedCodeQueryDomain::StructuralMatch
-                        | DetailedCodeQueryDomain::ReferenceSite
-                        | DetailedCodeQueryDomain::CallSite
-                        | DetailedCodeQueryDomain::ExpressionSite
-                        | DetailedCodeQueryDomain::Occurrence
-                        | DetailedCodeQueryDomain::ReceiverAnalysis,
-                        crate::definition::RowExpansionStep::ReceiverOutcome,
-                    ) => DetailedCodeQueryDomain::ReceiverOutcome,
-                    (
-                        DetailedCodeQueryDomain::StructuralMatch
-                        | DetailedCodeQueryDomain::ReferenceSite
-                        | DetailedCodeQueryDomain::CallSite
-                        | DetailedCodeQueryDomain::ExpressionSite
-                        | DetailedCodeQueryDomain::Occurrence
-                        | DetailedCodeQueryDomain::ReceiverAnalysis,
-                        crate::definition::RowExpansionStep::ReceiverEvidence,
-                    ) => DetailedCodeQueryDomain::ReceiverEvidence,
-                    (
-                        DetailedCodeQueryDomain::Occurrence,
-                        crate::definition::RowExpansionStep::MemberSelection,
-                    ) => DetailedCodeQueryDomain::MemberSelection,
-                    (
-                        DetailedCodeQueryDomain::Occurrence,
-                        crate::definition::RowExpansionStep::CandidateHierarchy,
-                    ) => DetailedCodeQueryDomain::CandidateHop,
-                    (
-                        DetailedCodeQueryDomain::Occurrence
-                        | DetailedCodeQueryDomain::CallSite
-                        | DetailedCodeQueryDomain::ReferenceSite
-                        | DetailedCodeQueryDomain::StructuralMatch,
-                        crate::definition::RowExpansionStep::DispatchOutcome,
-                    ) => DetailedCodeQueryDomain::DispatchOutcome,
-                    (
-                        DetailedCodeQueryDomain::Occurrence
-                        | DetailedCodeQueryDomain::CallSite
-                        | DetailedCodeQueryDomain::ReferenceSite
-                        | DetailedCodeQueryDomain::StructuralMatch,
-                        crate::definition::RowExpansionStep::DispatchTargets,
-                    ) => DetailedCodeQueryDomain::DispatchTarget,
-                    (
-                        DetailedCodeQueryDomain::Declaration,
-                        crate::definition::RowExpansionStep::MemberFamily,
-                    ) => DetailedCodeQueryDomain::MemberFamily,
-                    (
-                        DetailedCodeQueryDomain::Declaration,
-                        crate::definition::RowExpansionStep::FamilyEdges,
-                    ) => DetailedCodeQueryDomain::MemberFamilyEdge,
-                    _ => {
-                        return Err(RelationalAssertionPlanError::ExpansionDomainUnavailable {
-                            binding: binding.name.as_str().to_string(),
-                            step: step.label(),
-                        });
-                    }
-                }
-            }
-        };
-        domains.insert(&binding.name, domain);
-    }
-
-    for join in &plan.joins {
-        let left_domain = binding_domain(&domains, &join.left)?;
-        let right_domain = binding_domain(&domains, &join.right)?;
-        if join.on.is_empty() {
-            return Err(RelationalAssertionPlanError::EmptyJoin {
-                left: join.left.as_str().to_string(),
-                right: join.right.as_str().to_string(),
-            });
-        }
-        for condition in &join.on {
-            let left_type = field_type(left_domain, &join.left, &condition.left_field)?;
-            let right_type = field_type(right_domain, &join.right, &condition.right_field)?;
-            if left_type != right_type {
-                return Err(RelationalAssertionPlanError::JoinTypeMismatch {
-                    left: format!("{}.{}", join.left, condition.left_field),
-                    left_type,
-                    right: format!("{}.{}", join.right, condition.right_field),
-                    right_type,
-                });
-            }
-        }
-    }
-
-    let mut groups = HashMap::new();
-    for group in &plan.groups {
-        if groups.contains_key(&group.name) {
-            return Err(RelationalAssertionPlanError::DuplicateGroup {
-                name: group.name.as_str().to_string(),
-            });
-        }
-        if group.by.is_empty() {
-            return Err(RelationalAssertionPlanError::EmptyGroupKey {
-                group: group.name.as_str().to_string(),
-            });
-        }
-        for field in &group.by {
-            validate_field_ref(&domains, field)?;
-        }
-        let mut aggregates = HashSet::new();
-        for aggregate in &group.aggregates {
-            if !aggregates.insert(&aggregate.name) {
-                return Err(RelationalAssertionPlanError::DuplicateAggregate {
-                    group: group.name.as_str().to_string(),
-                    name: aggregate.name.as_str().to_string(),
-                });
-            }
-            let value_type = aggregate
-                .value
-                .as_ref()
-                .map(|field| validate_field_ref(&domains, field))
-                .transpose()?;
-            match (aggregate.op, value_type) {
-                (RowAggregateOp::Count | RowAggregateOp::OrderedEqual, None) => {}
-                (RowAggregateOp::Count | RowAggregateOp::OrderedEqual, Some(_)) => {
-                    return Err(RelationalAssertionPlanError::AggregateValueForbidden {
-                        group: group.name.as_str().to_string(),
-                        aggregate: aggregate.name.as_str().to_string(),
-                    });
-                }
-                (RowAggregateOp::Min | RowAggregateOp::CountDistinct, None) => {
-                    return Err(RelationalAssertionPlanError::AggregateValueRequired {
-                        group: group.name.as_str().to_string(),
-                        aggregate: aggregate.name.as_str().to_string(),
-                    });
-                }
-                (RowAggregateOp::Min, Some(CodeQueryRowScalarType::Integer))
-                | (RowAggregateOp::CountDistinct, Some(_)) => {}
-                (RowAggregateOp::Min, Some(actual)) => {
-                    return Err(RelationalAssertionPlanError::InvalidMinType {
-                        group: group.name.as_str().to_string(),
-                        aggregate: aggregate.name.as_str().to_string(),
-                        actual,
-                    });
-                }
-            }
-            validate_ordered_sequences(&domains, group, aggregate)?;
-            for predicate in &aggregate.predicate {
-                let actual = validate_field_ref(&domains, &predicate.field)?;
-                if !literal_matches_type(&predicate.value, actual) {
-                    return Err(RelationalAssertionPlanError::PredicateTypeMismatch {
-                        field: format!("{}.{}", predicate.field.binding, predicate.field.field),
-                        actual,
-                        literal: row_literal_kind(&predicate.value),
-                    });
-                }
-            }
-        }
-        groups.insert(&group.name, aggregates);
-    }
-
-    let mut assertion_ids = HashSet::new();
-    for assertion in &plan.assertions {
-        if !assertion_ids.insert(&assertion.id) {
-            return Err(RelationalAssertionPlanError::DuplicateAssertion {
-                id: assertion.id.as_str().to_string(),
-            });
-        }
-        let Some(aggregates) = groups.get(&assertion.group) else {
-            return Err(RelationalAssertionPlanError::UnknownGroup {
-                name: assertion.group.as_str().to_string(),
-            });
-        };
-        if !aggregates.contains(&assertion.aggregate) {
-            return Err(RelationalAssertionPlanError::UnknownAggregate {
-                group: assertion.group.as_str().to_string(),
-                name: assertion.aggregate.as_str().to_string(),
-            });
-        }
-    }
-
-    Ok(())
+    validate_limits(&IrLimits::from(plan.limits))?;
+    let ir = lower_relational_assertion_plan(plan)?;
+    validate_plan_ir(&ir)
 }
 
-/// An ordered comparison is only defined when both sides state an integer
-/// position and the two value columns hold the same scalar type. Anything else
-/// is rejected before a workspace query runs, because a comparison across
-/// scalar types would silently be false at every position rather than being an
-/// authoring mistake.
-fn validate_ordered_sequences(
-    domains: &HashMap<&RowBindingName, DetailedCodeQueryDomain>,
-    group: &crate::definition::RowGroup,
-    aggregate: &crate::definition::RowAggregate,
-) -> Result<(), RelationalAssertionPlanError> {
-    let names = || {
-        (
-            group.name.as_str().to_string(),
-            aggregate.name.as_str().to_string(),
-        )
-    };
-    let sequences = match (aggregate.op, aggregate.sequences.as_ref()) {
-        (RowAggregateOp::OrderedEqual, Some(sequences)) => sequences,
-        (RowAggregateOp::OrderedEqual, None) => {
-            let (group, aggregate) = names();
-            return Err(RelationalAssertionPlanError::OrderedSequencesRequired {
-                group,
-                aggregate,
-            });
-        }
-        (_, None) => return Ok(()),
-        (_, Some(_)) => {
-            let (group, aggregate) = names();
-            return Err(RelationalAssertionPlanError::OrderedSequencesForbidden {
-                group,
-                aggregate,
-            });
-        }
-    };
-    for sequence in [&sequences.left, &sequences.right] {
-        let position = validate_field_ref(domains, &sequence.position)?;
-        if position != CodeQueryRowScalarType::Integer {
-            let (group, aggregate) = names();
-            return Err(RelationalAssertionPlanError::InvalidOrderedPositionType {
-                group,
-                aggregate,
-                field: format!("{}.{}", sequence.position.binding, sequence.position.field),
-                actual: position,
-            });
-        }
-    }
-    let left_type = validate_field_ref(domains, &sequences.left.value)?;
-    let right_type = validate_field_ref(domains, &sequences.right.value)?;
-    if left_type != right_type {
-        let (group, aggregate) = names();
-        return Err(RelationalAssertionPlanError::OrderedValueTypeMismatch {
-            group,
-            aggregate,
-            left_type,
-            right_type,
-        });
-    }
-    Ok(())
-}
-
-fn literal_matches_type(
-    literal: &crate::definition::RowLiteral,
-    scalar_type: CodeQueryRowScalarType,
-) -> bool {
-    use crate::definition::RowLiteral;
-    matches!(
-        (literal, scalar_type),
-        (RowLiteral::Integer(_), CodeQueryRowScalarType::Integer)
-            | (RowLiteral::Boolean(_), CodeQueryRowScalarType::Boolean)
-            | (
-                RowLiteral::ConstrainedEnum(_),
-                CodeQueryRowScalarType::ConstrainedEnum
-            )
-            | (
-                RowLiteral::String(_),
-                CodeQueryRowScalarType::String
-                    | CodeQueryRowScalarType::StableId
-                    | CodeQueryRowScalarType::DeclarationIdentity
-            )
-    )
-}
-
-fn row_literal_kind(literal: &crate::definition::RowLiteral) -> &'static str {
-    use crate::definition::RowLiteral;
-    match literal {
-        RowLiteral::String(_) => "string",
-        RowLiteral::Integer(_) => "integer",
-        RowLiteral::Boolean(_) => "boolean",
-        RowLiteral::ConstrainedEnum(_) => "constrained-enum",
-    }
-}
-
-fn validate_limits(plan: &RelationalAssertionPlan) -> Result<(), RelationalAssertionPlanError> {
-    for (name, value) in [
-        ("max_source_rows", plan.limits.max_source_rows),
-        ("max_expanded_rows", plan.limits.max_expanded_rows),
-        ("max_join_comparisons", plan.limits.max_join_comparisons),
-        ("max_joined_rows", plan.limits.max_joined_rows),
-        ("max_groups", plan.limits.max_groups),
-        ("max_values_per_group", plan.limits.max_values_per_group),
-    ] {
-        if value == 0 {
-            return Err(RelationalAssertionPlanError::ZeroLimit { name });
-        }
-    }
-    Ok(())
-}
-
-fn binding_domain(
-    domains: &HashMap<&RowBindingName, DetailedCodeQueryDomain>,
-    binding: &RowBindingName,
-) -> Result<DetailedCodeQueryDomain, RelationalAssertionPlanError> {
-    domains
-        .get(binding)
-        .copied()
-        .ok_or_else(|| RelationalAssertionPlanError::UnknownBinding {
-            name: binding.as_str().to_string(),
-        })
-}
-
-fn validate_field_ref(
-    domains: &HashMap<&RowBindingName, DetailedCodeQueryDomain>,
-    field: &RowFieldRef,
-) -> Result<CodeQueryRowScalarType, RelationalAssertionPlanError> {
-    let domain = binding_domain(domains, &field.binding)?;
-    field_type(domain, &field.binding, &field.field)
-}
-
-fn field_type(
-    domain: DetailedCodeQueryDomain,
-    binding: &RowBindingName,
-    field: &str,
-) -> Result<CodeQueryRowScalarType, RelationalAssertionPlanError> {
-    domain
-        .row_fields()
-        .iter()
-        .find(|candidate| candidate.name == field)
-        .map(|candidate| candidate.scalar_type)
-        .ok_or_else(|| RelationalAssertionPlanError::UnknownField {
-            binding: binding.as_str().to_string(),
-            field: field.to_string(),
-        })
-}
-
-type JoinedTuple<'a> = HashMap<&'a RowBindingName, (usize, &'a CodeQueryResultValue)>;
-type GroupAggregateValues<'a> =
-    HashMap<(&'a RowGroupName, Vec<Option<RowScalar>>), HashMap<&'a RowAggregateName, u64>>;
-type GroupRepresentatives<'a> =
-    HashMap<(&'a RowGroupName, Vec<Option<RowScalar>>), Vec<Vec<RelationalViolationRow>>>;
-
-/// Evaluate a validated query-only relational plan over already executed
-/// CodeQuery row sets. Typed expansions use the same engine once their row
-/// domains land in later milestones.
+/// Evaluate a validated relational plan over already executed CodeQuery row
+/// sets, one per bound relation.
+///
+/// The result separates what the rows prove from what they do not: violations
+/// are the verdicts the coverage rules admit, and every verdict those rules
+/// blocked is reported as an unmet obligation instead of being silently
+/// dropped.
 pub fn evaluate_relational_assertion_rows(
     plan: &RelationalAssertionPlan,
     inputs: &[RelationalInput<'_>],
 ) -> Result<RelationalAssertionEvaluation, RelationalAssertionEvaluationError> {
-    let input_by_name = inputs
-        .iter()
-        .map(|input| (input.binding, input))
-        .collect::<HashMap<_, _>>();
-    let mut exhaustive = inputs.iter().all(|input| input.exhaustive);
-    let mut limit_exceeded = false;
-
-    let first =
-        plan.bindings
-            .first()
-            .ok_or_else(|| RelationalAssertionEvaluationError::MissingInput {
-                binding: "<first>".to_string(),
-            })?;
-    if matches!(first.source, RowBindingSource::Expansion { .. }) {
-        return Err(RelationalAssertionEvaluationError::UnsupportedExpansion {
-            binding: first.name.as_str().to_string(),
-        });
-    }
-    let first_input = input_by_name.get(&first.name).ok_or_else(|| {
-        RelationalAssertionEvaluationError::MissingInput {
-            binding: first.name.as_str().to_string(),
-        }
-    })?;
-    let source_count = first_input.rows.len().min(plan.limits.max_source_rows);
-    if source_count < first_input.rows.len() {
-        exhaustive = false;
-        limit_exceeded = true;
-    }
-    let mut tuples = first_input.rows[..source_count]
-        .iter()
-        .enumerate()
-        .map(|(index, item)| HashMap::from([(&first.name, (index, &item.value))]))
-        .collect::<Vec<_>>();
-    let mut comparisons = 0usize;
-
-    for join in &plan.joins {
-        if !tuples.iter().all(|tuple| tuple.contains_key(&join.left)) {
-            return Err(RelationalAssertionEvaluationError::DisconnectedJoin {
-                binding: join.left.as_str().to_string(),
-            });
-        }
-        let right = input_by_name.get(&join.right).ok_or_else(|| {
-            RelationalAssertionEvaluationError::MissingInput {
-                binding: join.right.as_str().to_string(),
-            }
-        })?;
-        let right_count = right.rows.len().min(plan.limits.max_source_rows);
-        if right_count < right.rows.len() {
-            exhaustive = false;
-            limit_exceeded = true;
-        }
-        let mut joined = Vec::new();
-        'left: for tuple in &tuples {
-            let (_, left_row) = tuple[&join.left];
-            let mut matched = false;
-            for (right_index, right_item) in right.rows[..right_count].iter().enumerate() {
-                comparisons = comparisons.saturating_add(1);
-                if comparisons > plan.limits.max_join_comparisons {
-                    exhaustive = false;
-                    limit_exceeded = true;
-                    break 'left;
-                }
-                if join_conditions_match(left_row, &right_item.value, join)? {
-                    matched = true;
-                    if join.kind == crate::definition::RowJoinKind::Inner {
-                        if joined.len() == plan.limits.max_joined_rows {
-                            exhaustive = false;
-                            limit_exceeded = true;
-                            break 'left;
-                        }
-                        let mut next = tuple.clone();
-                        next.insert(&join.right, (right_index, &right_item.value));
-                        joined.push(next);
-                    }
-                }
-            }
-            if join.kind == crate::definition::RowJoinKind::Anti && !matched {
-                if joined.len() == plan.limits.max_joined_rows {
-                    exhaustive = false;
-                    limit_exceeded = true;
-                    break;
-                }
-                joined.push(tuple.clone());
-            }
-        }
-        tuples = joined;
-    }
-
-    let mut aggregate_values: GroupAggregateValues<'_> = HashMap::new();
-    let mut group_representatives: GroupRepresentatives<'_> = HashMap::new();
-    for group in &plan.groups {
-        let mut grouped: HashMap<Vec<Option<RowScalar>>, Vec<&JoinedTuple<'_>>> = HashMap::new();
-        for tuple in &tuples {
-            let key = group
-                .by
-                .iter()
-                .map(|field| tuple_field(tuple, field))
-                .collect::<Result<Vec<_>, _>>()?;
-            if !grouped.contains_key(&key) && grouped.len() == plan.limits.max_groups {
-                exhaustive = false;
-                limit_exceeded = true;
-                continue;
-            }
-            let values = grouped.entry(key).or_default();
-            if values.len() == plan.limits.max_values_per_group {
-                exhaustive = false;
-                limit_exceeded = true;
-                continue;
-            }
-            values.push(tuple);
-        }
-        for (key, rows) in grouped {
-            let mut values = HashMap::new();
-            for aggregate in &group.aggregates {
-                let matching = rows
-                    .iter()
-                    .copied()
-                    .map(|tuple| {
-                        predicates_match(tuple, &aggregate.predicate)
-                            .map(|matches| (tuple, matches))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .filter_map(|(tuple, matches)| matches.then_some(tuple))
-                    .collect::<Vec<_>>();
-                let value = match aggregate.op {
-                    RowAggregateOp::Count => matching.len() as u64,
-                    RowAggregateOp::CountDistinct => {
-                        let field = aggregate.value.as_ref().expect("validated aggregate value");
-                        matching
-                            .into_iter()
-                            .filter_map(|tuple| tuple_field(tuple, field).transpose())
-                            .collect::<Result<HashSet<_>, _>>()?
-                            .len() as u64
-                    }
-                    RowAggregateOp::Min => {
-                        let field = aggregate.value.as_ref().expect("validated aggregate value");
-                        matching
-                            .into_iter()
-                            .filter_map(|tuple| match tuple_field(tuple, field) {
-                                Ok(Some(RowScalar::Integer(value))) => Some(Ok(value)),
-                                Ok(None) => None,
-                                Ok(Some(_)) => unreachable!("validated min field type"),
-                                Err(error) => Some(Err(error)),
-                            })
-                            .collect::<Result<Vec<_>, _>>()?
-                            .into_iter()
-                            .min()
-                            .unwrap_or(0)
-                    }
-                    RowAggregateOp::OrderedEqual => {
-                        let sequences = aggregate
-                            .sequences
-                            .as_ref()
-                            .expect("validated ordered sequences");
-                        let left = ordered_sequence(&matching, &sequences.left)?;
-                        let right = ordered_sequence(&matching, &sequences.right)?;
-                        u64::from(left.is_some() && left == right)
-                    }
-                };
-                values.insert(&aggregate.name, value);
-            }
-            let representatives = rows
-                .iter()
-                .take(MAX_VIOLATION_REPRESENTATIVE_TUPLES)
-                .map(|tuple| {
-                    plan.bindings
-                        .iter()
-                        .filter_map(|binding| {
-                            tuple
-                                .get(&binding.name)
-                                .map(|(index, _)| RelationalViolationRow {
-                                    binding: binding.name.clone(),
-                                    row: *index,
-                                })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>();
-            group_representatives.insert((&group.name, key.clone()), representatives);
-            aggregate_values.insert((&group.name, key), values);
-        }
-    }
-
-    // Deterministic finding order: one sort over every (group, key) pair,
-    // not map order and not a per-assertion sort. Assertions over one group
-    // read their contiguous slice of the same ordering.
-    let mut sorted_group_keys: Vec<(&RowGroupName, Vec<Option<RowScalar>>)> = aggregate_values
-        .keys()
-        .map(|(group, key)| (*group, key.clone()))
-        .collect();
-    sorted_group_keys.sort();
-
-    let mut violations = Vec::new();
-    for assertion in &plan.assertions {
-        let group_keys = sorted_group_keys
-            .iter()
-            .filter(|(group, _)| *group == &assertion.group)
-            .map(|(_, key)| key.clone())
-            .collect::<Vec<_>>();
-        for key in group_keys {
-            let values = &aggregate_values[&(&assertion.group, key.clone())];
-            let actual = values.get(&assertion.aggregate).copied().ok_or_else(|| {
-                RelationalAssertionEvaluationError::MissingAggregate {
-                    group: assertion.group.as_str().to_string(),
-                    aggregate: assertion.aggregate.as_str().to_string(),
-                }
-            })?;
-            let bounded_actual = u32::try_from(actual).unwrap_or(u32::MAX);
-            if !assertion.cardinality.satisfied_by(bounded_actual) {
-                let representatives = group_representatives
-                    .get(&(&assertion.group, key.clone()))
-                    .cloned()
-                    .unwrap_or_default();
-                violations.push(RelationalAssertionViolation {
-                    assertion: assertion.id.clone(),
-                    group: assertion.group.clone(),
-                    key,
-                    actual,
-                    representatives,
-                });
-            }
-        }
-    }
-    Ok(RelationalAssertionEvaluation {
-        violations,
-        exhaustive,
-        limit_exceeded,
-    })
-}
-
-/// Recover one ordered sequence from a group's contributing tuples.
-///
-/// A joined tuple set has no inherent order, so the sequence comes from the
-/// position each row states about itself. Two rows that state the same
-/// position must therefore agree on the value; if they do not, the sequence is
-/// not defined and the answer is `None`, which the caller reads as "parity is
-/// not proven" rather than as "the lists differ in a specific way". A row whose
-/// position is absent is undecidable for the same reason.
-fn ordered_sequence(
-    tuples: &[&JoinedTuple<'_>],
-    sequence: &crate::definition::RowOrderedSequence,
-) -> Result<Option<OrderedSequence>, RelationalAssertionEvaluationError> {
-    let mut positions: HashMap<u64, Option<RowScalar>> = HashMap::new();
-    for tuple in tuples {
-        let Some(RowScalar::Integer(position)) = tuple_field(tuple, &sequence.position)? else {
-            return Ok(None);
+    let invalid =
+        |error: RelationalAssertionPlanError| RelationalAssertionEvaluationError::InvalidPlan {
+            message: error.to_string(),
         };
-        let value = tuple_field(tuple, &sequence.value)?;
-        match positions.entry(position) {
-            std::collections::hash_map::Entry::Occupied(entry) => {
-                if entry.get() != &value {
-                    return Ok(None);
-                }
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(value);
-            }
-        }
-    }
-    let mut ordered = positions.into_iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|(position, _)| *position);
-    Ok(Some(ordered))
-}
-
-/// One recovered sequence: each stated position with the value read there,
-/// ascending by position.
-type OrderedSequence = Vec<(u64, Option<RowScalar>)>;
-
-fn join_conditions_match(
-    left: &CodeQueryResultValue,
-    right: &CodeQueryResultValue,
-    join: &crate::definition::RowJoin,
-) -> Result<bool, RelationalAssertionEvaluationError> {
-    for condition in &join.on {
-        let left_value = row_field(left, &join.left, &condition.left_field)?;
-        let right_value = row_field(right, &join.right, &condition.right_field)?;
-        if left_value != right_value {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn tuple_field(
-    tuple: &JoinedTuple<'_>,
-    field: &RowFieldRef,
-) -> Result<Option<RowScalar>, RelationalAssertionEvaluationError> {
-    let (_, row) = tuple.get(&field.binding).ok_or_else(|| {
-        RelationalAssertionEvaluationError::MissingTupleBinding {
-            binding: field.binding.as_str().to_string(),
-        }
-    })?;
-    row_field(row, &field.binding, &field.field)
-}
-
-fn row_field(
-    row: &CodeQueryResultValue,
-    binding: &RowBindingName,
-    field: &str,
-) -> Result<Option<RowScalar>, RelationalAssertionEvaluationError> {
-    row.row()
-        .field(field)
-        .map(|value| value.map(RowScalar::from))
-        .map_err(|_| RelationalAssertionEvaluationError::RowField {
-            binding: binding.as_str().to_string(),
-            field: field.to_string(),
-        })
-}
-
-fn predicates_match(
-    tuple: &JoinedTuple<'_>,
-    predicates: &[RowPredicate],
-) -> Result<bool, RelationalAssertionEvaluationError> {
-    for predicate in predicates {
-        let actual = tuple_field(tuple, &predicate.field)?;
-        if !actual.is_some_and(|actual| scalar_matches_literal(&actual, &predicate.value)) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn scalar_matches_literal(actual: &RowScalar, expected: &RowLiteral) -> bool {
-    match (actual, expected) {
-        (RowScalar::StableId(actual), RowLiteral::String(expected))
-        | (RowScalar::String(actual), RowLiteral::String(expected))
-        | (RowScalar::DeclarationIdentity(actual), RowLiteral::String(expected))
-        | (RowScalar::ConstrainedEnum(actual), RowLiteral::ConstrainedEnum(expected)) => {
-            actual == expected
-        }
-        (RowScalar::Integer(actual), RowLiteral::Integer(expected)) => actual == expected,
-        (RowScalar::Boolean(actual), RowLiteral::Boolean(expected)) => actual == expected,
-        _ => false,
-    }
+    let ir = lower_relational_assertion_plan(plan).map_err(invalid)?;
+    validate_plan_ir(&ir).map_err(invalid)?;
+    evaluate_plan_ir(&ir, inputs)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
     use std::str::FromStr;
 
     use brokk_bifrost_analysis::analyzer::structural::search::{
-        CodeQueryOccurrence, CodeQueryOccurrenceTarget,
+        CodeQueryOccurrence, CodeQueryOccurrenceTarget, CodeQueryResultItem,
     };
-    use brokk_bifrost_analysis::analyzer::structural::{CodeQuery, CodeQueryRange};
+    use brokk_bifrost_analysis::analyzer::structural::{
+        CodeQuery, CodeQueryRange, CodeQueryResultValue, CodeQueryRowScalarType,
+    };
     use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
     use serde_json::json;
 
     use super::*;
     use crate::definition::{
-        AssertCardinality, PolicyAssertId, RelationalAssertionLimits, RowAggregate,
-        RowAggregateName, RowAssertion, RowBinding, RowGroup, RowGroupName, RowJoin,
-        RowJoinCondition, RowJoinKind,
+        AssertCardinality, PolicyAssertId, PolicySelector, RelationalAssertionLimits, RowAggregate,
+        RowAggregateName, RowAggregateOp, RowAssertion, RowBinding, RowBindingName,
+        RowBindingSource, RowFieldRef, RowGroup, RowGroupName, RowJoin, RowJoinCondition,
+        RowJoinKind,
     };
+    use crate::relational::RelationCoverage;
 
     fn name<T: FromStr>(value: &str) -> T
     where
@@ -1129,6 +178,7 @@ mod tests {
                     source: RowBindingSource::Query(occurrence_selector()),
                 },
             ],
+            derivations: Vec::new(),
             joins: vec![RowJoin {
                 left: site.clone(),
                 right: candidate.clone(),
@@ -1203,6 +253,40 @@ mod tests {
         ));
     }
 
+    /// A group can only read rows the join chain actually brings in. Without
+    /// the join, the second binding's rows never meet the first one's, so no
+    /// row set could answer the plan.
+    #[test]
+    fn rejects_a_group_over_a_binding_the_joins_never_bring_in() {
+        let mut plan = valid_plan();
+        plan.joins.clear();
+        plan.groups[0].by[0] = RowFieldRef {
+            binding: name("candidate"),
+            field: "ast_id".to_string(),
+        };
+        assert_eq!(
+            validate_relational_assertion_plan(&plan),
+            Err(RelationalAssertionPlanError::DisconnectedBinding {
+                binding: "candidate".to_string(),
+            })
+        );
+    }
+
+    /// Joining one binding in twice would give its columns two meanings in the
+    /// same row.
+    #[test]
+    fn rejects_joining_one_binding_in_twice() {
+        let mut plan = valid_plan();
+        let repeated = plan.joins[0].clone();
+        plan.joins.push(repeated);
+        assert_eq!(
+            validate_relational_assertion_plan(&plan),
+            Err(RelationalAssertionPlanError::RepeatedJoinBinding {
+                binding: "candidate".to_string(),
+            })
+        );
+    }
+
     #[test]
     fn rejects_forward_expansion_binding() {
         let plan = RelationalAssertionPlan {
@@ -1213,6 +297,7 @@ mod tests {
                     step: crate::definition::RowExpansionStep::ReceiverEvidence,
                 },
             }],
+            derivations: Vec::new(),
             joins: Vec::new(),
             groups: Vec::new(),
             assertions: Vec::new(),
@@ -1263,12 +348,12 @@ mod tests {
                 RelationalInput {
                     binding: site,
                     rows: &site_rows,
-                    exhaustive: true,
+                    coverage: RelationCoverage::Exhaustive,
                 },
                 RelationalInput {
                     binding: candidate,
                     rows: &one_candidate,
-                    exhaustive: true,
+                    coverage: RelationCoverage::Exhaustive,
                 },
             ],
         )
@@ -1282,12 +367,12 @@ mod tests {
                 RelationalInput {
                     binding: site,
                     rows: &site_rows,
-                    exhaustive: true,
+                    coverage: RelationCoverage::Exhaustive,
                 },
                 RelationalInput {
                     binding: candidate,
                     rows: &two_candidates,
-                    exhaustive: true,
+                    coverage: RelationCoverage::Exhaustive,
                 },
             ],
         )
@@ -1301,18 +386,106 @@ mod tests {
                 RelationalInput {
                     binding: site,
                     rows: &site_rows,
-                    exhaustive: true,
+                    coverage: RelationCoverage::Exhaustive,
                 },
                 RelationalInput {
                     binding: candidate,
                     rows: &one_candidate,
-                    exhaustive: false,
+                    coverage: RelationCoverage::incomplete(Vec::new()),
                 },
             ],
         )
         .unwrap();
         assert!(incomplete.violations.is_empty());
         assert!(!incomplete.exhaustive);
+    }
+
+    /// The authored `(filter ...)` and `(project ...)` records change what the
+    /// evaluation sees, not only what the plan says.
+    ///
+    /// Both plans read the same two rows. Without a derivation the group
+    /// counts both and violates; a filter that keeps one row makes the same
+    /// group satisfy the same assertion, and a projection that renames the
+    /// filtered relation's columns changes nothing about the answer.
+    #[test]
+    fn authored_filters_and_projections_change_the_evaluated_rows() {
+        fn plan_with(derivation: &str, right: &str) -> RelationalAssertionPlan {
+            let source = format!(
+                r#"(policy
+                  :id "test.relational.derivation" :name "Derivation" :message "M"
+                  :severity warning
+                  :analysis (analysis :type assertion
+                    (bind :name site :query
+                      (rql (occurrences :role [member_position])))
+                    (bind :name cand :query
+                      (rql (occurrences :role [member_position])))
+                    {derivation}
+                    (join :left site :right {right} :on ((ast_id ast_id)))
+                    (group :name by-site :by (site.ast_id)
+                      (aggregate :name winners :op count))
+                    (assert :group by-site :value winners
+                      :cardinality (exactly 1))))"#
+            );
+            let parsed = crate::parse_rqlp_source(
+                &source,
+                crate::PolicySourceIdentity::new("test:derivation"),
+            )
+            .expect("the derivation policy parses");
+            let crate::RqlpDocument::Policy { definition } = parsed.document() else {
+                panic!("expected policy")
+            };
+            let crate::PolicyAnalysis::Assertion { spec } = &definition.analysis else {
+                panic!("expected assertion policy")
+            };
+            spec.relational.clone().expect("relational plan")
+        }
+
+        let site_rows = vec![occurrence("site", "ast-1")];
+        let candidate_rows = vec![
+            occurrence("candidate-1", "ast-1"),
+            occurrence("candidate-2", "ast-1"),
+        ];
+        let evaluate = |plan: &RelationalAssertionPlan| {
+            let inputs = vec![
+                RelationalInput {
+                    binding: &plan.bindings[0].name,
+                    rows: &site_rows,
+                    coverage: RelationCoverage::Exhaustive,
+                },
+                RelationalInput {
+                    binding: &plan.bindings[1].name,
+                    rows: &candidate_rows,
+                    coverage: RelationCoverage::Exhaustive,
+                },
+            ];
+            evaluate_relational_assertion_rows(plan, &inputs).expect("evaluation")
+        };
+
+        let plain = evaluate(&plan_with("", "cand"));
+        assert_eq!(plain.violations.len(), 1);
+        assert_eq!(plain.violations[0].actual, 2, "both rows reach the group");
+
+        let filtered = evaluate(&plan_with(
+            r#"(filter :over cand :where ((cand.id eq "candidate-1")))"#,
+            "cand",
+        ));
+        assert!(
+            filtered.violations.is_empty(),
+            "the filter removed the second row before the join: {:?}",
+            filtered.violations
+        );
+        assert!(filtered.exhaustive);
+
+        let projected = evaluate(&plan_with(
+            r#"(filter :over cand :where ((cand.id eq "candidate-1")))
+                    (project :name narrow :from cand :columns (cand.ast_id (cand.id key)))"#,
+            "narrow",
+        ));
+        assert!(
+            projected.violations.is_empty(),
+            "a projection carries the filtered rows under its own name: {:?}",
+            projected.violations
+        );
     }
 
     fn call_argument(site: &str, index: usize, name: &str) -> CodeQueryResultItem {
@@ -1377,6 +550,7 @@ mod tests {
                     source: RowBindingSource::Query(signature_parameter_selector()),
                 },
             ],
+            derivations: Vec::new(),
             joins: vec![RowJoin {
                 left: arg.clone(),
                 right: param.clone(),
@@ -1448,12 +622,12 @@ mod tests {
                 RelationalInput {
                     binding: &plan.bindings[0].name,
                     rows: &argument_rows,
-                    exhaustive: true,
+                    coverage: RelationCoverage::Exhaustive,
                 },
                 RelationalInput {
                     binding: &plan.bindings[1].name,
                     rows: &parameter_rows,
-                    exhaustive: true,
+                    coverage: RelationCoverage::Exhaustive,
                 },
             ],
         )
@@ -1547,12 +721,12 @@ mod tests {
                 RelationalInput {
                     binding: &plan.bindings[0].name,
                     rows: &site_rows,
-                    exhaustive: true,
+                    coverage: RelationCoverage::Exhaustive,
                 },
                 RelationalInput {
                     binding: &plan.bindings[1].name,
                     rows: &candidates,
-                    exhaustive: true,
+                    coverage: RelationCoverage::Exhaustive,
                 },
             ],
         )

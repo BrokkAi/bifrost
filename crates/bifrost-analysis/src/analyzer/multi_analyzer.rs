@@ -12,8 +12,10 @@ use crate::analyzer::{
     TestAssertionWeights, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
     TypescriptAnalyzer,
 };
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_jvm::realm::JvmSourceRealm;
 use rayon::prelude::*;
 use std::any::Any;
@@ -563,12 +565,14 @@ impl MultiAnalyzer {
 
 impl ImportAnalysisProvider for MultiAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
+        let query_scope = AnalyzerQueryScope::new(self);
+        let token = query_scope.token();
         // A Kotlin file can import a Java or Scala declaration from the same
         // workspace, and only the multi-analyzer can see both sides.
         if language_for_file(file) == Language::Kotlin
             && let Some((kotlin, realm)) = self.kotlin_realm()
         {
-            return kotlin.imported_code_units_in_realm(file, Some(&realm));
+            return kotlin.imported_code_units_in_realm(token, file, Some(&realm));
         }
         self.delegate_for_file(file)
             .and_then(AnalyzerDelegate::import_analysis_provider)
@@ -584,10 +588,10 @@ impl ImportAnalysisProvider for MultiAnalyzer {
             .collect()
     }
 
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
+    fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
         self.delegate_for_file(file)
             .and_then(AnalyzerDelegate::import_analysis_provider)
-            .map(|provider| provider.import_info_of(file))
+            .map(|provider| provider.import_info_of(token, file))
             .unwrap_or_default()
     }
 
@@ -595,6 +599,8 @@ impl ImportAnalysisProvider for MultiAnalyzer {
         &self,
         files: &[ProjectFile],
     ) -> Option<HashMap<ProjectFile, Vec<ImportInfo>>> {
+        let query_scope = AnalyzerQueryScope::new(self);
+        let token = query_scope.token();
         if files.is_empty() {
             return None;
         }
@@ -627,7 +633,7 @@ impl ImportAnalysisProvider for MultiAnalyzer {
                 out.extend(map);
             } else {
                 for file in group {
-                    let infos = provider.import_info_of(&file);
+                    let infos = provider.import_info_of(token, &file);
                     out.insert(file, infos);
                 }
             }
@@ -762,13 +768,15 @@ impl TypeHierarchyProvider for MultiAnalyzer {
     }
 
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        let query_scope = AnalyzerQueryScope::new(self);
+        let token = query_scope.token();
         // A Kotlin class can extend a Java class or implement a Scala trait
         // declared in the same workspace; resolving that needs every JVM
         // delegate, which only the multi-analyzer holds.
         if language_for_file(code_unit.source()) == Language::Kotlin
             && let Some((kotlin, realm)) = self.kotlin_realm()
         {
-            return kotlin.direct_ancestors_in_realm(code_unit, Some(&realm));
+            return kotlin.direct_ancestors_in_realm(token, code_unit, Some(&realm));
         }
         self.delegate_for_code_unit(code_unit)
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
@@ -790,11 +798,13 @@ impl TypeHierarchyProvider for MultiAnalyzer {
         code_unit: &CodeUnit,
         scope: &crate::analyzer::DescendantIndexScope<'_>,
     ) -> Option<Vec<CodeUnit>> {
+        let query_scope = AnalyzerQueryScope::new(self);
+        let token = query_scope.token();
         if language_for_file(code_unit.source()) == Language::Kotlin
             && let Some((kotlin, realm)) = self.kotlin_realm()
         {
             return (!scope.cancellation().is_cancelled())
-                .then(|| kotlin.direct_ancestors_in_realm(code_unit, Some(&realm)));
+                .then(|| kotlin.direct_ancestors_in_realm(token, code_unit, Some(&realm)));
         }
         match self
             .delegate_for_code_unit(code_unit)
@@ -810,6 +820,8 @@ impl TypeHierarchyProvider for MultiAnalyzer {
         code_unit: &CodeUnit,
         scope: &crate::analyzer::DescendantIndexScope<'_>,
     ) -> Option<HashSet<CodeUnit>> {
+        let query_scope = AnalyzerQueryScope::new(self);
+        let token = query_scope.token();
         let mut descendants = match self
             .delegate_for_code_unit(code_unit)
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
@@ -839,6 +851,7 @@ impl TypeHierarchyProvider for MultiAnalyzer {
             && let Some((kotlin, realm)) = self.kotlin_realm()
         {
             descendants.extend(kotlin.direct_descendants_in_realm(
+                token,
                 code_unit,
                 Some(&realm),
                 scope,
@@ -1465,6 +1478,8 @@ impl IAnalyzer for MultiAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
+        let query_scope = AnalyzerQueryScope::new(self);
+        let token = query_scope.token();
         // JVM diagnostics must see the same
         // wider JVM source realm its import and hierarchy resolution do:
         // otherwise a type declared in a Java or Scala sibling file would be
@@ -1487,6 +1502,7 @@ impl IAnalyzer for MultiAnalyzer {
             let realm = self.kotlin_realm().map(|(_, realm)| realm);
             return crate::analyzer::kotlin::diagnostics::collect_kotlin_semantic_diagnostics(
                 self,
+                token,
                 file,
                 source,
                 realm.as_ref(),
@@ -1495,7 +1511,7 @@ impl IAnalyzer for MultiAnalyzer {
         if language_for_file(file) == Language::Java && self.delegates.contains_key(&Language::Java)
         {
             return crate::analyzer::java::diagnostics::collect_java_semantic_diagnostics(
-                self, file, source,
+                self, token, file, source,
             );
         }
         // Scala's own ladder is delegate-resident, but the active dependency
@@ -1514,7 +1530,7 @@ impl IAnalyzer for MultiAnalyzer {
         // of an indexed module resolve instead of reporting nothing known.
         if language_for_file(file) == Language::Go && self.delegates.contains_key(&Language::Go) {
             return crate::analyzer::go::diagnostics::collect_go_semantic_diagnostics(
-                self, file, source,
+                self, token, file, source,
             );
         }
         // Python's environment proof lives on the analyzer a host activated
@@ -1526,7 +1542,7 @@ impl IAnalyzer for MultiAnalyzer {
             && self.delegates.contains_key(&Language::Python)
         {
             return crate::analyzer::python::diagnostics::collect_python_semantic_diagnostics(
-                self, file, source,
+                self, token, file, source,
             );
         }
         // PHP's proof ladder reads the semantic-model overlay and the retained
@@ -1589,7 +1605,7 @@ impl IAnalyzer for MultiAnalyzer {
             && self.delegates.contains_key(&Language::CSharp)
         {
             return crate::analyzer::csharp::diagnostics::collect_csharp_semantic_diagnostics(
-                self, file, source,
+                self, token, file, source,
             );
         }
         if language_for_file(file) == Language::Cpp

@@ -21,12 +21,14 @@ use crate::analyzer::usages::go_graph::go_graph_source;
 use crate::analyzer::{
     GoAnalyzer, IAnalyzer, Language, ProjectFile, SemanticDiagnosticReport, resolve_analyzer,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_go::diagnostics::{GoExternalEvidence, GoPackageSurface};
 use brokk_bifrost_go::graph::resolver::resolve_go_import_bindings;
 use std::sync::Arc;
 
 pub(crate) fn collect_go_semantic_diagnostics(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
 ) -> SemanticDiagnosticReport {
@@ -38,7 +40,7 @@ pub(crate) fn collect_go_semantic_diagnostics(
         discovery: analyzer.dependency_discovery_evidence(Language::Go),
     };
     let bindings = resolve_go_import_bindings(
-        go_graph_source(go),
+        go_graph_source(go, token),
         file,
         go.package_clause_names(),
         |import_path| external.packages().declared_package_name(import_path),
@@ -91,6 +93,7 @@ impl GoExternalEvidence for AnalyzerGoExternalEvidence {
 #[cfg(test)]
 mod tests {
     use super::collect_go_semantic_diagnostics;
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{
         GoAnalyzer, Language, ProjectFile, SemanticDiagnostic, SemanticDiagnosticReport,
         TestProject,
@@ -114,7 +117,9 @@ mod tests {
         fn report_for(&self, rel_path: &str) -> SemanticDiagnosticReport {
             let file = self.file(rel_path);
             let source = file.read_to_string().expect("read source");
-            collect_go_semantic_diagnostics(&self.analyzer, &file, &source)
+            let scope = AnalyzerQueryScope::new(&self.analyzer);
+            let token = scope.token();
+            collect_go_semantic_diagnostics(&self.analyzer, token, &file, &source)
         }
 
         fn diagnostics_for(&self, rel_path: &str) -> Vec<SemanticDiagnostic> {

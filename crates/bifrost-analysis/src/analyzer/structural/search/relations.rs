@@ -1,4 +1,6 @@
+use super::super::matcher::{CallableSignatureFacts, CallableSignatureOracle};
 use super::*;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 pub(super) fn direct_member_expansions(
     analyzer: &dyn IAnalyzer,
@@ -50,6 +52,7 @@ pub(super) fn reference_expansion(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn call_site_expansions(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     declaration: &DeclarationValue,
     step: &QueryStep,
     filter: &CallSiteTraversalFilter,
@@ -64,6 +67,7 @@ pub(super) fn call_site_expansions(
     let incoming = matches!(step, QueryStep::CallSitesTo(_));
     let result = cached_call_relation(
         analyzer,
+        token,
         &declaration.unit,
         incoming,
         cache,
@@ -93,6 +97,7 @@ pub(super) fn call_site_expansions(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn cached_call_relation(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     unit: &CodeUnit,
     incoming: bool,
     cache: &mut CallTraversalCache,
@@ -148,9 +153,21 @@ pub(super) fn cached_call_relation(
                 ..CallRelationResult::default()
             }
         } else if incoming {
-            CallRelationService::incoming_bounded(analyzer, unit, relation_limits, cancellation)
+            CallRelationService::incoming_bounded(
+                analyzer,
+                token,
+                unit,
+                relation_limits,
+                cancellation,
+            )
         } else {
-            CallRelationService::outgoing_bounded(analyzer, unit, relation_limits, cancellation)
+            CallRelationService::outgoing_bounded(
+                analyzer,
+                token,
+                unit,
+                relation_limits,
+                cancellation,
+            )
         };
         let budget_exhausted = charge_reference_scan(
             budget,
@@ -780,6 +797,49 @@ impl EnclosingDeclarationIndex {
                     && declaration.range.end_byte == seed_range.end_byte
             })
             .cloned()
+    }
+}
+
+/// Exact-range lookup from a callable fact onto persisted signature metadata.
+pub(super) struct FileCallableSignatureOracle<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    index: EnclosingDeclarationIndex,
+}
+
+impl<'a> FileCallableSignatureOracle<'a> {
+    pub(super) fn for_file(analyzer: &'a dyn IAnalyzer, file: &ProjectFile) -> Self {
+        let mut index = EnclosingDeclarationIndex::default();
+        for unit in analyzer.get_declarations(file) {
+            index.retain(unit.clone(), analyzer.ranges_of(&unit));
+        }
+        index.sort();
+        Self { analyzer, index }
+    }
+}
+
+impl CallableSignatureOracle for FileCallableSignatureOracle<'_> {
+    fn lookup(&self, range: Range) -> Option<CallableSignatureFacts> {
+        let declaration = self.index.exact(range)?;
+        let entries = self.analyzer.signature_metadata(&declaration.unit);
+        // Signature metadata is keyed by CodeUnit and not by range, so a
+        // callable whose fq_name is overloaded carries one entry per overload
+        // and nothing here can tell the overloads apart. Read every callable
+        // fact from a single entry so visibility and parameter types cannot
+        // describe two different declarations.
+        let Some(recorded) = entries.iter().find(|entry| {
+            entry.callable_modifiers_recorded() || entry.callable_parameter_types().is_some()
+        }) else {
+            return Some(CallableSignatureFacts {
+                modifiers_recorded: false,
+                visibility: None,
+                parameter_types: None,
+            });
+        };
+        Some(CallableSignatureFacts {
+            modifiers_recorded: recorded.callable_modifiers_recorded(),
+            visibility: recorded.callable_declared_visibility(),
+            parameter_types: recorded.callable_parameter_types().map(<[String]>::to_vec),
+        })
     }
 }
 

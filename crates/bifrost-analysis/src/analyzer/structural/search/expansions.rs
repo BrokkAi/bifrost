@@ -76,6 +76,7 @@ fn reclassify_declared_subset_omissions(diagnostics: &mut [CodeQueryDiagnostic])
 #[allow(clippy::too_many_arguments)]
 pub(super) fn call_declaration_expansions(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     declaration: &DeclarationValue,
     step: &QueryStep,
     filter: &CallTraversalFilter,
@@ -118,6 +119,7 @@ pub(super) fn call_declaration_expansions(
         let relation_diagnostic_start = diagnostics.len();
         let result = cached_call_relation(
             analyzer,
+            token,
             &work.unit,
             incoming,
             cache,

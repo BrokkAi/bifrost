@@ -11,7 +11,7 @@ use crate::declarations::{
 use crate::graph::resolver::cpp_name_for;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, CodeUnitType, StructuredTypeIdentity};
-use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
+use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, collect_parse_errors};
 use brokk_bifrost_core::hash::HashMap;
 use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser};
@@ -207,6 +207,9 @@ pub fn extract_external_declarations(
         )
     });
 
+    // One index for the file's tree rather than one ancestor walk per
+    // declaration: a large generated header has tens of thousands of them.
+    let ancestry = ParentIndex::new(tree.root_node());
     let mut types = Vec::new();
     let mut members = Vec::new();
     for declaration in declarations {
@@ -252,7 +255,9 @@ pub fn extract_external_declarations(
                         declaration_start
                             .and_then(|start| cpp_function_declarator_at(tree.root_node(), start))
                             .map(|declarator| {
-                                cpp_callable_parameter_type_identities(declarator, source)
+                                cpp_callable_parameter_type_identities(
+                                    declarator, source, &ancestry,
+                                )
                             })
                     })
                     .flatten();

@@ -11,6 +11,7 @@
 //! here. Module resolution reuses the analyzer's existing [`python_module_name`]
 //! + [`resolve_python_relative_module`].
 
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalBindingsSnapshot;
 use brokk_bifrost_core::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,
@@ -98,7 +99,7 @@ impl PythonUsageIndex {
     /// Takes [`PythonSource`], not [`PythonUsageSource`]: the cell this
     /// build fills is only reachable through the latter, so the narrower
     /// parameter is what stops the build from re-entering it.
-    pub fn build(python: &dyn PythonSource) -> Self {
+    pub fn build(python: &dyn PythonSource, token: QueryToken<'_>) -> Self {
         let _scope = brokk_bifrost_core::profiling::scope("PythonUsageIndex::build");
         let mut files: Vec<ProjectFile> = python
             .project()
@@ -157,7 +158,7 @@ impl PythonUsageIndex {
                 {
                     replacement_modules.insert(file.clone(), replacement.target_module);
                 }
-                let imports = python.import_info_of(file);
+                let imports = python.import_info_of(token, file);
                 import_bindings_by_file.insert(
                     file.clone(),
                     import_bindings_from_imports(python, file, &imports),

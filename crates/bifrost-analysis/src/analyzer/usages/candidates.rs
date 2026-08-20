@@ -3,12 +3,15 @@ use crate::analyzer::usages::common::{
     analyzed_files_for_language, language_for_file, language_for_target,
 };
 use crate::analyzer::usages::traits::CandidateFileProvider;
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{
     CodeUnit, DescendantIndexScope, IAnalyzer, ImportAnalysisProvider, ImportReachability,
     Language, ProjectFile, cpp_callable_definitions_share_identity_evidence,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet, set_with_capacity};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use rayon::prelude::*;
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -51,6 +54,10 @@ fn find_import_graph_candidates(
     scope: Option<&DescendantIndexScope<'_>>,
 ) -> HashSet<ProjectFile> {
     let cancellation = scope.map(DescendantIndexScope::cancellation);
+    // The importer walks below read import facts, so this candidate pass owns
+    // a request scope for the whole walk (issue #2423).
+    let query_scope = AnalyzerQueryScope::new(analyzer);
+    let token = query_scope.token();
     let mut candidates: HashSet<ProjectFile> = set_with_capacity(16);
 
     // (1) Polymorphic expansion: target + descendants of its parent type.
@@ -138,21 +145,32 @@ fn find_import_graph_candidates(
     // re-export expansion) without re-resolving every workspace import on
     // every query. Keeping both paths made a warm Python query repeatedly pay
     // for a workspace-wide candidate walk before the index could narrow it.
-    if language_for_target(target) != Language::Python
+    let target_language = language_for_target(target);
+    // A request-scoped default Rust query immediately enters
+    // `PreparedRustUsageQuery`, which derives the complete structured importer
+    // closure from binding seeds. Running the generic importer prefetch here
+    // resolves every Rust file's imports first and then repeats the same walk.
+    // The standalone provider has no prepared phase, so it retains this path.
+    let rust_prepared_query_owns_importers = target_language == Language::Rust && scope.is_some();
+    if target_language != Language::Python
+        && !rust_prepared_query_owns_importers
         && let Some(import_provider) = analyzer.import_analysis_provider()
     {
+        let importer_files = usage_ecosystem_files(analyzer.analyzed_files(), target_language);
         if let Some(cancellation) = cancellation {
-            let importers = if language_for_target(target) == Language::Ruby {
+            let importers = if target_language == Language::Ruby {
                 find_transitive_importers_with_cancellation(
-                    analyzer.analyzed_files(),
+                    importer_files,
                     import_provider,
+                    token,
                     &candidates,
                     cancellation,
                 )
             } else {
                 find_direct_importers_with_cancellation(
-                    analyzer.analyzed_files(),
+                    importer_files,
                     import_provider,
+                    token,
                     &source_files,
                     cancellation,
                 )
@@ -174,11 +192,31 @@ fn find_import_graph_candidates(
     candidates
 }
 
+/// Files that can name declarations in `target_language` through the usage
+/// graph's declared language ecosystem.
+///
+/// Java, Scala, and Kotlin intentionally share one candidate space, as do
+/// JavaScript and TypeScript. Every other supported language is isolated. This
+/// boundary must be applied before import prefetch: filtering resolved answers
+/// afterwards still pays to hydrate every unrelated language in the workspace.
+fn usage_ecosystem_files(
+    files: impl IntoIterator<Item = ProjectFile>,
+    target_language: Language,
+) -> Vec<ProjectFile> {
+    let target_ecosystem = UsageEcosystem::of(target_language);
+    files
+        .into_iter()
+        .filter(|file| UsageEcosystem::of(language_for_file(file)) == target_ecosystem)
+        .collect()
+}
+
 fn cpp_related_callable_source_files(
     targets: &HashSet<CodeUnit>,
     analyzer: &dyn IAnalyzer,
     cancellation: Option<&CancellationToken>,
 ) -> BTreeSet<ProjectFile> {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     if !targets
         .iter()
         .any(|target| language_for_target(target) == Language::Cpp && target.is_callable())
@@ -207,7 +245,8 @@ fn cpp_related_callable_source_files(
             {
                 continue;
             }
-            if cpp_callable_definitions_share_identity_evidence(analyzer, target, &candidate) {
+            if cpp_callable_definitions_share_identity_evidence(analyzer, token, target, &candidate)
+            {
                 related.insert(candidate.source().clone());
             }
         }
@@ -218,6 +257,7 @@ fn cpp_related_callable_source_files(
 fn find_direct_importers_with_cancellation(
     files: impl IntoIterator<Item = ProjectFile>,
     import_provider: &dyn ImportAnalysisProvider,
+    token: QueryToken<'_>,
     source_files: &BTreeSet<ProjectFile>,
     cancellation: &CancellationToken,
 ) -> HashSet<ProjectFile> {
@@ -261,7 +301,7 @@ fn find_direct_importers_with_cancellation(
             .as_ref()
             .and_then(|infos| infos.get(candidate))
             .cloned()
-            .unwrap_or_else(|| import_provider.import_info_of(candidate));
+            .unwrap_or_else(|| import_provider.import_info_of(token, candidate));
         // A single `DoesNotReach` only rules out one target, so the walk keeps
         // asking until a target reaches or one answers `Unknown`. The backstop
         // below is skipped only when EVERY target was proved unreachable
@@ -311,6 +351,7 @@ fn find_direct_importers_with_cancellation(
 fn find_transitive_importers_with_cancellation(
     files: impl IntoIterator<Item = ProjectFile>,
     import_provider: &dyn ImportAnalysisProvider,
+    token: QueryToken<'_>,
     seed_files: &HashSet<ProjectFile>,
     cancellation: &CancellationToken,
 ) -> HashSet<ProjectFile> {
@@ -327,7 +368,7 @@ fn find_transitive_importers_with_cancellation(
             .as_ref()
             .and_then(|infos| infos.get(&candidate))
             .cloned()
-            .unwrap_or_else(|| import_provider.import_info_of(&candidate));
+            .unwrap_or_else(|| import_provider.import_info_of(token, &candidate));
         let imported_files = crate::analyzer::resolve_imported_files_from_infos(
             import_provider,
             &candidate,
@@ -744,8 +785,20 @@ fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{CodeUnitType, ImportInfo};
+    use crate::analyzer::workspace::EmptyAnalyzer;
+    use crate::analyzer::{CodeUnitType, ImportInfo, Language};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The importer walks take a `QueryToken`, and these tests drive them with
+    /// hand-written providers rather than a real analyzer. The scope is opened
+    /// over an analyzer that owns nothing: the token is proof that a request
+    /// scope is live, never a handle to the analyzer that minted it.
+    fn scope_analyzer() -> EmptyAnalyzer {
+        EmptyAnalyzer::new(Arc::new(crate::TestProject::new(
+            std::env::temp_dir(),
+            Language::Java,
+        )))
+    }
 
     struct CancellingImportProvider {
         cancellation: CancellationToken,
@@ -805,7 +858,7 @@ mod tests {
             )
         }
 
-        fn import_info_of(&self, _file: &ProjectFile) -> Vec<ImportInfo> {
+        fn import_info_of(&self, _token: QueryToken<'_>, _file: &ProjectFile) -> Vec<ImportInfo> {
             panic!("batched import facts must be used when available");
         }
 
@@ -829,7 +882,7 @@ mod tests {
             panic!("cancellable discovery must not build the global reverse index");
         }
 
-        fn import_info_of(&self, _file: &ProjectFile) -> Vec<ImportInfo> {
+        fn import_info_of(&self, _token: QueryToken<'_>, _file: &ProjectFile) -> Vec<ImportInfo> {
             Vec::new()
         }
     }
@@ -871,9 +924,13 @@ mod tests {
             imported: CodeUnit::new(target_file.clone(), CodeUnitType::Class, "pkg", "Target"),
         };
 
+        let scope_analyzer = scope_analyzer();
+        let scope = AnalyzerQueryScope::new(&scope_analyzer);
+        let token = scope.token();
         let importers = find_direct_importers_with_cancellation(
             [importer],
             &provider,
+            token,
             &[target_file].into_iter().collect(),
             &cancellation,
         );
@@ -902,9 +959,13 @@ mod tests {
             imported: CodeUnit::new(target_file.clone(), CodeUnitType::Class, "pkg", "Target"),
         };
 
+        let scope_analyzer = scope_analyzer();
+        let scope = AnalyzerQueryScope::new(&scope_analyzer);
+        let token = scope.token();
         let importers = find_direct_importers_with_cancellation(
             importers_input,
             &provider,
+            token,
             &[target_file].into_iter().collect(),
             &cancellation,
         );
@@ -937,9 +998,13 @@ mod tests {
             imported: CodeUnit::new(target_file.clone(), CodeUnitType::Class, "pkg", "Target"),
         };
 
+        let scope_analyzer = scope_analyzer();
+        let scope = AnalyzerQueryScope::new(&scope_analyzer);
+        let token = scope.token();
         let importers = find_direct_importers_with_cancellation(
             [importer.clone()],
             &provider,
+            token,
             &[target_file].into_iter().collect(),
             &CancellationToken::default(),
         );
@@ -963,7 +1028,7 @@ mod tests {
             panic!("cancellable discovery must not build the global reverse index");
         }
 
-        fn import_info_of(&self, _file: &ProjectFile) -> Vec<ImportInfo> {
+        fn import_info_of(&self, _token: QueryToken<'_>, _file: &ProjectFile) -> Vec<ImportInfo> {
             Vec::new()
         }
 
@@ -1015,9 +1080,13 @@ mod tests {
             prefetches_before_first_candidate: Arc::new(AtomicUsize::new(0)),
         };
 
+        let scope_analyzer = scope_analyzer();
+        let scope = AnalyzerQueryScope::new(&scope_analyzer);
+        let token = scope.token();
         let importers = find_direct_importers_with_cancellation(
             candidates.clone(),
             &provider,
+            token,
             &[target_file].into_iter().collect(),
             &CancellationToken::default(),
         );
@@ -1058,9 +1127,13 @@ mod tests {
             prefetches_before_first_candidate: Arc::new(AtomicUsize::new(0)),
         };
 
+        let scope_analyzer = scope_analyzer();
+        let scope = AnalyzerQueryScope::new(&scope_analyzer);
+        let token = scope.token();
         let importers = find_direct_importers_with_cancellation(
             [candidate],
             &provider,
+            token,
             &[target_file].into_iter().collect(),
             &cancellation,
         );
@@ -1094,9 +1167,13 @@ mod tests {
             edge_lookups: Arc::clone(&edge_lookups),
         };
 
+        let scope_analyzer = scope_analyzer();
+        let scope = AnalyzerQueryScope::new(&scope_analyzer);
+        let token = scope.token();
         let importers = find_transitive_importers_with_cancellation(
             [target.clone(), loader.clone(), entrypoint.clone()],
             &provider,
+            token,
             &[target].into_iter().collect(),
             &CancellationToken::default(),
         );
@@ -1106,5 +1183,41 @@ mod tests {
             importers
         );
         assert_eq!(3, edge_lookups.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn importer_prefetch_scope_follows_language_ecosystems() {
+        let root = std::env::temp_dir();
+        let files = [
+            ProjectFile::new(root.clone(), "lib.rs"),
+            ProjectFile::new(root.clone(), "Main.java"),
+            ProjectFile::new(root.clone(), "Main.scala"),
+            ProjectFile::new(root.clone(), "Main.kt"),
+            ProjectFile::new(root.clone(), "app.js"),
+            ProjectFile::new(root, "app.ts"),
+        ];
+        let relative_paths = |selected: Vec<ProjectFile>| {
+            selected
+                .into_iter()
+                .map(|file| file.rel_path().to_string_lossy().into_owned())
+                .collect::<BTreeSet<_>>()
+        };
+
+        assert_eq!(
+            relative_paths(usage_ecosystem_files(files.clone(), Language::Rust)),
+            BTreeSet::from(["lib.rs".to_string()])
+        );
+        assert_eq!(
+            relative_paths(usage_ecosystem_files(files.clone(), Language::Java)),
+            BTreeSet::from([
+                "Main.java".to_string(),
+                "Main.kt".to_string(),
+                "Main.scala".to_string(),
+            ])
+        );
+        assert_eq!(
+            relative_paths(usage_ecosystem_files(files, Language::TypeScript)),
+            BTreeSet::from(["app.js".to_string(), "app.ts".to_string()])
+        );
     }
 }

@@ -26,8 +26,8 @@ use brokk_bifrost_js_ts::ts_owners::{
     jsts_identifier_candidates, jsts_member_candidates, node_text_matches, root_node,
     ts_call_expression_callees, ts_direct_object_literal_value,
     ts_expand_call_return_property_owners, ts_nodes_for_code_unit, ts_parameter_name_node,
-    ts_receiver_owner_candidates_at_byte, ts_resolve_type_text_to_property_owners,
-    ts_unwrap_expression,
+    ts_receiver_owner_candidates_at_byte, ts_resolve_type_node_to_property_owner_outcome,
+    ts_resolve_type_text_to_property_owners, ts_unwrap_expression,
 };
 use brokk_bifrost_js_ts::type_text::{
     jsts_type_space_candidates, jsts_unit_is_type_only, jsts_value_space_candidates,
@@ -47,11 +47,9 @@ struct JsTsAliasCandidateKey {
 /// (#1477).
 ///
 /// Every candidate here was found by asking the index for
-/// `<receiver fq>.<member>` (or its `$static` companion form), so the receiver
-/// *is* the owner and the walk took no hierarchy hop. This route performs no
-/// superclass or interface walk at all -- a member declared only on a base
-/// class does not resolve through it -- so no seam in this file can name an
-/// inherited owner, and none claims one.
+/// `<owner fq>.<member>` (or its `$static` companion form). Direct candidates
+/// name the receiver as their owner; inherited candidates name the declaring
+/// ancestor and retain the bounded hierarchy route that reached it.
 ///
 /// Applicability stays `Unknown`: these lookups select by owner and name and
 /// never inspect the call shape.
@@ -86,6 +84,33 @@ impl JsTsMemberFinds {
         }
     }
 
+    fn record_inherited(
+        &mut self,
+        owner: &CodeUnit,
+        found: &[CodeUnit],
+        dispatch_tier: crate::analyzer::structural::MemberDispatchTier,
+        hierarchy_depth: usize,
+        route: &[trace::HierarchyHopRecord],
+    ) {
+        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
+        if !trace::recording() {
+            return;
+        }
+        for candidate in found {
+            self.by_fq_name.push((
+                candidate.fq_name(),
+                trace::MemberEnrichment {
+                    owner: owner.clone(),
+                    hierarchy_depth,
+                    dispatch_tier,
+                    applicability: ApplicabilityVerdict::Unknown,
+                    route: route.to_vec(),
+                },
+            ));
+        }
+    }
+
     /// Stage the attribution for the outcome constructor the caller is about to
     /// reach. Staging nothing leaves the rows unattributed, which is what an
     /// unrecorded trace and an uninstrumented lookup must both look like.
@@ -95,6 +120,162 @@ impl JsTsMemberFinds {
         }
         trace::stage_member_context(self.by_fq_name.clone());
     }
+}
+
+const MAX_JS_TS_MEMBER_FRONTIER: usize = 512;
+
+/// The first-discovery parents and depths of a bounded JS/TS hierarchy walk.
+///
+/// The analyzer's hierarchy provider deliberately exposes only direct edges;
+/// retaining the parent chain here lets member attribution report the exact
+/// route without re-deriving it after resolution. A breadth-first walk gives
+/// the nearest declaring owner precedence and the bound keeps malformed or
+/// unusually broad hierarchies finite.
+#[derive(Default)]
+struct JsTsMemberHierarchy {
+    parents: HashMap<CodeUnit, CodeUnit>,
+    depths: HashMap<CodeUnit, usize>,
+}
+
+impl JsTsMemberHierarchy {
+    fn route(
+        &self,
+        receiver: &CodeUnit,
+        owner: &CodeUnit,
+    ) -> Option<(usize, Vec<trace::HierarchyHopRecord>)> {
+        use crate::analyzer::structural::HierarchyRelation;
+
+        let depth = *self.depths.get(owner)?;
+        let mut chain = vec![owner.clone()];
+        while chain.last() != Some(receiver) {
+            let parent = self
+                .parents
+                .get(chain.last().expect("chain is never empty"))?;
+            chain.push(parent.clone());
+        }
+        chain.reverse();
+        debug_assert_eq!(chain.len(), depth + 1);
+        let route = chain
+            .windows(2)
+            .enumerate()
+            .map(|(hop, pair)| trace::HierarchyHopRecord {
+                hop,
+                from: pair[0].clone(),
+                to: pair[1].clone(),
+                relation: HierarchyRelation::Extends,
+            })
+            .collect();
+        Some((depth, route))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inherited_member_candidates(
+    analyzer: &dyn IAnalyzer,
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    receiver: &CodeUnit,
+    member: &str,
+    value_position: bool,
+    static_access: bool,
+    finds: &mut JsTsMemberFinds,
+) -> Vec<CodeUnit> {
+    let Some(provider) = analyzer.type_hierarchy_provider() else {
+        return Vec::new();
+    };
+    let mut hierarchy = JsTsMemberHierarchy::default();
+    let mut seen = HashSet::default();
+    seen.insert(receiver.clone());
+    let mut level = provider.get_direct_ancestors(receiver);
+    let mut depth = 0usize;
+    let mut visited = 0usize;
+    let mut candidates = Vec::new();
+
+    while !level.is_empty() && visited < MAX_JS_TS_MEMBER_FRONTIER {
+        depth += 1;
+        let mut next_level = Vec::new();
+        let mut level_candidates = Vec::new();
+        for owner in level {
+            if !seen.insert(owner.clone()) {
+                continue;
+            }
+            if visited == MAX_JS_TS_MEMBER_FRONTIER {
+                break;
+            }
+            visited += 1;
+            hierarchy.depths.insert(owner.clone(), depth);
+            hierarchy
+                .parents
+                .entry(owner.clone())
+                .or_insert_with(|| receiver.clone());
+
+            let plain = jsts_file_scoped_dotted_candidates(
+                host,
+                support,
+                owner.source(),
+                &format!("{}.{}", owner.fq_name(), member),
+                value_position,
+            );
+            let static_members = if static_access {
+                jsts_file_scoped_dotted_candidates(
+                    host,
+                    support,
+                    owner.source(),
+                    &format!("{}.{}$static", owner.fq_name(), member),
+                    value_position,
+                )
+            } else {
+                Vec::new()
+            };
+            let found = if static_access {
+                if static_members.is_empty() {
+                    plain
+                } else {
+                    static_members
+                }
+            } else if plain.is_empty() {
+                jsts_file_scoped_dotted_candidates(
+                    host,
+                    support,
+                    owner.source(),
+                    &format!("{}.{}$static", owner.fq_name(), member),
+                    value_position,
+                )
+            } else {
+                plain
+            };
+            if !found.is_empty() {
+                let Some((hierarchy_depth, route)) = hierarchy.route(receiver, &owner) else {
+                    continue;
+                };
+                finds.record_inherited(
+                    &owner,
+                    &found,
+                    crate::analyzer::structural::MemberDispatchTier::InheritedOrPromoted,
+                    hierarchy_depth,
+                    &route,
+                );
+                level_candidates.extend(found);
+                continue;
+            }
+
+            for next in provider.get_direct_ancestors(&owner) {
+                hierarchy
+                    .parents
+                    .entry(next.clone())
+                    .or_insert_with(|| owner.clone());
+                next_level.push(next);
+            }
+        }
+        if !level_candidates.is_empty() {
+            candidates = level_candidates;
+            break;
+        }
+        level = next_level;
+    }
+    candidates.sort_by_key(CodeUnit::fq_name);
+    candidates.dedup();
+    candidates
 }
 
 fn js_ts_candidates_outcome(
@@ -382,6 +563,7 @@ pub(super) fn resolve_js_ts(
         let generic_member_candidates =
             if language == Language::JavaScript && imported_receiver_binding {
                 jsts_file_scoped_member_candidates(
+                    analyzer,
                     host,
                     support,
                     receiver_candidates,
@@ -455,6 +637,37 @@ pub(super) fn resolve_js_ts(
             host, support, file, language, source, tree, site, name, &batch,
         ) {
             ReceiverAnalysisOutcome::Precise(candidates) if !candidates.is_empty() => {
+                // The receiver-fact provider proves the value shape but
+                // intentionally returns only target declarations. Re-run the
+                // TypeScript owner lookup when it can name the declared
+                // receiver so member tracing records the same direct or
+                // inherited owner and route as the ordinary resolver path.
+                if language == Language::TypeScript {
+                    let receiver_owners = ts_local_receiver_owner_candidates(
+                        host, support, file, source, tree, site, imports, aliases, qualifier,
+                    );
+                    let receiver_owners = if receiver_owners.is_empty() {
+                        ts_parameter_annotation_receiver_owners(
+                            host, support, file, source, tree, site, imports, aliases, qualifier,
+                        )
+                    } else {
+                        receiver_owners
+                    };
+                    let mut provider_finds = JsTsMemberFinds::default();
+                    let attributed = ts_member_candidates(
+                        analyzer,
+                        host,
+                        support,
+                        receiver_owners,
+                        name,
+                        value_position,
+                        &mut provider_finds,
+                    );
+                    if !attributed.is_empty() {
+                        provider_finds.stage();
+                        return js_ts_candidates_outcome(analyzer, attributed);
+                    }
+                }
                 let candidates = if language == Language::TypeScript {
                     if value_position {
                         jsts_value_space_candidates(host, candidates)
@@ -484,6 +697,43 @@ pub(super) fn resolve_js_ts(
                     );
                 }
                 return js_ts_candidates_outcome(analyzer, candidates);
+            }
+            ReceiverAnalysisOutcome::Ambiguous(candidates)
+                if language == Language::TypeScript && !candidates.is_empty() =>
+            {
+                // An ambiguous provider result can still be enriched when
+                // the receiver's structured annotation is itself precise.
+                // Structured owner recovery rejects ambiguous/open
+                // annotations, so an unresolved arm keeps the existing
+                // no-definition outcome.
+                let receiver_owners = ts_local_receiver_owner_candidates(
+                    host, support, file, source, tree, site, imports, aliases, qualifier,
+                );
+                let receiver_owners = if receiver_owners.is_empty() {
+                    ts_parameter_annotation_receiver_owners(
+                        host, support, file, source, tree, site, imports, aliases, qualifier,
+                    )
+                } else {
+                    receiver_owners
+                };
+                let mut provider_finds = JsTsMemberFinds::default();
+                let attributed = ts_member_candidates(
+                    analyzer,
+                    host,
+                    support,
+                    receiver_owners,
+                    name,
+                    value_position,
+                    &mut provider_finds,
+                );
+                if !attributed.is_empty() {
+                    provider_finds.stage();
+                    return js_ts_candidates_outcome(analyzer, attributed);
+                }
+                return no_definition(
+                    "receiver_analysis_not_precise",
+                    format!("`{reference}` did not resolve to a precise JS/TS receiver"),
+                );
             }
             ReceiverAnalysisOutcome::Ambiguous(_)
             | ReceiverAnalysisOutcome::Unsupported { .. }
@@ -550,6 +800,7 @@ pub(super) fn resolve_js_ts(
             );
             let mut inferred_finds = JsTsMemberFinds::default();
             let inferred_member_candidates = jsts_file_scoped_member_candidates(
+                analyzer,
                 host,
                 support,
                 inferred_receivers,
@@ -2372,6 +2623,7 @@ fn ts_call_type_argument_member_candidates(
 }
 
 fn jsts_file_scoped_member_candidates(
+    analyzer: &dyn IAnalyzer,
     host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     receiver_candidates: Vec<CodeUnit>,
@@ -2390,8 +2642,21 @@ fn jsts_file_scoped_member_candidates(
             &format!("{}.{}", receiver.fq_name(), member),
             value_position,
         );
-        finds.record(&receiver, &found, MemberDispatchTier::InherentOrDirect);
-        candidates.extend(found);
+        if found.is_empty() {
+            candidates.extend(inherited_member_candidates(
+                analyzer,
+                host,
+                support,
+                &receiver,
+                member,
+                value_position,
+                false,
+                finds,
+            ));
+        } else {
+            finds.record(&receiver, &found, MemberDispatchTier::InherentOrDirect);
+            candidates.extend(found);
+        }
     }
     candidates
 }
@@ -2445,6 +2710,34 @@ fn ts_member_candidates(
                 value_position,
             );
             tier = MemberDispatchTier::StaticOrCompanion;
+        }
+        if members.is_empty() {
+            let inherited = inherited_member_candidates(
+                analyzer,
+                host,
+                support,
+                &receiver,
+                member,
+                value_position,
+                static_access,
+                finds,
+            );
+            let has_synthetic = inherited.iter().any(CodeUnit::is_synthetic);
+            if has_synthetic
+                && !jsts_unit_is_type_only(host, &receiver)
+                && !ts_synthetic_member_is_supported_by_receiver_initializer(
+                    analyzer, host, support, &receiver, member,
+                )
+            {
+                candidates.extend(
+                    inherited
+                        .into_iter()
+                        .filter(|member| !member.is_synthetic()),
+                );
+            } else {
+                candidates.extend(inherited);
+            }
+            continue;
         }
         finds.record(&receiver, &members, tier);
 
@@ -2738,6 +3031,68 @@ fn ts_local_receiver_owner_candidates(
         receiver,
         site.focus_start_byte,
     )
+}
+
+/// Resolve a parameter receiver's annotation directly from its structured AST
+/// when the general local-owner route has no result. The receiver fact provider
+/// already proved this parameter's value shape; this narrow fallback supplies
+/// the declaring owner needed to stage direct or inherited member enrichment.
+#[allow(clippy::too_many_arguments)]
+fn ts_parameter_annotation_receiver_owners(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
+    receiver: &str,
+) -> Vec<CodeUnit> {
+    let Some(function) = jsts_enclosing_function_scope(tree.root_node(), site.focus_start_byte)
+    else {
+        return Vec::new();
+    };
+    let Some(parameters) = function
+        .child_by_field_name("parameters")
+        .or_else(|| function.child_by_field_name("parameter"))
+    else {
+        return Vec::new();
+    };
+    let mut owners = Vec::new();
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        let Some(name) = ts_parameter_name_node(parameter) else {
+            continue;
+        };
+        if !node_text_matches(name, source, receiver) {
+            continue;
+        }
+        let Some(type_node) = parameter.child_by_field_name("type") else {
+            continue;
+        };
+        let Some(resolved_owners) = ts_resolve_type_node_to_property_owner_outcome(
+            host,
+            support,
+            file,
+            source,
+            imports,
+            aliases,
+            type_node,
+            0,
+            ReceiverAnalysisBudget::default(),
+        )
+        .into_precise() else {
+            // An unresolved or ambiguous annotation cannot establish one
+            // receiver owner for member enrichment. Leave the provider's
+            // candidates unattributed rather than collapsing an open union.
+            continue;
+        };
+        owners.extend(resolved_owners);
+    }
+    sort_units(&mut owners);
+    owners.dedup();
+    owners
 }
 
 fn jsts_enclosing_function_or_program_scope(root: Node<'_>, byte: usize) -> Option<Node<'_>> {
