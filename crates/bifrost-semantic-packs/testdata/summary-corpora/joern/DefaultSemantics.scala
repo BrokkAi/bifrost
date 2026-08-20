@@ -8,7 +8,7 @@
 // The `javaFlows` list below is copied verbatim from the pinned upstream file,
 // with one added `F` entry that carries an empty mapping list so the no-flow
 // claim has coverage. The slice exists so reader tests never touch the network
-// and never vendor the whole corpus; scripts/fetch-pinned-summary-corpora.sh
+// and never vendor the whole corpus; scripts/public/fetch-pinned-summary-corpora.sh
 // fetches the pinned file for a foundry run.
 package io.joern.dataflowengineoss
 

@@ -4,6 +4,8 @@ use super::sources::*;
 use super::summaries::*;
 use super::*;
 use crate::analyzer::structural::{NormalizedKind, Role};
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchSymbolsParams {
@@ -708,6 +710,8 @@ pub fn get_symbol_locations_with_cancellation(
     params: SymbolLookupParams,
     cancellation: Option<&crate::CancellationToken>,
 ) -> SymbolLocationsResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let mut outcomes: Vec<_> = params
         .symbols
         .into_par_iter()
@@ -729,6 +733,7 @@ pub fn get_symbol_locations_with_cancellation(
             // they must choose one definition to render.
             let code_units = match resolve_selectable_definition_groups(
                 analyzer,
+                token,
                 &symbol,
                 resolve_codeunit_fuzzy,
             ) {
@@ -847,10 +852,13 @@ pub fn get_definitions_by_location_with_cancellation(
     params: GetDefinitionParams,
     cancellation: Option<&crate::CancellationToken>,
 ) -> GetDefinitionResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let _scope = profiling::scope("searchtools::get_definitions_by_location");
     GetDefinitionResult {
         results: get_navigation_by_location_with_cancellation(
             analyzer,
+            token,
             params,
             NavigationOperation::Definition,
             cancellation,
@@ -870,10 +878,13 @@ pub fn get_declarations_by_location_with_cancellation(
     params: GetDefinitionParams,
     cancellation: Option<&crate::CancellationToken>,
 ) -> GetDeclarationResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let _scope = profiling::scope("searchtools::get_declarations_by_location");
     GetDeclarationResult {
         results: get_navigation_by_location_with_cancellation(
             analyzer,
+            token,
             params,
             NavigationOperation::Declaration,
             cancellation,
@@ -893,6 +904,7 @@ pub fn get_declarations_by_location_with_cancellation(
 
 fn get_navigation_by_location_with_cancellation(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     params: GetDefinitionParams,
     operation: NavigationOperation,
     cancellation: Option<&crate::CancellationToken>,
@@ -940,7 +952,12 @@ fn get_navigation_by_location_with_cancellation(
                 let navigation = if conflict {
                     Ok(None)
                 } else {
-                    semantic_model_navigation_candidates(analyzer, &overlay, matched.records[0])
+                    semantic_model_navigation_candidates(
+                        analyzer,
+                        token,
+                        &overlay,
+                        matched.records[0],
+                    )
                 };
                 let navigation_conflict = navigation.as_ref().is_err();
                 let (mut definitions, navigation_diagnostic) = match navigation {
@@ -1042,6 +1059,7 @@ fn get_navigation_by_location_with_cancellation(
             .collect();
         let outcomes = crate::analyzer::usages::get_definition::resolve_navigation_batch(
             analyzer,
+            token,
             requests,
             operation,
             cancellation,
@@ -1050,6 +1068,7 @@ fn get_navigation_by_location_with_cancellation(
         for ((index, query, request), outcome) in chunk.iter().zip(outcomes) {
             results[*index] = Some(render_definition_lookup(
                 analyzer,
+                token,
                 query.clone(),
                 &request.file,
                 outcome,
@@ -1064,6 +1083,7 @@ fn get_navigation_by_location_with_cancellation(
 
 fn semantic_model_navigation_candidates(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
     symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
 ) -> Result<Option<Vec<DefinitionCandidate>>, DefinitionDiagnostic> {
@@ -1111,7 +1131,7 @@ fn semantic_model_navigation_candidates(
 
     match exact_codeunit_resolution(analyzer, &relation.to) {
         CodeUnitResolution::Resolved(units) => {
-            let mut definitions = definition_candidates(analyzer, &units);
+            let mut definitions = definition_candidates(analyzer, token, &units);
             for definition in &mut definitions {
                 definition.semantic_model = Some(relation.provenance.clone());
             }
@@ -1148,6 +1168,8 @@ fn unresolved_semantic_model_navigation(
 }
 
 pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> GetTypeResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let _scope = profiling::scope("searchtools::get_type_by_location");
 
     if params.references.len() > TYPE_LOOKUP_MAX_REFERENCES {
@@ -1232,6 +1254,7 @@ pub fn get_type_by_location(analyzer: &dyn IAnalyzer, params: GetTypeParams) -> 
     for ((index, query, request), outcome) in pending.into_iter().zip(outcomes) {
         results[index] = Some(render_type_lookup(
             analyzer,
+            token,
             query,
             &request.file,
             outcome,
@@ -1405,6 +1428,7 @@ pub(super) fn rename_symbol_failure(
 
 pub(super) fn render_definition_lookup(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     query: DefinitionReferenceQuery,
     file: &ProjectFile,
     outcome: crate::analyzer::usages::get_definition::NavigationLookupOutcome,
@@ -1420,7 +1444,7 @@ pub(super) fn render_definition_lookup(
         outcome.status.as_str().to_string()
     };
     let mut definitions =
-        navigation_candidates_with_cache(analyzer, &outcome.targets, render_cache);
+        navigation_candidates_with_cache(analyzer, token, &outcome.targets, render_cache);
     if let Some(definition) = outcome.lexical_definition.as_ref()
         && let Some(candidate) = lexical_definition_candidate(analyzer, file, definition)
     {
@@ -1430,7 +1454,7 @@ pub(super) fn render_definition_lookup(
     let imported_model_target = outcome
         .reference
         .as_ref()
-        .and_then(|reference| explicit_import_model_target(analyzer, file, reference));
+        .and_then(|reference| explicit_import_model_target(analyzer, token, file, reference));
     let mut diagnostics: Vec<DefinitionDiagnostic> = outcome
         .diagnostics
         .into_iter()
@@ -1833,6 +1857,7 @@ fn structured_reference_kind(
 
 fn explicit_import_model_target(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     reference: &crate::analyzer::usages::reference_site::ResolvedReferenceSite,
 ) -> Option<String> {
@@ -1843,7 +1868,7 @@ fn explicit_import_model_target(
     let reference_name = symbol_selector_leaf(language, &reference.text)?;
     let provider = analyzer.import_analysis_provider_for_file(file)?;
     let mut targets = provider
-        .import_info_of(file)
+        .import_info_of(token, file)
         .into_iter()
         .filter(|import| {
             !import.is_wildcard
@@ -1868,6 +1893,7 @@ fn explicit_import_model_target(
 
 pub(super) fn render_type_lookup(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     query: TypeReferenceQuery,
     file: &ProjectFile,
     outcome: crate::analyzer::usages::get_type::TypeLookupOutcome,
@@ -1907,7 +1933,7 @@ pub(super) fn render_type_lookup(
         types: outcome
             .types
             .iter()
-            .map(|item| type_lookup_candidate(analyzer, item, render_cache))
+            .map(|item| type_lookup_candidate(analyzer, token, item, render_cache))
             .collect(),
         diagnostics,
     }
@@ -1962,10 +1988,12 @@ pub(super) fn location_failure_message(
 
 pub(super) fn type_lookup_candidate(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     item: &crate::analyzer::usages::get_type::TypeLookupType,
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> TypeLookupCandidate {
-    let definitions = definition_candidates_with_cache(analyzer, &item.definitions, render_cache);
+    let definitions =
+        definition_candidates_with_cache(analyzer, token, &item.definitions, render_cache);
     let primary = definitions.first();
     TypeLookupCandidate {
         fqn: item.fqn.clone(),
@@ -1979,6 +2007,8 @@ pub fn get_symbol_ancestors(
     analyzer: &dyn IAnalyzer,
     params: SymbolLookupParams,
 ) -> SymbolAncestorsResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let Some(provider) = analyzer.type_hierarchy_provider() else {
         let mut ancestors = Vec::new();
         let mut not_found = Vec::new();
@@ -2015,7 +2045,7 @@ pub fn get_symbol_ancestors(
         .into_iter()
         .filter(|symbol| !symbol.trim().is_empty())
     {
-        match resolve_selectable_definitions(analyzer, &symbol, resolve_codeunit_fuzzy) {
+        match resolve_selectable_definitions(analyzer, token, &symbol, resolve_codeunit_fuzzy) {
             SelectableDefinitionResolution::Resolved(code_units) => {
                 let mut resolved = Vec::new();
                 let mut rejected_kind = None;

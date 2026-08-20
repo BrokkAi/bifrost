@@ -1,0 +1,513 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.jdk-framework-summaries",
+  "version": "0.1.0",
+  "producer": {
+    "name": "bifrost-framework-foundry",
+    "version": "0.9.0"
+  },
+  "language": "java",
+  "ecosystem": "jdk",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": [
+      {
+        "name": "jdk",
+        "requirement": ">=17.0.0"
+      }
+    ]
+  },
+  "provenance": {
+    "source": "hand-authored flow-through summaries and escape effects for the JDK members bifrost.jdk-framework-decls declares (java.io.PrintWriter)",
+    "revision": "framework-decls"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": true
+  },
+  "shards": [
+    {
+      "id": "summaries.jdk",
+      "activation": [
+        {
+          "toolchain": {
+            "name": "jdk",
+            "version": ">=17.0.0"
+          },
+          "targets": [
+            "jvm"
+          ],
+          "configurations": []
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "java.io.printwriter.println",
+            "target": {
+              "path": "java.base/java/io/PrintWriter.java",
+              "symbol": "java.io.PrintWriter.println(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.io.printwriter.output",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.io.printwriter.print",
+            "target": {
+              "path": "java.base/java/io/PrintWriter.java",
+              "symbol": "java.io.PrintWriter.print(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.io.printwriter.output",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.io.printwriter.write",
+            "target": {
+              "path": "java.base/java/io/PrintWriter.java",
+              "symbol": "java.io.PrintWriter.write(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.io.printwriter.output",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.sql.connection.preparestatement",
+            "target": {
+              "path": "java.sql/java/sql/Connection.java",
+              "symbol": "java.sql.Connection.prepareStatement(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.sql.database.statement",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.sql.connection.preparecall",
+            "target": {
+              "path": "java.sql/java/sql/Connection.java",
+              "symbol": "java.sql.Connection.prepareCall(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.sql.database.statement",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.sql.statement.execute",
+            "target": {
+              "path": "java.sql/java/sql/Statement.java",
+              "symbol": "java.sql.Statement.execute(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.sql.database.statement",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.sql.statement.executequery",
+            "target": {
+              "path": "java.sql/java/sql/Statement.java",
+              "symbol": "java.sql.Statement.executeQuery(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.sql.database.statement",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.sql.statement.executeupdate",
+            "target": {
+              "path": "java.sql/java/sql/Statement.java",
+              "symbol": "java.sql.Statement.executeUpdate(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.sql.database.statement",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.sql.statement.addbatch",
+            "target": {
+              "path": "java.sql/java/sql/Statement.java",
+              "symbol": "java.sql.Statement.addBatch(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.sql.database.statement",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.lang.runtime.exec",
+            "target": {
+              "path": "java.base/java/lang/Runtime.java",
+              "symbol": "java.lang.Runtime.exec(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.lang.process.command",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.lang.runtime.exec-environment",
+            "target": {
+              "path": "java.base/java/lang/Runtime.java",
+              "symbol": "java.lang.Runtime.exec(java.lang.String,java.lang.String[])",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.lang.process.command",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.lang.runtime.exec-environment-directory",
+            "target": {
+              "path": "java.base/java/lang/Runtime.java",
+              "symbol": "java.lang.Runtime.exec(java.lang.String,java.lang.String[],java.io.File)",
+              "has_receiver": true,
+              "parameter_count": 3
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.lang.process.command",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.lang.processbuilder.command",
+            "target": {
+              "path": "java.base/java/lang/ProcessBuilder.java",
+              "symbol": "java.lang.ProcessBuilder.command(java.util.List)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.lang.process.command",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.lang.processbuilder.start",
+            "target": {
+              "path": "java.base/java/lang/ProcessBuilder.java",
+              "symbol": "java.lang.ProcessBuilder.start()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.lang.process.command",
+                "input": {
+                  "kind": "receiver"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

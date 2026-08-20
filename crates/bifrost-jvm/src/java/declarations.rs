@@ -1,4 +1,6 @@
-use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::fq_name::{
+    FqName, SegmentId, SegmentKind, joined_segments, normalize_joined, segment_interner,
+};
 use brokk_bifrost_core::analyzer::model::{CallableArity, SignatureMetadata};
 use brokk_bifrost_core::analyzer::model::{DeclarationInfo, DeclarationKind};
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
@@ -15,18 +17,27 @@ fn java_segment(text: &str, kind: SegmentKind) -> SegmentId {
     segment_interner().intern(text, kind)
 }
 
+/// Java's package path is stored `.`-joined in `package_name`.
+const JAVA_PACKAGE_SEPARATOR: &str = ".";
+
 /// Build the structured package-path prefix for a Java declaration.
 ///
 /// `package_name` (from `determine_package_name`) is already the `.`-joined
-/// dotted package (`com.example.pkg`, empty for the unnamed package). Java
-/// identifiers can never contain a literal `.`, so splitting on `.` is
-/// lossless; each component becomes one [`SegmentKind::Package`] segment —
-/// mirroring python's `python_module_fq` (`Package`-`Package` renders `.` by
-/// default, which is exactly this convention; unlike go's `/`-joined import
-/// path, java's package has no `Path` component).
+/// dotted package (`com.example.pkg`, empty for the unnamed package). Each
+/// component becomes one [`SegmentKind::Package`] segment — mirroring python's
+/// `python_module_fq` (`Package`-`Package` renders `.` by default, which is
+/// exactly this convention; unlike go's `/`-joined import path, java's package
+/// has no `Path` component).
+///
+/// [`joined_segments`] is the split half of the shared empty-component
+/// decision; `determine_package_name` applies [`normalize_joined`], its join
+/// half, to the string it returns. A Java identifier cannot contain a literal
+/// `.`, but a declaration can still be written with a doubled or dangling one
+/// -- intellij-community's inspection fixtures carry `package com..foo;` -- and
+/// the two spellings must not disagree about it (#2375).
 fn java_package_fq(package_name: &str) -> FqName {
     let mut fq = FqName::new();
-    for component in package_name.split('.').filter(|c| !c.is_empty()) {
+    for component in joined_segments(package_name, JAVA_PACKAGE_SEPARATOR) {
         fq.push(java_segment(component, SegmentKind::Package));
     }
     fq
@@ -39,7 +50,7 @@ pub fn determine_package_name(root: Node<'_>, source: &str) -> String {
         };
 
         if child.kind() == "package_declaration" {
-            return node_text(child, source)
+            let declared = node_text(child, source)
                 .trim()
                 .strip_prefix("package ")
                 .unwrap_or("")
@@ -47,6 +58,9 @@ pub fn determine_package_name(root: Node<'_>, source: &str) -> String {
                 .unwrap_or("")
                 .trim()
                 .to_string();
+            // Share the empty-component decision with `java_package_fq`, which
+            // splits this string back apart (#2375).
+            return normalize_joined(&declared, JAVA_PACKAGE_SEPARATOR).into_owned();
         }
 
         if is_class_like_declaration_kind(child.kind()) {

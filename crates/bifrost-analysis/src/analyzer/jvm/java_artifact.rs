@@ -275,6 +275,7 @@ impl JavaJarPackProducer {
                     &mut diagnostics,
                 ) {
                     ClassEntryResult::Declaration(declaration) => declarations.push(declaration),
+                    ClassEntryResult::Excluded => {}
                     ClassEntryResult::Skipped => {}
                     ClassEntryResult::Invalid => diagnostics.warning(
                         "java.class.invalid",
@@ -1719,8 +1720,98 @@ pub(super) fn source_declared_type_names(source: &str) -> Vec<String> {
 
 enum ClassEntryResult {
     Declaration(JavaApiType),
+    Excluded,
     Skipped,
     Invalid,
+}
+
+/// The bounded declaration surface needed by the JVM external index.
+///
+/// The regular artifact producer turns this same parsed representation into
+/// semantic-model facts. The external index only needs the type identity,
+/// hierarchy, and written member names, so keeping this small view lets it
+/// consume the class entry it already read instead of producing a whole pack
+/// and parsing the class entry again.
+pub(super) struct JavaClassSurface {
+    pub(super) name: String,
+    pub(super) package_name: String,
+    pub(super) type_kind: TypeKind,
+    pub(super) visibility: Visibility,
+    pub(super) hierarchy: Vec<HierarchyFact>,
+    pub(super) members: Vec<JavaClassSurfaceMember>,
+}
+
+pub(super) struct JavaClassSurfaceMember {
+    pub(super) name: String,
+    pub(super) visibility: Visibility,
+    /// The type the class file's member table writes as this member's return
+    /// type, decoded from the generic signature when the class carries one and
+    /// from the descriptor otherwise.
+    ///
+    /// This is what types a chained receiver (#2454): `response.getWriter()`
+    /// has no written type anywhere in the reading file, and the jar that
+    /// declares `getWriter` is the only surface that says it returns
+    /// `java.io.PrintWriter`. `class_method_member` already decodes it for the
+    /// full pack-production path, so dropping it here would make the same jar
+    /// answer the question on one path and not on the other.
+    pub(super) returns: Option<TypeRef>,
+}
+
+pub(super) enum JavaClassSurfaceOutcome {
+    Declared(JavaClassSurface),
+    Excluded,
+    Skipped,
+    Invalid,
+}
+
+/// Parse one class entry into the bounded external declaration surface.
+///
+/// `remaining_records` is shared by the whole artifact, matching the limit
+/// used by full Java pack production. The caller applies its own member-surface
+/// budget when retaining the returned members.
+pub(super) fn class_surface(
+    jar_name: &str,
+    class_entry: &str,
+    bytes: &[u8],
+    max_depth: usize,
+    remaining_records: &mut usize,
+    record_limit_hit: &mut bool,
+    diagnostics: &mut BoundedProducerDiagnostics,
+) -> JavaClassSurfaceOutcome {
+    match class_api_type(
+        jar_name,
+        class_entry,
+        bytes,
+        max_depth,
+        remaining_records,
+        record_limit_hit,
+        diagnostics,
+    ) {
+        ClassEntryResult::Declaration(declaration) => {
+            if declaration.visibility == Visibility::Private {
+                return JavaClassSurfaceOutcome::Excluded;
+            }
+            JavaClassSurfaceOutcome::Declared(JavaClassSurface {
+                name: declaration.name,
+                package_name: declaration.package_name,
+                type_kind: declaration.type_kind,
+                visibility: declaration.visibility,
+                hierarchy: declaration.hierarchy,
+                members: declaration
+                    .members
+                    .into_iter()
+                    .map(|member| JavaClassSurfaceMember {
+                        name: member.name,
+                        visibility: member.visibility,
+                        returns: member.signature.and_then(|signature| signature.returns),
+                    })
+                    .collect(),
+            })
+        }
+        ClassEntryResult::Excluded => JavaClassSurfaceOutcome::Excluded,
+        ClassEntryResult::Skipped => JavaClassSurfaceOutcome::Skipped,
+        ClassEntryResult::Invalid => JavaClassSurfaceOutcome::Invalid,
+    }
 }
 
 fn class_api_type(
@@ -1740,7 +1831,7 @@ fn class_api_type(
     };
     let flags = class_file.access_flags();
     if flags.contains(ClassFlags::ACC_MODULE) {
-        return ClassEntryResult::Skipped;
+        return ClassEntryResult::Excluded;
     }
     let Some(internal_name) = class_name_at(&class_file, class_file.this_class()) else {
         return ClassEntryResult::Invalid;
@@ -2150,6 +2241,11 @@ fn binary_class_visibility(class_file: &ClassFile, internal_name: &str) -> Visib
             let Some(inner_name) = class_name_at(class_file, class.inner_class_info_index()) else {
                 continue;
             };
+            if internal_name.starts_with(&format!("{inner_name}$"))
+                && nested_visibility(class.inner_class_access_flags()) == Visibility::Private
+            {
+                return Visibility::Private;
+            }
             if inner_name == internal_name {
                 visibility = nested_visibility(class.inner_class_access_flags());
             }
@@ -2459,6 +2555,7 @@ mod tests {
         _temp: tempfile::TempDir,
         source_jar: PathBuf,
         class_jar: PathBuf,
+        classes: PathBuf,
     }
 
     impl JavaFixture {
@@ -2501,6 +2598,7 @@ mod tests {
                 _temp: temp,
                 source_jar,
                 class_jar,
+                classes,
             }
         }
     }
@@ -2537,6 +2635,53 @@ mod tests {
                 review_required: false,
             },
         }
+    }
+
+    /// #2454's chained-receiver ladder types `response.getWriter()` by reading
+    /// the declared return type of `getWriter` out of the surface that declares
+    /// it, and for a dependency jar that surface is this bounded `class_surface`
+    /// path -- the one `JvmExternalDeclarationIndex` uses. The full
+    /// pack-production path already decodes the same return type, so a surface
+    /// member that dropped it made one jar answer the question on one path and
+    /// not on the other.
+    ///
+    /// That is not hypothetical: a merge repair set this field to `None`, and
+    /// the OWASP corpus census lost every chained identity it had gained --
+    /// `java.io.PrintWriter.println` fell from 1061 cases to 0 and
+    /// `org.owasp.esapi.Encoder.encodeForHTML` from 577 to 0 -- with no test
+    /// failing, because #2454's own fixtures declare their types through an
+    /// activated pack rather than through a jar.
+    #[test]
+    fn the_bounded_class_surface_carries_each_member_declared_return_type() {
+        let fixture = JavaFixture::new();
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let mut remaining_records = limits.max_records;
+        let mut record_limit_hit = false;
+        let entry = "fixture/api/Dollar$Type.class";
+        let bytes = fs::read(fixture.classes.join("fixture/api/Dollar$Type.class")).unwrap();
+        let JavaClassSurfaceOutcome::Declared(surface) = class_surface(
+            "fixture.jar",
+            entry,
+            &bytes,
+            limits.max_signature_depth,
+            &mut remaining_records,
+            &mut record_limit_hit,
+            &mut diagnostics,
+        ) else {
+            panic!("the fixture class must declare a surface");
+        };
+        let self_member = surface
+            .members
+            .iter()
+            .find(|member| member.name == "self")
+            .expect("the surface must carry the declared method");
+        assert_eq!(
+            self_member.returns,
+            Some(named_type("fixture.api.Dollar$Type".to_owned())),
+            "a surface member must carry the return type its class file writes: {:?}",
+            self_member.returns
+        );
     }
 
     #[test]

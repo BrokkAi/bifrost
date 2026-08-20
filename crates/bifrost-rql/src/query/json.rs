@@ -11,6 +11,7 @@ use super::schema::{
     usage_surface_label,
 };
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use serde_json::{Map, Value, json};
 
 impl CodeQuery {
@@ -853,6 +854,19 @@ fn kind_list_to_json(kinds: &[NormalizedKind]) -> Value {
     }
 }
 
+fn visibility_list_to_json(visibilities: &[DeclaredVisibility]) -> Value {
+    if visibilities.len() == 1 {
+        json!(visibilities[0].label())
+    } else {
+        Value::Array(
+            visibilities
+                .iter()
+                .map(|visibility| json!(visibility.label()))
+                .collect(),
+        )
+    }
+}
+
 fn pattern_to_json(pattern: &Pattern) -> Value {
     let mut object = Map::new();
     if !pattern.kinds.is_empty() {
@@ -872,6 +886,18 @@ fn pattern_to_json(pattern: &Pattern) -> Value {
     }
     if let Some(arity) = &pattern.arity {
         object.insert("arity".to_string(), arity_to_json(arity));
+    }
+    if !pattern.visibility.is_empty() {
+        object.insert(
+            "visibility".to_string(),
+            visibility_list_to_json(&pattern.visibility),
+        );
+    }
+    if let Some(predicate) = &pattern.parameter_type {
+        object.insert(
+            "parameter_type".to_string(),
+            string_predicate_to_json(predicate),
+        );
     }
     if let Some(capture) = &pattern.capture {
         object.insert("capture".to_string(), json!(capture));

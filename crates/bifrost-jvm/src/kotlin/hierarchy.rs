@@ -17,6 +17,7 @@ use brokk_bifrost_core::analyzer::capabilities::{
     DescendantIndexScope, DirectDescendantIndex, build_direct_descendant_index_from_candidates,
 };
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ImportInfo};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 use crate::kotlin::graph_support::KotlinSource;
@@ -46,6 +47,7 @@ pub trait KotlinHierarchyFact: Clone {
 /// The uncached half of the analyzer's realm-keyed ancestor cache.
 pub fn kotlin_resolve_direct_ancestors(
     source: &dyn KotlinSource,
+    token: QueryToken<'_>,
     code_unit: &CodeUnit,
     realm: Option<&JvmSourceRealm<'_>>,
 ) -> Vec<CodeUnit> {
@@ -59,8 +61,8 @@ pub fn kotlin_resolve_direct_ancestors(
         // it is never built for them.
         return Vec::new();
     }
-    let imports = source.import_info_of(code_unit.source());
-    kotlin_resolve_ancestors_from_facts(source, code_unit, &raw_supertypes, &imports, realm)
+    let imports = source.import_info_of(token, code_unit.source());
+    kotlin_resolve_ancestors_from_facts(source, token, code_unit, &raw_supertypes, &imports, realm)
 }
 
 /// The uncached half of the analyzer's realm-keyed descendant-index cell: every
@@ -80,6 +82,7 @@ pub fn build_kotlin_direct_descendant_index<Fact>(
     source: &dyn KotlinSource,
     realm: Option<&JvmSourceRealm<'_>>,
     scope: &DescendantIndexScope<'_>,
+    token: QueryToken<'_>,
 ) -> Option<DirectDescendantIndex>
 where
     Fact: KotlinHierarchyFact,
@@ -104,6 +107,7 @@ where
         for facts in &batch {
             let resolved = kotlin_resolve_ancestors_from_facts(
                 source,
+                token,
                 facts.declaration(),
                 facts.raw_supertypes(),
                 facts.imports(),
@@ -140,6 +144,7 @@ where
 /// no query can open.
 fn kotlin_resolve_ancestors_from_facts(
     source: &dyn KotlinSource,
+    token: QueryToken<'_>,
     owner: &CodeUnit,
     raw_supertypes: &[String],
     imports: &[ImportInfo],
@@ -151,19 +156,19 @@ fn kotlin_resolve_ancestors_from_facts(
     let scope = KotlinNameScope {
         package_name: owner.package_name(),
         imports,
-        scope_owners: kotlin_scope_owners_for(source, owner),
+        scope_owners: kotlin_scope_owners_for(source, token, owner),
     };
     let mut ancestors = Vec::new();
     let mut seen = HashSet::default();
     for spelled in raw_supertypes {
         let KotlinTypeName::Resolved(fqn) =
             resolve_kotlin_type_name(spelled, &scope, |candidate| {
-                kotlin_realm_type_exists(source, candidate, realm)
+                kotlin_realm_type_exists(source, token, candidate, realm)
             })
         else {
             continue;
         };
-        if let Some(unit) = kotlin_realm_type_by_fqn(source, &fqn, realm)
+        if let Some(unit) = kotlin_realm_type_by_fqn(source, token, &fqn, realm)
             && seen.insert(unit.fq_name())
         {
             ancestors.push(unit);

@@ -1,6 +1,7 @@
 use crate::analyzer::jvm::dependency_discovery::{discover_build_tools, discover_metadata};
 use crate::analyzer::jvm::java_artifact::{
-    JavaJarPackProducer, ZipDirectoryStatus, zip_directory_status,
+    JavaClassSurfaceOutcome, JavaJarPackProducer, ZipDirectoryStatus, class_surface,
+    zip_directory_status,
 };
 use crate::analyzer::jvm::jdk_artifact::{
     JdkSourceArchivePackProducer, detect_jdk_source_archive_layout,
@@ -26,10 +27,9 @@ use crate::analyzer::{
 use crate::hash::HashMap;
 use brokk_bifrost_jvm::java::declarations::{
     class_like_body_children_rev, determine_package_name, is_class_like_declaration_kind,
-    node_text, normalize_java_full_name, parse_tree,
+    node_text, parse_tree,
 };
-use jclassfile::attributes::{Attribute, NestedClassFlags};
-use jclassfile::class_file::{ClassFile, ClassFlags};
+use jclassfile::attributes::Attribute;
 use jclassfile::constant_pool::ConstantPool;
 use semver::Version;
 use std::ffi::OsString;
@@ -175,6 +175,7 @@ impl JavaArtifactFacts {
                     fqn: qualified_name(owner_fqn, &fact.name),
                     declaring_package: owner_package.to_owned(),
                     visibility: semantic_visibility(fact.visibility),
+                    returns: fact.signature.and_then(|signature| signature.returns),
                 });
         }
         JvmIndexedOwnerSurface {
@@ -1452,8 +1453,11 @@ impl JvmExternalDeclarationIndex {
         let mut total_bytes = 0u64;
         let mut skipped_entries = archive.len().saturating_sub(entry_count);
         let mut member_budget = MemberBudget::new();
-        let mut java_facts =
-            self.produce_java_facts(artifact_path, ExternalArtifactKind::JavaClassJar);
+        let producer_limits = ArtifactProducerLimits::default();
+        let mut producer_diagnostics =
+            crate::analyzer::semantic_model::BoundedProducerDiagnostics::new(&producer_limits);
+        let mut remaining_records = producer_limits.max_records;
+        let mut record_limit_hit = false;
         for index in 0..entry_count {
             let Ok(entry) = archive.by_index(index) else {
                 skipped_entries = skipped_entries.saturating_add(1);
@@ -1482,34 +1486,101 @@ impl JvmExternalDeclarationIndex {
                 skipped_entries = skipped_entries.saturating_add(1);
                 continue;
             }
-            let mut external_type = match class_type(artifact_path, &class_entry, &bytes) {
-                ClassTypeOutcome::Declared(external_type) => external_type,
+            let surface = match class_surface(
+                artifact_path.to_string_lossy().as_ref(),
+                &class_entry,
+                &bytes,
+                producer_limits.max_signature_depth,
+                &mut remaining_records,
+                &mut record_limit_hit,
+                &mut producer_diagnostics,
+            ) {
+                JavaClassSurfaceOutcome::Declared(surface) => surface,
                 // A module descriptor and a private class were read
                 // completely; the index publishes neither on purpose, and
                 // neither leaves anything unread.
-                ClassTypeOutcome::Excluded => continue,
-                // Bytes that did not parse are a class file this index did not
-                // read: it declares no type here and, just as importantly, no
-                // member surface that could later answer a member spelling
-                // negatively.
-                ClassTypeOutcome::Unreadable => {
+                JavaClassSurfaceOutcome::Excluded => continue,
+                // The producer could not parse this class file, so it declares
+                // no type here and, just as importantly, no member surface that
+                // could later answer a member spelling negatively.
+                JavaClassSurfaceOutcome::Invalid => {
+                    producer_diagnostics.warning(
+                        "java.class.invalid",
+                        Some(class_entry.clone()),
+                        "class entry did not contain supported bounded metadata",
+                    );
                     skipped_entries = skipped_entries.saturating_add(1);
                     continue;
                 }
+                // The bounded producer record limit was spent. It is reported
+                // below as `limit.records`; do not misclassify an intentional
+                // bound as an unread archive entry.
+                JavaClassSurfaceOutcome::Skipped => continue,
             };
-            if let Some(fact) = java_facts.types.get(&external_type.fqn) {
-                apply_java_type_fact(&mut external_type, fact);
+
+            let short_name = surface
+                .name
+                .strip_prefix(&format!("{}.", surface.package_name))
+                .unwrap_or(&surface.name)
+                .to_owned();
+            let external_type = JvmExternalType {
+                fqn: surface.name.clone(),
+                package_name: surface.package_name.clone(),
+                short_name,
+                kind: semantic_type_kind(surface.type_kind),
+                visibility: semantic_visibility(surface.visibility),
+                source: JvmExternalDeclarationSource::ClassFile {
+                    artifact_path: artifact_path.to_path_buf(),
+                    class_entry: class_entry.clone(),
+                },
+            };
+            if external_type.visibility == JvmVisibility::Private {
+                continue;
             }
             // This entry was read to the end and parsed, so the members the
             // same class file declares are a surface that may answer (#1900).
-            let surface = java_facts.take_owner_surface(
+            let mut members = HashMap::default();
+            for member in surface.members {
+                if !member_budget.take() {
+                    break;
+                }
+                members
+                    .entry(member.name.clone())
+                    .or_insert_with(|| JvmExternalMember {
+                        fqn: qualified_name(&external_type.fqn, &member.name),
+                        declaring_package: external_type.package_name.clone(),
+                        visibility: semantic_visibility(member.visibility),
+                        // The class file's member table is what types a chained
+                        // receiver (#2454), so this path carries the declared
+                        // return type exactly as `take_owner_surface` does for
+                        // the pack-production path. Dropping it here made the
+                        // same jar answer `response.getWriter()` on one path and
+                        // not on the other, which measurably retired the whole
+                        // chained-receiver census on the OWASP corpus.
+                        returns: member.returns,
+                    });
+            }
+            self.attach_member_surface(
                 &external_type.fqn,
-                &external_type.package_name,
-                &mut member_budget,
+                JvmIndexedOwnerSurface {
+                    members,
+                    supertypes: hierarchy_type_names(&surface.hierarchy),
+                },
             );
-            self.attach_member_surface(&external_type.fqn, surface);
             self.insert(external_type);
         }
+        if record_limit_hit {
+            producer_diagnostics.warning(
+                "limit.records",
+                None,
+                format!(
+                    "producer stopped after {} declaration records",
+                    producer_limits.max_records
+                ),
+            );
+        }
+        let (diagnostics, _) = producer_diagnostics.finish();
+        self.production_diagnostics.extend(diagnostics);
         self.note_bounded_artifact(artifact_path, skipped_entries, member_budget);
         total_bytes
     }
@@ -2033,6 +2104,10 @@ impl<'a> JvmExternalDeclarations<'a> {
                     .map_or("", |(package, _)| package)
                     .to_owned(),
                 visibility: semantic_visibility(member.visibility),
+                returns: member
+                    .structured_signature
+                    .as_ref()
+                    .and_then(|signature| signature.returns.clone()),
             })
         })
     }
@@ -2059,11 +2134,44 @@ pub(crate) struct JvmExternalMember {
     /// package of the type the reference wrote.
     declaring_package: String,
     visibility: JvmVisibility,
+    /// The type the declaration writes as this member's return type, exactly as
+    /// the declaring half recorded it. `None` means the declaration wrote none
+    /// -- a field, a constructor, a `void` method, or a member surface whose
+    /// signature the producer did not record -- which is not a claim that the
+    /// member returns nothing a caller can name.
+    ///
+    /// Overloads share one entry per written name in the artifact half, so this
+    /// is the return type of the *first* declaration read for that name. That is
+    /// the same "overloads are one name, not ambiguity" rule
+    /// [`JvmIndexedOwnerSurface`] already applies to the member itself.
+    returns: Option<TypeRef>,
 }
 
 impl JvmExternalMember {
     pub(crate) fn fqn(&self) -> &str {
         &self.fqn
+    }
+
+    /// The fully-qualified name of the class this member's declaration says it
+    /// returns (#2454).
+    ///
+    /// This is what types a *chained* receiver: `response.getWriter()` has no
+    /// written type anywhere in the reading file, but the declaration surface
+    /// that declares `getWriter` also writes down that it returns
+    /// `java.io.PrintWriter`.
+    ///
+    /// It fails closed, in the same direction as every other tier of the
+    /// receiver ladder. Only a `Named` return type names a class a member
+    /// lookup can continue from; a type variable, a wildcard, an array, a
+    /// pointer and every other structured form name no single declaration, so
+    /// they answer nothing and the call keeps the identity-free boundary it had.
+    /// A primitive return spells a `Named` type no external surface declares, so
+    /// it fails at the next rung rather than here.
+    pub(crate) fn declared_return_type_fqn(&self) -> Option<&str> {
+        match self.returns.as_ref()? {
+            TypeRef::Named { name, .. } if !name.is_empty() => Some(name),
+            _ => None,
+        }
     }
 
     fn is_accessible_from_package(&self, package_name: &str) -> bool {
@@ -2889,61 +2997,6 @@ fn modifier_present(modifiers: &str, expected: &str) -> bool {
         .any(|token| token == expected)
 }
 
-/// What one `.class` entry contributed to the index.
-///
-/// The three cases are kept apart because only one of them is a gap. A module
-/// descriptor and a private class are read completely and then deliberately not
-/// published; bytes that do not parse are a hole in what the index knows, and
-/// only a hole may make the artifact report as not fully read (#1900).
-enum ClassTypeOutcome {
-    /// The class file parsed and declares a type a reference outside the
-    /// artifact can name.
-    Declared(JvmExternalType),
-    /// The class file parsed and deliberately declares nothing here: a module
-    /// descriptor, or a class private to its own enclosing type.
-    Excluded,
-    /// The bytes are not a class file this index could read.
-    Unreadable,
-}
-
-fn class_type(artifact_path: &Path, class_entry: &str, bytes: &[u8]) -> ClassTypeOutcome {
-    let Ok(class_file) = jclassfile::class_file::parse(bytes) else {
-        return ClassTypeOutcome::Unreadable;
-    };
-    let flags = class_file.access_flags();
-    if flags.contains(ClassFlags::ACC_MODULE) {
-        return ClassTypeOutcome::Excluded;
-    }
-    let Some(internal_name) = class_internal_name(&class_file) else {
-        return ClassTypeOutcome::Unreadable;
-    };
-    let (package_name, short_name) = split_internal_class_name(&internal_name);
-    if short_name.is_empty() {
-        return ClassTypeOutcome::Unreadable;
-    }
-    let fqn = qualified_name(&package_name, &short_name);
-    let visibility = class_visibility(&class_file, &internal_name);
-    if visibility == JvmVisibility::Private {
-        return ClassTypeOutcome::Excluded;
-    }
-    ClassTypeOutcome::Declared(JvmExternalType {
-        fqn,
-        package_name,
-        short_name,
-        kind: class_kind(flags),
-        visibility,
-        source: JvmExternalDeclarationSource::ClassFile {
-            artifact_path: artifact_path.to_path_buf(),
-            class_entry: class_entry.to_string(),
-        },
-    })
-}
-
-fn class_internal_name(class_file: &ClassFile) -> Option<String> {
-    let class_index = class_file.this_class() as usize;
-    class_name_at_class_index(class_file, class_index)
-}
-
 /// One class to assemble into a test class JAR: its binary name, the binary
 /// name of its superclass, and the members it declares (#1900).
 ///
@@ -3096,51 +3149,6 @@ pub(crate) fn write_test_class_jar(path: &Path, classes: &[TestClassFile<'_>]) {
     jar.finish().expect("finish the fixture class jar");
 }
 
-fn class_name_at_class_index(class_file: &ClassFile, class_index: usize) -> Option<String> {
-    let constant_pool = class_file.constant_pool();
-    let ConstantPool::Class { name_index } = constant_pool.get(class_index)? else {
-        return None;
-    };
-    let ConstantPool::Utf8 { value } = constant_pool.get(*name_index as usize)? else {
-        return None;
-    };
-    Some(value.clone())
-}
-
-fn class_visibility(class_file: &ClassFile, internal_name: &str) -> JvmVisibility {
-    let mut own_visibility = None;
-    for attribute in class_file.attributes() {
-        let Attribute::InnerClasses { classes } = attribute else {
-            continue;
-        };
-        for class in classes {
-            let Some(inner_name) =
-                class_name_at_class_index(class_file, class.inner_class_info_index() as usize)
-            else {
-                continue;
-            };
-            if internal_name.starts_with(&format!("{inner_name}$"))
-                && nested_class_visibility(class.inner_class_access_flags())
-                    == JvmVisibility::Private
-            {
-                return JvmVisibility::Private;
-            }
-            if inner_name == internal_name {
-                own_visibility = Some(nested_class_visibility(class.inner_class_access_flags()));
-            }
-        }
-    }
-    if let Some(visibility) = own_visibility {
-        return visibility;
-    }
-
-    if class_file.access_flags().contains(ClassFlags::ACC_PUBLIC) {
-        JvmVisibility::Public
-    } else {
-        JvmVisibility::PackagePrivate
-    }
-}
-
 fn restrict_visibility(declared: JvmVisibility, enclosing: JvmVisibility) -> JvmVisibility {
     match (declared, enclosing) {
         (JvmVisibility::Private, _) | (_, JvmVisibility::Private) => JvmVisibility::Private,
@@ -3159,30 +3167,6 @@ fn is_interface_like_node(kind: &str) -> bool {
     )
 }
 
-fn nested_class_visibility(flags: &NestedClassFlags) -> JvmVisibility {
-    if flags.contains(NestedClassFlags::ACC_PUBLIC) {
-        JvmVisibility::Public
-    } else if flags.contains(NestedClassFlags::ACC_PROTECTED) {
-        JvmVisibility::Protected
-    } else if flags.contains(NestedClassFlags::ACC_PRIVATE) {
-        JvmVisibility::Private
-    } else {
-        JvmVisibility::PackagePrivate
-    }
-}
-
-fn class_kind(flags: &ClassFlags) -> JvmExternalTypeKind {
-    if flags.contains(ClassFlags::ACC_ANNOTATION) {
-        JvmExternalTypeKind::Annotation
-    } else if flags.contains(ClassFlags::ACC_ENUM) {
-        JvmExternalTypeKind::Enum
-    } else if flags.contains(ClassFlags::ACC_INTERFACE) {
-        JvmExternalTypeKind::Interface
-    } else {
-        JvmExternalTypeKind::Class
-    }
-}
-
 fn source_kind(kind: &str) -> JvmExternalTypeKind {
     match kind {
         "interface_declaration" => JvmExternalTypeKind::Interface,
@@ -3191,16 +3175,6 @@ fn source_kind(kind: &str) -> JvmExternalTypeKind {
         "record_declaration" => JvmExternalTypeKind::Record,
         _ => JvmExternalTypeKind::Class,
     }
-}
-
-fn split_internal_class_name(internal_name: &str) -> (String, String) {
-    let (package_path, class_name) = internal_name
-        .rsplit_once('/')
-        .unwrap_or(("", internal_name));
-    (
-        package_path.replace('/', "."),
-        normalize_java_full_name(&class_name.replace('$', ".")),
-    )
 }
 
 fn qualified_name(package_name: &str, short_name: &str) -> String {
@@ -3229,6 +3203,7 @@ mod tests {
         JvmExternalDependencies, JvmMavenCoordinate, Language, MultiAnalyzer, Project, ProjectFile,
         PythonAnalyzer, TestProject, resolve_analyzer,
     };
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::io::Write;
@@ -4179,7 +4154,9 @@ mod tests {
             TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
             config,
         );
-        assert!(analyzer.is_known_type_name_in_file(None, &app, "ExternalService"));
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        assert!(analyzer.is_known_type_name_in_file(token, None, &app, "ExternalService"));
     }
 
     #[test]
@@ -4225,8 +4202,10 @@ mod tests {
             TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
             config,
         );
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
         let resolution = analyzer
-            .resolve_type_name_with_external(None, &app, "ExternalService")
+            .resolve_type_name_with_external(token, None, &app, "ExternalService")
             .unwrap();
         let crate::analyzer::java::imports::JavaTypeResolution::External(external) = resolution
         else {
@@ -4301,7 +4280,9 @@ mod tests {
             TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
             config,
         );
-        assert!(!analyzer.is_known_type_name_in_file(None, &app, "ExternalService"));
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        assert!(!analyzer.is_known_type_name_in_file(token, None, &app, "ExternalService"));
     }
 
     #[test]
@@ -4331,14 +4312,16 @@ mod tests {
             TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
             config,
         );
-        assert!(!analyzer.is_known_type_name_in_file(None, &app, "ExternalService"));
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        assert!(!analyzer.is_known_type_name_in_file(token, None, &app, "ExternalService"));
         let initial_index = analyzer.external_index.clone();
 
         pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>")
             .unwrap();
         let updated = analyzer.update(&BTreeSet::from([pom.clone()]));
         assert!(!Arc::ptr_eq(&initial_index, &updated.external_index));
-        assert!(updated.is_known_type_name_in_file(None, &app, "ExternalService"));
+        assert!(updated.is_known_type_name_in_file(token, None, &app, "ExternalService"));
 
         app.write(
             "package app; import com.example.dep.ExternalService; class App { ExternalService changed; }",
@@ -4399,13 +4382,15 @@ mod tests {
             ),
         ]));
         let java = resolve_analyzer::<JavaAnalyzer>(&multi).unwrap();
-        assert!(!java.is_known_type_name_in_file(None, &app, "ExternalService"));
+        let scope = AnalyzerQueryScope::new(&multi);
+        let token = scope.token();
+        assert!(!java.is_known_type_name_in_file(token, None, &app, "ExternalService"));
 
         pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>")
             .unwrap();
         let updated = multi.update(&BTreeSet::from([pom]));
         let java = resolve_analyzer::<JavaAnalyzer>(&updated).unwrap();
-        assert!(java.is_known_type_name_in_file(None, &app, "ExternalService"));
+        assert!(java.is_known_type_name_in_file(token, None, &app, "ExternalService"));
     }
 
     #[test]
@@ -4755,48 +4740,61 @@ mod tests {
         let project = TestProject::new(fixture.project_root().to_path_buf(), Language::Java);
         let analyzer = JavaAnalyzer::from_project_with_config(project.clone(), config);
 
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
         assert!(matches!(
-            analyzer.resolve_type_name_with_external(None, &app, "LocalType"),
+            analyzer.resolve_type_name_with_external(token, None, &app, "LocalType"),
             Some(crate::analyzer::java::imports::JavaTypeResolution::Source(
                 _
             ))
         ));
         assert!(matches!(
-            analyzer.resolve_type_name_with_external(None, &app, "ExternalService"),
+            analyzer.resolve_type_name_with_external(token, None, &app, "ExternalService"),
             Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
         ));
         assert!(matches!(
-            analyzer.resolve_type_name_with_external(None, &app, "ExternalService.Nested"),
+            analyzer.resolve_type_name_with_external(token, None, &app, "ExternalService.Nested"),
             Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
         ));
         assert!(
             analyzer
-                .resolve_type_name_with_external(None, &app, "ExternalService.ProtectedNested")
+                .resolve_type_name_with_external(
+                    token,
+                    None,
+                    &app,
+                    "ExternalService.ProtectedNested"
+                )
                 .is_none(),
             "protected nested dependency types should not resolve from unrelated packages"
         );
         assert!(matches!(
-            analyzer.resolve_type_name_with_external(None, &app, "PublicApi.Callback"),
+            analyzer.resolve_type_name_with_external(token, None, &app, "PublicApi.Callback"),
             Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
         ));
         assert!(
             analyzer
-                .resolve_type_name_with_external(None, &app, "Foo")
+                .resolve_type_name_with_external(token, None, &app, "Foo")
                 .is_none(),
             "ambiguous wildcard external types should not resolve arbitrarily"
         );
         assert!(
             analyzer
-                .resolve_type_name_with_external(None, &app, "PackageOuter.Nested")
+                .resolve_type_name_with_external(token, None, &app, "PackageOuter.Nested")
                 .is_none(),
             "public nested types under package-private outers should not resolve from other packages"
         );
         assert!(matches!(
-            analyzer.resolve_type_name_with_external(None, &same_package_app, "PackageHelper"),
+            analyzer.resolve_type_name_with_external(
+                token,
+                None,
+                &same_package_app,
+                "PackageHelper"
+            ),
             Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
         ));
         assert!(matches!(
             analyzer.resolve_type_name_with_external(
+                token,
                 None,
                 &same_package_app,
                 "ExternalService.PackageNested"
@@ -4805,7 +4803,7 @@ mod tests {
         ));
         assert!(
             analyzer
-                .resolve_type_name_in_file(&app, "ExternalService")
+                .resolve_type_name_in_file(token, &app, "ExternalService")
                 .is_none(),
             "source-only resolution should not fabricate CodeUnits for dependency types"
         );

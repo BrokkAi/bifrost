@@ -1,8 +1,10 @@
 use super::*;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_plan_step(
     step: &QueryStep,
+    token: QueryToken<'_>,
     derived_layer_request: Option<DerivedLayerRequest>,
     final_in_authored_suffix: bool,
     rows: Vec<PipelineRow>,
@@ -34,7 +36,7 @@ pub(super) fn apply_plan_step(
                 .unwrap_or_else(DerivedLayerRequest::complete_direct_import_topology);
             let build_if_missing = derived_layer_request.is_some();
             snapshot_lifecycle =
-                acquire_direct_import_layer(state, request, limits, build_if_missing);
+                acquire_direct_import_layer(state, token, request, limits, build_if_missing);
         }
         discard_stale_direct_import_layer(state, derived_layer_request.is_some());
         if let Some(topology) = state
@@ -198,8 +200,13 @@ pub(super) fn apply_plan_step(
                         .max_pipeline_rows
                         .saturating_sub(state.budget.import_edges_resolved),
                 );
-                let exhausted =
-                    graph.ensure_complete(state.analyzer, max_files, max_edges, state.cancellation);
+                let exhausted = graph.ensure_complete(
+                    state.analyzer,
+                    token,
+                    max_files,
+                    max_edges,
+                    state.cancellation,
+                );
                 state.budget.import_files_resolved = state
                     .budget
                     .import_files_resolved
@@ -294,6 +301,7 @@ pub(super) fn apply_plan_step(
                 );
                 let exhausted = graph.ensure_forward(
                     state.analyzer,
+                    token,
                     &frontier,
                     max_files,
                     max_edges,
@@ -352,6 +360,7 @@ pub(super) fn apply_plan_step(
     };
     let (mut rows, mut exhausted, mut step_truncated) = apply_pipeline_step(
         state.analyzer,
+        token,
         state.workspace,
         step,
         rows,
@@ -849,6 +858,7 @@ pub(super) fn push_cancelled_diagnostic(diagnostics: &mut Vec<CodeQueryDiagnosti
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_pipeline_step(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     workspace: Option<&WorkspaceAnalyzer>,
     step: &QueryStep,
     rows: Vec<PipelineRow>,
@@ -1484,6 +1494,7 @@ pub(super) fn apply_pipeline_step(
                     .expect("semantic declaration index exists");
                 let (expansions, call_exhausted) = call_declaration_expansions(
                     analyzer,
+                    token,
                     declaration,
                     step,
                     filter,
@@ -1505,6 +1516,7 @@ pub(super) fn apply_pipeline_step(
             ) => {
                 let (expansions, call_exhausted) = call_site_expansions(
                     analyzer,
+                    token,
                     declaration,
                     step,
                     filter,

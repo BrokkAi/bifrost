@@ -24,9 +24,9 @@ use crate::analyzer::usages::{
     UsageQueryCompletion,
 };
 use crate::analyzer::{
-    AnalyzerDefinitionLookup, AnalyzerQueryScope, BoundedDefinitionLookup, CodeUnit, CodeUnitType,
-    DeclarationKind, GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, IAnalyzer, Language, ProjectFile,
-    Range, SearchSymbolPatternBatch, SummaryFileProjection, go_module_roots,
+    AnalyzerDefinitionLookup, BoundedDefinitionLookup, CodeUnit, CodeUnitType, DeclarationKind,
+    GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, IAnalyzer, Language, ProjectFile, Range,
+    SearchSymbolPatternBatch, SummaryFileProjection, go_module_roots,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::model_context;
@@ -183,6 +183,8 @@ pub use selectors::DefinitionDiagnostic;
 pub use selectors::NotFoundInput;
 pub use sources::SourceBlock;
 pub use sources::SymbolSourcesBudgetExceeded;
+pub use sources::SymbolSourcesIncomplete;
+pub use sources::SymbolSourcesIncompleteReason;
 pub use sources::SymbolSourcesResult;
 pub use sources::get_symbol_sources;
 pub use sources::get_symbol_sources_with_source_budget;

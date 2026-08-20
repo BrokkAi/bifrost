@@ -1391,37 +1391,56 @@ fn visit_js_assignment_declarations(
         js_commonjs_exported_roots(root, source),
         js_commonjs_exported_members(root, source),
     );
-    let mut stack = vec![JsAssignmentWalkFrame::Enter(root)];
+    let mut stack = vec![JsAssignmentWalkFrame::Enter {
+        node: root,
+        parent_kind: None,
+    }];
+    let mut cursor = root.walk();
 
     while let Some(frame) = stack.pop() {
         match frame {
-            JsAssignmentWalkFrame::Enter(node) => {
+            JsAssignmentWalkFrame::Enter { node, parent_kind } => {
                 register_js_assignment_declaration_name(node, source, &mut state);
                 let scope = js_assignment_scope_kind(node);
                 if let Some(scope) = scope {
                     state.enter_scope(scope);
                     register_js_assignment_parameters(node, source, &mut state);
                 }
-                register_js_assignment_variable(node, source, &mut state);
+                register_js_assignment_variable(node, parent_kind, source, &mut state);
                 if node.kind() == "assignment_expression" {
                     visit_js_assignment_expression(file, source, node, parsed, &state);
                 }
                 if scope.is_some() {
                     stack.push(JsAssignmentWalkFrame::Exit);
                 }
-                for index in (0..node.named_child_count()).rev() {
-                    if let Some(child) = node.named_child(index) {
-                        stack.push(JsAssignmentWalkFrame::Enter(child));
+                let node_kind = node.kind();
+                let first_child = stack.len();
+                stack.extend(node.named_children(&mut cursor).map(|child| {
+                    JsAssignmentWalkFrame::Enter {
+                        node: child,
+                        parent_kind: Some(node_kind),
                     }
-                }
+                }));
+                stack[first_child..].reverse();
             }
             JsAssignmentWalkFrame::Exit => state.exit_scope(),
         }
     }
 }
 
+/// A pending node of the assignment walk, carrying its parent's kind.
+///
+/// The parent kind is carried rather than asked for: tree-sitter nodes hold no
+/// parent pointer, so `Node::parent` re-descends from the root and costs the
+/// node's absolute position in the tree. Asking it once per walked node is
+/// quadratic, which livelocked the workspace build on bun's 9MB
+/// 320,000-deep nested-`for` fixture (#2369). The traversal already knows every
+/// parent, so it hands the answer down.
 enum JsAssignmentWalkFrame<'tree> {
-    Enter(Node<'tree>),
+    Enter {
+        node: Node<'tree>,
+        parent_kind: Option<&'static str>,
+    },
     Exit,
 }
 
@@ -1473,6 +1492,7 @@ fn register_js_assignment_parameters(
 
 fn register_js_assignment_variable(
     node: Node<'_>,
+    parent_kind: Option<&str>,
     source: &str,
     state: &mut JsAssignmentDeclarationState,
 ) {
@@ -1484,7 +1504,6 @@ fn register_js_assignment_variable(
     };
     let mut names = Vec::new();
     collect_js_assignment_binding_names(name_node, source, &mut names);
-    let parent_kind = node.parent().map(|parent| parent.kind());
     for name in names {
         let kind = state.binding_kind_for_declarator(&name, node, source);
         if parent_kind == Some("variable_declaration") {

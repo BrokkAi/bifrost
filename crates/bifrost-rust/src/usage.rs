@@ -676,12 +676,21 @@ impl RustUsageWalks<'_> {
             }
         }
         for root in &seeds.roots {
-            for file in self
-                .cargo_routes()
-                .files_that_can_reference_target_of(root.source())
-            {
-                keep_going().then_some(())?;
-                out.insert(file);
+            // A module reference can be spelled through its crate-relative
+            // path without naming an imported item, so it retains the broad
+            // Cargo-target reachability route. Named targets are already
+            // covered by their exact textual candidates and the verified
+            // binding-seed importers above; admitting every file in the same
+            // Cargo target makes a private item in a large library degenerate
+            // into a near-workspace scan.
+            if root.is_module() {
+                for file in self
+                    .cargo_routes()
+                    .files_that_can_reference_target_of(root.source())
+                {
+                    keep_going().then_some(())?;
+                    out.insert(file);
+                }
             }
         }
         for identity in &seeds.identities {

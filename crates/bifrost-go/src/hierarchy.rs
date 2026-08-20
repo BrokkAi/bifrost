@@ -10,6 +10,7 @@ use crate::declarations::{
 use crate::imports::{default_go_import_local_name, go_import_path};
 use crate::packages::canonical_go_package_name;
 use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::type_relations::{MethodKey, MethodSet};
 #[cfg(any(test, feature = "test-support"))]
 use brokk_bifrost_core::analyzer::type_relations::{TypeRelation, TypeRelationKind};
@@ -60,8 +61,12 @@ pub struct GoHierarchyIndex {
 }
 
 impl GoHierarchyIndex {
-    pub fn build(index: &dyn CodeUnitIndex, imports: &dyn ImportAnalysisProvider) -> Self {
-        let mut builder = GoHierarchyBuilder::new(index, imports);
+    pub fn build(
+        token: QueryToken<'_>,
+        index: &dyn CodeUnitIndex,
+        imports: &dyn ImportAnalysisProvider,
+    ) -> Self {
+        let mut builder = GoHierarchyBuilder::new(token, index, imports);
         builder.collect();
         builder.finish()
     }
@@ -101,6 +106,7 @@ struct ParsedGoFile {
 }
 
 struct GoHierarchyBuilder<'a> {
+    token: QueryToken<'a>,
     index: &'a dyn CodeUnitIndex,
     imports: &'a dyn ImportAnalysisProvider,
     files: Vec<ParsedGoFile>,
@@ -112,8 +118,13 @@ struct GoHierarchyBuilder<'a> {
 }
 
 impl<'a> GoHierarchyBuilder<'a> {
-    fn new(index: &'a dyn CodeUnitIndex, imports: &'a dyn ImportAnalysisProvider) -> Self {
+    fn new(
+        token: QueryToken<'a>,
+        index: &'a dyn CodeUnitIndex,
+        imports: &'a dyn ImportAnalysisProvider,
+    ) -> Self {
         Self {
+            token,
             index,
             imports,
             files: Vec::new(),
@@ -283,8 +294,13 @@ impl<'a> GoHierarchyBuilder<'a> {
             });
         }
         for mut parsed in parsed_files {
-            let (imports, dot_imports) =
-                import_packages(self.imports, &parsed.file, &package_index, &declared_names);
+            let (imports, dot_imports) = import_packages(
+                self.token,
+                self.imports,
+                &parsed.file,
+                &package_index,
+                &declared_names,
+            );
             parsed.imports = imports;
             parsed.dot_imports = dot_imports;
             self.files.push(parsed);
@@ -772,6 +788,7 @@ impl<'a> GoHierarchyBuilder<'a> {
 }
 
 fn import_packages(
+    token: QueryToken<'_>,
     imports: &dyn ImportAnalysisProvider,
     file: &ProjectFile,
     package_index: &[(ProjectFile, String)],
@@ -779,7 +796,7 @@ fn import_packages(
 ) -> (HashMap<String, Vec<String>>, Vec<String>) {
     let mut by_alias: HashMap<String, Vec<String>> = HashMap::default();
     let mut dot_imports = Vec::new();
-    for import in imports.import_info_of(file) {
+    for import in imports.import_info_of(token, file) {
         let alias = import.alias.as_deref();
         if alias == Some("_") {
             continue;

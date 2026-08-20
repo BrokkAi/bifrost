@@ -13,7 +13,7 @@
     },
     {
       "name": "meta.regex-predicate.bifrost-rql",
-      "match": "(\\(|:)(?:\\s*)((?:name|text)/regex)(?:\\s*)(\\\")((?:\\\\.|[^\\\"\\\\])*)(\\\")",
+      "match": "(\\(|:)(?:\\s*)((?:name|text|parameter-type)/regex)(?:\\s*)(\\\")((?:\\\\.|[^\\\"\\\\])*)(\\\")",
       "captures": {
         "1": {
           "name": "punctuation.section.parens.begin.bifrost-rql"
@@ -54,7 +54,7 @@
     },
     {
       "name": "variable.parameter.role.bifrost-rql",
-      "match": ":(?:args|arity|callee|capture|class(?:es)?|completeness|config[-_]gated|declaration[-_]only|decorators|depth|domains?|field|forms?|has|inputs?|kwargs|left|boundar(?:y|ies)|hoisting|include[-_]shadowed|min[-_]segments|origins?|resolved|max-(?:bytes|steps)|max|min|module|name(?:/regex)?|namespaces?|outcomes?|not[-_]has|not[-_]kind|object|parameter-(?:index|name)|plan-ref|proof|protocol-ref|receiver|reference-kinds|relation(?:s)?|right|roles?|site[-_]class|subjects?|certaint(?:y|ies)|surface|tiers?|taint[-_]ref|text/regex|transitive|usage)(?=$|[\\s()\\[\\]])"
+      "match": ":(?:args|arity|callee|capture|class(?:es)?|completeness|config[-_]gated|declaration[-_]only|decorators|depth|domains?|field|forms?|has|inputs?|kwargs|left|boundar(?:y|ies)|hoisting|include[-_]shadowed|min[-_]segments|origins?|resolved|max-(?:bytes|steps)|max|min|module|name(?:/regex)?|namespaces?|outcomes?|not[-_]has|not[-_]kind|object|parameter-(?:index|name|type(?:/regex)?)|plan-ref|proof|protocol-ref|receiver|reference-kinds|relation(?:s)?|right|roles?|site[-_]class|subjects?|certaint(?:y|ies)|surface|tiers?|taint[-_]ref|text/regex|transitive|usage|visibility)(?=$|[\\s()\\[\\]])"
     },
     {
       "name": "support.function.wrapper.bifrost-rql",
@@ -66,7 +66,7 @@
     },
     {
       "name": "support.function.predicate.bifrost-rql",
-      "match": "\\b(?:arity|capture|has|name(?:/regex)?|not[-_]has|not[-_]kind|text/regex)\\b"
+      "match": "\\b(?:arity|capture|has|name(?:/regex)?|not[-_]has|not[-_]kind|parameter-type(?:/regex)?|text/regex|visibility)\\b"
     },
     {
       "name": "meta.hierarchy-depth.bifrost-rql",

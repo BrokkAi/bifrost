@@ -2,6 +2,7 @@ use super::inverted::{CachedCallableAlternatives, is_package_level_type, same_ov
 use crate::scala::graph::syntax::{ScalaCallableRole, parenthesized_arity};
 use crate::scala::graph_support::ScalaSource;
 use crate::scala::wildcard_imports::scala_import_path;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, default_parent_fq_name};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::sync::Arc;
@@ -39,7 +40,11 @@ pub struct TargetSpec {
 }
 
 impl TargetSpec {
-    pub fn from_target(scala: &dyn ScalaSource, target: &CodeUnit) -> Option<Self> {
+    pub fn from_target(
+        scala: &dyn ScalaSource,
+        token: QueryToken<'_>,
+        target: &CodeUnit,
+    ) -> Option<Self> {
         if target.is_class() || scala.is_type_alias(target) {
             let owner_name = scala_display_name(target);
             let is_type_alias = scala.is_type_alias(target);
@@ -81,7 +86,7 @@ impl TargetSpec {
         let callable_alternatives = if !target.is_field() && target.is_function() {
             scala
                 .project_types()
-                .effective_callable_alternatives_for(scala, target)
+                .effective_callable_alternatives_for(scala, token, target)
         } else {
             Arc::new(Vec::new())
         };
@@ -95,7 +100,7 @@ impl TargetSpec {
                     alternatives.extend(
                         scala
                             .project_types()
-                            .effective_callable_alternatives_for(scala, &sibling)
+                            .effective_callable_alternatives_for(scala, token, &sibling)
                             .iter()
                             .cloned(),
                     );
@@ -491,17 +496,25 @@ pub fn extension_receiver_type(signature: &str) -> Option<String> {
 
 pub fn resolved_extension_receiver_type(
     scala: &dyn ScalaSource,
+    token: QueryToken<'_>,
     unit: &CodeUnit,
     signature: &str,
 ) -> Option<String> {
     extension_receiver_type(signature).map(|receiver_type| {
-        scala_resolve_declared_type(scala, unit.source(), unit.package_name(), &receiver_type)
-            .unwrap_or(receiver_type)
+        scala_resolve_declared_type(
+            scala,
+            token,
+            unit.source(),
+            unit.package_name(),
+            &receiver_type,
+        )
+        .unwrap_or(receiver_type)
     })
 }
 
 pub fn scala_resolve_declared_type(
     scala: &dyn ScalaSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     package_name: &str,
     type_text: &str,
@@ -512,7 +525,7 @@ pub fn scala_resolve_declared_type(
     let base = scala_type_base(type_text)?;
     let simple = scala_simple_type_name(base)?;
 
-    for import in scala.import_info_of(file) {
+    for import in scala.import_info_of(token, file) {
         let Some(path) = scala_import_path(&import) else {
             continue;
         };

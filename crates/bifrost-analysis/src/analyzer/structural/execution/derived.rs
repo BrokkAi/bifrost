@@ -13,6 +13,7 @@ use crate::cancellation::CancellationToken;
 use crate::compact_graph::CompactDirectedGraph;
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 /// The semantic family of one reusable, immutable query-execution layer.
 ///
@@ -546,6 +547,7 @@ impl DirectImportTopology {
 
 pub(crate) fn build_direct_import_topology(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     cancellation: &CancellationToken,
     limits: DirectImportTopologyLimits,
 ) -> DirectImportTopologyBuild {
@@ -594,6 +596,7 @@ pub(crate) fn build_direct_import_topology(
     let mut request_graph = RequestLocalDirectImportGraph::from_files(files);
     let (exhausted, construction_over_budget) = request_graph.resolve_complete_for_snapshot(
         analyzer,
+        token,
         limits.max_files,
         limits.max_edges,
         cancellation,
@@ -914,6 +917,7 @@ impl RequestLocalDirectImportGraph {
     pub(crate) fn ensure_complete(
         &mut self,
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         max_files: usize,
         max_edges: usize,
         cancellation: Option<&CancellationToken>,
@@ -925,6 +929,7 @@ impl RequestLocalDirectImportGraph {
         let files = self.all_files.clone();
         let (exhausted, _) = self.ensure_forward_inner(
             analyzer,
+            token,
             &files,
             RequestImportResolutionLimits {
                 max_files,
@@ -944,6 +949,7 @@ impl RequestLocalDirectImportGraph {
     fn resolve_complete_for_snapshot(
         &mut self,
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         max_files: usize,
         max_edges: usize,
         cancellation: &CancellationToken,
@@ -955,6 +961,7 @@ impl RequestLocalDirectImportGraph {
         let files = self.all_files.clone();
         let outcome = self.ensure_forward_inner(
             analyzer,
+            token,
             &files,
             RequestImportResolutionLimits {
                 max_files,
@@ -973,6 +980,7 @@ impl RequestLocalDirectImportGraph {
     pub(crate) fn ensure_forward(
         &mut self,
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         files: &[ProjectFile],
         max_files: usize,
         max_edges: usize,
@@ -980,6 +988,7 @@ impl RequestLocalDirectImportGraph {
     ) -> bool {
         self.ensure_forward_inner(
             analyzer,
+            token,
             files,
             RequestImportResolutionLimits {
                 max_files,
@@ -995,6 +1004,7 @@ impl RequestLocalDirectImportGraph {
     fn ensure_forward_inner(
         &mut self,
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         files: &[ProjectFile],
         limits: RequestImportResolutionLimits<'_>,
     ) -> (bool, bool) {
@@ -1086,7 +1096,7 @@ impl RequestLocalDirectImportGraph {
                     if let Some(imports) = bulk_infos.as_ref().and_then(|infos| infos.get(file)) {
                         imports.as_slice()
                     } else {
-                        owned_imports = provider.import_info_of(file);
+                        owned_imports = provider.import_info_of(token, file);
                         &owned_imports
                     };
                 let mut targets =
@@ -1152,6 +1162,7 @@ fn elapsed_ns(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{JavaAnalyzer, PhpAnalyzer, RubyAnalyzer, TestProject};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1533,13 +1544,17 @@ mod tests {
         c.write("def from_c; end\n").expect("write c");
         let analyzer = RubyAnalyzer::from_project(TestProject::new(root, Language::Ruby));
 
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
         let first = completed_topology(build_direct_import_topology(
             &analyzer,
+            token,
             &CancellationToken::default(),
             generous_limits(),
         ));
         let second = completed_topology(build_direct_import_topology(
             &analyzer,
+            token,
             &CancellationToken::default(),
             generous_limits(),
         ));
@@ -1580,8 +1595,11 @@ mod tests {
             .expect("write source");
         let analyzer = PhpAnalyzer::from_project(TestProject::new(root, Language::Php));
 
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
         let topology = completed_topology(build_direct_import_topology(
             &analyzer,
+            token,
             &CancellationToken::default(),
             generous_limits(),
         ));
@@ -1605,8 +1623,11 @@ mod tests {
             .expect("write consumer");
         let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
 
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
         let outcome = build_direct_import_topology(
             &analyzer,
+            token,
             &CancellationToken::default(),
             DirectImportTopologyLimits {
                 max_files: 100,
@@ -1634,8 +1655,11 @@ mod tests {
             .expect("write target");
         let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
 
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
         let build = build_direct_import_topology(
             &analyzer,
+            token,
             &CancellationToken::default(),
             DirectImportTopologyLimits {
                 max_files: 100,

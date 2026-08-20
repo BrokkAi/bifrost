@@ -16,6 +16,7 @@ use crate::java::graph_support::{
 };
 use crate::java::structural::expression_name_node;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
@@ -91,13 +92,20 @@ impl ScanCtx<'_> {
     /// an import (#1239 milestone 4).
     pub fn resolve_realm_type_name(&self, type_name: &str) -> Option<CodeUnit> {
         self.graph.with_definitions(|definitions| {
-            resolve_java_usage_type_name_in(self.java, definitions, self.file, type_name)
+            resolve_java_usage_type_name_in(
+                self.java,
+                self.graph.token,
+                definitions,
+                self.file,
+                type_name,
+            )
         })
     }
 }
 
 pub fn scan_file(
     java: &dyn JavaSource,
+    token: QueryToken<'_>,
     graph: &JavaGraphSource<'_>,
     file: &ProjectFile,
     spec: &TargetSpec,
@@ -126,7 +134,7 @@ pub fn scan_file(
     };
     let line_starts = compute_line_starts(&source);
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    seed_class_binding(java, file, spec, &mut bindings);
+    seed_class_binding(java, token, file, spec, &mut bindings);
     let mut ctx = ScanCtx {
         java,
         graph,
@@ -150,15 +158,15 @@ pub fn scan_file(
         enclosing_cache: HashMap::default(),
         class_scope_depths: Vec::new(),
     };
-    scan_node(tree.root_node(), &mut ctx);
+    scan_node(tree.root_node(), token, &mut ctx);
 }
 
-fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn scan_node(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     if *ctx.limit_exceeded {
         return;
     }
     if node.kind() == "try_with_resources_statement" {
-        scan_try_with_resources(node, ctx);
+        scan_try_with_resources(node, token, ctx);
         return;
     }
     let enters_class_scope = is_java_type_body(node.kind());
@@ -180,20 +188,20 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if enters_class_scope {
             ctx.class_scope_depths.push(ctx.bindings.scope_depth());
         }
-        seed_declarations(node, ctx);
+        seed_declarations(node, token, ctx);
     } else {
-        seed_inline_declarations(node, ctx);
+        seed_inline_declarations(node, token, ctx);
     }
 
     if node.kind() == "import_declaration" {
-        maybe_record_import_hit(node, ctx);
+        maybe_record_import_hit(node, token, ctx);
     } else {
-        maybe_record_hit(node, ctx);
+        maybe_record_hit(node, token, ctx);
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        scan_node(child, ctx);
+        scan_node(child, token, ctx);
         if *ctx.limit_exceeded {
             break;
         }
@@ -222,24 +230,24 @@ fn is_java_type_body(kind: &str) -> bool {
     )
 }
 
-fn scan_try_with_resources(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn scan_try_with_resources(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     ctx.bindings.enter_scope();
     if let Some(resources) = node.child_by_field_name("resources") {
         let mut cursor = resources.walk();
         for resource in resources.named_children(&mut cursor) {
-            scan_node(resource, ctx);
+            scan_node(resource, token, ctx);
             if *ctx.limit_exceeded {
                 break;
             }
             if resource.kind() == "resource" {
-                seed_typed_binding(resource, ctx);
+                seed_typed_binding(resource, token, ctx);
             }
         }
     }
     if !*ctx.limit_exceeded
         && let Some(body) = node.child_by_field_name("body")
     {
-        scan_node(body, ctx);
+        scan_node(body, token, ctx);
     }
     ctx.bindings.exit_scope();
 
@@ -253,28 +261,28 @@ fn scan_try_with_resources(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if Some(child) == resources || Some(child) == body {
             continue;
         }
-        scan_node(child, ctx);
+        scan_node(child, token, ctx);
         if *ctx.limit_exceeded {
             break;
         }
     }
 }
 
-fn seed_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn seed_declarations(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     match node.kind() {
         "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
             if let Some(parameters) = node.child_by_field_name("parameters") {
                 let mut cursor = parameters.walk();
                 for child in parameters.named_children(&mut cursor) {
                     if child.kind() == "formal_parameter" {
-                        seed_typed_binding(child, ctx);
+                        seed_typed_binding(child, token, ctx);
                     }
                 }
             }
         }
         "catch_clause" => {
             if let Some(parameter) = node.child_by_field_name("parameter") {
-                seed_typed_binding(parameter, ctx);
+                seed_typed_binding(parameter, token, ctx);
             }
         }
         "enhanced_for_statement" => {
@@ -286,20 +294,22 @@ fn seed_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn seed_inline_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn seed_inline_declarations(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     match node.kind() {
-        "local_variable_declaration" | "field_declaration" => seed_variable_declaration(node, ctx),
-        "formal_parameter" => seed_typed_binding(node, ctx),
+        "local_variable_declaration" | "field_declaration" => {
+            seed_variable_declaration(node, token, ctx)
+        }
+        "formal_parameter" => seed_typed_binding(node, token, ctx),
         _ => {}
     }
 }
 
-fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn seed_variable_declaration(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(type_node) = node.child_by_field_name("type") else {
         return;
     };
     let mut resolved_type = (ctx.spec.kind != TargetKind::Type)
-        .then(|| resolve_type_from_node(type_node, ctx))
+        .then(|| resolve_type_from_node(type_node, token, ctx))
         .flatten();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -318,7 +328,7 @@ fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             && resolved_type.is_none()
             && let Some(value) = child.child_by_field_name("value")
         {
-            resolved_type = infer_type_from_value(value, ctx);
+            resolved_type = infer_type_from_value(value, token, ctx);
         }
 
         // Record the type this declaration resolved to, whatever it is. Only a
@@ -337,7 +347,7 @@ fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn seed_typed_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn seed_typed_binding(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(name) = node.child_by_field_name("name") else {
         return;
     };
@@ -351,7 +361,7 @@ fn seed_typed_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     match node
         .child_by_field_name("type")
-        .and_then(|type_node| resolve_type_from_node(type_node, ctx))
+        .and_then(|type_node| resolve_type_from_node(type_node, token, ctx))
     {
         Some(resolved) => ctx
             .bindings
@@ -360,27 +370,27 @@ fn seed_typed_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn maybe_record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn maybe_record_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     match ctx.spec.kind {
-        TargetKind::Type => maybe_record_type_hit(node, ctx),
-        TargetKind::Constructor => maybe_record_constructor_hit(node, ctx),
-        TargetKind::Method => maybe_record_method_hit(node, ctx),
-        TargetKind::Field => maybe_record_field_hit(node, ctx),
+        TargetKind::Type => maybe_record_type_hit(node, token, ctx),
+        TargetKind::Constructor => maybe_record_constructor_hit(node, token, ctx),
+        TargetKind::Method => maybe_record_method_hit(node, token, ctx),
+        TargetKind::Field => maybe_record_field_hit(node, token, ctx),
     }
 }
 
-fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn maybe_record_type_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() == "method_reference" {
         if let Some(receiver) = node.named_child(0) {
-            record_selector_type_segments(receiver, ctx);
+            record_selector_type_segments(receiver, token, ctx);
         }
         return;
     }
     if node.kind() == "field_access" {
-        record_selector_type_segments(node, ctx);
+        record_selector_type_segments(node, token, ctx);
         return;
     }
-    if maybe_record_static_qualifier_type_hit(node, ctx) {
+    if maybe_record_static_qualifier_type_hit(node, token, ctx) {
         return;
     }
     let Some(type_node) = type_reference_node(node) else {
@@ -402,7 +412,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     for (resolved, segment) in resolve_type_segments(
         type_node,
         ctx.source,
-        |candidate| resolve_non_nested_type_from_node(candidate, ctx),
+        |candidate| resolve_non_nested_type_from_node(candidate, token, ctx),
         |owner, name| nested_type_for_owner(owner, name, ctx),
     ) {
         if resolved.fq_name() == ctx.spec.owner.fq_name() {
@@ -411,12 +421,12 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn record_selector_type_segments(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn record_selector_type_segments(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     let segments = match node.kind() {
         "field_access" => resolve_field_access_type_segments(
             node,
             ctx.source,
-            |base| Ok(resolve_selector_root_type(base, ctx)),
+            |base| Ok(resolve_selector_root_type(base, token, ctx)),
             |qualified| ctx.resolve_realm_type_name(qualified),
             |owner, name| nested_type_for_owner(owner, name, ctx),
         ),
@@ -427,7 +437,7 @@ fn record_selector_type_segments(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         | "generic_type" => resolve_type_segments(
             node,
             ctx.source,
-            |candidate| resolve_selector_root_type(candidate, ctx),
+            |candidate| resolve_selector_root_type(candidate, token, ctx),
             |owner, name| nested_type_for_owner(owner, name, ctx),
         ),
         _ => Vec::new(),
@@ -439,11 +449,15 @@ fn record_selector_type_segments(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn resolve_selector_root_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
+fn resolve_selector_root_type(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &ScanCtx<'_>,
+) -> Option<CodeUnit> {
     let name = node_text(node, ctx.source);
     let direct = || {
         ctx.resolve_realm_type_name(name)
-            .or_else(|| resolve_non_nested_type_from_node(node, ctx))
+            .or_else(|| resolve_non_nested_type_from_node(node, token, ctx))
     };
     match ctx.bindings.resolve_symbol(name) {
         SymbolResolution::Precise(_) => direct(),
@@ -453,7 +467,11 @@ fn resolve_selector_root_type(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeU
     }
 }
 
-fn maybe_record_static_qualifier_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
+fn maybe_record_static_qualifier_type_hit(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut ScanCtx<'_>,
+) -> bool {
     if node.kind() != "identifier" || !is_member_access_object(node) {
         return false;
     }
@@ -472,7 +490,8 @@ fn maybe_record_static_qualifier_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>)
         }
         SymbolResolution::Unknown if ctx.bindings.is_shadowed(text) => true,
         SymbolResolution::Unknown => {
-            if resolve_type_from_node(node, ctx).is_some_and(|resolved| resolved == ctx.spec.target)
+            if resolve_type_from_node(node, token, ctx)
+                .is_some_and(|resolved| resolved == ctx.spec.target)
             {
                 hits::push_hit(node, ctx);
             } else {
@@ -491,7 +510,7 @@ fn is_member_access_object(node: Node<'_>) -> bool {
     })
 }
 
-fn maybe_record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn maybe_record_import_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(path) = node.named_child(0) else {
         return;
     };
@@ -528,7 +547,7 @@ fn maybe_record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 current.kind(),
                 "type_identifier" | "scoped_type_identifier" | "scoped_identifier" | "identifier"
             ) && type_terminal_name_matches(current, ctx)
-                && resolve_type_from_node(current, ctx)
+                && resolve_type_from_node(current, token, ctx)
                     .is_some_and(|resolved| resolved.fq_name() == ctx.spec.owner.fq_name())
             {
                 hits::push_import_hit(current, ctx);
@@ -540,9 +559,9 @@ fn maybe_record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     );
 }
 
-fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn maybe_record_constructor_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     if let Some(receiver) = constructor_method_reference_receiver(node) {
-        maybe_record_constructor_method_reference(node, receiver, ctx);
+        maybe_record_constructor_method_reference(node, token, receiver, ctx);
         return;
     }
     if node.kind() != "object_creation_expression" {
@@ -554,7 +573,7 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !type_terminal_name_matches(type_node, ctx) {
         return;
     }
-    let Some(resolved) = resolve_type_from_node(type_node, ctx) else {
+    let Some(resolved) = resolve_type_from_node(type_node, token, ctx) else {
         return;
     };
     if resolved.fq_name() != ctx.spec.owner.fq_name() {
@@ -568,10 +587,11 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 fn maybe_record_constructor_method_reference(
     node: Node<'_>,
+    token: QueryToken<'_>,
     receiver: Node<'_>,
     ctx: &mut ScanCtx<'_>,
 ) {
-    let Some(owner) = resolve_type_from_node(receiver, ctx) else {
+    let Some(owner) = resolve_type_from_node(receiver, token, ctx) else {
         return;
     };
     if owner != ctx.spec.owner {
@@ -580,7 +600,7 @@ fn maybe_record_constructor_method_reference(
     let constructor_fqn = format!("{}.{}", owner.fq_name(), owner.identifier());
     let candidates = ctx
         .java
-        .usage_definitions()
+        .usage_definitions(token)
         .fqn(&constructor_fqn)
         .into_iter()
         .filter(|candidate| candidate.is_function() && !candidate.is_synthetic())
@@ -604,13 +624,13 @@ fn type_terminal_name_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         .is_some_and(|name| node_text(name, ctx.source) == ctx.spec.member_name)
 }
 
-fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn maybe_record_method_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     if is_declaration_name(node) {
         maybe_record_method_declaration_hit(node, ctx);
         return;
     }
     if node.kind() == "method_reference" {
-        maybe_record_method_reference_hit(node, ctx);
+        maybe_record_method_reference_hit(node, token, ctx);
         return;
     }
     if node.kind() != "method_invocation" {
@@ -630,15 +650,15 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     // implicit-this, or the owner type itself) so the hit is classified as a
     // same-owner site rather than an external usage (#1014 facet B).
     let (receiver_match, same_owner) = if let Some(object) = node.child_by_field_name("object") {
-        let outcome = receiver_matches_target(object, ctx);
+        let outcome = receiver_matches_target(object, token, ctx);
         let same_owner = outcome == ReceiverTargetMatch::Matched
-            && method_receiver_object_is_same_owner(object, ctx);
+            && method_receiver_object_is_same_owner(object, token, ctx);
         (outcome, same_owner)
-    } else if bare_method_context_matches_target(node, ctx) {
+    } else if bare_method_context_matches_target(node, token, ctx) {
         // An unqualified call resolving to the enclosing type is an implicit-this
         // (or inherited) receiver on the current instance.
         (ReceiverTargetMatch::Matched, true)
-    } else if has_proven_static_import(ctx) {
+    } else if has_proven_static_import(token, ctx) {
         // A static import resolves to another type's static member, not the owner.
         (ReceiverTargetMatch::Matched, false)
     } else {
@@ -656,7 +676,11 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 /// receiver: the current instance (`this`) or the owner type itself for a static
 /// call from within that type (`Owner.staticMethod()` inside `Owner`). A call
 /// through a different variable of the same type, or `super`, stays external.
-fn method_receiver_object_is_same_owner(object: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
+fn method_receiver_object_is_same_owner(
+    object: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut ScanCtx<'_>,
+) -> bool {
     match object.kind() {
         "this" => true,
         "super" => false,
@@ -669,7 +693,7 @@ fn method_receiver_object_is_same_owner(object: Node<'_>, ctx: &mut ScanCtx<'_>)
             if !name.is_empty() && ctx.bindings.is_shadowed(name) {
                 return false;
             }
-            match resolve_type_from_node(object, ctx) {
+            match resolve_type_from_node(object, token, ctx) {
                 Some(receiver_type) => {
                     receiver_type.fq_name() == ctx.spec.owner.fq_name()
                         && same_owner_context(object, ctx)
@@ -681,14 +705,14 @@ fn method_receiver_object_is_same_owner(object: Node<'_>, ctx: &mut ScanCtx<'_>)
     }
 }
 
-fn maybe_record_method_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn maybe_record_method_reference_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     let Some((receiver, member)) = method_reference_parts(node) else {
         return;
     };
     if node_text(member, ctx.source) != ctx.spec.member_name {
         return;
     }
-    match method_reference_target_resolution(receiver, ctx) {
+    match method_reference_target_resolution(receiver, token, ctx) {
         MethodReferenceTargetResolution::NotTarget => {}
         MethodReferenceTargetResolution::Proven => hits::push_hit(member, ctx),
         MethodReferenceTargetResolution::Unproven => hits::push_unproven_hit(member, ctx),
@@ -711,13 +735,14 @@ fn method_reference_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
 
 fn method_reference_target_resolution(
     receiver: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &mut ScanCtx<'_>,
 ) -> MethodReferenceTargetResolution {
-    let owners = method_reference_owner_fq_names(receiver, ctx);
+    let owners = method_reference_owner_fq_names(receiver, token, ctx);
     let receiver_matches = owners
         .iter()
         .filter_map(|owner| ctx.graph.index.definitions(owner).next())
-        .map(|owner| receiver_type_matches_target(&owner, ctx))
+        .map(|owner| receiver_type_matches_target(&owner, token, ctx))
         .collect::<Vec<_>>();
     if receiver_matches
         .iter()
@@ -731,7 +756,7 @@ fn method_reference_target_resolution(
     }
     let mut candidates = Vec::new();
     for owner in &owners {
-        candidates.extend(method_reference_candidates_for_owner(owner, ctx));
+        candidates.extend(method_reference_candidates_for_owner(owner, token, ctx));
     }
     let matching = candidates
         .iter()
@@ -747,7 +772,11 @@ fn method_reference_target_resolution(
     }
 }
 
-fn method_reference_owner_fq_names(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) -> Vec<String> {
+fn method_reference_owner_fq_names(
+    receiver: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut ScanCtx<'_>,
+) -> Vec<String> {
     match receiver.kind() {
         "this" | "super" => ctx
             .class_ranges
@@ -760,7 +789,7 @@ fn method_reference_owner_fq_names(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) ->
             .as_precise()
             .map(|targets| targets.iter().cloned().collect())
             .unwrap_or_else(|| {
-                resolve_type_from_node(receiver, ctx)
+                resolve_type_from_node(receiver, token, ctx)
                     .map(|unit| vec![unit.fq_name()])
                     .unwrap_or_default()
             }),
@@ -772,7 +801,7 @@ fn method_reference_owner_fq_names(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) ->
                 if ctx.bindings.is_shadowed(name) {
                     Err(())
                 } else {
-                    Ok(resolve_type_from_node(base, ctx))
+                    Ok(resolve_type_from_node(base, token, ctx))
                 }
             },
             |qualified| ctx.resolve_realm_type_name(qualified),
@@ -780,16 +809,20 @@ fn method_reference_owner_fq_names(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) ->
         )
         .map(|owner| vec![owner.fq_name()])
         .unwrap_or_default(),
-        _ => resolve_type_from_node(receiver, ctx)
+        _ => resolve_type_from_node(receiver, token, ctx)
             .map(|unit| vec![unit.fq_name()])
             .unwrap_or_default(),
     }
 }
 
-fn method_reference_candidates_for_owner(owner_fq_name: &str, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
+fn method_reference_candidates_for_owner(
+    owner_fq_name: &str,
+    token: QueryToken<'_>,
+    ctx: &ScanCtx<'_>,
+) -> Vec<CodeUnit> {
     let mut candidates = ctx
         .java
-        .usage_definitions()
+        .usage_definitions(token)
         .fqn(&format!("{owner_fq_name}.{}", ctx.spec.member_name))
         .iter()
         .filter(|unit| unit.is_function())
@@ -804,7 +837,7 @@ fn method_reference_candidates_for_owner(owner_fq_name: &str, ctx: &ScanCtx<'_>)
     for ancestor in provider.get_ancestors(&owner) {
         candidates.extend(
             ctx.java
-                .usage_definitions()
+                .usage_definitions(token)
                 .fqn(&format!("{}.{}", ancestor.fq_name(), ctx.spec.member_name))
                 .iter()
                 .filter(|unit| unit.is_function())
@@ -850,7 +883,7 @@ fn maybe_record_method_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn maybe_record_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn maybe_record_field_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() == "field_access" {
         let Some(field_node) = node.child_by_field_name("field") else {
             return;
@@ -859,7 +892,7 @@ fn maybe_record_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             return;
         }
         if let Some(object) = node.child_by_field_name("object") {
-            match receiver_matches_target(object, ctx) {
+            match receiver_matches_target(object, token, ctx) {
                 ReceiverTargetMatch::Matched => hits::push_hit(field_node, ctx),
                 ReceiverTargetMatch::Unresolved | ReceiverTargetMatch::Incompatible => {
                     hits::push_unproven_hit(field_node, ctx)
@@ -897,7 +930,7 @@ fn maybe_record_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         .parent()
         .is_some_and(|parent| parent.kind() == "switch_label")
         && let Some(selector) = java_switch_selector_expression(node)
-        && receiver_matches_target(selector, ctx) == ReceiverTargetMatch::Matched
+        && receiver_matches_target(selector, token, ctx) == ReceiverTargetMatch::Matched
     {
         hits::push_hit(node, ctx);
         return;
@@ -915,7 +948,9 @@ fn maybe_record_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 .is_shadowed_below_scope(*depth, ctx.spec.member_name.as_str())
         },
     );
-    if !shadowed && (bare_field_context_matches_target(node, ctx) || has_proven_static_import(ctx))
+    if !shadowed
+        && (bare_field_context_matches_target(node, token, ctx)
+            || has_proven_static_import(token, ctx))
     {
         hits::push_hit(node, ctx);
     }

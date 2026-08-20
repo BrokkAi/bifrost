@@ -59,7 +59,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: >
-          node scripts/release-version.mjs check
+          node scripts/public/release-version.mjs check
           --tag "$RELEASE_TAG"
           --github-output "$GITHUB_OUTPUT"
 

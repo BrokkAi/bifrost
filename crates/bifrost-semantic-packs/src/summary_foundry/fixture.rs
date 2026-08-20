@@ -562,6 +562,7 @@ fn pack_source(
                     locations: Vec::new(),
                     transfers: entry.transfers.clone(),
                     effects: Vec::new(),
+                    declared_effects: Vec::new(),
                 }],
             },
         }],

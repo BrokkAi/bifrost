@@ -15,12 +15,14 @@
 
 use super::CppAnalyzer;
 use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile, resolve_analyzer};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_cpp::graph::CppGraphSource;
 use brokk_bifrost_cpp::graph::resolver::VisibilityIndex;
 use brokk_bifrost_cpp::identity::cpp_header_body_implementation_file;
 
 pub(crate) fn cpp_header_body_files_are_related(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     left: &ProjectFile,
     right: &ProjectFile,
 ) -> bool {
@@ -30,7 +32,7 @@ pub(crate) fn cpp_header_body_files_are_related(
     let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
         return false;
     };
-    let imports = cpp.import_info_of(implementation);
+    let imports = cpp.import_info_of(token, implementation);
     let import_statements: Vec<_> = imports
         .into_iter()
         .map(|import| import.raw_snippet)
@@ -45,6 +47,7 @@ pub(crate) fn cpp_header_body_files_are_related(
 
 pub(crate) fn cpp_callable_definitions_share_identity_evidence(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     left: &CodeUnit,
     right: &CodeUnit,
 ) -> bool {
@@ -53,7 +56,7 @@ pub(crate) fn cpp_callable_definitions_share_identity_evidence(
         left,
         right,
         |left_source, right_source| {
-            cpp_header_body_files_are_related(analyzer, left_source, right_source)
+            cpp_header_body_files_are_related(analyzer, token, left_source, right_source)
         },
     )
 }
@@ -68,6 +71,7 @@ pub(crate) fn cpp_callable_definitions_share_identity_evidence(
 /// `resolve_analyzer::<CppAnalyzer>` downcast the wrapper above owns.
 pub(crate) fn cpp_callable_definitions_share_identity_evidence_with_visibility(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     graph: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
     left: &CodeUnit,
@@ -79,7 +83,7 @@ pub(crate) fn cpp_callable_definitions_share_identity_evidence_with_visibility(
         left,
         right,
         |left_source, right_source| {
-            cpp_header_body_files_are_related(analyzer, left_source, right_source)
+            cpp_header_body_files_are_related(analyzer, token, left_source, right_source)
         },
     )
 }

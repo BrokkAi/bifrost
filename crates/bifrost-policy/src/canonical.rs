@@ -729,21 +729,80 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
     }
 }
 
+/// The canonical projection of one relational plan.
+///
+/// `derivations` is omitted entirely when the plan declares none, which is
+/// what keeps every document authored before filter and project records
+/// existed byte-identical under this projection, and therefore keeps its
+/// semantic hash, its baselines and its suppressions valid.
 fn relational_assertion_plan_to_json(plan: &RelationalAssertionPlan) -> Value {
-    json!({
-        "bindings": plan.bindings.iter().map(row_binding_to_json).collect::<Vec<_>>(),
-        "joins": plan.joins.iter().map(row_join_to_json).collect::<Vec<_>>(),
-        "groups": plan.groups.iter().map(row_group_to_json).collect::<Vec<_>>(),
-        "assertions": plan.assertions.iter().map(row_assertion_to_json).collect::<Vec<_>>(),
-        "limits": {
+    let mut object = Map::new();
+    insert(
+        &mut object,
+        "bindings",
+        Value::Array(plan.bindings.iter().map(row_binding_to_json).collect()),
+    );
+    if !plan.derivations.is_empty() {
+        insert(
+            &mut object,
+            "derivations",
+            Value::Array(
+                plan.derivations
+                    .iter()
+                    .map(row_derivation_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    insert(
+        &mut object,
+        "joins",
+        Value::Array(plan.joins.iter().map(row_join_to_json).collect()),
+    );
+    insert(
+        &mut object,
+        "groups",
+        Value::Array(plan.groups.iter().map(row_group_to_json).collect()),
+    );
+    insert(
+        &mut object,
+        "assertions",
+        Value::Array(plan.assertions.iter().map(row_assertion_to_json).collect()),
+    );
+    insert(
+        &mut object,
+        "limits",
+        json!({
             "max_source_rows": plan.limits.max_source_rows,
             "max_expanded_rows": plan.limits.max_expanded_rows,
             "max_join_comparisons": plan.limits.max_join_comparisons,
             "max_joined_rows": plan.limits.max_joined_rows,
             "max_groups": plan.limits.max_groups,
             "max_values_per_group": plan.limits.max_values_per_group,
-        },
-    })
+        }),
+    );
+    Value::Object(object)
+}
+
+/// Every derivation is tagged with its record kind, so two families can never
+/// collapse into one projected object if their field sets ever coincide.
+fn row_derivation_to_json(derivation: &RowDerivation) -> Value {
+    match derivation {
+        RowDerivation::Filter(filter) => json!({
+            "type": derivation.label(),
+            "over": filter.over.as_str(),
+            "where": filter.predicates.iter().map(row_predicate_to_json).collect::<Vec<_>>(),
+        }),
+        RowDerivation::Project(projection) => json!({
+            "type": derivation.label(),
+            "name": projection.name.as_str(),
+            "from": projection.from.as_str(),
+            "columns": projection.columns.iter().map(|column| json!({
+                "source": row_field_ref_to_json(&column.source),
+                "name": column.name,
+            })).collect::<Vec<_>>(),
+        }),
+    }
 }
 
 fn row_binding_to_json(binding: &RowBinding) -> Value {
@@ -797,17 +856,46 @@ fn row_ordered_sequence_to_json(sequence: &crate::definition::RowOrderedSequence
     })
 }
 
+/// The canonical projection of one row test.
+///
+/// The literal comparison keeps exactly the `field`/`op`/`value` object it
+/// always projected, so an existing document's bytes do not move. Each other
+/// operand family publishes its own key -- `operand` for a compared field,
+/// `values` for a membership set, neither for a null test -- so no two
+/// families can project the same object.
 fn row_predicate_to_json(predicate: &RowPredicate) -> Value {
-    let value = match &predicate.value {
+    let mut object = Map::new();
+    insert(
+        &mut object,
+        "field",
+        row_field_ref_to_json(&predicate.field),
+    );
+    insert(&mut object, "op", json!(predicate.op.label()));
+    match &predicate.operand {
+        RowPredicateOperand::Literal(value) => {
+            insert(&mut object, "value", row_literal_to_json(value));
+        }
+        RowPredicateOperand::Field(field) => {
+            insert(&mut object, "operand", row_field_ref_to_json(field));
+        }
+        RowPredicateOperand::Set(values) => {
+            insert(
+                &mut object,
+                "values",
+                Value::Array(values.iter().map(row_literal_to_json).collect()),
+            );
+        }
+        RowPredicateOperand::None => {}
+    }
+    Value::Object(object)
+}
+
+fn row_literal_to_json(literal: &RowLiteral) -> Value {
+    match literal {
         RowLiteral::String(value) | RowLiteral::ConstrainedEnum(value) => json!(value),
         RowLiteral::Integer(value) => json!(value),
         RowLiteral::Boolean(value) => json!(value),
-    };
-    json!({
-        "field": row_field_ref_to_json(&predicate.field),
-        "op": "eq",
-        "value": value,
-    })
+    }
 }
 
 fn row_assertion_to_json(assertion: &RowAssertion) -> Value {
@@ -2883,6 +2971,252 @@ mod tests {
                 { "taxonomy": "a-taxonomy", "identifier": "z-id" },
                 { "taxonomy": "z-taxonomy", "identifier": "a-id" },
             ])
+        );
+    }
+
+    /// The relational plan family every byte-stability and hash-sensitivity
+    /// test below varies one construct of.
+    ///
+    /// The bindings are two occurrence relations, so every field the variants
+    /// name -- `ast_id`, `role`, the nullable `target_id`, the integer
+    /// `target_count` -- comes from the same published row registry.
+    fn relational_policy(plan: &str) -> String {
+        format!(
+            r#"(policy
+  :id "test.relational.canonical"
+  :name "Relational canonical"
+  :message "M"
+  :severity warning
+  :analysis (analysis
+    :type assertion
+{plan}))"#
+        )
+    }
+
+    /// The plan every existing relational document projects today: bindings,
+    /// one inner join, one group with an equality-filtered count, one
+    /// assertion.
+    const LEGACY_PLAN: &str = r#"    (bind :name site :query (rql (occurrences :role [member_position])))
+    (bind :name cand :query (rql (occurrences :role [member_position])))
+    (join :left site :right cand :on ((ast_id ast_id)))
+    (group :name by-site :by (site.ast_id)
+      (aggregate :name reads :op count :where ((cand.role eq member_position))))
+    (assert :group by-site :value reads :cardinality (exactly 1))"#;
+
+    fn canonical_semantic_bytes(source: &str) -> Vec<u8> {
+        let parsed = crate::parse_rqlp_source(
+            source,
+            crate::PolicySourceIdentity::new("test:relational-canonical"),
+        )
+        .expect("the relational policy parses");
+        let value = parsed
+            .document()
+            .to_inline_local_canonical_semantic_json()
+            .expect("an inline relational policy is a closed document");
+        serde_json::to_vec(&value).expect("serde_json::Value serialization is infallible")
+    }
+
+    fn canonical_semantic_sha256(source: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(canonical_semantic_bytes(source));
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// A document that uses none of the new constructs must project exactly
+    /// the bytes it projected before they existed.
+    ///
+    /// The semantic hash of every relational policy is the digest of these
+    /// bytes, so one added key would invalidate every stored baseline and
+    /// suppression. The pinned digest is the guard; the key-set assertion is
+    /// what tells a future reader which key moved.
+    #[test]
+    fn an_existing_relational_document_projects_byte_identical_canonical_json() {
+        let source = relational_policy(LEGACY_PLAN);
+        // Both values were read from the projection as it stood before the
+        // filter, project, and extended predicate constructs existed.
+        assert_eq!(
+            canonical_semantic_bytes(&source).len(),
+            1201,
+            "the canonical projection of a pre-derivation relational plan changed length"
+        );
+        assert_eq!(
+            canonical_semantic_sha256(&source),
+            "10ecdf3ee9638a40adfe8d9d243512c31f7dbb5a98105eeb193e6de39748d2a5",
+            "the canonical projection of a pre-derivation relational plan moved"
+        );
+
+        let parsed = crate::parse_rqlp_source(
+            &source,
+            crate::PolicySourceIdentity::new("test:relational-canonical"),
+        )
+        .expect("the relational policy parses");
+        let value = parsed
+            .document()
+            .to_inline_local_canonical_semantic_json()
+            .expect("an inline relational policy is a closed document");
+        let plan = value
+            .pointer("/analysis/plan")
+            .and_then(Value::as_object)
+            .expect("a relational analysis projects a plan");
+        assert_eq!(
+            plan.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["assertions", "bindings", "groups", "joins", "limits"],
+            "a plan with no derivations must not publish a derivations key"
+        );
+        let predicate = value
+            .pointer("/analysis/plan/groups/0/aggregates/0/where/0")
+            .and_then(Value::as_object)
+            .expect("the group aggregate projects its predicate");
+        assert_eq!(
+            predicate.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["field", "op", "value"],
+            "an equality predicate over a literal keeps the object it always projected"
+        );
+    }
+
+    /// Every new construct is a semantic difference, so each one must move the
+    /// hash. A construct that did not would let two policies that mean
+    /// different things share one identity, one baseline and one suppression.
+    #[test]
+    fn each_new_relational_construct_changes_the_semantic_hash() {
+        let base = canonical_semantic_sha256(&relational_policy(LEGACY_PLAN));
+        let variants: &[(&str, String)] = &[
+            (
+                "join kind",
+                relational_policy(
+                    // A semi join does not carry the right relation columns,
+                    // so the fold reads the left one instead.
+                    &LEGACY_PLAN
+                        .replace(
+                            "(join :left site :right cand :on ((ast_id ast_id)))",
+                            "(join :left site :right cand :kind semi :on ((ast_id ast_id)))",
+                        )
+                        .replace(
+                            "(cand.role eq member_position)",
+                            "(site.role eq member_position)",
+                        ),
+                ),
+            ),
+            (
+                "predicate operator",
+                relational_policy(
+                    &LEGACY_PLAN.replace("(cand.role eq member_position)", "(cand.role ne member_position)"),
+                ),
+            ),
+            (
+                "field-to-field operand",
+                relational_policy(
+                    &LEGACY_PLAN.replace("(cand.role eq member_position)", "(cand.ast_id eq site.ast_id)"),
+                ),
+            ),
+            (
+                "membership operand",
+                relational_policy(&LEGACY_PLAN.replace(
+                    "(cand.role eq member_position)",
+                    "(cand.role in (member_position value_reference))",
+                )),
+            ),
+            (
+                "null test",
+                relational_policy(
+                    &LEGACY_PLAN.replace("(cand.role eq member_position)", "(cand.target_id is-not-null)"),
+                ),
+            ),
+            (
+                "negated null test",
+                relational_policy(
+                    &LEGACY_PLAN.replace("(cand.role eq member_position)", "(cand.target_id is-null)"),
+                ),
+            ),
+            (
+                "aggregate operation",
+                relational_policy(&LEGACY_PLAN.replace(
+                    ":name reads :op count :where",
+                    ":name reads :op max :value cand.target_count :where",
+                )),
+            ),
+            (
+                "filter record",
+                relational_policy(&LEGACY_PLAN.replace(
+                    "    (join :left site",
+                    "    (filter :over cand :where ((cand.role eq member_position)))\n    (join :left site",
+                )),
+            ),
+            (
+                "projection record",
+                relational_policy(
+                    &LEGACY_PLAN
+                        .replace(
+                            "    (join :left site :right cand",
+                            "    (project :name narrow :from cand :columns (cand.ast_id cand.role))\n    (join :left site :right narrow",
+                        )
+                        .replace("(cand.role eq member_position)", "(narrow.role eq member_position)"),
+                ),
+            ),
+        ];
+
+        let mut seen = vec![("base", base)];
+        for (what, source) in variants {
+            let hash = canonical_semantic_sha256(source);
+            for (other, other_hash) in &seen {
+                assert_ne!(
+                    &hash, other_hash,
+                    "the {what} variant projects the same canonical JSON as the {other} plan"
+                );
+            }
+            seen.push((what, hash));
+        }
+    }
+
+    /// A filter's predicate list and a projection's column list are semantic
+    /// content, not decoration: changing one changes the hash.
+    #[test]
+    fn derivation_contents_change_the_semantic_hash() {
+        let with_filter = |predicate: &str| {
+            relational_policy(&LEGACY_PLAN.replace(
+                "    (join :left site",
+                &format!("    (filter :over cand :where (({predicate})))\n    (join :left site"),
+            ))
+        };
+        assert_ne!(
+            canonical_semantic_sha256(&with_filter("cand.role eq member_position")),
+            canonical_semantic_sha256(&with_filter("cand.role eq value_reference")),
+            "a filter literal is semantic content"
+        );
+        assert_ne!(
+            canonical_semantic_sha256(&with_filter("cand.target_count gt 0")),
+            canonical_semantic_sha256(&with_filter("cand.target_count ge 0")),
+            "a filter operator is semantic content"
+        );
+
+        let with_projection = |columns: &str| {
+            relational_policy(
+                &LEGACY_PLAN
+                    .replace(
+                        "    (join :left site :right cand",
+                        &format!(
+                            "    (project :name narrow :from cand :columns ({columns}))\n    (join :left site :right narrow"
+                        ),
+                    )
+                    .replace("(cand.role eq member_position)", "(narrow.role eq member_position)"),
+            )
+        };
+        assert_ne!(
+            canonical_semantic_sha256(&with_projection("cand.ast_id cand.role")),
+            canonical_semantic_sha256(&with_projection("cand.ast_id cand.role cand.target_count")),
+            "a projected column set is semantic content"
+        );
+        assert_ne!(
+            canonical_semantic_sha256(&with_projection("cand.ast_id cand.role cand.target_count")),
+            canonical_semantic_sha256(&with_projection(
+                "cand.ast_id cand.role (cand.target_count hits)"
+            )),
+            "a projected column rename is semantic content"
         );
     }
 }

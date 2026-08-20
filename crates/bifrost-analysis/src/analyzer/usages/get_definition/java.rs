@@ -8,6 +8,7 @@ use crate::analyzer::usages::receiver_analysis::{
 };
 use crate::analyzer::usages::reference_site::node_range;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_jvm::java::graph::resolver::argument_list_arity;
 use brokk_bifrost_jvm::java::graph::return_type::{
@@ -260,11 +261,12 @@ impl<'a> JavaResolutionSession<'a> {
 
     fn resolve_type_name_in_file(
         &self,
+        token: QueryToken<'_>,
         java: &JavaAnalyzer,
         file: &ProjectFile,
         name: &str,
     ) -> Option<CodeUnit> {
-        self.query_optional_row(|| java.resolve_type_name_in_file(file, name))
+        self.query_optional_row(|| java.resolve_type_name_in_file(token, file, name))
     }
 
     /// The full candidate set for a type name, ambiguous wildcard peers
@@ -273,11 +275,12 @@ impl<'a> JavaResolutionSession<'a> {
     /// [`Self::resolve_type_name_in_file`], which demands a unique answer.
     fn resolve_type_name_candidates_in_file(
         &self,
+        token: QueryToken<'_>,
         java: &JavaAnalyzer,
         file: &ProjectFile,
         name: &str,
     ) -> Vec<CodeUnit> {
-        self.query_rows(|| java.resolve_type_name_candidates_in_file(file, name))
+        self.query_rows(|| java.resolve_type_name_candidates_in_file(token, file, name))
     }
 
     /// Whether `name` resolves once the external surface is consulted. The
@@ -286,22 +289,29 @@ impl<'a> JavaResolutionSession<'a> {
     fn type_name_resolves_with_external(
         &self,
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         java: &JavaAnalyzer,
         file: &ProjectFile,
         name: &str,
     ) -> bool {
         self.query_optional_row(|| {
-            java.resolve_type_name_with_external(analyzer.semantic_model_overlay(), file, name)
+            java.resolve_type_name_with_external(
+                token,
+                analyzer.semantic_model_overlay(),
+                file,
+                name,
+            )
         })
         .is_some()
     }
 
     fn import_infos(
         &self,
+        token: QueryToken<'_>,
         java: &JavaAnalyzer,
         file: &ProjectFile,
     ) -> Vec<crate::analyzer::ImportInfo> {
-        self.query_rows(|| java.import_info_of(file))
+        self.query_rows(|| java.import_info_of(token, file))
     }
 
     fn ranges(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<Range> {
@@ -531,6 +541,8 @@ fn resolve_java_in_session(
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> BoundedResolution<DefinitionLookupOutcome> {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     // Java's tier ladder resolves the reference this site names, so the deep
     // scope covers the whole dispatch: the type-name tiers in
     // `java::imports::resolve_type_name_with`, the member tier, the
@@ -583,21 +595,23 @@ fn resolve_java_in_session(
                 && java_object_creation_focus_is_terminal_type(session, creation, node)
             {
                 return session.finish(resolve_java_constructor_call(
-                    analyzer, java, session, file, source, creation,
+                    analyzer, token, java, session, file, source, creation,
                 ));
             }
             resolve_java_type_reference(analyzer, java, session, file, source, node)
         }
         "object_creation_expression" => {
-            resolve_java_constructor_call(analyzer, java, session, file, source, node)
+            resolve_java_constructor_call(analyzer, token, java, session, file, source, node)
         }
         "method_invocation" => {
-            resolve_java_method_invocation(analyzer, session, file, source, root, node)
+            resolve_java_method_invocation(analyzer, token, session, file, source, root, node)
         }
         "method_reference" => {
-            resolve_java_method_reference(analyzer, java, session, file, source, root, node)
+            resolve_java_method_reference(analyzer, token, java, session, file, source, root, node)
         }
-        "field_access" => resolve_java_field_access(analyzer, session, file, source, root, node),
+        "field_access" => {
+            resolve_java_field_access(analyzer, token, session, file, source, root, node)
+        }
         "identifier" => {
             if let Some(parent) = node.parent() {
                 match parent.kind() {
@@ -606,16 +620,16 @@ fn resolve_java_in_session(
                             match qualified_access_focus(node, parent, &["object"], &["name"]) {
                                 Some(QualifiedAccessFocus::Qualifier) => {
                                     resolve_java_bare_identifier(
-                                        analyzer, java, session, file, source, root, node,
+                                        analyzer, token, java, session, file, source, root, node,
                                     )
                                 }
                                 Some(QualifiedAccessFocus::Member) => {
                                     resolve_java_method_invocation(
-                                        analyzer, session, file, source, root, parent,
+                                        analyzer, token, session, file, source, root, parent,
                                     )
                                 }
                                 None => resolve_java_bare_identifier(
-                                    analyzer, java, session, file, source, root, node,
+                                    analyzer, token, java, session, file, source, root, node,
                                 ),
                             },
                         );
@@ -628,10 +642,10 @@ fn resolve_java_in_session(
                             &["field"],
                         ) {
                             Some(QualifiedAccessFocus::Qualifier) => resolve_java_bare_identifier(
-                                analyzer, java, session, file, source, root, node,
+                                analyzer, token, java, session, file, source, root, node,
                             ),
                             Some(QualifiedAccessFocus::Member) => resolve_java_field_access(
-                                analyzer, session, file, source, root, parent,
+                                analyzer, token, session, file, source, root, parent,
                             ),
                             None => no_definition(
                                 "unsupported_java_reference_shape",
@@ -645,18 +659,18 @@ fn resolve_java_in_session(
                     }
                     "switch_label" => {
                         return session.finish(resolve_java_switch_label(
-                            analyzer, java, session, file, source, root, node,
+                            analyzer, token, java, session, file, source, root, node,
                         ));
                     }
                     "method_reference" => {
                         return session.finish(
                             if java_method_reference_receiver_contains_focus(parent, node) {
                                 resolve_java_bare_identifier(
-                                    analyzer, java, session, file, source, root, node,
+                                    analyzer, token, java, session, file, source, root, node,
                                 )
                             } else {
                                 resolve_java_method_reference(
-                                    analyzer, java, session, file, source, root, parent,
+                                    analyzer, token, java, session, file, source, root, parent,
                                 )
                             },
                         );
@@ -664,7 +678,7 @@ fn resolve_java_in_session(
                     _ => {}
                 }
             }
-            resolve_java_bare_identifier(analyzer, java, session, file, source, root, node)
+            resolve_java_bare_identifier(analyzer, token, java, session, file, source, root, node)
         }
         _ => no_definition(
             "unsupported_java_reference_shape",
@@ -687,16 +701,19 @@ fn java_type_lookup_node_fqn(
     root: Node<'_>,
     node: Node<'_>,
 ) -> Option<JavaTypeLookupResolution> {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     if matches!(
         node.kind(),
         "type_identifier" | "scoped_type_identifier" | "generic_type"
     ) {
-        return java_type_from_node_with_context(analyzer, java, session, file, source, node).map(
-            |unit| JavaTypeLookupResolution::Type {
-                fqn: unit.fq_name().to_string(),
-                target_kind: TypeLookupTargetKind::TypeReference,
-            },
-        );
+        return java_type_from_node_with_context(
+            analyzer, token, java, session, file, source, node,
+        )
+        .map(|unit| JavaTypeLookupResolution::Type {
+            fqn: unit.fq_name().to_string(),
+            target_kind: TypeLookupTargetKind::TypeReference,
+        });
     }
 
     if node.kind() != "identifier" {
@@ -707,7 +724,7 @@ fn java_type_lookup_node_fqn(
         if matches!(parent.kind(), "field_access" | "method_invocation")
             && parent.child_by_field_name("object") == Some(node)
             && let Some(receiver) =
-                java_sole_receiver_type(analyzer, session, file, source, root, node)
+                java_sole_receiver_type(analyzer, token, session, file, source, root, node)
         {
             return Some(JavaTypeLookupResolution::Type {
                 fqn: receiver.unit.fq_name().to_string(),
@@ -730,6 +747,7 @@ fn java_type_lookup_node_fqn(
     let name = java_node_text(node, source);
     java_type_of_identifier_before(
         analyzer,
+        token,
         java,
         session,
         file,
@@ -755,10 +773,14 @@ fn java_declaration_name_type(
     parent: Node<'_>,
     name: Node<'_>,
 ) -> Option<CodeUnit> {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     match parent.kind() {
         "formal_parameter" | "resource" if parent.child_by_field_name("name") == Some(name) => {
             parent.child_by_field_name("type").and_then(|type_node| {
-                java_type_from_node_with_context(analyzer, java, session, file, source, type_node)
+                java_type_from_node_with_context(
+                    analyzer, token, java, session, file, source, type_node,
+                )
             })
         }
         "variable_declarator" if parent.child_by_field_name("name") == Some(name) => {
@@ -773,12 +795,13 @@ fn java_declaration_name_type(
                 .child_by_field_name("type")
                 .and_then(|type_node| {
                     java_type_from_node_with_context(
-                        analyzer, java, session, file, source, type_node,
+                        analyzer, token, java, session, file, source, type_node,
                     )
                 })
         }
         _ => java_type_of_identifier_before(
             analyzer,
+            token,
             java,
             session,
             file,
@@ -849,6 +872,8 @@ fn resolve_java_type_reference(
     source: &str,
     node: Node<'_>,
 ) -> DefinitionLookupOutcome {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let raw = java_node_text(node, source);
     let normalized = normalize_java_type_text(raw);
     if normalized.is_empty() {
@@ -873,17 +898,19 @@ fn resolve_java_type_reference(
     ) {
         return candidates_outcome(vec![unit]);
     }
-    let candidates = session.resolve_type_name_candidates_in_file(java, file, normalized);
+    let candidates = session.resolve_type_name_candidates_in_file(token, java, file, normalized);
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
-    if let Some(unit) = java_qualified_nested_type(analyzer, java, session, file, source, node) {
+    if let Some(unit) =
+        java_qualified_nested_type(analyzer, token, java, session, file, source, node)
+    {
         return candidates_outcome(vec![unit]);
     }
     // `java_import_boundary_for_type` fuses the unresolved-import signal with the
     // workspace-type check; its negation is the workspace-internal gate.
     gated_boundary(
-        || !java_import_boundary_for_type(java, session, file, normalized),
+        || !java_import_boundary_for_type(java, token, session, file, normalized),
         format!(
             "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
         ),
@@ -900,6 +927,8 @@ fn java_explicit_scoped_type_reference(
     source: &str,
     node: Node<'_>,
 ) -> Option<DefinitionLookupOutcome> {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let support: &dyn BoundedDefinitionLookup = session;
     let scoped = java_enclosing_scoped_type_identifier(session, node)?;
     let focused_prefix = source.get(scoped.start_byte()..node.end_byte())?;
@@ -909,14 +938,16 @@ fn java_explicit_scoped_type_reference(
         return None;
     }
 
-    let candidates = session.resolve_type_name_candidates_in_file(java, file, normalized);
+    let candidates = session.resolve_type_name_candidates_in_file(token, java, file, normalized);
     if !candidates.is_empty() {
         return Some(candidates_outcome(candidates));
     }
-    if let Some(unit) = java_qualified_nested_type(analyzer, java, session, file, source, node) {
+    if let Some(unit) =
+        java_qualified_nested_type(analyzer, token, java, session, file, source, node)
+    {
         return Some(candidates_outcome(vec![unit]));
     }
-    if session.type_name_resolves_with_external(analyzer, java, file, normalized) {
+    if session.type_name_resolves_with_external(analyzer, token, java, file, normalized) {
         // gated upstream: `resolve_type_name_in_file` and `java_qualified_nested_type`
         // above return early for any workspace-internal type; reaching here means
         // the name only resolves once external imports are considered.
@@ -924,7 +955,7 @@ fn java_explicit_scoped_type_reference(
             "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
         )));
     }
-    if java_scoped_type_qualifier_resolves_in_source(session, java, file, source, scoped) {
+    if java_scoped_type_qualifier_resolves_in_source(session, token, java, file, source, scoped) {
         return Some(no_definition(
             "no_indexed_definition",
             format!("`{normalized}` did not resolve to an indexed Java type"),
@@ -936,7 +967,7 @@ fn java_explicit_scoped_type_reference(
     // check, so the negation of the whole condition is the workspace gate.
     Some(gated_boundary(
         || {
-            !java_import_boundary_for_type(java, session, file, normalized)
+            !java_import_boundary_for_type(java, token, session, file, normalized)
                 && qualifier_is_in_workspace
         },
         format!(
@@ -966,17 +997,19 @@ impl JavaInvocationBinding {
 
 fn resolve_java_method_invocation(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
     node: Node<'_>,
 ) -> DefinitionLookupOutcome {
-    java_method_invocation_binding(analyzer, session, file, source, root, node).outcome
+    java_method_invocation_binding(analyzer, token, session, file, source, root, node).outcome
 }
 
 fn java_method_invocation_binding(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
     source: &str,
@@ -1004,10 +1037,11 @@ fn java_method_invocation_binding(
     let arity = argument_list_arity(node);
 
     if let Some(object) = node.child_by_field_name("object") {
-        let receiver = java_receiver_types(analyzer, session, file, source, root, object);
+        let receiver = java_receiver_types(analyzer, token, session, file, source, root, object);
         if !receiver.is_empty() {
             let outcome = java_member_candidates_across(
                 analyzer,
+                token,
                 session,
                 &receiver,
                 name,
@@ -1018,6 +1052,7 @@ fn java_method_invocation_binding(
         }
         let mut outcome = java_unresolved_receiver_outcome(
             analyzer,
+            token,
             session,
             file,
             source,
@@ -1038,7 +1073,16 @@ fn java_method_invocation_binding(
         // *variable* name, which no summary can ever match.
         if let Some(owner_fqn) = resolve_analyzer::<JavaAnalyzer>(analyzer).and_then(|java| {
             java_external_receiver_owner_fqn(
-                analyzer, java, session, file, source, root, object, name,
+                analyzer,
+                token,
+                java,
+                session,
+                file,
+                source,
+                root,
+                object,
+                name,
+                JAVA_CHAINED_RECEIVER_LIMIT,
             )
         }) {
             outcome.reference = Some(ResolvedReferenceSite {
@@ -1054,6 +1098,7 @@ fn java_method_invocation_binding(
 
     let static_import = java_static_import_candidates(
         analyzer,
+        token,
         session,
         file,
         name,
@@ -1071,6 +1116,7 @@ fn java_method_invocation_binding(
         session.enclosing_static_context(analyzer, file, name_node);
     let outcome = java_member_candidates_in_enclosing_chain(
         analyzer,
+        token,
         session,
         session.enclosing_units(analyzer, file, name_node.start_byte()),
         initial_static_context,
@@ -1098,6 +1144,7 @@ fn java_method_invocation_binding(
 /// was written first.
 fn java_member_candidates_across(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     session: &JavaResolutionSession<'_>,
     receiver: &[JavaReceiverType],
     member: &str,
@@ -1107,7 +1154,15 @@ fn java_member_candidates_across(
     let mut outcomes = receiver
         .iter()
         .map(|candidate| {
-            java_member_candidates(analyzer, session, &candidate.unit, member, kind, arity)
+            java_member_candidates(
+                analyzer,
+                token,
+                session,
+                &candidate.unit,
+                member,
+                kind,
+                arity,
+            )
         })
         .collect::<Vec<_>>();
     if outcomes.len() == 1 {
@@ -1137,8 +1192,10 @@ fn java_member_candidates_across(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_java_method_reference(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -1159,10 +1216,12 @@ fn resolve_java_method_reference(
             "Java method reference has a blank receiver",
         );
     }
-    let mut owner = java_receiver_types(analyzer, session, file, source, root, receiver_node);
+    let mut owner =
+        java_receiver_types(analyzer, token, session, file, source, root, receiver_node);
     if owner.is_empty() {
         owner = java_type_text_with_context(
             analyzer,
+            token,
             java,
             session,
             file,
@@ -1201,6 +1260,7 @@ fn resolve_java_method_reference(
     if !owner.is_empty() {
         return java_member_candidates_across(
             analyzer,
+            token,
             session,
             &owner,
             member,
@@ -1256,6 +1316,7 @@ fn java_method_reference_is_constructor(
 
 fn resolve_java_constructor_call(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -1265,18 +1326,20 @@ fn resolve_java_constructor_call(
     let Some(type_node) = node.child_by_field_name("type") else {
         return no_definition("no_indexed_definition", "Java constructor call has no type");
     };
-    let owner = java_type_from_node_with_context(analyzer, java, session, file, source, type_node)
-        .or_else(|| {
-            let raw = java_node_text(type_node, source);
-            java_type_text_with_context(
-                analyzer,
-                java,
-                session,
-                file,
-                normalize_java_type_text(raw),
-                type_node.start_byte(),
-            )
-        });
+    let owner =
+        java_type_from_node_with_context(analyzer, token, java, session, file, source, type_node)
+            .or_else(|| {
+                let raw = java_node_text(type_node, source);
+                java_type_text_with_context(
+                    analyzer,
+                    token,
+                    java,
+                    session,
+                    file,
+                    normalize_java_type_text(raw),
+                    type_node.start_byte(),
+                )
+            });
     if let Some(owner) = owner {
         return java_constructor_outcome(analyzer, session, owner, Some(argument_list_arity(node)));
     }
@@ -1569,6 +1632,7 @@ fn java_method_reference_receiver_contains_focus(reference: Node<'_>, focus: Nod
 
 fn resolve_java_field_access(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
     source: &str,
@@ -1583,7 +1647,7 @@ fn resolve_java_field_access(
     let Some(object) = node.child_by_field_name("object") else {
         return no_definition("no_field_receiver", "Java field access has no receiver");
     };
-    let owner = java_receiver_types(analyzer, session, file, source, root, object);
+    let owner = java_receiver_types(analyzer, token, session, file, source, root, object);
     if !owner.is_empty() {
         let mut nested_types = Vec::new();
         for candidate in &owner {
@@ -1600,6 +1664,7 @@ fn resolve_java_field_access(
         }
         return java_member_candidates_across(
             analyzer,
+            token,
             session,
             &owner,
             field,
@@ -1609,6 +1674,7 @@ fn resolve_java_field_access(
     }
     java_unresolved_receiver_outcome(
         analyzer,
+        token,
         session,
         file,
         source,
@@ -1638,6 +1704,7 @@ fn resolve_java_field_access(
 #[allow(clippy::too_many_arguments)]
 fn java_unresolved_receiver_outcome(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
     source: &str,
@@ -1648,8 +1715,9 @@ fn java_unresolved_receiver_outcome(
 ) -> DefinitionLookupOutcome {
     let spelling = format!("{}.{}", java_node_text(object, source), member);
     let java = resolve_analyzer::<JavaAnalyzer>(analyzer);
-    let imported_bound = java
-        .and_then(|java| java_imported_receiver_bound(java, session, file, source, root, object));
+    let imported_bound = java.and_then(|java| {
+        java_imported_receiver_bound(java, token, session, file, source, root, object)
+    });
     let boundary_message = match &imported_bound {
         Some(bound) => format!(
             "`{spelling}` reads a receiver bounded by `{bound}`, a Java type imported from outside the indexed workspace"
@@ -1665,6 +1733,7 @@ fn java_unresolved_receiver_outcome(
                     session
                         .query_optional_row(|| {
                             java.resolve_member_name_with_external(
+                                token,
                                 analyzer.semantic_model_overlay(),
                                 file,
                                 &spelling,
@@ -1679,6 +1748,16 @@ fn java_unresolved_receiver_outcome(
     )
 }
 
+/// How many chained calls the receiver ladder walks inward before it refuses
+/// (#2454).
+///
+/// `response.getWriter().println(...)`, the shape 2668 of the 2740 OWASP
+/// Benchmark case files are written in, is one rung; `a().b().c()` is two. The
+/// bound makes a chain cost a fixed number of external declaration lookups
+/// rather than one per written call, and a chain longer than it answers nothing
+/// rather than a partial identity.
+const JAVA_CHAINED_RECEIVER_LIMIT: usize = 8;
+
 /// The fully-qualified name of the external type a receiver's written declared
 /// type spells, or `None` when no external declaration names it.
 ///
@@ -1689,9 +1768,13 @@ fn java_unresolved_receiver_outcome(
 /// procedure summary binds by (#1978). A type-parameter spelling names no
 /// class and a workspace-source resolution is not external, so both answer
 /// `None` and the call keeps the identity-free boundary it had before.
+///
+/// `chain_budget` is spent only by the #2454 chained-call rung below, which
+/// re-enters this function for the inner call's own receiver.
 #[allow(clippy::too_many_arguments)]
 fn java_external_receiver_owner_fqn(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -1699,6 +1782,7 @@ fn java_external_receiver_owner_fqn(
     root: Node<'_>,
     object: Node<'_>,
     member_name: &str,
+    chain_budget: usize,
 ) -> Option<String> {
     if let Some(type_node) = java_receiver_type_node(session, file, source, root, object) {
         let normalized = normalize_java_type_text(java_node_text(type_node, source));
@@ -1707,11 +1791,46 @@ fn java_external_receiver_owner_fqn(
                 type_node, source, normalized,
             )
             .is_none()
-            && let Some(fqn) =
-                java_resolved_type_owner_fqn(analyzer, java, session, file, normalized, member_name)
+            && let Some(fqn) = java_resolved_type_owner_fqn(
+                analyzer,
+                token,
+                java,
+                session,
+                file,
+                normalized,
+                member_name,
+            )
         {
             return Some(fqn);
         }
+    }
+    // #2454: a receiver that is itself a call writes its type nowhere in the
+    // reading file, so the written-type tier above answers nothing for it. Its
+    // static type is the callee's *declared return type*, which the same
+    // external declaration surface writes down --
+    // `javax.servlet.ServletResponse.getWriter` returns `java.io.PrintWriter`
+    // in the servlet artifact -- so the ladder simply continues from there.
+    if object.kind() == "method_invocation" {
+        let returned = java_external_call_return_type_fqn(
+            analyzer,
+            token,
+            java,
+            session,
+            file,
+            source,
+            root,
+            object,
+            chain_budget,
+        )?;
+        return java_resolved_type_owner_fqn(
+            analyzer,
+            token,
+            java,
+            session,
+            file,
+            &returned,
+            member_name,
+        );
     }
     // #2364: a method qualifier with no variable or field in scope is a
     // TypeName (JLS 6.5.2). Resolve the written spelling through imports and
@@ -1743,11 +1862,75 @@ fn java_external_receiver_owner_fqn(
     if normalized.is_empty() {
         return None;
     }
-    java_resolved_type_owner_fqn(analyzer, java, session, file, normalized, member_name)
+    java_resolved_type_owner_fqn(
+        analyzer,
+        token,
+        java,
+        session,
+        file,
+        normalized,
+        member_name,
+    )
+}
+
+/// The fully-qualified name of the class an external call's declaration says it
+/// returns (#2454), which is the static type of that call used as a receiver.
+///
+/// The call's own receiver is typed by the same ladder this feeds, so a chain
+/// walks inward one call at a time until a rung grounds it in a written type or
+/// a type name. Every step fails closed, and a step that fails ends the chain:
+/// a call whose receiver names no external owner, a member no activated pack or
+/// classpath artifact declares, and a declaration that writes no usable return
+/// type all answer `None`, and the outer call keeps the identity-free boundary
+/// it had.
+///
+/// The one call this cannot type is an unqualified one (`getWriter().println()`
+/// inside the servlet itself): it has no receiver to resolve, so there is no
+/// external owner to read a declaration from.
+#[allow(clippy::too_many_arguments)]
+fn java_external_call_return_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    call: Node<'_>,
+    chain_budget: usize,
+) -> Option<String> {
+    let remaining = chain_budget.checked_sub(1)?;
+    let member_name = java_node_text(call.child_by_field_name("name")?, source);
+    if member_name.is_empty() {
+        return None;
+    }
+    let object = call.child_by_field_name("object")?;
+    let owner_fqn = java_external_receiver_owner_fqn(
+        analyzer,
+        token,
+        java,
+        session,
+        file,
+        source,
+        root,
+        object,
+        member_name,
+        remaining,
+    )?;
+    let member = session.query_optional_row(|| {
+        java.resolve_member_name_with_external(
+            token,
+            analyzer.semantic_model_overlay(),
+            file,
+            &format!("{owner_fqn}.{member_name}"),
+        )
+    })?;
+    member.declared_return_type_fqn().map(str::to_owned)
 }
 
 fn java_resolved_type_owner_fqn(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -1755,7 +1938,12 @@ fn java_resolved_type_owner_fqn(
     member_name: &str,
 ) -> Option<String> {
     if let Some(resolution) = session.query_optional_row(|| {
-        java.resolve_type_name_with_external(analyzer.semantic_model_overlay(), file, normalized)
+        java.resolve_type_name_with_external(
+            token,
+            analyzer.semantic_model_overlay(),
+            file,
+            normalized,
+        )
     }) {
         let JavaTypeResolution::External(external_type) = resolution else {
             return None;
@@ -1765,6 +1953,7 @@ fn java_resolved_type_owner_fqn(
         // `HttpServletRequest.getParameter` is declared on `ServletRequest`.
         if let Some(member) = session.query_optional_row(|| {
             java.resolve_member_name_with_external(
+                token,
                 analyzer.semantic_model_overlay(),
                 file,
                 &format!("{}.{member_name}", external_type.fqn()),
@@ -1782,7 +1971,7 @@ fn java_resolved_type_owner_fqn(
     // The overlay and jar index can both be empty in an inline fixture. An
     // explicit single-type import is still file-local structured evidence of
     // the owner FQN (#2364).
-    session.query_optional_row(|| java.explicit_imported_type_fqn(file, normalized))
+    session.query_optional_row(|| java.explicit_imported_type_fqn(token, file, normalized))
 }
 
 /// The written bound of a type-parameter receiver whose bound this file imports
@@ -1794,6 +1983,7 @@ fn java_resolved_type_owner_fqn(
 /// behind it stays a plain miss.
 fn java_imported_receiver_bound(
     java: &JavaAnalyzer,
+    token: QueryToken<'_>,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
     source: &str,
@@ -1808,7 +1998,7 @@ fn java_imported_receiver_bound(
     brokk_bifrost_jvm::java::graph_support::java_type_parameter_bounds(parameter)
         .into_iter()
         .map(|bound| normalize_java_type_text(java_node_text(bound, source)))
-        .find(|bound| java_import_boundary_for_type(java, session, file, bound))
+        .find(|bound| java_import_boundary_for_type(java, token, session, file, bound))
         .map(str::to_owned)
 }
 
@@ -1820,8 +2010,10 @@ fn java_field_access_is_selector_receiver(node: Node<'_>) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_java_bare_identifier(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -1831,12 +2023,20 @@ fn resolve_java_bare_identifier(
 ) -> DefinitionLookupOutcome {
     let name = java_node_text(node, source);
     if java_identifier_is_annotation_name(node) {
-        if let Some(unit) =
-            java_type_text_with_context(analyzer, java, session, file, name, node.start_byte())
-        {
+        if let Some(unit) = java_type_text_with_context(
+            analyzer,
+            token,
+            java,
+            session,
+            file,
+            name,
+            node.start_byte(),
+        ) {
             return candidates_outcome(vec![unit]);
         }
-        return java_bare_name_static_import_or_boundary(analyzer, java, session, file, name);
+        return java_bare_name_static_import_or_boundary(
+            analyzer, token, java, session, file, name,
+        );
     }
     // JLS 6.4.2 (obscuring) and 6.5.2 (ambiguous names): outside a type context
     // a simple name denotes a variable whenever one is in scope -- a local, a
@@ -1853,6 +2053,7 @@ fn resolve_java_bare_identifier(
             session.enclosing_static_context(analyzer, file, node);
         let outcome = java_member_candidates_in_enclosing_chain(
             analyzer,
+            token,
             session,
             session.enclosing_units(analyzer, file, node.start_byte()),
             initial_static_context,
@@ -1871,12 +2072,18 @@ fn resolve_java_bare_identifier(
             format!("`{name}` resolves to a local Java binding"),
         );
     }
-    if let Some(unit) =
-        java_type_text_with_context(analyzer, java, session, file, name, node.start_byte())
-    {
+    if let Some(unit) = java_type_text_with_context(
+        analyzer,
+        token,
+        java,
+        session,
+        file,
+        name,
+        node.start_byte(),
+    ) {
         return candidates_outcome(vec![unit]);
     }
-    java_bare_name_static_import_or_boundary(analyzer, java, session, file, name)
+    java_bare_name_static_import_or_boundary(analyzer, token, java, session, file, name)
 }
 
 /// tree-sitter-java spells every Java type reference as `type_identifier`,
@@ -1897,6 +2104,7 @@ fn java_identifier_is_annotation_name(node: Node<'_>) -> bool {
 /// static imports, then the import-boundary gate.
 fn java_bare_name_static_import_or_boundary(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -1904,6 +2112,7 @@ fn java_bare_name_static_import_or_boundary(
 ) -> DefinitionLookupOutcome {
     let static_import = java_static_import_candidates(
         analyzer,
+        token,
         session,
         file,
         name,
@@ -1915,7 +2124,7 @@ fn java_bare_name_static_import_or_boundary(
     }
     // Workspace gate is the negation of the fused import-boundary predicate.
     gated_boundary(
-        || !java_import_boundary_for_type(java, session, file, name),
+        || !java_import_boundary_for_type(java, token, session, file, name),
         format!("`{name}` appears to cross a Java import boundary not indexed in this workspace"),
         "no_indexed_definition",
         format!("`{name}` did not resolve to an indexed Java definition"),
@@ -1936,8 +2145,10 @@ fn java_bare_name_static_import_or_boundary(
 /// ordinary path is therefore not a fallback once the selector's type is known:
 /// a constant the enum does not declare is a miss, not an invitation to look
 /// somewhere else.
+#[allow(clippy::too_many_arguments)]
 fn resolve_java_switch_label(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -1946,9 +2157,10 @@ fn resolve_java_switch_label(
     node: Node<'_>,
 ) -> DefinitionLookupOutcome {
     let name = java_node_text(node, source);
-    match java_switch_selector_type(analyzer, java, session, file, source, root, node) {
+    match java_switch_selector_type(analyzer, token, java, session, file, source, root, node) {
         JavaSwitchSelectorType::Indexed(owner) => java_member_candidates(
             analyzer,
+            token,
             session,
             &owner,
             name,
@@ -1956,7 +2168,7 @@ fn resolve_java_switch_label(
             None,
         ),
         JavaSwitchSelectorType::ConstantVariable => {
-            resolve_java_bare_identifier(analyzer, java, session, file, source, root, node)
+            resolve_java_bare_identifier(analyzer, token, java, session, file, source, root, node)
         }
         JavaSwitchSelectorType::Unknown => no_definition(
             "unresolved_switch_selector_type",
@@ -2004,6 +2216,7 @@ const JAVA_CONSTANT_VARIABLE_SELECTOR_TYPES: &[&str] = &[
 #[allow(clippy::too_many_arguments)]
 fn java_switch_selector_type(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -2019,11 +2232,14 @@ fn java_switch_selector_type(
     else {
         return JavaSwitchSelectorType::Unknown;
     };
-    if let Some(owner) = java_sole_receiver_type(analyzer, session, file, source, root, selector) {
+    if let Some(owner) =
+        java_sole_receiver_type(analyzer, token, session, file, source, root, selector)
+    {
         return JavaSwitchSelectorType::Indexed(owner.unit);
     }
     if let Some(type_text) = java_expression_type_text(
         analyzer,
+        token,
         java,
         session,
         file,
@@ -2121,6 +2337,7 @@ fn java_push_receiver_type(types: &mut Vec<JavaReceiverType>, candidate: JavaRec
 /// (`T extends A & B`), whose member surface is every bound's at once.
 fn java_receiver_types(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
     source: &str,
@@ -2130,7 +2347,8 @@ fn java_receiver_types(
     let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
         return Vec::new();
     };
-    let types = java_receiver_types_for_java(analyzer, java, session, file, source, root, object);
+    let types =
+        java_receiver_types_for_java(analyzer, token, java, session, file, source, root, object);
     if !types.is_empty() {
         return types;
     }
@@ -2180,18 +2398,21 @@ fn java_enclosing_receiver_type(
 /// answer nothing rather than the first one written.
 fn java_sole_receiver_type(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
     object: Node<'_>,
 ) -> Option<JavaReceiverType> {
-    let mut types = java_receiver_types(analyzer, session, file, source, root, object);
+    let mut types = java_receiver_types(analyzer, token, session, file, source, root, object);
     (types.len() == 1).then(|| types.remove(0))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn java_receiver_types_for_java(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -2206,7 +2427,7 @@ fn java_receiver_types_for_java(
         | "generic_type"
         | "annotated_type" => java_receiver_type_node(session, file, source, root, object)
             .map(|type_node| {
-                java_receiver_types_in_tree(analyzer, java, session, file, source, type_node)
+                java_receiver_types_in_tree(analyzer, token, java, session, file, source, type_node)
             })
             .unwrap_or_default(),
         "identifier" => {
@@ -2220,7 +2441,7 @@ fn java_receiver_types_for_java(
                 java_bindings_before_scoped(session, file, source, root, object.start_byte());
             if let Some(declared) = first_precise(&bindings, name) {
                 let types = java_receiver_types_of_spelling(
-                    analyzer, java, session, file, source, root, &declared,
+                    analyzer, token, java, session, file, source, root, &declared,
                 );
                 if !types.is_empty() {
                     return types;
@@ -2228,6 +2449,7 @@ fn java_receiver_types_for_java(
             }
             if let Some(unit) = java_lambda_parameter_type_before(
                 analyzer,
+                token,
                 java,
                 session,
                 file,
@@ -2241,17 +2463,26 @@ fn java_receiver_types_for_java(
             if bindings.is_shadowed(name) {
                 return Vec::new();
             }
-            java_type_text_with_context(analyzer, java, session, file, name, object.start_byte())
-                .map(JavaReceiverType::plain)
-                .into_iter()
-                .collect()
+            java_type_text_with_context(
+                analyzer,
+                token,
+                java,
+                session,
+                file,
+                name,
+                object.start_byte(),
+            )
+            .map(JavaReceiverType::plain)
+            .into_iter()
+            .collect()
         }
         // A method-call receiver (`getABC().i`) is typed by the called method's
         // declared return type, which the call's own receiver may have to
         // supply a type argument for.
         "method_invocation" => {
-            let binding =
-                java_method_invocation_binding(analyzer, session, file, source, root, object);
+            let binding = java_method_invocation_binding(
+                analyzer, token, session, file, source, root, object,
+            );
             let Some(method_unit) = binding.outcome.definitions.into_iter().next() else {
                 return Vec::new();
             };
@@ -2269,6 +2500,7 @@ fn java_receiver_types_for_java(
             }
             java_method_return_types(
                 analyzer,
+                token,
                 java,
                 session,
                 file,
@@ -2287,9 +2519,10 @@ fn java_receiver_types_for_java(
                 return Vec::new();
             };
             let mut types = Vec::new();
-            for owner in java_receiver_types(analyzer, session, file, source, root, receiver) {
+            for owner in java_receiver_types(analyzer, token, session, file, source, root, receiver)
+            {
                 if let Some(unit) =
-                    java_field_access_type(analyzer, java, session, &owner.unit, field)
+                    java_field_access_type(analyzer, token, java, session, &owner.unit, field)
                 {
                     java_push_receiver_type(&mut types, JavaReceiverType::plain(unit));
                 }
@@ -2304,6 +2537,7 @@ fn java_receiver_types_for_java(
 /// declares, or a nested type of the owner when the spelling names one.
 fn java_field_access_type(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     owner: &CodeUnit,
@@ -2324,7 +2558,9 @@ fn java_field_access_type(
         // against the reading file left the switch selector unknown (#2043).
         let normalized = normalize_java_type_text(&type_text);
         return java_nested_type_in_scope(analyzer, session, Some(owner.clone()), normalized)
-            .or_else(|| session.resolve_type_name_in_file(java, field_unit.source(), normalized));
+            .or_else(|| {
+                session.resolve_type_name_in_file(token, java, field_unit.source(), normalized)
+            });
     }
     candidates.into_iter().find(CodeUnit::is_class)
 }
@@ -2368,6 +2604,7 @@ fn java_receiver_type_node<'tree>(
 /// the spelling's own ancestors.
 fn java_receiver_types_in_tree(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -2384,10 +2621,11 @@ fn java_receiver_types_in_tree(
     if let Some(parameter) = brokk_bifrost_jvm::java::graph_support::java_type_parameter_in_scope(
         type_node, source, normalized,
     ) {
-        return java_type_parameter_types(analyzer, java, session, file, source, parameter);
+        return java_type_parameter_types(analyzer, token, java, session, file, source, parameter);
     }
     java_type_text_with_context(
         analyzer,
+        token,
         java,
         session,
         file,
@@ -2416,6 +2654,7 @@ fn java_receiver_types_in_tree(
 /// self-reference never re-enters this function at all.
 fn java_type_parameter_types(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -2438,7 +2677,9 @@ fn java_type_parameter_types(
         .insert(key.clone(), None);
     let mut expanded = Vec::new();
     for bound in brokk_bifrost_jvm::java::graph_support::java_type_parameter_bounds(parameter) {
-        for candidate in java_receiver_types_in_tree(analyzer, java, session, file, source, bound) {
+        for candidate in
+            java_receiver_types_in_tree(analyzer, token, java, session, file, source, bound)
+        {
             java_push_receiver_type(&mut expanded, candidate);
         }
     }
@@ -2456,6 +2697,7 @@ fn java_type_parameter_types(
 #[allow(clippy::too_many_arguments)]
 fn java_receiver_types_of_spelling(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -2466,7 +2708,9 @@ fn java_receiver_types_of_spelling(
     if &spelling.file == file {
         return session
             .smallest_named_node_covering(root, spelling.start_byte, spelling.end_byte)
-            .map(|node| java_receiver_types_in_tree(analyzer, java, session, file, source, node))
+            .map(|node| {
+                java_receiver_types_in_tree(analyzer, token, java, session, file, source, node)
+            })
             .unwrap_or_default();
     }
     let Some(other_source) = session.read_source(&spelling.file) else {
@@ -2480,6 +2724,7 @@ fn java_receiver_types_of_spelling(
         .map(|node| {
             java_receiver_types_in_tree(
                 analyzer,
+                token,
                 java,
                 session,
                 &spelling.file,
@@ -2518,6 +2763,7 @@ enum JavaReturnType {
 #[allow(clippy::too_many_arguments)]
 fn java_method_return_types(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -2531,7 +2777,16 @@ fn java_method_return_types(
     };
     let method_file = method_unit.source();
     let returned = if method_file == file {
-        java_return_type_of(analyzer, java, session, file, source, root, &method_range)
+        java_return_type_of(
+            analyzer,
+            token,
+            java,
+            session,
+            file,
+            source,
+            root,
+            &method_range,
+        )
     } else {
         let Some(method_source) = session.read_source(method_file) else {
             return Vec::new();
@@ -2541,6 +2796,7 @@ fn java_method_return_types(
         };
         java_return_type_of(
             analyzer,
+            token,
             java,
             session,
             method_file,
@@ -2566,9 +2822,9 @@ fn java_method_return_types(
         let Some(argument) = candidate.arguments.get(index) else {
             continue;
         };
-        for resolved in
-            java_receiver_types_of_spelling(analyzer, java, session, file, source, root, argument)
-        {
+        for resolved in java_receiver_types_of_spelling(
+            analyzer, token, java, session, file, source, root, argument,
+        ) {
             java_push_receiver_type(&mut types, resolved);
         }
     }
@@ -2578,6 +2834,7 @@ fn java_method_return_types(
 #[allow(clippy::too_many_arguments)]
 fn java_return_type_of(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -2604,11 +2861,13 @@ fn java_return_type_of(
         // it falls through to the ordinary bound expansion below.
         return JavaReturnType::OwnerTypeParameter {
             index,
-            bounds: java_type_parameter_types(analyzer, java, session, file, source, parameter),
+            bounds: java_type_parameter_types(
+                analyzer, token, java, session, file, source, parameter,
+            ),
         };
     }
     JavaReturnType::Types(java_receiver_types_in_tree(
-        analyzer, java, session, file, source, type_node,
+        analyzer, token, java, session, file, source, type_node,
     ))
 }
 
@@ -2668,6 +2927,7 @@ fn java_is_callable_declaration_name(parent: Node<'_>, name: Node<'_>) -> bool {
 /// like `class A extends B.Foo`.
 fn java_qualified_nested_type(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -2691,7 +2951,7 @@ fn java_qualified_nested_type(
     }
     let qualifier = qualifier?;
     let qualifier_type =
-        java_type_from_node_with_context(analyzer, java, session, file, source, qualifier)?;
+        java_type_from_node_with_context(analyzer, token, java, session, file, source, qualifier)?;
     let name = java_node_text(node, source);
 
     let nested = |owner: &CodeUnit| {
@@ -2747,13 +3007,14 @@ fn java_enclosing_scoped_type_identifier<'tree>(
 
 fn java_scoped_type_qualifier_resolves_in_source(
     session: &JavaResolutionSession<'_>,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     file: &ProjectFile,
     source: &str,
     scoped: Node<'_>,
 ) -> bool {
     java_scoped_type_qualifier_text(session, scoped, source)
-        .and_then(|qualifier| session.resolve_type_name_in_file(java, file, qualifier))
+        .and_then(|qualifier| session.resolve_type_name_in_file(token, java, file, qualifier))
         .is_some()
 }
 
@@ -2777,6 +3038,7 @@ fn java_scoped_type_qualifier_text<'a>(
 
 fn java_type_from_node_with_context(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -2785,6 +3047,7 @@ fn java_type_from_node_with_context(
 ) -> Option<CodeUnit> {
     java_type_text_with_context(
         analyzer,
+        token,
         java,
         session,
         file,
@@ -2795,6 +3058,7 @@ fn java_type_from_node_with_context(
 
 fn java_type_text_with_context(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -2819,7 +3083,7 @@ fn java_type_text_with_context(
     {
         return Some(unit);
     }
-    session.resolve_type_name_in_file(java, file, normalized)
+    session.resolve_type_name_in_file(token, java, file, normalized)
 }
 
 /// Find a method- or lambda-local class visible at `byte`.
@@ -2942,6 +3206,7 @@ fn java_nested_type_in_scope(
 #[allow(clippy::too_many_arguments)]
 fn java_type_of_identifier_before(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -2954,7 +3219,7 @@ fn java_type_of_identifier_before(
     let declared = first_precise(&bindings, name)?;
     let type_node =
         session.smallest_named_node_covering(root, declared.start_byte, declared.end_byte)?;
-    java_type_from_node_with_context(analyzer, java, session, file, source, type_node)
+    java_type_from_node_with_context(analyzer, token, java, session, file, source, type_node)
 }
 
 /// Every local binding visible at `cutoff_start`, recorded as the type spelling
@@ -3180,6 +3445,7 @@ fn java_seed_typed_name_binding(
 #[allow(clippy::too_many_arguments)]
 fn java_lambda_parameter_type_before(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -3190,6 +3456,7 @@ fn java_lambda_parameter_type_before(
 ) -> Option<CodeUnit> {
     let type_text = java_lambda_parameter_type_text_before(
         analyzer,
+        token,
         java,
         session,
         file,
@@ -3200,6 +3467,7 @@ fn java_lambda_parameter_type_before(
     )?;
     java_type_text_with_context(
         analyzer,
+        token,
         java,
         session,
         file,
@@ -3211,6 +3479,7 @@ fn java_lambda_parameter_type_before(
 #[allow(clippy::too_many_arguments)]
 fn java_lambda_parameter_type_text_before(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -3235,6 +3504,7 @@ fn java_lambda_parameter_type_text_before(
             {
                 return java_collection_element_type_text(
                     analyzer,
+                    token,
                     java,
                     session,
                     file,
@@ -3246,6 +3516,7 @@ fn java_lambda_parameter_type_text_before(
             }
             java_collection_element_type_text(
                 analyzer,
+                token,
                 java,
                 session,
                 file,
@@ -3257,6 +3528,7 @@ fn java_lambda_parameter_type_text_before(
         }
         "forEach" => java_collection_element_type_text(
             analyzer,
+            token,
             java,
             session,
             file,
@@ -3352,6 +3624,7 @@ fn java_ancestor_method_invocation<'tree>(
 #[allow(clippy::too_many_arguments)]
 fn java_collection_element_type_text(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -3368,6 +3641,7 @@ fn java_collection_element_type_text(
     {
         let type_text = java_expression_type_text(
             analyzer,
+            token,
             java,
             session,
             file,
@@ -3383,6 +3657,7 @@ fn java_collection_element_type_text(
     }
     let type_text = java_expression_type_text(
         analyzer,
+        token,
         java,
         session,
         file,
@@ -3400,6 +3675,7 @@ fn java_collection_element_type_text(
 #[allow(clippy::too_many_arguments)]
 fn java_expression_type_text(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
@@ -3413,6 +3689,7 @@ fn java_expression_type_text(
             let left = expression.child_by_field_name("left")?;
             java_expression_type_text(
                 analyzer,
+                token,
                 java,
                 session,
                 file,
@@ -3424,26 +3701,36 @@ fn java_expression_type_text(
         }
         "identifier" => {
             let name = java_node_text(expression, source);
-            java_identifier_type_text_before(session, java, file, source, root, name, before_byte)
-                .or_else(|| {
-                    java_lambda_parameter_type_text_before(
-                        analyzer,
-                        java,
-                        session,
-                        file,
-                        source,
-                        root,
-                        name,
-                        before_byte,
-                    )
-                })
+            java_identifier_type_text_before(
+                session,
+                token,
+                java,
+                file,
+                source,
+                root,
+                name,
+                before_byte,
+            )
+            .or_else(|| {
+                java_lambda_parameter_type_text_before(
+                    analyzer,
+                    token,
+                    java,
+                    session,
+                    file,
+                    source,
+                    root,
+                    name,
+                    before_byte,
+                )
+            })
         }
         "field_access" => {
             let field_node = expression.child_by_field_name("field")?;
             let field = java_node_text(field_node, source);
             let object = expression.child_by_field_name("object")?;
             let owner =
-                java_sole_receiver_type(analyzer, session, file, source, root, object)?.unit;
+                java_sole_receiver_type(analyzer, token, session, file, source, root, object)?.unit;
             let unit = session
                 .fqn(&format!("{}.{}", owner.fq_name(), field))
                 .into_iter()
@@ -3462,6 +3749,7 @@ fn java_expression_type_text(
             {
                 let type_text = java_expression_type_text(
                     analyzer,
+                    token,
                     java,
                     session,
                     file,
@@ -3481,8 +3769,10 @@ fn java_expression_type_text(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn java_identifier_type_text_before(
     session: &JavaResolutionSession<'_>,
+    token: QueryToken<'_>,
     java: &JavaAnalyzer,
     file: &ProjectFile,
     source: &str,
@@ -3536,7 +3826,7 @@ fn java_identifier_type_text_before(
     }
     if found.is_none()
         && session
-            .resolve_type_name_in_file(java, file, name)
+            .resolve_type_name_in_file(token, java, file, name)
             .is_some()
     {
         found = Some(name.to_string());
@@ -3837,6 +4127,7 @@ impl JavaMemberTrace {
 #[allow(clippy::too_many_arguments)]
 fn java_member_candidates_in_enclosing_chain(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     session: &JavaResolutionSession<'_>,
     owners: Vec<CodeUnit>,
     initial_static_context: bool,
@@ -3857,7 +4148,7 @@ fn java_member_candidates_in_enclosing_chain(
                 "Java member resolution stopped before completion",
             );
         }
-        let outcome = java_member_candidates(analyzer, session, &owner, member, kind, arity);
+        let outcome = java_member_candidates(analyzer, token, session, &owner, member, kind, arity);
         let outcome = if static_context {
             java_static_context_member_outcome(analyzer, session, outcome, kind, member)
         } else {
@@ -3984,6 +4275,7 @@ fn java_member_declared_in_hierarchy(
 
 fn java_member_candidates(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     session: &JavaResolutionSession<'_>,
     owner: &CodeUnit,
     member: &str,
@@ -4127,7 +4419,7 @@ fn java_member_candidates(
     // indexed workspace, the accepting declaration is on the far side of that
     // boundary, which is what the site must report.
     gated_boundary(
-        || !java_hierarchy_crosses_unindexed_supertype(analyzer, session, owner),
+        || !java_hierarchy_crosses_unindexed_supertype(analyzer, token, session, owner),
         format!(
             "`{owner_fqn}.{member}` is inherited from a Java supertype not indexed in this workspace"
         ),
@@ -4184,6 +4476,7 @@ fn java_prefer_class_method_candidates(
 /// as an unindexed one excused a genuine forward gap as an import boundary.
 fn java_hierarchy_crosses_unindexed_supertype(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     session: &JavaResolutionSession<'_>,
     owner: &CodeUnit,
 ) -> bool {
@@ -4205,7 +4498,7 @@ fn java_hierarchy_crosses_unindexed_supertype(
             if java_nested_type_in_scope(analyzer, session, Some(unit.clone()), normalized)
                 .is_none()
                 && session
-                    .resolve_type_name_in_file(java, unit.source(), normalized)
+                    .resolve_type_name_in_file(token, java, unit.source(), normalized)
                     .is_none()
             {
                 return true;
@@ -4257,6 +4550,7 @@ fn java_filter_member_candidates(
 
 fn java_static_import_candidates(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
     member: &str,
@@ -4272,7 +4566,7 @@ fn java_static_import_candidates(
     };
     let mut candidates = Vec::new();
     let mut saw_external = false;
-    for import in session.import_infos(java, file) {
+    for import in session.import_infos(token, java, file) {
         let Some(path) = import.path.as_ref() else {
             continue;
         };
@@ -4365,12 +4659,13 @@ fn java_static_import_candidates(
 
 fn java_import_boundary_for_type(
     java: &JavaAnalyzer,
+    token: QueryToken<'_>,
     session: &JavaResolutionSession<'_>,
     file: &ProjectFile,
     name: &str,
 ) -> bool {
     let support: &dyn BoundedDefinitionLookup = session;
-    for import in session.import_infos(java, file) {
+    for import in session.import_infos(token, java, file) {
         let Some(path) = import.path.as_ref() else {
             continue;
         };

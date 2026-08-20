@@ -73,12 +73,12 @@ pub trait JavaSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProv
     fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit>;
 
     /// The workspace's usage-definition index, as the bounded lookup contract.
-    fn usage_definitions(&self) -> &dyn BoundedDefinitionLookup;
+    fn usage_definitions(&self, token: QueryToken<'_>) -> &dyn BoundedDefinitionLookup;
 
     /// Every type the usage-definition index holds in `package_name`, sorted and
     /// deduplicated. The index's package projection has no bounded spelling, so
     /// this is the one lookup below that names its own accessor.
-    fn source_types_in_package(&self, package_name: &str) -> Vec<CodeUnit>;
+    fn source_types_in_package(&self, token: QueryToken<'_>, package_name: &str) -> Vec<CodeUnit>;
 
     /// The type identifiers a file spells, from the analyzer's persisted parse.
     fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>>;
@@ -315,11 +315,12 @@ pub fn java_extract_type_identifiers(source: &str) -> BTreeSet<String> {
 /// constructing the workspace-wide usage index.
 pub fn resolve_java_forward_type_name(
     source: &dyn JavaSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     raw_name: &str,
 ) -> Option<CodeUnit> {
     unique_candidate(resolve_java_forward_type_name_candidates(
-        source, file, raw_name,
+        source, token, file, raw_name,
     ))
 }
 
@@ -400,10 +401,11 @@ pub fn java_same_file_candidates(candidates: Vec<CodeUnit>, file: &ProjectFile) 
 /// multiple rows (issue #1602) rather than as a silent first-route win.
 pub fn resolve_java_forward_type_name_candidates(
     source: &dyn JavaSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     raw_name: &str,
 ) -> Vec<CodeUnit> {
-    resolve_java_type_name_with(source, file, raw_name, |fqn| {
+    resolve_java_type_name_with(source, token, file, raw_name, |fqn| {
         forward_source_type_by_fqn(source, file, fqn)
     })
 }
@@ -412,10 +414,17 @@ pub fn resolve_java_forward_type_name_candidates(
 /// workspace declaration index, against this analyzer's own index.
 pub fn resolve_java_usage_type_name(
     source: &dyn JavaSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     raw_name: &str,
 ) -> Option<CodeUnit> {
-    resolve_java_usage_type_name_in(source, source.usage_definitions(), file, raw_name)
+    resolve_java_usage_type_name_in(
+        source,
+        token,
+        source.usage_definitions(token),
+        file,
+        raw_name,
+    )
 }
 
 /// Resolve a source type against a *supplied* declaration index, applying
@@ -433,17 +442,24 @@ pub fn resolve_java_usage_type_name(
 /// needs an import.
 pub fn resolve_java_usage_type_name_in(
     source: &dyn JavaSource,
+    token: QueryToken<'_>,
     index: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     raw_name: &str,
 ) -> Option<CodeUnit> {
-    unique_candidate(resolve_java_type_name_with(source, file, raw_name, |fqn| {
-        index
-            .fqn(fqn)
-            .iter()
-            .find(|unit| unit.is_class() && unit.fq_name() == fqn)
-            .cloned()
-    }))
+    unique_candidate(resolve_java_type_name_with(
+        source,
+        token,
+        file,
+        raw_name,
+        |fqn| {
+            index
+                .fqn(fqn)
+                .iter()
+                .find(|unit| unit.is_class() && unit.fq_name() == fqn)
+                .cloned()
+        },
+    ))
 }
 
 /// Every candidate the deciding type-name tier produced for `raw_name`,
@@ -453,11 +469,12 @@ pub fn resolve_java_usage_type_name_in(
 /// simple name, so no candidate is provably unique (issue #1602).
 pub fn resolve_java_type_name_candidates_in_realm(
     source: &dyn JavaSource,
+    token: QueryToken<'_>,
     index: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     raw_name: &str,
 ) -> Vec<CodeUnit> {
-    resolve_java_type_name_with(source, file, raw_name, |fqn| {
+    resolve_java_type_name_with(source, token, file, raw_name, |fqn| {
         index
             .fqn(fqn)
             .iter()
@@ -478,6 +495,7 @@ pub fn resolve_java_type_name_candidates_in_realm(
 /// refusing to pick one (issue #1602).
 pub fn resolve_java_type_name_with(
     source: &dyn JavaSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     raw_name: &str,
     mut source_type_by_fqn: impl FnMut(&str) -> Option<CodeUnit>,
@@ -493,7 +511,7 @@ pub fn resolve_java_type_name_with(
         return vec![unit];
     }
 
-    let imports = source.import_info_of(file);
+    let imports = source.import_info_of(token, file);
     for import in &imports {
         let Some(import_path) = non_static_import_path(import) else {
             continue;
@@ -578,6 +596,7 @@ pub fn resolve_java_type_name_with(
 /// an external surface is precisely where those types live.
 pub fn java_type_name_candidate_fqns(
     source: &dyn JavaSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     raw_name: &str,
 ) -> Vec<String> {
@@ -591,7 +610,7 @@ pub fn java_type_name_candidate_fqns(
         candidates.push(normalized.to_string());
     }
 
-    let imports = source.import_info_of(file);
+    let imports = source.import_info_of(token, file);
     for import in &imports {
         let Some(import_path) = non_static_import_path(import) else {
             continue;
@@ -673,6 +692,7 @@ fn unique_candidate(mut candidates: Vec<CodeUnit>) -> Option<CodeUnit> {
 /// external-aware route above it consults first.
 pub fn resolve_java_type_name(
     source: &dyn JavaSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     raw_name: &str,
 ) -> Option<CodeUnit> {
@@ -682,10 +702,10 @@ pub fn resolve_java_type_name(
     }
 
     if normalized.contains('.') {
-        if let Some(code_unit) = usage_source_type_by_fqn(source, normalized) {
+        if let Some(code_unit) = usage_source_type_by_fqn(source, token, normalized) {
             return Some(code_unit);
         }
-        if let Some(code_unit) = resolve_java_nested_type_name(source, file, normalized) {
+        if let Some(code_unit) = resolve_java_nested_type_name(source, token, file, normalized) {
             return Some(code_unit);
         }
     }
@@ -696,28 +716,30 @@ pub fn resolve_java_type_name(
     }
 
     let same_package_fqn = java_same_package_fqn(source, file, normalized);
-    if let Some(code_unit) = usage_source_type_by_fqn(source, &same_package_fqn) {
+    if let Some(code_unit) = usage_source_type_by_fqn(source, token, &same_package_fqn) {
         return Some(code_unit);
     }
 
     java_file_is_in_default_package(source, file)
-        .then(|| usage_source_type_by_fqn(source, normalized))
+        .then(|| usage_source_type_by_fqn(source, token, normalized))
         .flatten()
 }
 
 fn resolve_java_nested_type_name(
     source: &dyn JavaSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     normalized: &str,
 ) -> Option<CodeUnit> {
     let (first, rest) = normalized.split_once('.')?;
-    let owner = resolve_java_visible_simple_type(source, file, first)?;
+    let owner = resolve_java_visible_simple_type(source, token, file, first)?;
     let nested_fqn = format!("{}.{}", owner.fq_name(), rest);
-    usage_source_type_by_fqn(source, &nested_fqn)
+    usage_source_type_by_fqn(source, token, &nested_fqn)
 }
 
 pub fn resolve_java_visible_simple_type(
     source: &dyn JavaSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     name: &str,
 ) -> Option<CodeUnit> {
@@ -725,16 +747,20 @@ pub fn resolve_java_visible_simple_type(
         return Some(code_unit.clone());
     }
     let same_package_fqn = java_same_package_fqn(source, file, name);
-    usage_source_type_by_fqn(source, &same_package_fqn).or_else(|| {
+    usage_source_type_by_fqn(source, token, &same_package_fqn).or_else(|| {
         java_file_is_in_default_package(source, file)
-            .then(|| usage_source_type_by_fqn(source, name))
+            .then(|| usage_source_type_by_fqn(source, token, name))
             .flatten()
     })
 }
 
-fn usage_source_type_by_fqn(source: &dyn JavaSource, fqn: &str) -> Option<CodeUnit> {
+fn usage_source_type_by_fqn(
+    source: &dyn JavaSource,
+    token: QueryToken<'_>,
+    fqn: &str,
+) -> Option<CodeUnit> {
     source
-        .usage_definitions()
+        .usage_definitions(token)
         .fqn(fqn)
         .iter()
         .find(|code_unit| code_unit.is_class())
@@ -749,6 +775,7 @@ fn usage_source_type_by_fqn(source: &dyn JavaSource, fqn: &str) -> Option<CodeUn
 /// file's imports bind, resolved to workspace declarations.
 pub fn resolve_java_import_infos(
     source: &dyn JavaSource,
+    token: QueryToken<'_>,
     imports: &[ImportInfo],
 ) -> HashMap<String, CodeUnit> {
     let mut resolved = HashMap::default();
@@ -761,7 +788,7 @@ pub fn resolve_java_import_infos(
 
         if !import.is_wildcard {
             if let Some(code_unit) =
-                usage_source_type_by_fqn(source, &import_path.render_segments("."))
+                usage_source_type_by_fqn(source, token, &import_path.render_segments("."))
             {
                 resolved.insert(code_unit.identifier().to_string(), code_unit);
             }
@@ -769,7 +796,7 @@ pub fn resolve_java_import_infos(
         }
 
         let package_name = import_path.render_segments(".");
-        for code_unit in source.source_types_in_package(&package_name) {
+        for code_unit in source.source_types_in_package(token, &package_name) {
             let identifier = code_unit.identifier().to_string();
             if resolved.contains_key(&identifier) && !wildcard_resolved.contains_key(&identifier) {
                 continue;
@@ -789,13 +816,14 @@ pub fn resolve_java_import_infos(
 /// declaration's file-level imports its own source actually needs.
 pub fn compute_java_relevant_imports(
     source: &dyn JavaSource,
+    token: QueryToken<'_>,
     code_unit: &CodeUnit,
 ) -> HashSet<String> {
     let Some(unit_source) = source.get_source(code_unit, false) else {
         return HashSet::default();
     };
 
-    let all_imports = source.import_info_of(code_unit.source());
+    let all_imports = source.import_info_of(token, code_unit.source());
     if all_imports.is_empty() {
         return HashSet::default();
     }

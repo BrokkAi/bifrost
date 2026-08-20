@@ -52,6 +52,7 @@
 
 mod shared;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 pub(crate) use shared::scan_kotlin_files_for_jvm_type;
 
@@ -104,6 +105,7 @@ pub(crate) fn is_companion_object(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> 
 /// Every Kotlin `caller -> callee` edge whose callee is one of `nodes`.
 pub(crate) fn build_kotlin_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> Option<UsageEdges>
@@ -111,12 +113,13 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = KotlinEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edges(analyzer, nodes, keep_file))
+    Some(resolver.build_edges(analyzer, token, nodes, keep_file))
 }
 
 /// The same edge set as [`build_kotlin_usage_edges`], weighted by call site.
 pub(crate) fn build_kotlin_usage_edge_weights<F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> Option<UsageEdgeWeights>
@@ -124,7 +127,7 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = KotlinEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
+    Some(resolver.build_edge_weights(analyzer, token, nodes, keep_file))
 }
 
 #[derive(Default)]
@@ -195,6 +198,7 @@ impl UsageAnalyzer for KotlinUsageGraphStrategy {
 mod tests {
     use super::*;
     use crate::analyzer::CodeUnitIndex;
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{KotlinAnalyzer, Project, TestProject};
     use std::sync::Arc;
 
@@ -248,7 +252,9 @@ mod tests {
             lru_after_warm,
             "declaration cataloging must not hydrate through the LRU path"
         );
-        let edges = build_kotlin_usage_edges(&analyzer, &nodes, |_| true)
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        let edges = build_kotlin_usage_edges(&analyzer, token, &nodes, |_| true)
             .expect("kotlin usage graph should build");
         assert!(
             edges

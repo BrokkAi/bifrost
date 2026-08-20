@@ -288,6 +288,40 @@ static PREPARED_FAILURE_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(Non
 static PREPARATION_FAILURE_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 #[cfg(test)]
 static FORCED_PARSE_TIMEOUT_PATHS: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+#[cfg(test)]
+static PANICKING_ANALYSIS_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static BLOCK_UNTIL_BUILD_ABORT_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// The whole build's "stop, something already failed" signal.
+///
+/// One language's build worker panicking must stop the whole build, not merely
+/// be reported once every sibling has finished. `std::thread::scope` joins each
+/// spawned thread before it returns, so with no signal to stop, the time to
+/// surface a panic is the duration of the SLOWEST language rather than the time
+/// to the panic. On a large multi-language repository that is indistinguishable
+/// from a hang: microsoft/PowerToys panicked in the Cpp worker within seconds
+/// and then outlived a 1872-second timeout (issue #2359).
+///
+/// Every language delegate in one build shares this through
+/// [`AnalyzerStoreContext`], which is already cloned per language. A worker
+/// that observes an abort stops claiming new work and returns whatever it has;
+/// the delegate is discarded either way, because the recorded panic is
+/// re-raised as soon as the fan-out joins.
+#[derive(Debug, Default)]
+pub(crate) struct BuildAbort {
+    aborted: std::sync::atomic::AtomicBool,
+}
+
+impl BuildAbort {
+    pub(crate) fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::Acquire)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BulkFileStateSource {
@@ -303,6 +337,9 @@ pub(crate) struct AnalyzerStoreContext {
     pub(crate) live_paths: Arc<LivePathMap>,
     pub(crate) generations: Arc<HashMap<String, GenerationId>>,
     pub(crate) startup_cache_validation: StartupCacheValidation,
+    /// Shared by every language delegate the same build fans out to. See
+    /// [`BuildAbort`].
+    pub(crate) build_abort: Arc<BuildAbort>,
 }
 
 #[derive(Clone, Copy)]
@@ -352,6 +389,7 @@ fn store_context_from_store(project: &dyn Project, store: AnalyzerStore) -> Anal
         live_paths: Arc::new(LivePathMap::default()),
         generations: Arc::new(HashMap::default()),
         startup_cache_validation: StartupCacheValidation::FullIntegrity,
+        build_abort: Arc::new(BuildAbort::default()),
     }
 }
 
@@ -3152,87 +3190,119 @@ where
             .saturating_add(PREPARED_CHANNEL_CAPACITY)
             .saturating_add(limits.max_blobs);
 
+        // The producer's panic is captured rather than left to the scope's own
+        // join. `std::thread::scope` reports a panicked child by panicking with
+        // its own `&str` "a scoped thread panicked", which replaces the parse
+        // failure's real message and location: on microsoft/PowerToys that is
+        // all a caller saw of an FqName boundary assert (issue #2359). Catching
+        // it here and re-raising it from inside the scope's own closure sends
+        // the original payload up instead.
+        let producer_panic: Mutex<Option<Box<dyn std::any::Any + Send>>> = Mutex::new(None);
         std::thread::scope(|scope| {
             let producer_tx = prepared_tx.clone();
             let producer_in_flight = Arc::clone(&in_flight);
+            let producer_panic = &producer_panic;
             scope.spawn(move || {
-                pool.install(|| {
-                    targets.into_par_iter().for_each_init(
-                        || Self::build_parser(language.clone()),
-                        |parser, (file, oid, storage_key, generation)| {
-                            let current_started = started.fetch_add(1, Ordering::SeqCst) + 1;
-                            if current_started == total {
-                                producer_tx
-                                    .send(PreparedAnalysis::AllStarted)
-                                    .expect("persistence receiver should remain connected");
-                            }
-                            let result = match Self::analyze_file(parser, adapter, project, &file) {
-                                Some(state) => {
-                                    let state = Arc::new(state);
-                                    if Self::should_inject_preparation_failure_for_test(&file) {
-                                        PreparedAnalysis::PreparationFailed {
-                                            file,
-                                            state,
-                                            error: "injected preparation failure".to_string(),
-                                        }
-                                    } else {
-                                        match AnalyzerStore::prepare_parsed_blob(
-                                            oid,
-                                            &storage_key,
-                                            generation,
-                                            adapter,
-                                            Arc::clone(&state),
-                                        ) {
-                                            Ok(mut prepared) => {
-                                                Self::inject_prepared_failure_for_test(
-                                                    &file,
-                                                    &mut prepared,
-                                                );
-                                                PreparedAnalysis::Ready {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pool.install(|| {
+                        targets.into_par_iter().for_each_init(
+                            || Self::build_parser(language.clone()),
+                            |parser, (file, oid, storage_key, generation)| {
+                                let current_started = started.fetch_add(1, Ordering::SeqCst) + 1;
+                                if current_started == total {
+                                    producer_tx
+                                        .send(PreparedAnalysis::AllStarted)
+                                        .expect("persistence receiver should remain connected");
+                                }
+                                // Another language's worker has already panicked and
+                                // the whole build is being torn down, so parsing this
+                                // file can only delay the panic reaching its caller.
+                                // Leaving it unpersisted is the ordinary state of a
+                                // file nobody has indexed yet (#2359).
+                                if store_context.build_abort.is_aborted() {
+                                    return;
+                                }
+                                Self::block_until_build_abort_for_test(&file, store_context);
+                                Self::panic_during_analysis_for_test(&file);
+                                let result =
+                                    match Self::analyze_file(parser, adapter, project, &file) {
+                                        Some(state) => {
+                                            let state = Arc::new(state);
+                                            if Self::should_inject_preparation_failure_for_test(
+                                                &file,
+                                            ) {
+                                                PreparedAnalysis::PreparationFailed {
                                                     file,
-                                                    prepared: Box::new(prepared),
+                                                    state,
+                                                    error: "injected preparation failure"
+                                                        .to_string(),
+                                                }
+                                            } else {
+                                                match AnalyzerStore::prepare_parsed_blob(
+                                                    oid,
+                                                    &storage_key,
+                                                    generation,
+                                                    adapter,
+                                                    Arc::clone(&state),
+                                                ) {
+                                                    Ok(mut prepared) => {
+                                                        Self::inject_prepared_failure_for_test(
+                                                            &file,
+                                                            &mut prepared,
+                                                        );
+                                                        PreparedAnalysis::Ready {
+                                                            file,
+                                                            prepared: Box::new(prepared),
+                                                        }
+                                                    }
+                                                    Err(error) => {
+                                                        PreparedAnalysis::PreparationFailed {
+                                                            file,
+                                                            state,
+                                                            error: error.to_string(),
+                                                        }
+                                                    }
                                                 }
                                             }
-                                            Err(error) => PreparedAnalysis::PreparationFailed {
-                                                file,
-                                                state,
-                                                error: error.to_string(),
-                                            },
                                         }
-                                    }
+                                        None => PreparedAnalysis::Unparseable(file),
+                                    };
+                                if let Some(progress) = producer_progress.as_ref() {
+                                    let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                                    let file = match &result {
+                                        PreparedAnalysis::Ready { file, .. }
+                                        | PreparedAnalysis::PreparationFailed { file, .. }
+                                        | PreparedAnalysis::Unparseable(file) => file.clone(),
+                                        PreparedAnalysis::AllStarted => {
+                                            unreachable!("start marker is not a parse result")
+                                        }
+                                    };
+                                    progress(BuildProgressEvent::new(
+                                        adapter.language(),
+                                        BuildProgressPhase::Parse,
+                                        current,
+                                        total,
+                                        Some(file),
+                                    ));
                                 }
-                                None => PreparedAnalysis::Unparseable(file),
-                            };
-                            if let Some(progress) = producer_progress.as_ref() {
-                                let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                                let file = match &result {
-                                    PreparedAnalysis::Ready { file, .. }
-                                    | PreparedAnalysis::PreparationFailed { file, .. }
-                                    | PreparedAnalysis::Unparseable(file) => file.clone(),
-                                    PreparedAnalysis::AllStarted => {
-                                        unreachable!("start marker is not a parse result")
-                                    }
-                                };
-                                progress(BuildProgressEvent::new(
-                                    adapter.language(),
-                                    BuildProgressPhase::Parse,
-                                    current,
-                                    total,
-                                    Some(file),
-                                ));
-                            }
-                            if let PreparedAnalysis::Ready { prepared, .. } = &result {
-                                producer_in_flight
-                                    .lock()
-                                    .expect("prepared in-flight mutex poisoned")
-                                    .add(prepared.payload_bytes());
-                            }
-                            producer_tx
-                                .send(result)
-                                .expect("persistence receiver should remain connected");
-                        },
-                    );
-                });
+                                if let PreparedAnalysis::Ready { prepared, .. } = &result {
+                                    producer_in_flight
+                                        .lock()
+                                        .expect("prepared in-flight mutex poisoned")
+                                        .add(prepared.payload_bytes());
+                                }
+                                producer_tx
+                                    .send(result)
+                                    .expect("persistence receiver should remain connected");
+                            },
+                        );
+                    });
+                }));
+                if let Err(payload) = outcome {
+                    *producer_panic
+                        .lock()
+                        .expect("producer panic mutex poisoned") = Some(payload);
+                }
             });
             drop(prepared_tx);
 
@@ -3406,6 +3476,14 @@ where
                 }
             }
         });
+        // Raised from the parent thread, with the producer's own payload, so
+        // the parse failure's message and location reach the caller intact.
+        if let Some(payload) = producer_panic
+            .into_inner()
+            .expect("producer panic mutex poisoned")
+        {
+            std::panic::resume_unwind(payload);
+        }
         let in_flight = in_flight.lock().expect("prepared in-flight mutex poisoned");
         debug_assert_eq!(in_flight.current_items, 0);
         debug_assert_eq!(in_flight.current_payload_bytes, 0);
@@ -3446,6 +3524,47 @@ where
         }
         #[cfg(not(test))]
         let _ = (file, prepared);
+    }
+
+    /// Stands in for a language frontend that panics on one file, which is what
+    /// the `$safeprojectname$` FqName assert did on PowerToys (#2359).
+    fn panic_during_analysis_for_test(file: &ProjectFile) {
+        #[cfg(test)]
+        {
+            let panicking = PANICKING_ANALYSIS_PATH
+                .lock()
+                .expect("panicking analysis path mutex poisoned")
+                .clone();
+            if panicking.is_some_and(|path| path == file.abs_path()) {
+                panic!("injected analysis panic for {}", file.rel_path().display());
+            }
+        }
+        #[cfg(not(test))]
+        let _ = file;
+    }
+
+    /// Stands in for a sibling language whose build is still busy when another
+    /// language panics: it holds until the build abort reaches it.
+    ///
+    /// The safety timeout exists so that a regression fails the test instead of
+    /// wedging the whole test binary, which is the very failure mode this hook
+    /// is here to catch.
+    fn block_until_build_abort_for_test(file: &ProjectFile, store_context: &AnalyzerStoreContext) {
+        #[cfg(test)]
+        {
+            let blocking = BLOCK_UNTIL_BUILD_ABORT_PATH
+                .lock()
+                .expect("block until build abort path mutex poisoned")
+                .clone();
+            if blocking.is_some_and(|path| path == file.abs_path()) {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !store_context.build_abort.is_aborted() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        #[cfg(not(test))]
+        let _ = (file, store_context);
     }
 
     fn should_inject_preparation_failure_for_test(file: &ProjectFile) -> bool {
@@ -3614,6 +3733,11 @@ where
                 },
             )
         };
+        // Another language already panicked: every phase below is work whose
+        // only effect is to postpone that panic reaching the caller (#2359).
+        if store_context.build_abort.is_aborted() {
+            return state;
+        }
         // Include-driven inference runs after the extension-discovered files
         // are reconciled, because the imports it reads are exactly what that
         // pass persisted: the closure costs one bulk import-fact hydration per
@@ -8759,7 +8883,11 @@ where
     /// is not part of it: every adapter derives it from the path alone, and the
     /// store lives on a per-adapter analyzer, so `(oid, rel_path)` already
     /// determines it.
-    pub(crate) fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
+    pub(crate) fn import_info_of(
+        &self,
+        _token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Vec<ImportInfo> {
         let Some(oid) = self.resolve_live_oid_for_file(file) else {
             return Vec::new();
         };
@@ -8819,6 +8947,7 @@ where
 
     fn import_info_for_oid_limited(
         &self,
+        _token: QueryToken<'_>,
         file: &ProjectFile,
         oid: Oid,
         limit: usize,
@@ -8859,17 +8988,19 @@ where
 
     pub(crate) fn import_info_of_limited(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         limit: usize,
     ) -> LimitedQueryRows<ImportInfo> {
         let Some(oid) = self.resolve_live_oid_for_file(file) else {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         };
-        self.import_info_for_oid_limited(file, oid, limit)
+        self.import_info_for_oid_limited(token, file, oid, limit)
     }
 
     pub(crate) fn workspace_import_info_limited(
         &self,
+        token: QueryToken<'_>,
         limit: usize,
         mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<ImportInfo> {
@@ -8893,7 +9024,7 @@ where
             if !self.adapter_owns_file(&file, &snapshot) {
                 continue;
             }
-            let imports = self.import_info_for_oid_limited(&file, oid, limit - inspected);
+            let imports = self.import_info_for_oid_limited(token, &file, oid, limit - inspected);
             inspected = inspected.saturating_add(imports.inspected);
             rows.extend(imports.rows);
             if !imports.complete {
@@ -9590,26 +9721,54 @@ where
     /// Owned handle to the workspace definition index. A refcount bump, not a
     /// map clone; used by per-query views that must outlive a borrow of the
     /// analyzer (e.g. Scala's `ProjectTypes` behind `Arc` caches).
-    pub(crate) fn global_usage_definition_index_shared(&self) -> Arc<GlobalUsageDefinitionIndex> {
-        Arc::clone(self.global_usage_definition_index_handle())
+    pub(crate) fn global_usage_definition_index_shared(
+        &self,
+        token: QueryToken<'_>,
+    ) -> Arc<GlobalUsageDefinitionIndex> {
+        Arc::clone(self.global_usage_definition_index_handle(token))
+    }
+
+    /// The usage-graph tier crossing, spelled exactly as
+    /// [`IAnalyzer::global_usage_definition_index`] but requiring proof that a
+    /// request scope is open (issue #2423 milestone B).
+    ///
+    /// This inherent method deliberately shadows the trait method for every
+    /// caller inside `brokk-bifrost-analysis` that holds a concrete
+    /// `&TreeSitterAnalyzer`: method resolution prefers an inherent candidate,
+    /// so `analyzer.global_usage_definition_index()` on the concrete type stops
+    /// compiling and the caller must produce a token. Callers that hold a
+    /// `&dyn IAnalyzer` still reach the trait method, whose impl below opens
+    /// its own scope; see the Decision Log entry for why that boundary is where
+    /// it is.
+    pub(crate) fn global_usage_definition_index(
+        &self,
+        token: QueryToken<'_>,
+    ) -> DefinitionIndexHandle<'_> {
+        DefinitionIndexHandle::Single(self.global_usage_definition_index_handle(token).as_ref())
     }
 
     /// The same index [`Self::global_usage_definition_index`] wraps in a
     /// single-shard handle, borrowed rather than wrapped, so a language
     /// implementation can hand out a `&dyn BoundedDefinitionLookup` without
     /// allocating a handle per question.
-    pub(crate) fn global_usage_definition_index_ref(&self) -> &GlobalUsageDefinitionIndex {
-        self.global_usage_definition_index_handle().as_ref()
+    pub(crate) fn global_usage_definition_index_ref(
+        &self,
+        token: QueryToken<'_>,
+    ) -> &GlobalUsageDefinitionIndex {
+        self.global_usage_definition_index_handle(token).as_ref()
     }
 
     /// Owned handle to the derived callable-facts index; see
     /// [`Self::global_usage_definition_index_shared`].
-    pub(crate) fn usage_facts_index_shared(&self) -> Arc<UsageFactsIndex> {
-        Arc::clone(self.usage_facts_index_handle())
+    pub(crate) fn usage_facts_index_shared(&self, token: QueryToken<'_>) -> Arc<UsageFactsIndex> {
+        Arc::clone(self.usage_facts_index_handle(token))
     }
 
-    fn global_usage_definition_index_handle(&self) -> &Arc<GlobalUsageDefinitionIndex> {
-        match self.try_global_usage_definition_index_handle() {
+    fn global_usage_definition_index_handle(
+        &self,
+        token: QueryToken<'_>,
+    ) -> &Arc<GlobalUsageDefinitionIndex> {
+        match self.try_global_usage_definition_index_handle(token) {
             Ok(index) => index,
             Err(error) => {
                 self.record_store_error(
@@ -9622,6 +9781,7 @@ where
 
     fn try_global_usage_definition_index_handle(
         &self,
+        _token: QueryToken<'_>,
     ) -> std::result::Result<&Arc<GlobalUsageDefinitionIndex>, StoreError> {
         if let Some(index) = self.global_usage_definition_index.get() {
             return Ok(index);
@@ -9651,8 +9811,8 @@ where
             .expect("successful definition index build initializes OnceLock"))
     }
 
-    fn usage_facts_index_handle(&self) -> &Arc<UsageFactsIndex> {
-        match self.try_usage_facts_index_handle() {
+    fn usage_facts_index_handle(&self, token: QueryToken<'_>) -> &Arc<UsageFactsIndex> {
+        match self.try_usage_facts_index_handle(token) {
             Ok(index) => index,
             Err(error) => {
                 self.record_store_error(error.context("building the usage facts index"));
@@ -9663,6 +9823,7 @@ where
 
     fn try_usage_facts_index_handle(
         &self,
+        token: QueryToken<'_>,
     ) -> std::result::Result<&Arc<UsageFactsIndex>, StoreError> {
         if let Some(index) = self.usage_facts_index.get() {
             return Ok(index);
@@ -9674,7 +9835,7 @@ where
         if let Some(index) = self.usage_facts_index.get() {
             return Ok(index);
         }
-        let built = Arc::new(self.build_usage_facts_index()?);
+        let built = Arc::new(self.build_usage_facts_index(token)?);
         self.usage_facts_index
             .set(built)
             .expect("usage facts initialization is serialized");
@@ -9684,7 +9845,10 @@ where
             .expect("successful usage facts build initializes OnceLock"))
     }
 
-    fn build_usage_facts_index(&self) -> std::result::Result<UsageFactsIndex, StoreError> {
+    fn build_usage_facts_index(
+        &self,
+        token: QueryToken<'_>,
+    ) -> std::result::Result<UsageFactsIndex, StoreError> {
         self.full_declaration_scan_count
             .fetch_add(1, Ordering::Relaxed);
         let storage_languages = self.storage_language_keys_for_queries();
@@ -9734,7 +9898,8 @@ where
             }
         }
         let definitions = DefinitionIndexHandle::Single(
-            self.try_global_usage_definition_index_handle()?.as_ref(),
+            self.try_global_usage_definition_index_handle(token)?
+                .as_ref(),
         );
         Ok(UsageFactsIndex::build_from_declarations(
             &definitions,
@@ -10431,11 +10596,22 @@ where
     }
 
     fn global_usage_definition_index(&self) -> DefinitionIndexHandle<'_> {
-        DefinitionIndexHandle::Single(self.global_usage_definition_index_handle().as_ref())
+        // The trait signature is fixed, so this boundary owns its scope and
+        // mints the token the funnel now requires. Scopes nest and share
+        // memoization, so a caller that already holds one pays nothing.
+        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        DefinitionIndexHandle::Single(
+            self.global_usage_definition_index_handle(scope.token())
+                .as_ref(),
+        )
     }
 
     fn usage_facts_index(&self) -> &UsageFactsIndex {
-        self.usage_facts_index_handle().as_ref()
+        // Same fixed-signature boundary as `global_usage_definition_index`
+        // above: the facts build reads the usage-graph index, so it opens the
+        // scope that mints the proof (issue #2423 milestone B).
+        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        self.usage_facts_index_handle(scope.token()).as_ref()
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -10741,6 +10917,7 @@ mod tests {
     use crate::analyzer::{
         AnalyzerConfig, IAnalyzer, JavaAnalyzer, Language, OverlayProject, TestProject,
     };
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use git2::{ObjectType, Oid};
     use std::path::{Path, PathBuf};
     use std::sync::{Barrier, Condvar, RwLock};
@@ -11259,6 +11436,7 @@ mod tests {
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
             startup_cache_validation: StartupCacheValidation::FullIntegrity,
+            build_abort: Arc::new(BuildAbort::default()),
         };
 
         let error = match TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
@@ -11445,6 +11623,76 @@ mod tests {
         assert_eq!(final_persist.total, 3);
     }
 
+    /// Issue #2359. On microsoft/PowerToys a Cpp build worker panicked within
+    /// seconds and the process then outlived a 1872-second timeout, because
+    /// `std::thread::scope` joins every sibling before the panic can leave the
+    /// fan-out and nothing told those siblings to stop.
+    ///
+    /// The fixture makes that shape deterministic: one language panics on its
+    /// only file, the other blocks on its only file until the build abort
+    /// reaches it. Without the abort the sibling holds for its full 30-second
+    /// safety timeout, which is what this bound catches; with it the build
+    /// re-raises the original panic straight away.
+    #[test]
+    fn a_panicking_build_worker_aborts_the_whole_build_promptly() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let panicking = temp_file(&root, "src/panics.cpp");
+        panicking
+            .write("void init_settings() {}\n")
+            .expect("cpp source");
+        let blocking = temp_file(&root, "src/blocks.py");
+        blocking
+            .write("def work():\n    return 1\n")
+            .expect("py source");
+        *PANICKING_ANALYSIS_PATH
+            .lock()
+            .expect("panicking analysis path mutex poisoned") = Some(panicking.abs_path());
+        *BLOCK_UNTIL_BUILD_ABORT_PATH
+            .lock()
+            .expect("block until build abort path mutex poisoned") = Some(blocking.abs_path());
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::with_languages(
+            &root,
+            BTreeSet::from([Language::Cpp, Language::Python]),
+        ));
+        // Two workers, not two thread pools the width of the machine: the
+        // fixture needs one file in flight per language, and a CPU spike inside
+        // a 1900-test binary perturbs timing-sensitive neighbours.
+        let config = AnalyzerConfig {
+            parallelism: Some(1),
+            ..AnalyzerConfig::default()
+        };
+        let started = Instant::now();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::analyzer::WorkspaceAnalyzer::build_persisted(project, config)
+        }));
+        let elapsed = started.elapsed();
+
+        *PANICKING_ANALYSIS_PATH
+            .lock()
+            .expect("panicking analysis path mutex poisoned") = None;
+        *BLOCK_UNTIL_BUILD_ABORT_PATH
+            .lock()
+            .expect("block until build abort path mutex poisoned") = None;
+
+        let payload = outcome
+            .err()
+            .expect("a panicking worker must fail the build");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_else(|| "non-string panic payload".to_string());
+        assert!(
+            message.contains("injected analysis panic"),
+            "the original panic message must survive propagation: {message}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "the build must abort promptly rather than waiting for its siblings, took {elapsed:?}"
+        );
+    }
+
     #[test]
     fn reconcile_keeps_only_irreducible_prepared_failure_dirty() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -11625,6 +11873,7 @@ mod tests {
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
             startup_cache_validation: StartupCacheValidation::FullIntegrity,
+            build_abort: Arc::new(BuildAbort::default()),
         };
         let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             Arc::clone(&project),
@@ -11739,6 +11988,7 @@ mod tests {
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
             startup_cache_validation: StartupCacheValidation::FullIntegrity,
+            build_abort: Arc::new(BuildAbort::default()),
         };
         let reopened = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             project,
@@ -11831,6 +12081,7 @@ mod tests {
                 GenerationId::BOOTSTRAP,
             )])),
             startup_cache_validation: StartupCacheValidation::FullIntegrity,
+            build_abort: Arc::new(BuildAbort::default()),
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -12428,6 +12679,7 @@ mod tests {
                 GenerationId::BOOTSTRAP,
             )])),
             startup_cache_validation: StartupCacheValidation::FullIntegrity,
+            build_abort: Arc::new(BuildAbort::default()),
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -12507,6 +12759,7 @@ mod tests {
                 GenerationId::BOOTSTRAP,
             )])),
             startup_cache_validation: StartupCacheValidation::FullIntegrity,
+            build_abort: Arc::new(BuildAbort::default()),
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -12949,11 +13202,13 @@ mod tests {
             .unwrap();
         let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
         analyzer.begin_query(&context);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
 
         assert!(analyzer.global_usage_definition_index.get().is_none());
         assert!(analyzer.usage_facts_index.get().is_none());
-        let definitions = analyzer.global_usage_definition_index_shared();
-        let facts = analyzer.usage_facts_index_shared();
+        let definitions = analyzer.global_usage_definition_index_shared(token);
+        let facts = analyzer.usage_facts_index_shared(token);
 
         assert!(definitions.fqn("Model").is_empty());
         assert!(facts.facts("Model").is_empty());
@@ -13055,14 +13310,16 @@ mod tests {
         analyzer
             .test_hooks()
             .reset_global_usage_definition_index_build_count_for_test();
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
 
-        let first_definitions = analyzer.global_usage_definition_index_shared();
-        let first_facts = analyzer.usage_facts_index_shared();
-        let second_definitions = analyzer.global_usage_definition_index_shared();
-        let second_facts = analyzer.usage_facts_index_shared();
+        let first_definitions = analyzer.global_usage_definition_index_shared(token);
+        let first_facts = analyzer.usage_facts_index_shared(token);
+        let second_definitions = analyzer.global_usage_definition_index_shared(token);
+        let second_facts = analyzer.usage_facts_index_shared(token);
         let cloned = analyzer.clone();
-        let cloned_definitions = cloned.global_usage_definition_index_shared();
-        let cloned_facts = cloned.usage_facts_index_shared();
+        let cloned_definitions = cloned.global_usage_definition_index_shared(token);
+        let cloned_facts = cloned.usage_facts_index_shared(token);
 
         assert!(Arc::ptr_eq(&first_definitions, &second_definitions));
         assert!(Arc::ptr_eq(&first_facts, &second_facts));
@@ -13080,8 +13337,10 @@ mod tests {
         file.write("package demo; class Service { String after() { return \"after\"; } }\n")
             .expect("updated java source");
         let updated = analyzer.update(&BTreeSet::from([file]));
-        let updated_definitions = updated.global_usage_definition_index_shared();
-        let updated_facts = updated.usage_facts_index_shared();
+        let updated_scope = AnalyzerQueryScope::new(&updated);
+        let updated_definitions =
+            updated.global_usage_definition_index_shared(updated_scope.token());
+        let updated_facts = updated.usage_facts_index_shared(updated_scope.token());
 
         assert!(!Arc::ptr_eq(&first_definitions, &updated_definitions));
         assert!(!Arc::ptr_eq(&first_facts, &updated_facts));
@@ -13126,9 +13385,10 @@ mod tests {
                     let barrier = Arc::clone(&barrier);
                     scope.spawn(move || {
                         barrier.wait();
+                        let query = AnalyzerQueryScope::new(&clone);
                         (
-                            clone.global_usage_definition_index_shared(),
-                            clone.usage_facts_index_shared(),
+                            clone.global_usage_definition_index_shared(query.token()),
+                            clone.usage_facts_index_shared(query.token()),
                         )
                     })
                 })
@@ -13794,6 +14054,7 @@ mod tests {
                 GenerationId::BOOTSTRAP,
             )])),
             startup_cache_validation: StartupCacheValidation::FullIntegrity,
+            build_abort: Arc::new(BuildAbort::default()),
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -13813,7 +14074,9 @@ mod tests {
         // Seed the cross-request store with a value the dirty state contradicts.
         analyzer.import_info_store_retain(key, import_infos(&["import stale_module"]));
 
-        let imports = analyzer.import_info_of(&file);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        let imports = analyzer.import_info_of(token, &file);
         assert_eq!(
             vec!["dirty_module".to_string()],
             imports
@@ -14188,6 +14451,7 @@ mod tests {
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
             startup_cache_validation: StartupCacheValidation::FullIntegrity,
+            build_abort: Arc::new(BuildAbort::default()),
         };
         let config = AnalyzerConfig::default();
 

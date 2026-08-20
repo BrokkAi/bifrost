@@ -31,6 +31,7 @@ use brokk_bifrost_core::analyzer::model::{
     ImportInfo, SemanticAbsenceProof, SemanticDiagnostic, SemanticDiagnosticDomain,
     SemanticDiagnosticIncompleteReason, SemanticDiagnosticReport, StructuredImportPathKind,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::{
     ScopeStack, contains_node, node_range, node_text, same_node,
 };
@@ -110,6 +111,7 @@ fn unknown_boundary() -> PythonEnvironmentBoundary {
 /// Collect Python semantic diagnostics and the proof behind each one.
 pub fn collect_python_semantic_diagnostics(
     py: &dyn PythonSource,
+    token: QueryToken<'_>,
     support: &dyn BoundedDefinitionLookup,
     environment: &dyn PythonEnvironmentSurface,
     file: &ProjectFile,
@@ -159,7 +161,7 @@ pub fn collect_python_semantic_diagnostics(
     }
 
     let line_starts = compute_line_starts(source);
-    let imports = py.import_info_of(file);
+    let imports = py.import_info_of(token, file);
     let resolved_imports = resolve_imports_batched(py, file, &imports);
     let dynamic = dynamic_surface_reasons(&imports, &resolved_imports, source, tree.root_node());
     if !dynamic.is_empty() {

@@ -1,5 +1,5 @@
 use super::syntax::*;
-use super::values::field_declaration_anchors;
+use super::values::java_declaration_inventory;
 use super::*;
 
 pub(super) fn lower_procedure<'tree, 'targets>(
@@ -26,12 +26,14 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         exceptional_exit,
         function_scope,
     } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
+    let declaration_inventory = java_declaration_inventory(prepared);
     let mut context = LoweringContext {
         prepared,
         session,
         expression_values: HashMap::default(),
         constant_index_values: HashMap::default(),
-        field_declaration_anchors: field_declaration_anchors(prepared),
+        field_declaration_anchors: declaration_inventory.field_anchors,
+        type_name_roots: declaration_inventory.type_roots,
         local_types: HashMap::default(),
         non_null_values: HashSet::default(),
         catch_binders: HashMap::default(),

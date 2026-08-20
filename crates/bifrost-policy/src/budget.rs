@@ -115,6 +115,37 @@ const SCALED_SEMANTIC_RETAINED_BYTES_PER_SOURCE_BYTE: u64 = 25;
 // decision into an abstention on a workspace that is not the one measured.
 
 const MAX_FINDINGS: usize = 1_000;
+
+// The findings lane is a floor as well, for the same reason as the scan lanes
+// (#1771) and the semantic lanes (#1936), and it is the one output lane that is
+// deliberately request-wide rather than per-batch (#2208): it caps how much one
+// whole request may report, so on a corpus the early batches spend it and every
+// later batch degrades to `BatchFindingLimit` and retains no analysis at all.
+// Measured on OWASP BenchmarkJava at 007786f86 (#2471): the `xss` category
+// spends the fixed 1000-finding lane, 55 analyzed cases fell to `NotAnalyzed`
+// purely because of where they sat in the batch order, and the category's
+// TP/FP moved (26 -> 22 TP, 7 -> 10 FP) under changes that touched no `xss`
+// code at all.  A fixed lane therefore makes every measurement on a corpus a
+// queue-position lottery.
+//
+// Raising it is abstention-direction-only.  A larger output cap can only let a
+// batch retain findings it already produced; it can never remove a finding, so
+// it can only turn `NotAnalyzed` into a decided or inconclusive case, and it can
+// never turn a flagged case into an affirmative clear.
+//
+// This hard cap, 16x the default, is the new rejection threshold and the ceiling
+// `PolicyBudget::scaled_for_workspace` clamps to, exactly as #1771 did for the
+// scan lanes and #1936 for the semantic lanes.
+const MAX_FINDINGS_HARD_CAP: usize = 16 * MAX_FINDINGS;
+
+// A finding is reported at a location, so the audited workspace's file count is
+// the volume the output lane has to follow.  This is the scan-file lane's own
+// model -- `total_files * SCALED_SCAN_HEADROOM` (#1771) -- reused rather than a
+// second one invented: one request may report up to two findings per audited
+// file.  On OWASP BenchmarkJava's 2770 analyzed files that is 5540, which the
+// 16000 hard cap admits; a workspace above 8000 files clamps.
+const SCALED_FINDINGS_PER_FILE: usize = SCALED_SCAN_HEADROOM as usize;
+
 const MAX_DIAGNOSTICS: usize = 256;
 const MAX_RELATED_LOCATIONS_PER_FINDING: usize = 64;
 const MAX_EVIDENCE_REFS_PER_FINDING: usize = 256;
@@ -232,6 +263,10 @@ impl PolicyBudget {
     /// for the measurement and the headroom.  The traversal lane keeps the
     /// byte-lane ratio it has had since #1936: its measured peak sits below even
     /// its fixed default, so a measured density would only lower it.
+    ///
+    /// The findings lane follows the audited file count for the same reason
+    /// (#2471): it is one request's total output cap, so a fixed value makes a
+    /// corpus-scale run's late batches lose their findings to the batch order.
     pub fn scaled_for_workspace(mut self, total_source_bytes: u64, total_files: usize) -> Self {
         let scaled_fact_nodes =
             saturating_usize(total_source_bytes / SOURCE_BYTES_PER_SCALED_FACT_NODE);
@@ -310,6 +345,11 @@ impl PolicyBudget {
             .max_traversal_steps
             .max(scaled_traversal_steps)
             .min(MAX_SEMANTIC_TRAVERSAL_STEPS_HARD_CAP);
+
+        self.max_findings = self
+            .max_findings
+            .max(total_files.saturating_mul(SCALED_FINDINGS_PER_FILE))
+            .min(MAX_FINDINGS_HARD_CAP);
         self
     }
 
@@ -638,7 +678,14 @@ impl PolicyBudgetBuilder {
         SelectorResults,
         MAX_SELECTOR_RESULTS
     );
-    policy_budget_setter!(with_max_findings, max_findings, Findings, MAX_FINDINGS);
+    // The findings lane's hard cap is the workspace-scaling ceiling, not the
+    // fixed default floor (#2471), exactly as the scan and semantic lanes are.
+    policy_budget_setter!(
+        with_max_findings,
+        max_findings,
+        Findings,
+        MAX_FINDINGS_HARD_CAP
+    );
     policy_budget_setter!(
         with_max_diagnostics,
         max_diagnostics,
@@ -1078,10 +1125,29 @@ mod tests {
                 .with_max_selector_results(MAX_SELECTOR_RESULTS + 1)
                 .is_err()
         );
+        // The findings lane's rejection threshold moved from the default floor
+        // to the 16x hard cap (#2471).  A value between the two is now a legal
+        // host configuration -- before this change no configuration could raise
+        // the request-wide output cap at all, which is the defect the ticket
+        // records.
+        assert!(
+            PolicyBudget::builder()
+                .with_max_findings(MAX_FINDINGS_HARD_CAP + 1)
+                .is_err()
+        );
         assert!(
             PolicyBudget::builder()
                 .with_max_findings(MAX_FINDINGS + 1)
-                .is_err()
+                .is_ok()
+        );
+        assert_eq!(
+            PolicyBudget::builder()
+                .with_max_findings(MAX_FINDINGS_HARD_CAP)
+                .expect("a findings value at the hard cap is accepted")
+                .build()
+                .unwrap()
+                .max_findings(),
+            MAX_FINDINGS_HARD_CAP
         );
         assert!(
             PolicyBudget::builder()
@@ -1217,6 +1283,7 @@ mod tests {
         );
         assert_eq!(query.max_scanned_files, MAX_SCANNED_FILES_HARD_CAP);
         assert_eq!(query.max_pipeline_rows, MAX_PIPELINE_ROWS);
+        assert_eq!(scaled.max_findings(), MAX_FINDINGS_HARD_CAP);
         PolicyBudget::builder()
             .with_query_limits(query)
             .expect("clamped scan lanes stay within the builder hard caps");
@@ -1311,6 +1378,42 @@ mod tests {
         PolicyBudget::builder()
             .with_query_limits(scaled.query_limits())
             .expect("scaled semantic lanes stay within the builder hard caps");
+    }
+
+    /// The request-wide output lane must follow the audited workspace, or a
+    /// corpus-scale run loses its late batches to the batch order (#2471).
+    #[test]
+    fn the_findings_lane_scales_with_the_audited_workspace_volume() {
+        // OWASP BenchmarkJava at 007786f86: 2770 analyzed files, 11,633,213
+        // source bytes.  The fixed 1000-finding lane is spent by the `xss`
+        // category before its later batches solve, so 55 analyzed cases read as
+        // `NotAnalyzed`.  Two findings per audited file admits 5540 here.
+        let corpus = PolicyBudget::default().scaled_for_workspace(11_633_213, 2_770);
+        assert_eq!(corpus.max_findings(), 5_540);
+        assert!(corpus.max_findings() > MAX_FINDINGS);
+
+        // The default is a floor: a workspace smaller than it is unchanged.
+        let small = PolicyBudget::default().scaled_for_workspace(1024 * 1024, 50);
+        assert_eq!(small.max_findings(), MAX_FINDINGS);
+
+        // An explicitly widened host budget is never narrowed by scaling.
+        let host_widened = PolicyBudget::builder()
+            .with_max_findings(8 * MAX_FINDINGS)
+            .expect("a value between the default and the hard cap is accepted")
+            .build()
+            .unwrap();
+        assert_eq!(
+            host_widened
+                .scaled_for_workspace(1024 * 1024, 50)
+                .max_findings(),
+            8 * MAX_FINDINGS
+        );
+
+        // And the scaled value stays a legal builder input, so a host can round
+        // trip the budget the coordinator computed.
+        PolicyBudget::builder()
+            .with_max_findings(corpus.max_findings())
+            .expect("the scaled findings lane stays within the builder hard cap");
     }
 
     /// The measured densities may only raise a lane.  Lowering one can turn a

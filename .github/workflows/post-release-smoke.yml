@@ -47,7 +47,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          node scripts/release-version.mjs check --tag "$RELEASE_TAG" --github-output "$GITHUB_OUTPUT"
+          node scripts/public/release-version.mjs check --tag "$RELEASE_TAG" --github-output "$GITHUB_OUTPUT"
 
   github-assets:
     name: GitHub release assets and checksums
@@ -419,7 +419,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node scripts/smoke-agent-plugin-release.mjs \
+          node scripts/public/smoke-agent-plugin-release.mjs \
             --plugin-dir "$RUNNER_TEMP/published-agent/bifrost-agent" \
             --cache-dir "$RUNNER_TEMP/codex-launcher-cache"
 

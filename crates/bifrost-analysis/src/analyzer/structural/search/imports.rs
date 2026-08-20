@@ -1,4 +1,5 @@
 use super::*;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 pub(super) fn push_seed_provider_omission(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
@@ -20,6 +21,7 @@ pub(super) fn push_seed_provider_omission(
 
 pub(super) fn acquire_direct_import_layer(
     state: &mut QueryExecutionState<'_>,
+    token: QueryToken<'_>,
     request: DerivedLayerRequest,
     limits: CodeQueryExecutionLimits,
     layer_requested: bool,
@@ -110,6 +112,7 @@ pub(super) fn acquire_direct_import_layer(
             || {
                 let build = build_direct_import_topology(
                     state.analyzer,
+                    token,
                     cancellation,
                     DirectImportTopologyLimits {
                         max_files: remaining_import_files,

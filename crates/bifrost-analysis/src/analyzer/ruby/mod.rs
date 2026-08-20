@@ -15,6 +15,7 @@ mod source_artifact;
 pub(crate) mod structural;
 mod tests;
 
+use crate::analyzer::QueryScope;
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
@@ -465,7 +466,10 @@ impl IAnalyzer for RubyAnalyzer {
     }
 
     fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
+        // Trait signature is fixed, so this boundary opens the scope the
+        // usage-graph funnel now demands proof of (issue #2423 milestone B).
+        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        self.inner.global_usage_definition_index(scope.token())
     }
 
     fn structural_search_providers(

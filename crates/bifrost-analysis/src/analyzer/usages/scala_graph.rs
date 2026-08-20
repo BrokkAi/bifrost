@@ -1,6 +1,7 @@
 pub(crate) mod shared;
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 /// Scala's usage-graph language knowledge -- the node predicates, the lexical
 /// type-namespace walk, the local-binding seeds, the project type index, the
 /// per-file scans and the find-references target-shape analysis -- now lives in
@@ -32,6 +33,7 @@ pub(in crate::analyzer::usages) use syntax::{node_text as scala_node_text, scala
 
 pub(crate) fn build_scala_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> Option<UsageEdges>
@@ -39,24 +41,26 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = ScalaEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edges(analyzer, nodes, keep_file))
+    Some(resolver.build_edges(analyzer, token, nodes, keep_file))
 }
 
 pub(crate) fn build_full_scala_usage_edges(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     nodes: &HashSet<String>,
 ) -> Option<Arc<UsageEdges>> {
     let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
     let edges = scala.full_usage_edges(nodes, || {
         let resolver = ScalaEdgeResolver::try_new(analyzer)
             .expect("resolved Scala analyzer must construct a Scala edge resolver");
-        resolver.build_edges(analyzer, nodes, |_| true)
+        resolver.build_edges(analyzer, token, nodes, |_| true)
     });
     Some(edges)
 }
 
 pub(crate) fn build_scala_usage_edge_weights<F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> Option<UsageEdgeWeights>
@@ -64,7 +68,7 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = ScalaEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
+    Some(resolver.build_edge_weights(analyzer, token, nodes, keep_file))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +124,7 @@ fn normalized_import_paths_contain(paths: &HashSet<String>, target_fq_name: &str
 
 pub(crate) fn dead_code_bulk_eligibility(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     target: &CodeUnit,
     overloaded_fqns: &HashSet<String>,
     context: &ScalaDeadCodeBulkContext,
@@ -127,7 +132,7 @@ pub(crate) fn dead_code_bulk_eligibility(
     let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
         return ScalaDeadCodeBulkEligibility::NeedsPrecise;
     };
-    let Some(spec) = TargetSpec::from_target(scala, target) else {
+    let Some(spec) = TargetSpec::from_target(scala, token, target) else {
         return ScalaDeadCodeBulkEligibility::NeedsPrecise;
     };
 
@@ -215,6 +220,7 @@ impl UsageAnalyzer for ScalaUsageGraphStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{Project, TestProject};
     use std::sync::Arc;
 
@@ -284,7 +290,9 @@ object StableUse {
             .all_declarations()
             .map(|unit| unit.fq_name())
             .collect();
-        let edges = build_scala_usage_edges(&analyzer, &nodes, |_| true)
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        let edges = build_scala_usage_edges(&analyzer, token, &nodes, |_| true)
             .expect("Scala inverted edge build should succeed");
 
         let has_edge = |caller: &str, callee: &str| {
@@ -425,7 +433,9 @@ object Use {
             .all_declarations()
             .map(|unit| unit.fq_name())
             .collect();
-        let edges = build_scala_usage_edges(&analyzer, &nodes, |_| true)
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        let edges = build_scala_usage_edges(&analyzer, token, &nodes, |_| true)
             .expect("Scala inverted field-chain build should succeed");
         let has_edge = |caller: &str, callee: &str| {
             edges
@@ -536,7 +546,9 @@ object Use {
             lru_after_warm,
             "declaration cataloging must not hydrate through the LRU path"
         );
-        let _edges = build_scala_usage_edges(&analyzer, &nodes, |_| true)
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        let _edges = build_scala_usage_edges(&analyzer, token, &nodes, |_| true)
             .expect("scala usage graph should build");
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
@@ -592,8 +604,10 @@ object Use {
         let analyzer = ScalaAnalyzer::new(Arc::new(TestProject::new(root, Language::Scala)));
         let nodes = HashSet::from_iter(["app.Target".to_string()]);
 
-        let first = build_full_scala_usage_edges(&analyzer, &nodes).unwrap();
-        let second = build_full_scala_usage_edges(&analyzer, &nodes).unwrap();
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        let first = build_full_scala_usage_edges(&analyzer, token, &nodes).unwrap();
+        let second = build_full_scala_usage_edges(&analyzer, token, &nodes).unwrap();
 
         assert!(Arc::ptr_eq(&first, &second));
     }

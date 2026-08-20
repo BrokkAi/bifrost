@@ -37,7 +37,7 @@ jobs:
         run: cargo fetch --locked
 
       - name: Generate Rust notice report
-        run: scripts/generate-rust-third-party-notices.sh dist/THIRD_PARTY_LICENSES.html
+        run: scripts/public/generate-rust-third-party-notices.sh dist/THIRD_PARTY_LICENSES.html
 
       - name: Upload Rust notice report
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0

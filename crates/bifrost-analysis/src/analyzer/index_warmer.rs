@@ -4,7 +4,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use crate::analyzer::WorkspaceAnalyzer;
+use crate::analyzer::{WorkspaceAnalyzer, spawn_on_dedicated_build_pool};
 use crate::profiling;
 
 /// Coalescing background warmer for the lazily built per-generation query
@@ -32,6 +32,10 @@ struct IndexWarmerState {
     pending: Option<Arc<WorkspaceAnalyzer>>,
 }
 
+fn spawn_index_warm(task: impl FnOnce() + Send + 'static) {
+    spawn_on_dedicated_build_pool(task);
+}
+
 impl IndexWarmer {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -55,45 +59,39 @@ impl IndexWarmer {
         state.running = true;
         drop(state);
         let warmer = Arc::clone(self);
-        let spawned = std::thread::Builder::new()
-            .name("bifrost-index-warm".to_string())
-            .spawn(move || {
-                let mut next = Some(snapshot);
-                while let Some(current) = next.take() {
-                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let _scope = profiling::scope("mcp_cold.query_index_construction");
-                        current.warm_query_indexes();
-                    }));
-                    // Release the snapshot before publishing idle. On Windows,
-                    // the snapshot can own SQLite handles that prevent its
-                    // temporary workspace from being removed.
-                    drop(current);
-                    let mut state = warmer.state.lock().expect("index warmer lock poisoned");
-                    if let Err(panic) = outcome {
-                        // A panicking index build installs nothing, so the
-                        // same panic resurfaces in whichever request first
-                        // demands the index; reset the warmer instead of
-                        // wedging it, then let the panic reach the hook.
-                        state.pending = None;
-                        state.running = false;
-                        warmer.idle.notify_all();
-                        drop(state);
-                        std::panic::resume_unwind(panic);
-                    }
-                    next = state.pending.take();
-                    if next.is_none() {
-                        state.running = false;
-                        warmer.idle.notify_all();
-                    }
+        // Keep background warming off the global Rayon pool used by
+        // interactive request fan-out. Otherwise a small request can wait for
+        // an unrelated workspace-scale warm to release a worker (#2464).
+        spawn_index_warm(move || {
+            let mut next = Some(snapshot);
+            while let Some(current) = next.take() {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _scope = profiling::scope("mcp_cold.query_index_construction");
+                    current.warm_query_indexes();
+                }));
+                // Release the snapshot before publishing idle. On Windows,
+                // the snapshot can own SQLite handles that prevent its
+                // temporary workspace from being removed.
+                drop(current);
+                let mut state = warmer.state.lock().expect("index warmer lock poisoned");
+                if let Err(panic) = outcome {
+                    // A panicking index build installs nothing, so the same
+                    // panic resurfaces in whichever request first demands the
+                    // index; reset the warmer instead of wedging it, then let
+                    // the panic reach the hook.
+                    state.pending = None;
+                    state.running = false;
+                    warmer.idle.notify_all();
+                    drop(state);
+                    std::panic::resume_unwind(panic);
                 }
-            });
-        if spawned.is_err() {
-            // Thread spawn failure leaves the indexes to demand-build inside
-            // requests, exactly the pre-warm behavior.
-            let mut state = self.state.lock().expect("index warmer lock poisoned");
-            state.running = false;
-            self.idle.notify_all();
-        }
+                next = state.pending.take();
+                if next.is_none() {
+                    state.running = false;
+                    warmer.idle.notify_all();
+                }
+            }
+        });
     }
 
     /// Block until no warm is running or queued. Panics if the warmer does not
@@ -109,5 +107,41 @@ impl IndexWarmer {
             "background index warm did not complete"
         );
         assert!(!state.running);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spawn_index_warm;
+    use rayon::prelude::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn nested_warm_parallelism_stays_off_the_global_rayon_pool() {
+        let (sender, receiver) = mpsc::channel();
+        spawn_index_warm(move || {
+            let worker_names: Vec<_> = (0..rayon::current_num_threads().max(1))
+                .into_par_iter()
+                .map(|_| {
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("<unnamed>")
+                        .to_string()
+                })
+                .collect();
+            sender.send(worker_names).unwrap();
+        });
+
+        let worker_names = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("background warm should complete on the dedicated pool");
+        assert!(!worker_names.is_empty());
+        assert!(
+            worker_names
+                .iter()
+                .all(|name| name.starts_with("bifrost-index-build-")),
+            "nested warm parallelism escaped to non-build workers: {worker_names:?}"
+        );
     }
 }

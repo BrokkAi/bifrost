@@ -7,10 +7,13 @@ use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::{IAnalyzer, ProjectFile, PythonAnalyzer, resolve_analyzer};
 use crate::cancellation::CancellationToken;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use tree_sitter::Tree;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_python_type_bounded(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -32,9 +35,14 @@ pub(crate) fn resolve_python_type_bounded(
         ));
     };
     let support = PythonDefinitionProvider::new(python, &session);
-    let Some(resolution) =
-        python_type_lookup_resolution_bounded(&support, file, source, tree.root_node(), site)
-    else {
+    let Some(resolution) = python_type_lookup_resolution_bounded(
+        &support,
+        token,
+        file,
+        source,
+        tree.root_node(),
+        site,
+    ) else {
         return session.finish(no_type(
             "python_dynamic_receiver_unsupported",
             format!(

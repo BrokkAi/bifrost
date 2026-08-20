@@ -12,7 +12,32 @@
 
 use super::facts::{FileFacts, RoleTarget, Span};
 use super::kinds::{NormalizedKind, Role};
+use crate::analyzer::Range;
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_rql::{CodeQuerySeed, Pattern};
+use std::cell::Cell;
+
+/// Recorded callable-signature facts for one declaration range, looked up from
+/// persisted `SignatureMetadata` rather than from FileFacts.
+pub(crate) struct CallableSignatureFacts {
+    pub modifiers_recorded: bool,
+    pub visibility: Option<DeclaredVisibility>,
+    pub parameter_types: Option<Vec<String>>,
+}
+
+/// Workspace-backed lookup from a callable fact's exact range to its recorded
+/// signature metadata. Nested `:has` patterns use the same oracle as the root.
+pub(crate) trait CallableSignatureOracle {
+    fn lookup(&self, range: Range) -> Option<CallableSignatureFacts>;
+}
+
+/// Flags set when a callable-signature predicate cannot be answered because
+/// the adapter did not record modifiers or parameter types.
+#[derive(Debug, Default)]
+pub(crate) struct CallableSignatureIncomplete {
+    pub visibility_unrecorded: Cell<bool>,
+    pub parameter_types_unrecorded: Cell<bool>,
+}
 
 #[derive(Debug)]
 pub(crate) struct CaptureBinding {
@@ -36,18 +61,22 @@ pub(crate) struct FactMatch {
 /// Evaluate `query` against one file's facts, in source order, stopping after
 /// `max_matches` hits. Callers pass one more than they can return so global
 /// truncation stays detectable without collecting unbounded per-file results.
+#[cfg(test)]
 pub(crate) fn match_query(
     query: &CodeQuerySeed,
     facts: &FileFacts,
     max_matches: usize,
 ) -> Vec<FactMatch> {
     let mut examined = 0u64;
+    let incomplete = CallableSignatureIncomplete::default();
     match_query_candidates(
         query,
         facts,
         0..u32::try_from(facts.nodes().len()).expect("FileFacts node ids fit in u32"),
         max_matches,
         &mut examined,
+        None,
+        &incomplete,
     )
 }
 
@@ -63,6 +92,8 @@ pub(crate) fn match_query_candidates(
     candidates: impl IntoIterator<Item = u32>,
     max_matches: usize,
     examined_facts: &mut u64,
+    oracle: Option<&dyn CallableSignatureOracle>,
+    incomplete: &CallableSignatureIncomplete,
 ) -> Vec<FactMatch> {
     let mut matches = Vec::new();
     let mut previous = None;
@@ -74,16 +105,40 @@ pub(crate) fn match_query_candidates(
             break;
         }
         let mut captures = Vec::new();
-        if !eval_pattern(&query.root, facts, id, &mut captures, examined_facts) {
+        if !eval_pattern(
+            &query.root,
+            facts,
+            id,
+            &mut captures,
+            examined_facts,
+            oracle,
+            incomplete,
+        ) {
             continue;
         }
         if let Some(inside) = &query.inside
-            && !eval_containment(inside, facts, id, &mut captures, examined_facts)
+            && !eval_containment(
+                inside,
+                facts,
+                id,
+                &mut captures,
+                examined_facts,
+                oracle,
+                incomplete,
+            )
         {
             continue;
         }
         if let Some(inside_decl) = &query.inside_decl
-            && !eval_declaration_containment(inside_decl, facts, id, &mut captures, examined_facts)
+            && !eval_declaration_containment(
+                inside_decl,
+                facts,
+                id,
+                &mut captures,
+                examined_facts,
+                oracle,
+                incomplete,
+            )
         {
             continue;
         }
@@ -91,7 +146,15 @@ pub(crate) fn match_query_candidates(
             // Verifier-only negation: captures inside a failed positive probe
             // must not leak into the result.
             let mut discarded = Vec::new();
-            if eval_containment(not_inside, facts, id, &mut discarded, examined_facts) {
+            if eval_containment(
+                not_inside,
+                facts,
+                id,
+                &mut discarded,
+                examined_facts,
+                oracle,
+                incomplete,
+            ) {
                 continue;
             }
         }
@@ -108,10 +171,20 @@ fn eval_containment(
     node: u32,
     captures: &mut Vec<CaptureBinding>,
     examined_facts: &mut u64,
+    oracle: Option<&dyn CallableSignatureOracle>,
+    incomplete: &CallableSignatureIncomplete,
 ) -> bool {
     let mut current = facts.node(node).parent;
     while let Some(ancestor) = current {
-        if eval_pattern(pattern, facts, ancestor, captures, examined_facts) {
+        if eval_pattern(
+            pattern,
+            facts,
+            ancestor,
+            captures,
+            examined_facts,
+            oracle,
+            incomplete,
+        ) {
             return true;
         }
         current = facts.node(ancestor).parent;
@@ -128,10 +201,20 @@ fn eval_declaration_containment(
     node: u32,
     captures: &mut Vec<CaptureBinding>,
     examined_facts: &mut u64,
+    oracle: Option<&dyn CallableSignatureOracle>,
+    incomplete: &CallableSignatureIncomplete,
 ) -> bool {
     let mut current = facts.node(node).parent;
     while let Some(ancestor) = current {
-        if eval_pattern(pattern, facts, ancestor, captures, examined_facts) {
+        if eval_pattern(
+            pattern,
+            facts,
+            ancestor,
+            captures,
+            examined_facts,
+            oracle,
+            incomplete,
+        ) {
             return true;
         }
         if facts
@@ -155,9 +238,20 @@ fn eval_pattern(
     node: u32,
     captures: &mut Vec<CaptureBinding>,
     examined_facts: &mut u64,
+    oracle: Option<&dyn CallableSignatureOracle>,
+    incomplete: &CallableSignatureIncomplete,
 ) -> bool {
     let checkpoint = captures.len();
-    if eval_pattern_inner_with_name(pattern, facts, node, None, captures, examined_facts) {
+    if eval_pattern_inner_with_name(
+        pattern,
+        facts,
+        node,
+        None,
+        captures,
+        examined_facts,
+        oracle,
+        incomplete,
+    ) {
         true
     } else {
         captures.truncate(checkpoint);
@@ -165,6 +259,7 @@ fn eval_pattern(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn eval_pattern_inner_with_name(
     pattern: &Pattern,
     facts: &FileFacts,
@@ -172,6 +267,8 @@ fn eval_pattern_inner_with_name(
     name_override: Option<Span>,
     captures: &mut Vec<CaptureBinding>,
     examined_facts: &mut u64,
+    oracle: Option<&dyn CallableSignatureOracle>,
+    incomplete: &CallableSignatureIncomplete,
 ) -> bool {
     *examined_facts = examined_facts.saturating_add(1);
     let fact = facts.node(node);
@@ -213,6 +310,10 @@ fn eval_pattern_inner_with_name(
         }
     }
 
+    if !eval_callable_signature(pattern, facts, node, oracle, incomplete) {
+        return false;
+    }
+
     // Single-target roles: the first (typically only) edge of that role must
     // match the sub-pattern; a role constraint on a fact without that edge
     // fails.
@@ -221,7 +322,17 @@ fn eval_pattern_inner_with_name(
             let matched = roles
                 .iter()
                 .filter(|target| target.role == role)
-                .any(|target| eval_target(sub_pattern, facts, target, captures, examined_facts));
+                .any(|target| {
+                    eval_target(
+                        sub_pattern,
+                        facts,
+                        target,
+                        captures,
+                        examined_facts,
+                        oracle,
+                        incomplete,
+                    )
+                });
             if !matched {
                 return false;
             }
@@ -239,7 +350,15 @@ fn eval_pattern_inner_with_name(
         for arg_pattern in &pattern.args {
             let mut advanced = None;
             for (offset, target) in targets[cursor..].iter().enumerate() {
-                if eval_target(arg_pattern, facts, target, captures, examined_facts) {
+                if eval_target(
+                    arg_pattern,
+                    facts,
+                    target,
+                    captures,
+                    examined_facts,
+                    oracle,
+                    incomplete,
+                ) {
                     advanced = Some(cursor + offset + 1);
                     break;
                 }
@@ -260,7 +379,15 @@ fn eval_pattern_inner_with_name(
                 target
                     .keyword
                     .is_some_and(|span| span.text(facts.source()) == keyword)
-                    && eval_target(value_pattern, facts, target, captures, examined_facts)
+                    && eval_target(
+                        value_pattern,
+                        facts,
+                        target,
+                        captures,
+                        examined_facts,
+                        oracle,
+                        incomplete,
+                    )
             });
         if !matched {
             return false;
@@ -272,20 +399,46 @@ fn eval_pattern_inner_with_name(
         let matched = roles
             .iter()
             .filter(|target| target.role == Role::Decorator)
-            .any(|target| eval_target(decorator_pattern, facts, target, captures, examined_facts));
+            .any(|target| {
+                eval_target(
+                    decorator_pattern,
+                    facts,
+                    target,
+                    captures,
+                    examined_facts,
+                    oracle,
+                    incomplete,
+                )
+            });
         if !matched {
             return false;
         }
     }
 
     if let Some(has) = &pattern.has
-        && !some_descendant_matches(has, facts, node, captures, examined_facts)
+        && !some_descendant_matches(
+            has,
+            facts,
+            node,
+            captures,
+            examined_facts,
+            oracle,
+            incomplete,
+        )
     {
         return false;
     }
     if let Some(not_has) = &pattern.not_has {
         let mut discarded = Vec::new();
-        if some_descendant_matches(not_has, facts, node, &mut discarded, examined_facts) {
+        if some_descendant_matches(
+            not_has,
+            facts,
+            node,
+            &mut discarded,
+            examined_facts,
+            oracle,
+            incomplete,
+        ) {
             return false;
         }
     }
@@ -305,17 +458,96 @@ fn eval_pattern_inner_with_name(
     true
 }
 
+fn eval_callable_signature(
+    pattern: &Pattern,
+    facts: &FileFacts,
+    node: u32,
+    oracle: Option<&dyn CallableSignatureOracle>,
+    incomplete: &CallableSignatureIncomplete,
+) -> bool {
+    let constrains_visibility = !pattern.visibility.is_empty();
+    let constrains_parameter_type = pattern.parameter_type.is_some();
+    if !constrains_visibility && !constrains_parameter_type {
+        return true;
+    }
+    let fact = facts.node(node);
+    if !fact.kind.satisfies(NormalizedKind::Callable) {
+        return false;
+    }
+    let Some(oracle) = oracle else {
+        if constrains_visibility {
+            incomplete.visibility_unrecorded.set(true);
+        }
+        if constrains_parameter_type {
+            incomplete.parameter_types_unrecorded.set(true);
+        }
+        return false;
+    };
+    let span = fact.span();
+    let Some(recorded) = oracle.lookup(Range {
+        start_byte: span.start_byte,
+        end_byte: span.end_byte,
+        start_line: fact.range.start_line,
+        end_line: fact.range.end_line,
+    }) else {
+        // No indexed declaration sits exactly on this callable fact, so nothing
+        // recorded its signature. A lambda is the common case: it satisfies
+        // Callable but has no declaration row. That is an unanswered constraint,
+        // not a clean miss.
+        if constrains_visibility {
+            incomplete.visibility_unrecorded.set(true);
+        }
+        if constrains_parameter_type {
+            incomplete.parameter_types_unrecorded.set(true);
+        }
+        return false;
+    };
+    if constrains_visibility {
+        if !recorded.modifiers_recorded {
+            incomplete.visibility_unrecorded.set(true);
+            return false;
+        }
+        let Some(visibility) = recorded.visibility else {
+            incomplete.visibility_unrecorded.set(true);
+            return false;
+        };
+        if !pattern.visibility.contains(&visibility) {
+            return false;
+        }
+    }
+    if let Some(predicate) = &pattern.parameter_type {
+        let Some(types) = recorded.parameter_types.as_deref() else {
+            incomplete.parameter_types_unrecorded.set(true);
+            return false;
+        };
+        if !types.iter().any(|spelling| predicate.matches(spelling)) {
+            return false;
+        }
+    }
+    true
+}
+
 fn some_descendant_matches(
     pattern: &Pattern,
     facts: &FileFacts,
     node: u32,
     captures: &mut Vec<CaptureBinding>,
     examined_facts: &mut u64,
+    oracle: Option<&dyn CallableSignatureOracle>,
+    incomplete: &CallableSignatureIncomplete,
 ) -> bool {
     // Facts are stored in pre-order with subtree intervals, so this walks
     // only actual descendants and returns immediately for leaves.
     for candidate in (node + 1)..facts.subtree_end(node) {
-        if eval_pattern(pattern, facts, candidate, captures, examined_facts) {
+        if eval_pattern(
+            pattern,
+            facts,
+            candidate,
+            captures,
+            examined_facts,
+            oracle,
+            incomplete,
+        ) {
             return true;
         }
     }
@@ -333,6 +565,8 @@ fn eval_target(
     target: &RoleTarget,
     captures: &mut Vec<CaptureBinding>,
     examined_facts: &mut u64,
+    oracle: Option<&dyn CallableSignatureOracle>,
+    incomplete: &CallableSignatureIncomplete,
 ) -> bool {
     let checkpoint = captures.len();
     let matched = match target.node {
@@ -343,6 +577,8 @@ fn eval_target(
             target.name,
             captures,
             examined_facts,
+            oracle,
+            incomplete,
         ),
         None => eval_span_only(pattern, facts, target, captures, examined_facts),
     };
@@ -365,6 +601,8 @@ fn eval_span_only(
     // none of the normalized kinds).
     if !pattern.kinds.is_empty()
         || pattern.arity.is_some()
+        || !pattern.visibility.is_empty()
+        || pattern.parameter_type.is_some()
         || pattern.has.is_some()
         || pattern.not_has.is_some()
         || !pattern.args.is_empty()

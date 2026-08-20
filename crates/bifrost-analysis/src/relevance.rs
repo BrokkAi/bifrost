@@ -10,11 +10,14 @@ use crate::analyzer::usages::workspace_graph_cache::{
     WorkspaceUsageGraphCacheAcquisition, WorkspaceUsageGraphCacheBuildOutcome,
     WorkspaceUsageGraphCacheKey, WorkspaceUsageGraphKind,
 };
+#[cfg(test)]
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::compact_graph::CompactDirectedGraph;
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use git2::{Oid, Repository};
 use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
@@ -489,6 +492,7 @@ fn cascade_history_evidence(
 
 pub(crate) fn most_relevant_project_files_with_ranking_mode_and_cancellation(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     seeds: &[(ProjectFile, f64)],
     top_k: usize,
     half_life: Option<f64>,
@@ -543,11 +547,17 @@ pub(crate) fn most_relevant_project_files_with_ranking_mode_and_cancellation(
             unreachable!("handled above")
         }
     };
-    let usage_candidates =
-        match related_files_by_usage(analyzer, &seed_weights, top_k, graph_kind, cancellation) {
-            Cancellable::Complete(candidates) => candidates,
-            Cancellable::Cancelled => return MostRelevantProjectFilesOutcome::Cancelled,
-        };
+    let usage_candidates = match related_files_by_usage(
+        analyzer,
+        token,
+        &seed_weights,
+        top_k,
+        graph_kind,
+        cancellation,
+    ) {
+        Cancellable::Complete(candidates) => candidates,
+        Cancellable::Cancelled => return MostRelevantProjectFilesOutcome::Cancelled,
+    };
     for candidate in usage_candidates {
         if append_candidate(&mut results, &mut seen, &excluded, candidate.file, top_k) {
             return MostRelevantProjectFilesOutcome::Complete(results);
@@ -579,6 +589,7 @@ pub(crate) fn most_relevant_project_files_with_ranking_mode_and_cancellation(
 
 fn related_files_by_usage(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     seed_weights: &HashMap<ProjectFile, f64>,
     k: usize,
     graph_kind: WorkspaceUsageGraphKind,
@@ -591,6 +602,7 @@ fn related_files_by_usage(
 
     let ranking_graph = match build_usage_ranking_graph_with_kind_and_cancellation(
         analyzer,
+        token,
         seed_weights,
         graph_kind,
         cancellation,
@@ -630,8 +642,11 @@ fn build_usage_ranking_graph_with_cancellation(
     seed_weights: &HashMap<ProjectFile, f64>,
     cancellation: &CancellationToken,
 ) -> Cancellable<Arc<UsageRankingGraph>> {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     build_usage_ranking_graph_with_kind_and_cancellation(
         analyzer,
+        token,
         seed_weights,
         WorkspaceUsageGraphKind::Exact,
         cancellation,
@@ -640,6 +655,7 @@ fn build_usage_ranking_graph_with_cancellation(
 
 fn build_usage_ranking_graph_with_kind_and_cancellation(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     seed_weights: &HashMap<ProjectFile, f64>,
     graph_kind: WorkspaceUsageGraphKind,
     cancellation: &CancellationToken,
@@ -665,6 +681,7 @@ fn build_usage_ranking_graph_with_kind_and_cancellation(
     else {
         return build_usage_ranking_graph_uncached(
             analyzer,
+            token,
             seed_weights,
             &selected_ecosystems,
             graph_kind,
@@ -685,6 +702,7 @@ fn build_usage_ranking_graph_with_kind_and_cancellation(
             cancellation,
             || match build_usage_ranking_graph_uncached(
                 analyzer,
+                token,
                 seed_weights,
                 &selected_ecosystems,
                 graph_kind,
@@ -730,6 +748,7 @@ impl<T> Cancellable<T> {
 
 fn build_usage_ranking_graph_uncached(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     seed_weights: &HashMap<ProjectFile, f64>,
     selected_ecosystems: &BTreeSet<UsageEcosystem>,
     graph_kind: WorkspaceUsageGraphKind,
@@ -740,6 +759,7 @@ fn build_usage_ranking_graph_uncached(
             let _scope = profiling::scope("relevance::file_usage_graph_construction");
             build_workspace_file_usage_graph_with_cancellation(
                 analyzer,
+                token,
                 selected_ecosystems,
                 cancellation,
             )
@@ -2904,6 +2924,7 @@ mod tests {
         AnalyzerDelegate, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile, PythonAnalyzer,
         RustAnalyzer, TestProject,
     };
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::hash::HashMap;
     use git2::{Repository, Signature};
     use std::collections::BTreeMap;
@@ -3335,8 +3356,11 @@ mod tests {
         let analyzer = java_analyzer(root);
         let cancellation = crate::CancellationToken::cancel_after_checks_for_test(3);
 
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
         let outcome = super::most_relevant_project_files_with_ranking_mode_and_cancellation(
             &analyzer,
+            token,
             &[(seed, 1.0)],
             1,
             Some(DEFAULT_RECENCY_HALF_LIFE),

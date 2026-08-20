@@ -48,19 +48,23 @@ pub trait CppWorkspaceSource {
     /// matches to a caller that outlives the lookup, so they must borrow the
     /// analyzer. Both are why the impls read the index shard-by-shard: the
     /// per-call `DefinitionIndexHandle` dies with the call.
-    fn definitions_by_fqn(&self, fqn: &str) -> Vec<&CodeUnit>;
+    fn definitions_by_fqn(&self, token: QueryToken<'_>, fqn: &str) -> Vec<&CodeUnit>;
 }
 
 /// The workspace definition index, spelled so a call reads exactly as it did
 /// against `IAnalyzer::global_usage_definition_index`.
+///
+/// Carries the request scope's [`QueryToken`] alongside the source, so a
+/// lookup made through it is proof-carrying without every C++ call site
+/// re-threading the token (issue #2423 milestone B).
 #[derive(Clone, Copy)]
-pub struct CppWorkspaceDefinitions<'a>(&'a dyn CppWorkspaceSource);
+pub struct CppWorkspaceDefinitions<'a>(&'a dyn CppWorkspaceSource, QueryToken<'a>);
 
 impl<'a> CppWorkspaceDefinitions<'a> {
     // `self.0` is copied out rather than reborrowed through `&self`, so the
     // returned borrows carry the source's `'a` and can outlive this call.
     pub fn fqn(&self, fqn: &str) -> Vec<&'a CodeUnit> {
-        self.0.definitions_by_fqn(fqn)
+        self.0.definitions_by_fqn(self.1, fqn)
     }
 }
 
@@ -119,7 +123,7 @@ impl<'a> CppGraphSource<'a> {
     }
 
     pub fn global_usage_definition_index(&self) -> CppWorkspaceDefinitions<'a> {
-        CppWorkspaceDefinitions(self.workspace)
+        CppWorkspaceDefinitions(self.workspace, self.token)
     }
 
     pub fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {

@@ -1,7 +1,7 @@
 # Pinned JDK source slices used by the summary-foundry derivation tests
 
 These files are reduced verbatim slices of the standard-library sources that
-`scripts/build-pinned-jvm-semantic-packs.sh` already pins.
+`scripts/public/build-pinned-jvm-semantic-packs.sh` already pins.
 
     artifact: OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.8_9.tar.gz
     member:   jdk-21.0.8+9/Contents/Home/lib/src.zip

@@ -33,7 +33,8 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
     Namespace, OccurrenceClass, OccurrenceRole,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
-    BindingKind, BoundaryStatus, HoistingClass, PrecedenceTier, RejectionReason,
+    ALL_DECLARED_VISIBILITIES, BindingKind, BoundaryStatus, DeclaredVisibility, HoistingClass,
+    PrecedenceTier, RejectionReason,
 };
 use brokk_bifrost_core::analyzer::structural::rewrite_path::{
     RewriteDomainKind, RewriteOutcomeKind,
@@ -1711,6 +1712,8 @@ struct PatternFields<'a> {
     name: Option<&'a Value>,
     text: Option<&'a Value>,
     arity: Option<&'a Value>,
+    visibility: Option<&'a Value>,
+    parameter_type: Option<&'a Value>,
     capture: Option<&'a Value>,
     has: Option<&'a Value>,
     not_has: Option<&'a Value>,
@@ -1730,6 +1733,8 @@ fn collect_pattern_fields<'a>(
                 PatternField::Name => fields.name = Some(value),
                 PatternField::Text => fields.text = Some(value),
                 PatternField::Arity => fields.arity = Some(value),
+                PatternField::Visibility => fields.visibility = Some(value),
+                PatternField::ParameterType => fields.parameter_type = Some(value),
                 PatternField::Capture => fields.capture = Some(value),
                 PatternField::Has => fields.has = Some(value),
                 PatternField::NotHas => fields.not_has = Some(value),
@@ -1792,6 +1797,21 @@ fn decode_pattern(
         .map(|value| decode_arity_constraint(value, &child_path(path, "arity")))
         .transpose()?;
 
+    let visibility = match fields.visibility {
+        None => Vec::new(),
+        Some(value) => decode_visibility_list(value, &child_path(path, "visibility"))?,
+    };
+    let parameter_type = fields
+        .parameter_type
+        .map(|value| decode_string_predicate(value, &child_path(path, "parameter_type"), true))
+        .transpose()?;
+    reject_callable_signature_on_non_callable(
+        &kinds,
+        !visibility.is_empty(),
+        parameter_type.is_some(),
+        path,
+    )?;
+
     let capture = fields
         .capture
         .map(|value| {
@@ -1819,6 +1839,8 @@ fn decode_pattern(
         name,
         text,
         arity,
+        visibility,
+        parameter_type,
         capture,
         has,
         not_has,
@@ -1929,6 +1951,94 @@ fn decode_kind_label(label: &str, path: &str) -> Result<NormalizedKind, QueryErr
             ),
         )
     })
+}
+
+/// Decode `visibility`: one label or a non-empty array of labels.
+fn decode_visibility_list(
+    value: &Value,
+    path: &str,
+) -> Result<Vec<DeclaredVisibility>, QueryError> {
+    match value {
+        Value::String(label) => Ok(vec![decode_visibility_label(label, path)?]),
+        Value::Array(entries) => {
+            if entries.is_empty() {
+                return Err(QueryError::new(path, "visibility array must not be empty"));
+            }
+            if entries.len() > ALL_DECLARED_VISIBILITIES.len() {
+                return Err(QueryError::new(
+                    path,
+                    format!(
+                        "visibility array may contain at most {} entries",
+                        ALL_DECLARED_VISIBILITIES.len()
+                    ),
+                ));
+            }
+            let mut visibilities = Vec::with_capacity(entries.len());
+            for (index, entry) in entries.iter().enumerate() {
+                let entry_path = index_path(path, index);
+                let label = entry.as_str().ok_or_else(|| {
+                    QueryError::new(&entry_path, "expected a visibility label string")
+                })?;
+                visibilities.push(decode_visibility_label(label, &entry_path)?);
+            }
+            Ok(visibilities)
+        }
+        _ => Err(QueryError::new(
+            path,
+            "expected a visibility label string or an array of visibility labels",
+        )),
+    }
+}
+
+fn decode_visibility_label(label: &str, path: &str) -> Result<DeclaredVisibility, QueryError> {
+    let canonical = label.replace('-', "_");
+    DeclaredVisibility::from_label(&canonical).ok_or_else(|| {
+        QueryError::new(
+            path,
+            format!(
+                "unknown visibility '{label}'; expected one of: {}",
+                ALL_DECLARED_VISIBILITIES
+                    .iter()
+                    .map(|visibility| visibility.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+    })
+}
+
+fn reject_callable_signature_on_non_callable(
+    kinds: &[NormalizedKind],
+    constrains_visibility: bool,
+    constrains_parameter_type: bool,
+    path: &str,
+) -> Result<(), QueryError> {
+    if !constrains_visibility && !constrains_parameter_type {
+        return Ok(());
+    }
+    if kinds.is_empty() {
+        return Ok(());
+    }
+    let invalid: Vec<&str> = kinds
+        .iter()
+        .filter(|kind| !kind.satisfies(NormalizedKind::Callable))
+        .map(|kind| kind.label())
+        .collect();
+    if invalid.is_empty() {
+        return Ok(());
+    }
+    let field = if constrains_visibility {
+        "visibility"
+    } else {
+        "parameter_type"
+    };
+    Err(QueryError::new(
+        child_path(path, field),
+        format!(
+            "{field} is only valid on callable kinds (function, method, constructor, lambda, callable); not valid for {}",
+            invalid.join(", ")
+        ),
+    ))
 }
 
 fn decode_string_predicate(

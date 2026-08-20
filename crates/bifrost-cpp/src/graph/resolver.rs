@@ -25,7 +25,7 @@ use brokk_bifrost_core::analyzer::model::{
 use brokk_bifrost_core::analyzer::pool_memo::PoolSafeMemo;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_core::analyzer::tree_walk::node_for_exact_range;
+use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, node_for_exact_range};
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
@@ -5914,7 +5914,13 @@ impl<'a> VisibilityIndex<'a> {
             .into_iter()
             .find_map(|range| cpp_function_declarator_at(root, range.start_byte))?;
         Some(ExtractedComparable {
-            shapes: cpp_comparable_parameter_shapes(declarator, prepared.source()),
+            // One question about one declarator: indexing the file's tree would
+            // cost more than the walk it saves.
+            shapes: cpp_comparable_parameter_shapes(
+                declarator,
+                prepared.source(),
+                &ParentIndex::unindexed(),
+            ),
             suffix: cpp_callable_identity_suffix(declarator, prepared.source())?,
         })
     }
@@ -11344,7 +11350,13 @@ pub fn cpp_template_reference_arguments(
                         .filter(|argument| !argument.is_extra() && argument.kind() != "comment")
                         .map(|argument| CppTemplateExpression {
                             text: normalize_cpp_whitespace(node_text(argument, source)),
-                            term: cpp_template_term(argument, source, &[]),
+                            // One template term from a resolver query; see `ParentIndex::unindexed`.
+                            term: cpp_template_term(
+                                argument,
+                                source,
+                                &[],
+                                &ParentIndex::unindexed(),
+                            ),
                         })
                         .collect(),
                 );
@@ -11888,6 +11900,170 @@ pub fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {
         current = parent.parent();
     }
     false
+}
+
+/// Whether a declaration type is initialized with a pointer cast.
+///
+/// This structured shape has an independent qualified occurrence in addition
+/// to the cast descriptor below it. Other declarations must keep their normal
+/// full-range occurrence only.
+pub(crate) fn initialized_type_declaration_with_cast(node: Node<'_>) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate.kind() == "declaration" {
+            let Some(type_node) = candidate.child_by_field_name("type") else {
+                return false;
+            };
+            if !(type_node.start_byte() <= node.start_byte()
+                && node.end_byte() <= type_node.end_byte())
+            {
+                return false;
+            }
+            let mut cursor = candidate.walk();
+            return candidate.named_children(&mut cursor).any(|child| {
+                child.kind() == "init_declarator"
+                    && child
+                        .child_by_field_name("value")
+                        .is_some_and(|value| value.kind() == "cast_expression")
+            });
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QualifiedAliasReferenceKind {
+    Ordinary,
+    ConstructorWithExpressionArgument,
+    ExhaustiveTemplate,
+}
+
+/// Whether a qualified alias reference preserves the requested target.
+///
+/// The complete qualified spelling and its terminal identifier are both valid
+/// occurrences when the visible alias path is structurally proven to name the
+/// target. Template aliases use their bound arguments; ordinary aliases use
+/// their structured primary chain.
+pub(crate) fn qualified_alias_reference_preserves_target(
+    node: Node<'_>,
+    target: &CodeUnit,
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    source: &str,
+) -> Option<QualifiedAliasReferenceKind> {
+    if !matches!(
+        node.kind(),
+        "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+    ) {
+        return None;
+    }
+    let components = cpp_type_name_components(node, source)?;
+    let name = components.last()?;
+    analyzer.type_alias_provider().and_then(|provider| {
+        visibility
+            .visible_identifier_candidates(file, name)
+            .find_map(|candidate| {
+                let proof = provider.is_type_alias(candidate)
+                    && canonical_cpp_scope_components(candidate) == components
+                    && visibility.external_type_candidate_visible_in_context(
+                        analyzer, file, candidate, node,
+                    )
+                    && match cpp_template_reference_arguments(node, source) {
+                        Some(arguments) => visibility.template_alias_arguments_preserve_target(
+                            analyzer, file, candidate, &arguments, target,
+                        ),
+                        None => visibility.structured_alias_primary_preserves_target(
+                            analyzer, file, candidate, target,
+                        ),
+                    };
+                proof.then(|| {
+                    if cpp_template_reference_arguments(node, source).is_some()
+                        && visibility.is_exhaustive_same_fqn_type_declaration_family(
+                            analyzer, file, candidate,
+                        )
+                    {
+                        QualifiedAliasReferenceKind::ExhaustiveTemplate
+                    } else if qualified_alias_constructor_has_expression_argument(node)
+                        || qualified_alias_local_constructor_declaration(node)
+                    {
+                        QualifiedAliasReferenceKind::ConstructorWithExpressionArgument
+                    } else {
+                        QualifiedAliasReferenceKind::Ordinary
+                    }
+                })
+            })
+    })
+}
+
+pub(crate) fn qualified_alias_reference_requires_terminal(
+    reference: Option<QualifiedAliasReferenceKind>,
+) -> bool {
+    matches!(
+        reference,
+        Some(
+            QualifiedAliasReferenceKind::ConstructorWithExpressionArgument
+                | QualifiedAliasReferenceKind::ExhaustiveTemplate
+        )
+    )
+}
+
+fn qualified_alias_constructor_has_expression_argument(node: Node<'_>) -> bool {
+    let Some(declaration) = node.parent().filter(|parent| {
+        parent.kind() == "declaration" && parent.child_by_field_name("type") == Some(node)
+    }) else {
+        return false;
+    };
+    let mut cursor = declaration.walk();
+    declaration.named_children(&mut cursor).any(|child| {
+        child.kind() == "init_declarator"
+            && child
+                .child_by_field_name("value")
+                .filter(|value| value.kind() == "argument_list")
+                .is_some_and(|arguments| {
+                    let mut cursor = arguments.walk();
+                    arguments.named_children(&mut cursor).any(|argument| {
+                        let is_parameter = matches!(
+                            argument.kind(),
+                            "parameter_declaration" | "optional_parameter_declaration"
+                        );
+                        if is_parameter {
+                            argument
+                                .child_by_field_name("type")
+                                .is_some_and(|type_node| {
+                                    type_node.kind() == "type_identifier"
+                                        && argument.child_by_field_name("declarator").is_none()
+                                })
+                        } else {
+                            !argument.kind().ends_with("_literal")
+                                && !matches!(argument.kind(), "true" | "false" | "nullptr")
+                        }
+                    })
+                })
+    })
+}
+
+/// Tree-sitter represents a local C++ direct construction such as
+/// `Alias value(argument)` as a function declarator. Restrict that recovery to
+/// declarations inside a compound statement so namespace-scope function
+/// declarations with the same qualified return type stay full-range only.
+fn qualified_alias_local_constructor_declaration(node: Node<'_>) -> bool {
+    let Some(declaration) = node.parent().filter(|parent| {
+        parent.kind() == "declaration" && parent.child_by_field_name("type") == Some(node)
+    }) else {
+        return false;
+    };
+    if declaration
+        .parent()
+        .is_none_or(|parent| parent.kind() != "compound_statement")
+    {
+        return false;
+    }
+    let mut cursor = declaration.walk();
+    declaration
+        .named_children(&mut cursor)
+        .any(|child| child.kind() == "function_declarator")
 }
 
 /// Return the terminal identifier represented by a callable or type callee.
@@ -13121,7 +13297,10 @@ fn cpp_global_field_declaration_linkage_in_tree(
     analyzer.ranges(candidate).iter().find_map(|range| {
         node_for_exact_range(root, range)
             .and_then(enclosing_cpp_field_declaration)
-            .map(|declaration| cpp_field_declaration_linkage(declaration, source))
+            .map(|declaration| {
+                // One question about one declaration; see `ParentIndex::unindexed`.
+                cpp_field_declaration_linkage(declaration, source, &ParentIndex::unindexed())
+            })
     })
 }
 

@@ -127,6 +127,11 @@ pub struct AssertionPolicySpec {
 #[derive(Debug, Clone)]
 pub struct RelationalAssertionPlan {
     pub bindings: Vec<RowBinding>,
+    /// Source-ordered `(filter ...)` and `(project ...)` records, each of which
+    /// refines one already named relation. Empty for every plan authored
+    /// before the derivation records existed, which is what keeps those plans'
+    /// canonical projection byte-identical.
+    pub derivations: Vec<RowDerivation>,
     pub joins: Vec<RowJoin>,
     pub groups: Vec<RowGroup>,
     pub assertions: Vec<RowAssertion>,
@@ -177,6 +182,53 @@ impl RowExpansionStep {
     }
 }
 
+/// One record that refines an already named relation.
+///
+/// A derivation takes the refined relation's place in the plan: the name it
+/// publishes is what later joins and groups read, and the name it consumed is
+/// no longer addressable. That is what lets a filtered or projected relation
+/// stand exactly where the relation it refines stood.
+#[derive(Debug, Clone)]
+pub enum RowDerivation {
+    Filter(RowFilter),
+    Project(RowProjection),
+}
+
+impl RowDerivation {
+    /// The record spelling, which is also the tag its canonical projection
+    /// carries.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Filter(_) => "filter",
+            Self::Project(_) => "project",
+        }
+    }
+}
+
+/// Narrow one named relation to the rows satisfying every listed predicate.
+#[derive(Debug, Clone)]
+pub struct RowFilter {
+    pub over: RowBindingName,
+    pub predicates: Vec<RowPredicate>,
+}
+
+/// Publish a new named relation holding chosen, optionally renamed, columns of
+/// an existing one.
+#[derive(Debug, Clone)]
+pub struct RowProjection {
+    pub name: RowBindingName,
+    pub from: RowBindingName,
+    pub columns: Vec<RowProjectionColumn>,
+}
+
+/// One projected column: the field it reads, and the field name it publishes
+/// under the projection's own relation name.
+#[derive(Debug, Clone)]
+pub struct RowProjectionColumn {
+    pub source: RowFieldRef,
+    pub name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct RowJoin {
     pub left: RowBindingName,
@@ -188,6 +240,9 @@ pub struct RowJoin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RowJoinKind {
     Inner,
+    /// Keep the left rows that have at least one partner, without carrying the
+    /// right side's columns. A semi join filters instead of multiplying rows.
+    Semi,
     Anti,
 }
 
@@ -195,6 +250,7 @@ impl RowJoinKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Inner => "inner",
+            Self::Semi => "semi",
             Self::Anti => "anti",
         }
     }
@@ -246,8 +302,17 @@ pub struct RowOrderedSequence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RowAggregateOp {
     Min,
+    /// The greatest integer value in the group.
+    Max,
     Count,
     CountDistinct,
+    /// One when some row of the group holds a true boolean value, zero
+    /// otherwise. Folding to an integer is what lets one cardinality
+    /// assertion state every fold.
+    Any,
+    /// One when every row of the group holds a true boolean value, zero
+    /// otherwise. An empty fold is one, because nothing contradicts it.
+    All,
     /// Position-aware list parity: one when the group's two ordered sequences
     /// hold the same value at the same position and have the same length,
     /// zero otherwise. A set-equality check cannot express this, because two
@@ -260,8 +325,11 @@ impl RowAggregateOp {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Min => "min",
+            Self::Max => "max",
             Self::Count => "count",
             Self::CountDistinct => "count-distinct",
+            Self::Any => "any",
+            Self::All => "all",
             Self::OrderedEqual => "ordered-equal",
         }
     }
@@ -273,16 +341,84 @@ pub struct RowFieldRef {
     pub field: String,
 }
 
+/// One row test: a left field, an operator, and whatever right-hand side the
+/// operator takes.
 #[derive(Debug, Clone)]
 pub struct RowPredicate {
     pub field: RowFieldRef,
     pub op: RowPredicateOp,
-    pub value: RowLiteral,
+    pub operand: RowPredicateOperand,
 }
 
+/// The right-hand side of a row test.
+///
+/// Which variant an operator takes is fixed: the comparisons take a literal or
+/// a second field, `in` takes a bounded literal set, and the two null tests
+/// take nothing at all.
+#[derive(Debug, Clone)]
+pub enum RowPredicateOperand {
+    Literal(RowLiteral),
+    /// A second field of the same tuple, which is what makes a row's own two
+    /// values comparable without a literal.
+    Field(RowFieldRef),
+    /// The bounded literal set of an `in` test.
+    Set(Vec<RowLiteral>),
+    /// The two null tests state everything in their operator.
+    None,
+}
+
+/// The number of literals one `in` test may enumerate.
+pub const MAX_ROW_PREDICATE_SET_MEMBERS: usize = 64;
+
+/// Row test operators.
+///
+/// Every comparison against an absent value is false, including `Ne`: a policy
+/// that means "absent" says so with `IsNull`, which the validator admits only
+/// over fields the row registry marks nullable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RowPredicateOp {
     Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    IsNull,
+    IsNotNull,
+    In,
+}
+
+impl RowPredicateOp {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Eq => "eq",
+            Self::Ne => "ne",
+            Self::Lt => "lt",
+            Self::Le => "le",
+            Self::Gt => "gt",
+            Self::Ge => "ge",
+            Self::IsNull => "is-null",
+            Self::IsNotNull => "is-not-null",
+            Self::In => "in",
+        }
+    }
+
+    /// Every spelling, in the order the documentation lists them.
+    pub const ALL: &'static [Self] = &[
+        Self::Eq,
+        Self::Ne,
+        Self::Lt,
+        Self::Le,
+        Self::Gt,
+        Self::Ge,
+        Self::IsNull,
+        Self::IsNotNull,
+        Self::In,
+    ];
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|op| op.label() == label)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

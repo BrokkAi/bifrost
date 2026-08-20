@@ -56,11 +56,32 @@ A pattern combines all supplied constraints with logical AND.
 | `not_kind` | string or string array | Exclude matching kinds and their subtypes. It never helps candidate pruning. |
 | `name` | string or `{ "regex": string }` | Match a normalized name exactly or by Rust regular expression. |
 | `text` | `{ "regex": string }` | Match parser-backed source text by Rust regular expression. There is no exact string shorthand. |
+| `visibility` | string or string array | Match a callable whose adapter recorded one of these modifier visibilities: `public`, `protected`, `internal`, `package_private`, `private`, `crate_or_module`, `unknown`. `unknown` means the adapter looked and could not classify; it is never equal to `public`. Valid only on callable kinds. An unrecorded modifier is incomplete, not a miss. |
+| `parameter_type` | string or `{ "regex": string }` | Match a callable that has a parameter whose recorded type spelling satisfies this predicate. The spelling is a discriminator, not a resolved type identity. Valid only on callable kinds. Unrecorded parameter types are incomplete, not a miss. |
 | `capture` | string | Return this node or role target under the supplied capture label. |
 | `has` | pattern | Require some structural descendant to match. |
 | `not_has` | pattern | Reject the node if any structural descendant matches. It never helps candidate pruning. |
 
 Nested role targets may be capture-only or otherwise unconstrained. The root `match` may not.
+
+<!-- code-query-test:json:callable-visibility -->
+```json
+{
+  "languages": ["java"],
+  "match": {
+    "kind": "method",
+    "visibility": "public",
+    "parameter_type": { "regex": "String" }
+  }
+}
+```
+
+`visibility` and `parameter_type` read persisted callable signature metadata, not source text. A language that does not record modifiers or parameter types returns incomplete rather than an empty complete miss.
+
+<!-- code-query-test:rql:callable-visibility -->
+```lisp
+(language java (method :visibility public :parameter-type/regex "String"))
+```
 
 ### Exact And Regex Predicates
 

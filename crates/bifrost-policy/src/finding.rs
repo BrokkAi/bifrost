@@ -365,6 +365,32 @@ pub enum PolicyIncompleteReason {
     OrganizationalRiskOverlayBudget,
 }
 
+impl PolicyIncompleteReason {
+    /// The stable snake_case tag, byte-identical to the serde serialization.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::QueryResultLimit => "query_result_limit",
+            Self::BatchFindingLimit => "batch_finding_limit",
+            Self::ScannedFileBudget => "scanned_file_budget",
+            Self::SourceByteBudget => "source_byte_budget",
+            Self::FactNodeBudget => "fact_node_budget",
+            Self::PipelineRowBudget => "pipeline_row_budget",
+            Self::ImportGraphBudget => "import_graph_budget",
+            Self::ReferenceCandidateBudget => "reference_candidate_budget",
+            Self::PartialDiscovery => "partial_discovery",
+            Self::CapabilityIncomplete => "capability_incomplete",
+            Self::EndpointDominanceUndecidable => "endpoint_dominance_undecidable",
+            Self::StableAnchorUnavailable => "stable_anchor_unavailable",
+            Self::ReportRetentionBudget => "report_retention_budget",
+            Self::CvssVariantBudget => "cvss_variant_budget",
+            Self::ProjectionScenarioMembershipBudget => "projection_scenario_membership_budget",
+            Self::OrganizationalRiskOverlayBudget => "organizational_risk_overlay_budget",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingIncompleteReason {
@@ -4677,5 +4703,37 @@ mod tests {
         assert_eq!(retained[0].family(), "evaluation_failure");
         assert_eq!(retained[0].message(), "evaluation_failure");
         assert_eq!(retained[0].family_count(), 2);
+    }
+
+    /// `label()` documents itself as byte-identical to the serde tag, and the
+    /// explanation node identity hashes it under that claim.
+    #[test]
+    fn incomplete_reason_labels_agree_with_their_serde_tags() {
+        use PolicyIncompleteReason as R;
+        let reasons = [
+            R::Cancelled,
+            R::DeadlineExceeded,
+            R::QueryResultLimit,
+            R::BatchFindingLimit,
+            R::ScannedFileBudget,
+            R::SourceByteBudget,
+            R::FactNodeBudget,
+            R::PipelineRowBudget,
+            R::ImportGraphBudget,
+            R::ReferenceCandidateBudget,
+            R::PartialDiscovery,
+            R::CapabilityIncomplete,
+            R::EndpointDominanceUndecidable,
+            R::StableAnchorUnavailable,
+            R::ReportRetentionBudget,
+            R::CvssVariantBudget,
+            R::ProjectionScenarioMembershipBudget,
+            R::OrganizationalRiskOverlayBudget,
+        ];
+        assert_eq!(
+            serde_json::to_value(reasons).expect("reasons are string tags"),
+            serde_json::Value::from_iter(reasons.iter().map(|reason| reason.label())),
+            "a label diverged from its serde tag"
+        );
     }
 }

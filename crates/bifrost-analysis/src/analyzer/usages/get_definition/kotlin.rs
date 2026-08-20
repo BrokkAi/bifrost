@@ -55,6 +55,7 @@ use crate::analyzer::usages::applicability::{
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{BoundedDefinitionLookup, ForwardQueryProvider, SignatureMetadata};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_jvm::kotlin::declarations::kotlin_package_name;
 use brokk_bifrost_jvm::kotlin::syntax::{
     kotlin_call_arity, kotlin_call_with_callee, kotlin_callee, kotlin_declaration_node,
@@ -224,6 +225,8 @@ fn resolve_kotlin_in_session(
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
 ) -> DefinitionLookupOutcome {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let Some(tree) = tree else {
         return no_definition("kotlin_parse_failed", "Kotlin source could not be parsed");
     };
@@ -239,7 +242,7 @@ fn resolve_kotlin_in_session(
         );
     };
 
-    let ctx = KotlinCtx::new(analyzer, support, session, file, source, root, site);
+    let ctx = KotlinCtx::new(analyzer, token, support, session, file, source, root, site);
 
     if let Some(header) = kotlin_enclosing_import_header(node) {
         return kotlin_import_reference_outcome(&ctx, header, node);
@@ -255,7 +258,7 @@ fn resolve_kotlin_in_session(
     }
 
     match node.kind() {
-        "type_identifier" => kotlin_type_reference_outcome(&ctx, node),
+        "type_identifier" => kotlin_type_reference_outcome(&ctx, token, node),
         "simple_identifier" => kotlin_identifier_reference_outcome(&ctx, node),
         kind => no_definition(
             "unsupported_kotlin_reference_shape",
@@ -276,29 +279,31 @@ fn kotlin_identifier_reference_outcome(
     ctx: &KotlinCtx<'_>,
     node: Node<'_>,
 ) -> DefinitionLookupOutcome {
+    let scope = AnalyzerQueryScope::new(ctx.analyzer);
+    let token = scope.token();
     let name = ctx.text(node);
     if name.is_empty() {
         return no_definition("no_reference_text", "Kotlin reference is blank");
     }
     let Some(parent) = node.parent() else {
-        return kotlin_bare_value_outcome(ctx, node, name);
+        return kotlin_bare_value_outcome(ctx, token, node, name);
     };
 
     if parent.kind() == "value_argument" && kotlin_named_argument_label(parent, node) {
-        return kotlin_named_argument_outcome(ctx, parent, name);
+        return kotlin_named_argument_outcome(ctx, token, parent, name);
     }
     if let Some(call) = kotlin_call_with_callee(node) {
-        return kotlin_bare_call_outcome(ctx, node, name, Some(kotlin_call_arity(call)));
+        return kotlin_bare_call_outcome(ctx, token, node, name, Some(kotlin_call_arity(call)));
     }
     if parent.kind() == "callable_reference" {
         // `::topLevel` names a callable without applying it, so no arity is
         // proven and every overload of the name is a legitimate answer.
-        return kotlin_bare_call_outcome(ctx, node, name, None);
+        return kotlin_bare_call_outcome(ctx, token, node, name, None);
     }
     if parent.kind() == "navigation_suffix" {
-        return kotlin_member_outcome(ctx, parent, name);
+        return kotlin_member_outcome(ctx, token, parent, name);
     }
-    kotlin_bare_value_outcome(ctx, node, name)
+    kotlin_bare_value_outcome(ctx, token, node, name)
 }
 
 /// Everything a Kotlin resolver step needs about the request it is serving.
@@ -364,8 +369,10 @@ struct KotlinFileSyntax {
 }
 
 impl<'a> KotlinCtx<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         analyzer: &'a dyn IAnalyzer,
+        token: QueryToken<'_>,
         support: &'a dyn BoundedDefinitionLookup,
         session: &'a ResolutionSession,
         file: &'a ProjectFile,
@@ -382,7 +389,7 @@ impl<'a> KotlinCtx<'a> {
             imports: session.query_rows(|| {
                 analyzer
                     .import_analysis_provider()
-                    .map(|provider| provider.import_info_of(file))
+                    .map(|provider| provider.import_info_of(token, file))
                     .unwrap_or_default()
             }),
         });
@@ -441,11 +448,11 @@ impl<'a> KotlinCtx<'a> {
             .query_limited_rows(|limit| kotlin.raw_supertypes_limited(unit, limit))
     }
 
-    fn imports_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
+    fn imports_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
         self.session.query_rows(|| {
             self.analyzer
                 .import_analysis_provider()
-                .map(|provider| provider.import_info_of(file))
+                .map(|provider| provider.import_info_of(token, file))
                 .unwrap_or_default()
         })
     }
@@ -479,10 +486,10 @@ impl<'a> KotlinCtx<'a> {
     /// [`Self::declared_type_of`] a genuine saving rather than a reordering: the
     /// spelled type still has to be resolved in the file that wrote it, and this
     /// is how that file's scope is obtained without opening it.
-    fn declaration_scope(&self, unit: &CodeUnit) -> Option<KotlinScope> {
+    fn declaration_scope(&self, token: QueryToken<'_>, unit: &CodeUnit) -> Option<KotlinScope> {
         let byte = self.ranges(unit).into_iter().min()?.start_byte;
         Some(KotlinScope {
-            facts: self.indexed_file_facts(unit),
+            facts: self.indexed_file_facts(token, unit),
             owners: self.scope_owners_at(unit.source(), byte),
         })
     }
@@ -493,14 +500,14 @@ impl<'a> KotlinCtx<'a> {
     /// the same answer: a Kotlin `CodeUnit` records the package of the file that
     /// declared it, which is exactly what parsing that file's package header
     /// would report.
-    fn indexed_file_facts(&self, unit: &CodeUnit) -> Rc<KotlinFileFacts> {
+    fn indexed_file_facts(&self, token: QueryToken<'_>, unit: &CodeUnit) -> Rc<KotlinFileFacts> {
         let file = unit.source();
         if let Some(cached) = self.file_facts.borrow().get(file) {
             return Rc::clone(cached);
         }
         let facts = Rc::new(KotlinFileFacts {
             package_name: unit.package_name().to_string(),
-            imports: self.imports_of(file),
+            imports: self.imports_of(token, file),
         });
         self.file_facts
             .borrow_mut()
@@ -509,7 +516,7 @@ impl<'a> KotlinCtx<'a> {
     }
 
     /// The package and imports of `file`.
-    fn file_facts(&self, file: &ProjectFile) -> Rc<KotlinFileFacts> {
+    fn file_facts(&self, token: QueryToken<'_>, file: &ProjectFile) -> Rc<KotlinFileFacts> {
         if let Some(cached) = self.file_facts.borrow().get(file) {
             return Rc::clone(cached);
         }
@@ -519,7 +526,7 @@ impl<'a> KotlinCtx<'a> {
             .unwrap_or_default();
         let facts = Rc::new(KotlinFileFacts {
             package_name,
-            imports: self.imports_of(file),
+            imports: self.imports_of(token, file),
         });
         self.file_facts
             .borrow_mut()
@@ -571,15 +578,15 @@ impl<'a> KotlinCtx<'a> {
     }
 
     /// The names visible at `byte` of the requesting file.
-    fn scope_at(&self, byte: usize) -> KotlinScope {
-        self.scope_in(self.file, byte)
+    fn scope_at(&self, token: QueryToken<'_>, byte: usize) -> KotlinScope {
+        self.scope_in(token, self.file, byte)
     }
 
     /// The names visible at `byte` of `file`: that file's package and imports,
     /// plus the declarations enclosing the position and the scopes they inherit.
-    fn scope_in(&self, file: &ProjectFile, byte: usize) -> KotlinScope {
+    fn scope_in(&self, token: QueryToken<'_>, file: &ProjectFile, byte: usize) -> KotlinScope {
         KotlinScope {
-            facts: self.file_facts(file),
+            facts: self.file_facts(token, file),
             owners: self.scope_owners_at(file, byte),
         }
     }
@@ -744,6 +751,7 @@ impl<'a> KotlinCtx<'a> {
 
     fn model_extension_candidates(
         &self,
+        token: QueryToken<'_>,
         owner: &str,
         member: &str,
         arity: Option<usize>,
@@ -754,7 +762,7 @@ impl<'a> KotlinCtx<'a> {
             .into_iter()
             .map(|symbol| symbol.qualified_name.as_str())
             .collect::<Vec<_>>();
-        let scope = self.scope_at(site_byte);
+        let scope = self.scope_at(token, site_byte);
         let resolution = resolve_kotlin_type_name(member, &scope.as_name_scope(), |candidate| {
             self.model_callables_named(candidate, arity)
                 .iter()
@@ -771,13 +779,14 @@ impl<'a> KotlinCtx<'a> {
 
     fn model_extension_candidates_for_conforming(
         &self,
+        token: QueryToken<'_>,
         conforming: &[String],
         member: &str,
         arity: Option<usize>,
         site_byte: usize,
     ) -> Vec<&SemanticModelSymbol> {
         let conforming = conforming.iter().map(String::as_str).collect::<Vec<_>>();
-        let scope = self.scope_at(site_byte);
+        let scope = self.scope_at(token, site_byte);
         let resolution = resolve_kotlin_type_name(member, &scope.as_name_scope(), |candidate| {
             self.model_callables_named(candidate, arity)
                 .iter()
@@ -792,7 +801,11 @@ impl<'a> KotlinCtx<'a> {
             .collect()
     }
 
-    fn authored_receiver_model_names(&self, receiver: &KotlinReceiver) -> Vec<String> {
+    fn authored_receiver_model_names(
+        &self,
+        token: QueryToken<'_>,
+        receiver: &KotlinReceiver,
+    ) -> Vec<String> {
         let mut names = Vec::new();
         let mut frontier = vec![receiver.owner.clone()];
         for _ in 0..MAX_MEMBER_HIERARCHY_DEPTH {
@@ -805,7 +818,7 @@ impl<'a> KotlinCtx<'a> {
                 let Some(range) = self.ranges(unit).into_iter().min() else {
                     continue;
                 };
-                let scope = self.scope_in(unit.source(), range.start_byte);
+                let scope = self.scope_in(token, unit.source(), range.start_byte);
                 for spelled in self.raw_supertypes(unit) {
                     let Some(fqn) = self.resolve_name(&spelled, &scope).resolved() else {
                         continue;
@@ -832,6 +845,7 @@ impl<'a> KotlinCtx<'a> {
 
     fn model_members_for_conforming(
         &self,
+        token: QueryToken<'_>,
         conforming: &[String],
         static_qualifier: bool,
         member: &str,
@@ -851,11 +865,12 @@ impl<'a> KotlinCtx<'a> {
                 }
             }
         }
-        self.model_extension_candidates_for_conforming(conforming, member, arity, site_byte)
+        self.model_extension_candidates_for_conforming(token, conforming, member, arity, site_byte)
     }
 
     fn model_members_for_receiver(
         &self,
+        token: QueryToken<'_>,
         owner: &str,
         static_qualifier: bool,
         member: &str,
@@ -876,7 +891,7 @@ impl<'a> KotlinCtx<'a> {
                 }
             }
         }
-        self.model_extension_candidates(owner, member, arity, site_byte)
+        self.model_extension_candidates(token, owner, member, arity, site_byte)
     }
 
     fn model_outcome(
@@ -1076,14 +1091,19 @@ impl<'a> KotlinCtx<'a> {
     /// Read from the declaring file's syntax and resolved in *that* file's
     /// scope, because a spelled type means whatever the file that wrote it says
     /// it means.
-    fn declared_type_of(&self, unit: &CodeUnit, depth: usize) -> Option<CodeUnit> {
+    fn declared_type_of(
+        &self,
+        token: QueryToken<'_>,
+        unit: &CodeUnit,
+        depth: usize,
+    ) -> Option<CodeUnit> {
         // The index publishes what a Kotlin declaration wrote (issue #1345), so
         // the case that matters — a written type, which is what a receiver chain
         // needs at every link — costs a lookup rather than a parse of the
         // declaring file. The syntax path below stays for what the index cannot
         // publish: an unwritten type inferred from an initializer, an enum
         // entry's own enum, and a declaration parse recovery dropped entirely.
-        if let Some(resolved) = self.published_declared_type_of(unit) {
+        if let Some(resolved) = self.published_declared_type_of(token, unit) {
             return Some(resolved);
         }
 
@@ -1110,7 +1130,7 @@ impl<'a> KotlinCtx<'a> {
                 .find_map(|child| kotlin_type_node_spelling(&declaring, child)),
         };
         if let Some(spelled) = type_node {
-            let scope = declaring.scope_in(unit.source(), range.start_byte);
+            let scope = declaring.scope_in(token, unit.source(), range.start_byte);
             if let Some(resolved) = declaring.resolve_type_unit(&spelled, &scope) {
                 return Some(resolved);
             }
@@ -1124,7 +1144,7 @@ impl<'a> KotlinCtx<'a> {
             .into_iter()
             .rev()
             .find(|child| kotlin_is_expression_kind(child.kind()))?;
-        kotlin_expression_type(&declaring, initializer, depth + 1)
+        kotlin_expression_type(&declaring, token, initializer, depth + 1)
     }
 
     /// The type `unit` declares, read from the published index rather than from
@@ -1135,7 +1155,11 @@ impl<'a> KotlinCtx<'a> {
     /// return type of their own — resolving one of *those* spellings through
     /// Kotlin's name ladder would answer a Kotlin question with another
     /// language's syntax.
-    fn published_declared_type_of(&self, unit: &CodeUnit) -> Option<CodeUnit> {
+    fn published_declared_type_of(
+        &self,
+        token: QueryToken<'_>,
+        unit: &CodeUnit,
+    ) -> Option<CodeUnit> {
         if language_for_target(unit) != Language::Kotlin {
             return None;
         }
@@ -1143,13 +1167,13 @@ impl<'a> KotlinCtx<'a> {
             .signature_metadata(unit)
             .into_iter()
             .find_map(|entry| entry.return_type_text().map(str::to_string))?;
-        let scope = self.declaration_scope(unit)?;
+        let scope = self.declaration_scope(token, unit)?;
         self.resolve_type_unit(&spelled, &scope)
     }
 
     /// The type an extension function extends, or `None` when the callable is
     /// not an extension.
-    fn extension_receiver_unit(&self, unit: &CodeUnit) -> Option<CodeUnit> {
+    fn extension_receiver_unit(&self, token: QueryToken<'_>, unit: &CodeUnit) -> Option<CodeUnit> {
         // Extension conformance is checked once per candidate, so a member
         // lookup considering several same-named extensions used to re-parse
         // several declaring files to decide which applied. The published
@@ -1162,7 +1186,7 @@ impl<'a> KotlinCtx<'a> {
                 .find_map(|entry| entry.extension_receiver_type())
             {
                 let spelled = spelled.to_string();
-                let scope = self.declaration_scope(unit)?;
+                let scope = self.declaration_scope(token, unit)?;
                 return self.resolve_type_unit(&spelled, &scope);
             }
             if !metadata.is_empty() {
@@ -1179,7 +1203,7 @@ impl<'a> KotlinCtx<'a> {
         let receiver = node.child_by_field_name("receiver")?;
         let declaring = self.declaring_ctx(unit.source(), &syntax.source);
         let spelled = kotlin_type_node_spelling(&declaring, receiver)?;
-        let scope = declaring.scope_in(unit.source(), range.start_byte);
+        let scope = declaring.scope_in(token, unit.source(), range.start_byte);
         declaring.resolve_type_unit(&spelled, &scope)
     }
 
@@ -1386,13 +1410,17 @@ fn kotlin_import_reference_outcome(
 
 /// Resolve a focus on a `type_identifier`: a type annotation, a supertype, an
 /// annotation name, a receiver type, or a type argument.
-fn kotlin_type_reference_outcome(ctx: &KotlinCtx<'_>, node: Node<'_>) -> DefinitionLookupOutcome {
+fn kotlin_type_reference_outcome(
+    ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
+    node: Node<'_>,
+) -> DefinitionLookupOutcome {
     let segments = kotlin_type_spelling_segments(ctx, node);
     let spelled = segments.join(".");
     if spelled.is_empty() {
         return no_definition("no_reference_text", "Kotlin type reference is blank");
     }
-    let scope = ctx.scope_at(node.start_byte());
+    let scope = ctx.scope_at(token, node.start_byte());
     match ctx.resolve_name(&spelled, &scope) {
         KotlinTypeName::Resolved(fqn) => {
             let units = ctx.types_named(&fqn);
@@ -1552,11 +1580,12 @@ fn kotlin_workspace_package_exists(support: &dyn BoundedDefinitionLookup, packag
 /// declaration does not exist.
 fn kotlin_bare_call_outcome(
     ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
     node: Node<'_>,
     name: &str,
     arity: Option<usize>,
 ) -> DefinitionLookupOutcome {
-    let scope = ctx.scope_at(node.start_byte());
+    let scope = ctx.scope_at(token, node.start_byte());
     for required_arity in [arity, None] {
         match resolve_kotlin_type_name(name, &scope.as_name_scope(), |candidate| {
             ctx.callable_exists(candidate, required_arity)
@@ -1638,10 +1667,11 @@ fn kotlin_callable_outcome(candidates: Vec<CodeUnit>, subject: &str) -> Definiti
 /// or a class named as a qualifier.
 fn kotlin_bare_value_outcome(
     ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
     node: Node<'_>,
     name: &str,
 ) -> DefinitionLookupOutcome {
-    let scope = ctx.scope_at(node.start_byte());
+    let scope = ctx.scope_at(token, node.start_byte());
     match resolve_kotlin_type_name(name, &scope.as_name_scope(), |candidate| {
         !ctx.values_named(candidate).is_empty() || !ctx.model_values_named(candidate).is_empty()
     }) {
@@ -1666,6 +1696,7 @@ fn kotlin_bare_value_outcome(
             match kotlin_qualified_member_of_receiver(ctx, node) {
                 Some(member) => kotlin_unresolved_receiver_outcome(
                     ctx,
+                    token,
                     node,
                     member,
                     "no_indexed_definition",
@@ -1705,6 +1736,7 @@ fn kotlin_qualified_member_of_receiver<'a>(ctx: &KotlinCtx<'a>, node: Node<'_>) 
 /// rather than pointing at a callable it does not belong to.
 fn kotlin_named_argument_outcome(
     ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
     argument: Node<'_>,
     label: &str,
 ) -> DefinitionLookupOutcome {
@@ -1729,8 +1761,13 @@ fn kotlin_named_argument_outcome(
             ),
         );
     }
-    let owner =
-        kotlin_bare_call_outcome(ctx, callee, ctx.text(callee), Some(kotlin_call_arity(call)));
+    let owner = kotlin_bare_call_outcome(
+        ctx,
+        token,
+        callee,
+        ctx.text(callee),
+        Some(kotlin_call_arity(call)),
+    );
     if owner.definitions.is_empty() {
         return no_definition(
             "no_named_argument_owner",
@@ -1792,6 +1829,7 @@ struct KotlinReceiver {
 /// Resolve the member of `a.member` / `a?.member` / `a!!.member`.
 fn kotlin_member_outcome(
     ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
     suffix: Node<'_>,
     member: &str,
 ) -> DefinitionLookupOutcome {
@@ -1818,16 +1856,17 @@ fn kotlin_member_outcome(
         .filter(|call| kotlin_callee(*call).is_some_and(|callee| callee.id() == navigation.id()))
         .map(kotlin_call_arity);
 
-    let authored_receiver = kotlin_receiver(ctx, receiver_node, 0);
+    let authored_receiver = kotlin_receiver(ctx, token, receiver_node, 0);
     if let Some(receiver) = authored_receiver.as_ref() {
         let candidates =
-            kotlin_member_candidates(ctx, receiver, member, arity, suffix.start_byte());
+            kotlin_member_candidates(ctx, token, receiver, member, arity, suffix.start_byte());
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
-        let conforming = ctx.authored_receiver_model_names(receiver);
+        let conforming = ctx.authored_receiver_model_names(token, receiver);
         for required_arity in [arity, None] {
             let modeled = ctx.model_members_for_conforming(
+                token,
                 &conforming,
                 receiver.static_qualifier,
                 member,
@@ -1842,9 +1881,10 @@ fn kotlin_member_outcome(
             }
         }
     }
-    if let Some((owner, static_qualifier)) = kotlin_model_receiver(ctx, receiver_node, 0) {
+    if let Some((owner, static_qualifier)) = kotlin_model_receiver(ctx, token, receiver_node, 0) {
         for required_arity in [arity, None] {
             let modeled = ctx.model_members_for_receiver(
+                token,
                 &owner,
                 static_qualifier,
                 member,
@@ -1874,6 +1914,7 @@ fn kotlin_member_outcome(
     }
     kotlin_unresolved_receiver_outcome(
         ctx,
+        token,
         receiver_node,
         member,
         "receiver_type_unknown",
@@ -1900,6 +1941,7 @@ fn kotlin_member_outcome(
 /// unknown type and a member no surface declares are both unchanged.
 fn kotlin_unresolved_receiver_outcome(
     ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
     receiver: Node<'_>,
     member: &str,
     unresolved_kind: &str,
@@ -1910,7 +1952,12 @@ fn kotlin_unresolved_receiver_outcome(
     };
     let declared = resolve_analyzer::<KotlinAnalyzer>(ctx.analyzer).and_then(|kotlin| {
         ctx.session.query_optional(|| {
-            kotlin.resolve_member_name_with_external(ctx.overlay.clone(), ctx.file, &spelling)
+            kotlin.resolve_member_name_with_external(
+                token,
+                ctx.overlay.clone(),
+                ctx.file,
+                &spelling,
+            )
         })
     });
     // gated upstream is *not* claimed here: the closure below is the workspace
@@ -2014,6 +2061,7 @@ fn model_extension_symbol_matches(symbol: &SemanticModelSymbol, conforming: &[&s
 
 fn kotlin_model_receiver(
     ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
     node: Node<'_>,
     depth: usize,
 ) -> Option<(String, bool)> {
@@ -2021,14 +2069,17 @@ fn kotlin_model_receiver(
         return None;
     }
     match node.kind() {
-        "postfix_expression" | "parenthesized_expression" => {
-            kotlin_model_receiver(ctx, named_children(node).into_iter().next()?, depth + 1)
-        }
+        "postfix_expression" | "parenthesized_expression" => kotlin_model_receiver(
+            ctx,
+            token,
+            named_children(node).into_iter().next()?,
+            depth + 1,
+        ),
         "as_expression" => {
             let asserted = named_children(node).into_iter().next_back()?;
             let spelled = kotlin_type_node_spelling(ctx, asserted)?;
             let fqn = ctx
-                .resolve_name(&spelled, &ctx.scope_at(node.start_byte()))
+                .resolve_name(&spelled, &ctx.scope_at(token, node.start_byte()))
                 .resolved()?;
             ctx.model_type_available(&fqn).then_some((fqn, false))
         }
@@ -2038,20 +2089,20 @@ fn kotlin_model_receiver(
                 && let Some(spelled) = kotlin_declared_type_spelling(ctx, binding)
             {
                 let fqn = ctx
-                    .resolve_name(&spelled, &ctx.scope_at(binding.start_byte()))
+                    .resolve_name(&spelled, &ctx.scope_at(token, binding.start_byte()))
                     .resolved()?;
                 if ctx.model_type_available(&fqn) {
                     return Some((fqn, false));
                 }
             }
             let fqn = ctx
-                .resolve_name(name, &ctx.scope_at(node.start_byte()))
+                .resolve_name(name, &ctx.scope_at(token, node.start_byte()))
                 .resolved()?;
             ctx.model_type_available(&fqn).then_some((fqn, true))
         }
         "call_expression" => {
             let callee = kotlin_callee(node)?;
-            let scope = ctx.scope_at(callee.start_byte());
+            let scope = ctx.scope_at(token, callee.start_byte());
             let arity = Some(kotlin_call_arity(node));
             if callee.kind() == "navigation_expression" {
                 let children = named_children(callee);
@@ -2059,9 +2110,10 @@ fn kotlin_model_receiver(
                 let suffix = children.last().copied()?;
                 let member_node = named_children(suffix).into_iter().last()?;
                 let records = if let Some((owner, static_qualifier)) =
-                    kotlin_model_receiver(ctx, receiver, depth + 1)
+                    kotlin_model_receiver(ctx, token, receiver, depth + 1)
                 {
                     ctx.model_members_for_receiver(
+                        token,
                         &owner,
                         static_qualifier,
                         ctx.text(member_node),
@@ -2069,9 +2121,10 @@ fn kotlin_model_receiver(
                         callee.start_byte(),
                     )
                 } else {
-                    let authored = kotlin_receiver(ctx, receiver, depth + 1)?;
-                    let conforming = ctx.authored_receiver_model_names(&authored);
+                    let authored = kotlin_receiver(ctx, token, receiver, depth + 1)?;
+                    let conforming = ctx.authored_receiver_model_names(token, &authored);
                     ctx.model_members_for_conforming(
+                        token,
                         &conforming,
                         authored.static_qualifier,
                         ctx.text(member_node),
@@ -2129,6 +2182,7 @@ fn model_return_receiver(
 /// missing arity record cannot turn a present declaration into "not found".
 fn kotlin_member_candidates(
     ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
     receiver: &KotlinReceiver,
     member: &str,
     arity: Option<usize>,
@@ -2189,7 +2243,7 @@ fn kotlin_member_candidates(
         }
 
         let extensions =
-            kotlin_extension_candidates(ctx, receiver, member, required_arity, site_byte);
+            kotlin_extension_candidates(ctx, token, receiver, member, required_arity, site_byte);
         if !extensions.is_empty() {
             return extensions;
         }
@@ -2439,6 +2493,7 @@ impl KotlinMemberTrace {
 /// imported, declared in the same package, or star-imported.
 fn kotlin_extension_candidates(
     ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
     receiver: &KotlinReceiver,
     member: &str,
     arity: Option<usize>,
@@ -2446,7 +2501,7 @@ fn kotlin_extension_candidates(
 ) -> Vec<CodeUnit> {
     use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 
-    let scope = ctx.scope_at(site_byte);
+    let scope = ctx.scope_at(token, site_byte);
     // The declared receiver each admitted extension conformed to, kept from the
     // very check that admitted it. Re-reading it afterwards would spend session
     // budget a recording run must not spend.
@@ -2454,7 +2509,7 @@ fn kotlin_extension_candidates(
         if !arity.is_none_or(|arity| ctx.accepts_arity(unit, arity)) {
             return None;
         }
-        let declared = ctx.extension_receiver_unit(unit)?;
+        let declared = ctx.extension_receiver_unit(token, unit)?;
         ctx.type_conforms_to(&receiver.owner, &declared)
             .then_some(declared)
     };
@@ -2505,17 +2560,25 @@ fn kotlin_extension_candidates(
 }
 
 /// Type the expression a member is selected from.
-fn kotlin_receiver(ctx: &KotlinCtx<'_>, node: Node<'_>, depth: usize) -> Option<KotlinReceiver> {
+fn kotlin_receiver(
+    ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
+    node: Node<'_>,
+    depth: usize,
+) -> Option<KotlinReceiver> {
     if depth > MAX_RECEIVER_DEPTH {
         return None;
     }
     match node.kind() {
         // `a!!.b` and `(a).b` select from the same thing `a` does.
-        "postfix_expression" | "parenthesized_expression" => {
-            kotlin_receiver(ctx, named_children(node).into_iter().next()?, depth + 1)
-        }
+        "postfix_expression" | "parenthesized_expression" => kotlin_receiver(
+            ctx,
+            token,
+            named_children(node).into_iter().next()?,
+            depth + 1,
+        ),
         "this_expression" => Some(KotlinReceiver {
-            owner: kotlin_this_owner(ctx, node)?,
+            owner: kotlin_this_owner(ctx, token, node)?,
             static_qualifier: false,
         }),
         "super_expression" => Some(KotlinReceiver {
@@ -2527,14 +2590,14 @@ fn kotlin_receiver(ctx: &KotlinCtx<'_>, node: Node<'_>, depth: usize) -> Option<
             Some(KotlinReceiver {
                 owner: ctx.resolve_type_unit(
                     &kotlin_type_node_spelling(ctx, asserted)?,
-                    &ctx.scope_at(node.start_byte()),
+                    &ctx.scope_at(token, node.start_byte()),
                 )?,
                 static_qualifier: false,
             })
         }
-        "simple_identifier" => kotlin_identifier_receiver(ctx, node, depth),
+        "simple_identifier" => kotlin_identifier_receiver(ctx, token, node, depth),
         "call_expression" | "navigation_expression" => Some(KotlinReceiver {
-            owner: kotlin_expression_type(ctx, node, depth)?,
+            owner: kotlin_expression_type(ctx, token, node, depth)?,
             static_qualifier: false,
         }),
         _ => None,
@@ -2545,18 +2608,19 @@ fn kotlin_receiver(ctx: &KotlinCtx<'_>, node: Node<'_>, depth: usize) -> Option<
 /// or a type named as a static qualifier.
 fn kotlin_identifier_receiver(
     ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
     node: Node<'_>,
     depth: usize,
 ) -> Option<KotlinReceiver> {
     let name = ctx.text(node);
     if let Some(binding) = kotlin_local_binding(node, ctx.source, name) {
         return Some(KotlinReceiver {
-            owner: kotlin_binding_type(ctx, binding, depth)?,
+            owner: kotlin_binding_type(ctx, token, binding, depth)?,
             static_qualifier: false,
         });
     }
 
-    let scope = ctx.scope_at(node.start_byte());
+    let scope = ctx.scope_at(token, node.start_byte());
     if let Some(owner) = ctx.resolve_type_unit(name, &scope) {
         return Some(KotlinReceiver {
             owner,
@@ -2578,7 +2642,7 @@ fn kotlin_identifier_receiver(
         .into_iter()
         .find(CodeUnit::is_field)?;
     Some(KotlinReceiver {
-        owner: ctx.declared_type_of(&property, depth)?,
+        owner: ctx.declared_type_of(token, &property, depth)?,
         static_qualifier: false,
     })
 }
@@ -2587,7 +2651,11 @@ fn kotlin_identifier_receiver(
 ///
 /// A label (`this@Outer`) picks the named enclosing declaration; an unlabelled
 /// `this` is the innermost one.
-fn kotlin_this_owner(ctx: &KotlinCtx<'_>, node: Node<'_>) -> Option<CodeUnit> {
+fn kotlin_this_owner(
+    ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
+    node: Node<'_>,
+) -> Option<CodeUnit> {
     let label = first_named_child_of_kind(node, "label").map(|label| {
         ctx.text(label)
             .trim_start_matches('@')
@@ -2601,7 +2669,7 @@ fn kotlin_this_owner(ctx: &KotlinCtx<'_>, node: Node<'_>) -> Option<CodeUnit> {
         && let Some(receiver) = kotlin_enclosing_extension_receiver(node)
         && let Some(spelled) = kotlin_type_node_spelling(ctx, receiver)
     {
-        let scope = ctx.scope_at(receiver.start_byte());
+        let scope = ctx.scope_at(token, receiver.start_byte());
         return ctx.resolve_type_unit(&spelled, &scope);
     }
     let mut current = ctx.enclosing_class_at(node.start_byte());
@@ -2661,33 +2729,46 @@ fn kotlin_super_owner(ctx: &KotlinCtx<'_>, node: Node<'_>) -> Option<CodeUnit> {
 }
 
 /// The type an expression evaluates to, as an indexed declaration.
-fn kotlin_expression_type(ctx: &KotlinCtx<'_>, node: Node<'_>, depth: usize) -> Option<CodeUnit> {
+fn kotlin_expression_type(
+    ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
+    node: Node<'_>,
+    depth: usize,
+) -> Option<CodeUnit> {
     if depth > MAX_RECEIVER_DEPTH {
         return None;
     }
     match node.kind() {
-        "postfix_expression" | "parenthesized_expression" => {
-            kotlin_expression_type(ctx, named_children(node).into_iter().next()?, depth + 1)
-        }
+        "postfix_expression" | "parenthesized_expression" => kotlin_expression_type(
+            ctx,
+            token,
+            named_children(node).into_iter().next()?,
+            depth + 1,
+        ),
         "call_expression" => {
             let callee = kotlin_callee(node)?;
-            let target = kotlin_call_target(ctx, node, callee, depth)?;
+            let target = kotlin_call_target(ctx, token, node, callee, depth)?;
             // A constructor call evaluates to the class it constructs; any
             // other call evaluates to its declared return type.
             if target.is_class() {
                 return Some(target);
             }
-            ctx.declared_type_of(&target, depth)
+            ctx.declared_type_of(token, &target, depth)
         }
         "navigation_expression" => {
             let suffix = named_children(node)
                 .into_iter()
                 .find(|child| child.kind() == "navigation_suffix")?;
             let member = first_named_child_of_kind(suffix, "simple_identifier")?;
-            let receiver =
-                kotlin_receiver(ctx, named_children(node).into_iter().next()?, depth + 1)?;
+            let receiver = kotlin_receiver(
+                ctx,
+                token,
+                named_children(node).into_iter().next()?,
+                depth + 1,
+            )?;
             let target = kotlin_member_candidates(
                 ctx,
+                token,
                 &receiver,
                 ctx.text(member),
                 None,
@@ -2695,14 +2776,16 @@ fn kotlin_expression_type(ctx: &KotlinCtx<'_>, node: Node<'_>, depth: usize) -> 
             )
             .into_iter()
             .next()?;
-            ctx.declared_type_of(&target, depth)
+            ctx.declared_type_of(token, &target, depth)
         }
-        "simple_identifier" => kotlin_receiver(ctx, node, depth + 1).map(|receiver| receiver.owner),
+        "simple_identifier" => {
+            kotlin_receiver(ctx, token, node, depth + 1).map(|receiver| receiver.owner)
+        }
         "as_expression" => {
             let asserted = named_children(node).into_iter().next_back()?;
             ctx.resolve_type_unit(
                 &kotlin_type_node_spelling(ctx, asserted)?,
-                &ctx.scope_at(node.start_byte()),
+                &ctx.scope_at(token, node.start_byte()),
             )
         }
         "object_literal" => None,
@@ -2713,23 +2796,33 @@ fn kotlin_expression_type(ctx: &KotlinCtx<'_>, node: Node<'_>, depth: usize) -> 
 /// The single declaration a call resolves to, when it resolves to exactly one.
 fn kotlin_call_target(
     ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
     call: Node<'_>,
     callee: Node<'_>,
     depth: usize,
 ) -> Option<CodeUnit> {
     let outcome = match callee.kind() {
-        "simple_identifier" => {
-            kotlin_bare_call_outcome(ctx, callee, ctx.text(callee), Some(kotlin_call_arity(call)))
-        }
+        "simple_identifier" => kotlin_bare_call_outcome(
+            ctx,
+            token,
+            callee,
+            ctx.text(callee),
+            Some(kotlin_call_arity(call)),
+        ),
         "navigation_expression" => {
             let suffix = named_children(callee)
                 .into_iter()
                 .find(|child| child.kind() == "navigation_suffix")?;
             let member = first_named_child_of_kind(suffix, "simple_identifier")?;
-            let receiver =
-                kotlin_receiver(ctx, named_children(callee).into_iter().next()?, depth + 1)?;
+            let receiver = kotlin_receiver(
+                ctx,
+                token,
+                named_children(callee).into_iter().next()?,
+                depth + 1,
+            )?;
             return kotlin_member_candidates(
                 ctx,
+                token,
                 &receiver,
                 ctx.text(member),
                 Some(kotlin_call_arity(call)),
@@ -2746,8 +2839,13 @@ fn kotlin_call_target(
 
 /// The declaration a `variable_declaration`, `parameter`, or `class_parameter`
 /// node binds a type to.
-fn kotlin_binding_type(ctx: &KotlinCtx<'_>, binding: Node<'_>, depth: usize) -> Option<CodeUnit> {
-    let scope = ctx.scope_at(binding.start_byte());
+fn kotlin_binding_type(
+    ctx: &KotlinCtx<'_>,
+    token: QueryToken<'_>,
+    binding: Node<'_>,
+    depth: usize,
+) -> Option<CodeUnit> {
+    let scope = ctx.scope_at(token, binding.start_byte());
     if let Some(spelled) = kotlin_declared_type_spelling(ctx, binding)
         && let Some(unit) = ctx.resolve_type_unit(&spelled, &scope)
     {
@@ -2763,7 +2861,7 @@ fn kotlin_binding_type(ctx: &KotlinCtx<'_>, binding: Node<'_>, depth: usize) -> 
         .into_iter()
         .rev()
         .find(|child| kotlin_is_expression_kind(child.kind()))?;
-    kotlin_expression_type(ctx, initializer, depth + 1)
+    kotlin_expression_type(ctx, token, initializer, depth + 1)
 }
 
 /// The `variable_declaration`, `parameter`, or `class_parameter` node that binds
@@ -2865,6 +2963,7 @@ pub(crate) enum KotlinTypeLookupResolution {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn kotlin_type_lookup_resolution_in_session(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     support: &dyn BoundedDefinitionLookup,
     session: &ResolutionSession,
     file: &ProjectFile,
@@ -2873,14 +2972,14 @@ pub(crate) fn kotlin_type_lookup_resolution_in_session(
     site: &ResolvedReferenceSite,
 ) -> Option<KotlinTypeLookupResolution> {
     let node = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
-    let ctx = KotlinCtx::new(analyzer, support, session, file, source, root, site);
+    let ctx = KotlinCtx::new(analyzer, token, support, session, file, source, root, site);
 
     if node.kind() == "type_identifier" {
         if kotlin_enclosing_import_header(node).is_some() {
             return None;
         }
         let spelled = kotlin_type_spelling_segments(&ctx, node).join(".");
-        let scope = ctx.scope_at(node.start_byte());
+        let scope = ctx.scope_at(token, node.start_byte());
         let fqn = ctx.resolve_name(&spelled, &scope).resolved()?;
         return Some(KotlinTypeLookupResolution::Type {
             fqn,
@@ -2894,7 +2993,7 @@ pub(crate) fn kotlin_type_lookup_resolution_in_session(
     // and this is the only place a construction can answer with the class it
     // builds.
     if node.kind() != "simple_identifier" && kotlin_is_expression_kind(node.kind()) {
-        let unit = kotlin_expression_type(&ctx, node, 0)?;
+        let unit = kotlin_expression_type(&ctx, token, node, 0)?;
         return Some(KotlinTypeLookupResolution::Type {
             fqn: unit.fq_name(),
             target_kind: TypeLookupTargetKind::ValueExpression,
@@ -2921,17 +3020,28 @@ pub(crate) fn kotlin_type_lookup_resolution_in_session(
     ) && first_named_child_of_kind(parent, "simple_identifier")
         .is_some_and(|name| name.id() == node.id())
     {
-        kotlin_binding_type(&ctx, parent, 0)?
+        kotlin_binding_type(&ctx, token, parent, 0)?
     } else if parent.kind() == "navigation_suffix" {
         let navigation = parent.parent()?;
-        let receiver = kotlin_receiver(&ctx, named_children(navigation).into_iter().next()?, 0)?;
-        let member =
-            kotlin_member_candidates(&ctx, &receiver, ctx.text(node), None, parent.start_byte())
-                .into_iter()
-                .next()?;
-        ctx.declared_type_of(&member, 0)?
+        let receiver = kotlin_receiver(
+            &ctx,
+            token,
+            named_children(navigation).into_iter().next()?,
+            0,
+        )?;
+        let member = kotlin_member_candidates(
+            &ctx,
+            token,
+            &receiver,
+            ctx.text(node),
+            None,
+            parent.start_byte(),
+        )
+        .into_iter()
+        .next()?;
+        ctx.declared_type_of(token, &member, 0)?
     } else {
-        kotlin_receiver(&ctx, node, 0)?.owner
+        kotlin_receiver(&ctx, token, node, 0)?.owner
     };
 
     Some(KotlinTypeLookupResolution::Type {

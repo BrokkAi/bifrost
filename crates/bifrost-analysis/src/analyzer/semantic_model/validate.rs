@@ -526,6 +526,9 @@ impl Validator {
                 ),
             );
         }
+        // A declared effect (#2437) is metadata about the procedure, not a
+        // modeled port, so it deliberately does not satisfy this rule: a summary
+        // still has to say how values move through the procedure.
         if summary.transfers.is_empty() && summary.effects.is_empty() {
             self.error(
                 "summary.empty",
@@ -533,6 +536,8 @@ impl Validator {
                 "a procedure summary must declare at least one transfer or effect",
             );
         }
+
+        self.declared_effects(path, &summary.declared_effects);
 
         let mut locations = HashMap::new();
         for (index, location) in summary.locations.iter().enumerate() {
@@ -793,6 +798,45 @@ impl Validator {
                     "summary.duplicate_sanitize_label",
                     format!("{path}[{index}]"),
                     format!("duplicate sanitize label `{label}`"),
+                );
+            }
+        }
+    }
+
+    /// Validate the namespaced effect identifiers a summary declares (#2437).
+    ///
+    /// The identifier rule is the shared `stable_component` rule (dots allowed),
+    /// plus a required `.` separator: an unnamespaced `write` would collide the
+    /// moment two vendors ship packs for the same language.
+    fn declared_effects(&mut self, path: &str, declared: &[AuthoredDeclaredEffect]) {
+        if declared.len() > MAX_PROCEDURE_SUMMARY_DECLARED_EFFECTS {
+            self.error(
+                "limit.summary_declared_effects",
+                format!("{path}.declared_effects"),
+                format!(
+                    "summary declares more than {MAX_PROCEDURE_SUMMARY_DECLARED_EFFECTS} effects"
+                ),
+            );
+        }
+        let mut seen = HashSet::new();
+        for (index, effect) in declared.iter().enumerate() {
+            let effect_path = format!("{path}.declared_effects[{index}]");
+            self.stable_component(&format!("{effect_path}.id"), &effect.id);
+            if !effect.id.contains('.') {
+                self.error(
+                    "summary.effect_namespace",
+                    format!("{effect_path}.id"),
+                    format!(
+                        "declared effect `{}` must be namespaced, for example `vendor.effect`",
+                        effect.id
+                    ),
+                );
+            }
+            if !seen.insert(effect.id.as_str()) {
+                self.error(
+                    "summary.duplicate_declared_effect",
+                    format!("{effect_path}.id"),
+                    format!("duplicate declared effect `{}`", effect.id),
                 );
             }
         }

@@ -1,11 +1,11 @@
 use super::artifact::{
-    ArtifactEncoding, ArtifactError, CompiledPackManifest, CompiledPayload,
-    CompiledProcedureSummary, CompiledProcedureTarget, CompiledSemanticModelPack, CompiledShard,
-    CompiledShardArtifact, CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind,
-    CompiledSummaryInput, CompiledSummaryLocation, CompiledSummaryLocationKind,
-    CompiledSummaryOutput, CompiledSummaryTransfer, DecodeLimits, canonical_json, content_digest,
-    manifest_content_digest, manifest_semantic_digest, payload_inventory, routing_keys,
-    semantic_digest, stored_digest,
+    ArtifactEncoding, ArtifactError, CompiledDeclaredEffect, CompiledDeclaredEffectCertainty,
+    CompiledDeclaredEffectTiming, CompiledPackManifest, CompiledPayload, CompiledProcedureSummary,
+    CompiledProcedureTarget, CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact,
+    CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
+    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryOutput,
+    CompiledSummaryTransfer, DecodeLimits, canonical_json, content_digest, manifest_content_digest,
+    manifest_semantic_digest, payload_inventory, routing_keys, semantic_digest, stored_digest,
 };
 use super::model::*;
 use super::source::{SourceFormat, parse_source};
@@ -294,6 +294,13 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
                     }
                     summary.effects.sort_by_cached_key(canonical_sort_key);
                     summary.effects.dedup();
+                    // Declared effects (#2437) are a set keyed by id; validation
+                    // already rejected two entries sharing one id, so sorting by
+                    // id is a total order over what survives.
+                    summary
+                        .declared_effects
+                        .sort_by(|left, right| left.id.cmp(&right.id));
+                    summary.declared_effects.dedup();
                 }
                 summaries.sort_by(|left, right| left.id.cmp(&right.id));
             }
@@ -411,7 +418,27 @@ fn compile_procedure_summary(
             })
             .collect(),
         effects: summary.effects.iter().map(compile_summary_effect).collect(),
+        declared_effects: summary
+            .declared_effects
+            .iter()
+            .map(compile_declared_effect)
+            .collect(),
     })
+}
+
+fn compile_declared_effect(effect: &AuthoredDeclaredEffect) -> CompiledDeclaredEffect {
+    CompiledDeclaredEffect {
+        id: effect.id.clone(),
+        timing: match effect.timing {
+            DeclaredEffectTiming::Immediate => CompiledDeclaredEffectTiming::Immediate,
+            DeclaredEffectTiming::Deferred => CompiledDeclaredEffectTiming::Deferred,
+            DeclaredEffectTiming::Unknown => CompiledDeclaredEffectTiming::Unknown,
+        },
+        certainty: match effect.certainty {
+            DeclaredEffectCertainty::Definite => CompiledDeclaredEffectCertainty::Definite,
+            DeclaredEffectCertainty::Possible => CompiledDeclaredEffectCertainty::Possible,
+        },
+    }
 }
 
 fn compile_summary_input(input: &AuthoredSummaryInput) -> CompiledSummaryInput {

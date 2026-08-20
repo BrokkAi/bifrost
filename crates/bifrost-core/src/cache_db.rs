@@ -1238,19 +1238,17 @@ fn install_busy_timeout(conn: &Connection) -> Result<()> {
 
 fn configure_connection_after_busy_timeout(conn: &mut Connection) -> Result<()> {
     if conn.path().is_some_and(|path| !path.is_empty()) {
+        // Page size is an optional performance tuning choice. Initialize it
+        // before the first schema write, but do not rebuild an existing store
+        // just to change its page size; VACUUM would block the synchronous open.
+        if let Err(error) =
+            retry_initialization_phase("page-size initialization", || ensure_cache_page_size(conn))
+        {
+            eprintln!("Bifrost cache page-size initialization skipped: {error}");
+        }
         retry_initialization_phase("auto-vacuum initialization", || {
             ensure_incremental_auto_vacuum(conn)
         })?;
-        // The page-size upgrade is best-effort: the store is fully functional
-        // at its existing page size, so a failed one-time VACUUM must not
-        // block the workspace from opening. The journal-mode phase below runs
-        // afterwards regardless and re-establishes WAL even when the upgrade
-        // left the file in rollback mode.
-        if let Err(error) =
-            retry_initialization_phase("page-size upgrade", || ensure_cache_page_size(conn))
-        {
-            eprintln!("Bifrost cache page-size upgrade skipped: {error}");
-        }
         retry_initialization_phase("journal-mode initialization", || {
             ensure_wal_journal_mode(conn)
         })?;
@@ -1333,45 +1331,32 @@ fn ensure_incremental_auto_vacuum(
     }
 }
 
-/// Upgrade the store file to [`CACHE_PAGE_SIZE_BYTES`] pages.
+/// Initialize fresh store files with [`CACHE_PAGE_SIZE_BYTES`] pages.
 ///
-/// The page size is a persistent property of the database file, fixed in its
-/// header: `PRAGMA page_size` on an existing database only records the request
-/// (`sqlite3BtreeSetPageSize` declines once `BTS_PAGESIZE_FIXED` is set), and
-/// `VACUUM` is the rebuild that applies it. `VACUUM` in turn silently keeps the
-/// old page size while the database is in WAL mode (`src/vacuum.c` zeroes
-/// `db->nextPagesize` for a WAL main database), so the sequence is: leave WAL,
-/// request the size, VACUUM, and let the caller's journal-mode phase restore
-/// WAL. `VACUUM` preserves user_version, application_id, text encoding, and the
-/// auto-vacuum mode, so the store's schema version and vacuum policy survive.
+/// Page size is a persistent property of the database file, fixed in its
+/// header. Changing it for an existing store requires a full `VACUUM` rebuild,
+/// which is optional performance tuning and must not block a synchronous cache
+/// open. Existing stores therefore retain their page size and continue through
+/// the normal WAL and schema initialization phases.
 fn ensure_cache_page_size(conn: &Connection) -> std::result::Result<(), InitializationPhaseError> {
     let current: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
     if current == CACHE_PAGE_SIZE_BYTES {
         return Ok(());
     }
-    conn.pragma_update(None, "page_size", CACHE_PAGE_SIZE_BYTES)?;
-    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
-    if page_count == 0 {
-        // A fresh file has no header yet: the requested size lands in the
-        // header when the first write creates page 1. Nothing to rebuild.
+
+    let schema_is_empty: bool = conn.query_row(
+        "SELECT NOT EXISTS(
+           SELECT 1 FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !schema_is_empty {
         return Ok(());
     }
-    let mode: String =
-        conn.pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))?;
-    if !mode.eq_ignore_ascii_case("delete") {
-        return Err(InitializationPhaseError::Verification(format!(
-            "requested rollback journal mode for the page-size upgrade but SQLite reported {mode}"
-        )));
-    }
-    conn.execute_batch("VACUUM")?;
-    let updated: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
-    if updated == CACHE_PAGE_SIZE_BYTES {
-        Ok(())
-    } else {
-        Err(InitializationPhaseError::Verification(format!(
-            "page-size upgrade VACUUM ran but SQLite reports page_size={updated}"
-        )))
-    }
+
+    conn.pragma_update(None, "page_size", CACHE_PAGE_SIZE_BYTES)?;
+    Ok(())
 }
 
 fn retry_initialization_phase<T>(
@@ -2220,14 +2205,16 @@ mod tests {
     }
 
     #[test]
-    fn populated_wal_store_upgrades_page_size_without_losing_rows() {
+    fn populated_wal_store_keeps_legacy_page_size_without_losing_rows_or_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join(cache_db_file_name());
-        let mut conn = Connection::open(&db_path).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE existing(value TEXT PRIMARY KEY) WITHOUT ROWID, STRICT;
-             INSERT INTO existing VALUES('alpha'), ('beta'), ('gamma');",
+             INSERT INTO existing VALUES('alpha'), ('beta'), ('gamma');
+             PRAGMA application_id=2462;
+             PRAGMA user_version=1234;",
         )
         .unwrap();
         assert_eq!(connection_page_size(&conn), 4096);
@@ -2238,12 +2225,66 @@ mod tests {
             "wal"
         );
 
-        configure_connection(&mut conn).unwrap();
+        // Keep a separate reader transaction open while the writer is
+        // configured. The legacy page-size path tried to switch this WAL
+        // store to rollback mode before VACUUM, which waited on this reader.
+        let reader = Connection::open(&db_path).unwrap();
+        reader
+            .execute_batch("PRAGMA journal_mode=WAL; BEGIN;")
+            .unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT COUNT(*) FROM existing", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+
+        // The limit is deliberately generous for a non-benchmark regression,
+        // while still rejecting the old multi-second reader/VACUUM wait. If a
+        // pre-fix implementation is ever tested, release the reader before
+        // joining the worker so the failure remains bounded.
+        let (configured_tx, configured_rx) = std::sync::mpsc::channel();
+        let configure_started = Instant::now();
+        let configure_thread = thread::spawn(move || {
+            let mut conn = conn;
+            let result = configure_connection(&mut conn);
+            configured_tx
+                .send((conn, result, configure_started.elapsed()))
+                .unwrap();
+        });
+        let configure_limit = Duration::from_secs(10);
+        let (mut conn, configure_result, configure_elapsed) = match configured_rx
+            .recv_timeout(configure_limit)
+        {
+            Ok(completion) => {
+                configure_thread.join().unwrap();
+                completion
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                reader.execute_batch("ROLLBACK").unwrap();
+                let _ = configure_thread.join();
+                panic!(
+                    "configure_connection exceeded {configure_limit:?} while a reader transaction was open"
+                );
+            }
+            Err(error) => {
+                reader.execute_batch("ROLLBACK").unwrap();
+                let _ = configure_thread.join();
+                panic!("configure_connection worker disconnected: {error}");
+            }
+        };
+        reader.execute_batch("ROLLBACK").unwrap();
+        configure_result.unwrap();
+        assert!(
+            configure_elapsed < configure_limit,
+            "configure_connection took {configure_elapsed:?} with an active reader"
+        );
 
         assert_eq!(
             connection_page_size(&conn),
-            CACHE_PAGE_SIZE_BYTES,
-            "an existing populated store must be rebuilt to the cache page size"
+            4096,
+            "an existing populated store must not be rebuilt for page-size tuning"
         );
         assert_eq!(
             conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
@@ -2257,24 +2298,38 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             3,
-            "VACUUM must preserve existing rows"
+            "connection setup must preserve existing rows"
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2462,
+            "connection setup must preserve SQLite metadata"
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1234,
+            "connection setup must preserve the schema version metadata"
         );
         assert!(quick_check_is_ok(&conn).unwrap());
 
-        // The upgrade is a persistent file property: reconfiguring the same
-        // store observes the target size and does not rebuild again.
+        // Reconfiguring the same legacy store is safe and remains rewrite-free.
         configure_connection(&mut conn).unwrap();
-        assert_eq!(connection_page_size(&conn), CACHE_PAGE_SIZE_BYTES);
+        assert_eq!(connection_page_size(&conn), 4096);
+        assert!(quick_check_is_ok(&conn).unwrap());
     }
 
     #[test]
-    fn populated_rollback_store_upgrades_page_size() {
+    fn populated_rollback_store_keeps_legacy_page_size() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join(cache_db_file_name());
         let mut conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(
             "CREATE TABLE existing(value TEXT PRIMARY KEY) WITHOUT ROWID, STRICT;
-             INSERT INTO existing VALUES('alpha');",
+             INSERT INTO existing VALUES('alpha');
+             PRAGMA application_id=2462;
+             PRAGMA user_version=5678;",
         )
         .unwrap();
         assert_eq!(connection_page_size(&conn), 4096);
@@ -2287,7 +2342,11 @@ mod tests {
 
         configure_connection(&mut conn).unwrap();
 
-        assert_eq!(connection_page_size(&conn), CACHE_PAGE_SIZE_BYTES);
+        assert_eq!(
+            connection_page_size(&conn),
+            4096,
+            "an existing populated store must not be rebuilt for page-size tuning"
+        );
         assert_eq!(
             conn.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
                 .unwrap()
@@ -2300,6 +2359,21 @@ mod tests {
                 .unwrap(),
             1
         );
+        assert_eq!(
+            conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2462
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            5678
+        );
+        assert!(quick_check_is_ok(&conn).unwrap());
+
+        configure_connection(&mut conn).unwrap();
+        assert_eq!(connection_page_size(&conn), 4096);
+        assert!(quick_check_is_ok(&conn).unwrap());
     }
 
     fn sqlite_initialization_error(code: i32) -> InitializationPhaseError {

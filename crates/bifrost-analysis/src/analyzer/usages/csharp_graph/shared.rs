@@ -4,10 +4,12 @@ use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{
     CSharpAnalyzer, CodeUnit, IAnalyzer, Language, ProjectFile, resolve_analyzer,
 };
 use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_csharp::graph::extractor::{ScanState, prepare_file, scan_prepared_file};
 use brokk_bifrost_csharp::graph::resolver::TargetSpec;
 use std::collections::BTreeSet;
@@ -30,6 +32,8 @@ impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
@@ -75,7 +79,15 @@ impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
                 continue;
             };
             for spec in &specs {
-                scan_prepared_file(self.csharp, &graph, &file, &prepared, spec, &mut state);
+                scan_prepared_file(
+                    self.csharp,
+                    token,
+                    &graph,
+                    &file,
+                    &prepared,
+                    spec,
+                    &mut state,
+                );
                 if *state.limit_exceeded {
                     break;
                 }
@@ -119,24 +131,26 @@ impl<'a> CSharpEdgeResolver<'a> {
     pub(crate) fn build_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         nodes: &HashSet<String>,
         keep_file: F,
     ) -> UsageEdges
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        build_csharp_edges(analyzer, self.csharp, &self.files, nodes, keep_file)
+        build_csharp_edges(analyzer, token, self.csharp, &self.files, nodes, keep_file)
     }
 
     pub(crate) fn build_edge_weights<F>(
         &self,
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         nodes: &HashSet<String>,
         keep_file: F,
     ) -> UsageEdgeWeights
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        build_csharp_edges(analyzer, self.csharp, &self.files, nodes, keep_file)
+        build_csharp_edges(analyzer, token, self.csharp, &self.files, nodes, keep_file)
     }
 }

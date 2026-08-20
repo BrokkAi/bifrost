@@ -20,6 +20,7 @@ use crate::graph_support::CppSource;
 use brokk_bifrost_core::analyzer::fq_name::segment_interner;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
@@ -1338,9 +1339,16 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         })
                     })
                 {
-                    template_reference_name_node(hit_node)
+                    let terminal = template_reference_name_node(hit_node)
                         .map(function_terminal_node)
-                        .unwrap_or(hit_node)
+                        .unwrap_or(hit_node);
+                    push_type_hit(hit_node, ctx);
+                    if terminal.start_byte() != hit_node.start_byte()
+                        || terminal.end_byte() != hit_node.end_byte()
+                    {
+                        push_type_hit(terminal, ctx);
+                    }
+                    return;
                 } else if qualified_type_scope_contains_template(hit_node) {
                     function_terminal_node(hit_node)
                 } else {
@@ -1348,7 +1356,26 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 };
                 let hit_node = target_guided_missing_orphaned_namespace_type_leaf(hit_node, ctx)
                     .unwrap_or(hit_node);
-                push_type_hit(type_reference_hit_node(hit_node), ctx);
+                let hit_node = type_reference_hit_node(hit_node);
+                let qualified_alias = qualified_alias_reference_preserves_target(
+                    node,
+                    &ctx.spec.target,
+                    &ctx.analyzer,
+                    ctx.visibility,
+                    ctx.file,
+                    ctx.source,
+                );
+                push_type_hit(hit_node, ctx);
+                if qualified_alias_reference_requires_terminal(qualified_alias)
+                    || initialized_type_declaration_with_cast(node)
+                {
+                    let terminal = function_terminal_node(hit_node);
+                    if terminal.start_byte() != hit_node.start_byte()
+                        || terminal.end_byte() != hit_node.end_byte()
+                    {
+                        push_type_hit(terminal, ctx);
+                    }
+                }
             }
             return;
         }
@@ -5046,7 +5073,14 @@ fn nearer_type_name_shadows_structured_reference(node: Node<'_>, ctx: &ScanCtx<'
 }
 
 fn local_type_name_shadows(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    if cpp_active_template_type_parameter(node, ctx.spec.target.identifier(), ctx.source) {
+    // One question per node in the usage scan, which does not otherwise index
+    // the tree; see `ParentIndex::unindexed`.
+    if cpp_active_template_type_parameter(
+        node,
+        ctx.spec.target.identifier(),
+        ctx.source,
+        &ParentIndex::unindexed(),
+    ) {
         return true;
     }
     let Some(callable) = nearest_callable_scope(node) else {
@@ -7304,7 +7338,12 @@ fn recovered_receiver_alias_target(
     let (components, global) = type_reference_components(type_node, ctx.source)?;
     if !global
         && components.len() == 2
-        && cpp_active_template_type_parameter(type_node, &components[0], ctx.source)
+        && cpp_active_template_type_parameter(
+            type_node,
+            &components[0],
+            ctx.source,
+            &ParentIndex::unindexed(),
+        )
     {
         let alias_provider = ctx.analyzer.type_alias_provider()?;
         let concrete = ctx

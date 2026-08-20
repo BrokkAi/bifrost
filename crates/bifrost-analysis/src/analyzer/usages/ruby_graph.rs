@@ -6,6 +6,7 @@
 //! inconclusive evidence instead of query failure.
 
 use crate::analyzer::usages::parsed_tree::ParseSpec;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 mod shared;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
@@ -49,7 +50,9 @@ pub(crate) fn with_ruby_graph_source<R>(
     let definitions = |consume: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| {
         consume(&analyzer.global_usage_definition_index());
     };
+    let scope = AnalyzerQueryScope::new(analyzer);
     visit(RubyGraphSource {
+        token: scope.token(),
         index: analyzer,
         definitions: &definitions,
     })

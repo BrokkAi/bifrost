@@ -7,6 +7,8 @@
 //! Java-to-Scala cross-language scan, and the dead-code bulk routing predicate.
 
 use crate::analyzer::usages::parsed_tree::ParseSpec;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 mod shared;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
@@ -51,7 +53,9 @@ pub(in crate::analyzer::usages) fn with_java_graph_source<R>(
         consume(&analyzer.global_usage_definition_index());
     };
     let import_statements = |file: &ProjectFile| analyzer.import_statements(file);
+    let scope = AnalyzerQueryScope::new(analyzer);
     visit(JavaGraphSource {
+        token: scope.token(),
         index: analyzer,
         hierarchy: analyzer.type_hierarchy_provider(),
         definitions: &definitions,
@@ -97,6 +101,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scan_jvm_files_for_foreign_type(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     candidate_files: &HashSet<ProjectFile>,
     target: &CodeUnit,
     max_usages: usize,
@@ -111,7 +116,7 @@ pub(crate) fn scan_jvm_files_for_foreign_type(
     let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
         return;
     };
-    let Some(spec) = TargetSpec::from_target(java, target) else {
+    let Some(spec) = TargetSpec::from_target(java, token, target) else {
         return;
     };
     let mut state = ScanState {
@@ -137,7 +142,15 @@ pub(crate) fn scan_jvm_files_for_foreign_type(
     java_files.sort();
     with_java_graph_source(analyzer, |graph| {
         for file in java_files {
-            extractor::scan_file(java, &graph, &file, &spec, &return_caches, &mut state);
+            extractor::scan_file(
+                java,
+                token,
+                &graph,
+                &file,
+                &spec,
+                &return_caches,
+                &mut state,
+            );
             if *state.limit_exceeded {
                 return;
             }
@@ -154,6 +167,7 @@ pub(crate) enum JavaDeadCodeBulkEligibility {
 
 pub(crate) fn dead_code_bulk_eligibility(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     target: &CodeUnit,
     overloaded_fqns: &HashSet<String>,
     static_imports_present: bool,
@@ -162,7 +176,7 @@ pub(crate) fn dead_code_bulk_eligibility(
     let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
         return JavaDeadCodeBulkEligibility::NeedsPrecise;
     };
-    let Some(spec) = TargetSpec::from_target(java, target) else {
+    let Some(spec) = TargetSpec::from_target(java, token, target) else {
         return JavaDeadCodeBulkEligibility::NeedsPrecise;
     };
     match spec.kind {
@@ -351,8 +365,10 @@ fn scan_scala_files_for_foreign_target(
             max_usages: state.max_usages,
             limit_exceeded: false,
         };
+        let scope = AnalyzerQueryScope::new(analyzer);
         brokk_bifrost_jvm::scala::graph::inverted::scan_scala_query_file(
             scala,
+            scope.token(),
             analyzer,
             &dispatch,
             file,
@@ -389,6 +405,8 @@ where
     Output: crate::analyzer::usages::inverted_edges::UsageEdgeBuildOutput<String>,
     F: Fn(&ProjectFile) -> bool + Sync,
 {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     use crate::analyzer::usages::inverted_edges::{
         ClassRangeIndex, build_edge_output, build_file_declarations_from_state_with_file_scope,
         build_file_declarations_with_file_scope, class_range_index_from_state,
@@ -436,7 +454,7 @@ where
                 nodes,
                 ParseSpec::whole(&language),
                 declarations,
-                |input| scan_inverted_file(java, &graph, file, input, class_ranges, &caches),
+                |input| scan_inverted_file(java, token, &graph, file, input, class_ranges, &caches),
             )
         })
     })

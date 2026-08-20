@@ -69,6 +69,7 @@ use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_rql::schema::{reference_kind_label, usage_proof_label};
 use brokk_bifrost_rql::{
     CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
@@ -103,6 +104,7 @@ mod receiver;
 mod relations;
 mod render;
 use super::occurrence_rows::OccurrenceDerivationOptions;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use applicability::{CallableApplicabilityValue, OverloadSelectionValue};
 use callable_signature::{CallableSignatureValue, SignatureParameterValue};
 use dispatch::{DispatchSiteValue, DispatchTargetValue};
@@ -1260,16 +1262,20 @@ pub fn execute_request(analyzer: &dyn IAnalyzer, query: &CodeQuery) -> CodeQuery
 
 pub fn execute_request_with_limits(
     analyzer: &dyn IAnalyzer,
+
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResponse {
-    execute_request_internal(analyzer, None, query, limits, None, None, None)
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    execute_request_internal(analyzer, token, None, query, limits, None, None, None)
 }
 
 /// Honor the query's root execution mode with access to generation-bound
 /// semantic oracles for receiver traversal.
 pub fn execute_workspace_request(
     workspace: &WorkspaceAnalyzer,
+
     query: &CodeQuery,
 ) -> CodeQueryResponse {
     execute_workspace_request_with_limits(workspace, query, CodeQueryExecutionLimits::default())
@@ -1277,11 +1283,15 @@ pub fn execute_workspace_request(
 
 pub fn execute_workspace_request_with_limits(
     workspace: &WorkspaceAnalyzer,
+
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResponse {
+    let scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let token = scope.token();
     execute_request_internal(
         workspace.analyzer(),
+        token,
         Some(workspace),
         query,
         limits,
@@ -1298,6 +1308,7 @@ pub fn execute_workspace_request_with_limits(
 /// explain remains planning-only.
 pub fn execute_workspace_request_with_registrations(
     workspace: &WorkspaceAnalyzer,
+
     workspace_generation: u64,
     registrations: &ProtocolRegistrationSet,
     query: &CodeQuery,
@@ -1313,15 +1324,19 @@ pub fn execute_workspace_request_with_registrations(
 
 pub fn execute_workspace_request_with_registration_limits(
     workspace: &WorkspaceAnalyzer,
+
     workspace_generation: u64,
     registrations: &ProtocolRegistrationSet,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResponse {
+    let scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let token = scope.token();
     let value_flow_registrations = ValueFlowPlanRegistrationSet::default();
     let taint_registrations = TaintResultRegistrationSet::default();
     execute_request_internal(
         workspace.analyzer(),
+        token,
         Some(workspace),
         query,
         limits,
@@ -1857,6 +1872,7 @@ struct ParallelUnionExecution {
 #[doc(hidden)]
 pub fn execute_with_limits(
     analyzer: &dyn IAnalyzer,
+
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResult {
@@ -1868,11 +1884,15 @@ pub fn execute_with_limits(
 #[doc(hidden)]
 pub fn execute_workspace_with_limits(
     workspace: &WorkspaceAnalyzer,
+
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResult {
+    let scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let token = scope.token();
     let mut result = execute_internal_with_analysis(
         workspace.analyzer(),
+        token,
         Some(workspace),
         None,
         0,
@@ -1904,12 +1924,16 @@ pub(crate) fn execute_with_cancellation(
 /// cancellation-safe partial result to the caller.
 pub fn execute_request_with_cancellation(
     analyzer: &dyn IAnalyzer,
+
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: &CancellationToken,
 ) -> CodeQueryResponse {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     execute_request_internal(
         analyzer,
+        token,
         None,
         query,
         limits,
@@ -1924,12 +1948,16 @@ pub fn execute_request_with_cancellation(
 /// workspace.
 pub fn execute_workspace_request_with_cancellation(
     workspace: &WorkspaceAnalyzer,
+
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: &CancellationToken,
 ) -> CodeQueryResponse {
+    let scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let token = scope.token();
     execute_request_internal(
         workspace.analyzer(),
+        token,
         Some(workspace),
         query,
         limits,
@@ -1941,16 +1969,20 @@ pub fn execute_workspace_request_with_cancellation(
 
 pub fn execute_workspace_request_with_registration_cancellation(
     workspace: &WorkspaceAnalyzer,
+
     workspace_generation: u64,
     registrations: &ProtocolRegistrationSet,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: &CancellationToken,
 ) -> CodeQueryResponse {
+    let scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let token = scope.token();
     let value_flow_registrations = ValueFlowPlanRegistrationSet::default();
     let taint_registrations = TaintResultRegistrationSet::default();
     execute_request_internal(
         workspace.analyzer(),
+        token,
         Some(workspace),
         query,
         limits,
@@ -1971,6 +2003,7 @@ pub fn execute_workspace_request_with_registration_cancellation(
 /// exact production results without introducing process-global state.
 pub fn execute_workspace_request_with_registration_lease(
     workspace: &WorkspaceAnalyzer,
+
     workspace_generation: u64,
     registrations: &ProtocolRegistrationSet,
     query: &CodeQuery,
@@ -1994,6 +2027,7 @@ pub fn execute_workspace_request_with_registration_lease(
 #[allow(clippy::too_many_arguments)]
 pub fn execute_workspace_request_with_analysis_registration_lease(
     workspace: &WorkspaceAnalyzer,
+
     workspace_generation: u64,
     registrations: &ProtocolRegistrationSet,
     value_flow_registrations: &ValueFlowPlanRegistrationSet,
@@ -2019,6 +2053,7 @@ pub fn execute_workspace_request_with_analysis_registration_lease(
 #[allow(clippy::too_many_arguments)]
 pub fn execute_workspace_request_with_all_analysis_registration_lease(
     workspace: &WorkspaceAnalyzer,
+
     workspace_generation: u64,
     registrations: &ProtocolRegistrationSet,
     value_flow_registrations: &ValueFlowPlanRegistrationSet,
@@ -2028,8 +2063,11 @@ pub fn execute_workspace_request_with_all_analysis_registration_lease(
     cancellation: Option<&CancellationToken>,
     summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
 ) -> CodeQueryResponse {
+    let scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let token = scope.token();
     execute_request_internal(
         workspace.analyzer(),
+        token,
         Some(workspace),
         query,
         limits,
@@ -2044,8 +2082,10 @@ pub fn execute_workspace_request_with_all_analysis_registration_lease(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_request_internal(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     workspace: Option<&WorkspaceAnalyzer>,
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
@@ -2126,6 +2166,7 @@ fn execute_request_internal(
         CodeQueryExecutionMode::Results => {
             let mut result = execute_internal_with_analysis(
                 analyzer,
+                token,
                 workspace,
                 analysis_context.as_ref(),
                 workspace_generation,
@@ -2157,6 +2198,7 @@ fn execute_request_internal(
         CodeQueryExecutionMode::Profile => {
             let detailed = execute_internal_with_analysis(
                 analyzer,
+                token,
                 workspace,
                 analysis_context.as_ref(),
                 workspace_generation,
@@ -2187,12 +2229,16 @@ fn execute_request_internal(
 
 pub fn execute_code_query_detailed(
     analyzer: &dyn IAnalyzer,
+
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DetailedCodeQueryResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     execute_internal_with_analysis(
         analyzer,
+        token,
         None,
         None,
         0,
@@ -2209,16 +2255,20 @@ pub fn execute_code_query_detailed(
 /// use instead of deferring it to a later request.
 pub fn execute_code_query_detailed_eager_index(
     analyzer: &dyn IAnalyzer,
+
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DetailedCodeQueryResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let access_mode = match benchmark_structural_access_mode() {
         StructuralAccessMode::ScanOnly => StructuralAccessMode::ScanOnly,
         _ => StructuralAccessMode::EagerAuto,
     };
     execute_internal_with_analysis_strategy(
         analyzer,
+        token,
         None,
         None,
         0,
@@ -2246,16 +2296,20 @@ pub fn execute_code_query_detailed_eager_index(
 /// than mistaken for an unresolved reference.
 pub fn execute_code_query_detailed_eager_index_without_targets(
     analyzer: &dyn IAnalyzer,
+
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DetailedCodeQueryResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let access_mode = match benchmark_structural_access_mode() {
         StructuralAccessMode::ScanOnly => StructuralAccessMode::ScanOnly,
         _ => StructuralAccessMode::EagerAuto,
     };
     execute_internal_with_analysis_strategy(
         analyzer,
+        token,
         None,
         None,
         0,
@@ -2280,16 +2334,20 @@ pub fn execute_code_query_detailed_eager_index_without_targets(
 /// step reports `SemanticWorkspaceRequired` and the plan is invalid.
 pub fn execute_code_query_detailed_eager_index_workspace(
     workspace: &WorkspaceAnalyzer,
+
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
     cancellation: Option<&CancellationToken>,
 ) -> DetailedCodeQueryResult {
+    let scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let token = scope.token();
     let access_mode = match benchmark_structural_access_mode() {
         StructuralAccessMode::ScanOnly => StructuralAccessMode::ScanOnly,
         _ => StructuralAccessMode::EagerAuto,
     };
     execute_internal_with_analysis_strategy(
         workspace.analyzer(),
+        token,
         Some(workspace),
         None,
         0,
@@ -2314,7 +2372,11 @@ pub(crate) fn execute_code_query_profiled(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> DetailedCodeQueryResult {
-    execute_internal_with_analysis(analyzer, None, None, 0, query, limits, None, None, true)
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    execute_internal_with_analysis(
+        analyzer, token, None, None, 0, query, limits, None, None, true,
+    )
 }
 
 /// M4 benchmark/test entry point. A forced strategy still passes through the
@@ -2327,8 +2389,11 @@ pub(crate) fn execute_code_query_with_union_strategy(
     strategy: UnionExecutionStrategy,
     capture_profile: bool,
 ) -> DetailedCodeQueryResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     execute_internal_with_analysis_strategy(
         analyzer,
+        token,
         None,
         None,
         0,
@@ -2354,8 +2419,11 @@ pub(crate) fn execute_code_query_with_access_mode(
     capture_profile: bool,
 ) -> Result<DetailedCodeQueryResult, String> {
     let mut failure = None;
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let detailed = execute_internal_with_analysis_strategy(
         analyzer,
+        token,
         None,
         None,
         0,
@@ -2382,8 +2450,11 @@ fn execute_with_receiver_budget_for_test(
     query: &CodeQuery,
     receiver_budget: ReceiverAnalysisBudget,
 ) -> CodeQueryResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     execute_internal_with_analysis(
         analyzer,
+        token,
         None,
         None,
         0,
@@ -2406,8 +2477,11 @@ fn execute_internal(
     receiver_budget_override: Option<ReceiverAnalysisBudget>,
     capture_profile: bool,
 ) -> DetailedCodeQueryResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     execute_internal_with_analysis(
         analyzer,
+        token,
         workspace,
         None,
         0,
@@ -2422,6 +2496,7 @@ fn execute_internal(
 #[allow(clippy::too_many_arguments)]
 fn execute_internal_with_analysis(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     workspace: Option<&WorkspaceAnalyzer>,
     analysis_context: Option<&QueryAnalysisContext>,
     workspace_generation: u64,
@@ -2433,6 +2508,7 @@ fn execute_internal_with_analysis(
 ) -> DetailedCodeQueryResult {
     execute_internal_with_analysis_strategy(
         analyzer,
+        token,
         workspace,
         analysis_context,
         workspace_generation,
@@ -2471,8 +2547,11 @@ fn execute_internal_with_strategy(
     access_mode: StructuralAccessMode,
     access_failure_out: Option<&mut Option<String>>,
 ) -> DetailedCodeQueryResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     execute_internal_with_analysis_strategy(
         analyzer,
+        token,
         workspace,
         None,
         0,
@@ -2492,6 +2571,7 @@ fn execute_internal_with_strategy(
 #[allow(clippy::too_many_arguments)]
 fn execute_internal_with_analysis_strategy(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     workspace: Option<&WorkspaceAnalyzer>,
     analysis_context: Option<&QueryAnalysisContext>,
     workspace_generation: u64,
@@ -2604,6 +2684,7 @@ fn execute_internal_with_analysis_strategy(
     let execution_started = capture_profile.then(Instant::now);
     let mut execution = execute_plan(
         &physical_plan,
+        token,
         physical_plan.root(),
         &mut state,
         limits,

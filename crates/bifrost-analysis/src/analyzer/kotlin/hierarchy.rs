@@ -16,6 +16,7 @@ use crate::analyzer::{
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_jvm::kotlin::hierarchy::{
     KotlinHierarchyFact, build_kotlin_direct_descendant_index, kotlin_resolve_direct_ancestors,
 };
@@ -23,6 +24,7 @@ use brokk_bifrost_jvm::realm::JvmSourceRealm;
 use std::sync::Arc;
 
 use super::KotlinAnalyzer;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
 impl KotlinHierarchyFact for HierarchyDeclarationFacts {
     fn declaration(&self) -> &CodeUnit {
@@ -40,12 +42,17 @@ impl KotlinHierarchyFact for HierarchyDeclarationFacts {
 
 impl TypeHierarchyProvider for KotlinAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.direct_ancestors_in_realm(code_unit, None)
+        let query_scope = AnalyzerQueryScope::new(self);
+        let token = query_scope.token();
+        self.direct_ancestors_in_realm(token, code_unit, None)
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+        let query_scope = AnalyzerQueryScope::new(self);
+        let token = query_scope.token();
         let uncancelled = CancellationToken::default();
         self.direct_descendants_in_realm(
+            token,
             code_unit,
             None,
             &DescendantIndexScope::whole_workspace(&uncancelled),
@@ -58,7 +65,9 @@ impl TypeHierarchyProvider for KotlinAnalyzer {
         code_unit: &CodeUnit,
         scope: &DescendantIndexScope<'_>,
     ) -> Option<HashSet<CodeUnit>> {
-        self.direct_descendants_in_realm(code_unit, None, scope)
+        let query_scope = AnalyzerQueryScope::new(self);
+        let token = query_scope.token();
+        self.direct_descendants_in_realm(token, code_unit, None, scope)
     }
 }
 
@@ -67,6 +76,7 @@ impl KotlinAnalyzer {
     /// source realm when a realm view is supplied.
     pub(crate) fn direct_ancestors_in_realm(
         &self,
+        token: QueryToken<'_>,
         code_unit: &CodeUnit,
         realm: Option<&JvmSourceRealm<'_>>,
     ) -> Vec<CodeUnit> {
@@ -77,13 +87,14 @@ impl KotlinAnalyzer {
         if let Some(cached) = cache.get(code_unit) {
             return (*cached).clone();
         }
-        let ancestors = kotlin_resolve_direct_ancestors(self, code_unit, realm);
+        let ancestors = kotlin_resolve_direct_ancestors(self, token, code_unit, realm);
         cache.insert(code_unit.clone(), Arc::new(ancestors.clone()));
         ancestors
     }
 
     pub(crate) fn direct_descendants_in_realm(
         &self,
+        token: QueryToken<'_>,
         code_unit: &CodeUnit,
         realm: Option<&JvmSourceRealm<'_>>,
         scope: &DescendantIndexScope<'_>,
@@ -93,12 +104,13 @@ impl KotlinAnalyzer {
             None => &self.direct_descendant_index,
         };
         descendants_from_variant_index(index, scope, code_unit, || {
-            self.build_direct_descendant_index(realm, scope)
+            self.build_direct_descendant_index(token, realm, scope)
         })
     }
 
     fn build_direct_descendant_index(
         &self,
+        token: QueryToken<'_>,
         realm: Option<&JvmSourceRealm<'_>>,
         scope: &DescendantIndexScope<'_>,
     ) -> Option<DirectDescendantIndex> {
@@ -117,6 +129,7 @@ impl KotlinAnalyzer {
             self,
             realm,
             scope,
+            token,
         )
     }
 }

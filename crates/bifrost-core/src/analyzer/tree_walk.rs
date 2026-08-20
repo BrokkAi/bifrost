@@ -451,10 +451,88 @@ pub fn walk_tree_iterative<State>(
     }
 }
 
+/// Push `node`'s named children so the walk pops them in source order.
+///
+/// Collected through a cursor rather than by `named_child(index)`: tree-sitter
+/// resolves a child by index by stepping a fresh cursor from the first child, so
+/// an index loop over `k` children costs `O(k^2)`. A generated source file whose
+/// program node holds tens of thousands of statements pays that once per level
+/// (#2369). The cursor walks each child exactly once instead, and the reversal
+/// of the freshly pushed span keeps the original visit order.
 fn push_named_children<'tree>(node: Node<'tree>, stack: &mut Vec<TreeWalkFrame<'tree>>) {
-    for index in (0..node.named_child_count()).rev() {
-        if let Some(child) = node.named_child(index) {
-            stack.push(TreeWalkFrame::Enter(child));
+    let mut cursor = node.walk();
+    let first_pushed = stack.len();
+    stack.extend(node.named_children(&mut cursor).map(TreeWalkFrame::Enter));
+    stack[first_pushed..].reverse();
+}
+
+/// The parent of every node in one tree, recorded by a single downward pass.
+///
+/// A tree-sitter node carries no parent pointer. `ts_node_parent` recovers one
+/// by re-descending from the root, scanning each level's children until it finds
+/// the one that contains the node, so a single call costs the node's position in
+/// the tree. A file whose translation unit holds thousands of siblings therefore
+/// makes one parent question cost thousands of steps, and asking it once per
+/// declaration is quadratic in the file (#2361, and #2369 for the same shape in
+/// JavaScript).
+///
+/// The relation the question asks about is fixed for the tree, so one preorder
+/// pass records all of it and every later question is a hash lookup.
+/// [`Self::parent`] answers exactly what [`Node::parent`] answers -- it is built
+/// from the same visible-child relation `ts_node_parent` descends through -- so
+/// substituting it cannot change a walk's result.
+///
+/// The index owns one entry per node, so it costs memory proportional to the
+/// tree. Build it for the tree a walk is about to traverse and drop it with the
+/// walk.
+pub struct ParentIndex<'tree> {
+    parents: crate::hash::HashMap<usize, Node<'tree>>,
+}
+
+impl<'tree> ParentIndex<'tree> {
+    /// Record the parent of every node beneath `root`.
+    pub fn new(root: Node<'tree>) -> Self {
+        let mut parents = crate::hash::HashMap::default();
+        let mut cursor = root.walk();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            // Visible children, named and anonymous alike: that is the relation
+            // `ts_node_parent` walks, so an index built from anything narrower
+            // would answer a different question for an anonymous node.
+            cursor.reset(node);
+            let before = stack.len();
+            stack.extend(node.children(&mut cursor));
+            for child in &stack[before..] {
+                parents.insert(child.id(), node);
+            }
+        }
+        Self { parents }
+    }
+
+    /// An index that records nothing, so every question is answered by
+    /// [`Node::parent`] itself.
+    ///
+    /// This is what a caller outside a traversal passes: it asks a bounded
+    /// number of parent questions about a tree it does not otherwise walk, so
+    /// indexing the tree would cost more than the questions do. It allocates
+    /// nothing. A per-node caller inside a walk must pass a real index instead
+    /// -- that is the shape this type exists to remove.
+    pub fn unindexed() -> Self {
+        Self {
+            parents: crate::hash::HashMap::default(),
+        }
+    }
+
+    /// The parent of `node`, or `None` for the root.
+    ///
+    /// A node the index does not hold -- the indexed root, a node of another
+    /// tree, or any node at all when the index is [`Self::unindexed`] -- falls
+    /// back to [`Node::parent`], which answers the same question and pays the
+    /// walk this index exists to avoid.
+    pub fn parent(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        match self.parents.get(&node.id()) {
+            Some(parent) => Some(*parent),
+            None => node.parent(),
         }
     }
 }

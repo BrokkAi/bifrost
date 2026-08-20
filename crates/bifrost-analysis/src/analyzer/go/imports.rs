@@ -9,6 +9,7 @@
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ImportInfo, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_go::imports::{
     GoImportTables, build_go_dir_parent_files, build_go_dir_parent_suffix_files,
     build_go_package_files, dir_suffix_matches, go_directory_sibling_import_files, go_import_path,
@@ -17,9 +18,12 @@ use brokk_bifrost_go::imports::{
 use std::sync::Arc;
 
 use super::GoAnalyzer;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
 impl ImportAnalysisProvider for GoAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         if let Some(cached) = self.memo_caches.imported_code_units.get(file) {
             return cached;
         }
@@ -28,7 +32,7 @@ impl ImportAnalysisProvider for GoAnalyzer {
             &self.inner,
             &self.import_tables(),
             file,
-            &self.inner.import_info_of(file),
+            &self.inner.import_info_of(token, file),
         ));
 
         self.memo_caches
@@ -57,8 +61,8 @@ impl ImportAnalysisProvider for GoAnalyzer {
         referencing
     }
 
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
-        self.inner.import_info_of(file)
+    fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
+        self.inner.import_info_of(token, file)
     }
 
     fn imported_files_from_infos(
@@ -89,8 +93,13 @@ impl ImportAnalysisProvider for GoAnalyzer {
     }
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         let source = self.inner.get_source(code_unit, false).unwrap_or_default();
-        go_relevant_imports_for(&source, &self.inner.import_info_of(code_unit.source()))
+        go_relevant_imports_for(
+            &source,
+            &self.inner.import_info_of(token, code_unit.source()),
+        )
     }
 
     fn could_import_file(
@@ -118,6 +127,7 @@ impl GoAnalyzer {
     /// usage analysis.
     pub(crate) fn definition_import_namespaces(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
     ) -> (HashMap<String, Vec<String>>, Vec<String>) {
         brokk_bifrost_go::imports::go_definition_import_namespaces(
@@ -125,7 +135,7 @@ impl GoAnalyzer {
             self.workspace_path_index(),
             |candidate| self.package_clause_of(candidate),
             file,
-            &self.inner.import_info_of(file),
+            &self.inner.import_info_of(token, file),
         )
     }
 

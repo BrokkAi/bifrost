@@ -14,6 +14,7 @@ pub mod inverted;
 pub mod resolver;
 pub mod syntax;
 
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{CodeUnitIndex, DefinitionLookupAccess};
 
 /// The *dispatching* analyzer's side of a Ruby usage-graph scan.
@@ -33,6 +34,9 @@ use brokk_bifrost_core::analyzer::{CodeUnitIndex, DefinitionLookupAccess};
 /// returning a handle would force the build there too.
 #[derive(Clone, Copy)]
 pub struct RubyGraphSource<'a> {
+    /// Proof that a request scope is open: the import accessors reached from
+    /// this source cross the import tier's storage (issue #2423).
+    pub token: QueryToken<'a>,
     pub index: &'a dyn CodeUnitIndex,
     pub definitions: &'a DefinitionLookupAccess<'a>,
 }

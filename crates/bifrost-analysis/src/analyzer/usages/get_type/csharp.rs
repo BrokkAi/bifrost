@@ -10,10 +10,13 @@ use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, resolve_analyzer};
 use crate::cancellation::CancellationToken;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use tree_sitter::Tree;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_csharp_type_bounded(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -22,12 +25,14 @@ pub(crate) fn resolve_csharp_type_bounded(
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<TypeLookupOutcome> {
     let session = ResolutionSession::bounded(budget, cancellation);
-    let outcome = resolve_csharp_type_in_session(analyzer, file, source, tree, site, &session);
+    let outcome =
+        resolve_csharp_type_in_session(analyzer, token, file, source, tree, site, &session);
     session.finish(outcome)
 }
 
 fn resolve_csharp_type_in_session(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -42,6 +47,7 @@ fn resolve_csharp_type_in_session(
     };
     let resolution = csharp_type_lookup_resolution_in_session(
         analyzer,
+        token,
         file,
         source,
         tree.root_node(),
@@ -163,6 +169,7 @@ mod tests {
     use crate::analyzer::usages::get_definition::parse_tree_for_language;
     use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverBudgetLimit};
     use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+    use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{Language, Range};
     use crate::path_utils::rel_path_string;
     use crate::test_support::AnalyzerFixture;
@@ -205,6 +212,7 @@ mod tests {
     /// resolved outcome and their fixtures fit the default budget comfortably.
     fn complete_csharp_type(
         analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         source: &str,
         tree: Option<&Tree>,
@@ -212,6 +220,7 @@ mod tests {
     ) -> TypeLookupOutcome {
         match resolve_csharp_type_bounded(
             analyzer,
+            token,
             file,
             source,
             tree,
@@ -235,8 +244,10 @@ mod tests {
         let file = ProjectFile::new(fixture.project_root(), file_name);
         let tree = parse_tree_for_language(&file, Language::CSharp, source).expect("C# tree");
         let cancellation = cancel_after_checks.map(CancellationToken::cancel_after_checks_for_test);
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
         resolve_csharp_type_bounded(
             fixture.analyzer.analyzer(),
+            scope.token(),
             &file,
             source,
             Some(&tree),
@@ -281,8 +292,11 @@ public class Consumer
             "factory.Value",
             "factory?.Value",
         ] {
+            let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+            let token = scope.token();
             let outcome = complete_csharp_type(
                 fixture.analyzer.analyzer(),
+                token,
                 &file,
                 source,
                 Some(&tree),
@@ -352,8 +366,11 @@ public class Factory
         let tree = parse_tree_for_language(&file, Language::CSharp, caller).expect("C# tree");
 
         for expression in ["factory.Create()", "factory.Value"] {
+            let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+            let token = scope.token();
             let outcome = resolve_csharp_type_bounded(
                 fixture.analyzer.analyzer(),
+                token,
                 &file,
                 caller,
                 Some(&tree),
@@ -404,8 +421,11 @@ public class Outer
         let file = ProjectFile::new(fixture.project_root(), "NestedReturn.cs");
         let tree = parse_tree_for_language(&file, Language::CSharp, source).expect("C# tree");
         let expression = "factory.Create()";
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let outcome = resolve_csharp_type_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &file,
             source,
             Some(&tree),
@@ -469,8 +489,11 @@ public class Caller
         let tree = parse_tree_for_language(&file, Language::CSharp, source).expect("C# tree");
 
         for expression in ["factory.Create()", "factory.Value", "methods.Create()"] {
+            let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+            let token = scope.token();
             let outcome = resolve_csharp_type_bounded(
                 fixture.analyzer.analyzer(),
+                token,
                 &file,
                 source,
                 Some(&tree),
@@ -490,8 +513,11 @@ public class Caller
         }
 
         let expression = "methods.Create<Service>()";
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let outcome = resolve_csharp_type_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &file,
             source,
             Some(&tree),
@@ -532,8 +558,11 @@ public class Caller
             parse_tree_for_language(&file, Language::CSharp, &thread_source).expect("deep C# tree");
         let site = full_expression_site(&file, &thread_source, &thread_expression);
         let run = move || {
+            let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+            let token = scope.token();
             resolve_csharp_type_bounded(
                 fixture.analyzer.analyzer(),
+                token,
                 &file,
                 &thread_source,
                 Some(&tree),
@@ -642,8 +671,11 @@ public class Caller
             .name("csharp-alternating-chain".to_string())
             .stack_size(512 * 1024)
             .spawn(move || {
+                let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+                let token = scope.token();
                 resolve_csharp_type_bounded(
                     fixture.analyzer.analyzer(),
+                    token,
                     &file,
                     &thread_source,
                     Some(&tree),
@@ -717,8 +749,11 @@ public class Consumer
         );
         let file = ProjectFile::new(fixture.project_root(), "App/Consumer.cs");
         let tree = parse_tree_for_language(&file, Language::CSharp, source).expect("C# tree");
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let outcome = complete_csharp_type(
             fixture.analyzer.analyzer(),
+            token,
             &file,
             source,
             Some(&tree),
@@ -757,8 +792,11 @@ public class Consumer
         let site = full_expression_site(&file, source, "product.ToString()");
         let budget = ReceiverAnalysisBudget::tiny();
 
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let outcome = resolve_csharp_type_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &file,
             source,
             Some(&tree),
@@ -794,8 +832,11 @@ public class Consumer
         let cancellation = CancellationToken::new();
         cancellation.cancel();
 
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let outcome = resolve_csharp_type_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &file,
             source,
             Some(&tree),
@@ -836,8 +877,11 @@ public class Consumer
             focus_end_byte: receiver_end,
         };
 
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
         let outcome = resolve_csharp_type_bounded(
             fixture.analyzer.analyzer(),
+            token,
             &file,
             source,
             Some(&tree),
@@ -885,8 +929,11 @@ public class Child : Parent
         let tree = parse_tree_for_language(&file, Language::CSharp, source).expect("C# tree");
 
         for (keyword, expected_fqn) in [("this", "Demo.Child"), ("base", "Demo.Parent")] {
+            let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+            let token = scope.token();
             let outcome = resolve_csharp_type_bounded(
                 fixture.analyzer.analyzer(),
+                token,
                 &file,
                 source,
                 Some(&tree),

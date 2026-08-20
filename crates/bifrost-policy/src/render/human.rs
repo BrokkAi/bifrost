@@ -19,9 +19,9 @@ use super::super::{
     PolicyLocationRelationship, PolicyMessageSpec, PolicyOverlayScope, PolicyQueryProof,
     PolicyQueryProvenance, PolicyQueryResultRef, PolicyReportDocument, PolicyRuleDescriptor,
     PolicyRun, PolicyRunCompletion, PolicySemanticEvent, PolicySeveritySpec, PolicySourceLocation,
-    PolicySuppressionDecision, PolicySuppressionMatchState, PolicySuppressionPolicyHashState,
-    PolicySuppressionReview, PolicySuppressionTemporalState, ProofMetadata, ProofReason,
-    ProofState, ResolvedEndpointDependency, ResolvedEndpointIdentity,
+    PolicySuppressionDecision, PolicySuppressionMatchState, PolicySuppressionOrphanState,
+    PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicySuppressionTemporalState,
+    ProofMetadata, ProofReason, ProofState, ResolvedEndpointDependency, ResolvedEndpointIdentity,
     ResolvedEndpointManifestEntry, ResolvedMatchDirectoryManifest, ResolvedPrecedenceEdge,
     ResolvedTypestateTerminal, SchemaVersionOrigin, SchemaVersionResolution,
     StableSemanticIdentity, TaintSourceEvidence, TaintSystemEntry, TaintTrustBoundary,
@@ -686,15 +686,22 @@ fn write_suppression_review<W: Write>(
     .map_err(map_io_error)?;
     writeln!(
         output,
-        "  disposition: match {}; temporal {}; policy hash {}; applied {}; stale {}; result omitted {}",
+        "  disposition: match {}; temporal {}; policy hash {}; applied {}; orphan {}; result omitted {}",
         suppression_match_state(review.match_state()),
         suppression_temporal_state(review.temporal_state()),
         suppression_policy_hash_state(review.policy_hash_state()),
         yes_no(review.applied()),
-        yes_no(review.stale()),
+        suppression_orphan_state(review.orphan_state()),
         yes_no(review.result_omitted()),
     )
     .map_err(map_io_error)?;
+    if !review.rekey_candidates().is_empty() {
+        write!(output, "  re-key candidates:").map_err(map_io_error)?;
+        for candidate in review.rekey_candidates() {
+            write!(output, " {candidate}").map_err(map_io_error)?;
+        }
+        writeln!(output).map_err(map_io_error)?;
+    }
     write_suppression_decision(output, review.decision())
 }
 
@@ -2663,10 +2670,15 @@ fn write_summary<W: Write>(
         .iter()
         .filter(|review| review.applied())
         .count();
-    let stale_count = report
+    let orphaned_count = report
         .suppressions()
         .iter()
-        .filter(|review| review.stale())
+        .filter(|review| review.is_orphaned())
+        .count();
+    let unattributable_count = report
+        .suppressions()
+        .iter()
+        .filter(|review| review.orphan_state() == PolicySuppressionOrphanState::PathUnrecorded)
         .count();
     let expired_count = report
         .suppressions()
@@ -2740,7 +2752,12 @@ fn write_summary<W: Write>(
         .filter(|review| review.result_omitted())
         .count();
     write_summary_count(output, scope_result_omitted_count, "scope result omitted")?;
-    write_summary_count(output, stale_count, "stale suppression review")?;
+    write_summary_count(output, orphaned_count, "orphaned suppression record")?;
+    write_summary_count(
+        output,
+        unattributable_count,
+        "unresolved pathless suppression record",
+    )?;
     write_summary_count(output, expired_count, "expired suppression review")?;
     write_summary_count(
         output,
@@ -3164,30 +3181,7 @@ const fn cvss_severity(value: CvssSeverity) -> &'static str {
 }
 
 const fn incomplete_reason(value: PolicyIncompleteReason) -> &'static str {
-    match value {
-        PolicyIncompleteReason::Cancelled => "cancelled",
-        PolicyIncompleteReason::DeadlineExceeded => "deadline_exceeded",
-        PolicyIncompleteReason::QueryResultLimit => "query_result_limit",
-        PolicyIncompleteReason::BatchFindingLimit => "batch_finding_limit",
-        PolicyIncompleteReason::ScannedFileBudget => "scanned_file_budget",
-        PolicyIncompleteReason::SourceByteBudget => "source_byte_budget",
-        PolicyIncompleteReason::FactNodeBudget => "fact_node_budget",
-        PolicyIncompleteReason::PipelineRowBudget => "pipeline_row_budget",
-        PolicyIncompleteReason::ImportGraphBudget => "import_graph_budget",
-        PolicyIncompleteReason::ReferenceCandidateBudget => "reference_candidate_budget",
-        PolicyIncompleteReason::PartialDiscovery => "partial_discovery",
-        PolicyIncompleteReason::CapabilityIncomplete => "capability_incomplete",
-        PolicyIncompleteReason::EndpointDominanceUndecidable => "endpoint_dominance_undecidable",
-        PolicyIncompleteReason::StableAnchorUnavailable => "stable_anchor_unavailable",
-        PolicyIncompleteReason::ReportRetentionBudget => "report_retention_budget",
-        PolicyIncompleteReason::CvssVariantBudget => "cvss_variant_budget",
-        PolicyIncompleteReason::ProjectionScenarioMembershipBudget => {
-            "projection_scenario_membership_budget"
-        }
-        PolicyIncompleteReason::OrganizationalRiskOverlayBudget => {
-            "organizational_risk_overlay_budget"
-        }
-    }
+    value.label()
 }
 
 const fn failure_reason(value: PolicyFailureReason) -> &'static str {
@@ -3280,6 +3274,15 @@ const fn suppression_match_state(value: PolicySuppressionMatchState) -> &'static
         PolicySuppressionMatchState::FindingAbsent => "finding absent",
         PolicySuppressionMatchState::PolicyNotEvaluated => "policy not evaluated",
         PolicySuppressionMatchState::PolicyIncomplete => "policy incomplete",
+    }
+}
+
+const fn suppression_orphan_state(value: PolicySuppressionOrphanState) -> &'static str {
+    match value {
+        PolicySuppressionOrphanState::Resolved => "resolved",
+        PolicySuppressionOrphanState::Orphaned => "orphaned",
+        PolicySuppressionOrphanState::PathNotAnalyzed => "path not analyzed",
+        PolicySuppressionOrphanState::PathUnrecorded => "path unrecorded",
     }
 }
 

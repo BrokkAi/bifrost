@@ -1030,6 +1030,7 @@ pub(super) fn execute_seed(
     let mut pending: Vec<PendingMatch> = Vec::new();
     let mut truncated = false;
     let mut cache_complete = state.cache_profile.as_ref().map(|_| true);
+    let signature_incomplete = super::super::matcher::CallableSignatureIncomplete::default();
     'candidates: for (_path, language, provider, file, access) in candidates {
         if state
             .cancellation
@@ -1290,6 +1291,12 @@ pub(super) fn execute_seed(
             }
         };
         let remaining = match_cap.saturating_sub(pending.len());
+        let signature_oracle = seed.constrains_callable_signature().then(|| {
+            super::relations::FileCallableSignatureOracle::for_file(state.analyzer, &file)
+        });
+        let oracle = signature_oracle
+            .as_ref()
+            .map(|oracle| oracle as &dyn super::super::matcher::CallableSignatureOracle);
         let matches = if indexed_file.is_some() {
             let mut examined = 0u64;
             let matches = super::super::matcher::match_query_candidates(
@@ -1298,6 +1305,8 @@ pub(super) fn execute_seed(
                 selected_facts.iter().copied(),
                 remaining,
                 &mut examined,
+                oracle,
+                &signature_incomplete,
             );
             if let Some(profile) = &mut state.profile {
                 profile.access_path.examined_fact_nodes = profile
@@ -1347,7 +1356,16 @@ pub(super) fn execute_seed(
                     .examined_fact_nodes
                     .saturating_add(u64::try_from(facts.nodes().len()).unwrap_or(u64::MAX));
             }
-            super::super::matcher::match_query(seed, &facts, remaining)
+            let mut examined = 0u64;
+            super::super::matcher::match_query_candidates(
+                seed,
+                &facts,
+                0..u32::try_from(facts.nodes().len()).expect("FileFacts node ids fit in u32"),
+                remaining,
+                &mut examined,
+                oracle,
+                &signature_incomplete,
+            )
         };
         if let Some(lease) = &parallel_budget {
             for fact_match in matches {
@@ -1383,6 +1401,24 @@ pub(super) fn execute_seed(
             cache_complete = cache_complete.map(|_| false);
             break;
         }
+    }
+    if signature_incomplete.visibility_unrecorded.get() {
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: "callable visibility is unrecorded for at least one declaration; results that depend on it are incomplete rather than a clean miss".to_string(),
+        });
+    }
+    if signature_incomplete.parameter_types_unrecorded.get() {
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::UnsupportedStructuralFeature,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: "workspace",
+            message: "callable parameter types are unrecorded for at least one declaration; results that depend on them are incomplete rather than a clean miss".to_string(),
+        });
     }
     if selected_index_generations
         .iter()

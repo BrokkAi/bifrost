@@ -1,6 +1,7 @@
 //! Bounded, capability-confined policy suppression documents.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
@@ -22,12 +23,35 @@ use super::identity::PolicySemanticHash;
 use super::retained::{RetainedSize, retained_extra};
 use super::scope::{PolicyScopeDocumentState, PolicyScopeOptions};
 
+/// The projected, checked-in decision record. Its records must name only
+/// paths that are published, because this file is published with them.
 pub const DEFAULT_POLICY_SUPPRESSION_PATH: &str = ".bifrost/suppressions.json";
+/// Checked in, but not published. Holds decisions whose finding lives in a
+/// file the publishing repository does not ship.
+pub const PRIVATE_POLICY_SUPPRESSION_PATH: &str = ".bifrost/suppressions.private.json";
+/// Never checked in. One developer's or agent's working decisions.
+pub const LOCAL_POLICY_SUPPRESSION_PATH: &str = ".bifrost/suppressions.local.json";
+
+/// Every conventional source, in load order.
+///
+/// Splitting the record set by file is what lets each record carry its full
+/// provenance. A single published document cannot: a decision about an
+/// unpublished file would have to either omit the path -- leaving the record
+/// unreadable and the run unable to tell a dead record from an unseen file --
+/// or disclose it. Separate files decide that per record instead of per field.
+pub const CONVENTIONAL_POLICY_SUPPRESSION_PATHS: [&str; 3] = [
+    DEFAULT_POLICY_SUPPRESSION_PATH,
+    PRIVATE_POLICY_SUPPRESSION_PATH,
+    LOCAL_POLICY_SUPPRESSION_PATH,
+];
 pub const MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES: u64 = 256 * 1024;
 pub const MAX_POLICY_SUPPRESSIONS: usize = 512;
 pub const MAX_POLICY_SUPPRESSION_REASON_BYTES: usize = 4_096;
 pub const MAX_POLICY_SUPPRESSION_ACCEPTED_BY_BYTES: usize = 256;
 pub const MAX_POLICY_SUPPRESSION_PATH_BYTES: usize = 1_024;
+/// Identities offered as re-key targets for one orphaned record. A file with
+/// more matches than this is a re-keying job the report cannot shorten.
+pub const MAX_SUPPRESSION_REKEY_CANDIDATES: usize = 8;
 
 const POLICY_SUPPRESSION_SCHEMA_VERSION: u32 = 1;
 const MAX_JSON_ERROR_BYTES: usize = 512;
@@ -181,6 +205,18 @@ pub enum PolicySuppressionStatus {
 pub struct PolicySuppressionRecord {
     policy_id: PolicyId,
     finding_id: PolicyFindingId,
+    /// The workspace-relative file the accepted finding was reported against.
+    ///
+    /// Optional, because a finding identity is a hash and older records
+    /// predate the field. When it is present a run can tell an identity that
+    /// rotated under an edit from one whose file this run never analyzed; when
+    /// it is absent the two are indistinguishable. See
+    /// [`PolicySuppressionOrphanState`].
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_workspace_relative_path"
+    )]
+    path: Option<WorkspaceRelativePath>,
     identity_stability: FindingIdentityStability,
     status: PolicySuppressionStatus,
     reason: Box<str>,
@@ -197,6 +233,10 @@ impl PolicySuppressionRecord {
 
     pub const fn finding_id(&self) -> PolicyFindingId {
         self.finding_id
+    }
+
+    pub fn path(&self) -> Option<&WorkspaceRelativePath> {
+        self.path.as_ref()
     }
 
     pub const fn identity_stability(&self) -> FindingIdentityStability {
@@ -262,10 +302,14 @@ impl PolicySuppressionSource {
         Self::from_workspace_path(WorkspaceRelativePath::new(path)?)
     }
 
-    pub fn relative_path(&self) -> &str {
+    /// Every path this source loads, in order.
+    ///
+    /// An explicit source names exactly one file: an override that silently
+    /// also read the conventional files would not be an override.
+    pub fn relative_paths(&self) -> Vec<&str> {
         match self {
-            Self::Conventional => DEFAULT_POLICY_SUPPRESSION_PATH,
-            Self::Explicit(path) => path.as_str(),
+            Self::Conventional => CONVENTIONAL_POLICY_SUPPRESSION_PATHS.to_vec(),
+            Self::Explicit(path) => vec![path.as_str()],
         }
     }
 
@@ -293,6 +337,31 @@ impl PolicySuppressionOptions {
 
     pub const fn source(&self) -> &PolicySuppressionSource {
         &self.source
+    }
+
+    /// The identity to attach to a diagnostic that concerns the suppression
+    /// configuration as a whole rather than one document, such as an audit
+    /// that outgrew its retention budget. Always the first configured source.
+    pub fn primary_relative_path(&self) -> &str {
+        self.source
+            .relative_paths()
+            .first()
+            .copied()
+            .unwrap_or(DEFAULT_POLICY_SUPPRESSION_PATH)
+    }
+
+    /// Every configured source reported in one uniform state, for a run that
+    /// ended before the sources could be consulted. Reporting the configured
+    /// set is what distinguishes "not consulted" from "not configured".
+    pub fn source_states(
+        &self,
+        state: PolicySuppressionDocumentState,
+    ) -> Vec<PolicySuppressionSourceState> {
+        self.source
+            .relative_paths()
+            .into_iter()
+            .map(|path| PolicySuppressionSourceState::new(path, state))
+            .collect()
     }
 }
 
@@ -338,12 +407,41 @@ pub enum PolicySuppressionDocumentState {
     Invalid,
 }
 
+/// What one configured suppression source contributed to this run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicySuppressionSourceState {
+    path: Box<str>,
+    state: PolicySuppressionDocumentState,
+}
+
+impl PolicySuppressionSourceState {
+    pub(crate) fn new(path: &str, state: PolicySuppressionDocumentState) -> Self {
+        Self {
+            path: path.into(),
+            state,
+        }
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub const fn state(&self) -> PolicySuppressionDocumentState {
+        self.state
+    }
+}
+
+impl RetainedSize for PolicySuppressionSourceState {
+    fn retained_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.path.len())
+    }
+}
+
 /// Deterministic report context for one suppression-aware policy batch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicyReportEvaluationContext {
     evaluation_date: PolicyEvaluationDate,
-    suppression_path: Box<str>,
-    suppression_document_state: PolicySuppressionDocumentState,
+    suppression_sources: Box<[PolicySuppressionSourceState]>,
     scope_path: Box<str>,
     scope_document_state: PolicyScopeDocumentState,
 }
@@ -351,30 +449,27 @@ pub struct PolicyReportEvaluationContext {
 impl PolicyReportEvaluationContext {
     pub fn new(
         evaluation_date: PolicyEvaluationDate,
-        suppressions: &PolicySuppressionOptions,
-        suppression_document_state: PolicySuppressionDocumentState,
+        suppression_sources: Vec<PolicySuppressionSourceState>,
         scope: &PolicyScopeOptions,
         scope_document_state: PolicyScopeDocumentState,
     ) -> Self {
         Self {
             evaluation_date,
-            suppression_path: suppressions.source.relative_path().into(),
-            suppression_document_state,
+            suppression_sources: suppression_sources.into_boxed_slice(),
             scope_path: scope.source().relative_path().into(),
             scope_document_state,
         }
     }
 
+    /// Every configured suppression source and what it contributed. A source
+    /// whose file is absent is reported, not omitted: "the local file was not
+    /// there" and "the local file was never consulted" are different facts.
+    pub fn suppression_sources(&self) -> &[PolicySuppressionSourceState] {
+        &self.suppression_sources
+    }
+
     pub const fn evaluation_date(&self) -> PolicyEvaluationDate {
         self.evaluation_date
-    }
-
-    pub fn suppression_path(&self) -> &str {
-        &self.suppression_path
-    }
-
-    pub const fn suppression_document_state(&self) -> PolicySuppressionDocumentState {
-        self.suppression_document_state
     }
 
     pub fn scope_path(&self) -> &str {
@@ -447,6 +542,40 @@ pub enum PolicySuppressionMatchState {
     FindingAbsent,
     PolicyNotEvaluated,
     PolicyIncomplete,
+}
+
+/// Why an accepted decision did not resolve to a finding in this run.
+///
+/// [`PolicySuppressionMatchState::FindingAbsent`] alone cannot say. A record
+/// whose file this run never analyzed reports `FindingAbsent` forever -- the
+/// projected public tree does exactly that for every record on a private-only
+/// path -- and is indistinguishable from a record whose accepted finding is
+/// still there under a rotated identity. Splitting the two is what lets a run
+/// gate on the second without ever gating on the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicySuppressionOrphanState {
+    /// The record resolved to a finding, or this run could not decide because
+    /// the policy did not run exhaustively.
+    Resolved,
+    /// This run analyzed the record's file exhaustively and no finding carries
+    /// its identity: the accepted decision is dead. Either the identity
+    /// rotated under an edit or the finding is genuinely gone, and both mean
+    /// the record needs a decision.
+    Orphaned,
+    /// This run did not analyze the record's file, so it cannot see the
+    /// finding at all and says nothing about the record.
+    PathNotAnalyzed,
+    /// The record names no path, so this run cannot tell an orphan from a file
+    /// it never analyzed. Recording a path on the record resolves this.
+    PathUnrecorded,
+}
+
+impl PolicySuppressionOrphanState {
+    /// Whether this run proved the record no longer resolves to any finding.
+    pub const fn is_orphaned(self) -> bool {
+        matches!(self, Self::Orphaned)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -523,9 +652,15 @@ pub struct PolicySuppressionReview {
     match_state: PolicySuppressionMatchState,
     temporal_state: PolicySuppressionTemporalState,
     policy_hash_state: PolicySuppressionPolicyHashState,
+    orphan_state: PolicySuppressionOrphanState,
     applied: bool,
-    stale: bool,
     result_omitted: bool,
+    /// Unclaimed identities this run found for the same policy in the record's
+    /// own file. On an orphan caused by rotation these are the identities the
+    /// record can be re-keyed to; reporting them makes the repair mechanical
+    /// without accepting anything on the reviewer's behalf. Empty otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    rekey_candidates: Vec<PolicyFindingId>,
 }
 
 impl PolicySuppressionReview {
@@ -534,7 +669,16 @@ impl PolicySuppressionReview {
         match_state: PolicySuppressionMatchState,
         temporal_state: PolicySuppressionTemporalState,
         policy_hash_state: PolicySuppressionPolicyHashState,
+        orphan_state: PolicySuppressionOrphanState,
+        mut rekey_candidates: Vec<PolicyFindingId>,
     ) -> Self {
+        debug_assert!(
+            orphan_state.is_orphaned() || rekey_candidates.is_empty(),
+            "only an orphaned record can offer re-key candidates"
+        );
+        rekey_candidates.sort_unstable();
+        rekey_candidates.truncate(MAX_SUPPRESSION_REKEY_CANDIDATES);
+        rekey_candidates.shrink_to_fit();
         Self {
             policy_id: record.policy_id.clone(),
             finding_id: record.finding_id,
@@ -542,10 +686,11 @@ impl PolicySuppressionReview {
             match_state,
             temporal_state,
             policy_hash_state,
+            orphan_state,
             applied: match_state == PolicySuppressionMatchState::StrongFinding
                 && temporal_state == PolicySuppressionTemporalState::Current,
-            stale: match_state == PolicySuppressionMatchState::FindingAbsent,
             result_omitted: false,
+            rekey_candidates,
         }
     }
 
@@ -577,8 +722,17 @@ impl PolicySuppressionReview {
         self.applied
     }
 
-    pub const fn stale(&self) -> bool {
-        self.stale
+    pub const fn orphan_state(&self) -> PolicySuppressionOrphanState {
+        self.orphan_state
+    }
+
+    /// Whether this run proved the accepted decision no longer resolves.
+    pub const fn is_orphaned(&self) -> bool {
+        self.orphan_state.is_orphaned()
+    }
+
+    pub fn rekey_candidates(&self) -> &[PolicyFindingId] {
+        &self.rekey_candidates
     }
 
     pub const fn result_omitted(&self) -> bool {
@@ -602,20 +756,19 @@ impl PolicySuppressionReview {
 pub fn load_policy_suppressions(
     workspace_root: &Path,
     options: &PolicySuppressionOptions,
-) -> Result<Option<PolicySuppressionDocument>, PolicySuppressionLoadError> {
+) -> Result<PolicySuppressionLoadOutcome, PolicySuppressionLoadError> {
     let root =
         WorkspaceRoot::open(workspace_root).map_err(PolicySuppressionLoadError::Workspace)?;
-    load_policy_suppressions_from_root(&root, options)
+    Ok(load_policy_suppressions_from_root(&root, options))
 }
 
-pub(crate) fn load_policy_suppressions_from_root(
+fn load_one_policy_suppression_document(
     root: &WorkspaceRoot,
-    options: &PolicySuppressionOptions,
+    relative_path: &str,
 ) -> Result<Option<PolicySuppressionDocument>, PolicySuppressionLoadError> {
-    let relative_path = Path::new(options.source.relative_path());
     let document = match read_workspace_document(
         root,
-        relative_path,
+        Path::new(relative_path),
         &["json"],
         MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES,
     ) {
@@ -626,6 +779,168 @@ pub(crate) fn load_policy_suppressions_from_root(
     parse_policy_suppression_document(document.source())
         .map(Some)
         .map_err(PolicySuppressionLoadError::Document)
+}
+
+/// Why one configured source contributed nothing.
+#[derive(Debug)]
+pub enum PolicySuppressionSourceFailureKind {
+    /// The file exists but could not be read or parsed.
+    Load(PolicySuppressionLoadError),
+    /// Another source already recorded this finding.
+    Collision {
+        policy_id: PolicyId,
+        finding_id: PolicyFindingId,
+        first_source: Box<str>,
+        identical: bool,
+    },
+    /// The merged record set is larger than any single document may be.
+    TooManyRecords { observed: usize, max: usize },
+}
+
+impl fmt::Display for PolicySuppressionSourceFailureKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Load(error) => error.fmt(formatter),
+            Self::Collision {
+                policy_id,
+                finding_id,
+                first_source,
+                identical,
+            } => write!(
+                formatter,
+                "policy {policy_id} finding {finding_id} is {} `{first_source}`; one finding must have exactly one record",
+                if *identical {
+                    "already recorded identically in"
+                } else {
+                    "recorded with different terms in"
+                }
+            ),
+            Self::TooManyRecords { observed, max } => write!(
+                formatter,
+                "the configured suppression sources hold {observed} records in total, exceeding {max}"
+            ),
+        }
+    }
+}
+
+/// One source that failed to load, or a pair of sources that disagree.
+#[derive(Debug)]
+pub struct PolicySuppressionSourceFailure {
+    pub path: Box<str>,
+    pub error: PolicySuppressionSourceFailureKind,
+}
+
+/// Everything the configured sources contributed to one run.
+#[derive(Debug, Default)]
+pub struct PolicySuppressionLoadOutcome {
+    /// The merged record set, absent when no source produced one.
+    pub document: Option<PolicySuppressionDocument>,
+    /// Every configured source and its state, in load order.
+    pub sources: Vec<PolicySuppressionSourceState>,
+    pub failures: Vec<PolicySuppressionSourceFailure>,
+}
+
+/// Load every configured source and merge them into one record set.
+///
+/// A source that is absent contributes nothing and is not an error: the local
+/// file is expected to be missing on most machines, and the private file is
+/// absent in a repository that publishes everything.
+///
+/// Two sources that claim the same finding are rejected rather than resolved.
+/// Picking one silently is precisely the failure mode this document exists to
+/// prevent, and the disagreement is a mistake in the records, not an ordering
+/// question the tool can settle.
+pub(crate) fn load_policy_suppressions_from_root(
+    root: &WorkspaceRoot,
+    options: &PolicySuppressionOptions,
+) -> PolicySuppressionLoadOutcome {
+    let mut outcome = PolicySuppressionLoadOutcome::default();
+    // Which source claimed each identity, so a collision can name both files.
+    let mut claimed: HashMap<(PolicyId, PolicyFindingId), (usize, PolicySuppressionRecord)> =
+        HashMap::new();
+    let mut order = Vec::new();
+
+    for relative_path in options.source.relative_paths() {
+        let (state, loaded) = match load_one_policy_suppression_document(root, relative_path) {
+            Ok(Some(document)) => (PolicySuppressionDocumentState::Loaded, Some(document)),
+            Ok(None) => (PolicySuppressionDocumentState::NotFound, None),
+            Err(error) => {
+                outcome.failures.push(PolicySuppressionSourceFailure {
+                    path: relative_path.into(),
+                    error: PolicySuppressionSourceFailureKind::Load(error),
+                });
+                (PolicySuppressionDocumentState::Invalid, None)
+            }
+        };
+        let source_index = outcome.sources.len();
+        outcome
+            .sources
+            .push(PolicySuppressionSourceState::new(relative_path, state));
+        let Some(document) = loaded else {
+            continue;
+        };
+        for record in document.suppressions() {
+            let key = (record.policy_id.clone(), record.finding_id);
+            match claimed.get(&key) {
+                Some((first_index, first)) => {
+                    outcome.failures.push(PolicySuppressionSourceFailure {
+                        path: relative_path.into(),
+                        error: PolicySuppressionSourceFailureKind::Collision {
+                            policy_id: record.policy_id.clone(),
+                            finding_id: record.finding_id,
+                            first_source: outcome.sources[*first_index].path().into(),
+                            identical: first == record,
+                        },
+                    });
+                }
+                None => {
+                    claimed.insert(key.clone(), (source_index, record.clone()));
+                    order.push(key);
+                }
+            }
+        }
+    }
+
+    // Any collision leaves the merged set ambiguous, so apply none of it and
+    // let the caller report the run unreliable rather than guess.
+    if !outcome.failures.is_empty() {
+        for source in &mut outcome.sources {
+            if source.state == PolicySuppressionDocumentState::Loaded {
+                source.state = PolicySuppressionDocumentState::Invalid;
+            }
+        }
+        return outcome;
+    }
+    if order.is_empty() {
+        return outcome;
+    }
+    if order.len() > MAX_POLICY_SUPPRESSIONS {
+        outcome.failures.push(PolicySuppressionSourceFailure {
+            path: DEFAULT_POLICY_SUPPRESSION_PATH.into(),
+            error: PolicySuppressionSourceFailureKind::TooManyRecords {
+                observed: order.len(),
+                max: MAX_POLICY_SUPPRESSIONS,
+            },
+        });
+        return outcome;
+    }
+
+    let mut suppressions = order
+        .into_iter()
+        .map(|key| {
+            claimed
+                .remove(&key)
+                .expect("every ordered key was inserted exactly once")
+                .1
+        })
+        .collect::<Vec<_>>();
+    suppressions.sort_by(compare_suppression_key);
+    suppressions.shrink_to_fit();
+    outcome.document = Some(PolicySuppressionDocument {
+        schema_version: POLICY_SUPPRESSION_SCHEMA_VERSION,
+        suppressions: suppressions.into_boxed_slice(),
+    });
+    outcome
 }
 
 pub fn parse_policy_suppression_document(
@@ -749,10 +1064,26 @@ fn normalize_wire_record(
         .map_err(
             |source| PolicySuppressionValidationError::InvalidAcceptedPolicyHash { index, source },
         )?;
+    let path = wire
+        .path
+        .as_deref()
+        .map(WorkspaceRelativePath::new)
+        .transpose()
+        .map_err(|source| PolicySuppressionValidationError::InvalidPath { index, source })?;
+    if path
+        .as_ref()
+        .is_some_and(|path| path.as_str().len() > MAX_POLICY_SUPPRESSION_PATH_BYTES)
+    {
+        return Err(PolicySuppressionValidationError::PathTooLong {
+            index,
+            max_bytes: MAX_POLICY_SUPPRESSION_PATH_BYTES,
+        });
+    }
 
     Ok(PolicySuppressionRecord {
         policy_id,
         finding_id,
+        path,
         identity_stability: FindingIdentityStability::Strong,
         status: PolicySuppressionStatus::Accepted,
         reason: wire.reason.into_boxed_str(),
@@ -761,6 +1092,22 @@ fn normalize_wire_record(
         accepted_at,
         expires_at,
     })
+}
+
+/// Emit the record's optional path as the same portable slash-separated
+/// string the loader accepted. `WorkspaceRelativePath` is not `Serialize`,
+/// and the field is skipped entirely when absent.
+fn serialize_optional_workspace_relative_path<S>(
+    path: &Option<WorkspaceRelativePath>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match path {
+        Some(path) => serializer.serialize_some(path.as_str()),
+        None => serializer.serialize_none(),
+    }
 }
 
 fn compare_suppression_key(
@@ -809,6 +1156,7 @@ impl RetainedSize for PolicySuppressionRecord {
     fn retained_size(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(retained_extra(&self.policy_id))
+            .saturating_add(retained_extra(&self.path))
             .saturating_add(retained_extra(&self.reason))
             .saturating_add(retained_extra(&self.policy_hash_at_acceptance))
             .saturating_add(retained_extra(&self.accepted_by))
@@ -845,7 +1193,9 @@ impl RetainedSize for PolicySuppressionOptions {
 impl RetainedSize for PolicyReportEvaluationContext {
     fn retained_size(&self) -> usize {
         std::mem::size_of::<Self>()
-            .saturating_add(self.suppression_path.len())
+            .saturating_add(self.suppression_sources.iter().fold(0, |bytes, source| {
+                bytes.saturating_add(retained_extra(source))
+            }))
             .saturating_add(self.scope_path.len())
     }
 }
@@ -869,6 +1219,11 @@ impl RetainedSize for PolicySuppressionReview {
         std::mem::size_of::<Self>()
             .saturating_add(retained_extra(&self.policy_id))
             .saturating_add(retained_extra(&self.decision))
+            .saturating_add(
+                self.rekey_candidates
+                    .len()
+                    .saturating_mul(std::mem::size_of::<PolicyFindingId>()),
+            )
     }
 }
 
@@ -884,6 +1239,8 @@ struct WireSuppressionDocument {
 struct WireSuppressionRecord {
     policy_id: String,
     finding_id: String,
+    #[serde(default)]
+    path: Option<String>,
     identity_stability: String,
     status: String,
     reason: String,
@@ -979,6 +1336,14 @@ pub enum PolicySuppressionValidationError {
         index: usize,
         source: Sha256ValueError,
     },
+    InvalidPath {
+        index: usize,
+        source: WorkspaceRelativePathError,
+    },
+    PathTooLong {
+        index: usize,
+        max_bytes: usize,
+    },
     DuplicateSuppression {
         policy_id: PolicyId,
         finding_id: PolicyFindingId,
@@ -1056,6 +1421,13 @@ impl fmt::Display for PolicySuppressionValidationError {
                 formatter,
                 "suppression {index} has invalid policy_hash_at_acceptance: {source}"
             ),
+            Self::InvalidPath { index, source } => {
+                write!(formatter, "suppression {index} has invalid path: {source}")
+            }
+            Self::PathTooLong { index, max_bytes } => write!(
+                formatter,
+                "suppression {index} path exceeds {max_bytes} bytes"
+            ),
             Self::DuplicateSuppression {
                 policy_id,
                 finding_id,
@@ -1084,7 +1456,9 @@ impl std::error::Error for PolicySuppressionValidationError {
                 Some(source)
             }
             Self::InvalidDate { source, .. } => Some(source),
-            Self::DocumentTooLarge { .. }
+            Self::InvalidPath { source, .. } => Some(source),
+            Self::PathTooLong { .. }
+            | Self::DocumentTooLarge { .. }
             | Self::UnsupportedSchemaVersion { .. }
             | Self::TooManySuppressions { .. }
             | Self::IdentityMustBeStrong { .. }
@@ -1134,5 +1508,84 @@ impl std::error::Error for PolicySuppressionLoadError {
             Self::Workspace(error) => Some(error),
             Self::Document(error) => Some(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn document_with_path(path: Option<&str>) -> String {
+        let path_field = path.map_or_else(String::new, |path| {
+            format!("\"path\": \"{path}\",\n            ")
+        });
+        format!(
+            r#"{{
+  "schema_version": 1,
+  "suppressions": [
+    {{
+      "policy_id": "test.policy",
+      "finding_id": "{id}",
+      {path_field}"identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Reviewed",
+      "accepted_at": "2026-08-01"
+    }}
+  ]
+}}"#,
+            id = "a".repeat(64),
+            path_field = path_field,
+        )
+    }
+
+    #[test]
+    fn a_record_path_is_optional_and_round_trips_as_a_portable_string() {
+        let without = parse_policy_suppression_document(&document_with_path(None))
+            .expect("document without a path");
+        assert_eq!(without.suppressions()[0].path(), None);
+        let encoded = serde_json::to_value(&without).expect("encode");
+        assert!(
+            encoded["suppressions"][0].get("path").is_none(),
+            "an absent path must not be emitted: {encoded}"
+        );
+
+        let with = parse_policy_suppression_document(&document_with_path(Some("src/app.rs")))
+            .expect("document with a path");
+        assert_eq!(
+            with.suppressions()[0]
+                .path()
+                .map(WorkspaceRelativePath::as_str),
+            Some("src/app.rs")
+        );
+        let encoded = serde_json::to_value(&with).expect("encode");
+        assert_eq!(encoded["suppressions"][0]["path"], "src/app.rs");
+    }
+
+    #[test]
+    fn a_record_path_must_be_workspace_relative_and_portable() {
+        let error = parse_policy_suppression_document(&document_with_path(Some("/etc/passwd")))
+            .expect_err("an absolute path is not workspace-relative");
+        assert!(
+            matches!(
+                error,
+                PolicySuppressionDocumentError::Validation(
+                    PolicySuppressionValidationError::InvalidPath { index: 0, .. }
+                )
+            ),
+            "unexpected error: {error}"
+        );
+
+        let error =
+            parse_policy_suppression_document(&document_with_path(Some("src/../../escape.rs")))
+                .expect_err("a traversing path is not workspace-relative");
+        assert!(
+            matches!(
+                error,
+                PolicySuppressionDocumentError::Validation(
+                    PolicySuppressionValidationError::InvalidPath { index: 0, .. }
+                )
+            ),
+            "unexpected error: {error}"
+        );
     }
 }

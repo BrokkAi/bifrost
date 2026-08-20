@@ -41,10 +41,10 @@ impl RustAnalyzer {
         index
     }
 
-    pub fn import_binder_of(&self, file: &ProjectFile) -> ImportBinder {
+    pub fn import_binder_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> ImportBinder {
         let mut binder = ImportBinder::empty();
 
-        for import in self.inner.import_info_of(file) {
+        for import in self.inner.import_info_of(token, file) {
             insert_rust_import_binding(&mut binder, &import);
         }
 
@@ -232,7 +232,7 @@ mod frozen {
         file: &ProjectFile,
         forward: bool,
     ) -> FrozenReferenceContext {
-        let binder = analyzer.import_binder_of(file);
+        let binder = analyzer.import_binder_of(token, file);
         let same_file = analyzer
             .declarations(file)
             .into_iter()
@@ -564,7 +564,10 @@ mod tests {
             Language::Rust,
             &[
                 ("src/lib.rs", "pub mod exports;\n"),
-                ("src/exports.rs", "pub use std::collections::HashMap;\n"),
+                (
+                    "src/exports.rs",
+                    "pub struct Public;\npub(crate) struct CrateVisible;\nstruct Private;\npub use std::collections::HashMap;\n",
+                ),
             ],
         );
         let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
@@ -574,6 +577,10 @@ mod tests {
         let second = analyzer.export_index_of(&file);
 
         assert!(Arc::ptr_eq(&first, &second));
+        assert!(first.exports_by_name.contains_key("Public"));
+        assert!(first.exports_by_name.contains_key("CrateVisible"));
+        assert!(!first.exports_by_name.contains_key("Private"));
+        assert!(first.exports_by_name.contains_key("HashMap"));
         let scope = AnalyzerQueryScope::new(&analyzer);
         assert_eq!(
             analyzer

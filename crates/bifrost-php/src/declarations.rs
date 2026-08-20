@@ -1,4 +1,6 @@
-use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::fq_name::{
+    FqName, SegmentId, SegmentKind, joined_segments, normalize_joined, segment_interner,
+};
 use brokk_bifrost_core::analyzer::model::{
     CodeUnitType, ParameterMetadata, Range, SignatureMetadata,
 };
@@ -11,18 +13,26 @@ fn php_segment(text: &str, kind: SegmentKind) -> SegmentId {
     segment_interner().intern(text, kind)
 }
 
+/// PHP's `\`-separated namespace path is stored `.`-joined in `package_name`.
+const PHP_PACKAGE_SEPARATOR: &str = ".";
+
 /// Build the structured namespace prefix for a PHP declaration.
 ///
 /// `determine_php_package_name` (below) already turns the namespace's `\`-
 /// separated AST text into a `.`-joined string (`replace('\\', ".")`) before it
-/// ever becomes `package_name`; PHP identifiers can never contain a literal
-/// `.`, so splitting that string back into components is lossless. Each
-/// component becomes one [`SegmentKind::Package`] segment: `Package`-`Package`
-/// renders with `.` by default, matching this convention exactly (unlike Go's
-/// `/`-joined import path, which needs the `Path` kind).
+/// ever becomes `package_name`. Each component becomes one
+/// [`SegmentKind::Package`] segment: `Package`-`Package` renders with `.` by
+/// default, matching this convention exactly (unlike Go's `/`-joined import
+/// path, which needs the `Path` kind).
+///
+/// [`joined_segments`] is the split half of the shared empty-component
+/// decision; `php_namespace_package_name` applies [`normalize_joined`], its
+/// join half, to the string it stores. Making one decision in one place is what
+/// keeps the two spellings from disagreeing when malformed source puts a
+/// literal `.` where a PHP identifier cannot have one (#2352).
 fn php_package_fq(package_name: &str) -> FqName {
     let mut fq = FqName::new();
-    for component in package_name.split('.').filter(|c| !c.is_empty()) {
+    for component in joined_segments(package_name, PHP_PACKAGE_SEPARATOR) {
         fq.push(php_segment(component, SegmentKind::Package));
     }
     fq
@@ -505,15 +515,24 @@ fn determine_php_package_name(root: Node<'_>, source: &str) -> String {
 /// while the FqName bridge drops empty components, desyncing the
 /// package/short boundary assert for every unit in the file (phan's
 /// tests/files/src/0019_noop.php, #2413).
+///
+/// The `\` -> `.` mapping then goes through [`normalize_joined`], the same
+/// decision about empty components that [`php_package_fq`] makes when it splits
+/// this string back apart. A PHP identifier cannot contain a literal `.`, so a
+/// well-formed namespace passes through untouched; malformed source can put one
+/// there anyway. PHP_CodeSniffer's `namespace MyStandard\.hidden;` fixture --
+/// which documents its own parse error -- mapped to `MyStandard..hidden`, whose
+/// empty middle component the fq dropped and the stored package kept (#2352).
 fn php_namespace_package_name(name_node: Node<'_>, source: &str) -> String {
     let start = name_node
         .child(0)
         .filter(|child| !child.is_named() && child.kind() == "\\")
         .map_or(name_node.start_byte(), |marker| marker.end_byte());
-    source
+    let dotted = source
         .get(start..name_node.end_byte())
         .expect("namespace name node covers one source range")
-        .replace('\\', ".")
+        .replace('\\', PHP_PACKAGE_SEPARATOR);
+    normalize_joined(&dotted, PHP_PACKAGE_SEPARATOR).into_owned()
 }
 
 fn php_class_body(node: Node<'_>) -> Option<Node<'_>> {

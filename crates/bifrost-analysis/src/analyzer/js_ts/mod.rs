@@ -44,11 +44,11 @@ use crate::analyzer::usages::js_ts_graph::{
     build_jsts_usage_edges,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
-use crate::analyzer::{CodeUnit, Language};
 use crate::analyzer::{
-    ForwardQueryProvider, IAnalyzer, JavascriptAnalyzer, ParserFlavor, ProjectFile, Range,
-    TypescriptAnalyzer, resolve_analyzer,
+    AnalyzerQueryScope, ForwardQueryProvider, IAnalyzer, JavascriptAnalyzer, ParserFlavor,
+    ProjectFile, QueryScope, Range, TypescriptAnalyzer, resolve_analyzer,
 };
+use crate::analyzer::{CodeUnit, Language};
 use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
 use brokk_bifrost_js_ts::model::module_code_unit;
@@ -322,11 +322,14 @@ impl LanguageEdgePass for JsTsEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        build_jsts_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        let scope = AnalyzerQueryScope::new(ctx.analyzer);
+        build_jsts_usage_edges(ctx.analyzer, scope.token(), ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeSites)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
-        build_jsts_scoped_usage_edges(ctx.analyzer, ctx.scoped_nodes, ctx.keep_file)
+        let scope = AnalyzerQueryScope::new(ctx.analyzer);
+        build_jsts_scoped_usage_edges(ctx.analyzer, scope.token(), ctx.scoped_nodes, ctx.keep_file)
             .map(LanguageEdgeWeights::Scoped)
     }
 }
@@ -376,6 +379,8 @@ impl DeadCodeBulkProof for JsTsDeadCodeBulk {
             .map(|unit| UsageNodeKey::from_unit(&unit))
             .collect();
         nodes.extend(candidates.iter().map(UsageNodeKey::from_unit));
-        build_jsts_scoped_usage_edges(analyzer, &nodes, |_| true).map(DeadCodeBulkEdges::Scoped)
+        let scope = AnalyzerQueryScope::new(analyzer);
+        build_jsts_scoped_usage_edges(analyzer, scope.token(), &nodes, |_| true)
+            .map(DeadCodeBulkEdges::Scoped)
     }
 }

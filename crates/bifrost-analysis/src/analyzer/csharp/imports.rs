@@ -10,19 +10,23 @@ use crate::analyzer::{
     CodeUnit, CodeUnitType, ImportAnalysisProvider, ImportReachability, ProjectFile,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use std::sync::Arc;
 
 use super::CSharpAnalyzer;
 use super::graph_support::{
     compute_implicit_reference_index, csharp_import_reachability, visible_type_candidates,
 };
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 impl ImportAnalysisProvider for CSharpAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         if let Some(cached) = self.memo_caches.imported_code_units.get(file) {
             return cached;
         }
-        let namespaces = self.using_namespaces_of(file);
-        let aliases = self.using_aliases_of(file);
+        let namespaces = self.using_namespaces_of(token, file);
+        let aliases = self.using_aliases_of(token, file);
         if namespaces.is_empty() && aliases.is_empty() {
             return Arc::new(HashSet::default());
         }
@@ -36,7 +40,7 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
             );
         }
         for target in aliases.values() {
-            imported.extend(visible_type_candidates(self, file, target));
+            imported.extend(visible_type_candidates(self, token, file, target));
         }
         let imported = Arc::new(imported);
         self.memo_caches
@@ -46,6 +50,8 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         if let Some(cached) = self.memo_caches.referencing_files.get(file) {
             return (*cached).clone();
         }
@@ -71,7 +77,7 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
             .map(|files| (**files).clone())
             .unwrap_or_default();
 
-        if let Some(files) = self.implicit_reference_index().get(file) {
+        if let Some(files) = self.implicit_reference_index(token).get(file) {
             result.extend(files.iter().cloned());
         }
 
@@ -81,8 +87,12 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         result
     }
 
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<crate::analyzer::ImportInfo> {
-        self.inner.import_info_of(file)
+    fn import_info_of(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Vec<crate::analyzer::ImportInfo> {
+        self.inner.import_info_of(token, file)
     }
 
     /// Derived from [`Self::import_reachability`] rather than written
@@ -106,15 +116,20 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         imports: &[crate::analyzer::ImportInfo],
         target: &ProjectFile,
     ) -> ImportReachability {
-        csharp_import_reachability(self, source_file, imports, target)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        csharp_import_reachability(self, token, source_file, imports, target)
     }
 }
 
 impl CSharpAnalyzer {
-    fn implicit_reference_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
+    fn implicit_reference_index(
+        &self,
+        token: QueryToken<'_>,
+    ) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
         self.memo_caches.implicit_reference_index.get_or_build(
-            || compute_implicit_reference_index(self, true),
-            || compute_implicit_reference_index(self, false),
+            || compute_implicit_reference_index(self, token, true),
+            || compute_implicit_reference_index(self, token, false),
         )
     }
 }

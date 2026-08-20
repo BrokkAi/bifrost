@@ -2,6 +2,8 @@ use super::*;
 use crate::analyzer::ImportInfo;
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use crate::analyzer::usages::scala_graph::{ScalaNameResolver, ScalaProjectTypes};
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -18,11 +20,13 @@ enum ScalaHierarchyPackageResolution {
 
 impl TypeHierarchyProvider for ScalaAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        let query_scope = AnalyzerQueryScope::new(self);
+        let token = query_scope.token();
         if let Some(cached) = self.direct_ancestors.get(code_unit) {
             return (*cached).clone();
         }
 
-        let ancestors = self.resolve_direct_ancestors(code_unit);
+        let ancestors = self.resolve_direct_ancestors(token, code_unit);
         self.direct_ancestors
             .insert(code_unit.clone(), Arc::new(ancestors.clone()));
         ancestors
@@ -51,12 +55,14 @@ impl TypeHierarchyProvider for ScalaAnalyzer {
         code_unit: &CodeUnit,
         scope: &crate::analyzer::DescendantIndexScope<'_>,
     ) -> Option<HashSet<CodeUnit>> {
+        let query_scope = AnalyzerQueryScope::new(self);
+        let token = query_scope.token();
         if scope.cancellation().is_cancelled() {
             return None;
         }
         self.lazy_hierarchy_index
             .get_or_init(|| self.build_lazy_hierarchy_index())
-            .direct_descendants_while(self, code_unit, scope)
+            .direct_descendants_while(token, self, code_unit, scope)
     }
 }
 
@@ -95,6 +101,7 @@ impl ScalaLazyHierarchyIndex {
     /// ancestor resolution, which is the whole cost of this walk.
     fn direct_descendants_while(
         &self,
+        token: QueryToken<'_>,
         scala: &ScalaAnalyzer,
         owner: &CodeUnit,
         scope: &crate::analyzer::DescendantIndexScope<'_>,
@@ -111,7 +118,7 @@ impl ScalaLazyHierarchyIndex {
             if scope.cancellation().is_cancelled() {
                 return None;
             }
-            let ancestors = self.ancestors_of(scala, candidate);
+            let ancestors = self.ancestors_of(token, scala, candidate);
             if ancestors
                 .iter()
                 .any(|ancestor| self.reconcile_ancestor(ancestor, candidate) == *owner)
@@ -125,7 +132,12 @@ impl ScalaLazyHierarchyIndex {
     /// Resolve a candidate's direct ancestors, reading through the analyzer's
     /// shared `direct_ancestors` cache so repeated subtree walks and later
     /// `get_direct_ancestors` queries never re-resolve or point-hydrate.
-    fn ancestors_of(&self, scala: &ScalaAnalyzer, candidate: &CodeUnit) -> Arc<Vec<CodeUnit>> {
+    fn ancestors_of(
+        &self,
+        token: QueryToken<'_>,
+        scala: &ScalaAnalyzer,
+        candidate: &CodeUnit,
+    ) -> Arc<Vec<CodeUnit>> {
         if let Some(cached) = scala.direct_ancestors.get(candidate) {
             return cached;
         }
@@ -133,7 +145,12 @@ impl ScalaLazyHierarchyIndex {
             .contexts
             .get(candidate)
             .map(|context| {
-                scala.resolve_direct_ancestor_units_with_context(candidate, &self.types, context)
+                scala.resolve_direct_ancestor_units_with_context(
+                    token,
+                    candidate,
+                    &self.types,
+                    context,
+                )
             })
             .unwrap_or_default();
         let ancestors = Arc::new(ancestors);
@@ -239,29 +256,34 @@ impl ScalaAnalyzer {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn type_relations(&self) -> &[TypeRelation] {
+    pub(crate) fn type_relations(&self, token: QueryToken<'_>) -> &[TypeRelation] {
         self.type_relations
-            .get_or_init(|| self.collect_type_relations())
+            .get_or_init(|| self.collect_type_relations(token))
             .as_slice()
     }
 
     #[allow(dead_code)]
-    fn collect_type_relations(&self) -> Vec<TypeRelation> {
+    fn collect_type_relations(&self, token: QueryToken<'_>) -> Vec<TypeRelation> {
         let types = self.project_types();
         let traits = self.scala_trait_fqns();
         self.all_declarations()
             .filter(|unit| unit.is_class())
-            .flat_map(|unit| self.resolve_direct_ancestor_relations(&unit, &types, &traits))
+            .flat_map(|unit| self.resolve_direct_ancestor_relations(token, &unit, &types, &traits))
             .collect()
     }
 
-    fn resolve_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+    fn resolve_direct_ancestors(
+        &self,
+        token: QueryToken<'_>,
+        code_unit: &CodeUnit,
+    ) -> Vec<CodeUnit> {
         let types = self.project_types();
-        self.resolve_direct_ancestor_units(code_unit, &types)
+        self.resolve_direct_ancestor_units(token, code_unit, &types)
     }
 
     fn resolve_direct_ancestor_units(
         &self,
+        token: QueryToken<'_>,
         code_unit: &CodeUnit,
         types: &ScalaProjectTypes,
     ) -> Vec<CodeUnit> {
@@ -275,11 +297,12 @@ impl ScalaAnalyzer {
         let Some(context) = hierarchy_owner_context_from_state(&state, code_unit) else {
             return Vec::new();
         };
-        self.resolve_direct_ancestor_units_with_context(code_unit, types, &context)
+        self.resolve_direct_ancestor_units_with_context(token, code_unit, types, &context)
     }
 
     fn resolve_direct_ancestor_units_with_context(
         &self,
+        token: QueryToken<'_>,
         code_unit: &CodeUnit,
         types: &ScalaProjectTypes,
         context: &ScalaHierarchyOwnerContext,
@@ -295,6 +318,7 @@ impl ScalaAnalyzer {
             };
             let resolver = ScalaNameResolver::for_file_with_package_context(
                 self,
+                token,
                 Some(code_unit.source()),
                 package_prefixes,
                 &context.imports,
@@ -310,6 +334,7 @@ impl ScalaAnalyzer {
                 (non_wildcard_imports.len() != context.imports.len()).then(|| {
                     ScalaNameResolver::for_file_with_package_context(
                         self,
+                        token,
                         Some(code_unit.source()),
                         package_prefixes,
                         &non_wildcard_imports,
@@ -409,12 +434,13 @@ impl ScalaAnalyzer {
 
     fn resolve_direct_ancestor_relations(
         &self,
+        token: QueryToken<'_>,
         code_unit: &CodeUnit,
         types: &ScalaProjectTypes,
         traits: &HashSet<String>,
     ) -> Vec<TypeRelation> {
         let owner_is_trait = traits.contains(&code_unit.fq_name());
-        self.resolve_direct_ancestor_units(code_unit, types)
+        self.resolve_direct_ancestor_units(token, code_unit, types)
             .into_iter()
             .map(|ancestor| {
                 let kind = self.relation_kind(owner_is_trait, &ancestor, traits);
@@ -563,7 +589,9 @@ trait External
             ),
         ]);
 
-        let relations = analyzer.type_relations();
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        let relations = analyzer.type_relations(token);
         assert!(relations.iter().any(|relation| {
             relation.from.fq_name() == "app.Worker"
                 && relation.to.fq_name() == "app.Base"
@@ -627,7 +655,11 @@ trait External
             let ancestors = contexts
                 .get(candidate)
                 .map(|context| {
-                    analyzer.resolve_direct_ancestor_units_with_context(candidate, &types, context)
+                    let scope = AnalyzerQueryScope::new(analyzer);
+                    let token = scope.token();
+                    analyzer.resolve_direct_ancestor_units_with_context(
+                        token, candidate, &types, context,
+                    )
                 })
                 .unwrap_or_default();
             ancestors_by_owner.insert(candidate.clone(), ancestors);

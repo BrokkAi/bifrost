@@ -28,6 +28,7 @@ use crate::kotlin::syntax::{
     kotlin_named_argument_label, kotlin_navigation_member, kotlin_navigation_receiver,
     kotlin_user_type_segments,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{
     TreeWalkAction, first_named_child_of_kind, named_children, walk_tree_iterative,
 };
@@ -156,6 +157,7 @@ impl KotlinResolutionCtx for ScanCtx<'_> {
 
 pub fn scan_file(
     graph: &KotlinGraphSource<'_>,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     spec: &TargetSpec,
     state: &mut ScanState<'_>,
@@ -186,7 +188,7 @@ pub fn scan_file(
     };
 
     let line_starts = compute_line_starts(&source);
-    let names = KotlinNameResolver::new(graph, file, tree.root_node(), &source);
+    let names = KotlinNameResolver::new(graph, token, file, tree.root_node(), &source);
     let mut type_parameters: TypeParameterScopes = Vec::new();
     let mut ctx = ScanCtx {
         graph,
@@ -207,7 +209,7 @@ pub fn scan_file(
         class_scope_depths: Vec::new(),
         pending_exits: Vec::new(),
     };
-    walk(tree.root_node(), &mut ctx, &mut type_parameters);
+    walk(tree.root_node(), token, &mut ctx, &mut type_parameters);
 }
 
 /// Type-parameter names in scope, innermost frame last.
@@ -227,7 +229,12 @@ fn type_parameter_in_scope(scopes: &TypeParameterScopes, name: &str) -> bool {
         .any(|frame| frame.iter().any(|declared| declared == name))
 }
 
-fn walk(root: Node<'_>, ctx: &mut ScanCtx<'_>, type_parameters: &mut TypeParameterScopes) {
+fn walk(
+    root: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut ScanCtx<'_>,
+    type_parameters: &mut TypeParameterScopes,
+) {
     let mut state = (ctx, type_parameters);
     walk_tree_iterative(
         root,
@@ -251,8 +258,8 @@ fn walk(root: Node<'_>, ctx: &mut ScanCtx<'_>, type_parameters: &mut TypeParamet
             if enters_type_scope {
                 type_parameters.push(declared_type_parameters);
             }
-            seed_value_declarations(node, ctx);
-            record_reference(node, ctx, type_parameters);
+            seed_value_declarations(node, token, ctx);
+            record_reference(node, token, ctx, type_parameters);
 
             if enters_value_scope || enters_type_scope {
                 // The exit callback cannot see which of the three it is
@@ -310,7 +317,7 @@ fn type_parameter_names(node: Node<'_>, source: &str) -> Vec<String> {
 /// misread as the class it hides: a local `val Registry = "text"` shadows the
 /// object `Registry` in value positions, so a later `Registry.length` is not a
 /// reference to the object.
-fn seed_value_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn seed_value_declarations(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     if !matches!(
         node.kind(),
         "variable_declaration" | "parameter" | "class_parameter" | "parameter_with_optional_type"
@@ -324,7 +331,7 @@ fn seed_value_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if name.is_empty() {
         return;
     }
-    match binding_type_fq_name(node, ctx) {
+    match binding_type_fq_name(node, token, ctx) {
         Some(fqn) => ctx.bindings.seed_symbol(name, fqn),
         None => ctx.bindings.declare_shadow(name),
     }
@@ -332,7 +339,11 @@ fn seed_value_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 /// The type a binding has: the type it writes, or the type its initializer
 /// proves.
-fn binding_type_fq_name(binding: Node<'_>, ctx: &mut ScanCtx<'_>) -> Option<String> {
+fn binding_type_fq_name(
+    binding: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut ScanCtx<'_>,
+) -> Option<String> {
     if let Some(spelled) = kotlin_binding_type_text(binding, ctx.source)
         && let Some(fqn) = ctx.names.resolve_type_fqn(&spelled, binding.start_byte())
     {
@@ -349,15 +360,20 @@ fn binding_type_fq_name(binding: Node<'_>, ctx: &mut ScanCtx<'_>) -> Option<Stri
         .into_iter()
         .rev()
         .find(|child| kotlin_is_expression_kind(child.kind()))?;
-    receiver_type_fq_name(initializer, ctx, 0)
+    receiver_type_fq_name(initializer, token, ctx, 0)
 }
 
-fn record_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>, types: &TypeParameterScopes) {
+fn record_reference(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut ScanCtx<'_>,
+    types: &TypeParameterScopes,
+) {
     match ctx.spec.kind {
         TargetKind::Type => record_type_reference(node, ctx, types),
         TargetKind::Constructor => record_constructor_reference(node, ctx),
-        TargetKind::Function => record_function_reference(node, ctx),
-        TargetKind::Property => record_property_reference(node, ctx),
+        TargetKind::Function => record_function_reference(node, token, ctx),
+        TargetKind::Property => record_property_reference(node, token, ctx),
     }
 }
 
@@ -452,9 +468,9 @@ fn dotted_navigation_spelling(navigation: Node<'_>, ctx: &ScanCtx<'_>) -> Option
 
 /// Record a reference to a function: a call, a callable reference, or a
 /// declaration that overrides it.
-fn record_function_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn record_function_reference(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     match node.kind() {
-        "call_expression" => record_call(node, ctx),
+        "call_expression" => record_call(node, token, ctx),
         "function_declaration" => record_override_declaration(node, ctx),
         // `::topLevel` names a callable without applying it, so no arity is
         // proven and the reference is judged on the name alone.
@@ -463,20 +479,22 @@ fn record_function_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         // parse as a navigation. One that is a call's callee is handled by the
         // call arm, so only the non-call ones land here.
         kind if kotlin_is_navigation_kind(kind) && kotlin_call_with_callee(node).is_none() => {
-            record_member_access(node, ctx, None)
+            record_member_access(node, token, ctx, None)
         }
         _ => {}
     }
 }
 
 /// Record a call whose callee names the target.
-fn record_call(call: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn record_call(call: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(callee) = kotlin_callee(call) else {
         return;
     };
     let arity = kotlin_call_arity(call);
     match callee.kind() {
-        kind if kotlin_is_navigation_kind(kind) => record_member_access(callee, ctx, Some(arity)),
+        kind if kotlin_is_navigation_kind(kind) => {
+            record_member_access(callee, token, ctx, Some(arity))
+        }
         "simple_identifier" => {
             if node_text(callee, ctx.source) != ctx.spec.member_name
                 || kotlin_is_declaration_name(callee)
@@ -491,7 +509,12 @@ fn record_call(call: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 /// Record `receiver.member`, typed through the receiver.
-fn record_member_access(navigation: Node<'_>, ctx: &mut ScanCtx<'_>, arity: Option<usize>) {
+fn record_member_access(
+    navigation: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut ScanCtx<'_>,
+    arity: Option<usize>,
+) {
     let Some(member) = kotlin_navigation_member(navigation) else {
         return;
     };
@@ -504,7 +527,7 @@ fn record_member_access(navigation: Node<'_>, ctx: &mut ScanCtx<'_>, arity: Opti
     let Some(receiver) = kotlin_navigation_receiver(navigation) else {
         return;
     };
-    match receiver_matches_target(receiver, ctx) {
+    match receiver_matches_target(receiver, token, ctx) {
         ReceiverTargetMatch::Matched if receiver_is_same_owner(receiver, ctx) => {
             hits::push_self_receiver_hit(member, ctx)
         }
@@ -643,13 +666,13 @@ fn node_range(node: Node<'_>, ctx: &ScanCtx<'_>) -> brokk_bifrost_core::analyzer
 /// Record a reference to a property, a `val`/`var` constructor parameter, or an
 /// enum entry. A read and a write name the same declaration, because the index
 /// records one `Field` unit for a property even with custom accessors.
-fn record_property_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn record_property_reference(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     match node.kind() {
         // Both a read (`navigation_expression`) and the left-hand side of a
         // write (`directly_assignable_expression`) name the same declaration:
         // the index records one `Field` unit for a property even with custom
         // accessors.
-        kind if kotlin_is_navigation_kind(kind) => record_member_access(node, ctx, None),
+        kind if kotlin_is_navigation_kind(kind) => record_member_access(node, token, ctx, None),
         "simple_identifier" => record_bare_property_reference(node, ctx),
         _ => {}
     }

@@ -1,7 +1,9 @@
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn execute_plan(
     plan: &PhysicalQueryPlan,
+    token: QueryToken<'_>,
     node_id: PhysicalQueryNodeId,
     state: &mut QueryExecutionState<'_>,
     limits: CodeQueryExecutionLimits,
@@ -269,6 +271,7 @@ pub(super) fn execute_plan(
             let dependency_started = profiling.then(Instant::now);
             let child = execute_plan(
                 plan,
+                token,
                 dependency,
                 state,
                 limits,
@@ -305,6 +308,7 @@ pub(super) fn execute_plan(
                 let mut instrumentation = profiling.then(QueryStepInstrumentation::default);
                 let mut stepped = apply_plan_step(
                     step,
+                    token,
                     physical_node.derived_layer_request(),
                     *final_in_authored_suffix,
                     child.rows,
@@ -343,6 +347,7 @@ pub(super) fn execute_plan(
         ) => {
             let parallel = execute_parallel_seed_union(
                 plan,
+                token,
                 physical_node.dependencies(),
                 state,
                 limits,
@@ -422,6 +427,7 @@ pub(super) fn execute_plan(
                     let dependency_started = profiling.then(Instant::now);
                     let mut child = execute_plan(
                         plan,
+                        token,
                         dependency,
                         state,
                         branch_limits,
@@ -515,6 +521,7 @@ pub(super) fn execute_plan(
                         let dependency_started = profiling.then(Instant::now);
                         let mut child = execute_plan(
                             plan,
+                            token,
                             dependencies[index],
                             state,
                             retry_limits,
@@ -615,6 +622,7 @@ pub(super) fn execute_plan(
             let dependency_started = profiling.then(Instant::now);
             let mut child = execute_plan(
                 plan,
+                token,
                 dependency,
                 state,
                 limits,
@@ -771,6 +779,7 @@ fn retry_can_progress(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_parallel_seed_union(
     plan: &PhysicalQueryPlan,
+    token: QueryToken<'_>,
     dependencies: &[PhysicalQueryNodeId],
     state: &mut QueryExecutionState<'_>,
     limits: CodeQueryExecutionLimits,
@@ -855,6 +864,7 @@ pub(super) fn execute_parallel_seed_union(
                 });
                 let execution = execute_plan(
                     plan,
+                    token,
                     dependencies[branch],
                     &mut branch_state,
                     limits,

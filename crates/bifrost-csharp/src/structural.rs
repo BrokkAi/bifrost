@@ -1,6 +1,6 @@
 //! C# structural spec for `query_code`.
 
-use crate::syntax::csharp_conditional_member_access;
+use crate::syntax::{csharp_conditional_member_access, csharp_member_name};
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_role_with_derived_name, attach_terminal_callee, first_named_child,
@@ -17,7 +17,7 @@ use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT,
 };
 use brokk_bifrost_core::analyzer::structural::occurrences::{
-    NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport,
+    OccurrenceRole, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
     CALLABLE_APPLICABILITY_ONLY_SUPPORT, LexicalEnvironmentSupport,
@@ -32,6 +32,9 @@ use tree_sitter::Node;
 pub struct CSharpStructuralSpec;
 
 pub static CSHARP_STRUCTURAL_SPEC: CSharpStructuralSpec = CSharpStructuralSpec;
+
+static CSHARP_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport =
+    OccurrenceRoleSupport::NONE.supported(OccurrenceRole::MemberPosition);
 
 pub const CSHARP_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("invocation_expression", NormalizedKind::Call),
@@ -144,6 +147,44 @@ fn callable_target_node(node: Node<'_>) -> Option<Node<'_>> {
 
 fn conditional_member_binding(node: Node<'_>) -> Option<Node<'_>> {
     csharp_conditional_member_access(node).map(|access| access.binding)
+}
+
+/// Classify the terminal identifier of an ordinary or conditional member name.
+///
+/// A generic member name inserts one `generic_name` wrapper between the
+/// identifier and its owning access node. Checking the owning node's `name`
+/// field keeps receivers, declaration names and named-argument labels out of
+/// the member-position role without inspecting source text.
+fn csharp_member_position(node: Node<'_>) -> Option<OccurrenceRole> {
+    if node.kind() != "identifier" {
+        return None;
+    }
+
+    let parent = node.parent()?;
+    let member_name = match parent.kind() {
+        "member_access_expression" | "member_binding_expression" => {
+            parent.child_by_field_name("name")?
+        }
+        "generic_name" => {
+            if parent.child_by_field_name("name") != Some(node) {
+                return None;
+            }
+            let access = parent.parent()?;
+            if !matches!(
+                access.kind(),
+                "member_access_expression" | "member_binding_expression"
+            ) || access.child_by_field_name("name") != Some(parent)
+            {
+                return None;
+            }
+            parent
+        }
+        _ => return None,
+    };
+
+    csharp_member_name(member_name)
+        .is_some_and(|member| member.identifier.id() == node.id())
+        .then_some(OccurrenceRole::MemberPosition)
 }
 
 fn first_argument_value(argument: Node<'_>) -> Option<Node<'_>> {
@@ -304,11 +345,8 @@ impl StructuralSpec for CSharpStructuralSpec {
             .then(|| CallSiteFacts::of_kind(CallKind::Constructor))
     }
 
-    /// C# has not learned occurrence-role classification yet (#1473).
-    /// The empty table is the honest answer: queries and assertions that ask
-    /// for an occurrence role here report incomplete rather than clean-empty.
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
-        &NO_OCCURRENCE_ROLE_SUPPORT
+        &CSHARP_OCCURRENCE_ROLE_SUPPORT
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
@@ -339,6 +377,10 @@ impl StructuralSpec for CSharpStructuralSpec {
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
+        if let Some(role) = csharp_member_position(node) {
+            sink.occurrence_role(node, role);
+        }
+
         match kind {
             NormalizedKind::Call => {
                 let function = if node.kind() == "object_creation_expression" {
@@ -453,5 +495,95 @@ impl StructuralSpec for CSharpStructuralSpec {
             },
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
+    use tree_sitter::{Parser, Tree};
+
+    fn parse(source: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .expect("C# grammar loads");
+        let tree = parser.parse(source, None).expect("C# source parses");
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        tree
+    }
+
+    fn identifier_roles(source: &str) -> Vec<(String, Option<OccurrenceRole>)> {
+        let tree = parse(source);
+        let mut pending = vec![tree.root_node()];
+        let mut identifiers = Vec::new();
+        while let Some(node) = pending.pop() {
+            if node.kind() == "identifier" {
+                let spelling = node
+                    .utf8_text(source.as_bytes())
+                    .expect("identifier has valid source span")
+                    .to_owned();
+                identifiers.push((spelling, csharp_member_position(node)));
+            }
+            pending
+                .extend((0..node.named_child_count()).filter_map(|index| node.named_child(index)));
+        }
+        identifiers
+    }
+
+    #[test]
+    fn member_positions_are_limited_to_member_access_names() {
+        let source = r#"
+            class Runner {
+                int Field;
+                void Build(int count) { }
+
+                void Run(Runner service, int count) {
+                    var result = service.Build(count: count);
+                    var optional = service?.Build(count: count);
+                    var unrelated = count;
+                }
+            }
+        "#;
+
+        let identifiers = identifier_roles(source);
+        let member_names: Vec<_> = identifiers
+            .iter()
+            .filter_map(|(spelling, role)| {
+                (*role == Some(OccurrenceRole::MemberPosition)).then_some(spelling.as_str())
+            })
+            .collect();
+        assert_eq!(member_names, ["Build", "Build"]);
+
+        for spelling in ["service", "count", "Field", "unrelated", "result"] {
+            assert!(
+                identifiers
+                    .iter()
+                    .filter(|(name, _)| name == spelling)
+                    .all(|(_, role)| *role != Some(OccurrenceRole::MemberPosition)),
+                "{spelling} must not be a member-position occurrence"
+            );
+        }
+
+        assert!(
+            identifiers
+                .iter()
+                .filter(|(name, _)| name == "Build")
+                .any(|(_, role)| role.is_none()),
+            "the Build declaration must not be a member-position occurrence"
+        );
+    }
+
+    #[test]
+    fn csharp_support_advertises_only_member_position() {
+        let support = CSHARP_STRUCTURAL_SPEC.occurrence_role_support();
+        assert!(support.is_supported(OccurrenceRole::MemberPosition));
+        assert!(!support.is_supported(OccurrenceRole::ReceiverPosition));
+        assert!(!support.is_supported(OccurrenceRole::ValueReference));
     }
 }

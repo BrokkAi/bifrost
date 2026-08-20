@@ -53,6 +53,7 @@ use crate::kotlin::syntax::{
     kotlin_user_type_segments,
 };
 use brokk_bifrost_core::analyzer::ProjectFile;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{
     TreeWalkAction, first_named_child_of_kind, named_children, walk_tree_iterative,
 };
@@ -94,11 +95,12 @@ const SCOPE_NODES: &[&str] = &[
 /// decoded facts across).
 pub fn scan_file(
     graph: &KotlinGraphSource<'_>,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     input: &FileEdgeScanInput<'_>,
     class_ranges: ClassRangeIndex,
 ) -> PerFileEdges {
-    let names = KotlinNameResolver::new(graph, file, input.root(), input.source);
+    let names = KotlinNameResolver::new(graph, token, file, input.root(), input.source);
     let mut scan = KotlinEdgeScan {
         graph,
         source: input.source,
@@ -110,7 +112,7 @@ pub fn scan_file(
         input,
         edges: PerFileEdges::default(),
     };
-    walk(input.root(), &mut scan);
+    walk(input.root(), token, &mut scan);
     scan.edges
 }
 
@@ -195,7 +197,7 @@ impl KotlinEdgeScan<'_> {
     }
 }
 
-fn walk(root: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
+fn walk(root: Node<'_>, token: QueryToken<'_>, scan: &mut KotlinEdgeScan<'_>) {
     walk_tree_iterative(
         root,
         scan,
@@ -204,8 +206,8 @@ fn walk(root: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
             if enters_scope {
                 scan.bindings.enter_scope();
             }
-            seed_value_declarations(node, scan);
-            record_reference(node, scan);
+            seed_value_declarations(node, token, scan);
+            record_reference(node, token, scan);
             if enters_scope {
                 TreeWalkAction::DescendWithExit
             } else {
@@ -219,7 +221,7 @@ fn walk(root: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
 /// Record what each value declaration introduces: its type when the scan can
 /// establish one, otherwise a *shadow* — a binding of unknown type that keeps a
 /// local from being misread as the class it hides.
-fn seed_value_declarations(node: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
+fn seed_value_declarations(node: Node<'_>, token: QueryToken<'_>, scan: &mut KotlinEdgeScan<'_>) {
     if !matches!(
         node.kind(),
         "variable_declaration" | "parameter" | "class_parameter" | "parameter_with_optional_type"
@@ -233,13 +235,17 @@ fn seed_value_declarations(node: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
     if name.is_empty() {
         return;
     }
-    match binding_type_fq_name(node, scan) {
+    match binding_type_fq_name(node, token, scan) {
         Some(fqn) => scan.bindings.seed_symbol(name, fqn),
         None => scan.bindings.declare_shadow(name),
     }
 }
 
-fn binding_type_fq_name(binding: Node<'_>, scan: &mut KotlinEdgeScan<'_>) -> Option<String> {
+fn binding_type_fq_name(
+    binding: Node<'_>,
+    token: QueryToken<'_>,
+    scan: &mut KotlinEdgeScan<'_>,
+) -> Option<String> {
     if let Some(spelled) = kotlin_binding_type_text(binding, scan.source)
         && let Some(fqn) = scan.names.resolve_type_fqn(&spelled, binding.start_byte())
     {
@@ -256,17 +262,17 @@ fn binding_type_fq_name(binding: Node<'_>, scan: &mut KotlinEdgeScan<'_>) -> Opt
         .into_iter()
         .rev()
         .find(|child| kotlin_is_expression_kind(child.kind()))?;
-    receiver_type_fq_name(initializer, scan, 0)
+    receiver_type_fq_name(initializer, token, scan, 0)
 }
 
-fn record_reference(node: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
+fn record_reference(node: Node<'_>, token: QueryToken<'_>, scan: &mut KotlinEdgeScan<'_>) {
     match node.kind() {
         "import_header" => record_import(node, scan),
         "user_type" => record_user_type(node, scan),
         // A superclass constructor call in a supertype list; its `user_type`
         // child records the type itself.
         "constructor_invocation" => record_constructor_invocation(node, scan),
-        "call_expression" => record_call(node, scan),
+        "call_expression" => record_call(node, token, scan),
         // `C::class` names a type; `::name` and `C::name` name a callable.
         "callable_reference" => match kotlin_class_literal_type(node) {
             Some(literal) => record_class_literal(literal, scan),
@@ -281,7 +287,7 @@ fn record_reference(node: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
             // `lib.D::class` is the qualified class literal, not a member access.
             match kotlin_class_literal_type(node) {
                 Some(literal) => record_class_literal(literal, scan),
-                None => record_member_access(node, scan, None),
+                None => record_member_access(node, token, scan, None),
             }
         }
         _ => {}
@@ -502,7 +508,7 @@ fn record_bare_identifier(node: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
 // Calls and members
 // ---------------------------------------------------------------------------
 
-fn record_call(call: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
+fn record_call(call: Node<'_>, token: QueryToken<'_>, scan: &mut KotlinEdgeScan<'_>) {
     let Some(callee) = kotlin_callee(call) else {
         return;
     };
@@ -518,7 +524,7 @@ fn record_call(call: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
                 record_constructor_of(&owner_fqn, type_node, call, arity, scan);
                 return;
             }
-            record_member_access(callee, scan, Some(arity));
+            record_member_access(callee, token, scan, Some(arity));
         }
         "simple_identifier" => {
             if kotlin_is_declaration_name(callee) {
@@ -615,7 +621,12 @@ fn record_bare_callable(
 /// ancestor's or the companion's rather than one spelled `Receiver.member` —
 /// `member_unit` is the same lookup the query path uses, so the two cannot
 /// disagree about which declaration a call means.
-fn record_member_access(navigation: Node<'_>, scan: &mut KotlinEdgeScan<'_>, arity: Option<usize>) {
+fn record_member_access(
+    navigation: Node<'_>,
+    token: QueryToken<'_>,
+    scan: &mut KotlinEdgeScan<'_>,
+    arity: Option<usize>,
+) {
     let Some(member) = kotlin_navigation_member(navigation) else {
         return;
     };
@@ -639,7 +650,7 @@ fn record_member_access(navigation: Node<'_>, scan: &mut KotlinEdgeScan<'_>, ari
     // a member reachable only through same-owner references is inconclusive for
     // dead code, never confidently dead.
     let same_owner = receiver_is_same_owner(receiver, scan);
-    let owner_fqn = receiver_type_fq_name(receiver, scan, 0);
+    let owner_fqn = receiver_type_fq_name(receiver, token, scan, 0);
     let resolved = owner_fqn
         .as_ref()
         .and_then(|owner| member_unit(owner, &name, arity, scan))
@@ -654,7 +665,7 @@ fn record_member_access(navigation: Node<'_>, scan: &mut KotlinEdgeScan<'_>, ari
         // through the receiver's type but never found among its members.
         .or_else(|| {
             let owner = owner_fqn.as_ref()?;
-            visible_extension_unit(&name, owner, member.start_byte(), scan)
+            visible_extension_unit(&name, token, owner, member.start_byte(), scan)
                 .map(|unit| unit.fq_name())
         });
     route_same_owner(

@@ -8,6 +8,7 @@ use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::{BoundedDefinitionLookup, IAnalyzer, ProjectFile, resolve_analyzer};
 use crate::cancellation::CancellationToken;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use tree_sitter::Tree;
 
 /// Bounded Kotlin type resolution, serving both `get_type_by_location` and the
@@ -17,8 +18,10 @@ use tree_sitter::Tree;
 /// The type itself is worked out by the definition resolver, which already
 /// knows how to type a Kotlin expression; this turns the fully-qualified name
 /// it returns into indexed declarations, or explains why there is none.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_kotlin_type_bounded(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     tree: Option<&Tree>,
@@ -42,6 +45,7 @@ pub(crate) fn resolve_kotlin_type_bounded(
     let support = KotlinDefinitionProvider::new(kotlin, &session);
     let resolution = kotlin_type_lookup_resolution_in_session(
         analyzer,
+        token,
         &support,
         &session,
         file,

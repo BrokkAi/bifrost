@@ -18,10 +18,59 @@
 //! store persists segment text + kind, never IDs).
 
 use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::sync::{OnceLock, RwLock};
 
 use crate::analyzer::Language;
 use crate::hash::HashMap;
+
+/// The components a legacy `separator`-joined qualified-name string contributes
+/// to an [`FqName`]: every non-empty run between separators.
+///
+/// A frontend that still carries a qualified name as a joined string spells it
+/// twice — once as the string it stores in a [`crate::analyzer::CodeUnit`]'s
+/// `package_name`/`short_name`, and once as the structured `FqName` it builds
+/// by interning these components. `CodeUnit::with_signature_and_fq` asserts the
+/// two agree (the #1189 round-trip assert), and they can disagree in exactly
+/// one way: a separator run that yields no component. Well-formed source never
+/// writes one, but real corpora are full of source that is not well formed —
+/// `namespace winrt::{{ namespaceCpp }}` truncated at the placeholder,
+/// `package com..foo;` in a parser-test fixture, `namespace MyStandard\.hidden;`
+/// in a fixture that documents its own parse error. Each of those tripped the
+/// assert and aborted a whole workspace build.
+///
+/// Pair this with [`normalize_joined`] on the string side. Splitting here and
+/// re-joining there is the SAME decision about empty components made once, so
+/// the two spellings agree by construction rather than by each site
+/// remembering to guard (issues #2352, #2353, #2375).
+pub fn joined_segments<'a>(
+    joined: &'a str,
+    separator: &'a str,
+) -> impl Iterator<Item = &'a str> + 'a {
+    joined.split(separator).filter(|part| !part.is_empty())
+}
+
+/// [`joined_segments`] put back together: the joined string that renders the
+/// same segments the `FqName` will hold.
+///
+/// Storing this instead of the raw text is what closes the divergence. The
+/// common case borrows — a clean name has no empty component to drop, so this
+/// allocates only for the malformed input it exists to repair.
+pub fn normalize_joined<'a>(joined: &'a str, separator: &str) -> Cow<'a, str> {
+    let has_empty_component = joined.starts_with(separator)
+        || joined.ends_with(separator)
+        || joined.contains(&format!("{separator}{separator}"));
+    if !has_empty_component {
+        return Cow::Borrowed(joined);
+    }
+    Cow::Owned(
+        joined
+            .split(separator)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(separator),
+    )
+}
 
 /// What a qualified-name segment denotes. Baked into the interned entry rather
 /// than stored in a parallel per-position field, so an `FqName` stays a single
@@ -696,6 +745,50 @@ mod tests {
             name.push(interner.intern(text, kind));
         }
         name
+    }
+
+    /// The whole point of the pair: whatever `normalize_joined` stores must
+    /// re-split into exactly the components `joined_segments` interns, so the
+    /// `CodeUnit::with_signature_and_fq` boundary search cannot fail (#1189).
+    #[test]
+    fn normalize_joined_agrees_with_joined_segments() {
+        for (raw, separator) in [
+            // Well formed: every one of these must survive untouched.
+            ("com.example.pkg", "."),
+            ("cutlass::gemm::warp", "::"),
+            ("", "."),
+            ("single", "::"),
+            // The malformed shapes that aborted real workspace builds.
+            ("winrt::", "::"),           // #2353 react-native-windows
+            ("com..foo", "."),           // #2375 intellij-community
+            ("MyStandard..hidden", "."), // #2352 PHP_CodeSniffer
+            (".ArrayObject", "."),       // #2350 phan
+            ("::", "::"),
+            ("...", "."),
+        ] {
+            let normalized = normalize_joined(raw, separator);
+            let rejoined = joined_segments(&normalized, separator).collect::<Vec<_>>();
+            assert_eq!(
+                rejoined.join(separator),
+                *normalized,
+                "normalize_joined({raw:?}, {separator:?}) must be a fixed point of the split"
+            );
+            assert_eq!(
+                joined_segments(raw, separator).collect::<Vec<_>>(),
+                rejoined,
+                "normalizing must not change which components the fq gets ({raw:?})"
+            );
+        }
+    }
+
+    /// A clean name must not allocate: this runs on every declaration.
+    #[test]
+    fn normalize_joined_borrows_a_clean_name() {
+        assert!(matches!(
+            normalize_joined("com.example.pkg", "."),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(normalize_joined("com..foo", "."), Cow::Owned(_)));
     }
 
     #[test]

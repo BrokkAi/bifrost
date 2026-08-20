@@ -30,14 +30,17 @@ use crate::analyzer::{
     SemanticDiagnosticReport, resolve_analyzer,
 };
 use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_csharp::diagnostics::{
     CSharpExternalEvidence, CSharpExternalTypes, CSharpMemberSurface,
 };
 
 use super::external::CSharpExternalDeclarationIndex;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
 pub(crate) fn collect_csharp_semantic_diagnostics(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
 ) -> SemanticDiagnosticReport {
@@ -57,7 +60,7 @@ pub(crate) fn collect_csharp_semantic_diagnostics(
         evidence: analyzer.dependency_discovery_evidence(Language::CSharp),
     };
     let report = brokk_bifrost_csharp::diagnostics::collect_csharp_semantic_diagnostics(
-        csharp, &external, file, source,
+        csharp, token, &external, file, source,
     );
     crate::analyzer::semantic_model::degrade_pack_gap_absences(analyzer, report)
 }
@@ -124,6 +127,8 @@ impl CSharpExternalEvidence for RetainedCSharpExternal<'_> {
     }
 
     fn resolve_type(&self, file: &ProjectFile, identity: &str) -> CSharpExternalTypes {
+        let scope = AnalyzerQueryScope::new(self.csharp);
+        let token = scope.token();
         let Some(index) = self.index else {
             return CSharpExternalTypes::None;
         };
@@ -133,8 +138,8 @@ impl CSharpExternalEvidence for RetainedCSharpExternal<'_> {
         let matched = index.resolve_in_file(
             identity,
             &self.csharp.namespace_of_file(file),
-            &self.csharp.using_namespaces_of(file),
-            &self.csharp.using_aliases_of(file),
+            &self.csharp.using_namespaces_of(token, file),
+            &self.csharp.using_aliases_of(token, file),
         );
         // Two assemblies publishing the same identity are one type as far as a
         // name lookup is concerned; only distinct identities are an ambiguity.

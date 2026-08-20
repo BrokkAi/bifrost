@@ -10,6 +10,7 @@ mod structural;
 use crate::analyzer::Range;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 /// The Scala declaration walk, structured import/export parsing, raw-supertype
 /// extraction and ordered wildcard-import environment now live in
 /// [`brokk_bifrost_jvm::scala`]. Re-exporting the modules under their historical
@@ -236,10 +237,11 @@ impl ScalaAnalyzer {
 
     pub(crate) fn import_info_of_limited(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         limit: usize,
     ) -> crate::analyzer::store::LimitedQueryRows<crate::analyzer::ImportInfo> {
-        self.inner.import_info_of_limited(file, limit)
+        self.inner.import_info_of_limited(token, file, limit)
     }
 
     pub(crate) fn namespace_of_file_limited(
@@ -448,13 +450,14 @@ impl ScalaAnalyzer {
     #[allow(dead_code)]
     pub(crate) fn global_usage_definition_index_shared(
         &self,
+        token: QueryToken<'_>,
     ) -> Arc<crate::analyzer::GlobalUsageDefinitionIndex> {
-        self.inner.global_usage_definition_index_shared()
+        self.inner.global_usage_definition_index_shared(token)
     }
 
     #[allow(dead_code)]
-    pub(crate) fn usage_facts_index_shared(&self) -> Arc<UsageFactsIndex> {
-        self.inner.usage_facts_index_shared()
+    pub(crate) fn usage_facts_index_shared(&self, token: QueryToken<'_>) -> Arc<UsageFactsIndex> {
+        self.inner.usage_facts_index_shared(token)
     }
 
     pub(crate) fn project_types(&self) -> Arc<ScalaProjectTypes> {
@@ -498,13 +501,14 @@ impl ScalaAnalyzer {
     /// declared artifacts the index never finished reading.
     pub(crate) fn external_boundary_evidence(
         &self,
+        token: QueryToken<'_>,
         packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
         file: &ProjectFile,
         name: &str,
     ) -> (BoundaryStatus, Option<String>) {
         let external = self.external_declarations(packs.clone());
         let package_name = self.inner.package_name_of(file).unwrap_or_default();
-        if let Some(ty) = self.external_type_spelling(&external, file, &package_name, name) {
+        if let Some(ty) = self.external_type_spelling(token, &external, file, &package_name, name) {
             return (BoundaryStatus::ExternalIndexed, Some(ty.fqn().to_owned()));
         }
         // A member spelling leaves the workspace exactly as its owner type
@@ -512,7 +516,7 @@ impl ScalaAnalyzer {
         // (#1900). A member the surface does not declare changes nothing.
         // One ladder answers here and in the resolver's own boundary gate, so
         // a trace and a definition cannot disagree about a spelling (#2287).
-        if let Some(member) = self.resolve_member_name_with_external(packs, file, name) {
+        if let Some(member) = self.resolve_member_name_with_external(token, packs, file, name) {
             return (
                 BoundaryStatus::ExternalIndexed,
                 Some(member.fqn().to_owned()),
@@ -538,6 +542,7 @@ impl ScalaAnalyzer {
     /// copies of this ladder would let a trace and a definition disagree.
     fn external_type_spelling(
         &self,
+        token: QueryToken<'_>,
         external: &JvmExternalDeclarations<'_>,
         file: &ProjectFile,
         package_name: &str,
@@ -551,7 +556,7 @@ impl ScalaAnalyzer {
         if let Some(ty) = external.resolve_java_lang(spelling) {
             return Some(ty);
         }
-        for import in self.inner.import_info_of(file) {
+        for import in self.inner.import_info_of(token, file) {
             let Some(path) = scala_import_path(&import) else {
                 continue;
             };
@@ -585,6 +590,7 @@ impl ScalaAnalyzer {
     /// are indexed, and the resolver either found them or did not.
     pub(crate) fn resolve_member_name_with_external(
         &self,
+        token: QueryToken<'_>,
         packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
         file: &ProjectFile,
         raw_name: &str,
@@ -599,7 +605,7 @@ impl ScalaAnalyzer {
         }
         let package_name = self.inner.package_name_of(file).unwrap_or_default();
         external.resolve_member_spelling(normalized, &package_name, |owner_spelling| {
-            self.external_type_spelling(&external, file, &package_name, owner_spelling)
+            self.external_type_spelling(token, &external, file, &package_name, owner_spelling)
         })
     }
 
@@ -836,6 +842,8 @@ impl ScalaSource for ScalaAnalyzer {
         name: &str,
         model: &dyn JvmActiveSemanticModel,
     ) -> ScalaNameProof {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         if name.is_empty() || scala_default_type_name(name) {
             // A name on Scala's built-in list is known by construction. It
             // denotes a stdlib declaration, so the boundary is external.
@@ -847,7 +855,7 @@ impl ScalaSource for ScalaAnalyzer {
             return ScalaNameProof::Workspace;
         }
 
-        let imports = self.inner.import_info_of(file);
+        let imports = self.inner.import_info_of(token, file);
         let imported = self.imported_code_units_of(file);
         let retained = self.external_index.get();
         let declares_name = |declaration: &CodeUnit| {
@@ -927,6 +935,8 @@ impl ScalaSource for ScalaAnalyzer {
         name: &str,
         model: &dyn JvmActiveSemanticModel,
     ) -> ScalaNameProof {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         let package_name = self.inner.package_name_of(file).unwrap_or_default();
         if self.declares_simple_type(file, &package_name, name) {
             return ScalaNameProof::Workspace;
@@ -937,7 +947,7 @@ impl ScalaSource for ScalaAnalyzer {
         {
             return ScalaNameProof::ExternalIndexed;
         }
-        let imports = self.inner.import_info_of(file);
+        let imports = self.inner.import_info_of(token, file);
         if let Some(import) = imports
             .iter()
             .find(|import| import.is_wildcard || import.local_name() == Some(name))
@@ -1293,7 +1303,10 @@ impl IAnalyzer for ScalaAnalyzer {
     }
 
     fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
+        // Trait signature is fixed, so this boundary opens the scope the
+        // usage-graph funnel now demands proof of (issue #2423 milestone B).
+        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        self.inner.global_usage_definition_index(scope.token())
     }
 
     fn usage_facts_index(&self) -> &UsageFactsIndex {
@@ -1650,11 +1663,15 @@ impl LanguageEdgePass for ScalaEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        build_scala_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        let scope = AnalyzerQueryScope::new(ctx.analyzer);
+        let token = scope.token();
+        build_scala_usage_edges(ctx.analyzer, token, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
-        build_scala_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+        let scope = AnalyzerQueryScope::new(ctx.analyzer);
+        let token = scope.token();
+        build_scala_usage_edge_weights(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
             .map(LanguageEdgeWeights::Fqn)
     }
 }
@@ -1664,8 +1681,11 @@ impl StructuralReceiverResolver for ScalaSupport {
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<TypeLookupOutcome> {
+        let scope = AnalyzerQueryScope::new(query.analyzer);
+        let token = scope.token();
         resolve_scala_type_bounded(
             query.analyzer,
+            token,
             query.file,
             query.source,
             query.tree,
@@ -1679,8 +1699,11 @@ impl StructuralReceiverResolver for ScalaSupport {
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<DefinitionLookupOutcome> {
+        let scope = AnalyzerQueryScope::new(query.analyzer);
+        let token = scope.token();
         resolve_scala_bounded(
             query.analyzer,
+            token,
             query.file,
             query.source,
             query.tree,
@@ -1767,7 +1790,9 @@ class Use(api: Api) { def call(): Int = api.choose(1)("overlay") }
             .into_iter()
             .map(|unit| unit.fq_name())
             .collect();
-        let edges = build_scala_usage_edges(&snapshot, &nodes, |_| true)
+        let scope = AnalyzerQueryScope::new(&disk);
+        let token = scope.token();
+        let edges = build_scala_usage_edges(&snapshot, token, &nodes, |_| true)
             .expect("Scala inverted edge build");
         assert!(
             edges
@@ -2052,6 +2077,8 @@ impl DeadCodeBulkProof for ScalaDeadCodeBulk {
     /// bucket, rather than falling through to a per-symbol scan that would pay the cost
     /// the cap exists to avoid.
     fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool {
+        let scope = AnalyzerQueryScope::new(routing.analyzer);
+        let token = scope.token();
         let DeadCodeRouting {
             analyzer,
             candidate,
@@ -2084,7 +2111,7 @@ impl DeadCodeBulkProof for ScalaDeadCodeBulk {
         };
 
         matches!(
-            dead_code_bulk_eligibility(analyzer, candidate, overloads, context),
+            dead_code_bulk_eligibility(analyzer, token, candidate, overloads, context),
             ScalaDeadCodeBulkEligibility::NeedsPrecise
         )
     }
@@ -2103,12 +2130,14 @@ impl DeadCodeBulkProof for ScalaDeadCodeBulk {
         analyzer: &dyn IAnalyzer,
         candidates: &[CodeUnit],
     ) -> Option<DeadCodeBulkEdges> {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let nodes = fqn_bulk_nodes(
             analyzer,
             Language::Scala,
             |unit| unit.is_function() || unit.is_class(),
             candidates,
         );
-        build_full_scala_usage_edges(analyzer, &nodes).map(DeadCodeBulkEdges::Fqn)
+        build_full_scala_usage_edges(analyzer, token, &nodes).map(DeadCodeBulkEdges::Fqn)
     }
 }

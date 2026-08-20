@@ -14,6 +14,7 @@ use crate::analyzer::jvm::JvmOverlayModel;
 use crate::analyzer::{
     IAnalyzer, KotlinAnalyzer, ProjectFile, SemanticDiagnosticReport, resolve_analyzer,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_jvm::realm::JvmSourceRealm;
 
 /// Collect proof-gated Kotlin unresolved-type diagnostics for `file`.
@@ -23,6 +24,7 @@ use brokk_bifrost_jvm::realm::JvmSourceRealm;
 /// `KotlinAnalyzer` passes `None`.
 pub(crate) fn collect_kotlin_semantic_diagnostics(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     realm: Option<&JvmSourceRealm<'_>>,
@@ -33,6 +35,7 @@ pub(crate) fn collect_kotlin_semantic_diagnostics(
     let report = brokk_bifrost_jvm::kotlin::diagnostics::collect_kotlin_semantic_diagnostics(
         analyzer,
         kotlin,
+        token,
         file,
         source,
         realm,

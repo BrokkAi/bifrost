@@ -837,6 +837,27 @@ sets. Inputs must exist on the target, outputs must reference a location of the
 right kind, call targets must exist, and all collections have fixed validation
 budgets. Duplicate targets and duplicate IDs are rejected across shards.
 
+`declared_effects` is a separate, optional list of namespaced effect
+identifiers the reviewed pack attributes to the exact procedure, such as
+`acme.network_io`. Unlike `effects`, a declared effect names no input, output,
+or callee and never joins the transfer graph; it lets a policy ask whether a
+call performs an effect without new analyzer code. Each entry carries:
+
+- `id`: a stable identifier that must contain at least one `.`, so two vendors
+  can ship packs without colliding on a bare word like `write`.
+- `timing`: `immediate` (before the call returns), `deferred` (scheduled by the
+  call), or `unknown` (the pack asserts the effect but not when it happens).
+- `certainty`: `definite` (every execution performs it) or `possible` (some
+  execution may).
+
+A summary may declare at most 64 effects, and one summary may not repeat an
+`id`. Declared effects do not satisfy the rule that a summary must carry at
+least one transfer or effect. Two activated summaries that match the same
+procedure and disagree about their declared effects resolve to a conflict and
+are not used. Omitting the field changes no digest, so a pack that declares no
+effects keeps the compiled bytes and the digests it had before the field
+existed.
+
 Completeness is explicit at both levels. A `partial` record remains partial
 after compilation and decoding; a partial pack cannot claim a `complete`
 record. Completeness is evidence metadata only and does not enable matching or
@@ -871,6 +892,13 @@ payload:
             location: location.receiver-field
         - kind: unknown_call_boundary
           event: event.helper.unknown-boundary
+      declared_effects:
+        - id: acme.network_io
+          timing: immediate
+          certainty: definite
+        - id: acme.audit_log
+          timing: deferred
+          certainty: possible
 ```
 
 ## Canonical artifacts and digests

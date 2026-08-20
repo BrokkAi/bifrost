@@ -1,7 +1,7 @@
 {
   "format": "bifrost_framework_pack_audit/v1",
-  "types_total": 9,
-  "members_total": 46,
+  "types_total": 10,
+  "members_total": 53,
   "packs": [
     {
       "pack_id": "bifrost.javax.servlet-api-framework-decls",
@@ -19,8 +19,8 @@
       "pinned": true,
       "ecosystem": "jdk",
       "completeness": "partial",
-      "types": 6,
-      "members": 29
+      "types": 7,
+      "members": 36
     }
   ]
 }

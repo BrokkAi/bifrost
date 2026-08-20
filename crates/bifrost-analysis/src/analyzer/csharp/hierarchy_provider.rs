@@ -16,14 +16,17 @@ use brokk_bifrost_csharp::hierarchy::logical_direct_ancestors;
 use std::sync::Arc;
 
 use super::CSharpAnalyzer;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
 impl TypeHierarchyProvider for CSharpAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         if let Some(cached) = self.memo_caches.direct_ancestors.get(code_unit) {
             return (*cached).clone();
         }
 
-        let ancestors = logical_direct_ancestors(self, code_unit, false);
+        let ancestors = logical_direct_ancestors(self, token, code_unit, false);
         self.memo_caches
             .direct_ancestors
             .insert(code_unit.clone(), Arc::new(ancestors.clone()));

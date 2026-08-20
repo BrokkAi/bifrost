@@ -162,7 +162,7 @@ impl RustDefinitionProvider for AnalyzerRustDefinitionProvider<'_> {
                         session.observe_cancellation()
                     })
             }),
-            None => self.rust.definitions(fqn).collect(),
+            None => self.rust.declaration_candidates_by_fqn(fqn),
         };
         sort_units(&mut units);
         units.dedup();
@@ -195,8 +195,9 @@ impl RustDefinitionProvider for AnalyzerRustDefinitionProvider<'_> {
                 .collect(),
             None => self
                 .rust
-                .declarations(file)
+                .declaration_candidates_by_identifier(identifier)
                 .into_iter()
+                .filter(|unit| unit.source() == file)
                 .filter(|unit| unit.identifier() == identifier)
                 .collect(),
         };
@@ -220,8 +221,7 @@ impl RustDefinitionProvider for AnalyzerRustDefinitionProvider<'_> {
             }),
             None => self
                 .rust
-                .definitions(&format!("{owner_fqn}.{name}"))
-                .collect(),
+                .declaration_candidates_by_fqn(&format!("{owner_fqn}.{name}")),
         };
         sort_units(&mut units);
         units.dedup();
@@ -8310,7 +8310,7 @@ fn rust_imported_export_candidates(
             targets
         }
     } else {
-        let binder = rust.import_binder_of(file);
+        let binder = rust.import_binder_of(token, file);
         let targets =
             resolve_imported_export_from_binder_forward(rust, token, file, &binder, reference);
         if targets.is_empty() && rust_binder_has_external_binding(&binder, reference) {

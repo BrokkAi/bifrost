@@ -532,6 +532,7 @@ pub fn is_adjudicated_answer_diagnostic_kind(kind: &str) -> bool {
 
 pub(crate) fn resolve_definition_batch(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     requests: Vec<DefinitionLookupRequest>,
 ) -> Vec<DefinitionLookupOutcome> {
     let _scope = profiling::scope("get_definition::resolve_definition_batch");
@@ -540,11 +541,12 @@ pub(crate) fn resolve_definition_batch(
     }
     let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
-    resolve_definition_requests(analyzer, &mut context, requests, None, None, true)
+    resolve_definition_requests(analyzer, token, &mut context, requests, None, None, true)
 }
 
 pub(crate) fn resolve_navigation_batch(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     requests: Vec<DefinitionLookupRequest>,
     operation: NavigationOperation,
     cancellation: Option<&CancellationToken>,
@@ -561,6 +563,7 @@ pub(crate) fn resolve_navigation_batch(
     let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
     resolve_navigation_requests(
         analyzer,
+        token,
         &mut context,
         requests,
         operation,
@@ -571,6 +574,7 @@ pub(crate) fn resolve_navigation_batch(
 
 fn resolve_navigation_requests<'a>(
     analyzer: &'a dyn IAnalyzer,
+    token: QueryToken<'_>,
     context: &mut DefinitionBatchContext<'a>,
     requests: Vec<DefinitionLookupRequest>,
     operation: NavigationOperation,
@@ -587,6 +591,7 @@ fn resolve_navigation_requests<'a>(
         .collect();
     let outcomes = resolve_definition_requests(
         analyzer,
+        token,
         context,
         requests,
         cancellation,
@@ -597,7 +602,7 @@ fn resolve_navigation_requests<'a>(
         .into_iter()
         .zip(outcomes)
         .map(|(language, outcome)| {
-            navigation_lookup_outcome(analyzer, context, outcome, language, operation)
+            navigation_lookup_outcome(analyzer, token, context, outcome, language, operation)
         })
         .collect()
 }
@@ -613,6 +618,7 @@ fn resolve_navigation_requests<'a>(
 /// of the ones before it.
 fn resolve_definition_requests<'a>(
     analyzer: &'a dyn IAnalyzer,
+    token: QueryToken<'_>,
     context: &mut DefinitionBatchContext<'a>,
     requests: Vec<DefinitionLookupRequest>,
     cancellation: Option<&CancellationToken>,
@@ -621,6 +627,7 @@ fn resolve_definition_requests<'a>(
 ) -> Vec<DefinitionLookupOutcome> {
     resolve_definition_requests_traced(
         analyzer,
+        token,
         context,
         requests,
         cancellation,
@@ -634,6 +641,7 @@ fn resolve_definition_requests<'a>(
 #[allow(clippy::too_many_arguments)]
 fn resolve_definition_requests_traced<'a>(
     analyzer: &'a dyn IAnalyzer,
+    token: QueryToken<'_>,
     context: &mut DefinitionBatchContext<'a>,
     requests: Vec<DefinitionLookupRequest>,
     cancellation: Option<&CancellationToken>,
@@ -660,6 +668,7 @@ fn resolve_definition_requests_traced<'a>(
             let file = request.file.clone();
             let outcome = resolve_one(
                 analyzer,
+                token,
                 context,
                 request,
                 operation,
@@ -687,9 +696,11 @@ pub fn resolve_definition_batch_with_source(
     source: Arc<str>,
 ) -> Vec<DefinitionLookupOutcome> {
     let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
     context.sources.insert(file, Ok(source));
-    resolve_definition_requests(analyzer, &mut context, requests, None, None, true)
+    resolve_definition_requests(analyzer, token, &mut context, requests, None, None, true)
 }
 
 /// The traced counterpart of [`resolve_definition_batch_with_source`]: same
@@ -716,9 +727,19 @@ pub fn resolve_navigation_batch_with_source(
     operation: NavigationOperation,
 ) -> Vec<NavigationLookupOutcome> {
     let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
     context.sources.insert(file, Ok(source));
-    resolve_navigation_requests(analyzer, &mut context, requests, operation, None, true)
+    resolve_navigation_requests(
+        analyzer,
+        token,
+        &mut context,
+        requests,
+        operation,
+        None,
+        true,
+    )
 }
 
 pub fn navigation_declaration_site_targets(
@@ -726,6 +747,8 @@ pub fn navigation_declaration_site_targets(
     candidate: CodeUnit,
     operation: NavigationOperation,
 ) -> Vec<NavigationTarget> {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     if language_for_file(candidate.source()) != Language::Cpp {
         return vec![NavigationTarget {
             code_unit: candidate,
@@ -734,7 +757,7 @@ pub fn navigation_declaration_site_targets(
     }
     let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = DefinitionBatchContext::new(analyzer, scope.token(), false);
-    cpp::select_navigation_targets(&mut context, &[candidate], operation).targets
+    cpp::select_navigation_targets(&mut context, token, &[candidate], operation).targets
 }
 
 pub fn navigation_declaration_site_at_offset(
@@ -755,10 +778,13 @@ pub fn resolve_definition_batch_with_source_and_cancellation(
     cancellation: &CancellationToken,
 ) -> Vec<DefinitionLookupOutcome> {
     let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
     context.sources.insert(file, Ok(source));
     resolve_definition_requests(
         analyzer,
+        token,
         &mut context,
         requests,
         Some(cancellation),
@@ -769,6 +795,7 @@ pub fn resolve_definition_batch_with_source_and_cancellation(
 
 pub(crate) fn resolve_call_target_batch_with_source(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     requests: Vec<DefinitionLookupRequest>,
     file: ProjectFile,
     source: Arc<str>,
@@ -801,6 +828,7 @@ pub(crate) fn resolve_call_target_batch_with_source(
     context.sources.insert(file, Ok(source));
     resolve_navigation_requests(
         analyzer,
+        token,
         &mut context,
         requests,
         NavigationOperation::Definition,
@@ -833,6 +861,8 @@ pub fn resolve_call_reference_definition_with_source(
     file: ProjectFile,
     source: Arc<str>,
 ) -> Option<DefinitionLookupOutcome> {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let language = language_for_file(&request.file);
     if matches!(language, Language::None | Language::Ruby) {
         return None;
@@ -854,6 +884,7 @@ pub fn resolve_call_reference_definition_with_source(
 
     Some(resolve_one(
         analyzer,
+        token,
         &mut context,
         request,
         None,
@@ -1009,6 +1040,7 @@ impl<'a> DefinitionBatchContext<'a> {
 
     fn go_context(
         &mut self,
+        token: QueryToken<'_>,
         go: &GoAnalyzer,
         file: &ProjectFile,
         source: &str,
@@ -1018,7 +1050,7 @@ impl<'a> DefinitionBatchContext<'a> {
             let definitions =
                 go::AnalyzerGoDefinitionProvider::new(go, self.analyzer.semantic_model_overlay());
             let (aliases, dot_imports) =
-                go::go_definition_import_namespaces(&definitions, go, file);
+                go::go_definition_import_namespaces(&definitions, token, go, file);
             GoDefinitionContext {
                 package: go.canonical_package_name_from_tree(file, source, tree.root_node()),
                 aliases,
@@ -1029,6 +1061,7 @@ impl<'a> DefinitionBatchContext<'a> {
 
     fn scala_context(
         &mut self,
+        token: QueryToken<'_>,
         scala: &ScalaAnalyzer,
         file: &ProjectFile,
     ) -> ScalaDefinitionContext {
@@ -1037,7 +1070,7 @@ impl<'a> DefinitionBatchContext<'a> {
             .or_insert_with(|| ScalaDefinitionContext {
                 file: file.clone(),
                 package: Arc::from(scala_package_name_of(scala, file).unwrap_or_default()),
-                imports: Arc::new(scala.import_info_of(file)),
+                imports: Arc::new(scala.import_info_of(token, file)),
             })
             .clone()
     }
@@ -1177,6 +1210,7 @@ impl<'a> DefinitionBatchContext<'a> {
 
     fn python_context(
         &mut self,
+        token: QueryToken<'_>,
         py: &PythonAnalyzer,
         file: &ProjectFile,
     ) -> Arc<python::PythonDefinitionContext> {
@@ -1191,6 +1225,7 @@ impl<'a> DefinitionBatchContext<'a> {
                 Arc::new(python::PythonDefinitionContext::build(
                     py,
                     self.analyzer,
+                    token,
                     file,
                     #[cfg(test)]
                     Arc::clone(&self.python_build_counters),
@@ -1220,6 +1255,7 @@ impl<'a> DefinitionBatchContext<'a> {
 
 fn resolve_one<'a>(
     analyzer: &'a dyn IAnalyzer,
+    token: QueryToken<'_>,
     context: &mut DefinitionBatchContext<'a>,
     request: DefinitionLookupRequest,
     operation: Option<NavigationOperation>,
@@ -1385,7 +1421,7 @@ fn resolve_one<'a>(
                 .and_then(|tree| go_selector_descriptor(tree.root_node(), &site));
             let resolution = go.and_then(|go| {
                 let tree = tree.as_ref()?;
-                let batch = context.go_context(go, &request.file, &source, tree);
+                let batch = context.go_context(token, go, &request.file, &source, tree);
                 Some(resolve_go_reference_with_namespaces(
                     tree.root_node(),
                     &source,
@@ -1432,6 +1468,7 @@ fn resolve_one<'a>(
         ),
         Language::Python => python::resolve_python(
             analyzer,
+            token,
             context,
             &request.file,
             &source,
@@ -1444,6 +1481,7 @@ fn resolve_one<'a>(
                 let definitions = csharp::CSharpDefinitionProvider::new(csharp_analyzer);
                 csharp::resolve_csharp(
                     analyzer,
+                    token,
                     &definitions,
                     &request.file,
                     &source,
@@ -1454,6 +1492,7 @@ fn resolve_one<'a>(
         ),
         Language::Cpp => cpp::resolve_cpp(
             analyzer,
+            token,
             context,
             &request.file,
             &source,
@@ -1462,6 +1501,7 @@ fn resolve_one<'a>(
         ),
         Language::Scala => scala::resolve_scala(
             analyzer,
+            token,
             context,
             &request.file,
             &source,
@@ -1642,6 +1682,7 @@ fn finalize_navigation_outcome(
 
 fn navigation_lookup_outcome(
     _analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     context: &mut DefinitionBatchContext<'_>,
     outcome: DefinitionLookupOutcome,
     language: Language,
@@ -1656,7 +1697,7 @@ fn navigation_lookup_outcome(
     } = outcome;
     let (mut targets, structure_unavailable, unproven_link_unit, mut truncated) =
         if language == Language::Cpp {
-            let selection = cpp::select_navigation_targets(context, &definitions, operation);
+            let selection = cpp::select_navigation_targets(context, token, &definitions, operation);
             (
                 selection.targets,
                 selection.structure_unavailable,
@@ -2044,8 +2085,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let outcomes =
-            resolve_definition_requests(analyzer, &mut context, requests, None, None, false);
+            resolve_definition_requests(analyzer, token, &mut context, requests, None, None, false);
 
         assert!(outcomes.iter().all(|outcome| {
             outcome.status == DefinitionLookupStatus::Resolved
@@ -2087,8 +2130,10 @@ mod tests {
             })
             .collect();
 
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let outcomes =
-            resolve_definition_requests(analyzer, &mut context, requests, None, None, false);
+            resolve_definition_requests(analyzer, token, &mut context, requests, None, None, false);
 
         assert!(outcomes.iter().all(|outcome| {
             outcome.status == DefinitionLookupStatus::Resolved
@@ -2148,12 +2193,16 @@ mod tests {
         let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
 
         {
-            let first = context.go_context(go, &file, source, &tree);
+            let scope = AnalyzerQueryScope::new(analyzer);
+            let token = scope.token();
+            let first = context.go_context(token, go, &file, source, &tree);
             assert_eq!(first.package, "consumer");
             assert_eq!(first.aliases.len(), 1);
         }
         let second_aliases = {
-            let second = context.go_context(go, &file, source, &tree);
+            let scope = AnalyzerQueryScope::new(analyzer);
+            let token = scope.token();
+            let second = context.go_context(token, go, &file, source, &tree);
             assert_eq!(second.package, "consumer");
             second.aliases.len()
         };
@@ -2180,8 +2229,10 @@ mod tests {
         let scope = AnalyzerQueryScope::new(analyzer);
         let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
 
-        let first = context.scala_context(scala, &file);
-        let second = context.scala_context(scala, &file);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let first = context.scala_context(token, scala, &file);
+        let second = context.scala_context(token, scala, &file);
         let first_prefixes =
             context.scala_package_prefixes(&file, tree.root_node(), source, source.len());
         let second_prefixes = context.scala_package_prefixes(&file, tree.root_node(), source, 0);
@@ -2216,8 +2267,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let _outcomes =
-            resolve_definition_requests(analyzer, &mut context, requests, None, None, true);
+            resolve_definition_requests(analyzer, token, &mut context, requests, None, None, true);
         assert_eq!(context.scala_lookup_cache_counts(), (1, 0));
     }
 
@@ -2242,8 +2295,11 @@ mod tests {
         let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
         let start_byte = source.rfind("run").expect("receiver member in source");
 
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let outcomes = resolve_definition_requests(
             analyzer,
+            token,
             &mut context,
             vec![DefinitionLookupRequest {
                 file,
@@ -2310,8 +2366,10 @@ mod tests {
             })
             .collect();
 
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let outcomes =
-            resolve_definition_requests(analyzer, &mut context, requests, None, None, false);
+            resolve_definition_requests(analyzer, token, &mut context, requests, None, None, false);
 
         assert_eq!(
             outcomes[0].definitions[0].fq_name(),
@@ -2365,8 +2423,10 @@ mod tests {
             })
             .collect();
 
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         let outcomes =
-            resolve_definition_requests(analyzer, &mut context, requests, None, None, false);
+            resolve_definition_requests(analyzer, token, &mut context, requests, None, None, false);
 
         assert_eq!(
             outcomes[0].definitions[0].fq_name(),
@@ -2402,7 +2462,9 @@ mod tests {
         let py = resolve_analyzer::<PythonAnalyzer>(analyzer).expect("Python analyzer");
         let scope = AnalyzerQueryScope::new(analyzer);
         let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
-        let python_context = context.python_context(py, &file);
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let python_context = context.python_context(token, py, &file);
         python_context.set_receiver_type_cache_limit(1);
         let member_offsets = [
             source
@@ -2428,7 +2490,7 @@ mod tests {
             .collect();
 
         let outcomes =
-            resolve_definition_requests(analyzer, &mut context, requests, None, None, false);
+            resolve_definition_requests(analyzer, token, &mut context, requests, None, None, false);
 
         assert_eq!(outcomes[0].definitions[0].fq_name(), "service.Service.run");
         assert_eq!(outcomes[1].definitions[0].fq_name(), "other.Other.stop");
@@ -2470,8 +2532,17 @@ mod tests {
         let scope = AnalyzerQueryScope::new(&analyzer);
         let mut context = DefinitionBatchContext::new(&analyzer, scope.token(), true);
 
-        let outcomes =
-            resolve_definition_requests(&analyzer, &mut context, requests, None, None, false);
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+        let outcomes = resolve_definition_requests(
+            &analyzer,
+            token,
+            &mut context,
+            requests,
+            None,
+            None,
+            false,
+        );
 
         assert_eq!(outcomes.len(), REFERENCE_COUNT);
         assert!(outcomes.iter().all(|outcome| {

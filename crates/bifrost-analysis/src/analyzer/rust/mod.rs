@@ -237,6 +237,23 @@ impl RustAnalyzer {
             .lookup_declarations_by_identifier_limited(identifier, limit, continue_query)
     }
 
+    pub(crate) fn declaration_candidates_by_identifier(&self, identifier: &str) -> Vec<CodeUnit> {
+        self.inner
+            .lookup_declarations_by_identifier(identifier)
+            .into_iter()
+            .collect()
+    }
+
+    pub(crate) fn declaration_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        let Some(identifier) = fqn.rsplit('.').next().filter(|name| !name.is_empty()) else {
+            return Vec::new();
+        };
+        self.declaration_candidates_by_identifier(identifier)
+            .into_iter()
+            .filter(|candidate| candidate.fq_name() == fqn)
+            .collect()
+    }
+
     pub(crate) fn declaration_candidates_by_fqn_limited(
         &self,
         fqn: &str,
@@ -730,7 +747,9 @@ impl brokk_bifrost_rust::graph_support::RustSource for RustAnalyzer {
     }
 
     fn import_binder_of(&self, file: &ProjectFile) -> crate::analyzer::usages::ImportBinder {
-        self.import_binder_of(file)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        self.import_binder_of(token, file)
     }
 
     fn export_index_of(&self, file: &ProjectFile) -> Arc<crate::analyzer::usages::ExportIndex> {
@@ -772,6 +791,12 @@ impl RustFactSource for RustAnalyzer {
     fn rust_import_target_blobs(&self, module_path: &str) -> Vec<git2::Oid> {
         self.analyzer_store()
             .rust_import_target_blobs("rust", module_path)
+            .unwrap_or_default()
+    }
+
+    fn rust_module_import_candidate_blobs(&self, component: &str) -> Vec<git2::Oid> {
+        self.analyzer_store()
+            .rust_module_import_candidate_blobs("rust", component)
             .unwrap_or_default()
     }
 
@@ -1070,7 +1095,10 @@ impl IAnalyzer for RustAnalyzer {
     }
 
     fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
+        // Trait signature is fixed, so this boundary opens the scope the
+        // usage-graph funnel now demands proof of (issue #2423 milestone B).
+        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        self.inner.global_usage_definition_index(scope.token())
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {

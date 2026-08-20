@@ -26,6 +26,7 @@ use brokk_bifrost_core::analyzer::model::{
     ImportInfo, SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
     SemanticDiagnosticReport,
 };
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::semantic_diagnostics::node_range;
 use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
 use brokk_bifrost_core::analyzer::{CodeUnitIndex, ProjectFile};
@@ -57,6 +58,7 @@ const MAX_KOTLIN_SEMANTIC_DIAGNOSTICS: usize = 200;
 pub fn collect_kotlin_semantic_diagnostics(
     owners: &dyn CodeUnitIndex,
     kotlin: &dyn KotlinSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     realm: Option<&JvmSourceRealm<'_>>,
@@ -93,7 +95,7 @@ pub fn collect_kotlin_semantic_diagnostics(
 
     let line_starts = compute_line_starts(source);
     let package_name = kotlin.package_name_of(file).unwrap_or_default();
-    let imports = kotlin.import_info_of(file);
+    let imports = kotlin.import_info_of(token, file);
     let mut collector = KotlinDiagnosticCollector {
         owners,
         kotlin,
@@ -107,7 +109,7 @@ pub fn collect_kotlin_semantic_diagnostics(
         report,
         errors: 0,
     };
-    collector.scan_tree(tree.root_node());
+    collector.scan_tree(token, tree.root_node());
     collector.report
 }
 
@@ -134,7 +136,7 @@ struct KotlinDiagnosticCollector<'a> {
 }
 
 impl KotlinDiagnosticCollector<'_> {
-    fn scan_tree(&mut self, root: Node<'_>) {
+    fn scan_tree(&mut self, token: QueryToken<'_>, root: Node<'_>) {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
             if self.errors >= MAX_KOTLIN_SEMANTIC_DIAGNOSTICS {
@@ -143,7 +145,7 @@ impl KotlinDiagnosticCollector<'_> {
                 break;
             }
             if node.kind() == "user_type" && kotlin_enclosing_import_header(node).is_none() {
-                self.check_user_type(node);
+                self.check_user_type(token, node);
             }
             let mut cursor = node.walk();
             let children = node.named_children(&mut cursor).collect::<Vec<_>>();
@@ -151,7 +153,7 @@ impl KotlinDiagnosticCollector<'_> {
         }
     }
 
-    fn check_user_type(&mut self, node: Node<'_>) {
+    fn check_user_type(&mut self, token: QueryToken<'_>, node: Node<'_>) {
         let Some(name) = kotlin_type_spelling(node, self.source) else {
             return;
         };
@@ -165,14 +167,15 @@ impl KotlinDiagnosticCollector<'_> {
                 node.start_position().row,
                 node.end_position().row,
             )
-            .map(|owner| kotlin_scope_owners_for(self.kotlin, &owner))
+            .map(|owner| kotlin_scope_owners_for(self.kotlin, token, &owner))
             .unwrap_or_default();
         let scope = KotlinNameScope {
             package_name: &self.package_name,
             imports: &self.imports,
             scope_owners,
         };
-        let proof = kotlin_type_name_proof(self.kotlin, &scope, &name, self.realm, self.model);
+        let proof =
+            kotlin_type_name_proof(self.kotlin, token, &scope, &name, self.realm, self.model);
         let range = node_range(node, self.line_starts);
         if record_jvm_name_proof(&mut self.report, range, proof, || {
             (

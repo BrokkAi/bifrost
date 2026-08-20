@@ -10,10 +10,12 @@ MostRelevantFilesRankingModeValue = Literal[
     "cascade", "history_imports", "usage_graph", "usage_graph_exact"
 ]
 MostRelevantFilesIncompleteReasonValue = Literal["cancelled", "time_budget"]
+SymbolSourcesIncompleteReasonValue = Literal["cancelled"]
 TestFileKindValue = Literal["test", "test_support", "production", "ambiguous"]
 _CODE_QUERY_EXECUTION_MODES = get_args(CodeQueryExecutionMode)
 _MOST_RELEVANT_FILES_RANKING_MODES = get_args(MostRelevantFilesRankingModeValue)
 _MOST_RELEVANT_FILES_INCOMPLETE_REASONS = get_args(MostRelevantFilesIncompleteReasonValue)
+_SYMBOL_SOURCES_INCOMPLETE_REASONS = get_args(SymbolSourcesIncompleteReasonValue)
 _TEST_FILE_KINDS = get_args(TestFileKindValue)
 _MISSING = object()
 
@@ -73,6 +75,15 @@ def _most_relevant_files_incomplete_reason(
         )
         raise ValueError(f"incomplete_reason must be one of {expected}, got {value!r}")
     return cast(MostRelevantFilesIncompleteReasonValue, value)
+
+
+def _symbol_sources_incomplete_reason(value: Any) -> SymbolSourcesIncompleteReasonValue:
+    if value not in _SYMBOL_SOURCES_INCOMPLETE_REASONS:
+        expected = ", ".join(
+            repr(reason) for reason in _SYMBOL_SOURCES_INCOMPLETE_REASONS
+        )
+        raise ValueError(f"reason must be one of {expected}, got {value!r}")
+    return cast(SymbolSourcesIncompleteReasonValue, value)
 
 
 def _test_file_kind(value: Any) -> TestFileKindValue:
@@ -4875,10 +4886,30 @@ class SourceBlock:
 
 
 @dataclass(frozen=True)
+class SymbolSourcesIncomplete:
+    """A requested source target whose lookup stopped before a verdict."""
+
+    target: str
+    reason: SymbolSourcesIncompleteReasonValue
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SymbolSourcesIncomplete:
+        return cls(
+            target=data["target"],
+            reason=_symbol_sources_incomplete_reason(data["reason"]),
+        )
+
+    def render_text(self) -> str:
+        return f"{self.target} ({self.reason})"
+
+
+@dataclass(frozen=True)
 class SymbolSourcesResult:
     sources: list[SourceBlock]
     not_found: list[str]
     ambiguous: list[AmbiguousSymbol]
+    complete: bool = True
+    incomplete: list[SymbolSourcesIncomplete] = field(default_factory=list)
     render_line_numbers: bool = True
     rendered_text: str | None = None
 
@@ -4895,6 +4926,13 @@ class SymbolSourcesResult:
             ambiguous=[
                 AmbiguousSymbol.from_dict(item) for item in data.get("ambiguous", [])
             ],
+            # These fields were added after the original source lookup result;
+            # absent fields therefore describe the old, complete response.
+            complete=_strict_bool(data, "complete", True),
+            incomplete=[
+                SymbolSourcesIncomplete.from_dict(item)
+                for item in _strict_list(data, "incomplete", [])
+            ],
             render_line_numbers=render_line_numbers,
             rendered_text=rendered_text,
         )
@@ -4910,7 +4948,16 @@ class SymbolSourcesResult:
         if self.not_found:
             blocks.append(f"Not found: {', '.join(self.not_found)}")
         blocks.extend(item.render_text() for item in self.ambiguous)
-        return "\n\n".join(blocks) if blocks else "No matching sources found."
+        if self.incomplete:
+            blocks.append(
+                "Incomplete: "
+                + ", ".join(item.render_text() for item in self.incomplete)
+            )
+        if blocks:
+            return "\n\n".join(blocks)
+        if not self.complete:
+            return "Incomplete source lookup."
+        return "No matching sources found."
 
 
 @dataclass(frozen=True)

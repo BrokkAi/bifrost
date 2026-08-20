@@ -136,6 +136,103 @@ mod tests {
         );
     }
 
+    /// The module-name supplement exists for imports that do not spell the
+    /// target declaration, such as a glob. Ordinary code can use the same
+    /// common module word without creating an import edge, so those files must
+    /// not be offered for expensive forward-edge verification.
+    #[test]
+    fn module_import_candidates_exclude_ordinary_terminal_name_mentions() {
+        let mut files = vec![
+            (
+                "src/lib.rs".to_string(),
+                "pub mod service;\npub mod other;\npub mod direct;\npub mod glob;\npub mod namespace;\npub mod wrong;\n"
+                    .to_string(),
+            ),
+            (
+                "src/service.rs".to_string(),
+                "pub mod child;\npub struct Widget;\n".to_string(),
+            ),
+            (
+                "src/service/child.rs".to_string(),
+                "use super::*;\npub fn take(_: Widget) {}\n".to_string(),
+            ),
+            (
+                "src/other.rs".to_string(),
+                "pub mod child;\npub mod service;\n".to_string(),
+            ),
+            (
+                "src/other/child.rs".to_string(),
+                "use super::*;\npub fn unrelated() {}\n".to_string(),
+            ),
+            (
+                "src/other/service.rs".to_string(),
+                "pub struct Other;\n".to_string(),
+            ),
+            (
+                "src/wrong.rs".to_string(),
+                "use crate::other::service::*;\nuse tree_sitter::Node;\npub fn unrelated(_: Node) {}\n"
+                    .to_string(),
+            ),
+            (
+                "src/direct.rs".to_string(),
+                "use crate::service::Widget;\npub fn take(_: Widget) {}\n".to_string(),
+            ),
+            (
+                "src/glob.rs".to_string(),
+                "use crate::service::*;\npub fn take(_: Widget) {}\n".to_string(),
+            ),
+            (
+                "src/namespace.rs".to_string(),
+                "use crate::service as svc;\npub fn take(_: svc::Widget) {}\n".to_string(),
+            ),
+        ];
+        for index in 0..32 {
+            files.push((
+                format!("src/bystander_{index}.rs"),
+                format!("pub fn service() -> usize {{ {index} }}\n"),
+            ));
+        }
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect();
+        let (_temp, analyzer) = project(&borrowed);
+        let analyzer_scope = AnalyzerQueryScope::new(&analyzer);
+        let walks = RustUsageWalks::new(&analyzer, analyzer_scope.token());
+        let target_file = file(&analyzer, "src/service.rs");
+        let target = identity_named(&walks, &target_file, "Widget");
+
+        let candidates: BTreeSet<ProjectFile> =
+            walks.importer_candidates_for(&target).into_iter().collect();
+        assert_eq!(
+            candidates,
+            BTreeSet::from([
+                target_file,
+                file(&analyzer, "lib.rs"),
+                file(&analyzer, "service/child.rs"),
+                file(&analyzer, "direct.rs"),
+                file(&analyzer, "glob.rs"),
+                file(&analyzer, "namespace.rs"),
+            ]),
+            "ordinary code mentions of `service` are not import candidates"
+        );
+
+        let importers: BTreeSet<ProjectFile> = walks
+            .edges_binding_identity(&target)
+            .into_iter()
+            .map(|edge| edge.importer)
+            .collect();
+        assert_eq!(
+            importers,
+            BTreeSet::from([
+                file(&analyzer, "direct.rs"),
+                file(&analyzer, "glob.rs"),
+                file(&analyzer, "namespace.rs"),
+                file(&analyzer, "service/child.rs"),
+            ])
+        );
+    }
+
     /// A walk result is memoized for the analyzer that produced it and for no
     /// longer. The analyzer instance is the generation: `update_all` builds a
     /// fresh one with fresh caches, which is the invalidation these

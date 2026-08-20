@@ -11,6 +11,7 @@
 mod resolver_tests;
 mod shared;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 pub(in crate::analyzer::usages) use brokk_bifrost_csharp::graph::extractor::{
     is_declaration_name as csharp_is_declaration_name, member_access_name, member_access_receiver,
@@ -76,12 +77,14 @@ pub(in crate::analyzer::usages) fn csharp_graph_source(
 
 pub(in crate::analyzer::usages) fn csharp_usage_direct_base(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     csharp: &CSharpAnalyzer,
     owner: &CodeUnit,
 ) -> Option<CodeUnit> {
     brokk_bifrost_csharp::graph::resolver::usage_direct_base(
         &csharp_graph_source(analyzer),
         csharp,
+        token,
         owner,
     )
 }
@@ -90,6 +93,7 @@ pub(in crate::analyzer::usages) fn csharp_usage_direct_base(
 pub(in crate::analyzer::usages) fn csharp_extension_invocation_return_type_fq_name(
     csharp: &CSharpAnalyzer,
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     source: &str,
     site: Node<'_>,
     receiver_type_names: &[String],
@@ -101,6 +105,7 @@ pub(in crate::analyzer::usages) fn csharp_extension_invocation_return_type_fq_na
 ) -> Option<String> {
     brokk_bifrost_csharp::graph::resolver::extension_invocation_return_type_fq_name(
         csharp,
+        token,
         &csharp_graph_source(analyzer),
         source,
         site,
@@ -117,6 +122,7 @@ pub(in crate::analyzer::usages) fn csharp_extension_invocation_return_type_fq_na
 pub(in crate::analyzer::usages) fn csharp_extension_invocation_return_type_fq_name_in_session(
     csharp: &CSharpAnalyzer,
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     source: &str,
     site: Node<'_>,
     receiver_type_names: &[String],
@@ -129,6 +135,7 @@ pub(in crate::analyzer::usages) fn csharp_extension_invocation_return_type_fq_na
 ) -> Option<String> {
     brokk_bifrost_csharp::graph::resolver::extension_invocation_return_type_fq_name_in_session(
         csharp,
+        token,
         &csharp_graph_source(analyzer),
         source,
         site,
@@ -146,6 +153,7 @@ pub(in crate::analyzer::usages) fn csharp_extension_invocation_return_type_fq_na
 pub(in crate::analyzer::usages) fn csharp_visible_extension_method_candidates(
     csharp: &CSharpAnalyzer,
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     site: Node<'_>,
@@ -156,6 +164,7 @@ pub(in crate::analyzer::usages) fn csharp_visible_extension_method_candidates(
 ) -> Vec<CodeUnit> {
     brokk_bifrost_csharp::graph::resolver::visible_extension_method_candidates(
         csharp,
+        token,
         &csharp_graph_source(analyzer),
         file,
         source,
@@ -171,6 +180,7 @@ pub(in crate::analyzer::usages) fn csharp_visible_extension_method_candidates(
 pub(in crate::analyzer::usages) fn csharp_visible_extension_method_candidates_in_session(
     csharp: &CSharpAnalyzer,
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     source: &str,
     site: Node<'_>,
@@ -182,6 +192,7 @@ pub(in crate::analyzer::usages) fn csharp_visible_extension_method_candidates_in
 ) -> Vec<CodeUnit> {
     brokk_bifrost_csharp::graph::resolver::visible_extension_method_candidates_in_session(
         csharp,
+        token,
         &csharp_graph_source(analyzer),
         file,
         source,
@@ -203,6 +214,7 @@ pub(in crate::analyzer::usages) fn csharp_visible_extension_method_candidates_in
 /// the workspace size (#200).
 fn build_csharp_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     csharp: &CSharpAnalyzer,
     files: &[ProjectFile],
     nodes: &HashSet<String>,
@@ -220,13 +232,16 @@ where
             file,
             nodes,
             brokk_bifrost_csharp::preprocessor::csharp_parse_spec(&language),
-            |input| brokk_bifrost_csharp::graph::inverted::scan_file(&graph, csharp, file, input),
+            |input| {
+                brokk_bifrost_csharp::graph::inverted::scan_file(&graph, csharp, token, file, input)
+            },
         )
     })
 }
 
 pub(crate) fn build_csharp_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> Option<UsageEdges>
@@ -234,11 +249,12 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = CSharpEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edges(analyzer, nodes, keep_file))
+    Some(resolver.build_edges(analyzer, token, nodes, keep_file))
 }
 
 pub(crate) fn build_csharp_usage_edge_weights<F>(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     nodes: &HashSet<String>,
     keep_file: F,
 ) -> Option<UsageEdgeWeights>
@@ -246,7 +262,7 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = CSharpEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
+    Some(resolver.build_edge_weights(analyzer, token, nodes, keep_file))
 }
 
 #[derive(Default)]

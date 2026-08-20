@@ -13,6 +13,7 @@ use brokk_bifrost_core::analyzer::capabilities::{
 };
 use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ImportInfo, Language, Range};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 use crate::java::graph_support::{
@@ -112,13 +113,18 @@ pub fn java_nearest_declaring_ancestors(
 }
 
 /// The uncached half of the analyzer's `get_direct_ancestors`.
-pub fn java_direct_ancestors(source: &dyn JavaSource, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+pub fn java_direct_ancestors(
+    source: &dyn JavaSource,
+    token: QueryToken<'_>,
+    code_unit: &CodeUnit,
+) -> Vec<CodeUnit> {
     source
         .raw_supertypes_of(code_unit)
         .iter()
         .filter_map(|raw_name| {
-            resolve_java_lexical_type_name(source, code_unit, raw_name)
-                .or_else(|| resolve_java_forward_type_name(source, code_unit.source(), raw_name))
+            resolve_java_lexical_type_name(source, code_unit, raw_name).or_else(|| {
+                resolve_java_forward_type_name(source, token, code_unit.source(), raw_name)
+            })
         })
         .collect()
 }

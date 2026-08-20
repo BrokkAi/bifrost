@@ -23,6 +23,7 @@ use crate::parse::js_ts_tree_sitter_language_for_file;
 use crate::providers::JsTsSource;
 use crate::syntax::{direct_property_definitions, slice};
 use crate::tsconfig::AliasResolver;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::common::classify_recursive_hit;
 use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, UsageHit, UsageProof};
 use brokk_bifrost_core::analyzer::usages::outcome::CandidateUsageHits;
@@ -81,6 +82,7 @@ impl<'a> JsTsHosts<'a> {
 /// `language`.
 pub fn scan_js_ts_target_usages(
     host: &dyn JsTsSource,
+    token: QueryToken<'_>,
     analyzer: &dyn CodeUnitIndex,
     index: &JsTsUsageIndex,
     target: &CodeUnit,
@@ -125,6 +127,7 @@ pub fn scan_js_ts_target_usages(
 
         scan_files_for_seeds(
             host,
+            token,
             analyzer,
             index,
             &scan_files,
@@ -147,6 +150,7 @@ pub fn scan_js_ts_target_usages(
 
         scan_files_for_seeds(
             host,
+            token,
             analyzer,
             index,
             &scan_files,

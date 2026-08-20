@@ -7,7 +7,7 @@
 #
 # Every row below is copied verbatim from the pinned upstream files. The slice
 # exists so translator tests never touch the network and never vendor the whole
-# corpus; scripts/fetch-pinned-summary-corpora.sh fetches the full corpus for a
+# corpus; scripts/public/fetch-pinned-summary-corpora.sh fetches the full corpus for a
 # foundry run.
 extensions:
   - addsTo:

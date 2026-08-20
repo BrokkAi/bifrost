@@ -467,19 +467,81 @@ requirement over an absent binding is simply skipped.
 The asserts above each address one captured token. An assertion policy can
 instead state an invariant over named relations of typed rows. It replaces
 `:subject` and `:asserts` with a plan: `(bind ...)` names one relation, either
-an RQL query or an expansion of an earlier binding; `(join ...)` relates two
-bindings by equal-typed registered fields, as an inner join or an anti-join;
-`(group ...)` groups the joined rows by registered fields and computes named
-`(aggregate ...)` values; and `(assert :group NAME :value NAME :cardinality
-...)` bounds one aggregate in every group. A group that violates its assertion
-becomes one finding anchored at the exact source ranges of the rows that
-produced it. A binding the query engine had to truncate makes the run
-inconclusive, never clean.
+an RQL query or an expansion of an earlier binding; `(filter ...)` and
+`(project ...)` refine a named relation; `(join ...)` relates two relations by
+equal-typed registered fields; `(group ...)` groups the joined rows by
+registered fields and computes named `(aggregate ...)` values; and `(assert
+:group NAME :value NAME :cardinality ...)` bounds one aggregate in every group.
+A group that violates its assertion becomes one finding anchored at the exact
+source ranges of the rows that produced it. A binding the query engine had to
+truncate makes the run inconclusive, never clean; the run's diagnostics then
+name each assertion whose verdict that truncation blocked.
 
-The aggregate operations are `count`, `count-distinct`, `min`, and
-`ordered-equal`. The first three fold one column. `ordered-equal` compares two
-ordered sequences instead, each named by its own integer position field and the
-value read at that position:
+##### Row predicates
+
+`:where` takes a bounded conjunction of typed row tests. Each test is one list,
+and the operator decides its shape:
+
+- `(BINDING.FIELD eq|ne|lt|le|gt|ge VALUE)` compares a field with a literal.
+  `eq` and `ne` are defined for every field; the four ordered operators need an
+  integer field, because no other registry scalar carries an order that
+  survives a rename.
+- `(BINDING.FIELD eq|ne|lt|le|gt|ge OTHER.FIELD)` compares two fields of the
+  same row instead. A symbol carrying a `.` is always a field reference, so
+  writing a bare registry value never becomes one by accident. Both fields must
+  hold the same scalar type.
+- `(BINDING.FIELD is-null)` and `(BINDING.FIELD is-not-null)` test presence.
+  They are admitted only over fields the row registry marks optional; over a
+  field the registry always populates they would be constants, so they are an
+  authoring error rather than a question.
+- `(BINDING.FIELD in (VALUE ...))` tests membership in a bounded literal set of
+  one through 64 values.
+
+Every comparison against an absent value is false, including `ne`. Three-valued
+logic would make `(x ne "a")` true for rows that state nothing about `x` at
+all, which is the opposite of what an invariant about `x` means. Say `is-null`
+when you mean absent.
+
+##### Filtering and projecting a relation
+
+`(filter :over NAME :where (...))` narrows one named relation to the rows that
+satisfy every listed predicate. The relation keeps its name and its columns, so
+every later record reads the same `NAME.FIELD` columns whether or not a filter
+stands between them and the binding. A filter reads only the relation it
+narrows, so its predicates name that relation and nothing else.
+
+`(project :name NEW :from NAME :columns (...))` publishes a new relation
+holding chosen columns of an existing one. Each column entry is either
+`NAME.FIELD`, which keeps the field name, or `(NAME.FIELD NEW-FIELD)`, which
+renames it. The projected columns are addressable under the projection's own
+name, and the relation it read is no longer addressable at all: a projection
+takes the place of its input rather than sitting beside it.
+
+##### Joins
+
+`:kind` chooses how a join combines its two relations, and omitting it means
+`inner`:
+
+- `inner` keeps every matching pair and carries both relations' columns.
+- `semi` keeps the left rows that have at least one partner and carries the
+  left columns only, so it filters without multiplying rows.
+- `anti` keeps the left rows that have no partner.
+
+An anti-join is sound only over a right relation that was read exhaustively. If
+the right relation was truncated or partly unreadable, its output rows exist
+only because nothing was found to remove them, so they support no verdict and
+the run reports an unmet obligation instead of a clean pass.
+
+##### Aggregates
+
+The aggregate operations are `count`, `count-distinct`, `min`, `max`, `any`,
+`all`, and `ordered-equal`. `count` folds rows; `count-distinct` folds any
+column; `min` and `max` fold an integer column; `any` and `all` fold a boolean
+column to one or zero, so one cardinality assertion can state every fold. `any`
+is one when some contributing row is true, `all` is one when every contributing
+row is true, and a group with no contributing row folds `all` to one and `any`
+to zero. `ordered-equal` compares two ordered sequences instead, each named by
+its own integer position field and the value read at that position:
 
 ```lisp
 (aggregate :name parity :op ordered-equal
@@ -501,6 +563,32 @@ predicate. Joining on the compared value keeps only positions that already
 matched on both sides, and two such projections have equal length by
 construction; joining on a correlation key instead -- one call site to one
 callable -- puts both complete sequences in the group.
+
+##### A plan that uses the whole surface
+
+The rule below states that no member access rejects a candidate: the semi join
+keeps only the sites the receiver analysis described, the fold's `:where`
+compares two integer columns of the same row, and `max` reports how many
+candidates the offending site actually weighed.
+
+```lisp
+(policy
+  :id "example.relational.no-rejected-candidate"
+  :name "Member accesses reject no candidate"
+  :message "a member access must select every candidate it considered"
+  :severity error
+  :analysis (analysis
+    :type assertion
+    (bind :name site :query (rql (occurrences :role [member_position])))
+    (bind :name outcome :from site :step receiver-outcome)
+    (bind :name selection :from site :step member-selection)
+    (join :left site :right outcome :kind semi :on ((ast_id site_ast_id)))
+    (join :left site :right selection :on ((ast_id site_ast_id)))
+    (group :name by-site :by (site.ast_id)
+      (aggregate :name considered :op max :value selection.candidate_count
+                 :where ((selection.selected_count lt selection.candidate_count))))
+    (assert :group by-site :value considered :cardinality (exactly 0))))
+```
 
 `(assert-selected-in-winning-tier :id ID :site NAME :candidates NAME
 [:cardinality ...])` is authoring sugar over the callable-applicability rows.
@@ -872,15 +960,37 @@ separate:
 
 ```text
 .bifrost/
-├── queries/                 # saved exploratory .rql
-├── policies/                # recurring .rqlp roots
-├── suppressions.json        # exact review decisions
-├── policy-scope.json        # directory-level review decisions
-└── cache/                   # generated; safe to ignore
+├── queries/                    # saved exploratory .rql
+├── policies/                   # recurring .rqlp roots
+├── suppressions.json           # exact review decisions
+├── suppressions.private.json   # decisions on files this repository does not publish
+├── suppressions.local.json     # one developer's decisions; not committed
+├── policy-scope.json           # directory-level review decisions
+└── cache/                      # generated; safe to ignore
 ```
 
-The conventional suppression file is `.bifrost/suppressions.json`. Version 1
-contains accepted review decisions for exact strong findings:
+Bifrost reads all three suppression files, in that order, and merges them into
+one record set. Each is optional: a repository that publishes everything needs
+no private file, and the local file is absent on most machines. All three use
+the identical schema below, so a record can be moved between them unchanged.
+
+The split exists so every record can name the file its finding was reported
+against. A repository that publishes a subset of its source publishes
+`suppressions.json` with it, and a decision about an unpublished file would
+otherwise have to omit that name -- leaving the record unreadable -- or
+disclose it. `suppressions.private.json` holds those decisions instead. Add
+`.bifrost/suppressions.local.json` to `.gitignore`; it is for decisions you are
+still working out, and it is never published or shared.
+
+Two files must not both claim the same finding. Bifrost rejects the run rather
+than choosing a winner: a disagreement about one finding is a mistake in the
+records, not an ordering question. Each source's state is reported separately,
+so an absent local file is visibly absent rather than silently ignored.
+
+`--suppressions-file PATH` replaces the whole convention with one named file,
+including the private and local ones.
+
+Version 1 contains accepted review decisions for exact strong findings:
 
 ```json
 {
@@ -889,6 +999,7 @@ contains accepted review decisions for exact strong findings:
     {
       "policy_id": "bifrost.security.dynamic-eval",
       "finding_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "path": "src/migrate.py",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "This evaluator runs only a checked-in migration script",
@@ -909,6 +1020,21 @@ presentation changes can preserve the ID. Editing the selected source bytes,
 moving the file, changing its semantic owner, or changing the duplicate
 occurrence ordinal produces a different ID and leaves the old decision for
 review.
+
+`path` is optional and is never part of the join key. It records the
+workspace-relative file the decision was made against, which is what lets a
+run tell a record whose identity changed under an edit from a record whose
+file that run does not contain at all. Record it: without it a decision that
+silently stopped matching is indistinguishable from one this run cannot see,
+and the run cannot gate on either. It follows the same portable path rules as
+a scope entry -- forward slashes, no absolute paths, no `.` or `..`
+components.
+
+Recording it also makes the record readable. A finding identity is a hash and
+cannot be reversed, so a record carrying only an identity can be traced back to
+its code only by re-running the policy and matching the hash -- and once the
+identity has rotated, not at all. The path is what keeps a decision auditable
+after the code around it moves.
 
 Use an explicit date for a reproducible accept-and-rerun cycle:
 
@@ -935,13 +1061,34 @@ The audit keeps independent states instead of collapsing review outcomes:
   marked `drifted`, but hash drift alone does not reactivate the same finding.
 - A record is `expired` only when the evaluation date is later than
   `expires_at`; it remains active on the expiration date itself.
-- An unmatched record is `stale` only when the selected policy completed and
-  proved that the finding is absent.
+- An unmatched record reports `finding_absent` only when the selected policy
+  completed and proved that the finding is absent.
 - An unselected, incomplete, failed, unsupported, or inconclusive policy
-  cannot prove staleness. A current weak finding also cannot prove the strong
+  cannot prove absence. A current weak finding also cannot prove the strong
   match required for suppression.
 - A retention-limit failure is explicit as `result_omitted` and makes the
   report unreliable rather than claiming a clean result.
+
+`finding_absent` alone does not say whether a decision went dead. A record
+naming a file the run never analyzed reports `finding_absent` in every run
+forever, and a document copied to a tree that does not contain every file it
+names is full of those. The separate `orphan_state` answers the question the
+gate needs:
+
+- `orphaned`: the run analyzed the record's file and no finding carries its
+  identity. The accepted decision no longer resolves to anything, either
+  because an edit changed the identity or because the finding is genuinely
+  gone. **This fails the run.** A finding that was reviewed and accepted must
+  not quietly return to the gate as new code, and a decision that covers
+  nothing must not sit in the document unnoticed. Repair it by re-keying the
+  record to the current identity or by deleting it; the review lists the
+  policy's unclaimed identities in that same file as `rekey_candidates`.
+- `path_not_analyzed`: the run did not analyze the record's file, so it says
+  nothing about the record and never fails the run.
+- `path_unrecorded`: the record names no `path`, so the two cases above
+  cannot be told apart. It never fails the run. Adding `path` to the record
+  is what makes it decidable.
+- `resolved`: the record matched, or the policy did not run exhaustively.
 
 A missing conventional or explicit suppression file means no suppressions.
 Malformed, unsafe, oversized, escaping, duplicate, or conflicting input

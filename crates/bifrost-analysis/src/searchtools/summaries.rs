@@ -1,6 +1,8 @@
 use super::navigation::deserialize_symbol_lookup_names;
 use super::selectors::*;
 use super::*;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use std::cell::OnceCell;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -523,6 +525,7 @@ pub(super) fn container_entry_sort_key(entry: &ContainerListingEntry) -> (u8, &s
 
 fn summarize_symbol_targets_with_cancellation(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     targets: Vec<String>,
     cancellation: Option<&crate::CancellationToken>,
 ) -> SummaryResult {
@@ -558,7 +561,12 @@ fn summarize_symbol_targets_with_cancellation(
             DefinitionSelector::FileAnchored { .. }
         );
         if !file_anchored && (target.contains('/') || target.contains('\\')) {
-            match resolve_selectable_definitions(analyzer, &target, exact_codeunit_resolution) {
+            match resolve_selectable_definitions(
+                analyzer,
+                token,
+                &target,
+                exact_codeunit_resolution,
+            ) {
                 SelectableDefinitionResolution::Resolved(code_units) => {
                     extend_symbol_summaries(
                         analyzer,
@@ -584,7 +592,12 @@ fn summarize_symbol_targets_with_cancellation(
             continue;
         }
         if looks_like_explicit_source_file_target(&target) {
-            match resolve_selectable_definitions(analyzer, &target, exact_codeunit_resolution) {
+            match resolve_selectable_definitions(
+                analyzer,
+                token,
+                &target,
+                exact_codeunit_resolution,
+            ) {
                 SelectableDefinitionResolution::Resolved(code_units) => {
                     extend_symbol_summaries(
                         analyzer,
@@ -612,7 +625,7 @@ fn summarize_symbol_targets_with_cancellation(
         }
         let keep_going = || !cancellation.is_some_and(crate::CancellationToken::is_cancelled);
         let resolution =
-            resolve_selectable_definitions_bounded(analyzer, &target, |analyzer, lookup| {
+            resolve_selectable_definitions_bounded(analyzer, token, &target, |analyzer, lookup| {
                 resolve_codeunit_fuzzy_bounded(
                     analyzer,
                     lookup,
@@ -692,6 +705,8 @@ pub fn get_summaries_with_cancellation(
     params: SummariesParams,
     cancellation: Option<&crate::CancellationToken>,
 ) -> SummaryResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let _scope = profiling::scope("searchtools::get_summaries");
     // Same request boundary as `get_symbol_sources`: routing builds a resolver
     // per target through `resolve_file_patterns`, so without a shared listing
@@ -708,7 +723,7 @@ pub fn get_summaries_with_cancellation(
         GET_SUMMARIES_MAX_FILES_PER_TARGET,
         cancellation,
     );
-    summarize_routed_targets_with_cancellation(analyzer, &targets, cancellation)
+    summarize_routed_targets_with_cancellation(analyzer, token, &targets, cancellation)
 }
 
 pub(super) fn skim_files_for_files(
@@ -969,6 +984,7 @@ pub(super) fn extract_include_target(statement: &str) -> String {
 
 fn summarize_routed_targets_with_cancellation(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     summary_targets: &SummaryTargets,
     cancellation: Option<&crate::CancellationToken>,
 ) -> SummaryResult {
@@ -979,6 +995,7 @@ fn summarize_routed_targets_with_cancellation(
     );
     let symbol_output = summarize_symbol_targets_with_cancellation(
         analyzer,
+        token,
         summary_targets.symbol_targets.clone(),
         cancellation,
     );
@@ -1028,6 +1045,8 @@ pub fn most_relevant_files_with_cancellation(
     params: MostRelevantFilesParams,
     cancellation: &crate::CancellationToken,
 ) -> Result<MostRelevantFilesResult, String> {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let _scope = profiling::scope("searchtools::most_relevant_files");
     validate_most_relevant_files_params(&params)?;
     if cancellation.is_cancelled() {
@@ -1091,6 +1110,7 @@ pub fn most_relevant_files_with_cancellation(
         let (ranked, complete, ranking_mode_used, incomplete_reason) =
             match most_relevant_project_files_with_ranking_mode_and_cancellation(
                 analyzer,
+                token,
                 &seeds,
                 requested_limit,
                 recency_half_life,

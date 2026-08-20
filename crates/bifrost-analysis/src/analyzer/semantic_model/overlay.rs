@@ -15,6 +15,7 @@ use super::{
     TypeFact, TypeKind, TypeParameterConstraint, TypeRef, Visibility,
 };
 use crate::analyzer::structural::{FileFacts, NormalizedKind, Role};
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 
@@ -2379,6 +2380,8 @@ fn imported_trigger_name_matches(
     actual: &str,
     site_byte: usize,
 ) -> bool {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     if !expected.contains('.') || actual.contains('.') {
         return false;
     }
@@ -2386,7 +2389,7 @@ fn imported_trigger_name_matches(
         return false;
     };
     let local_imports = provider
-        .import_info_of(file)
+        .import_info_of(token, file)
         .into_iter()
         .filter(|import| {
             !import.is_wildcard

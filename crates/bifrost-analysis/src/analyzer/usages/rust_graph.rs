@@ -559,8 +559,12 @@ impl UsageAnalyzer for RustExportUsageGraphStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{CodeUnitIndex, Language, TestProject};
+    use crate::analyzer::{
+        AnalyzerDelegate, CodeUnitIndex, FileSetProject, JavaAnalyzer, Language, MultiAnalyzer,
+        TestProject,
+    };
     use crate::test_support::AnalyzerFixture;
+    use std::collections::BTreeMap;
 
     const WIDE_EXPORT_SURFACE: usize = 20;
 
@@ -624,6 +628,70 @@ mod tests {
             canonicalizations <= 4,
             "one written site canonicalized {canonicalizations} names from a {}-name surface",
             WIDE_EXPORT_SURFACE + 1
+        );
+    }
+
+    #[test]
+    fn rust_usage_scan_uses_indexed_definition_queries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "Cargo.toml")
+            .write("[package]\nname = \"shard_scope\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+            .expect("write Cargo.toml");
+        let target_file = ProjectFile::new(root.clone(), "src/lib.rs");
+        target_file
+            .write("pub fn target() {}\npub fn caller() { target(); }\n")
+            .expect("write Rust source");
+        ProjectFile::new(root.clone(), "src/App.java")
+            .write("package app; public class App {}\n")
+            .expect("write Java source");
+        let project = FileSetProject::new(
+            root,
+            [
+                std::path::PathBuf::from("Cargo.toml"),
+                std::path::PathBuf::from("src/lib.rs"),
+                std::path::PathBuf::from("src/App.java"),
+            ],
+        );
+        let rust = RustAnalyzer::from_project(project.clone());
+        let target = declaration_named(&rust, &target_file, "target");
+        let analyzer = MultiAnalyzer::new(BTreeMap::from([
+            (
+                Language::Java,
+                AnalyzerDelegate::Java(JavaAnalyzer::from_project(project.clone())),
+            ),
+            (Language::Rust, AnalyzerDelegate::Rust(rust)),
+        ]));
+        analyzer
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_definition_candidates_query_count_for_test();
+        let candidates: HashSet<_> = [target_file].into_iter().collect();
+        let scope = UsageScanScope::new(&candidates, true);
+
+        let outcome = RustExportUsageGraphStrategy::new()
+            .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scope, 1000)
+            .into_fuzzy_result();
+
+        assert_eq!(outcome.all_hits_including_imports().len(), 1);
+        for (language, delegate) in analyzer.delegates() {
+            let builds = delegate
+                .analyzer()
+                .test_hooks()
+                .global_usage_definition_index_build_count_for_test();
+            assert_eq!(
+                builds, 0,
+                "Rust usage scan built the {language:?} definition shard"
+            );
+        }
+        assert!(
+            analyzer
+                .test_hooks()
+                .definition_candidates_query_count_for_test()
+                > 0,
+            "the regression must exercise persisted definition queries"
         );
     }
 

@@ -25,6 +25,7 @@ use crate::imports::{import_info_tokens, resolve_js_ts_import_paths};
 use crate::tsconfig::AliasResolver;
 use brokk_bifrost_core::analyzer::capabilities::{ImportAnalysisProvider, TypeHierarchyProvider};
 use brokk_bifrost_core::analyzer::model::ImportInfo;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{
     BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, Language, ProjectFile,
 };
@@ -116,7 +117,7 @@ pub trait JsTsSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProv
     /// scan called `IAnalyzer::global_usage_definition_index`, which has no
     /// core spelling because it hands back an analysis-side handle; the bounded
     /// lookup is the part of it this crate actually reads.
-    fn usage_definitions(&self) -> &dyn BoundedDefinitionLookup;
+    fn usage_definitions(&self, token: QueryToken<'_>) -> &dyn BoundedDefinitionLookup;
 
     /// The analyzer-cached JS/TS resolution index for this source's own language,
     /// built on first use. `None` only when `cancellation` fires mid-build.
@@ -219,10 +220,14 @@ pub fn imported_files_from_infos(
 /// source actually spells, plus every import that binds no token at all.
 ///
 /// The uncached body behind `ImportAnalysisProvider::relevant_imports_for`.
-pub fn compute_relevant_imports(host: &dyn JsTsSource, code_unit: &CodeUnit) -> HashSet<String> {
+pub fn compute_relevant_imports(
+    host: &dyn JsTsSource,
+    token: QueryToken<'_>,
+    code_unit: &CodeUnit,
+) -> HashSet<String> {
     let source = host.get_source(code_unit, false).unwrap_or_default();
     let mut relevant = HashSet::default();
-    for import in host.import_info_of(code_unit.source()) {
+    for import in host.import_info_of(token, code_unit.source()) {
         let tokens = import_info_tokens(&import);
         if tokens.is_empty() || tokens.iter().any(|token| source.contains(token)) {
             relevant.insert(import.raw_snippet.clone());
@@ -240,11 +245,12 @@ pub fn compute_relevant_imports(host: &dyn JsTsSource, code_unit: &CodeUnit) -> 
 /// workspace.
 pub fn resolve_import_target_files(
     host: &dyn JsTsSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
 ) -> HashSet<ProjectFile> {
     let language = host.language();
     let alias_resolver = host.alias_resolver();
-    host.import_info_of(file)
+    host.import_info_of(token, file)
         .iter()
         .flat_map(|import| {
             resolve_js_ts_import_paths(file, &import.raw_snippet, language, Some(alias_resolver))

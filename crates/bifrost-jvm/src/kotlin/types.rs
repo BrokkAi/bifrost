@@ -31,6 +31,7 @@
 //! without three copies of the precedence rules.
 
 use brokk_bifrost_core::analyzer::model::ImportInfo;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile};
 
@@ -221,10 +222,11 @@ pub enum KotlinTypeResolution {
 /// question "does this name exist at all".
 pub fn resolve_kotlin_type_name_in_file(
     source: &dyn KotlinSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     raw_name: &str,
 ) -> Option<CodeUnit> {
-    match resolve_kotlin_type_name_with_external(source, file, raw_name)? {
+    match resolve_kotlin_type_name_with_external(source, token, file, raw_name)? {
         KotlinTypeResolution::Source(unit) => Some(unit),
         KotlinTypeResolution::External => None,
     }
@@ -234,35 +236,38 @@ pub fn resolve_kotlin_type_name_in_file(
 /// workspace declaration or a type from the shared JVM dependency realm.
 pub fn kotlin_type_name_is_known_in_file(
     source: &dyn KotlinSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     raw_name: &str,
 ) -> bool {
-    resolve_kotlin_type_name_with_external(source, file, raw_name).is_some()
+    resolve_kotlin_type_name_with_external(source, token, file, raw_name).is_some()
 }
 
 pub fn resolve_kotlin_type_name_with_external(
     source: &dyn KotlinSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     raw_name: &str,
 ) -> Option<KotlinTypeResolution> {
-    resolve_kotlin_type_name_with_external_in_realm(source, file, raw_name, None)
+    resolve_kotlin_type_name_with_external_in_realm(source, token, file, raw_name, None)
 }
 
 pub fn resolve_kotlin_type_name_with_external_in_realm(
     source: &dyn KotlinSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     raw_name: &str,
     realm: Option<&JvmSourceRealm<'_>>,
 ) -> Option<KotlinTypeResolution> {
     let package_name = source.package_name_of(file).unwrap_or_default();
-    let imports = source.import_info_of(file);
+    let imports = source.import_info_of(token, file);
     let scope = KotlinNameScope {
         package_name: &package_name,
         imports: &imports,
         // A name spelled at file level sees no enclosing declaration.
         scope_owners: Vec::new(),
     };
-    resolve_kotlin_type_name_in_scope(source, raw_name, &scope, realm)
+    resolve_kotlin_type_name_in_scope(source, token, raw_name, &scope, realm)
 }
 
 /// What every retained surface proves about `raw_name` looked up against a
@@ -283,13 +288,14 @@ pub fn resolve_kotlin_type_name_with_external_in_realm(
 /// see [`crate::proof`] on why a diagnostic may not build the jar index.
 pub fn kotlin_type_name_proof(
     source: &dyn KotlinSource,
+    token: QueryToken<'_>,
     scope: &KotlinNameScope<'_>,
     raw_name: &str,
     realm: Option<&JvmSourceRealm<'_>>,
     model: &dyn JvmActiveSemanticModel,
 ) -> JvmNameProof {
     match resolve_kotlin_type_name(raw_name, scope, |candidate| {
-        kotlin_realm_type_exists(source, candidate, realm)
+        kotlin_realm_type_exists(source, token, candidate, realm)
     }) {
         KotlinTypeName::Resolved(_) => return JvmNameProof::Workspace,
         // The head-segment walk stops at the second competing star import, so
@@ -352,16 +358,17 @@ pub fn kotlin_type_name_proof(
 
 fn resolve_kotlin_type_name_in_scope(
     source: &dyn KotlinSource,
+    token: QueryToken<'_>,
     raw_name: &str,
     scope: &KotlinNameScope<'_>,
     realm: Option<&JvmSourceRealm<'_>>,
 ) -> Option<KotlinTypeResolution> {
     let external_is_empty = source.external_index_is_empty();
     let source_first = resolve_kotlin_type_name(raw_name, scope, |candidate| {
-        kotlin_realm_type_exists(source, candidate, realm)
+        kotlin_realm_type_exists(source, token, candidate, realm)
     });
     if let KotlinTypeName::Resolved(fqn) = source_first
-        && let Some(unit) = kotlin_realm_type_by_fqn(source, &fqn, realm)
+        && let Some(unit) = kotlin_realm_type_by_fqn(source, token, &fqn, realm)
     {
         return Some(KotlinTypeResolution::Source(unit));
     }
@@ -378,13 +385,21 @@ fn resolve_kotlin_type_name_in_scope(
     .map(|_| KotlinTypeResolution::External)
 }
 
-pub fn kotlin_source_type_exists(source: &dyn KotlinSource, fqn: &str) -> bool {
-    kotlin_source_type_by_fqn(source, fqn).is_some()
+pub fn kotlin_source_type_exists(
+    source: &dyn KotlinSource,
+    token: QueryToken<'_>,
+    fqn: &str,
+) -> bool {
+    kotlin_source_type_by_fqn(source, token, fqn).is_some()
 }
 
-pub fn kotlin_source_type_by_fqn(source: &dyn KotlinSource, fqn: &str) -> Option<CodeUnit> {
+pub fn kotlin_source_type_by_fqn(
+    source: &dyn KotlinSource,
+    token: QueryToken<'_>,
+    fqn: &str,
+) -> Option<CodeUnit> {
     source
-        .usage_definitions()
+        .usage_definitions(token)
         .fqn(fqn)
         .into_iter()
         .find(|unit| unit.is_class() && unit.fq_name() == fqn && !unit.is_synthetic())
@@ -397,10 +412,11 @@ pub fn kotlin_source_type_by_fqn(source: &dyn KotlinSource, fqn: &str) -> Option
 /// wins a tie, and so a realm-less caller pays nothing.
 pub fn kotlin_realm_type_by_fqn(
     source: &dyn KotlinSource,
+    token: QueryToken<'_>,
     fqn: &str,
     realm: Option<&JvmSourceRealm<'_>>,
 ) -> Option<CodeUnit> {
-    if let Some(unit) = kotlin_source_type_by_fqn(source, fqn) {
+    if let Some(unit) = kotlin_source_type_by_fqn(source, token, fqn) {
         return Some(unit);
     }
     realm?
@@ -411,15 +427,20 @@ pub fn kotlin_realm_type_by_fqn(
 
 pub fn kotlin_realm_type_exists(
     source: &dyn KotlinSource,
+    token: QueryToken<'_>,
     fqn: &str,
     realm: Option<&JvmSourceRealm<'_>>,
 ) -> bool {
-    kotlin_realm_type_by_fqn(source, fqn, realm).is_some()
+    kotlin_realm_type_by_fqn(source, token, fqn, realm).is_some()
 }
 
 /// The scope owners visible inside `owner`: the declaration itself, each of its
 /// lexical owners, and the nested-type scopes each of those inherits.
-pub fn kotlin_scope_owners_for(source: &dyn KotlinSource, owner: &CodeUnit) -> Vec<String> {
+pub fn kotlin_scope_owners_for(
+    source: &dyn KotlinSource,
+    token: QueryToken<'_>,
+    owner: &CodeUnit,
+) -> Vec<String> {
     let mut owners = Vec::new();
     let mut current = Some(owner.clone());
     while let Some(unit) = current {
@@ -436,7 +457,7 @@ pub fn kotlin_scope_owners_for(source: &dyn KotlinSource, owner: &CodeUnit) -> V
     for _ in 0..MAX_INHERITED_SCOPE_DEPTH {
         let mut next = Vec::new();
         for fqn in &frontier {
-            for ancestor in kotlin_lexical_direct_ancestor_fqns(source, fqn) {
+            for ancestor in kotlin_lexical_direct_ancestor_fqns(source, token, fqn) {
                 if !owners.contains(&ancestor) {
                     owners.push(ancestor.clone());
                     next.push(ancestor);
@@ -453,8 +474,12 @@ pub fn kotlin_scope_owners_for(source: &dyn KotlinSource, owner: &CodeUnit) -> V
 
 /// Direct supertype fully-qualified names of `fqn`, resolved with lexical scope
 /// only so inherited-scope discovery cannot recurse into itself.
-fn kotlin_lexical_direct_ancestor_fqns(source: &dyn KotlinSource, fqn: &str) -> Vec<String> {
-    let Some(owner) = kotlin_source_type_by_fqn(source, fqn) else {
+fn kotlin_lexical_direct_ancestor_fqns(
+    source: &dyn KotlinSource,
+    token: QueryToken<'_>,
+    fqn: &str,
+) -> Vec<String> {
+    let Some(owner) = kotlin_source_type_by_fqn(source, token, fqn) else {
         return Vec::new();
     };
     let mut lexical_owners = Vec::new();
@@ -463,7 +488,7 @@ fn kotlin_lexical_direct_ancestor_fqns(source: &dyn KotlinSource, fqn: &str) -> 
         lexical_owners.push(unit.fq_name());
         current = CodeUnitIndex::parent_of(source, &unit);
     }
-    let imports = source.import_info_of(owner.source());
+    let imports = source.import_info_of(token, owner.source());
     let scope = KotlinNameScope {
         package_name: owner.package_name(),
         imports: &imports,
@@ -474,7 +499,7 @@ fn kotlin_lexical_direct_ancestor_fqns(source: &dyn KotlinSource, fqn: &str) -> 
         .iter()
         .filter_map(|spelled| {
             resolve_kotlin_type_name(spelled, &scope, |candidate| {
-                kotlin_source_type_exists(source, candidate)
+                kotlin_source_type_exists(source, token, candidate)
             })
             .resolved()
         })

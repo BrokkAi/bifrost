@@ -11,6 +11,7 @@ use crate::analyzer::{
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_js_ts::queries::TYPESCRIPT_QUERY_DIRECTORY;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -229,8 +230,11 @@ impl JsTsSource for TypescriptAnalyzer {
         Some(ts_clean_type_text(node_text(annotation, prepared.source())))
     }
 
-    fn usage_definitions(&self) -> &dyn brokk_bifrost_core::analyzer::BoundedDefinitionLookup {
-        self.inner.global_usage_definition_index_ref()
+    fn usage_definitions(
+        &self,
+        token: QueryToken<'_>,
+    ) -> &dyn brokk_bifrost_core::analyzer::BoundedDefinitionLookup {
+        self.inner.global_usage_definition_index_ref(token)
     }
 
     fn usage_index(
@@ -370,15 +374,19 @@ impl TypescriptAnalyzer {
 
 impl ImportAnalysisProvider for TypescriptAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        providers::imported_code_units_of(self, file)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        providers::imported_code_units_of(self, token, file)
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
-        providers::referencing_files_of(self, file)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        providers::referencing_files_of(self, token, file)
     }
 
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
-        self.inner.import_info_of(file)
+    fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
+        self.inner.import_info_of(token, file)
     }
 
     fn import_infos_for_files(
@@ -393,7 +401,9 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         file: &ProjectFile,
         imports: &[ImportInfo],
     ) -> Option<Arc<HashSet<CodeUnit>>> {
-        providers::imported_code_units_from_infos(self, file, imports)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        providers::imported_code_units_from_infos(self, token, file, imports)
     }
 
     fn imported_files_from_infos(
@@ -405,7 +415,9 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
     }
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
-        providers::relevant_imports_for(self, code_unit)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        providers::relevant_imports_for(self, token, code_unit)
     }
 
     fn could_import_file(
@@ -414,7 +426,9 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         imports: &[ImportInfo],
         target: &ProjectFile,
     ) -> bool {
-        providers::could_import_file(self, source_file, imports, target)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        providers::could_import_file(self, token, source_file, imports, target)
     }
 }
 
@@ -669,7 +683,10 @@ impl IAnalyzer for TypescriptAnalyzer {
     }
 
     fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
+        // Trait signature is fixed, so this boundary opens the scope the
+        // usage-graph funnel now demands proof of (issue #2423 milestone B).
+        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        self.inner.global_usage_definition_index(scope.token())
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {

@@ -1961,8 +1961,9 @@ impl PolicyReportDocument {
         Self::try_new_with_suppression_audit(
             PolicyReportEvaluationContext::new(
                 options.evaluation_date(),
-                options.suppressions(),
-                super::suppression::PolicySuppressionDocumentState::NotFound,
+                options
+                    .suppressions()
+                    .source_states(super::suppression::PolicySuppressionDocumentState::NotFound),
                 options.scope(),
                 super::scope::PolicyScopeDocumentState::NotFound,
             ),
@@ -2381,8 +2382,9 @@ impl PolicyReportBuilder {
             expected_inputs,
             PolicyReportEvaluationContext::new(
                 options.evaluation_date(),
-                options.suppressions(),
-                super::suppression::PolicySuppressionDocumentState::NotFound,
+                options
+                    .suppressions()
+                    .source_states(super::suppression::PolicySuppressionDocumentState::NotFound),
                 options.scope(),
                 super::scope::PolicyScopeDocumentState::NotFound,
             ),
@@ -3662,8 +3664,8 @@ mod tests {
     use crate::source::parse_rqlp_source;
     use crate::suppression::{
         PolicyEvaluationDate, PolicySuppressionDocumentState, PolicySuppressionMatchState,
-        PolicySuppressionPolicyHashState, PolicySuppressionTemporalState,
-        parse_policy_suppression_document,
+        PolicySuppressionOrphanState, PolicySuppressionPolicyHashState,
+        PolicySuppressionTemporalState, parse_policy_suppression_document,
     };
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
     use serde_json::json;
@@ -4182,14 +4184,17 @@ mod tests {
             PolicySuppressionMatchState::StrongFinding,
             PolicySuppressionTemporalState::Current,
             PolicySuppressionPolicyHashState::Unknown,
+            PolicySuppressionOrphanState::Resolved,
+            Vec::new(),
         );
         let options = PolicyEvaluationOptions::new(
             PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
         );
         let evaluation = PolicyReportEvaluationContext::new(
             options.evaluation_date(),
-            options.suppressions(),
-            PolicySuppressionDocumentState::Loaded,
+            options
+                .suppressions()
+                .source_states(PolicySuppressionDocumentState::Loaded),
             options.scope(),
             super::super::scope::PolicyScopeDocumentState::NotFound,
         );
@@ -4508,13 +4513,15 @@ mod tests {
 
     #[test]
     fn secondary_diagnostic_omission_tracks_count_and_worst_severity() {
+        // Large enough for the skeleton, small enough that one full-width
+        // diagnostic does not fit: the omission is what this test is about.
         let per_policy = super::super::budget::PolicyBudget::builder()
-            .with_max_retained_report_bytes(5_000)
+            .with_max_retained_report_bytes(6_000)
             .unwrap()
             .build()
             .unwrap();
         let budget = PolicyBatchBudget::builder()
-            .with_max_retained_report_bytes(5_000)
+            .with_max_retained_report_bytes(6_000)
             .unwrap()
             .with_per_policy(per_policy)
             .unwrap()

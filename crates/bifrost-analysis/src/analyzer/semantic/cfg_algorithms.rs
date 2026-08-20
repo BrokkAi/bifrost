@@ -1676,9 +1676,6 @@ mod test_support {
 }
 
 #[cfg(test)]
-mod benchmark;
-
-#[cfg(test)]
 mod tests {
     use super::test_support::SyntheticGraph as TestGraph;
     use super::*;

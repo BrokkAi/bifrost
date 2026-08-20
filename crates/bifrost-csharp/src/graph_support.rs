@@ -22,6 +22,7 @@ use brokk_bifrost_core::analyzer::capabilities::{
 use brokk_bifrost_core::analyzer::code_unit_index::file_namespace_from_top_level_declarations;
 use brokk_bifrost_core::analyzer::model::{CodeUnitType, ImportInfo, SignatureMetadata};
 use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -124,7 +125,7 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
     /// The workspace's usage-definition index, as the bounded lookup contract.
     /// Every `usage_*` spelling below answers from here rather than from the
     /// persisted store.
-    fn usage_definitions(&self) -> &dyn BoundedDefinitionLookup;
+    fn usage_definitions(&self, token: QueryToken<'_>) -> &dyn BoundedDefinitionLookup;
 
     // --- indexed file facts ---
 
@@ -156,6 +157,7 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
     /// verbatim for the C# spellings to parse. `limit` caps rows.
     fn import_info_of_limited(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         limit: usize,
     ) -> LimitedQueryRows<ImportInfo>;
@@ -313,9 +315,10 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
 
 pub fn usage_declaration_candidates_by_identifier(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     identifier: &str,
 ) -> Vec<CodeUnit> {
-    source.usage_definitions().identifier(identifier)
+    source.usage_definitions(token).identifier(identifier)
 }
 
 pub fn declaration_candidates_by_fqn(
@@ -358,21 +361,30 @@ pub fn declaration_candidates_by_fqn_limited(
 
 pub fn usage_member_candidates_for_owner(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     owner_fqn: &str,
     name: &str,
 ) -> Vec<CodeUnit> {
     let normalized = csharp_normalize_full_name(owner_fqn);
     source
-        .usage_definitions()
+        .usage_definitions(token)
         .members_for_owner_name(owner_fqn, &normalized, name)
 }
 
-pub fn usage_workspace_namespace_exists(source: &dyn CSharpSource, namespace: &str) -> bool {
-    source.usage_definitions().package_exists(namespace)
+pub fn usage_workspace_namespace_exists(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    namespace: &str,
+) -> bool {
+    source.usage_definitions(token).package_exists(namespace)
 }
 
-pub fn usage_type_candidates_by_fqn(source: &dyn CSharpSource, fqn: &str) -> Vec<CodeUnit> {
-    let lookup = source.usage_definitions();
+pub fn usage_type_candidates_by_fqn(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    fqn: &str,
+) -> Vec<CodeUnit> {
+    let lookup = source.usage_definitions(token);
     let exact = lookup
         .fqn(fqn)
         .iter()
@@ -393,8 +405,12 @@ pub fn usage_type_candidates_by_fqn(source: &dyn CSharpSource, fqn: &str) -> Vec
         .collect()
 }
 
-pub fn usage_definition_candidates_by_fqn(source: &dyn CSharpSource, fqn: &str) -> Vec<CodeUnit> {
-    let lookup = source.usage_definitions();
+pub fn usage_definition_candidates_by_fqn(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    fqn: &str,
+) -> Vec<CodeUnit> {
+    let lookup = source.usage_definitions(token);
     let exact = lookup.fqn(fqn);
     if !exact.is_empty() {
         return exact.to_vec();
@@ -423,9 +439,14 @@ fn explicit_generic_arity_key(fqn: &str) -> Option<String> {
     (csharp_normalize_full_name(&arity_key) != arity_key).then_some(arity_key)
 }
 
-pub fn type_candidates_by_fqn(source: &dyn CSharpSource, fqn: &str, usage: bool) -> Vec<CodeUnit> {
+pub fn type_candidates_by_fqn(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    fqn: &str,
+    usage: bool,
+) -> Vec<CodeUnit> {
     if usage {
-        return usage_type_candidates_by_fqn(source, fqn);
+        return usage_type_candidates_by_fqn(source, token, fqn);
     }
     let mut candidates = source
         .forward_definition_fqn(fqn)
@@ -484,10 +505,11 @@ pub fn compute_namespace_of_file_limited(
 
 pub fn import_statements_limited(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     limit: usize,
 ) -> LimitedQueryRows<String> {
-    let imports = source.import_info_of_limited(file, limit);
+    let imports = source.import_info_of_limited(token, file, limit);
     let statements = imports
         .rows
         .into_iter()
@@ -501,9 +523,13 @@ pub fn import_statements_limited(
 }
 
 /// The uncached half of the analyzer's `using_namespaces_of`.
-pub fn compute_using_namespaces_of(source: &dyn CSharpSource, file: &ProjectFile) -> Vec<String> {
+pub fn compute_using_namespaces_of(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+) -> Vec<String> {
     let mut namespaces: Vec<String> = source
-        .import_info_of(file)
+        .import_info_of(token, file)
         .iter()
         .filter_map(csharp_using_namespace)
         .collect();
@@ -519,9 +545,13 @@ pub fn compute_using_namespaces_of(source: &dyn CSharpSource, file: &ProjectFile
 /// workspace `global using` directives. Visible-type lookup keeps this set as
 /// a distinct precedence tier so a global directive from another compilation
 /// cannot make a file-local import ambiguous (#2060).
-pub fn file_using_namespaces(source: &dyn CSharpSource, file: &ProjectFile) -> Vec<String> {
+pub fn file_using_namespaces(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+) -> Vec<String> {
     source
-        .import_info_of(file)
+        .import_info_of(token, file)
         .iter()
         .filter(|import| !import.is_global)
         .filter_map(csharp_using_namespace)
@@ -531,10 +561,11 @@ pub fn file_using_namespaces(source: &dyn CSharpSource, file: &ProjectFile) -> V
 /// [`file_using_namespaces`] under a store-row budget.
 pub fn file_using_namespaces_limited(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     limit: usize,
 ) -> LimitedQueryRows<String> {
-    let imports = source.import_info_of_limited(file, limit);
+    let imports = source.import_info_of_limited(token, file, limit);
     let namespaces = imports
         .rows
         .into_iter()
@@ -551,6 +582,7 @@ pub fn file_using_namespaces_limited(
 /// The uncached half of the analyzer's `using_namespaces_of_limited`.
 pub fn compute_using_namespaces_of_limited(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     limit: usize,
     continue_query: &mut dyn FnMut() -> bool,
@@ -559,7 +591,7 @@ pub fn compute_using_namespaces_of_limited(
         return LimitedQueryRows::incomplete(Vec::new(), 0);
     }
 
-    let imports = source.import_info_of_limited(file, limit);
+    let imports = source.import_info_of_limited(token, file, limit);
     let mut namespaces: Vec<_> = imports
         .rows
         .into_iter()
@@ -634,6 +666,7 @@ pub fn compute_using_namespaces_of_limited(
 /// those; it is not a regression to keep not finding them.
 pub fn csharp_import_reachability(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     source_file: &ProjectFile,
     imports: &[ImportInfo],
     target: &ProjectFile,
@@ -643,10 +676,10 @@ pub fn csharp_import_reachability(
         .into_iter()
         .filter(|unit| unit.kind() == CodeUnitType::Class)
         .collect();
-    if csharp_reaches_target(source, source_file, imports, target, &target_classes) {
+    if csharp_reaches_target(source, token, source_file, imports, target, &target_classes) {
         return ImportReachability::Reaches;
     }
-    if csharp_cannot_reach_target(source, source_file, imports, &target_classes) {
+    if csharp_cannot_reach_target(source, token, source_file, imports, &target_classes) {
         return ImportReachability::DoesNotReach;
     }
     ImportReachability::Unknown
@@ -656,6 +689,7 @@ pub fn csharp_import_reachability(
 /// reports a possible reference and never a proven absence.
 fn csharp_reaches_target(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     source_file: &ProjectFile,
     imports: &[ImportInfo],
     target: &ProjectFile,
@@ -701,7 +735,7 @@ fn csharp_reaches_target(
                     .is_some_and(|suffix| suffix.starts_with("::"))
             });
             if uses_namespace_alias {
-                let candidates = visible_type_candidates(source, source_file, &identifier);
+                let candidates = visible_type_candidates(source, token, source_file, &identifier);
                 if target_classes
                     .iter()
                     .any(|target| candidates.contains(target))
@@ -718,7 +752,7 @@ fn csharp_reaches_target(
         .chain(source_imports)
         .any(|namespace| target_namespaces.contains(&namespace))
         || source_aliases.values().any(|alias_target| {
-            let candidates = visible_type_candidates(source, source_file, alias_target);
+            let candidates = visible_type_candidates(source, token, source_file, alias_target);
             target_classes.iter().any(|unit| candidates.contains(unit))
         })
 }
@@ -741,6 +775,7 @@ fn csharp_reaches_target(
 /// verdict falls back to `Unknown`.
 fn csharp_cannot_reach_target(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     source_file: &ProjectFile,
     imports: &[ImportInfo],
     target_classes: &[CodeUnit],
@@ -765,7 +800,7 @@ fn csharp_cannot_reach_target(
         }
     }
 
-    let visible = csharp_visible_namespaces(source, source_file, imports);
+    let visible = csharp_visible_namespaces(source, token, source_file, imports);
     !target_classes
         .iter()
         .any(|unit| visible.contains(unit.package_name()))
@@ -810,6 +845,7 @@ fn csharp_reference_name_segments(identifier: &str) -> impl Iterator<Item = &str
 /// about which of its segments are namespaces and which are types.
 fn csharp_visible_namespaces(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     source_file: &ProjectFile,
     imports: &[ImportInfo],
 ) -> HashSet<String> {
@@ -837,7 +873,7 @@ fn csharp_visible_namespaces(
     // whose imports it already loaded.
     for import in imports
         .iter()
-        .chain(source.import_info_of(source_file).iter())
+        .chain(source.import_info_of(token, source_file).iter())
     {
         if let Some(namespace) = csharp_using_namespace(import) {
             insert_namespace_prefixes(&namespace, &mut visible);
@@ -870,10 +906,11 @@ fn insert_namespace_prefixes(path: &str, visible: &mut HashSet<String>) {
 /// The uncached half of the analyzer's `using_aliases_of`.
 pub fn compute_using_aliases_of(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
 ) -> HashMap<String, String> {
     let mut aliases: HashMap<String, String> = source
-        .import_info_of(file)
+        .import_info_of(token, file)
         .iter()
         .filter_map(csharp_using_alias_from_import)
         .collect();
@@ -888,6 +925,7 @@ pub fn compute_using_aliases_of(
 /// The uncached half of the analyzer's `using_aliases_of_limited`.
 pub fn compute_using_aliases_of_limited(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     limit: usize,
     continue_query: &mut dyn FnMut() -> bool,
@@ -896,7 +934,7 @@ pub fn compute_using_aliases_of_limited(
         return LimitedQueryRows::incomplete(Vec::new(), 0);
     }
 
-    let imports = source.import_info_of_limited(file, limit);
+    let imports = source.import_info_of_limited(token, file, limit);
     let mut aliases: HashMap<String, String> = imports
         .rows
         .iter()
@@ -919,11 +957,14 @@ pub fn compute_using_aliases_of_limited(
 }
 
 /// The uncached half of the analyzer's `global_using_namespaces`.
-pub fn compute_global_using_namespaces(source: &dyn CSharpSource) -> HashSet<String> {
+pub fn compute_global_using_namespaces(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+) -> HashSet<String> {
     source
         .all_files()
         .into_iter()
-        .flat_map(|file| source.import_info_of(&file).into_iter())
+        .flat_map(|file| source.import_info_of(token, &file).into_iter())
         .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
         .filter_map(|import| csharp_using_namespace(&import))
         .map(|namespace| {
@@ -957,11 +998,14 @@ pub fn compute_global_using_namespaces_limited(
 }
 
 /// The uncached half of the analyzer's `global_using_aliases`.
-pub fn compute_global_using_aliases(source: &dyn CSharpSource) -> HashMap<String, String> {
+pub fn compute_global_using_aliases(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+) -> HashMap<String, String> {
     source
         .all_files()
         .into_iter()
-        .flat_map(|file| source.import_info_of(&file).into_iter())
+        .flat_map(|file| source.import_info_of(token, &file).into_iter())
         .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
         .filter_map(|import| csharp_using_alias_from_import(&import))
         .collect()
@@ -988,11 +1032,14 @@ pub fn compute_global_using_aliases_limited(
 
 /// The uncached half of the analyzer's `global_static_using_type_names_limited`.
 /// The uncached half of the analyzer's `global_static_using_type_names`.
-pub fn compute_global_static_using_type_names(source: &dyn CSharpSource) -> Vec<String> {
+pub fn compute_global_static_using_type_names(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+) -> Vec<String> {
     let mut names: Vec<_> = source
         .all_files()
         .into_iter()
-        .flat_map(|file| source.import_info_of(&file).into_iter())
+        .flat_map(|file| source.import_info_of(token, &file).into_iter())
         .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
         .filter_map(|import| {
             let target = csharp_static_using_from_import(&import)?;
@@ -1032,18 +1079,21 @@ pub fn compute_global_static_using_type_names_limited(
 
 /// The uncached half of the analyzer's two `global_static_using_types` cells;
 /// `usage` selects the usage-definition index over the persisted store.
-pub fn compute_global_static_using_types(source: &dyn CSharpSource) -> Vec<CodeUnit> {
+pub fn compute_global_static_using_types(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+) -> Vec<CodeUnit> {
     let mut types = Vec::new();
     for file in source.all_files() {
         for target in source
-            .import_info_of(&file)
+            .import_info_of(token, &file)
             .iter()
             .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
             .filter_map(csharp_static_using_from_import)
         {
             let target =
                 normalize_csharp_type_fragment(target.strip_prefix("global::").unwrap_or(target));
-            types.extend(type_candidates_by_fqn(source, &target, false));
+            types.extend(type_candidates_by_fqn(source, token, &target, false));
         }
     }
     types.sort();
@@ -1055,18 +1105,21 @@ pub fn compute_global_static_using_types(source: &dyn CSharpSource) -> Vec<CodeU
 /// index instead of the persisted store. Two cells, two walks: the difference
 /// is which index resolves each target, and a `usage` flag threaded through one
 /// body would hide that behind a mode parameter.
-pub fn compute_usage_global_static_using_types(source: &dyn CSharpSource) -> Vec<CodeUnit> {
+pub fn compute_usage_global_static_using_types(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+) -> Vec<CodeUnit> {
     let mut types = Vec::new();
     for file in source.all_files() {
         for target in source
-            .import_info_of(&file)
+            .import_info_of(token, &file)
             .iter()
             .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
             .filter_map(csharp_static_using_from_import)
         {
             let target =
                 normalize_csharp_type_fragment(target.strip_prefix("global::").unwrap_or(target));
-            types.extend(type_candidates_by_fqn(source, &target, true));
+            types.extend(type_candidates_by_fqn(source, token, &target, true));
         }
     }
     types.sort();
@@ -1080,22 +1133,25 @@ pub fn compute_usage_global_static_using_types(source: &dyn CSharpSource) -> Vec
 
 pub fn visible_type_candidates(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     name: &str,
 ) -> Vec<CodeUnit> {
-    visible_type_candidates_inner(source, file, name, true, false)
+    visible_type_candidates_inner(source, token, file, name, true, false)
 }
 
 pub fn usage_visible_type_candidates(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     name: &str,
 ) -> Vec<CodeUnit> {
-    visible_type_candidates_inner(source, file, name, true, true)
+    visible_type_candidates_inner(source, token, file, name, true, true)
 }
 
 fn visible_type_candidates_inner(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     name: &str,
     resolve_aliases: bool,
@@ -1103,14 +1159,14 @@ fn visible_type_candidates_inner(
 ) -> Vec<CodeUnit> {
     let mut using_aliases = || Some(source.using_aliases_of(file));
     let mut namespace_of_file = || Some(source.namespace_of_file(file));
-    let mut file_using_namespaces = || Some(file_using_namespaces(source, file));
+    let mut file_using_namespaces = || Some(file_using_namespaces(source, token, file));
     let mut global_using_namespaces = || {
         let mut namespaces: Vec<_> = source.global_using_namespaces().iter().cloned().collect();
         namespaces.sort();
         Some(namespaces)
     };
     let mut namespace_exists = |namespace: &str| source.workspace_namespace_exists(namespace);
-    let mut type_candidates = |fqn: &str| Some(type_candidates_by_fqn(source, fqn, usage));
+    let mut type_candidates = |fqn: &str| Some(type_candidates_by_fqn(source, token, fqn, usage));
     visible_type_candidates_with_lookups(
         name,
         resolve_aliases,
@@ -1296,18 +1352,20 @@ where
 
 pub fn resolve_visible_type(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     name: &str,
 ) -> Option<CodeUnit> {
-    unique_logical_type(visible_type_candidates(source, file, name))
+    unique_logical_type(visible_type_candidates(source, token, file, name))
 }
 
 pub fn resolve_usage_visible_type(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
     name: &str,
 ) -> Option<CodeUnit> {
-    unique_logical_type(usage_visible_type_candidates(source, file, name))
+    unique_logical_type(usage_visible_type_candidates(source, token, file, name))
 }
 
 /// The one declaration `candidates` names, or `None` when the spelling is
@@ -1405,6 +1463,7 @@ where
 /// [`supertype_candidates_with_lookups`] over an unbounded [`CSharpSource`].
 pub fn supertype_candidates(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     part: &CodeUnit,
     raw: &str,
     usage: bool,
@@ -1412,12 +1471,12 @@ pub fn supertype_candidates(
     supertype_candidates_with_lookups(
         &part.fq_name(),
         raw,
-        &mut |fqn| Some(type_candidates_by_fqn(source, fqn, usage)),
+        &mut |fqn| Some(type_candidates_by_fqn(source, token, fqn, usage)),
         &mut |name| {
             if usage {
-                usage_visible_type_candidates(source, part.source(), name)
+                usage_visible_type_candidates(source, token, part.source(), name)
             } else {
-                visible_type_candidates(source, part.source(), name)
+                visible_type_candidates(source, token, part.source(), name)
             }
         },
     )
@@ -1472,12 +1531,16 @@ pub fn partial_type_parts_limited(
     LimitedQueryRows::complete(parts, batch.inspected)
 }
 
-pub fn usage_partial_type_parts(source: &dyn CSharpSource, owner: &CodeUnit) -> Vec<CodeUnit> {
+pub fn usage_partial_type_parts(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    owner: &CodeUnit,
+) -> Vec<CodeUnit> {
     if !owner.is_class() {
         return Vec::new();
     }
     let owner_key = type_declaration_key(owner);
-    let mut parts: Vec<_> = usage_definition_candidates_by_fqn(source, &owner.fq_name())
+    let mut parts: Vec<_> = usage_definition_candidates_by_fqn(source, token, &owner.fq_name())
         .into_iter()
         .filter(|unit| unit.is_class() && type_declaration_key(unit) == owner_key)
         .collect();
@@ -1541,6 +1604,7 @@ fn type_declaration_key(unit: &CodeUnit) -> String {
 /// every same-namespace reference.
 pub fn compute_implicit_reference_index(
     source: &dyn CSharpSource,
+    token: QueryToken<'_>,
     parallel: bool,
 ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
     let mut by_namespace_and_name: HashMap<String, HashMap<String, Vec<ProjectFile>>> =
@@ -1609,7 +1673,7 @@ pub fn compute_implicit_reference_index(
                 // default candidate routing agrees with authoritative scanning.
                 if identifier.contains("::") {
                     resolved_targets.extend(
-                        visible_type_candidates(source, candidate, &identifier)
+                        visible_type_candidates(source, token, candidate, &identifier)
                             .into_iter()
                             .map(|unit| unit.source().clone()),
                     );

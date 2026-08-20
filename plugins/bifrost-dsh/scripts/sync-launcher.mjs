@@ -3,7 +3,7 @@
 // Vendors the shared launcher into this package so the published bundle is
 // self-contained. Source of truth stays in plugins/bifrost-agent; the copies
 // here must remain byte-identical (enforced by test/plugin.test.mjs and
-// scripts/check-codex-plugin-manifest.mjs). `--check` verifies without
+// scripts/public/check-codex-plugin-manifest.mjs). `--check` verifies without
 // writing, for prepack and CI.
 
 import fs from "node:fs";

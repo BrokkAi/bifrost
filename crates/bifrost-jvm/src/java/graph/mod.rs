@@ -16,6 +16,7 @@ pub mod resolver;
 pub mod return_type;
 
 use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{
     BoundedDefinitionLookup, CodeUnitIndex, DefinitionLookupAccess, ProjectFile,
 };
@@ -33,6 +34,9 @@ use brokk_bifrost_core::analyzer::{
 /// Java-only questions.
 #[derive(Clone, Copy)]
 pub struct JavaGraphSource<'a> {
+    /// Proof that a request scope is open: the import accessors reached from
+    /// this source cross the import tier's storage (issue #2423).
+    pub token: QueryToken<'a>,
     pub index: &'a dyn CodeUnitIndex,
     pub hierarchy: Option<&'a dyn TypeHierarchyProvider>,
     pub definitions: &'a DefinitionLookupAccess<'a>,

@@ -21,3 +21,8 @@ bifrost_searchtools/*.so
 /packaging/bifrost-cli/.generated-licenses/
 /packaging/bifrost-cli/dist/
 /npm/dist/
+
+# One developer's or agent's working policy decisions. The checked-in
+# decisions live in .bifrost/suppressions.json (published) and
+# .bifrost/suppressions.private.json (not published).
+/.bifrost/suppressions.local.json

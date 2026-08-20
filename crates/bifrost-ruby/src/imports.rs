@@ -9,6 +9,7 @@
 use crate::declarations::{extract_name_segments, parse_ruby_tree, ruby_node_text as node_text};
 use crate::graph_support::RubySource;
 use brokk_bifrost_core::analyzer::model::ImportInfo;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -360,8 +361,12 @@ fn ruby_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 }
 
 /// Project files this file pulls in via supported Ruby require forms.
-pub fn ruby_required_files(ruby: &dyn RubySource, file: &ProjectFile) -> Vec<ProjectFile> {
-    ruby.import_info_of(file)
+pub fn ruby_required_files(
+    ruby: &dyn RubySource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+) -> Vec<ProjectFile> {
+    ruby.import_info_of(token, file)
         .iter()
         .filter_map(|import| resolve_required_file(file, import))
         .collect()
@@ -373,8 +378,12 @@ pub fn ruby_required_files(ruby: &dyn RubySource, file: &ProjectFile) -> Vec<Pro
 /// runtime. Navigation can still offer best-effort indexed results, but a
 /// diagnostic must not claim that a constant is absent while that boundary
 /// remains open.
-pub fn ruby_has_unresolved_load_directive(ruby: &dyn RubySource, file: &ProjectFile) -> bool {
-    ruby.import_info_of(file)
+pub fn ruby_has_unresolved_load_directive(
+    ruby: &dyn RubySource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+) -> bool {
+    ruby.import_info_of(token, file)
         .iter()
         .any(|import| resolve_required_file(file, import).is_none())
 }
@@ -495,10 +504,11 @@ pub fn ruby_zeitwerk_visible_files_for<'a>(
 
 pub fn ruby_effective_imported_code_units(
     ruby: &dyn RubySource,
+    token: QueryToken<'_>,
     file: &ProjectFile,
 ) -> HashSet<CodeUnit> {
     let mut units = HashSet::default();
-    for required in ruby_required_files(ruby, file) {
+    for required in ruby_required_files(ruby, token, file) {
         for code_unit in ruby.top_level_declarations(&required) {
             units.insert(code_unit.clone());
         }

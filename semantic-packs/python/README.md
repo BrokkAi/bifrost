@@ -86,7 +86,7 @@ in `notices/typeshed-stdlib-2026.8.8.txt`, which ships with the pack.
 
 ## Regeneration
 
-`scripts/build-pinned-python-semantic-packs.sh OUTPUT_DIR WORK_DIR` downloads
+`scripts/public/build-pinned-python-semantic-packs.sh OUTPUT_DIR WORK_DIR` downloads
 the pinned archive, checks its SHA-256, extracts the stub root under the
 pinned directory name, and then generates and verifies the bundle. The
 pinned artifact is a source set rather than one file, so its digest is the

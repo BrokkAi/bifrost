@@ -12,6 +12,7 @@
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ImportInfo, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_jvm::kotlin::imports::{
     compute_kotlin_same_package_reference_index, kotlin_could_import_file,
     resolve_kotlin_import_infos,
@@ -20,6 +21,7 @@ use brokk_bifrost_jvm::realm::JvmSourceRealm;
 use std::sync::Arc;
 
 use super::KotlinAnalyzer;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
 impl KotlinAnalyzer {
     /// The declarations a Kotlin file imports, widened to the whole JVM source
@@ -30,6 +32,7 @@ impl KotlinAnalyzer {
     /// Java and Scala declarations.
     pub(crate) fn imported_code_units_in_realm(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         realm: Option<&JvmSourceRealm<'_>>,
     ) -> Arc<HashSet<CodeUnit>> {
@@ -43,8 +46,8 @@ impl KotlinAnalyzer {
         if file_language(file) != Language::Kotlin {
             return Arc::new(HashSet::default());
         }
-        let imports = self.inner.import_info_of(file);
-        let resolved = Arc::new(resolve_kotlin_import_infos(self, &imports, realm));
+        let imports = self.inner.import_info_of(token, file);
+        let resolved = Arc::new(resolve_kotlin_import_infos(self, token, &imports, realm));
         cache.insert(file.clone(), Arc::clone(&resolved));
         resolved
     }
@@ -61,11 +64,13 @@ impl KotlinAnalyzer {
 
 impl ImportAnalysisProvider for KotlinAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
-        self.imported_code_units_in_realm(file, None)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        self.imported_code_units_in_realm(token, file, None)
     }
 
-    fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
-        self.inner.import_info_of(file)
+    fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
+        self.inner.import_info_of(token, file)
     }
 
     fn imported_code_units_from_infos(
@@ -73,7 +78,13 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
         _file: &ProjectFile,
         imports: &[ImportInfo],
     ) -> Option<Arc<HashSet<CodeUnit>>> {
-        Some(Arc::new(resolve_kotlin_import_infos(self, imports, None)))
+        let scope = AnalyzerQueryScope::new(self);
+        Some(Arc::new(resolve_kotlin_import_infos(
+            self,
+            scope.token(),
+            imports,
+            None,
+        )))
     }
 
     /// Kotlin files that reference `file`.
@@ -124,6 +135,7 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
         imports: &[ImportInfo],
         target: &ProjectFile,
     ) -> bool {
-        kotlin_could_import_file(self, source_file, imports, target)
+        let scope = AnalyzerQueryScope::new(self);
+        kotlin_could_import_file(self, scope.token(), source_file, imports, target)
     }
 }

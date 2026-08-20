@@ -9,6 +9,7 @@ use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{
     BulkFileStateSource, CodeUnit, IAnalyzer, Language, ProjectFile, Range, ScalaAnalyzer,
     resolve_analyzer,
@@ -16,6 +17,7 @@ use crate::analyzer::{
 use crate::hash::HashMap;
 use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_jvm::scala::graph::query::{
     ScalaCatalogBuildError, ScalaFileEligibility, ScalaQueryHitSink, ScalaQueryTargetCatalog,
 };
@@ -39,6 +41,7 @@ pub(super) struct ScalaEdgeGraph {
 /// built once here and the class-range index is handed on.
 fn build_scala_edges<Output, F>(
     scala: &ScalaAnalyzer,
+    token: QueryToken<'_>,
     graph: &ScalaEdgeGraph,
     nodes: &HashSet<String>,
     keep_file: F,
@@ -66,7 +69,7 @@ where
             nodes,
             ParseSpec::whole(&language),
             declarations,
-            |input| scan_edge_file(scala, &graph.types, file, state, class_ranges, input),
+            |input| scan_edge_file(scala, token, &graph.types, file, state, class_ranges, input),
         )
     })
 }
@@ -116,6 +119,8 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         if overloads.is_empty() {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         }
@@ -128,6 +133,7 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
             .collect();
         let catalog = match ScalaQueryTargetCatalog::build(
             self.scala,
+            token,
             overloads,
             scan_scope.cancellation(),
         ) {
@@ -195,6 +201,7 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
             };
             scan_scala_query_file(
                 self.scala,
+                token,
                 analyzer,
                 &dispatch,
                 file,
@@ -282,24 +289,26 @@ impl<'a> ScalaEdgeResolver<'a> {
     pub(crate) fn build_edges<F>(
         &self,
         _analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         nodes: &HashSet<String>,
         keep_file: F,
     ) -> UsageEdges
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        build_scala_edges(self.scala, &self.graph, nodes, keep_file)
+        build_scala_edges(self.scala, token, &self.graph, nodes, keep_file)
     }
 
     pub(crate) fn build_edge_weights<F>(
         &self,
         _analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
         nodes: &HashSet<String>,
         keep_file: F,
     ) -> UsageEdgeWeights
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        build_scala_edges(self.scala, &self.graph, nodes, keep_file)
+        build_scala_edges(self.scala, token, &self.graph, nodes, keep_file)
     }
 }

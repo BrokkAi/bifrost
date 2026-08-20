@@ -49,7 +49,7 @@ environment rather than whichever system interpreter happens to be on `PATH`.
 Python:
 
 ```bash
-scripts/test_python.sh
+scripts/public/test_python.sh
 ```
 
 That wrapper provisions a uv-managed Python 3.12 environment, makes `maturin` available, installs the editable native extension, and then runs the unittest suite.
@@ -95,7 +95,7 @@ The Rust crate, the `bifrost` binary, the Python wheel, and the agent/editor
 plugin release metadata are versioned **together** and cut from a **single tag**.
 `Cargo.toml`'s `[workspace.package]` version is the committed source of truth for the release version:
 `pyproject.toml` inherits it via maturin's `dynamic = ["version"]`, and
-`scripts/release-version.mjs sync` copies it into citation, semantic-pack,
+`scripts/public/release-version.mjs sync` copies it into citation, semantic-pack,
 plugin, and editor metadata that require literal versions. The script does not
 infer `CITATION.cff`'s `date-released`; setting the actual release date remains
 an explicit release-preparation step.
@@ -112,7 +112,7 @@ workflows generate it automatically. To inspect or package it locally, install
 `cargo-about` 0.9.1 and run:
 
 ```bash
-scripts/generate-rust-third-party-notices.sh licenses/THIRD_PARTY_LICENSES.html
+scripts/public/generate-rust-third-party-notices.sh licenses/THIRD_PARTY_LICENSES.html
 ```
 
 The generated path is ignored by Git.
@@ -123,7 +123,7 @@ version in `Cargo.toml`, set `CITATION.cff`'s `date-released` to the actual
 release date, then run:
 
 ```bash
-node scripts/release-version.mjs sync
+node scripts/public/release-version.mjs sync
 ```
 
 That script updates these committed version fields:
@@ -155,11 +155,11 @@ release archive checksums:
 - `plugins/bifrost-agent/bifrost-release.json`
 
 Those checksum-bearing files must match the actual release archives.
-`scripts/release-version.mjs sync` only copies the current
+`scripts/public/release-version.mjs sync` only copies the current
 `plugins/bifrost-agent/bifrost-release.json` checksums into the VS Code manifest
 when that release metadata is already on the same version as `Cargo.toml`. The
 `release.yml` workflow prepares checksum metadata from the built `.sha256`
-sidecars with `scripts/prepare-vscode-extension-manifest.mjs`, validates the
+sidecars with `scripts/public/prepare-vscode-extension-manifest.mjs`, validates the
 plugin manifests, packages
 `bifrost-agent-<tag>.tar.gz`, and publishes the VSIX. A separate Pi package job
 prepares the same release metadata for the npm tarball, validates the packed
@@ -193,9 +193,9 @@ To cut a release:
    the plugin bundles:
 
    ```bash
-   node scripts/release-version.mjs check
-   node scripts/check-agent-plugins-v1.mjs
-   node scripts/check-codex-plugin-manifest.mjs
+   node scripts/public/release-version.mjs check
+   node scripts/public/check-agent-plugins-v1.mjs
+   node scripts/public/check-codex-plugin-manifest.mjs
    node --test plugins/bifrost-agent/test/*.test.mjs
    ```
 
@@ -208,7 +208,7 @@ To cut a release:
    required branch checks and these release-specific checks pass:
 
    ```bash
-   scripts/pre-push-gate.sh
+   scripts/public/pre-push-gate.sh
    cargo build --release --locked --bin bifrost
    plugin_smoke_root="$(mktemp -d "${TMPDIR:-/tmp}/bifrost-agent-pretag.XXXXXX")"
    mkdir -p "$plugin_smoke_root/package" "$plugin_smoke_root/extracted"
@@ -217,7 +217,7 @@ To cut a release:
    tar -C "$plugin_smoke_root/package/plugins" -czf "$plugin_smoke_root/bifrost-agent.tar.gz" bifrost-agent
    tar -C "$plugin_smoke_root/extracted" -xzf "$plugin_smoke_root/bifrost-agent.tar.gz"
    plugin_smoke_dir="$(cd "$plugin_smoke_root/extracted/bifrost-agent" && pwd -P)"
-   node scripts/smoke-agent-plugin-release.mjs \
+   node scripts/public/smoke-agent-plugin-release.mjs \
      --plugin-dir "$plugin_smoke_dir" \
      --cache-dir "$plugin_smoke_root/cache" \
      --binary-path "$(pwd)/target/release/bifrost"
@@ -248,15 +248,25 @@ To cut a release:
    resolve any conflicts against current `master` deliberately. Changes that
    land on `master` after the branch point remain outside the release unless
    they are explicitly selected for the RC branch.
-8. After the RC branch is frozen and validated, compare the RC commit to the
-   previous release with `scripts/check-build-ancestry.sh` so a higher version
-   label is not treated as newer source. Then tag the validated RC commit -
-   not the current `master` tip - and push the tag:
+8. After the RC branch is frozen and validated, project it to public `master`,
+   qualify that public commit, and tag **the qualified public commit in
+   `BrokkAi/bifrost`**. The tag does not go on the private RC commit and does
+   not go in the private repository: `release.yml` is gated on
+   `github.repository == 'BrokkAi/bifrost'`, so a tag pushed there starts
+   nothing. The v-tags present in the private repository predate the
+   open-core split and are not release tags.
 
-   ```bash
-   git tag -a v0.8.22 -m "Release v0.8.22"
-   git push origin refs/tags/v0.8.22
-   ```
+   Do not improvise this step. Follow the numbered handoff under
+   [Readiness handoff and recovery](#readiness-handoff-and-recovery),
+   which is the authoritative sequence: project, wait for public CI, dispatch
+   `Release readiness` against the exact public commit, inspect the retained
+   qualification bundle, confirm ancestry with
+   `scripts/check-build-ancestry.sh`, and only then create the public tag.
+
+   The ancestry check compares the **qualified public commit** against the
+   previous release tag's source, so that a higher version label cannot carry
+   older source. Comparing the private RC commit answers a different question
+   and does not establish that property for what is actually published.
 
 A single `vX.Y.Z` tag starts the **Release** workflow. It resolves the tagged
 commit once, then builds and validates CLI archives, crate contents, wheels/sdist,
@@ -278,7 +288,7 @@ Bifrost archives plus their `.sha256` sidecars, run the consumer smoke from a
 clean checkout using the exact published version:
 
 ```bash
-node scripts/smoke-published-agent-plugin.mjs --version 0.10.1
+node scripts/public/smoke-published-agent-plugin.mjs --version 0.10.1
 ```
 
 The command downloads `bifrost-agent-v<version>.tar.gz` away from the checkout,
@@ -299,7 +309,7 @@ credentialed model-level check.
 For a release asset downloaded separately, pass it explicitly:
 
 ```bash
-node scripts/smoke-published-agent-plugin.mjs \
+node scripts/public/smoke-published-agent-plugin.mjs \
   --version 0.10.1 \
   --archive /path/to/bifrost-agent-v0.10.1.tar.gz \
   --keep-temp
@@ -426,10 +436,31 @@ Use one explicit handoff from source projection to release publication:
    that single qualification bundle as the evidence for the handoff. Confirm
    with `scripts/check-build-ancestry.sh` that the qualified public commit
    contains the prior release tag's source.
-4. Only after that inspection, separately create and authorize the public
-   `vX.Y.Z` tag on the qualified public commit. Projection does not create a
-   tag, dispatch `Release`, or publish an artifact.
-5. After promotion, invoke the post-release smoke workflow with that exact tag
+4. Sync the launcher checksums before tagging. The qualification's promoted
+   sidecars are the first point at which the release's archive digests exist,
+   and tracked source still records the previous release's. Dispatch
+   `Sync qualified release metadata` (private repository) with the release
+   tag, the qualification run, artifact, digest, and the private source commit.
+   It corrects the three tracked checksum projections, commits them, projects
+   them to public `master`, and adopts that projection's conclusion, so a
+   failure here means the corrected digests are not public and the tag must
+   wait. Skipping this step is what left `v0.10.3` and `v0.10.4` publishing
+   plugins whose committed checksums described the previous release, so a
+   fresh marketplace install failed closed with `checksum_mismatch`.
+5. Re-qualify the corrected commit. Dispatch `Release readiness` again against
+   the new public head with `requalify_from_run` set to the run from step 2.
+   Nothing is rebuilt: it verifies the correction touches only those three
+   paths and re-labels the existing bundle for the corrected commit. That is
+   sound because the build identity names the last commit that touched a
+   compiled input, so the binaries already qualified report the same identity
+   at either commit. A full readiness run here would not converge -- the
+   binary compiles its identity in, so rebuilding the corrected commit yields
+   digests that commit does not record.
+6. Only after that inspection, separately create and authorize the public
+   `vX.Y.Z` tag on the **corrected** public commit, whose committed checksums
+   now describe its own artifacts. Projection does not create a tag, dispatch
+   `Release`, or publish an artifact.
+7. After promotion, invoke the post-release smoke workflow with that exact tag
    (through its reusable call or manual dispatch), then monitor registry and
    marketplace visibility and rerun only the failed smoke jobs when a target
    is still propagating.
@@ -480,7 +511,7 @@ themselves while the existing qualification remains valid. Its contract:
 The npm trusted-publishing client contract (pinned modern npm, no
 classic-token configuration, cleared `NODE_AUTH_TOKEN`, explicit provenance,
 master-ref child dispatch) is validated before any tag exists by
-`scripts/check-npm-trusted-publishing.mjs`, which runs in the readiness
+`scripts/public/check-npm-trusted-publishing.mjs`, which runs in the readiness
 preflight and in private CI.
 
 The workflows do not currently claim a fixed duration or speed improvement
@@ -490,11 +521,15 @@ rehearsal; it must not be inferred from configuration alone.
 The release workflow also syncs the policy-scan composite action into the
 standalone alias repository `BrokkAi/bifrost-policy-scan`, so workflows can
 reference `uses: BrokkAi/bifrost-policy-scan@vX.Y.Z` instead of the
-subdirectory form. `scripts/sync-policy-scan-action.sh` copies the canonical
+subdirectory form. `scripts/public/sync-policy-scan-action.sh` copies the canonical
 `.github/actions/policy-scan/action.yml`, rewrites its `version` input default
 to the release tag being published (keeping the action and the Bifrost binary
 it installs in lockstep), pushes one commit, tags the exact release tag, and
-force-moves the floating major tag (`v0`). The push authenticates as a GitHub
+force-moves the floating major tag (`v0`). Only the newest `vMAJOR.x.y`
+release may move the floating tag and the default branch: an out-of-order
+sync of an older release (a recovery re-run or a backport) publishes its
+exact tag only, so it can never downgrade consumers that follow `@v0` or the
+repository head. The push authenticates as a GitHub
 App installation: the job mints a short-lived installation token with
 `actions/create-github-app-token` from the `POLICY_SCAN_APP_CLIENT_ID`
 variable and the `POLICY_SCAN_APP_PRIVATE_KEY` secret in the protected
@@ -525,7 +560,7 @@ GitHub Actions allowlist entry is needed.
 
 - The workspace package version in `Cargo.toml` is the single source of truth for all Rust
   packages, the Python package, and release-aligned plugin/editor metadata. Never add a
-  `version` to `pyproject.toml`; run `node scripts/release-version.mjs sync` to
+  `version` to `pyproject.toml`; run `node scripts/public/release-version.mjs sync` to
   update JSON metadata from `Cargo.toml`.
 - The Tree-sitter grammar crate versions are intentionally not forced to share
   the same numeric version. The policy is documented in `Cargo.toml`.

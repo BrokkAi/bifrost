@@ -201,10 +201,11 @@ impl JavaAnalyzer {
 
     pub fn resolve_type_name_in_file(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         raw_name: &str,
     ) -> Option<CodeUnit> {
-        resolve_java_forward_type_name(self, file, raw_name)
+        resolve_java_forward_type_name(self, token, file, raw_name)
     }
 
     /// Every candidate the deciding type-name tier produced for `raw_name`.
@@ -212,10 +213,11 @@ impl JavaAnalyzer {
     /// simple name, so no candidate is provably unique (issue #1602).
     pub fn resolve_type_name_candidates_in_file(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         raw_name: &str,
     ) -> Vec<CodeUnit> {
-        resolve_java_forward_type_name_candidates(self, file, raw_name)
+        resolve_java_forward_type_name_candidates(self, token, file, raw_name)
     }
 
     /// Expand `URLDecoder.decode` to `java.net.URLDecoder.decode` when the
@@ -224,6 +226,7 @@ impl JavaAnalyzer {
     /// the #1978 identity.
     pub(crate) fn expand_imported_external_callee(
         &self,
+        token: QueryToken<'_>,
         packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
         file: &ProjectFile,
         callee_text: &str,
@@ -232,7 +235,7 @@ impl JavaAnalyzer {
         if owner.contains('.') {
             return None;
         }
-        match self.resolve_type_name_with_external(packs, file, owner) {
+        match self.resolve_type_name_with_external(token, packs, file, owner) {
             Some(JavaTypeResolution::External(external_type)) => {
                 Some(format!("{}.{}", external_type.fqn(), member))
             }
@@ -240,7 +243,7 @@ impl JavaAnalyzer {
                 Some(format!("{}.{}", unit.fq_name(), member))
             }
             None => self
-                .explicit_imported_type_fqn(file, owner)
+                .explicit_imported_type_fqn(token, file, owner)
                 .map(|fqn| format!("{fqn}.{member}")),
         }
     }
@@ -250,11 +253,12 @@ impl JavaAnalyzer {
     /// [`JavaAnalyzer::resolve_type_name_with_external`].
     pub fn is_known_type_name_in_file(
         &self,
+        token: QueryToken<'_>,
         packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
         file: &ProjectFile,
         raw_name: &str,
     ) -> bool {
-        self.resolve_type_name_with_external(packs, file, raw_name)
+        self.resolve_type_name_with_external(token, packs, file, raw_name)
             .is_some()
     }
 
@@ -281,19 +285,20 @@ impl JavaAnalyzer {
     /// member spelling exactly as unknown as it was before activation.
     pub(crate) fn external_boundary_evidence(
         &self,
+        token: QueryToken<'_>,
         packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
         file: &ProjectFile,
         name: &str,
     ) -> (BoundaryStatus, Option<String>) {
         if let Some(JavaTypeResolution::External(external_type)) =
-            self.resolve_type_name_with_external(packs.clone(), file, name)
+            self.resolve_type_name_with_external(token, packs.clone(), file, name)
         {
             return (
                 BoundaryStatus::ExternalIndexed,
                 Some(external_type.fqn().to_owned()),
             );
         }
-        if let Some(member) = self.resolve_member_name_with_external(packs, file, name) {
+        if let Some(member) = self.resolve_member_name_with_external(token, packs, file, name) {
             return (
                 BoundaryStatus::ExternalIndexed,
                 Some(member.fqn().to_owned()),
@@ -368,21 +373,26 @@ impl JavaSource for JavaAnalyzer {
     }
 
     fn resolved_imports(&self, file: &ProjectFile) -> Arc<HashMap<String, CodeUnit>> {
-        self.resolve_imports(file)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        self.resolve_imports(token, file)
     }
 
     fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
         ForwardQueryProvider::forward_definition_fqn(self, fqn)
     }
 
-    fn usage_definitions(&self) -> &dyn crate::analyzer::BoundedDefinitionLookup {
-        self.inner.global_usage_definition_index_ref()
+    fn usage_definitions(
+        &self,
+        token: QueryToken<'_>,
+    ) -> &dyn crate::analyzer::BoundedDefinitionLookup {
+        self.inner.global_usage_definition_index_ref(token)
     }
 
-    fn source_types_in_package(&self, package_name: &str) -> Vec<CodeUnit> {
+    fn source_types_in_package(&self, token: QueryToken<'_>, package_name: &str) -> Vec<CodeUnit> {
         let mut types: Vec<_> = self
             .inner
-            .global_usage_definition_index()
+            .global_usage_definition_index(token)
             .package_types()
             .filter(|((package, _), _)| package == package_name)
             .flat_map(|(_, units)| units.iter().cloned())
@@ -621,7 +631,8 @@ impl IAnalyzer for JavaAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
-        diagnostics::collect_java_semantic_diagnostics(self, file, source)
+        let scope = AnalyzerQueryScope::new(self);
+        diagnostics::collect_java_semantic_diagnostics(self, scope.token(), file, source)
     }
 
     /// Build the jar-backed external declaration index off the request path.
@@ -675,7 +686,10 @@ impl IAnalyzer for JavaAnalyzer {
     }
 
     fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
+        // Trait signature is fixed, so this boundary opens the scope the
+        // usage-graph funnel now demands proof of (issue #2423 milestone B).
+        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        self.inner.global_usage_definition_index(scope.token())
     }
 
     fn usage_facts_index(&self) -> &UsageFactsIndex {
@@ -1051,7 +1065,10 @@ impl LanguageSupport for JavaSupport {
         file: &ProjectFile,
         callee_text: &str,
     ) -> Option<String> {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
         resolve_analyzer::<JavaAnalyzer>(analyzer)?.expand_imported_external_callee(
+            token,
             analyzer.semantic_model_overlay(),
             file,
             callee_text,
@@ -1156,9 +1173,11 @@ impl DeadCodeBulkProof for JavaDeadCodeBulk {
         let has_scala_files = *scala_files_present
             .get_or_insert_with(|| analyzable_file_count(analyzer, Language::Scala) > 0);
 
+        let scope = AnalyzerQueryScope::new(analyzer);
         matches!(
             dead_code_bulk_eligibility(
                 analyzer,
+                scope.token(),
                 candidate,
                 overloads,
                 has_static_imports,

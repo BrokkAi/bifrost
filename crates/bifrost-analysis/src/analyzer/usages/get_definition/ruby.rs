@@ -4,6 +4,7 @@ use crate::analyzer::RubyMethodDispatchMode;
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner_bounded;
 use crate::analyzer::ruby::{RubyFieldScope, RubyNamePath, ruby_field_short_name};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use brokk_bifrost_ruby::graph::resolver::{ReceiverType, RubyMethodFind};
 
 pub(crate) struct RubyDefinitionProvider<'a> {
@@ -983,8 +984,10 @@ pub(super) fn resolve_ruby(
     let definitions = |consume: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| {
         consume(&analyzer.global_usage_definition_index());
     };
+    let scope = AnalyzerQueryScope::new(analyzer);
     let semantic = RubySemanticIndex::build_for_lookup(
         RubyGraphSource {
+            token: scope.token(),
             index: analyzer,
             definitions: &definitions,
         },

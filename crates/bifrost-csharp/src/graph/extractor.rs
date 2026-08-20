@@ -26,6 +26,7 @@ use crate::syntax::{
     csharp_unqualified_invocation_for_name,
 };
 use brokk_bifrost_core::analyzer::common::is_unparseable_source;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
 use brokk_bifrost_core::analyzer::usages::local_inference::SymbolResolution;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
@@ -80,6 +81,7 @@ pub fn prepare_file(csharp: &dyn CSharpSource, file: &ProjectFile) -> Option<Pre
 
 pub fn scan_prepared_file(
     csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
     graph: &CSharpGraphSource<'_>,
     file: &ProjectFile,
     prepared: &PreparedCSharpFile,
@@ -107,7 +109,7 @@ pub fn scan_prepared_file(
         class_ranges: prepared.class_ranges.clone(),
         using_aliases: &prepared.using_aliases,
     };
-    scan_node(prepared.tree.root_node(), &mut ctx);
+    scan_node(prepared.tree.root_node(), token, &mut ctx);
 }
 
 pub(super) struct ScanCtx<'a> {
@@ -147,45 +149,45 @@ enum TypeCandidateRole {
     Receiver,
 }
 
-fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn scan_node(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     if *ctx.limit_exceeded {
         return;
     }
 
     match ctx.spec.kind {
-        TargetKind::Type => scan_type_reference(node, ctx),
-        TargetKind::Constructor => scan_constructor_reference(node, ctx),
+        TargetKind::Type => scan_type_reference(node, token, ctx),
+        TargetKind::Constructor => scan_constructor_reference(node, token, ctx),
         TargetKind::Method | TargetKind::Field => {
-            scan_member_reference(node, ctx);
-            scan_unqualified_member_reference(node, ctx);
+            scan_member_reference(node, token, ctx);
+            scan_unqualified_member_reference(node, token, ctx);
         }
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        scan_node(child, ctx);
+        scan_node(child, token, ctx);
         if *ctx.limit_exceeded {
             return;
         }
     }
 }
 
-fn scan_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn scan_type_reference(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() == "attribute" {
-        scan_attribute_reference(node, ctx);
+        scan_attribute_reference(node, token, ctx);
         return;
     }
     if let Some(candidate) = csharp_constant_pattern_type_candidate(node) {
-        scan_structured_type_candidate(candidate, TypeCandidateRole::Pattern, true, ctx);
+        scan_structured_type_candidate(candidate, token, TypeCandidateRole::Pattern, true, ctx);
     }
     if let Some(receiver) = csharp_member_access_type_receiver(node) {
-        scan_structured_type_candidate(receiver, TypeCandidateRole::Receiver, true, ctx);
+        scan_structured_type_candidate(receiver, token, TypeCandidateRole::Receiver, true, ctx);
     }
     if let Some((operand, qualified_owner)) = csharp_nameof_type_candidates(node, ctx.source)
-        && !scan_structured_type_candidate(operand, TypeCandidateRole::Nameof, false, ctx)
+        && !scan_structured_type_candidate(operand, token, TypeCandidateRole::Nameof, false, ctx)
         && let Some(owner) = qualified_owner
     {
-        scan_structured_type_candidate(owner, TypeCandidateRole::Nameof, false, ctx);
+        scan_structured_type_candidate(owner, token, TypeCandidateRole::Nameof, false, ctx);
     }
     let Some(root) = csharp_type_reference_root(node) else {
         return;
@@ -193,11 +195,12 @@ fn scan_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !same_node(root, node) || is_declaration_name(root) {
         return;
     }
-    scan_structured_type_candidate(root, TypeCandidateRole::Ordinary, true, ctx);
+    scan_structured_type_candidate(root, token, TypeCandidateRole::Ordinary, true, ctx);
 }
 
 fn scan_structured_type_candidate(
     candidate: Node<'_>,
+    token: QueryToken<'_>,
     role: TypeCandidateRole,
     filter_by_target_name: bool,
     ctx: &mut ScanCtx<'_>,
@@ -223,6 +226,7 @@ fn scan_structured_type_candidate(
             binding_scope_node(candidate),
             candidate,
             ctx.csharp,
+            token,
             ctx.file,
             ctx.source,
             &mut bindings,
@@ -230,7 +234,7 @@ fn scan_structured_type_candidate(
         if member_name_is_locally_bound(&left_name, &bindings)
             || unqualified_member_has_structured_shadow(leftmost, ctx.source)
             || usage_unqualified_value_member_shadows_type(
-                leftmost, &left_name, ctx.graph, ctx.csharp, ctx.file, ctx.source,
+                leftmost, &left_name, ctx.graph, ctx.csharp, token, ctx.file, ctx.source,
             )
         {
             return false;
@@ -240,6 +244,7 @@ fn scan_structured_type_candidate(
     let reference = reference_type_text(candidate, ctx.source);
     match resolve_type_fq_name_at(
         ctx.csharp,
+        token,
         ctx.file,
         &ctx.class_ranges,
         &reference,
@@ -253,7 +258,7 @@ fn scan_structured_type_candidate(
         Some(resolved)
             if role == TypeCandidateRole::Receiver
                 && csharp_receiver_member_selects_visible_target(
-                    candidate, &reference, &resolved, ctx,
+                    candidate, token, &reference, &resolved, ctx,
                 ) =>
         {
             push_hit(candidate, ctx);
@@ -270,11 +275,13 @@ fn scan_structured_type_candidate(
 
 fn csharp_receiver_member_selects_visible_target(
     receiver: Node<'_>,
+    token: QueryToken<'_>,
     reference: &str,
     resolved_fqn: &str,
     ctx: &mut ScanCtx<'_>,
 ) -> bool {
-    let Some(visible) = graph_support::resolve_usage_visible_type(ctx.csharp, ctx.file, reference)
+    let Some(visible) =
+        graph_support::resolve_usage_visible_type(ctx.csharp, token, ctx.file, reference)
     else {
         return false;
     };
@@ -291,16 +298,18 @@ fn csharp_receiver_member_selects_visible_target(
         return false;
     };
     let member = node_text(member.identifier, ctx.source);
-    let Some(resolved_owner) = class_unit_for_fq_name(ctx.csharp, resolved_fqn) else {
+    let Some(resolved_owner) = class_unit_for_fq_name(ctx.csharp, token, resolved_fqn) else {
         return false;
     };
-    nearest_member_candidates_for_owner(ctx.graph, ctx.csharp, &resolved_owner, member, None)
+    nearest_member_candidates_for_owner(ctx.graph, ctx.csharp, token, &resolved_owner, member, None)
         .is_empty()
-        && !nearest_member_candidates_for_owner(ctx.graph, ctx.csharp, &visible, member, None)
-            .is_empty()
+        && !nearest_member_candidates_for_owner(
+            ctx.graph, ctx.csharp, token, &visible, member, None,
+        )
+        .is_empty()
 }
 
-fn scan_attribute_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn scan_attribute_reference(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(name) = node.child_by_field_name("name") else {
         return;
     };
@@ -319,7 +328,7 @@ fn scan_attribute_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let names = csharp_attribute_type_names(name, ctx.source);
-    if hierarchy::usage_unambiguous_attribute_type_candidates(ctx.csharp, ctx.file, &names)
+    if hierarchy::usage_unambiguous_attribute_type_candidates(ctx.csharp, token, ctx.file, &names)
         .into_iter()
         .any(|candidate| type_identity_matches(&candidate.fq_name(), &ctx.spec.target.fq_name()))
     {
@@ -327,7 +336,7 @@ fn scan_attribute_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn scan_constructor_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn scan_constructor_reference(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() != "object_creation_expression" {
         return;
     }
@@ -346,6 +355,7 @@ fn scan_constructor_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         ctx.source,
         &ctx.spec.owner,
         ctx.csharp,
+        token,
     );
     if !resolved {
         return;
@@ -360,7 +370,7 @@ fn scan_constructor_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit(type_node, ctx);
 }
 
-fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn scan_member_reference(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     let access = match node.kind() {
         "member_access_expression" => member_access_receiver(node).zip(member_access_name(node)),
         "conditional_access_expression" => {
@@ -381,6 +391,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             binding_scope_node(node),
             node,
             ctx.csharp,
+            token,
             ctx.file,
             ctx.source,
             &mut bindings,
@@ -392,6 +403,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             *call,
             ctx.graph,
             ctx.csharp,
+            token,
             ctx.file,
             &ctx.class_ranges,
             ctx.source,
@@ -437,7 +449,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
 
-    if resolves_to_target(ctx.csharp, ctx.file, receiver, &ctx.spec.owner) {
+    if resolves_to_target(ctx.csharp, token, ctx.file, receiver, &ctx.spec.owner) {
         if ctx.spec.kind == TargetKind::Method && !ordinary_call_arity_matches {
             return;
         }
@@ -462,6 +474,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             binding_scope_node(node),
             node,
             ctx.csharp,
+            token,
             ctx.file,
             ctx.source,
             &mut bindings,
@@ -473,6 +486,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             receiver_node,
             ctx.graph,
             ctx.csharp,
+            token,
             ctx.file,
             ctx.source,
             &bindings,
@@ -481,6 +495,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 let receiver_type_names = targets.into_iter().collect::<Vec<_>>();
                 if extension_call_resolution(
                     name.identifier,
+                    token,
                     explicit_generic_arity,
                     member_call_arity,
                     &receiver_type_names,
@@ -493,6 +508,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             SymbolResolution::Ambiguous | SymbolResolution::Unknown => {
                 if extension_call_resolution(
                     name.identifier,
+                    token,
                     explicit_generic_arity,
                     member_call_arity,
                     &[],
@@ -509,6 +525,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         receiver_node,
         ctx.graph,
         ctx.csharp,
+        token,
         ctx.file,
         ctx.source,
         &bindings,
@@ -517,6 +534,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             if targets.iter().any(|target| {
                 receiver_fqn_target_member_resolution(
                     target,
+                    token,
                     explicit_generic_arity,
                     member_call_arity,
                     ctx,
@@ -559,6 +577,7 @@ fn csharp_static_receiver_is_same_owner(receiver_node: Node<'_>, ctx: &ScanCtx<'
 
 fn extension_call_resolution(
     name: Node<'_>,
+    token: QueryToken<'_>,
     explicit_generic_arity: Option<usize>,
     call_arity: Option<usize>,
     receiver_type_names: &[String],
@@ -582,10 +601,11 @@ fn extension_call_resolution(
         return *resolution;
     }
     let ordinary_member_is_applicable = receiver_type_names.iter().any(|receiver_fqn| {
-        class_unit_for_fq_name(ctx.csharp, receiver_fqn).is_some_and(|owner| {
+        class_unit_for_fq_name(ctx.csharp, token, receiver_fqn).is_some_and(|owner| {
             applicable_member_candidates_for_owner(
                 ctx.graph,
                 ctx.csharp,
+                token,
                 &owner,
                 &ctx.spec.member_name,
                 explicit_generic_arity,
@@ -602,6 +622,7 @@ fn extension_call_resolution(
     }
     let candidates = usage_visible_extension_method_candidates(
         ctx.csharp,
+        token,
         ctx.graph,
         ctx.source,
         name,
@@ -621,7 +642,7 @@ fn extension_call_resolution(
     resolution
 }
 
-fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn scan_unqualified_member_reference(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() != "identifier" || is_declaration_name(node) {
         return;
     }
@@ -644,8 +665,13 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         TargetKind::Method if csharp_unqualified_invocation_for_name(node).is_some() => {
             let (invocation, explicit_generic_arity) =
                 csharp_unqualified_invocation_for_name(node).expect("call shape was checked");
-            match unqualified_method_call_resolution(node, invocation, explicit_generic_arity, ctx)
-            {
+            match unqualified_method_call_resolution(
+                node,
+                token,
+                invocation,
+                explicit_generic_arity,
+                ctx,
+            ) {
                 // A bare `Member(..)` is an implicit-this call on the current
                 // instance — a same-owner site (#1014 facet B), now that csharp's
                 // inverted builder routes same-owner calls to unproven inbound
@@ -658,13 +684,14 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         TargetKind::Method
             if is_unqualified_method_group_value(node, ctx.source)
-                || relational_generic_call_argument_is_method_group(node, ctx) =>
+                || relational_generic_call_argument_is_method_group(node, token, ctx) =>
         {
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
             seed_visible_bindings_at(
                 binding_scope_node(node),
                 node,
                 ctx.csharp,
+                token,
                 ctx.file,
                 ctx.source,
                 &mut bindings,
@@ -681,12 +708,13 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             else {
                 return;
             };
-            let Some(owner) = class_unit_for_fq_name(ctx.csharp, &owner_fqn) else {
+            let Some(owner) = class_unit_for_fq_name(ctx.csharp, token, &owner_fqn) else {
                 return;
             };
             match resolve_unqualified_method_group_for_owner(
                 ctx.graph,
                 ctx.csharp,
+                token,
                 &owner,
                 node_text(node, ctx.source),
             ) {
@@ -719,11 +747,12 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 binding_scope_node(node),
                 node,
                 ctx.csharp,
+                token,
                 ctx.file,
                 ctx.source,
                 &mut bindings,
             );
-            match member_label_owner_resolution(node, ctx) {
+            match member_label_owner_resolution(node, token, ctx) {
                 LabelOwnerResolution::MatchesTarget => {
                     push_hit(node, ctx);
                     return;
@@ -747,6 +776,7 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 &ctx.spec.owner,
                 ctx.graph,
                 ctx.csharp,
+                token,
                 ctx.file,
                 ctx.source,
                 &bindings,
@@ -771,7 +801,11 @@ pub(super) fn is_unqualified_method_group_value(node: Node<'_>, source: &str) ->
     containing_method_group_value_context(node)
 }
 
-fn relational_generic_call_argument_is_method_group(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+fn relational_generic_call_argument_is_method_group(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &ScanCtx<'_>,
+) -> bool {
     let Some(call) = csharp_relational_generic_call_for_argument(node) else {
         return false;
     };
@@ -780,6 +814,7 @@ fn relational_generic_call_argument_is_method_group(node: Node<'_>, ctx: &ScanCt
         binding_scope_node(call.member_access),
         call.member_access,
         ctx.csharp,
+        token,
         ctx.file,
         ctx.source,
         &mut bindings,
@@ -788,6 +823,7 @@ fn relational_generic_call_argument_is_method_group(node: Node<'_>, ctx: &ScanCt
         call,
         ctx.graph,
         ctx.csharp,
+        token,
         ctx.file,
         &ctx.class_ranges,
         ctx.source,
@@ -870,6 +906,7 @@ fn is_delegate_binary_operand(current: Node<'_>, parent: Node<'_>) -> bool {
 
 fn unqualified_method_call_resolution(
     node: Node<'_>,
+    token: QueryToken<'_>,
     invocation: Node<'_>,
     explicit_generic_arity: Option<usize>,
     ctx: &mut ScanCtx<'_>,
@@ -895,6 +932,7 @@ fn unqualified_method_call_resolution(
         binding_scope_node(node),
         node,
         ctx.csharp,
+        token,
         ctx.file,
         ctx.source,
         &mut bindings,
@@ -904,12 +942,14 @@ fn unqualified_method_call_resolution(
     {
         return TargetMemberResolution::KnownOther;
     }
-    let Some(mut owner) = enclosing_declared_type(node, ctx.csharp, ctx.file, ctx.source) else {
+    let Some(mut owner) = enclosing_declared_type(node, ctx.csharp, token, ctx.file, ctx.source)
+    else {
         return TargetMemberResolution::NotFound;
     };
     let call_arity = Some(argument_count(invocation, ctx.source));
     let direct = receiver_fqn_target_member_resolution(
         &owner.fq_name(),
+        token,
         explicit_generic_arity,
         call_arity,
         ctx,
@@ -921,6 +961,7 @@ fn unqualified_method_call_resolution(
     while let Some(parent) = ctx.csharp.parent_of(&owner) {
         let resolution = receiver_fqn_target_member_resolution(
             &parent.fq_name(),
+            token,
             explicit_generic_arity,
             call_arity,
             ctx,
@@ -941,6 +982,7 @@ fn unqualified_method_call_resolution(
 
 fn receiver_fqn_target_member_resolution(
     receiver_fqn: &str,
+    token: QueryToken<'_>,
     explicit_generic_arity: Option<usize>,
     call_arity: Option<usize>,
     ctx: &mut ScanCtx<'_>,
@@ -949,13 +991,14 @@ fn receiver_fqn_target_member_resolution(
     if let Some(resolution) = ctx.nearest_member_target_cache.get(&key) {
         return *resolution;
     }
-    let resolution = class_unit_for_fq_name(ctx.csharp, receiver_fqn)
+    let resolution = class_unit_for_fq_name(ctx.csharp, token, receiver_fqn)
         .map(|receiver_owner| {
             call_arity.map_or_else(
                 || {
                     nearest_member_candidates_for_owner(
                         ctx.graph,
                         ctx.csharp,
+                        token,
                         &receiver_owner,
                         &ctx.spec.member_name,
                         explicit_generic_arity,
@@ -965,6 +1008,7 @@ fn receiver_fqn_target_member_resolution(
                     applicable_member_candidates_for_owner(
                         ctx.graph,
                         ctx.csharp,
+                        token,
                         &receiver_owner,
                         &ctx.spec.member_name,
                         explicit_generic_arity,
@@ -1012,19 +1056,23 @@ enum LabelOwnerResolution {
 /// label (`new Foo { Bar = .. }`) or an attribute named-argument label
 /// (`[Foo(Bar = ..)]`), whose owner is the attribute type (#1796). A plain
 /// `name:` argument label names a parameter, so it is provably not this member.
-fn member_label_owner_resolution(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> LabelOwnerResolution {
+fn member_label_owner_resolution(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut ScanCtx<'_>,
+) -> LabelOwnerResolution {
     let Some(shape) = csharp_named_argument_label(node) else {
-        return object_initializer_label_owner_resolution(node, ctx);
+        return object_initializer_label_owner_resolution(node, token, ctx);
     };
     let CSharpNamedArgumentLabel::AttributeMember { attribute_name } = shape else {
         return LabelOwnerResolution::KnownOther;
     };
     let names = csharp_attribute_type_names(attribute_name, ctx.source);
     let owners =
-        hierarchy::usage_unambiguous_attribute_type_candidates(ctx.csharp, ctx.file, &names);
+        hierarchy::usage_unambiguous_attribute_type_candidates(ctx.csharp, token, ctx.file, &names);
     let mut resolution = LabelOwnerResolution::Unknown;
     for owner in owners {
-        match receiver_fqn_target_member_resolution(&owner.fq_name(), None, None, ctx) {
+        match receiver_fqn_target_member_resolution(&owner.fq_name(), token, None, None, ctx) {
             TargetMemberResolution::MatchesTarget
             | TargetMemberResolution::MatchesEnclosingTarget => {
                 return LabelOwnerResolution::MatchesTarget;
@@ -1038,6 +1086,7 @@ fn member_label_owner_resolution(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Label
 
 fn object_initializer_label_owner_resolution(
     node: Node<'_>,
+    token: QueryToken<'_>,
     ctx: &mut ScanCtx<'_>,
 ) -> LabelOwnerResolution {
     let Some(initializer) = object_initializer_for_label(node) else {
@@ -1048,6 +1097,7 @@ fn object_initializer_label_owner_resolution(
     };
     let Some(receiver_fqn) = resolve_type_fq_name_at(
         ctx.csharp,
+        token,
         ctx.file,
         &ctx.class_ranges,
         &reference_type_text(type_node, ctx.source),
@@ -1056,7 +1106,7 @@ fn object_initializer_label_owner_resolution(
     ) else {
         return LabelOwnerResolution::Unknown;
     };
-    match receiver_fqn_target_member_resolution(&receiver_fqn, None, None, ctx) {
+    match receiver_fqn_target_member_resolution(&receiver_fqn, token, None, None, ctx) {
         TargetMemberResolution::MatchesTarget | TargetMemberResolution::MatchesEnclosingTarget => {
             LabelOwnerResolution::MatchesTarget
         }

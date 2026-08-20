@@ -1,7 +1,9 @@
 use super::selectors::*;
 use super::*;
 use crate::analyzer::symbol_lookup::resolve_codeunit_fuzzy_bounded_with;
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::cancellation::CancellationToken;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use std::time::Duration;
 
 fn is_zero(value: &usize) -> bool {
@@ -1304,6 +1306,7 @@ pub(super) fn character_column_for_byte(source: &str, line: usize, byte: usize) 
 
 pub(super) fn resolve_scan_usages_target(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     resolver: &WorkspaceFileResolver,
     target: ScanUsagesTarget,
 ) -> ScanUsageTargetResolution {
@@ -1615,6 +1618,7 @@ pub(super) fn resolve_scan_usages_target(
         // at this same location would have resolved to.
         let here = resolve_location_groups(
             analyzer,
+            token,
             location_units(declarations_here, None, &selector_matches_exact_form),
             true,
         );
@@ -1636,7 +1640,7 @@ pub(super) fn resolve_scan_usages_target(
         ));
     }
 
-    let groups = resolve_location_groups(analyzer, matching_units, selector.is_none());
+    let groups = resolve_location_groups(analyzer, token, matching_units, selector.is_none());
     if groups.len() > 1 {
         let label = scan_usages_target_label(&target);
         return ScanUsageTargetResolution::Ambiguous(ambiguous_usage_symbol_from_groups(
@@ -1666,6 +1670,7 @@ pub(super) fn resolve_scan_usages_target(
 /// the same location.
 fn resolve_location_groups(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     pool: Vec<(CodeUnit, usize)>,
     filter_synthetic: bool,
 ) -> Vec<(String, Vec<CodeUnit>)> {
@@ -1695,7 +1700,7 @@ fn resolve_location_groups(
             .then_with(|| left.fq_name().cmp(&right.fq_name()))
     });
 
-    distinct_definitions(analyzer, matches)
+    distinct_definitions(analyzer, token, matches)
 }
 
 pub(super) fn scan_usages_location_diagnostic(
@@ -1749,6 +1754,7 @@ pub(super) fn scan_usages_target_matches_range(
 
 pub(super) fn retain_hits_resolving_to_overloads(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     overloads: &[CodeUnit],
     hits: Vec<UsageHit>,
     cancellation: &CancellationToken,
@@ -1776,8 +1782,9 @@ pub(super) fn retain_hits_resolving_to_overloads(
                 },
             )
             .collect();
-        let outcomes =
-            crate::analyzer::usages::get_definition::resolve_definition_batch(analyzer, requests);
+        let outcomes = crate::analyzer::usages::get_definition::resolve_definition_batch(
+            analyzer, token, requests,
+        );
         retained.extend(
             chunk
                 .iter()
@@ -1932,9 +1939,12 @@ pub fn scan_usages_by_reference_with_cancellation(
     params: ScanUsagesByReferenceParams,
     cancellation: CancellationToken,
 ) -> ScanUsagesResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let max_duration = params.max_duration_secs.map(Duration::from_secs);
     scan_usages_by_reference_with_context(
         analyzer,
+        token,
         params,
         &ScanUsagesExecutionContext::with_cancellation_and_max_duration(cancellation, max_duration),
     )
@@ -1942,6 +1952,7 @@ pub fn scan_usages_by_reference_with_cancellation(
 
 pub(crate) fn scan_usages_by_reference_with_context(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     params: ScanUsagesByReferenceParams,
     context: &ScanUsagesExecutionContext,
 ) -> ScanUsagesResult {
@@ -1953,6 +1964,7 @@ pub(crate) fn scan_usages_by_reference_with_context(
         .collect();
     let mut result = scan_usages_backend(
         analyzer,
+        token,
         ScanUsagesSurface::Reference,
         params.include_tests,
         params.paths.as_deref(),
@@ -1977,9 +1989,12 @@ pub fn scan_usages_by_location_with_cancellation(
     params: ScanUsagesByLocationParams,
     cancellation: CancellationToken,
 ) -> ScanUsagesResult {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
     let max_duration = params.max_duration_secs.map(Duration::from_secs);
     scan_usages_by_location_with_context(
         analyzer,
+        token,
         params,
         &ScanUsagesExecutionContext::with_cancellation_and_max_duration(cancellation, max_duration),
     )
@@ -1987,6 +2002,7 @@ pub fn scan_usages_by_location_with_cancellation(
 
 pub(crate) fn scan_usages_by_location_with_context(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     params: ScanUsagesByLocationParams,
     context: &ScanUsagesExecutionContext,
 ) -> ScanUsagesResult {
@@ -1998,6 +2014,7 @@ pub(crate) fn scan_usages_by_location_with_context(
         .collect();
     let mut result = scan_usages_backend(
         analyzer,
+        token,
         ScanUsagesSurface::Location,
         params.include_tests,
         params.paths.as_deref(),
@@ -2036,6 +2053,7 @@ static HEAVY_SCAN_POOL: std::sync::LazyLock<rayon::ThreadPool> = std::sync::Lazy
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_usages_backend(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     surface: ScanUsagesSurface,
     include_tests: bool,
     paths: Option<&[String]>,
@@ -2047,6 +2065,7 @@ pub(super) fn scan_usages_backend(
     HEAVY_SCAN_POOL.install(|| {
         scan_usages_backend_on_pool(
             analyzer,
+            token,
             surface,
             include_tests,
             paths,
@@ -2061,6 +2080,7 @@ pub(super) fn scan_usages_backend(
 #[allow(clippy::too_many_arguments)]
 fn scan_usages_backend_on_pool(
     analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
     surface: ScanUsagesSurface,
     include_tests: bool,
     paths: Option<&[String]>,
@@ -2159,7 +2179,7 @@ fn scan_usages_backend_on_pool(
         };
         let resolution = {
             let _scope = profiling::scope("searchtools::scan_usages_target_resolution");
-            resolve_scan_usages_target(analyzer, &resolver, target)
+            resolve_scan_usages_target(analyzer, token, &resolver, target)
         };
         if context.cancellation.is_cancelled() {
             work_entries.push(incomplete_work_entry(
@@ -2314,7 +2334,7 @@ fn scan_usages_backend_on_pool(
         let overloads = match resolution {
             CodeUnitResolution::Resolved(overloads) => overloads,
             CodeUnitResolution::Ambiguous(candidate_targets) => {
-                let groups = distinct_definitions(analyzer, candidate_targets);
+                let groups = distinct_definitions(analyzer, token, candidate_targets);
                 let item = ambiguous_usage_symbol_from_groups(
                     analyzer,
                     ScanUsagesSurface::Reference,
@@ -2368,7 +2388,7 @@ fn scan_usages_backend_on_pool(
             // symbols, not one with overloads; surface them as selectable
             // candidates rather than scanning a conflation of all of them.
             None => {
-                let groups = distinct_definitions(analyzer, overloads);
+                let groups = distinct_definitions(analyzer, token, overloads);
                 if groups.len() > 1 {
                     let item = ambiguous_usage_symbol_from_groups(
                         analyzer,
@@ -2525,6 +2545,7 @@ fn scan_usages_backend_on_pool(
                         .collect();
                     let (hits, resolution_complete) = retain_hits_resolving_to_overloads(
                         analyzer,
+                        token,
                         &overloads,
                         hits,
                         &context.cancellation,
@@ -2563,8 +2584,11 @@ fn scan_usages_backend_on_pool(
                     });
                     continue;
                 }
-                let groups =
-                    distinct_definitions(analyzer, candidate_targets.iter().cloned().collect());
+                let groups = distinct_definitions(
+                    analyzer,
+                    token,
+                    candidate_targets.iter().cloned().collect(),
+                );
                 let surface = request.surface;
                 let detail_source = ambiguous_usage_symbol_from_groups(
                     analyzer,

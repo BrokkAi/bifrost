@@ -69,7 +69,15 @@ fn dedicated_build_pool() -> &'static rayon::ThreadPool {
 /// global-pool worker either, because the query that scheduled it goes straight
 /// back to its own parallel fan-out.
 pub fn spawn_on_dedicated_build_pool(task: impl FnOnce() + Send + 'static) {
-    dedicated_build_pool().spawn(task);
+    if ON_DEDICATED_BUILD_POOL.with(Cell::get) {
+        // A background warm that already owns this pool can discover a
+        // follow-up build (Rust fact catch-up is the production case). Run it
+        // before the parent warm publishes completion; queueing it behind the
+        // parent on a one-worker pool would make the parent appear idle first.
+        task();
+    } else {
+        dedicated_build_pool().spawn(task);
+    }
 }
 
 pub struct PoolSafeMemo<T> {
@@ -590,11 +598,12 @@ impl<K, V> std::fmt::Debug for KeyedPoolSafeMemo<K, V> {
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyedPoolSafeMemo, PoolSafeMemo};
+    use super::{KeyedPoolSafeMemo, PoolSafeMemo, spawn_on_dedicated_build_pool};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn racing_builders_observe_one_stored_value() {
@@ -704,8 +713,6 @@ mod tests {
     #[test]
     fn reentrant_build_from_inner_parallelism_completes() {
         use rayon::prelude::*;
-        use std::time::Duration;
-
         let memo = Arc::new(PoolSafeMemo::new());
         let (tx, rx) = mpsc::channel();
 
@@ -1016,6 +1023,24 @@ mod tests {
         assert!(Arc::ptr_eq(&value, &stored));
         assert!(*stored == 7 || *stored == 448);
         builder.join().expect("builder should finish");
+    }
+
+    #[test]
+    fn nested_dedicated_spawn_finishes_before_its_parent() {
+        let (sender, receiver) = mpsc::channel();
+        spawn_on_dedicated_build_pool(move || {
+            let completed = Arc::new(AtomicBool::new(false));
+            let nested_completed = Arc::clone(&completed);
+            spawn_on_dedicated_build_pool(move || {
+                nested_completed.store(true, Ordering::Release);
+            });
+            sender.send(completed.load(Ordering::Acquire)).unwrap();
+        });
+
+        assert!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "a nested catch-up must finish before its parent warm publishes completion"
+        );
     }
 
     /// A panicking build must wake waiters and leave the slot empty so a woken

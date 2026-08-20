@@ -12,12 +12,12 @@ import {
   RELEASE_BUNDLE_SPECS,
   RELEASED_CARGO_MANIFESTS,
   THIRD_PARTY_SEMANTIC_PACK_SPECS,
-} from "../../../scripts/release-version.mjs";
+} from "../../../scripts/public/release-version.mjs";
 
 const execFileAsync = promisify(execFile);
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(testDir, "../../..");
-const releaseVersionScript = path.resolve(testDir, "../../../scripts/release-version.mjs");
+const releaseVersionScript = path.resolve(testDir, "../../../scripts/public/release-version.mjs");
 
 const jsonProjections = [
   "plugins/bifrost-agent/.claude-plugin/plugin.json",

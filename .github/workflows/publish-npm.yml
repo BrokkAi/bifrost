@@ -119,7 +119,7 @@ jobs:
 
       - name: Verify every qualified byte and identity
         run: >-
-          node scripts/verify-qualified-release.mjs verify
+          node scripts/public/verify-qualified-release.mjs verify
           --bundle qualification
           --manifest qualification/release-qualification.json
           --repository "$GITHUB_REPOSITORY"

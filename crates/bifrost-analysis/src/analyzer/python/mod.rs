@@ -66,6 +66,7 @@ use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 pub(crate) use adapter::PythonAdapter;
 use brokk_bifrost_python::declarations::python_expanded_comment_start;
 pub(crate) use brokk_bifrost_python::graph_support::resolve_module_code_unit;
@@ -302,30 +303,30 @@ impl PythonAnalyzer {
     }
 
     /// The cached re-export/importer index, built once per analyzer generation.
-    fn usage_index(&self) -> Arc<PythonUsageIndex> {
+    fn usage_index(&self, token: QueryToken<'_>) -> Arc<PythonUsageIndex> {
         self.usage_index.get_or_build(
-            || PythonUsageIndex::build(self),
-            || PythonUsageIndex::build(self),
+            || PythonUsageIndex::build(self, token),
+            || PythonUsageIndex::build(self, token),
         )
     }
 
     /// `get_with` (not get-then-insert): callers include the parallelized candidate walker's
     /// re-export BFS, so two threads racing on the same file's first lookup must not both pay the
     /// full disk-read-and-reparse cost below.
-    pub fn export_index_of(&self, file: &ProjectFile) -> Arc<ExportIndex> {
+    pub fn export_index_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Arc<ExportIndex> {
         self.export_index.get_with(file.clone(), || {
-            Arc::new(compute_export_index_of(self, file))
+            Arc::new(compute_export_index_of(self, token, file))
         })
     }
 
     /// `get_with` for the same reason as `export_index_of`: the receiver-type and annotation
     /// resolvers ask for this from the parallelized candidate walk.
-    pub fn import_binder_of(&self, file: &ProjectFile) -> Arc<ImportBinder> {
+    pub fn import_binder_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Arc<ImportBinder> {
         self.import_binder.get_with(file.clone(), || {
             Arc::new(import_binder_from_imports(
                 self,
                 file,
-                &self.inner.import_info_of(file),
+                &self.inner.import_info_of(token, file),
             ))
         })
     }
@@ -338,9 +339,13 @@ impl PythonAnalyzer {
     /// threads by the now-parallelized candidate walker, and get-then-insert would let two threads
     /// that both miss the cache for the same file each redundantly pay the whole-file resolution
     /// cost. `get_with` guarantees only one thread ever runs the init closure per key.
-    fn resolve_import_target_files(&self, file: &ProjectFile) -> Arc<HashSet<ProjectFile>> {
+    fn resolve_import_target_files(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Arc<HashSet<ProjectFile>> {
         self.imported_target_files.get_with(file.clone(), || {
-            let imports = self.inner.import_info_of(file);
+            let imports = self.inner.import_info_of(token, file);
             let targets: HashSet<ProjectFile> = resolve_imports_batched(self, file, &imports)
                 .into_iter()
                 .flatten()
@@ -394,11 +399,15 @@ impl PythonSource for PythonAnalyzer {
     }
 
     fn import_binder_of(&self, file: &ProjectFile) -> Arc<ImportBinder> {
-        self.import_binder_of(file)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        self.import_binder_of(token, file)
     }
 
     fn export_index_of(&self, file: &ProjectFile) -> Arc<ExportIndex> {
-        self.export_index_of(file)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        self.export_index_of(token, file)
     }
 
     fn prepared_syntax(
@@ -432,7 +441,9 @@ impl PythonSource for PythonAnalyzer {
 
 impl PythonUsageSource for PythonAnalyzer {
     fn usage_index(&self) -> Arc<PythonUsageIndex> {
-        self.usage_index()
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        self.usage_index(token)
     }
 }
 
@@ -687,7 +698,10 @@ impl IAnalyzer for PythonAnalyzer {
     }
 
     fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
+        // Trait signature is fixed, so this boundary opens the scope the
+        // usage-graph funnel now demands proof of (issue #2423 milestone B).
+        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        self.inner.global_usage_definition_index(scope.token())
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -749,7 +763,8 @@ impl IAnalyzer for PythonAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
-        diagnostics::collect_python_semantic_diagnostics(self, file, source)
+        let scope = AnalyzerQueryScope::new(self);
+        diagnostics::collect_python_semantic_diagnostics(self, scope.token(), file, source)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
@@ -1028,8 +1043,11 @@ impl StructuralReceiverResolver for PythonSupport {
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<TypeLookupOutcome> {
+        let scope = AnalyzerQueryScope::new(query.analyzer);
+        let token = scope.token();
         resolve_python_type_bounded(
             query.analyzer,
+            token,
             query.file,
             query.source,
             query.tree,
@@ -1043,8 +1061,11 @@ impl StructuralReceiverResolver for PythonSupport {
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<DefinitionLookupOutcome> {
+        let scope = AnalyzerQueryScope::new(query.analyzer);
+        let token = scope.token();
         resolve_python_bounded(
             query.analyzer,
+            token,
             query.file,
             query.source,
             query.tree,

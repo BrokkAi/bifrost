@@ -402,6 +402,16 @@ impl<'a> RustUsageQueries<'a> {
         self.live_files(self.analyzer.rust_import_target_blobs(module_path))
     }
 
+    /// Live files whose structured imports can name `component` as a module.
+    ///
+    /// This covers named namespace imports and module paths ending in the
+    /// component, including globs and named imports below that module. It does
+    /// not include ordinary code mentions; callers still verify every returned
+    /// file by resolving its forward import edges.
+    pub fn files_importing_module_component(&self, component: &str) -> Vec<ProjectFile> {
+        self.live_files(self.analyzer.rust_module_import_candidate_blobs(component))
+    }
+
     /// Live files whose text mentions `identifier` in at least one of the
     /// contexts in `context_mask`.
     ///

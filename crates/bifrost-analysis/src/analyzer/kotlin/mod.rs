@@ -63,6 +63,7 @@ pub(crate) mod types;
 use crate::analyzer::Range;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::structural::BoundaryStatus;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_jvm::kotlin::graph_support::KotlinSource;
 use brokk_bifrost_jvm::kotlin::imports::build_kotlin_top_level_declarations_by_package;
 use brokk_bifrost_jvm::kotlin::syntax;
@@ -106,6 +107,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 use tree_sitter::Node;
 
+use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 pub(crate) use adapter::KotlinAdapter;
 use clones::build_kotlin_clone_candidate_data;
 
@@ -301,6 +303,7 @@ impl KotlinAnalyzer {
     /// because the build declared artifacts the index never finished reading.
     pub(crate) fn external_boundary_evidence(
         &self,
+        token: QueryToken<'_>,
         packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
         file: &ProjectFile,
         name: &str,
@@ -311,7 +314,7 @@ impl KotlinAnalyzer {
 
         let external = self.external_declarations(packs.clone());
         let package_name = self.inner.package_name_of(file).unwrap_or_default();
-        let imports = self.inner.import_info_of(file);
+        let imports = self.inner.import_info_of(token, file);
         let scope = KotlinNameScope {
             package_name: &package_name,
             imports: &imports,
@@ -339,7 +342,7 @@ impl KotlinAnalyzer {
         // (#1900). A member the surface does not declare changes nothing.
         // One ladder answers here and in the resolver's own boundary gate, so
         // a trace and a definition cannot disagree about a spelling (#2287).
-        if let Some(member) = self.resolve_member_name_with_external(packs, file, name) {
+        if let Some(member) = self.resolve_member_name_with_external(token, packs, file, name) {
             return (
                 BoundaryStatus::ExternalIndexed,
                 Some(member.fqn().to_owned()),
@@ -372,6 +375,7 @@ impl KotlinAnalyzer {
     /// are indexed, and the resolver either found them or did not.
     pub(crate) fn resolve_member_name_with_external(
         &self,
+        token: QueryToken<'_>,
         packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
         file: &ProjectFile,
         raw_name: &str,
@@ -389,7 +393,7 @@ impl KotlinAnalyzer {
             return None;
         }
         let package_name = self.inner.package_name_of(file).unwrap_or_default();
-        let imports = self.inner.import_info_of(file);
+        let imports = self.inner.import_info_of(token, file);
         let scope = KotlinNameScope {
             package_name: &package_name,
             imports: &imports,
@@ -458,8 +462,11 @@ impl KotlinSource for KotlinAnalyzer {
         self.inner.package_name_of(file)
     }
 
-    fn usage_definitions(&self) -> &dyn crate::analyzer::BoundedDefinitionLookup {
-        self.inner.global_usage_definition_index_ref()
+    fn usage_definitions(
+        &self,
+        token: QueryToken<'_>,
+    ) -> &dyn crate::analyzer::BoundedDefinitionLookup {
+        self.inner.global_usage_definition_index_ref(token)
     }
 
     fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>> {
@@ -715,7 +722,10 @@ impl IAnalyzer for KotlinAnalyzer {
     }
 
     fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
+        // Trait signature is fixed, so this boundary opens the scope the
+        // usage-graph funnel now demands proof of (issue #2423 milestone B).
+        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
+        self.inner.global_usage_definition_index(scope.token())
     }
 
     fn usage_facts_index(&self) -> &UsageFactsIndex {
@@ -745,7 +755,9 @@ impl IAnalyzer for KotlinAnalyzer {
         file: &ProjectFile,
         source: &str,
     ) -> crate::analyzer::SemanticDiagnosticReport {
-        diagnostics::collect_kotlin_semantic_diagnostics(self, file, source, None)
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        diagnostics::collect_kotlin_semantic_diagnostics(self, token, file, source, None)
     }
 
     /// Build the jar-backed external declaration index off the request path.
@@ -1043,11 +1055,16 @@ impl LanguageEdgePass for KotlinEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        build_kotlin_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        let scope = AnalyzerQueryScope::new(ctx.analyzer);
+        let token = scope.token();
+        build_kotlin_usage_edges(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeSites)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
-        build_kotlin_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+        let scope = AnalyzerQueryScope::new(ctx.analyzer);
+        let token = scope.token();
+        build_kotlin_usage_edge_weights(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
             .map(LanguageEdgeWeights::Fqn)
     }
 }
@@ -1057,8 +1074,10 @@ impl StructuralReceiverResolver for KotlinSupport {
         &self,
         query: BoundedReceiverQuery<'_>,
     ) -> BoundedResolution<TypeLookupOutcome> {
+        let scope = AnalyzerQueryScope::new(query.analyzer);
         resolve_kotlin_type_bounded(
             query.analyzer,
+            scope.token(),
             query.file,
             query.source,
             query.tree,

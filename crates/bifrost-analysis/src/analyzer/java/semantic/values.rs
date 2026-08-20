@@ -1,12 +1,46 @@
 use super::syntax::*;
 use super::*;
 
-pub(super) fn field_declaration_anchors(
+pub(super) struct JavaDeclarationInventory {
+    pub(super) field_anchors: HashMap<(Box<str>, Box<str>), Option<SourceAnchor>>,
+    pub(super) type_roots: HashSet<Box<str>>,
+}
+
+pub(super) fn java_declaration_inventory(
     prepared: &PreparedSyntaxTree,
-) -> HashMap<(Box<str>, Box<str>), Option<SourceAnchor>> {
-    let mut anchors = HashMap::default();
+) -> JavaDeclarationInventory {
+    let mut field_anchors = HashMap::default();
+    let mut type_roots = HashSet::default();
     let mut stack = vec![prepared.tree().root_node()];
     while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        ) && let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|name| node_text(prepared.source(), name))
+        {
+            type_roots.insert(name.into());
+        }
+        if node.kind() == "import_declaration"
+            && let Some(raw) = prepared.source().get(node.byte_range())
+        {
+            let import = brokk_bifrost_jvm::java::imports::parse_import_info(
+                node,
+                prepared.source(),
+                raw.to_string(),
+            );
+            if !import.is_wildcard
+                && brokk_bifrost_jvm::java::imports::non_static_import_path(&import).is_some()
+                && let Some(identifier) = import.identifier
+            {
+                type_roots.insert(identifier.into_boxed_str());
+            }
+        }
         if matches!(node.kind(), "field_declaration" | "constant_declaration") {
             for declarator in children_by_field_name(node, "declarator") {
                 let Some(name) = declarator.child_by_field_name("name") else {
@@ -21,7 +55,7 @@ pub(super) fn field_declaration_anchors(
                 let Some(owner) = enclosing_type_name(prepared.source(), node) else {
                     continue;
                 };
-                match anchors.entry((owner, text.into())) {
+                match field_anchors.entry((owner, text.into())) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
                         entry.insert(Some(anchor));
                     }
@@ -34,7 +68,10 @@ pub(super) fn field_declaration_anchors(
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-    anchors
+    JavaDeclarationInventory {
+        field_anchors,
+        type_roots,
+    }
 }
 
 fn enclosing_type_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
@@ -379,9 +416,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     pub(super) fn field_access_is_type_qualifier(&self, node: Node<'tree>) -> bool {
-        java_field_access_is_type_qualifier(node, self.prepared.source(), |root| {
-            self.root_identifier_is_value(root, node)
-        })
+        java_field_access_is_type_qualifier(
+            node,
+            self.prepared.source(),
+            |root| self.root_identifier_is_value(root, node),
+            |root| self.type_name_roots.contains(root),
+        )
     }
 
     fn root_identifier_is_value(&self, name: &str, access: Node<'tree>) -> bool {

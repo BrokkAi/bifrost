@@ -699,7 +699,9 @@ pub enum SearchToolsServiceErrorCode {
 #[cfg(test)]
 mod issue_1228_response_budget_tests {
     use super::*;
-    use crate::searchtools::{SourceBlock, SymbolSourcesResult};
+    use crate::searchtools::{
+        SourceBlock, SymbolSourcesIncomplete, SymbolSourcesIncompleteReason, SymbolSourcesResult,
+    };
 
     #[test]
     fn oversized_symbol_source_response_is_rejected_before_rendering() {
@@ -720,6 +722,8 @@ mod issue_1228_response_budget_tests {
             ambiguous: Vec::new(),
             ambiguous_paths: Vec::new(),
             too_broad: Vec::new(),
+            complete: true,
+            incomplete: Vec::new(),
         };
 
         let error = SearchToolsService::symbol_sources_output(result, RenderOptions::default())
@@ -731,6 +735,48 @@ mod issue_1228_response_budget_tests {
             "{}",
             error.message
         );
+    }
+
+    #[test]
+    fn partial_symbol_source_response_keeps_completed_sources_and_typed_cancellation() {
+        let result = SymbolSourcesResult {
+            sources: vec![SourceBlock {
+                label: "ready".to_string(),
+                path: "ready.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+                text: "fn ready() {}".to_string(),
+                canonical_selector: None,
+                occurrence_role: None,
+                presentation: None,
+                note: None,
+                semantic_model: None,
+            }],
+            not_found: Vec::new(),
+            ambiguous: Vec::new(),
+            ambiguous_paths: Vec::new(),
+            too_broad: Vec::new(),
+            complete: false,
+            incomplete: vec![SymbolSourcesIncomplete {
+                target: "slow".to_string(),
+                reason: SymbolSourcesIncompleteReason::Cancelled,
+            }],
+        };
+
+        let output = SearchToolsService::symbol_sources_output(result, RenderOptions::default())
+            .expect("partial responses remain valid tool output");
+        let ToolOutput::Structured {
+            structured,
+            rendered_text,
+        } = output
+        else {
+            panic!("expected structured symbol source output");
+        };
+
+        assert_eq!(structured["complete"], false);
+        assert_eq!(structured["incomplete"][0]["target"], "slow");
+        assert_eq!(structured["incomplete"][0]["reason"], "cancelled");
+        assert!(rendered_text.unwrap_or_default().contains("ready"));
     }
 }
 
@@ -935,9 +981,10 @@ pub struct SearchToolsService {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StartupIndexWarm {
     /// A long-lived MCP server, built through the deferred or unbound
-    /// constructors. Start the builds in the background as soon as the
-    /// workspace exists, so the first request that needs one waits for a build
-    /// already in flight instead of running it inside its own budget (#1757).
+    /// constructors. Start the builds after the first tool call, so an
+    /// unrelated cold request is not delayed by optional index construction;
+    /// later requests that need one still wait for a build already in flight
+    /// instead of running it inside their own budget (#1757).
     AtStartup,
     /// A synchronously constructed service: a one-shot `--tool` invocation, an
     /// embedded host, a test fixture. It can exit seconds later, so it must not
@@ -952,6 +999,10 @@ struct WorkspaceSession {
     watcher: SessionWatcher,
     usage_index_warm: Option<JoinHandle<()>>,
     index_warmer: Arc<IndexWarmer>,
+    /// Initial optional query-index warming is deferred until the first tool
+    /// call has completed. This keeps a long-lived server's startup
+    /// accelerator from competing with an unrelated cold request.
+    initial_index_warm_scheduled: std::sync::atomic::AtomicBool,
     #[cfg(feature = "nlp")]
     semantic: Option<Arc<SemanticIndexer>>,
 }
@@ -1128,7 +1179,22 @@ impl WorkspaceSession {
     /// Free when the snapshot is already warm (incremental updates whose
     /// sources were unchanged share the previous generation's indexes).
     fn schedule_index_warm(&self) {
+        self.initial_index_warm_scheduled
+            .store(true, Ordering::Release);
         self.index_warmer.schedule(Arc::clone(&self.snapshot));
+    }
+
+    /// Queue the initial optional warm once, after the first tool call has
+    /// completed. Unlike refresh/update warming, this is deliberately not
+    /// started while the first request is still paying for workspace startup.
+    fn schedule_initial_index_warm(&self) {
+        if self
+            .initial_index_warm_scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.index_warmer.schedule(Arc::clone(&self.snapshot));
+        }
     }
 
     /// Whether a caller can ask a usage question without waiting behind the
@@ -1620,6 +1686,25 @@ impl SearchToolsService {
     /// The host measures this phase before it enters the synchronous service.
     /// Profiled `query_code` responses retain the delay as request timing.
     pub(crate) fn call_tool_output_with_transport_queue_wait(
+        &self,
+        name: &str,
+        arguments: Value,
+        render_options: RenderOptions,
+        cancellation: Option<&CancellationToken>,
+        transport_queue_wait: Duration,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
+        let result = self.call_tool_output_with_transport_queue_wait_inner(
+            name,
+            arguments,
+            render_options,
+            cancellation,
+            transport_queue_wait,
+        );
+        self.schedule_initial_index_warm();
+        result
+    }
+
+    fn call_tool_output_with_transport_queue_wait_inner(
         &self,
         name: &str,
         arguments: Value,
@@ -2861,7 +2946,6 @@ impl SearchToolsService {
                     let mut guard = self.session.write().map_err(|_| {
                         SearchToolsServiceError::internal("SearchToolsService lock poisoned")
                     })?;
-                    session.schedule_index_warm();
                     *guard = Some(session);
                 }
                 Err(err) => {
@@ -2916,7 +3000,6 @@ impl SearchToolsService {
                 SearchToolsServiceError::internal("SearchToolsService lock poisoned")
             })?;
             if guard.is_none() {
-                session.schedule_index_warm();
                 *guard = Some(session);
             }
         }
@@ -3320,9 +3403,9 @@ impl SearchToolsService {
         )
         .map_err(Self::symbol_sources_budget_error)?;
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err(SearchToolsServiceError::internal(
-                "get_symbol_sources was cancelled or exceeded its request-wide time budget",
-            ));
+            result.complete = false;
+            let output = Self::symbol_sources_output(result, render_options);
+            return initial_snapshot.finish("get_symbol_sources", output);
         }
         if self.update_strategy == UpdateStrategy::WatchFiles {
             let candidate_files =
@@ -3339,9 +3422,9 @@ impl SearchToolsService {
             };
             let stale_files = stale_symbol_source_files(peek_snapshot.analyzer(), candidate_files)?;
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return Err(SearchToolsServiceError::internal(
-                    "get_symbol_sources was cancelled or exceeded its request-wide time budget",
-                ));
+                result.complete = false;
+                let output = Self::symbol_sources_output(result, render_options);
+                return initial_snapshot.finish("get_symbol_sources", output);
             }
 
             let final_snapshot = if stale_files.is_empty() {
@@ -3370,9 +3453,15 @@ impl SearchToolsService {
                     cancellation,
                 )
                 .map_err(Self::symbol_sources_budget_error)?;
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    result.complete = false;
+                }
                 let output = Self::symbol_sources_output(result, render_options);
                 return final_snapshot.finish("get_symbol_sources", output);
             }
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            result.complete = false;
         }
         let output = Self::symbol_sources_output(result, render_options);
         initial_snapshot.finish("get_symbol_sources", output)
@@ -3392,7 +3481,10 @@ impl SearchToolsService {
                 "get_symbol_sources resolved {source_bytes} bytes of source, exceeding the {GET_SYMBOL_SOURCES_RESPONSE_BUDGET_BYTES}-byte response budget; re-call with fewer or narrower symbols"
             )));
         }
-        let rendered_text = result.render_text(render_options);
+        let rendered_text = {
+            let _render_scope = profiling::scope("searchtools.get_symbol_sources.mcp_rendering");
+            result.render_text(render_options)
+        };
         let structured = serde_json::to_value(result).map_err(|err| {
             SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
         })?;
@@ -4034,6 +4126,22 @@ impl SearchToolsService {
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
     }
 
+    /// Start the long-lived session's optional query-index warm after the
+    /// first tool call has finished. Initial workspace installation deliberately
+    /// leaves this unscheduled so unrelated cold requests retain priority.
+    fn schedule_initial_index_warm(&self) {
+        if self.startup_index_warm != StartupIndexWarm::AtStartup {
+            return;
+        }
+        let guard = self
+            .session
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(session) = guard.as_ref() {
+            session.schedule_initial_index_warm();
+        }
+    }
+
     fn service_root(&self) -> Result<PathBuf, SearchToolsServiceError> {
         self.root
             .read()
@@ -4232,6 +4340,9 @@ fn assemble_session(
         watcher,
         usage_index_warm,
         index_warmer: IndexWarmer::new(),
+        initial_index_warm_scheduled: std::sync::atomic::AtomicBool::new(
+            startup_index_warm == StartupIndexWarm::OnDemand,
+        ),
         #[cfg(feature = "nlp")]
         semantic,
     })
@@ -4731,9 +4842,14 @@ mod watcher_startup_tests {
             result.report.diagnostics()[0].code(),
             PolicyReportDiagnosticCode::WorkspaceSnapshotDeadlineExceeded
         );
-        assert_eq!(
-            result.report.evaluation().suppression_document_state(),
-            PolicySuppressionDocumentState::NotEvaluated
+        assert!(
+            result
+                .report
+                .evaluation()
+                .suppression_sources()
+                .iter()
+                .all(|source| source.state() == PolicySuppressionDocumentState::NotEvaluated),
+            "a run that ended before loading consults no source"
         );
         release_startup_tx
             .send(())
@@ -5058,7 +5174,7 @@ mod watcher_startup_tests {
     }
 
     #[test]
-    fn deferred_build_install_schedules_background_query_index_warm() {
+    fn deferred_build_defers_background_query_index_warm_until_first_tool_call() {
         let (_temp, root) = workspace(
             "lib.rs",
             "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
@@ -5082,6 +5198,11 @@ mod watcher_startup_tests {
                 Arc::clone(&session.index_warmer),
             )
         };
+        assert!(!snapshot.query_indexes_warm());
+
+        service
+            .call_tool_value("get_active_workspace", json!({}))
+            .unwrap();
         warmer.wait_until_idle();
         assert!(snapshot.query_indexes_warm());
     }
@@ -5602,6 +5723,7 @@ public partial class MudDialogContainer
                 watcher: SessionWatcher::Disabled,
                 usage_index_warm: None,
                 index_warmer: IndexWarmer::new(),
+                initial_index_warm_scheduled: std::sync::atomic::AtomicBool::new(true),
                 #[cfg(feature = "nlp")]
                 semantic: None,
             })),
@@ -6503,6 +6625,7 @@ mod tests {
                 watcher: SessionWatcher::Disabled,
                 usage_index_warm: None,
                 index_warmer: IndexWarmer::new(),
+                initial_index_warm_scheduled: std::sync::atomic::AtomicBool::new(true),
                 semantic: Some(indexer.clone()),
             })),
             workspace_generation: AtomicU64::new(1),

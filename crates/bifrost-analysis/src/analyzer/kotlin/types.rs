@@ -9,6 +9,7 @@
 //! `KotlinSource` instead of holding a `JvmExternalType`.
 
 use crate::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_jvm::kotlin::types::{
     kotlin_type_name_is_known_in_file, resolve_kotlin_type_name_in_file,
 };
@@ -24,15 +25,21 @@ impl KotlinAnalyzer {
     /// ask the weaker question "does this name exist at all".
     pub fn resolve_type_name_in_file(
         &self,
+        token: QueryToken<'_>,
         file: &ProjectFile,
         raw_name: &str,
     ) -> Option<CodeUnit> {
-        resolve_kotlin_type_name_in_file(self, file, raw_name)
+        resolve_kotlin_type_name_in_file(self, token, file, raw_name)
     }
 
     /// Whether a spelled type name resolves to anything the analyzer knows:
     /// a workspace declaration or a type from the shared JVM dependency realm.
-    pub fn is_known_type_name_in_file(&self, file: &ProjectFile, raw_name: &str) -> bool {
-        kotlin_type_name_is_known_in_file(self, file, raw_name)
+    pub fn is_known_type_name_in_file(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> bool {
+        kotlin_type_name_is_known_in_file(self, token, file, raw_name)
     }
 }

@@ -37,11 +37,13 @@ impl JavaHierarchyFact for HierarchyDeclarationFacts {
 
 impl TypeHierarchyProvider for JavaAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
         if let Some(cached) = self.memo_caches.direct_ancestors.get(code_unit) {
             return (*cached).clone();
         }
 
-        let ancestors = java_direct_ancestors(self, code_unit);
+        let ancestors = java_direct_ancestors(self, token, code_unit);
         self.memo_caches
             .direct_ancestors
             .insert(code_unit.clone(), Arc::new(ancestors.clone()));
