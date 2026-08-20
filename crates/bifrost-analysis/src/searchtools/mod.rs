@@ -60,6 +60,8 @@ mod navigation;
 mod scan_usages;
 mod selectors;
 mod sources;
+#[cfg(test)]
+mod spelling_roundtrip_tests;
 mod summaries;
 #[cfg(test)]
 mod tests;

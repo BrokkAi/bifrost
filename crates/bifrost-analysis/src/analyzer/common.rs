@@ -56,6 +56,21 @@ pub fn display_symbol_for_target(target: &CodeUnit) -> String {
 /// C++ out-of-line definitions), so consumers can't reliably reconstruct the parent from
 /// line spans. The hierarchy is encoded in `short_name` (members after `.`, nested types
 /// via `$`), so we strip the last segment and re-qualify with the package.
+///
+/// Scala `object`s carry a trailing companion `$` on their own name segment (`Foo$`;
+/// nested: `CharsetRange$.Atom$`, per `is_scala_object_like` above and
+/// bifrost-jvm's `Companion` segment rendering). That trailing `$` is
+/// self-decoration, not a hierarchy separator, so like TypeScript's `$static` suffix
+/// above it must be stripped before the `rfind` cut -- otherwise it's read as the last
+/// separator and an object names itself as its own parent (top-level `Probe$` -> `Some`
+/// instead of `None`) or names its own display symbol instead of its enclosing scope
+/// (`CharsetRange$.Atom$` -> itself instead of `CharsetRange`).
+///
+/// A `$` is a nesting join only *between* two names (C# `Outer$Inner`). At the
+/// start of a segment it is identifier text (`angular.mock.$LogProvider`,
+/// `$http`) -- the same misreading `split_segments_on_dollar` guards against on
+/// the query side (#1057). Cutting there named `angular.mock.`, trailing
+/// separator and all, as the parent.
 pub(crate) fn display_parent_symbol_for_target(target: &CodeUnit) -> Option<String> {
     let short_storage;
     let short = if language_for_target(target) == Language::TypeScript {
@@ -65,10 +80,30 @@ pub(crate) fn display_parent_symbol_for_target(target: &CodeUnit) -> Option<Stri
             .unwrap_or(target.short_name())
             .to_string();
         short_storage.as_str()
+    } else if language_for_target(target) == Language::Scala {
+        short_storage = target
+            .short_name()
+            .strip_suffix('$')
+            .unwrap_or(target.short_name())
+            .to_string();
+        short_storage.as_str()
     } else {
         target.short_name()
     };
-    let cut = short.rfind(['.', '$'])?; // fqname-M4: parent-of on the raw short_name string; runs on targets whose fq is not threaded to this display helper
+    // fqname-M4: parent-of on the raw short_name string; runs on targets whose
+    // fq is not threaded to this display helper.
+    let cut = short
+        .char_indices()
+        .rev()
+        .find(|&(index, ch)| match ch {
+            '.' => true,
+            '$' => !matches!(
+                short[..index].chars().next_back(),
+                None | Some('.') | Some('$')
+            ),
+            _ => false,
+        })
+        .map(|(index, _)| index)?;
     let parent_short = &short[..cut];
     if parent_short.is_empty() {
         return None;
@@ -323,10 +358,11 @@ pub(crate) fn is_scala_object_like(target: &CodeUnit) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MAX_LINE_LENGTH, display_symbol_name, is_unparseable_source,
-        is_valid_rename_identifier,
+        DEFAULT_MAX_LINE_LENGTH, display_parent_symbol_for_target, display_symbol_name,
+        is_unparseable_source, is_valid_rename_identifier,
     };
-    use crate::analyzer::Language;
+    use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
+    use crate::analyzer::{CodeUnit, CodeUnitType, Language, ProjectFile};
 
     #[test]
     fn minified_and_binary_sources_are_unparseable_by_default() {
@@ -353,6 +389,85 @@ mod tests {
             "N.Outer.Inner.Method",
             display_symbol_name(Language::CSharp, "N.Outer$Inner.Method")
         );
+    }
+
+    #[test]
+    fn scala_companion_dollar_is_not_read_as_a_parent_separator() {
+        let root = std::env::temp_dir().join("bifrost-common-scala-parent-test");
+        let interner = segment_interner();
+
+        // Top-level `object Probe` -> short_name "Probe$": the trailing `$` must
+        // not be read as a separator, so there is no parent.
+        let mut top_level_fq = FqName::new();
+        top_level_fq.push(interner.intern("com.example", SegmentKind::Package));
+        top_level_fq.push(interner.intern("Probe", SegmentKind::Companion));
+        let top_level = CodeUnit::from_fq(
+            ProjectFile::new(&root, "Probe.scala"),
+            CodeUnitType::Class,
+            top_level_fq,
+            1,
+            None,
+            false,
+        );
+        assert_eq!(None, display_parent_symbol_for_target(&top_level));
+
+        // `object CharsetRange { object Atom }` -> short_name
+        // "CharsetRange$.Atom$": the parent is the enclosing object
+        // "org.http4s.CharsetRange", not the target's own display symbol.
+        let mut nested_fq = FqName::new();
+        nested_fq.push(interner.intern("org.http4s", SegmentKind::Package));
+        nested_fq.push(interner.intern("CharsetRange", SegmentKind::Companion));
+        nested_fq.push(interner.intern("Atom", SegmentKind::Companion));
+        let nested = CodeUnit::from_fq(
+            ProjectFile::new(&root, "CharsetRange.scala"),
+            CodeUnitType::Class,
+            nested_fq,
+            1,
+            None,
+            false,
+        );
+        assert_eq!(
+            Some("org.http4s.CharsetRange".to_string()),
+            display_parent_symbol_for_target(&nested)
+        );
+    }
+
+    #[test]
+    fn leading_dollar_in_a_terminal_identifier_is_not_a_parent_separator() {
+        let root = std::env::temp_dir().join("bifrost-common-js-parent-test");
+        let interner = segment_interner();
+
+        // `angular.mock.$LogProvider = function() {...}` -> the terminal
+        // identifier starts with `$`. That `$` is identifier text, not a
+        // nesting join, so the parent is `angular.mock`, not `angular.mock.`.
+        let mut fq = FqName::new();
+        fq.push(interner.intern("angular.mock", SegmentKind::Member));
+        fq.push(interner.intern("$LogProvider", SegmentKind::Member));
+        let member = CodeUnit::from_fq(
+            ProjectFile::new(&root, "angular-mocks.js"),
+            CodeUnitType::Function,
+            fq,
+            0,
+            None,
+            false,
+        );
+        assert_eq!(
+            Some("angular.mock".to_string()),
+            display_parent_symbol_for_target(&member)
+        );
+
+        // A bare `$`-prefixed top-level function has no parent at all.
+        let mut top_level_fq = FqName::new();
+        top_level_fq.push(interner.intern("$LogProvider", SegmentKind::Member));
+        let top_level = CodeUnit::from_fq(
+            ProjectFile::new(&root, "log.js"),
+            CodeUnitType::Function,
+            top_level_fq,
+            0,
+            None,
+            false,
+        );
+        assert_eq!(None, display_parent_symbol_for_target(&top_level));
     }
 
     #[test]
