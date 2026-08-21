@@ -21,8 +21,92 @@ use crate::analyzer::{
 };
 use crate::profiling;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+struct InitialBuildLock {
+    _file: File,
+    marker_path: PathBuf,
+}
+
+impl InitialBuildLock {
+    fn acquire(db_path: &Path) -> Result<Self, StoreError> {
+        let lock_path = analyzer_sidecar_path(db_path, ".initial-build.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                StoreError::new(format!(
+                    "failed to open initial analyzer build lock {}: {error}",
+                    lock_path.display()
+                ))
+            })?;
+        file.lock().map_err(|error| {
+            StoreError::new(format!(
+                "failed to acquire initial analyzer build lock {}: {error}",
+                lock_path.display()
+            ))
+        })?;
+        Ok(Self {
+            _file: file,
+            marker_path: analyzer_sidecar_path(db_path, ".initial-build.complete"),
+        })
+    }
+
+    fn publish_complete(self) -> Result<(), StoreError> {
+        let parent = self.marker_path.parent().ok_or_else(|| {
+            StoreError::new(format!(
+                "initial analyzer build marker has no parent: {}",
+                self.marker_path.display()
+            ))
+        })?;
+        let _ = std::fs::remove_file(&self.marker_path);
+        let mut marker = tempfile::NamedTempFile::new_in(parent)?;
+        marker.write_all(b"complete\n")?;
+        marker.as_file().sync_all()?;
+        marker.persist(&self.marker_path).map_err(|error| {
+            StoreError::new(format!(
+                "failed to publish initial analyzer build marker {}: {}",
+                self.marker_path.display(),
+                error.error
+            ))
+        })?;
+        Ok(())
+    }
+}
+
+fn analyzer_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = OsString::from(db_path.as_os_str());
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+fn initial_build_complete(
+    store_context: &crate::analyzer::AnalyzerStoreContext,
+    db_path: &Path,
+    marker_path: &Path,
+) -> Result<bool, StoreError> {
+    if !marker_path.is_file() {
+        return Ok(false);
+    }
+    store_context
+        .store
+        .has_published_analyzer_rows()
+        .map_err(|error| {
+            error.context(format!(
+                "checking the persisted analyzer store at {}; this cache is derived state, so remove {} and retry to rebuild it",
+                db_path.display(),
+                db_path.display(),
+            ))
+        })
+}
 
 #[derive(Clone)]
 pub struct EmptyAnalyzer {
@@ -635,26 +719,13 @@ impl WorkspaceAnalyzer {
         }
     }
 
-    pub fn build(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
-        let store_context = crate::analyzer::default_store_context(project.as_ref());
-        Self::build_filtered(project, config, None, store_context, None, true)
-            .expect("failed to initialize in-memory workspace analyzer")
-    }
-
-    pub fn build_for_service(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
-        let store_context = crate::analyzer::default_store_context(project.as_ref());
-        Self::build_filtered(project, config, None, store_context, None, false)
-            .expect("failed to initialize in-memory workspace analyzer")
-    }
-
-    pub fn build_for_languages(
+    pub fn build_ephemeral_for_languages(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
         languages: &BTreeSet<Language>,
-    ) -> Self {
-        let store_context = crate::analyzer::default_store_context(project.as_ref());
-        Self::build_filtered(project, config, Some(languages), store_context, None, true)
-            .expect("failed to initialize in-memory workspace analyzer")
+    ) -> Result<Self, StoreError> {
+        let store_context = crate::analyzer::ephemeral_store_context(project.as_ref())?;
+        Self::build_filtered(project, config, Some(languages), store_context, None)
     }
 
     /// Build an analyzer whose store lives only in memory, no matter what the
@@ -663,32 +734,20 @@ impl WorkspaceAnalyzer {
     /// Use this for throwaway file sets — temp-directory revision exports, or a
     /// changed-file-scoped view of a live workspace — where writing an on-disk
     /// cache would be either pure waste or actively wrong (a partial file set
-    /// must not become the workspace's cached picture of itself). Unlike
-    /// [`Self::build`] this reports store failures instead of panicking.
+    /// must not become the workspace's cached picture of itself).
     pub fn build_ephemeral(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
     ) -> Result<Self, StoreError> {
-        let store_context = crate::analyzer::default_store_context(project.as_ref());
-        Self::build_filtered(project, config, None, store_context, None, true)
+        let store_context = crate::analyzer::ephemeral_store_context(project.as_ref())?;
+        Self::build_filtered(project, config, None, store_context, None)
     }
 
     pub fn build_persisted(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
     ) -> Result<Self, StoreError> {
-        let store_context = crate::analyzer::persistent_store_context(project.as_ref())?;
-        Self::build_filtered(project, config, None, store_context, None, true)
-    }
-
-    pub fn build_persisted_for_service(
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-    ) -> Result<Self, StoreError> {
-        let mut store_context = crate::analyzer::persistent_store_context(project.as_ref())?;
-        store_context.startup_cache_validation =
-            crate::analyzer::tree_sitter_analyzer::StartupCacheValidation::AtomicPublication;
-        Self::build_filtered(project, config, None, store_context, None, false)
+        Self::build_persisted_inner(project, config, None)
     }
 
     /// Progress-reporting variant of `build_persisted`.
@@ -700,15 +759,30 @@ impl WorkspaceAnalyzer {
     where
         F: Fn(crate::analyzer::BuildProgressEvent) + Send + Sync + 'static,
     {
+        Self::build_persisted_inner(project, config, Some(Arc::new(progress)))
+    }
+
+    fn build_persisted_inner(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        progress: Option<BuildProgress>,
+    ) -> Result<Self, StoreError> {
         let store_context = crate::analyzer::persistent_store_context(project.as_ref())?;
-        Self::build_filtered(
-            project,
-            config,
-            None,
-            store_context,
-            Some(Arc::new(progress)),
-            true,
-        )
+        let Some(db_path) = store_context.store.db_path().map(Path::to_path_buf) else {
+            return Self::build_filtered(project, config, None, store_context, progress);
+        };
+        let marker_path = analyzer_sidecar_path(&db_path, ".initial-build.complete");
+        if initial_build_complete(&store_context, &db_path, &marker_path)? {
+            return Self::build_filtered(project, config, None, store_context, progress);
+        }
+        let lock = InitialBuildLock::acquire(&db_path)?;
+        if initial_build_complete(&store_context, &db_path, &marker_path)? {
+            drop(lock);
+            return Self::build_filtered(project, config, None, store_context, progress);
+        }
+        let workspace = Self::build_filtered(project, config, None, store_context, progress)?;
+        lock.publish_complete()?;
+        Ok(workspace)
     }
 
     fn build_filtered(
@@ -717,7 +791,6 @@ impl WorkspaceAnalyzer {
         requested_languages: Option<&BTreeSet<Language>>,
         store_context: crate::analyzer::AnalyzerStoreContext,
         progress: Option<BuildProgress>,
-        revalidate_filesystem_paths: bool,
     ) -> Result<Self, StoreError> {
         let _scope = profiling::scope("WorkspaceAnalyzer::build");
         // A fresh abort per fan-out. The caller's context may outlive this
@@ -774,7 +847,6 @@ impl WorkspaceAnalyzer {
                                         cfg,
                                         store_context,
                                         progress,
-                                        revalidate_filesystem_paths,
                                     )
                                 }));
                                 if built.is_err() {
@@ -814,7 +886,6 @@ impl WorkspaceAnalyzer {
             config,
             store_context,
             requested_languages.cloned(),
-            revalidate_filesystem_paths,
         ));
 
         Ok(if delegates.is_empty() {
@@ -1134,7 +1205,8 @@ mod tests {
         let file = ProjectFile::new(root.clone(), "src/generation.ts");
         file.write("export const generation = 1;\n").unwrap();
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::TypeScript));
-        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
         let cancellation = crate::analyzer::semantic::CancellationToken::default();
         let mut budget = crate::analyzer::semantic::SemanticBudget::default();
         let artifact = workspace
@@ -1181,7 +1253,8 @@ mod tests {
             .unwrap();
 
         let single: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let single = WorkspaceAnalyzer::build(single, AnalyzerConfig::default());
+        let single = WorkspaceAnalyzer::build_ephemeral(single, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
         assert!(!single.query_indexes_warm());
         single.warm_query_indexes();
         assert!(single.query_indexes_warm());
@@ -1190,7 +1263,8 @@ mod tests {
             root,
             BTreeSet::from([Language::Rust, Language::Java]),
         ));
-        let multi = WorkspaceAnalyzer::build(multi, AnalyzerConfig::default());
+        let multi = WorkspaceAnalyzer::build_ephemeral(multi, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
         assert!(!multi.query_indexes_warm());
         multi.warm_query_indexes();
         assert!(multi.query_indexes_warm());
@@ -1214,7 +1288,8 @@ mod tests {
             .unwrap();
 
         let rust: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let rust = WorkspaceAnalyzer::build(rust, AnalyzerConfig::default());
+        let rust = WorkspaceAnalyzer::build_ephemeral(rust, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
         assert!(rust.rust_usage_facts_ready());
         assert!(!rust.rust_usage_facts_warm());
         rust.warm_rust_usage_facts();
@@ -1222,7 +1297,8 @@ mod tests {
         assert!(rust.rust_usage_facts_warm());
 
         let java: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
-        let java = WorkspaceAnalyzer::build(java, AnalyzerConfig::default());
+        let java = WorkspaceAnalyzer::build_ephemeral(java, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
         assert!(java.rust_usage_facts_ready());
         assert!(java.rust_usage_facts_warm());
     }
@@ -1253,7 +1329,8 @@ mod tests {
             memo_cache_budget_bytes: Some(1024 * 1024),
             ..AnalyzerConfig::default()
         };
-        let workspace = WorkspaceAnalyzer::build(Arc::clone(&project), config);
+        let workspace = WorkspaceAnalyzer::build_ephemeral(Arc::clone(&project), config)
+            .expect("ephemeral workspace should build");
         assert_eq!(
             workspace
                 .analyzer()

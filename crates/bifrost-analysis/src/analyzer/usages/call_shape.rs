@@ -56,6 +56,12 @@ pub struct CallShapeOutcome {
     /// The span of the token that names the callee, where the lowering
     /// recorded one. A callable-object call (`proc.(x)`) has none.
     pub callee_range: Option<Range>,
+    /// The span of the receiver expression the call is written against, where
+    /// the lowering recorded one. A curried sequence names it on its innermost
+    /// application, which is where the receiver is written. This is the actual
+    /// a `receiver` binding row binds (issue #2499); whether it binds anything
+    /// is the callee's answer, not the shape's.
+    pub receiver_range: Option<Range>,
     pub call_kind: CallKind,
     pub coverage: CallShapeCoverage,
 }
@@ -132,6 +138,12 @@ pub fn call_shape_for_call(
     let callee_range = call
         .name
         .map(|span| range_for_bytes(facts, span.start_byte, span.end_byte));
+    // The receiver is written on the innermost application: `a.f(x)(y)` reads
+    // its receiver at `a`, and the outer application has none of its own.
+    let receiver_range = applications
+        .iter()
+        .find_map(|&id| facts.role_targets(id, Role::Receiver).next())
+        .map(|target| range_for_bytes(facts, target.span.start_byte, target.span.end_byte));
     // Coverage is the least complete answer any application in the sequence
     // gave: one unreadable list makes the whole site's shape unreadable.
     let coverage = applications
@@ -194,6 +206,7 @@ pub fn call_shape_for_call(
             file: file.clone(),
             range: call.range,
             callee_range,
+            receiver_range,
             call_kind,
             coverage,
         },

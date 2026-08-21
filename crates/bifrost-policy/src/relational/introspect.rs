@@ -10,10 +10,10 @@
 //! The catalog is data, not prose: it is deterministic, versioned, and carries
 //! no evaluation state.
 
-use brokk_bifrost_analysis::analyzer::structural::CodeQueryRowScalarType;
 use brokk_bifrost_analysis::analyzer::structural::search::{
     ALL_DETAILED_CODE_QUERY_DOMAINS, DetailedCodeQueryDomain,
 };
+use brokk_bifrost_analysis::analyzer::structural::{CodeQueryEnumDomain, CodeQueryRowScalarType};
 use serde::Serialize;
 
 use super::ir::{ALL_ROW_EXPANSION_STEPS, expansion_result_domain};
@@ -51,6 +51,18 @@ pub struct RelationFieldSchema {
     /// `String` name or an enum label may be equal across unrelated rows, so a
     /// join on it is a filter, not a correlation.
     pub stable_join_key: bool,
+    /// Every value a `constrained_enum` column can hold, in the producing
+    /// vocabulary's declaration order. This is the same table the validator
+    /// checks a literal against (issue #2515), so an author reading the catalog
+    /// reads the rule that will be enforced.
+    ///
+    /// Absent for every other scalar type, and for the rare enum column whose
+    /// producing vocabulary the registry marks as not enumerable, where
+    /// `unenumerable_reason` states why instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values: Option<&'static [&'static str]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unenumerable_reason: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -74,6 +86,14 @@ pub fn relation_schema_catalog() -> RelationSchemaCatalog {
                     scalar_type: scalar_type_label(field.scalar_type),
                     nullable: field.nullable,
                     stable_join_key: is_stable_join_key(field.scalar_type),
+                    values: match field.value_domain {
+                        Some(CodeQueryEnumDomain::Labels(labels)) => Some(labels),
+                        Some(CodeQueryEnumDomain::Unenumerable(_)) | None => None,
+                    },
+                    unenumerable_reason: match field.value_domain {
+                        Some(CodeQueryEnumDomain::Unenumerable(reason)) => Some(reason),
+                        Some(CodeQueryEnumDomain::Labels(_)) | None => None,
+                    },
                 })
                 .collect(),
             expansions: admitted_expansions(*domain),

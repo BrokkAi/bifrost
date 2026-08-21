@@ -317,6 +317,24 @@ function collectProjectionUpdates(repoRoot, version) {
       json.packages[""] ??= {};
       json.packages[""].version = version;
     }),
+    // The composite action installs a Bifrost release by tag, and consumers
+    // reach it two ways: the alias repository, whose copy the release sync
+    // rewrites, and the subdirectory form
+    // `BrokkAi/bifrost/.github/actions/policy-scan@vX.Y.Z`, which gets this
+    // file verbatim. Left out of the projection set, the second form pins the
+    // *previous* release's binary at its own tag -- v0.10.5 shipped an action
+    // defaulting to v0.10.4 -- and does it silently, because the default is a
+    // real tag that installs and runs.
+    updateText(repoRoot, ".github/actions/policy-scan/action.yml", (contents) => {
+      const pattern = /^    default: v\d+\.\d+\.\d+$/gmu;
+      const matches = contents.match(pattern) ?? [];
+      if (matches.length !== 1) {
+        throw new Error(
+          `Expected exactly one policy-scan version default, found ${matches.length}.`,
+        );
+      }
+      return contents.replace(pattern, `    default: v${version}`);
+    }),
     updateText(repoRoot, "docs/src/content/docs/rust-library.md", (contents) => {
       const pattern = /^brokk-bifrost = "[^"]+"$/gmu;
       const matches = contents.match(pattern) ?? [];

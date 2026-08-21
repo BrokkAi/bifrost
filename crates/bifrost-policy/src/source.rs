@@ -6365,6 +6365,67 @@ mod tests {
         );
     }
 
+    /// Issue #2515, the policy-authoring dogfood reproduction. A `ConstrainedEnum`
+    /// column compared against a label the row can never hold is an authoring
+    /// error reported at load time, naming the field, the bad label, and the
+    /// legal set.
+    ///
+    /// Before this check, the filter simply matched nothing: the plan produced
+    /// no groups, and the run reported `1 complete policy run; clean` with exit
+    /// 0 forever.
+    #[test]
+    fn an_unknown_enum_label_in_a_relational_filter_fails_to_load() {
+        let policy = |predicate: &str| {
+            format!(
+                r#"(policy
+                  :id "test.relational.enum" :name "Enum" :message "M" :severity warning
+                  :analysis (analysis :type assertion
+                    (bind :name shape :query
+                      (rql (call-shape (occurrences :role [member_position]))))
+                    (filter :over shape :where (({predicate})))
+                    (group :name by-site :by (shape.site_id)
+                      (aggregate :name hits :op count))
+                    (assert :group by-site :value hits :cardinality (at-most 1))))"#
+            )
+        };
+
+        let error = parse(&policy("shape.call_kind eq zzz_totally_bogus_value_xyz"))
+            .unwrap_err()
+            .diagnostic;
+        assert_eq!(error.code, "invalid-relational-assertion-plan");
+        assert_eq!(
+            error.message,
+            "`zzz_totally_bogus_value_xyz` is not a value of `shape.call_kind`; \
+             the accepted values are function, method, constructor, extractor, infix, \
+             operator, method_value"
+        );
+
+        // The same rule holds for every member of a set membership test: one
+        // bad member would silently shrink the set.
+        let error = parse(&policy(
+            "shape.call_kind in [method zzz_totally_bogus_value_xyz]",
+        ))
+        .unwrap_err()
+        .diagnostic;
+        assert_eq!(error.code, "invalid-relational-assertion-plan");
+        assert!(
+            error
+                .message
+                .contains("`zzz_totally_bogus_value_xyz` is not a value of `shape.call_kind`"),
+            "{}",
+            error.message
+        );
+
+        // A correct label still loads, through both operators.
+        for predicate in [
+            "shape.call_kind eq method",
+            "shape.call_kind in [method function]",
+        ] {
+            parse(&policy(predicate))
+                .unwrap_or_else(|error| panic!("{predicate}: {}", error.diagnostic.message));
+        }
+    }
+
     /// A projection publishes a new relation and takes the place of the one it
     /// reads: the projected columns are addressable under the new name, and
     /// the old name is not addressable at all.

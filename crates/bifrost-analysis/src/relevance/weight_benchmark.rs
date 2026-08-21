@@ -158,7 +158,8 @@ fn benchmark_usage_reference_weight_profiles() {
         );
         let started = Instant::now();
         let project = Arc::new(FilesystemProject::new(root.clone()).unwrap());
-        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
         let analyzer = workspace.analyzer();
         let analyzer_ms = started.elapsed().as_secs_f64() * 1000.0;
 

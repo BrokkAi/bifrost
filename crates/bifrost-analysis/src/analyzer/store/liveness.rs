@@ -340,6 +340,13 @@ struct PathState {
     /// Only an identity taken from disk has one; an overlay's content is not a
     /// function of anything on disk, so no disk stat can confirm it.
     capture_stat: Option<FileStat>,
+    /// The analyzer owns this entry's generation and advances it only through
+    /// an explicit refresh. Such an entry is a sound content-reuse token for
+    /// the lifetime of the generation without a filesystem stat: an
+    /// out-of-band edit is intentionally invisible until the caller updates
+    /// the analyzer. Overlay entries do not use this bit because their source
+    /// identity also depends on the overlay revision held by the project.
+    generation_trusted: bool,
     /// Whether this entry is intrinsically current for the lifetime of the
     /// `LiveSnapshot`. Overlay entries have no filesystem stat and can be
     /// trusted until their overlay generation changes. Filesystem entries keep
@@ -365,7 +372,7 @@ impl PartialEq for PathState {
     /// without changing its bytes keeps the same `oid`, so it is not a content
     /// change and must not bump the map's generation. The retained older
     /// `capture_stat` still names the same content, and the re-stat in
-    /// `stat_paired_oid_for_path` simply declines until the identity is
+    /// `reusable_oid_for_path` simply declines until the identity is
     /// captured again, which is the conservative direction.
     fn eq(&self, other: &Self) -> bool {
         self.oid == other.oid && self.stat == other.stat
@@ -401,6 +408,7 @@ impl PathState {
             oid,
             stat,
             capture_stat,
+            generation_trusted: !revalidate_filesystem && validation.is_filesystem(),
             validated: false,
         })
     }
@@ -621,17 +629,15 @@ impl LiveSnapshot {
         }
     }
 
-    /// The blob identity recorded for `file` from the filesystem, re-confirmed
-    /// against the file's current stat on this call.
+    /// The blob identity that can be reused for content-derived work without
+    /// reading `file`.
     ///
-    /// Unlike [`Self::validated_oid_for_path`], this never takes the snapshot's
-    /// intrinsic-currency shortcut and never answers from an entry that has no
-    /// recorded capture stat. Only an identity taken from a file on disk under
-    /// filesystem revalidation records one (see [`PathState::new`]), so a
-    /// `Some` answer means "this oid and this stat were captured from the same
-    /// file at the same time, and the file still has that stat". An overlay
-    /// entry and an entry recorded under a trusted filesystem generation both
-    /// answer `None` rather than being trusted.
+    /// A filesystem-revalidated entry must still have the stat captured with
+    /// its identity. An entry owned by an explicit analyzer generation can be
+    /// reused directly: filesystem edits are outside that snapshot until an
+    /// explicit update advances the generation. Overlay entries answer `None`
+    /// because their source identity also depends on the project's overlay
+    /// revision rather than on the path map alone.
     ///
     /// This is the token a caller uses to reuse content-derived work without
     /// reading the file. It asks a different question from the token that
@@ -639,8 +645,11 @@ impl LiveSnapshot {
     /// stat: a hashed non-Git identity stays live for the generation that
     /// indexed it, while the content it names is reusable only while the file
     /// provably still holds those bytes.
-    pub fn stat_paired_oid_for_path(&self, file: &ProjectFile) -> Option<Oid> {
+    pub fn reusable_oid_for_path(&self, file: &ProjectFile) -> Option<Oid> {
         let state = self.path_to_state.get(file)?;
+        if state.generation_trusted {
+            return Some(state.oid);
+        }
         let expected = state.capture_stat.as_ref()?;
         (FileStat::from_path(&file.abs_path()).as_ref() == Some(expected)).then_some(state.oid)
     }
@@ -707,6 +716,7 @@ fn build_snapshot(
                 oid,
                 stat: Some(stat.clone()),
                 capture_stat: Some(stat),
+                generation_trusted: false,
                 // `Liveness::snapshot()` intentionally never promotes to
                 // `true` -- see the `validated` field doc.
                 validated: false,
@@ -1405,7 +1415,7 @@ mod tests {
     /// hashed non-Git identity is the case that shows the two questions are
     /// separate: it stays live while its content stops being reusable.
     #[test]
-    fn the_stat_paired_token_refuses_anything_it_cannot_re_confirm() {
+    fn reusable_identity_honors_stat_and_explicit_generation_contracts() {
         let temp = tempfile::TempDir::new().unwrap();
         std::fs::write(temp.path().join("a.rs"), "fn a() {}\n").unwrap();
         let file = project_file(temp.path(), "a.rs");
@@ -1414,7 +1424,7 @@ mod tests {
         let map = LivePathMap::default();
         map.refresh([LivePathEntry::filesystem(file.clone(), oid)]);
         let snapshot = map.snapshot();
-        assert_eq!(snapshot.stat_paired_oid_for_path(&file), Some(oid));
+        assert_eq!(snapshot.reusable_oid_for_path(&file), Some(oid));
 
         // An overlay identity has no filesystem stat to pair with, so the file
         // on disk says nothing about the content this identity describes.
@@ -1422,15 +1432,15 @@ mod tests {
         overlay_map.refresh([LivePathEntry::overlay(file.clone(), oid)]);
         let overlay_snapshot = overlay_map.snapshot();
         assert_eq!(overlay_snapshot.oid_for_path(&file), Some(oid));
-        assert_eq!(overlay_snapshot.stat_paired_oid_for_path(&file), None);
+        assert_eq!(overlay_snapshot.reusable_oid_for_path(&file), None);
 
-        // An analyzer that trusts its filesystem generation records no stat
-        // either, so nothing here can be re-confirmed.
+        // An analyzer that owns its filesystem generation needs no stat: an
+        // out-of-band edit is outside that snapshot until explicit refresh.
         let trusting_map = LivePathMap::trust_filesystem_generation();
         trusting_map.refresh([LivePathEntry::filesystem(file.clone(), oid)]);
         let trusting_snapshot = trusting_map.snapshot();
         assert_eq!(trusting_snapshot.validated_oid_for_path(&file), Some(oid));
-        assert_eq!(trusting_snapshot.stat_paired_oid_for_path(&file), None);
+        assert_eq!(trusting_snapshot.reusable_oid_for_path(&file), Some(oid));
 
         // An identity hashed here, outside a Git repository, answers the two
         // questions separately: it is live for the generation that indexed it,
@@ -1439,20 +1449,21 @@ mod tests {
         hashed_map.refresh([LivePathEntry::filesystem_hashed(file.clone(), oid)]);
         let hashed_snapshot = hashed_map.snapshot();
         assert_eq!(hashed_snapshot.validated_oid_for_path(&file), Some(oid));
-        assert_eq!(hashed_snapshot.stat_paired_oid_for_path(&file), Some(oid));
+        assert_eq!(hashed_snapshot.reusable_oid_for_path(&file), Some(oid));
 
         // An edit behind the map's back is refused by the re-check, even
         // though the map still holds the entry.
         std::fs::write(temp.path().join("a.rs"), "fn a() { edited(); }\n").unwrap();
         assert_eq!(snapshot.oid_for_path(&file), Some(oid));
-        assert_eq!(snapshot.stat_paired_oid_for_path(&file), None);
+        assert_eq!(snapshot.reusable_oid_for_path(&file), None);
+        assert_eq!(trusting_snapshot.reusable_oid_for_path(&file), Some(oid));
 
         // The same edit decouples the hashed entry's two answers. The analyzer
         // indexed the old bytes and no one has told it otherwise, so it must
         // keep answering from that generation; but the file no longer provably
         // holds those bytes, so nothing derived from them may be reused.
         assert_eq!(hashed_snapshot.validated_oid_for_path(&file), Some(oid));
-        assert_eq!(hashed_snapshot.stat_paired_oid_for_path(&file), None);
+        assert_eq!(hashed_snapshot.reusable_oid_for_path(&file), None);
         // A forked map rebuilds its snapshot from the same states, so this
         // exercises the build path rather than the memoized snapshot: a hashed
         // entry must survive it too.

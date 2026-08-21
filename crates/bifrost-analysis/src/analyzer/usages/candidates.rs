@@ -225,6 +225,8 @@ fn cpp_related_callable_source_files(
     }
 
     let mut related = BTreeSet::new();
+    let definitions =
+        crate::analyzer::AnalyzerDefinitionLookup::new(analyzer, crate::analyzer::Language::None);
     for target in targets {
         if is_cancelled(cancellation) {
             break;
@@ -234,7 +236,7 @@ fn cpp_related_callable_source_files(
         }
         let identifier = source_identifier_for_target(target);
         let target_fqn = target.fq_name();
-        for candidate in analyzer.global_usage_definition_index().fqn(&target_fqn) {
+        for candidate in definitions.fqn(&target_fqn) {
             if is_cancelled(cancellation) {
                 break;
             }

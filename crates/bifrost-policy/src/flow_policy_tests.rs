@@ -359,6 +359,43 @@ fn every_flow_relevant_field_moves_the_semantic_hash() {
     }
 }
 
+/// A formal-name port and an ordinal port are different claims about the same
+/// call, even when they select the same operand in one tree (#2496). Ordinal
+/// zero of `put(value)` is formal `value` today and need not be tomorrow, so
+/// the two spellings must never collide in a baseline or a suppression.
+#[test]
+fn a_formal_name_port_hashes_distinctly_from_an_index_port() {
+    let by_index = semantic_hash(
+        &FlowRule {
+            observation_operand: "(argument :index 0)",
+            ..FlowRule::default()
+        }
+        .render(),
+    );
+    let by_name = semantic_hash(
+        &FlowRule {
+            observation_operand: r#"(argument :name "value")"#,
+            ..FlowRule::default()
+        }
+        .render(),
+    );
+    let by_other_name = semantic_hash(
+        &FlowRule {
+            observation_operand: r#"(argument :name "other")"#,
+            ..FlowRule::default()
+        }
+        .render(),
+    );
+    assert_ne!(
+        by_index, by_name,
+        "an ordinal port and a formal-name port must not share a semantic hash"
+    );
+    assert_ne!(
+        by_name, by_other_name,
+        "the formal's name is part of what the policy claims"
+    );
+}
+
 #[test]
 fn an_equal_flow_and_taint_model_do_not_share_a_semantic_hash() {
     // Both policies bind the same sites through the same ports with the same

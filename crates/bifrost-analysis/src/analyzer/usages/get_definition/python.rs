@@ -410,15 +410,6 @@ fn python_focused_reference_text<'source>(
         .then(|| source.get(focus_start..focus_end))?
 }
 
-fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
-    }
-}
-
 fn python_type_for_expression_bounded(
     support: &PythonDefinitionProvider<'_>,
     token: QueryToken<'_>,
@@ -1043,13 +1034,10 @@ fn python_current_receiver_class(
         return None;
     }
     let function = python_enclosing_callable_bounded(support, node)?;
-    let layout = formal_parameter_slots_for_owner_bounded(
-        Language::Python,
-        function,
-        source,
-        &node_range(function),
-        || support.scope_step(),
-    )?;
+    let layout =
+        formal_parameter_slots_for_owner_bounded(Language::Python, function, source, || {
+            support.scope_step()
+        })?;
     if matches!(layout.python_binding, Some(PythonMethodBinding::Static))
         || layout
             .slots

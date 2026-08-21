@@ -13,7 +13,9 @@
 use std::fmt;
 
 use brokk_bifrost_analysis::analyzer::structural::search::DetailedCodeQueryDomain;
-use brokk_bifrost_analysis::analyzer::structural::{CodeQueryRowScalarRef, CodeQueryRowScalarType};
+use brokk_bifrost_analysis::analyzer::structural::{
+    CodeQueryEnumDomain, CodeQueryRowScalarRef, CodeQueryRowScalarType,
+};
 
 use crate::definition::{
     AssertCardinality, PolicyAssertId, RelationalAssertionLimits, RowAggregateName, RowBindingName,
@@ -121,6 +123,11 @@ pub struct IrField {
     /// nullable field admits an `is-null` test; a required field's null test
     /// would be a constant, which is an authoring mistake rather than a query.
     pub nullable: bool,
+    /// The registry's value domain, present exactly for a `ConstrainedEnum`
+    /// column. A literal outside it can never match, so the validator rejects
+    /// it at load time instead of letting the plan report a clean run
+    /// (issue #2515).
+    pub value_domain: Option<CodeQueryEnumDomain>,
 }
 
 /// The ordered typed columns one relation produces.
@@ -573,6 +580,7 @@ pub fn group_schema(
         column: aggregate.output.clone(),
         scalar_type: CodeQueryRowScalarType::Integer,
         nullable: false,
+        value_domain: None,
     }));
     Some(IrSchema::new(fields))
 }
@@ -587,6 +595,7 @@ pub fn domain_schema(qualifier: &str, domain: DetailedCodeQueryDomain) -> IrSche
                 column: IrColumn::new(qualifier, field.name),
                 scalar_type: field.scalar_type,
                 nullable: field.nullable,
+                value_domain: field.value_domain,
             })
             .collect(),
     )

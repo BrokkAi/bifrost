@@ -677,6 +677,19 @@ pub(super) fn render_edge_ref(
 
 /// The mandatory member-selection summary for one occurrence, computed from
 /// the production resolver's candidate trace. `untraced` states the language
+/// The value domains the three `member_selection` summary fields publish.
+/// Minted by [`render_member_selection`] below rather than by a typed
+/// vocabulary (issue #2515).
+pub(super) const MEMBER_SELECTION_OUTCOME_LABELS: &[&str] = &["selected", "unresolved", "untraced"];
+pub(super) const MEMBER_SELECTION_TRACE_COMPLETENESS_LABELS: &[&str] =
+    &["full", "selection_only", "absent"];
+pub(super) const MEMBER_SELECTION_COVERAGE_LABELS: &[&str] = &["exhaustive", "open", "unsupported"];
+
+/// The value domain the `member_family_edge.completeness` row field publishes.
+/// A family edge the resolver recorded is complete by construction, so the
+/// domain is the single label [`render_member_family_edge`] writes.
+pub(super) const MEMBER_FAMILY_EDGE_COMPLETENESS_LABELS: &[&str] = &["complete"];
+
 /// recorded no trace; it is never rendered as a proven-empty selection.
 pub(super) fn render_member_selection(
     analyzer: &dyn IAnalyzer,
@@ -1872,6 +1885,17 @@ pub(super) fn render_receiver_analysis(
     }
 }
 
+/// The value domain the `receiver_outcome.coverage` row field publishes, and
+/// with it the `receiver_evidence.completeness` field that copies it. Minted
+/// by [`render_receiver_outcome`] below rather than by a typed vocabulary
+/// (issue #2515).
+pub(super) const RECEIVER_COVERAGE_LABELS: &[&str] =
+    &["unsupported", "truncated", "open", "unknown", "exhaustive"];
+
+/// The value domain the `receiver_evidence.proof` row field publishes: an
+/// evidence row is `precise` exactly when its site's analysis was precise.
+pub(super) const RECEIVER_EVIDENCE_PROOF_LABELS: &[&str] = &["precise", "ambiguous"];
+
 pub(super) fn render_receiver_outcome(
     analyzer: &dyn IAnalyzer,
     value: &ReceiverAnalysisValue,
@@ -2005,6 +2029,7 @@ pub(super) fn render_call_binding(
         formal_index: row.formal_index,
         formal_name: row.formal_name.clone(),
         binding_kind: row.binding_kind.map(|kind| kind.label()),
+        conversion: row.conversion.clone(),
         mapping: row.mapping.label(),
         reason: row.reason.map(|reason| reason.label()),
         coverage: report.coverage.label(),
@@ -2252,6 +2277,18 @@ pub(super) fn receiver_query_outcome_label(analysis: &ReceiverQueryAnalysis) -> 
     }
 }
 
+/// The value domain the `receiver_analysis.outcome` and
+/// `receiver_outcome.outcome` row fields publish. Declared here because these
+/// labels are minted by [`receiver_outcome_metadata`] rather than by a typed
+/// vocabulary (issue #2515).
+pub(super) const RECEIVER_OUTCOME_LABELS: &[&str] = &[
+    "precise",
+    "ambiguous",
+    "unknown",
+    "unsupported",
+    "exceeded_budget",
+];
+
 pub(super) fn receiver_outcome_metadata<T>(
     outcome: &ReceiverAnalysisOutcome<T>,
 ) -> (&'static str, Option<&'static str>, Option<&'static str>) {
@@ -2265,6 +2302,10 @@ pub(super) fn receiver_outcome_metadata<T>(
         }
     }
 }
+
+/// The value domain the `expression_site.input_kind` row field publishes,
+/// minted by [`expression_input_parts`] (issue #2515).
+pub(super) const EXPRESSION_INPUT_KIND_LABELS: &[&str] = &["receiver", "parameter"];
 
 pub(super) fn expression_input_parts(
     input: &ExpressionInput,
@@ -2289,6 +2330,11 @@ pub(super) fn declaration_value_for_unit(
             .unwrap_or(fallback),
     )
 }
+
+/// The value domain the `call_site.call_kind` row field publishes. This is the
+/// usage-seam call syntax vocabulary, which is deliberately not the
+/// `call_shape.call_kind` one (issue #2515).
+pub(super) const CALL_SYNTAX_KIND_LABELS: &[&str] = &["function", "method", "constructor", "super"];
 
 pub(super) fn call_syntax_kind_label(kind: CallSyntaxKind) -> &'static str {
     match kind {

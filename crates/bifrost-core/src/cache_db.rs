@@ -26,7 +26,7 @@ pub const STORE_FILE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
 /// migrations that produced them were folded into the baseline, so a store
 /// older than this cannot be carried forward and is refused.
 const BASELINE_MIGRATION_VERSION: i64 = 18;
-const CURRENT_MIGRATION_VERSION: i64 = 23;
+const CURRENT_MIGRATION_VERSION: i64 = 24;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -43,6 +43,8 @@ const DROP_BM25_LEXICAL_COLUMNS_SQL: &str =
     include_str!("../migrations/cache/0022-drop-bm25-lexical-columns.sql");
 const SIGNATURE_METADATA_COLUMNS_SQL: &str =
     include_str!("../migrations/cache/0023-signature-metadata-columns.sql");
+const LIVE_DEFINITION_VIEWS_SQL: &str =
+    include_str!("../migrations/cache/0024-live-definition-views.sql");
 
 // Migration 0023 spells the signature-metadata byte cap as the literal 8388608,
 // because a checked-in SQL file cannot interpolate a Rust constant. The two must
@@ -63,7 +65,7 @@ struct CacheMigration {
     sql: &'static str,
 }
 
-const CACHE_MIGRATIONS: [CacheMigration; 6] = [
+const CACHE_MIGRATIONS: [CacheMigration; 7] = [
     CacheMigration {
         version: 18,
         sql: CURRENT_BASELINE_SQL,
@@ -87,6 +89,10 @@ const CACHE_MIGRATIONS: [CacheMigration; 6] = [
     CacheMigration {
         version: 23,
         sql: SIGNATURE_METADATA_COLUMNS_SQL,
+    },
+    CacheMigration {
+        version: 24,
+        sql: LIVE_DEFINITION_VIEWS_SQL,
     },
 ];
 
@@ -1972,6 +1978,88 @@ mod tests {
             CURRENT_MIGRATION_VERSION
         );
         assert!(current_schema_is_valid(&conn).unwrap());
+    }
+
+    #[test]
+    fn live_definition_views_enforce_publication_and_keep_indexed_lookups() {
+        let conn = open_in_memory_cache();
+        let live_oid = "1111111111111111111111111111111111111111";
+        conn.execute_batch(
+            "INSERT INTO analysis_epochs(lang, epoch, generation)
+               VALUES('java', 'test', 7);
+             INSERT INTO blobs(blob_oid, lang, generation) VALUES
+               ('1111111111111111111111111111111111111111', 'java', 7),
+               ('2222222222222222222222222222222222222222', 'java', 6),
+               ('3333333333333333333333333333333333333333', 'java', 7);
+             INSERT INTO blob_meta(
+               blob_oid, lang, contains_tests, content_package,
+               stored_unit_count, range_count, signature_count,
+               signature_metadata_count, supertype_count, child_count,
+               import_statement_count, type_identifier_count, is_complete
+             ) VALUES
+               ('1111111111111111111111111111111111111111', 'java', 0, 'pkg',
+                1, 0, 0, 0, 0, 0, 0, 0, 1),
+               ('2222222222222222222222222222222222222222', 'java', 0, 'pkg',
+                1, 0, 0, 0, 0, 0, 0, 0, 1),
+               ('3333333333333333333333333333333333333333', 'java', 0, 'pkg',
+                1, 0, 0, 0, 0, 0, 0, 0, 0);
+             INSERT INTO code_units(
+               blob_oid, lang, unit_key, kind, short_name, identifier,
+               content_qualifier, exact_fqn, normalized_fqn,
+               simple_type_name, synthetic, is_type_alias,
+               in_declarations, in_definition_lookup
+             ) VALUES
+               ('1111111111111111111111111111111111111111', 'java', 1, 0,
+                'Live', 'Live', 'pkg', 'pkg.Live', 'pkg.Live', 'Live', 0, 0, 1, 1),
+               ('2222222222222222222222222222222222222222', 'java', 1, 0,
+                'Stale', 'Stale', 'pkg', 'pkg.Stale', 'pkg.Stale', 'Stale', 0, 0, 1, 1),
+               ('3333333333333333333333333333333333333333', 'java', 1, 0,
+                'Incomplete', 'Incomplete', 'pkg', 'pkg.Incomplete',
+                'pkg.Incomplete', 'Incomplete', 0, 0, 1, 1);",
+        )
+        .unwrap();
+
+        for view in [
+            "live_parsed_blobs",
+            "live_code_units",
+            "live_declarations",
+            "live_definition_units",
+        ] {
+            let rows: Vec<String> = conn
+                .prepare(&format!("SELECT blob_oid FROM {view}"))
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                rows,
+                [live_oid],
+                "{view} must expose only published live rows"
+            );
+        }
+
+        let plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT blob_oid, unit_key
+                 FROM live_declarations
+                 WHERE lang = 'java' AND exact_fqn = 'pkg.Live'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_code_units_lang_exact_fqn_declarations")),
+            "exact live declaration lookup must use its partial index: {plan:?}"
+        );
+        assert!(
+            plan.iter().all(|step| !step.contains("SCAN units")),
+            "exact live declaration lookup must not scan code_units: {plan:?}"
+        );
     }
 
     #[test]

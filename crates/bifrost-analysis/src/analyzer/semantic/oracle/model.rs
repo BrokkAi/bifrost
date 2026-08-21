@@ -1128,6 +1128,16 @@ pub enum DispatchBoundaryKind {
 }
 
 impl DispatchBoundaryKind {
+    /// The value domain the `dispatch_target.boundary_kind` row field
+    /// publishes (issue #2515).
+    pub const LABELS: &'static [&'static str] = &[
+        "external",
+        "unmaterialized",
+        "deferred",
+        "unresolved",
+        "truncated",
+    ];
+
     /// The stable public spelling of this boundary kind.
     pub const fn label(&self) -> &'static str {
         match self {

@@ -290,6 +290,10 @@ pub enum CandidateOutcome {
 }
 
 impl CandidateOutcome {
+    /// The value domain the `resolution_candidate.outcome` row field publishes
+    /// (issue #2515).
+    pub const LABELS: &'static [&'static str] = &["selected", "rejected"];
+
     /// The coarse label. The rejection reason is a separate field on every
     /// surface that renders an outcome, so the label stays a two-value
     /// vocabulary a filter can be written against.

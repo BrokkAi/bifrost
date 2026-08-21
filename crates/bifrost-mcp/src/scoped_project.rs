@@ -1,5 +1,6 @@
 use crate::analyzer::{
-    FileSetProject, OverlayProject, Project, SourceIngestionKind, ingest_source_bytes,
+    AnalyzerConfig, FileSetProject, OverlayProject, Project, SourceIngestionKind,
+    ingest_source_bytes,
 };
 use crate::git_file::{list_git_files_at_revision, read_git_file_bytes};
 use crate::tool_arguments::GitHistoryOverlay;
@@ -20,7 +21,10 @@ pub fn create_scoped_service(
     let Some(revision) = revision.map(str::trim).filter(|rev| !rev.is_empty()) else {
         let rel_paths = resolve_sources(&root, sources)?;
         let project = Arc::new(FileSetProject::new(root, rel_paths));
-        return SearchToolsService::new_manual_for_project(project);
+        return SearchToolsService::new_manual_ephemeral_for_project(
+            project,
+            AnalyzerConfig::default(),
+        );
     };
     let rel_paths = resolve_sources_at_revision(&root, sources, revision)?;
     let mut admitted = Vec::with_capacity(rel_paths.len());
@@ -73,7 +77,7 @@ pub fn create_scoped_service(
         }
     }
     let project: Arc<dyn Project> = overlay_project;
-    SearchToolsService::new_manual_for_project(project)
+    SearchToolsService::new_manual_ephemeral_for_project(project, AnalyzerConfig::default())
 }
 
 pub fn create_cli_tool_service(
@@ -104,7 +108,10 @@ pub fn create_cli_tool_service(
     if overlays.is_empty() {
         let rel_paths = resolve_sources(&root, sources)?;
         let project = Arc::new(FileSetProject::new(root, rel_paths));
-        return SearchToolsService::new_manual_for_project(project);
+        return SearchToolsService::new_manual_ephemeral_for_project(
+            project,
+            AnalyzerConfig::default(),
+        );
     }
 
     let mut rel_paths: BTreeSet<PathBuf> = if sources.is_empty() {
@@ -128,7 +135,7 @@ pub fn create_cli_tool_service(
     let overlay_project = Arc::new(OverlayProject::new(project));
     install_git_history_overlays(&root, &overlay_project, overlays)?;
     let project: Arc<dyn Project> = overlay_project;
-    SearchToolsService::new_manual_for_project(project)
+    SearchToolsService::new_manual_ephemeral_for_project(project, AnalyzerConfig::default())
 }
 
 pub fn resolve_sources(root: &Path, inputs: &[String]) -> Result<Vec<PathBuf>, String> {

@@ -58,6 +58,10 @@ macro_rules! effect_enum {
         pub const $all: &[$name] = &[$($name::$variant,)+];
 
         impl $name {
+            /// Every label of this vocabulary, in declaration order: the value
+            /// domain the matching row field publishes (issue #2515).
+            pub const LABELS: &'static [&'static str] = &[$($label,)+];
+
             pub const fn label(self) -> &'static str {
                 match self {
                     $($name::$variant => $label,)+

@@ -15,14 +15,14 @@ use crate::analyzer::semantic::cfg::{
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
-use crate::analyzer::{Language, ProjectFile, PythonAnalyzer, Range};
+use crate::analyzer::{Language, ProjectFile, PythonAnalyzer};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_python::bindings::{
     PythonDirectScopeBindingKind, PythonLexicalNameResolution, PythonLexicalScopeInventory,
     python_direct_scope_bindings_bounded,
 };
 
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v7";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v8";
 
 impl_program_semantics_provider!(PythonAnalyzer, PythonSemanticLowerer);
 
@@ -276,7 +276,7 @@ fn enumerate_procedures<'tree>(
 
         let mut callable_body_scope = None;
         if let Some((kind, segment_kind, body, properties)) =
-            callable_shape(frame.node, frame.lexical_parent)
+            callable_shape(prepared.source(), frame.node, frame.lexical_parent)
         {
             let name = callable_name(prepared.source(), frame.node);
             let anchor =
@@ -393,6 +393,7 @@ fn enclosing_binding_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
 }
 
 fn callable_shape<'tree>(
+    source: &str,
     node: Node<'tree>,
     lexical_parent: Option<ProcedureId>,
 ) -> Option<(
@@ -420,6 +421,21 @@ fn callable_shape<'tree>(
     };
     let is_async = has_direct_token(node, "async");
     let is_generator = body_contains_yield(body);
+    // PEP 591 is Python's own closed-dispatch declaration, and it is the only
+    // one the language has: `@final` on a method forbids an override, and
+    // `@final` on a class forbids a subclass, so no override of any of its
+    // methods can exist. Java reaches the same conclusion from `final` and
+    // publishes `DispatchExtensibility::Closed` for it; a Python method that
+    // carries the same declaration is closed for the same reason (#2495).
+    // Everything else stays `Open`, the correct default for a language whose
+    // classes are extensible unless they say otherwise.
+    let dispatch_extensibility = if kind == ProcedureKind::Method
+        && (has_final_decorator(source, node) || enclosing_class_is_final(source, node))
+    {
+        DispatchExtensibility::Closed
+    } else {
+        DispatchExtensibility::Open
+    };
     Some((
         kind,
         segment_kind,
@@ -434,9 +450,59 @@ fn callable_shape<'tree>(
             } else {
                 ProcedureInvocationKind::Immediate
             },
-            ..ProcedureProperties::default()
+            dispatch_extensibility,
         },
     ))
+}
+
+/// Whether `definition` carries a `@final` decorator.
+///
+/// The decorator is matched by the name it is written with -- `final`, or a
+/// qualified `<module>.final` -- which is the standard the structural
+/// `decorators` role already applies. An intra-file lowering has no resolved
+/// annotation type to consult, so an aliased import (`from typing import final
+/// as sealed`) is not recognized and the method stays open. That is the safe
+/// direction: a missed `@final` costs a discharge, it never manufactures one.
+fn has_final_decorator(source: &str, definition: Node<'_>) -> bool {
+    let Some(decorated) = definition.parent().filter(|parent| {
+        parent.kind() == "decorated_definition"
+            && parent.child_by_field_name("definition") == Some(definition)
+    }) else {
+        return false;
+    };
+    let mut cursor = decorated.walk();
+    decorated
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "decorator")
+        .filter_map(|decorator| decorator.named_child(0))
+        .any(|expression| match expression.kind() {
+            "identifier" => node_text(source, expression) == Some("final"),
+            "attribute" => {
+                expression
+                    .child_by_field_name("attribute")
+                    .and_then(|attribute| node_text(source, attribute))
+                    == Some("final")
+            }
+            _ => false,
+        })
+}
+
+/// Whether the class body that lexically encloses `node` is `@final`.
+///
+/// The walk mirrors [`python_function_kind`]: a `function_definition` or
+/// `lambda` between `node` and a class body means `node` is a local function
+/// rather than that class's method, so the class's declaration says nothing
+/// about it.
+fn enclosing_class_is_final(source: &str, node: Node<'_>) -> bool {
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        match candidate.kind() {
+            "class_definition" => return has_final_decorator(source, candidate),
+            "function_definition" | "lambda" => return false,
+            _ => parent = candidate.parent(),
+        }
+    }
+    false
 }
 
 fn python_function_kind(node: Node<'_>, lexical_parent: Option<ProcedureId>) -> ProcedureKind {
@@ -1482,12 +1548,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         spec: &ProcedureSpec<'tree>,
     ) -> Result<(), PythonLoweringError> {
-        let declaration_range = node_range(spec.callable);
         let layout = formal_parameter_slots_for_owner(
             Language::Python,
             spec.callable,
             self.prepared.source(),
-            &declaration_range,
         )
         .unwrap_or_default();
         let first_slot_is_receiver = spec.kind == ProcedureKind::Method
@@ -2433,14 +2497,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let attribute = required_field(node, "attribute")?;
                 let proven = self.proven_instance_attribute(node, object, attribute);
                 if !proven {
-                    self.add_gap(
-                        builder,
-                        entry,
-                        SemanticGapSubject::Value(result),
-                        SemanticCapability::ExceptionalControlFlow,
-                        SemanticGapKind::Unsupported,
-                        implicit_exception_detail(node),
-                    )?;
+                    // Two independent claims, published as two gaps.
+                    //
+                    // The missing abort edge is an implicit-exception gap like
+                    // every other one this adapter publishes, and like the
+                    // JavaScript and C# adapters' member-access gaps, so it
+                    // carries the same `Point` subject. When no handler or
+                    // cleanup body runs user code, the missing edge can only
+                    // remove paths from a may analysis, and the shared
+                    // discharge closes it (#1952). A `Value` subject asserted
+                    // more than that and left the gap permanently open, which
+                    // is why no Python procedure that read an attribute could
+                    // ever complete a value-flow snapshot (#2495).
+                    //
+                    // The value-level claim -- that a descriptor or special
+                    // method may produce this value -- keeps its own `Value`
+                    // subject below, and is discharged only when the same value
+                    // is a call's callee whose target the plan resolved.
+                    self.implicit_exception_gap(builder, entry, node)?;
                     self.add_gap(
                         builder,
                         entry,
@@ -2499,14 +2573,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let subscript = required_field(node, "subscript")?;
                 let proven = self.proven_list_index(node, value, subscript);
                 if !proven {
-                    self.add_gap(
-                        builder,
-                        entry,
-                        SemanticGapSubject::Value(result),
-                        SemanticCapability::ExceptionalControlFlow,
-                        SemanticGapKind::Unsupported,
-                        implicit_exception_detail(node),
-                    )?;
+                    // The same split as the attribute arm above: the abort edge
+                    // is a `Point`-subject implicit-exception gap, and the
+                    // value-level special-method claim keeps its `Value` subject.
+                    self.implicit_exception_gap(builder, entry, node)?;
                     self.add_gap(
                         builder,
                         entry,
@@ -4495,15 +4565,6 @@ fn context_manager_expression(item: Node<'_>) -> Result<Node<'_>, PythonLowering
         .into_iter()
         .find(|child| alias.is_none_or(|alias| alias.id() != child.id()))
         .ok_or_else(|| missing_field(value, "context expression"))
-}
-
-fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
-    }
 }
 
 fn python_binding_name_node<'tree>(

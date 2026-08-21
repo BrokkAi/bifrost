@@ -35,8 +35,11 @@ use crate::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEv
 use crate::finding_identity::PolicyFindingId;
 use crate::registry::{PolicyRegistry, PolicyRegistryLimits};
 use crate::resolved::LoadedPolicy;
+use crate::taint_policy::ProductionTaintPolicyEvaluator;
+use crate::typestate_policy::ProductionTypestatePolicyEvaluator;
 
 use super::model::{ExplainError, ExplanationLimits, PolicyExplanation};
+use super::near_miss::{NearMissCandidates, PolicyNearMissRanking, rank_near_misses};
 use super::why::explain_finding;
 use super::why_not::{ExplanationCandidate, explain_candidate};
 
@@ -76,6 +79,61 @@ pub fn explain_policy_inputs(
     cancellation: Option<&CancellationToken>,
     limits: &ExplanationLimits,
 ) -> Result<PolicyExplanation, ExplainError> {
+    with_one_policy(
+        root,
+        policy_inputs,
+        workspace,
+        cancellation,
+        |policy, context, budget| explain_loaded_policy(policy, context, target, budget, limits),
+    )
+}
+
+/// Rank the subjects that came closest to satisfying one policy.
+///
+/// The workspace, registry, and budget handling are exactly
+/// [`explain_policy_inputs`]'s. Only the question differs: a ranking is over a
+/// bounded candidate *set*, so it returns the sibling
+/// [`PolicyNearMissRanking`] document rather than a node tree.
+///
+/// # Errors
+///
+/// [`ExplainError::PolicyUnavailable`] and
+/// [`ExplainError::AmbiguousPolicySelection`] exactly as
+/// [`explain_policy_inputs`] reports them, plus everything
+/// [`rank_near_misses`] can return.
+pub fn rank_policy_near_misses(
+    root: &Path,
+    policy_inputs: &[PolicyEvaluationInput],
+    candidates: &NearMissCandidates,
+    workspace: Option<&WorkspaceAnalyzer>,
+    cancellation: Option<&CancellationToken>,
+    limits: &ExplanationLimits,
+) -> Result<PolicyNearMissRanking, ExplainError> {
+    with_one_policy(
+        root,
+        policy_inputs,
+        workspace,
+        cancellation,
+        |policy, context, budget| rank_near_misses(policy, context, candidates, budget, limits),
+    )
+}
+
+/// Resolve a root, register exactly one policy, obtain a workspace snapshot,
+/// and hand the loaded policy plus its evaluation context to one question.
+///
+/// Shared because every host-facing question needs the same three steps and
+/// the same refusal of an ambiguous selection.
+fn with_one_policy<T>(
+    root: &Path,
+    policy_inputs: &[PolicyEvaluationInput],
+    workspace: Option<&WorkspaceAnalyzer>,
+    cancellation: Option<&CancellationToken>,
+    answer: impl FnOnce(
+        &LoadedPolicy,
+        &PolicyEvaluationContext<'_>,
+        &mut PolicyBudget,
+    ) -> Result<T, ExplainError>,
+) -> Result<T, ExplainError> {
     let root = root.canonicalize().map_err(|error| {
         unavailable(format!(
             "failed to resolve the policy workspace root {}: {error}",
@@ -103,7 +161,10 @@ pub fn explain_policy_inputs(
                 ))
             })?;
             let project: Arc<dyn Project> = Arc::new(project);
-            Some(WorkspaceAnalyzer::build(project, AnalyzerConfig::default()))
+            Some(
+                WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+                    .expect("ephemeral workspace should build"),
+            )
         }
     };
     let workspace = workspace
@@ -119,13 +180,28 @@ pub fn explain_policy_inputs(
     // The same per-policy budget an ordinary run would use, scaled the same
     // way, so a re-executed prefix is bounded exactly as the original was.
     let mut budget = PolicyBatchBudget::default().per_policy().to_owned();
-    explain_loaded_policy(policy, &context, target, &mut budget, limits)
+    answer(policy, &context, &mut budget)
 }
 
 /// Answer one explanation question about an already-loaded policy.
 ///
 /// Split out so a host that already owns a registry and an evaluation context
 /// -- and a test -- can reuse the dispatch without re-opening a workspace.
+///
+/// # The `why` evaluation is the ordinary one
+///
+/// A `why` question needs the run its finding came from, so it evaluates the
+/// policy with the same evaluator an ordinary run uses, production taint and
+/// typestate adapters installed. Without them a taint, flow or typestate
+/// policy would report `unsupported` here and every one of its findings would
+/// be unfindable -- an explanation surface that silently disagreed with the
+/// report it exists to explain.
+///
+/// What it does not do is activate semantic-model packs: activation belongs to
+/// the host that owns the analyzer's lifecycle, and re-activating here would
+/// race it. A finding that exists only because an activated pack modeled a
+/// call is therefore reported as [`ExplainError::FindingNotFound`] rather than
+/// explained from a differently-modeled run.
 ///
 /// # Errors
 ///
@@ -140,7 +216,22 @@ pub fn explain_loaded_policy(
 ) -> Result<PolicyExplanation, ExplainError> {
     match target {
         ExplanationTarget::Finding(finding_id) => {
+            let taint = context.workspace.map_or_else(
+                ProductionTaintPolicyEvaluator::default,
+                |workspace| {
+                    ProductionTaintPolicyEvaluator::prepare(
+                        std::iter::once(policy),
+                        workspace,
+                        Ok(None),
+                        context.cancellation,
+                        budget,
+                    )
+                },
+            );
+            let typestate = ProductionTypestatePolicyEvaluator::default();
             let run = DefaultPolicyEvaluator::new()
+                .with_taint(&taint)
+                .with_typestate(&typestate)
                 .evaluate(policy, context, budget)
                 .map_err(|error| {
                     unavailable(format!("the policy could not be evaluated: {error:?}"))

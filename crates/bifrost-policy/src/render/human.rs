@@ -12,20 +12,20 @@ use super::super::{
     CvssUnscoredReason, CvssVersion, DirectoryScope, EndpointDefinitionSchemaResolution,
     EndpointObservationPhase, EndpointOrigin, EndpointRole, EndpointTaintSemantics, EvidenceRef,
     FindingCertainty, FindingClassification, FindingCompleteness, FindingDiffDisposition,
-    FindingIdentityStability, FindingIncompleteReason, FindingSeverity, MatchFindingAnchor,
-    MatchResultDomain, OrganizationalRiskAssessment, PolicyAnalysisType, PolicyCapability,
-    PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyEndpointBinding, PolicyFailureReason,
-    PolicyFinding, PolicyFindingEvidence, PolicyIncompleteReason, PolicyLevel,
-    PolicyLocationRelationship, PolicyMessageSpec, PolicyObligation, PolicyOverlayScope,
-    PolicyQueryProof, PolicyQueryProvenance, PolicyQueryResultRef, PolicyReportDocument,
-    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySemanticEvent, PolicySeveritySpec,
-    PolicySourceLocation, PolicySuppressionDecision, PolicySuppressionMatchState,
-    PolicySuppressionOrphanState, PolicySuppressionPolicyHashState, PolicySuppressionReview,
-    PolicySuppressionTemporalState, ProofMetadata, ProofReason, ProofState,
-    ResolvedEndpointDependency, ResolvedEndpointIdentity, ResolvedEndpointManifestEntry,
-    ResolvedMatchDirectoryManifest, ResolvedPrecedenceEdge, ResolvedTypestateTerminal,
-    SchemaVersionOrigin, SchemaVersionResolution, StableSemanticIdentity, TaintSourceEvidence,
-    TaintSystemEntry, TaintTrustBoundary, TypestateViolationEvidence, WitnessStepKind,
+    FindingIdentityStability, FindingSeverity, MatchFindingAnchor, MatchResultDomain,
+    OrganizationalRiskAssessment, PolicyAnalysisType, PolicyCapability, PolicyDiagnosticImpact,
+    PolicyDiagnosticSeverity, PolicyEndpointBinding, PolicyFailureReason, PolicyFinding,
+    PolicyFindingEvidence, PolicyIncompleteReason, PolicyLevel, PolicyLocationRelationship,
+    PolicyMessageSpec, PolicyObligation, PolicyOverlayScope, PolicyQueryProof,
+    PolicyQueryProvenance, PolicyQueryResultRef, PolicyReportDocument, PolicyRuleDescriptor,
+    PolicyRun, PolicyRunCompletion, PolicySemanticEvent, PolicySeveritySpec, PolicySourceLocation,
+    PolicySuppressionDecision, PolicySuppressionMatchState, PolicySuppressionOrphanState,
+    PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicySuppressionTemporalState,
+    ProofMetadata, ProofReason, ResolvedEndpointDependency, ResolvedEndpointIdentity,
+    ResolvedEndpointManifestEntry, ResolvedMatchDirectoryManifest, ResolvedPrecedenceEdge,
+    ResolvedTypestateTerminal, SchemaVersionOrigin, SchemaVersionResolution,
+    StableSemanticIdentity, TaintSourceEvidence, TaintSystemEntry, TaintTrustBoundary,
+    TypestateViolationEvidence,
 };
 
 use super::{
@@ -355,13 +355,8 @@ fn write_concise_witness_rows<W: Write>(
     writeln!(output, "    #   Kind         Location  Code / symbol").map_err(map_io_error)?;
     let retained_step_limit = MAX_CONCISE_WITNESS_STEPS - usize::from(taint_sink.is_some());
     for (index, step) in witness.steps().iter().take(retained_step_limit).enumerate() {
-        write!(
-            output,
-            "    {:<3} {:<12} ",
-            index + 1,
-            witness_step_kind(step.kind()),
-        )
-        .map_err(map_io_error)?;
+        write!(output, "    {:<3} {:<12} ", index + 1, step.kind().label(),)
+            .map_err(map_io_error)?;
         if let Some(location) = step.location() {
             write_location(output, location).map_err(map_io_error)?;
         } else {
@@ -509,14 +504,14 @@ fn write_finding<W: Write>(
         output,
         "  analysis: {} ({}, {})",
         analysis_type(finding.analysis_type()),
-        certainty(finding.certainty()),
-        completeness(finding.completeness()),
+        finding.certainty().label(),
+        finding.completeness().label(),
     )
     .map_err(map_io_error)?;
     if let FindingCompleteness::Partial { reasons } = finding.completeness() {
         write!(output, "  finding incomplete:").map_err(map_io_error)?;
         for reason in reasons {
-            write!(output, " {}", finding_incomplete_reason(*reason)).map_err(map_io_error)?;
+            write!(output, " {}", reason.label()).map_err(map_io_error)?;
         }
         writeln!(output).map_err(map_io_error)?;
     }
@@ -557,7 +552,7 @@ fn write_finding<W: Write>(
         write_organizational_risk(output, risk)?;
     }
 
-    writeln!(output, "  proof: {}", proof_state(finding.proof().state())).map_err(map_io_error)?;
+    writeln!(output, "  proof: {}", finding.proof().state().label()).map_err(map_io_error)?;
     for witness in finding.witnesses() {
         writeln!(
             output,
@@ -577,7 +572,7 @@ fn write_finding<W: Write>(
             write!(
                 output,
                 "    {}: {}",
-                witness_step_kind(step.kind()),
+                step.kind().label(),
                 escape_terminal_text(step.label()),
             )
             .map_err(map_io_error)?;
@@ -2253,7 +2248,7 @@ fn write_certainty_detail<W: Write>(
                 write!(output, "analyzer ambiguity {}", escape_terminal_text(code),)
                     .map_err(map_io_error)?
             }
-            _ => write!(output, "{}", certainty_reason(reason)).map_err(map_io_error)?,
+            _ => write!(output, "{}", reason.label()).map_err(map_io_error)?,
         }
         writeln!(output).map_err(map_io_error)?;
     }
@@ -2283,7 +2278,7 @@ fn write_proof_detail<W: Write>(
                 contract_version,
             )
             .map_err(map_io_error)?,
-            _ => write!(output, "{}", proof_reason(reason)).map_err(map_io_error)?,
+            _ => write!(output, "{}", reason.label()).map_err(map_io_error)?,
         }
         writeln!(output).map_err(map_io_error)?;
     }
@@ -3180,31 +3175,6 @@ const fn semantic_event(value: PolicySemanticEvent) -> &'static str {
     }
 }
 
-fn certainty_reason(value: &CertaintyReason) -> &str {
-    match value {
-        CertaintyReason::AmbiguousReceiver => "ambiguous_receiver",
-        CertaintyReason::AmbiguousDispatch => "ambiguous_dispatch",
-        CertaintyReason::NameBasedResolution => "name_based_resolution",
-        CertaintyReason::MultipleCandidateDeclarations => "multiple_candidate_declarations",
-        CertaintyReason::AnalyzerAmbiguity { code } => code.as_str(),
-    }
-}
-
-fn proof_reason(value: &ProofReason) -> &str {
-    match value {
-        ProofReason::DirectStructuralMatch => "direct_structural_match",
-        ProofReason::ResolvedDeclaration => "resolved_declaration",
-        ProofReason::ResolvedReference => "resolved_reference",
-        ProofReason::ExactCallTarget => "exact_call_target",
-        ProofReason::DataflowWitness => "dataflow_witness",
-        ProofReason::TypestateWitness => "typestate_witness",
-        ProofReason::AmbiguousTarget => "ambiguous_target",
-        ProofReason::PartialWitness => "partial_witness",
-        ProofReason::AnalyzerEvidence { code } => code.as_str(),
-        ProofReason::AuthoredArmClosure { .. } => "authored_arm_closure",
-    }
-}
-
 const fn analysis_type(value: PolicyAnalysisType) -> &'static str {
     match value {
         PolicyAnalysisType::Match => "match",
@@ -3253,20 +3223,6 @@ const fn diagnostic_impact(value: PolicyDiagnosticImpact) -> &'static str {
     }
 }
 
-const fn certainty(value: &FindingCertainty) -> &'static str {
-    match value {
-        FindingCertainty::Definite => "definite",
-        FindingCertainty::Possible { .. } => "possible",
-    }
-}
-
-const fn completeness(value: &FindingCompleteness) -> &'static str {
-    match value {
-        FindingCompleteness::Complete => "complete",
-        FindingCompleteness::Partial { .. } => "partial",
-    }
-}
-
 const fn match_result_domain(value: MatchResultDomain) -> &'static str {
     match value {
         MatchResultDomain::StructuralMatch => "structural_match",
@@ -3309,27 +3265,6 @@ const fn location_relationship(value: PolicyLocationRelationship) -> &'static st
     }
 }
 
-const fn witness_step_kind(value: WitnessStepKind) -> &'static str {
-    match value {
-        WitnessStepKind::Source => "source",
-        WitnessStepKind::Propagation => "propagation",
-        WitnessStepKind::Call => "call",
-        WitnessStepKind::Return => "return",
-        WitnessStepKind::Sanitizer => "sanitizer",
-        WitnessStepKind::Transform => "transform",
-        WitnessStepKind::Transition => "transition",
-        WitnessStepKind::Violation => "violation",
-    }
-}
-
-const fn proof_state(value: ProofState) -> &'static str {
-    match value {
-        ProofState::Proven => "proven",
-        ProofState::Unproven => "unproven",
-        ProofState::Ambiguous => "ambiguous",
-    }
-}
-
 const fn cvss_nomenclature(value: CvssNomenclature) -> &'static str {
     match value {
         CvssNomenclature::B => "B",
@@ -3368,21 +3303,6 @@ const fn failure_reason(value: PolicyFailureReason) -> &'static str {
     }
 }
 
-const fn finding_incomplete_reason(value: FindingIncompleteReason) -> &'static str {
-    match value {
-        FindingIncompleteReason::QueryProvenanceTruncated => "query_provenance_truncated",
-        FindingIncompleteReason::RelatedLocationsTruncated => "related_locations_truncated",
-        FindingIncompleteReason::OriginsTruncated => "origins_truncated",
-        FindingIncompleteReason::SourceScenariosTruncated => "source_scenarios_truncated",
-        FindingIncompleteReason::TypestateScenariosTruncated => "typestate_scenarios_truncated",
-        FindingIncompleteReason::WitnessTruncated => "witness_truncated",
-        FindingIncompleteReason::EvidenceTruncated => "evidence_truncated",
-        FindingIncompleteReason::DeclaredNonExhaustive => "declared_non_exhaustive",
-        FindingIncompleteReason::ProofPartial => "proof_partial",
-        FindingIncompleteReason::StableAnchorWeak => "stable_anchor_weak",
-    }
-}
-
 fn diff_disposition(value: FindingDiffDisposition) -> &'static str {
     match value {
         FindingDiffDisposition::New => "new",
@@ -3403,6 +3323,8 @@ fn report_diagnostic_code(value: super::super::PolicyReportDiagnosticCode) -> &'
         Code::BaselineAuditRetentionExceeded => "baseline-audit-retention-exceeded",
         Code::PacksLoadFailed => "packs-load-failed",
         Code::PackActivationFailed => "pack-activation-failed",
+        Code::WorkspaceModelLoadFailed => "workspace-model-load-failed",
+        Code::WorkspaceModelInert => "workspace-model-inert",
         Code::PolicyLoadFailed => "policy-load-failed",
         Code::PolicyParseFailed => "policy-parse-failed",
         Code::PolicyValidationFailed => "policy-validation-failed",
@@ -3491,7 +3413,7 @@ mod tests {
         CvssEvidenceContentHash, CvssEvidenceSetHash, CvssMetric, CvssMetricEvidence,
         CvssMetricValue, CvssMetricValueToken, CvssUnscoredReason, CvssVersion, EvidenceRef,
         OpaqueFindingKey, PolicyDiagnosticCode, PolicyOverlayScope, SourceScenarioSetHash,
-        SourceSliceHash, VulnerabilityIdentity, WitnessId, WitnessStep,
+        SourceSliceHash, VulnerabilityIdentity, WitnessId, WitnessStep, WitnessStepKind,
     };
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
     use brokk_bifrost_analysis::analyzer::structural::CodeQueryDiagnosticCode;

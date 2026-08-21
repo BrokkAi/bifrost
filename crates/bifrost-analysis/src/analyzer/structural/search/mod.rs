@@ -206,6 +206,7 @@ pub use results::CodeQueryDiagnosticCode;
 pub use results::CodeQueryDiagnosticImpact;
 pub use results::CodeQueryDispatchOutcome;
 pub use results::CodeQueryDispatchTarget;
+pub use results::CodeQueryEnumDomain;
 pub use results::CodeQueryExecutionLimits;
 pub use results::CodeQueryExecutionWork;
 pub use results::CodeQueryExport;

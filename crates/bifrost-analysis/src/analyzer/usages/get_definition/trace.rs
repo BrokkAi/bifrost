@@ -234,6 +234,10 @@ pub enum TraceCompleteness {
 }
 
 impl TraceCompleteness {
+    /// The value domain the `resolution_candidate.trace_completeness` row
+    /// field publishes (issue #2515).
+    pub const LABELS: &'static [&'static str] = &["selection_only", "full"];
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::SelectionOnly => "selection_only",
@@ -1360,7 +1364,9 @@ mod boundary_evidence_tests {
             file.write(source).expect("write fixture source");
             let config = config(&root);
             let project = TestProject::new(root, language);
-            let workspace = WorkspaceAnalyzer::build(Arc::new(project) as Arc<dyn Project>, config);
+            let workspace =
+                WorkspaceAnalyzer::build_ephemeral(Arc::new(project) as Arc<dyn Project>, config)
+                    .expect("ephemeral workspace should build");
             Self {
                 _temp: temp,
                 workspace,

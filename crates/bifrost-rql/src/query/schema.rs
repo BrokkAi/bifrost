@@ -467,7 +467,7 @@ query_step_ops! {
     CallArguments { label: "call_arguments", signature: "call_argument_group -> call_argument", description: "Project the ordered argument rows of each argument-list group." }
     CallEffects { label: "call_effects", signature: "call_shape -> call_effect", description: "Project the direct effect rows of each call shape: one row per (dispatch arm, declared effect) for every callee an active semantic-model pack declares effects for, carrying the effect id, its execution timing, the certainty meet of the declaration and the dispatch proof, and the pack provenance. At least one row per call shape, so an unresolved, unmodeled or unsupported dispatch states that instead of answering empty. The callee set and its proof are the dispatch oracle's own answer; nothing is re-derived here.", semantic: [Procedures] }
     ProcedureEffects { label: "procedure_effects", signature: "declaration -> procedure_effect", description: "Summarize the effects of each procedure over its reachable call graph: one row per (procedure, effect id), classified direct or transitive, with the hop count, the certainty and timing carried along the attributing chain, a bounded witness chain of call-site identities, and the coverage that says whether an absent effect is proven absent or merely unseen. At least one row per declaration. The walk is a bounded deterministic fixpoint over the same dispatch answers call_effects publishes.", semantic: [Procedures] }
-    CallBindings { label: "call_bindings", signature: "call_shape -> call_binding", description: "Project the normalized actual-to-formal binding rows of each call shape: one row per actual, carrying the call-shape argument identity it binds, the formal ordinal and name it was bound to, the binding kind, this row's mapping status, and the whole call's partition coverage. At least one row per call shape, so an unreadable shape, an unresolved or ambiguous callee, unrecorded formals, or a call that passes nothing each state that instead of answering empty. The callee is the one the production definition resolver binds; no overload is re-decided here." }
+    CallBindings { label: "call_bindings", signature: "call_shape -> call_binding", description: "Project the normalized actual-to-formal binding rows of each call shape: one row per written actual, carrying the call-shape argument identity it binds, the formal ordinal and name it was bound to, the binding kind, this row's mapping status, and the whole call's partition coverage. Beside them, a row for each fact no written actual accounts for: the receiver the call is made against, an argument the language supplies with no syntax, and a formal that no actual passed but whose declaration carries a default. Coverage describes the written actuals alone. At least one row per call shape, so an unreadable shape, an unresolved or ambiguous callee, unrecorded formals, or a call that binds nothing each state that instead of answering empty. The callee is the one the production definition resolver binds; no overload is re-decided here." }
     CallableSignature { label: "callable_signature", signature: "declaration -> callable_signature", description: "Project the mandatory callable-signature rows of each declaration from the persisted signature contract: one row per persisted signature entry, so an overload set separates into one row per overload." }
     SignatureParameters { label: "signature_parameters", signature: "callable_signature -> signature_parameter", description: "Project the ordered declared parameter rows of each callable signature." }
     CallableApplicability { label: "callable_applicability", signature: "occurrence -> callable_applicability", description: "Project one applicability row per candidate callable the production resolver considered for each reference occurrence: the verdict, the typed callable rejection reason when inapplicable, the precedence tier, and whether the resolver bound it. A candidate the resolver refused stays visible with its reason, so a losing overload is evidence rather than an absence." }
@@ -2011,6 +2011,22 @@ pub const ALL_REFERENCE_KINDS: &[ReferenceKind] = &[
     ReferenceKind::Inheritance,
 ];
 
+/// The value domain the `reference_kind` row fields publish (issue #2515), in
+/// [`ALL_REFERENCE_KINDS`] order. Pinned by a unit test.
+pub const REFERENCE_KIND_LABELS: &[&str] = &[
+    "method_call",
+    "constructor_call",
+    "field_read",
+    "field_write",
+    "type_reference",
+    "static_reference",
+    "super_call",
+    "inheritance",
+];
+
+/// The value domain the `proof` row fields publish (issue #2515).
+pub const USAGE_PROOF_LABELS: &[&str] = &["proven", "unproven"];
+
 pub fn reference_kind_label(kind: ReferenceKind) -> &'static str {
     match kind {
         ReferenceKind::MethodCall => "method_call",
@@ -2249,6 +2265,18 @@ mod tests {
     use super::*;
     use brokk_bifrost_core::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
     use std::collections::HashSet;
+
+    /// The `reference_kind` row fields publish this list as their value
+    /// domain, so it must stay the exact image of `reference_kind_label` over
+    /// the registry (issue #2515).
+    #[test]
+    fn every_reference_kind_label_is_published_in_registry_order() {
+        let mapped = ALL_REFERENCE_KINDS
+            .iter()
+            .map(|kind| reference_kind_label(*kind))
+            .collect::<Vec<_>>();
+        assert_eq!(mapped, REFERENCE_KIND_LABELS);
+    }
 
     #[test]
     fn rql_schema_lineage_defaults_to_the_head_and_accepts_exact_pins() {

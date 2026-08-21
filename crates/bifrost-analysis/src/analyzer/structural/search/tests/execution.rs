@@ -1541,10 +1541,11 @@ fn arity_predicate_selects_a_call_overload_by_argument_count() {
     ProjectFile::new(root.clone(), "Sink.java")
         .write(source)
         .expect("write java source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::Java)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
 
     let match_texts = |query_source: &str| -> Vec<String> {
         let query = CodeQuery::from_source(query_source).expect("arity selector should parse");

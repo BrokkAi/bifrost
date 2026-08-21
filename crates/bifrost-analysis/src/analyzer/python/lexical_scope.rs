@@ -12,8 +12,8 @@
 //! its zero-based lines -- the layout lookup compares byte offsets only, so
 //! changing the line base here would be a silent behavior change.
 
+use crate::analyzer::Language;
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner_bounded;
-use crate::analyzer::{Language, Range};
 use brokk_bifrost_python::bindings::PythonLexicalScopeInventory;
 use tree_sitter::Node;
 
@@ -26,18 +26,8 @@ pub(crate) fn python_lexical_scope_inventory_bounded<'tree>(
         Language::Python,
         callable,
         source,
-        &node_range(callable),
         &mut scope_step,
     )?;
     let parameter_names = layout.slots.into_iter().flat_map(|slot| slot.names);
     PythonLexicalScopeInventory::collect_bounded(callable, source, parameter_names, scope_step)
-}
-
-fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
-    }
 }

@@ -229,14 +229,12 @@ const EXACT_PATH_SYMBOL_FQN_SQL: &str =
 /// table against the counts `blob_meta` recorded.
 ///
 /// It costs 14 correlated scalar subqueries per requested key. Keep it on the
-/// paths that exist to verify a cache -- the startup reconcile in
-/// [`StartupCacheValidation::FullIntegrity`] mode, the post-write check in
-/// `insert_blob_meta_tx`, and the explicit `contains_parsed_blob` /
+/// paths that exist to verify a cache -- the post-write check in
+/// `insert_blob_meta_tx` and the explicit `contains_parsed_blob` /
 /// `parsed_blob_keys` presence checks -- and off the read path, which asks the
 /// same question millions of times per cold start. See
 /// [`read_path_parsed_blob_condition`].
 ///
-/// [`StartupCacheValidation::FullIntegrity`]: crate::analyzer::tree_sitter_analyzer::StartupCacheValidation::FullIntegrity
 static PARSED_BLOB_INTEGRITY_CONDITION: LazyLock<String> = LazyLock::new(|| {
     let mut condition = "
 meta.is_complete = 1
@@ -1089,7 +1087,7 @@ impl AnalyzerStore {
         if gitblob::discover(workspace_root).is_some() {
             Self::open_persistent(&analyzer_db_path(workspace_root))
         } else {
-            Self::open_in_memory()
+            Self::open_ephemeral()
         }
     }
 
@@ -1137,14 +1135,14 @@ impl AnalyzerStore {
     /// reader pool works uniformly: an `:memory:` DB is private to a single
     /// connection, which a reader pool could never share. The temp file runs in
     /// WAL at page-cache speed. `db_path()` still reports `None` and
-    /// `is_in_memory()` still reports `true` — these mark "no persistent
+    /// `is_ephemeral()` still reports `true` — these mark "no persistent
     /// workspace identity", which is exactly what an ephemeral store is,
     /// independent of the on-disk backing.
     ///
     /// Documented fallback: if the temp-file backing cannot be established on
     /// this platform, fall back to a single in-memory connection whose reads
     /// route through the writer (no read parallelism, but correct).
-    pub fn open_in_memory() -> Result<Self> {
+    pub fn open_ephemeral() -> Result<Self> {
         match Self::open_ephemeral_temp_file() {
             Ok(store) => Ok(store),
             Err(_) => Self::open_in_memory_single_connection(),
@@ -1356,8 +1354,16 @@ impl AnalyzerStore {
         self.db_path.as_deref()
     }
 
-    pub fn is_in_memory(&self) -> bool {
+    pub fn is_ephemeral(&self) -> bool {
         self.db_path.is_none()
+    }
+
+    pub(crate) fn has_published_analyzer_rows(&self) -> Result<bool> {
+        let connection = self.read_conn()?;
+        Ok(connection
+            .query_row("SELECT 1 FROM analysis_epochs LIMIT 1", [], |_| Ok(()))
+            .optional()?
+            .is_some())
     }
 
     pub fn register_blobs(&self, oids: &[Oid], lang: &str, generation: GenerationId) -> Result<()> {
@@ -1517,36 +1523,6 @@ impl AnalyzerStore {
             }
         }
         Ok(out)
-    }
-
-    /// The keys a `FullIntegrity` startup reconcile must reparse.
-    ///
-    /// This is the one batched caller that keeps
-    /// [`PARSED_BLOB_INTEGRITY_CONDITION`]: verifying the cache is what the mode
-    /// is for, so a blob whose fact rows were deleted outside Bifrost is
-    /// reported missing here and repaired by a reparse. A service build opts
-    /// into the cheaper published-key check instead; see
-    /// [`Self::missing_published_parsed_blob_keys_at_generations`].
-    pub(crate) fn missing_parsed_blob_keys_at_generations(
-        &self,
-        entries: &[(Oid, String)],
-        generations: &HashMap<String, GenerationId>,
-    ) -> Result<Vec<(Oid, String)>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_generation_map(
-            &tx,
-            generations,
-            entries.iter().map(|(_, lang)| lang.as_str()),
-        )?;
-        let present = verified_parsed_blob_keys_conn(&tx, entries)?;
-        tx.commit()?;
-        let mut seen = HashSet::default();
-        Ok(entries
-            .iter()
-            .filter(|entry| seen.insert((*entry).clone()) && !present.contains(*entry))
-            .cloned()
-            .collect())
     }
 
     pub(crate) fn missing_published_parsed_blob_keys_at_generations(
@@ -11321,7 +11297,7 @@ mod tests {
             .insert(target.clone(), metadata.to_vec());
         let state = Arc::new(state);
 
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store
             .ensure_language_epoch_value(lang, "signature-metadata-round-trip")
             .unwrap();
@@ -11496,7 +11472,7 @@ mod tests {
             ],
         );
         let state = Arc::new(state);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store
             .ensure_language_epoch_value("ruby", "oversized-signature-metadata-write-v1")
             .unwrap();
@@ -11579,7 +11555,7 @@ mod tests {
             )],
         );
         let state = Arc::new(state);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store
             .ensure_language_epoch_value("ruby", "clamped-signature-label-write-v1")
             .unwrap();
@@ -11622,7 +11598,7 @@ mod tests {
     /// on a table measured at two million rows.
     #[test]
     fn signature_metadata_readers_seek_the_primary_key() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
         let explain = |sql: &str, parameters: &[&str]| {
             let mut statement = conn
@@ -11708,7 +11684,7 @@ mod tests {
         );
         let state = parse_state(&JavaAdapter, &file);
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store
             .ensure_language_epoch_value("java", "limited-content-package-row-bytes-v1")
             .unwrap();
@@ -11759,7 +11735,7 @@ mod tests {
         );
         let state = parse_state(&JavaAdapter, &file);
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store
             .ensure_language_epoch_value("java", "limited-fallback-qualifier-row-bytes-v1")
             .unwrap();
@@ -11849,7 +11825,7 @@ mod tests {
         );
         let state = parse_state(&JavaAdapter, &file);
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store
             .ensure_language_epoch_value("java", "limited-fallback-qualifier-scan-v1")
             .unwrap();
@@ -11913,7 +11889,7 @@ mod tests {
         let state = parse_state(&GoAdapter, &file);
         assert_eq!(state.imports.len(), 1, "fixture should persist one import");
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store
             .ensure_language_epoch_value("go", "limited-import-row-bytes-v1")
             .unwrap();
@@ -11965,7 +11941,7 @@ mod tests {
         let state = parse_state(&GoAdapter, &file);
         assert_eq!(state.imports.len(), 2, "fixture should persist two imports");
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store
             .ensure_language_epoch_value("go", "limited-import-count-integrity-v1")
             .unwrap();
@@ -12025,7 +12001,7 @@ mod tests {
             "fixture should persist a supertype lookup path"
         );
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store
             .ensure_language_epoch_value("scala", "limited-supertype-row-bytes-v1")
             .unwrap();
@@ -12085,7 +12061,7 @@ mod tests {
         );
         let state = parse_state(&JavaAdapter, &file);
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store
             .ensure_language_epoch_value("java", "limited-candidate-row-bytes-v1")
             .unwrap();
@@ -12161,7 +12137,7 @@ mod tests {
     fn non_git_root_uses_in_memory_store_and_roundtrips_registry() {
         let temp = tempfile::TempDir::new().unwrap();
         let store = AnalyzerStore::open_for_workspace(temp.path()).unwrap();
-        assert!(store.is_in_memory());
+        assert!(store.is_ephemeral());
         assert!(store.db_path().is_none());
 
         let one = Oid::hash_object(ObjectType::Blob, b"one").unwrap();
@@ -12299,7 +12275,7 @@ mod tests {
 
     #[test]
     fn parsed_blob_presence_requires_completed_parse_rows() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let oid = Oid::hash_object(ObjectType::Blob, b"class Registered:\n    pass\n").unwrap();
 
         store
@@ -12332,7 +12308,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&ScalaAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_generation = store
             .ensure_language_epoch_value("scala", PRE_EMPTY_LAMBDA_EPOCH)
             .unwrap();
@@ -12374,7 +12350,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&ScalaAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::scala_epoch_before_tree_sitter_scala_0_26_2();
         let prior_generation = store
             .ensure_language_epoch_value("scala", &prior_epoch)
@@ -12413,7 +12389,7 @@ mod tests {
         let file = write_file(temp.path(), "Model.java", "class Model { int value; }\n");
         let state = Arc::new(parse_state(&JavaAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store
             .ensure_language_epoch_value("java", "structural-snapshot-v1")
             .unwrap();
@@ -12557,7 +12533,7 @@ mod tests {
         let file = write_file(temp.path(), "Model.java", "class Model {}\n");
         let state = parse_state(&JavaAdapter, &file);
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let old_generation = store
             .ensure_language_epoch_value("java", "snapshot-old-generation")
             .unwrap();
@@ -12615,7 +12591,7 @@ mod tests {
         let java_oid = oid_for(java_file.read_to_string().unwrap().as_bytes());
         let incomplete_oid = oid_for(b"registered but not parsed");
         let missing_oid = oid_for(b"not registered");
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
                 python_oid,
@@ -12667,14 +12643,6 @@ mod tests {
                 .iter()
                 .all(|oid| missing.contains(&(*oid, "python".to_string())))
         );
-        let generations = ["python", "java", "rust"]
-            .into_iter()
-            .map(|lang| (lang.to_string(), GenerationId::BOOTSTRAP))
-            .collect();
-        let startup_missing = store
-            .missing_parsed_blob_keys_at_generations(&entries, &generations)
-            .unwrap();
-        assert_eq!(startup_missing, missing);
     }
 
     #[test]
@@ -12839,7 +12807,7 @@ mod tests {
     /// ones (issue #2316).
     #[test]
     fn search_candidate_name_plan_is_driven_by_the_live_blob_set() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
         sync_active_blob_oids(&conn, &[]).unwrap();
         let langs = vec!["rust".to_string(), "python".to_string()];
@@ -12989,7 +12957,7 @@ mod tests {
 
     #[test]
     fn generation_map_requires_a_token_for_every_requested_storage_language() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let typescript = store
             .ensure_language_epoch_value("typescript:ts", "ts-epoch")
             .unwrap();
@@ -13020,7 +12988,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path();
         let adapter = JavaAdapter;
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         for (path, source) in [
             ("src/a_b/One.java", "package a_b; class One {}\n"),
             (
@@ -13078,7 +13046,7 @@ mod tests {
 
     #[test]
     fn unchanged_path_symbol_snapshot_skips_table_reconciliation() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let row = PathSymbolRow {
             rel_path: "pkg/model.py".to_string(),
             blob_oid: oid_for(b"class Model:\n    pass\n"),
@@ -13137,7 +13105,7 @@ mod tests {
     /// charged 56.2 us per key on the firefox cold start.
     #[test]
     fn read_path_membership_query_seeks_keys_without_reading_fact_tables() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
         let sql = parsed_blob_keys_sql(2, "", read_path_parsed_blob_condition());
         let mut statement = conn
@@ -13195,7 +13163,7 @@ mod tests {
 
     #[test]
     fn python_exact_path_symbol_lookup_uses_fqn_index() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
         let mut stmt = conn
             .prepare(&format!("EXPLAIN QUERY PLAN {EXACT_PATH_SYMBOL_FQN_SQL}"))
@@ -13229,7 +13197,7 @@ mod tests {
         let oid = oid_for(source.as_bytes());
         let adapter = JavaAdapter;
         let state = parse_state(&adapter, &file);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "java", &adapter, &state)
             .unwrap();
@@ -13287,7 +13255,7 @@ mod tests {
         let oid = oid_for(source.as_bytes());
         let adapter = JavaAdapter;
         let state = parse_state(&adapter, &file);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "java", &adapter, &state)
             .unwrap();
@@ -13317,7 +13285,7 @@ mod tests {
         let oid = oid_for(source.as_bytes());
         let adapter = JavaAdapter;
         let state = parse_state(&adapter, &file);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "java", &adapter, &state)
             .unwrap();
@@ -13363,7 +13331,7 @@ mod tests {
         let oid = oid_for(source.as_bytes());
         let adapter = JavaAdapter;
         let state = parse_state(&adapter, &file);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "java", &adapter, &state)
             .unwrap();
@@ -13471,7 +13439,7 @@ mod tests {
         );
         let adapter = JavaAdapter;
         let state = parse_state(&adapter, &file);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         for index in 0..blobs {
             let oid = oid_for(format!("sample blob {index}").as_bytes());
             store
@@ -13576,7 +13544,7 @@ mod tests {
         let oid = oid_for(source.as_bytes());
         let adapter = PythonAdapter;
         let state = parse_state(&adapter, &file);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "python", &adapter, &state)
             .unwrap();
@@ -13605,7 +13573,7 @@ mod tests {
         let file = write_file(temp.path(), "pkg/unknown.py", "class Unknown:\n    pass\n");
         let source = file.read_to_string().unwrap();
         let oid = oid_for(source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
                 oid,
@@ -13643,7 +13611,7 @@ mod tests {
         );
         let source = file.read_to_string().unwrap();
         let oid = oid_for(source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "cpp", &CppAdapter, &parse_state(&CppAdapter, &file))
             .unwrap();
@@ -13760,7 +13728,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         // Recompute the immediately preceding C++ epoch for this target from
         // the complete pre-#1208 language salt, rather than passing an
         // arbitrary old label through the store's generic epoch API. The live
@@ -13807,7 +13775,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_complete_sentinel_class_tail();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
@@ -13849,7 +13817,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_sentinel_class_before_member_callable();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
@@ -13896,7 +13864,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_namespaced_plain_fragment_boundary();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
@@ -13941,7 +13909,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_templated_plain_fragment_ownership();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
@@ -13985,7 +13953,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_macro_displaced_callable_name();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
@@ -14027,7 +13995,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_explicit_object_callable_arity();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
@@ -14069,7 +14037,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_macro_template_return_free_function_ownership();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
@@ -14115,7 +14083,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_c_header_projection();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
@@ -14151,7 +14119,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_c_tag_scope();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
@@ -14213,7 +14181,7 @@ mod tests {
 
         let state = Arc::new(parse_state(&CppAdapter, &c_file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let epochs = CppAdapter
             .storage_language_keys()
             .into_iter()
@@ -14252,7 +14220,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_abstract_reference_declarator_identity();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
@@ -14293,7 +14261,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_structured_callable_parameter_types();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
@@ -14336,7 +14304,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_plain_fragmented_class_sibling_ownership();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
@@ -14388,7 +14356,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_fragmented_export_sibling_class_parent_scope();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
@@ -14438,7 +14406,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_macro_decorated_template_class_scope();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
@@ -14487,7 +14455,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_conditional_alias_physical_ranges();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
@@ -14531,7 +14499,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&CppAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::cpp_epoch_before_macro_argument_typedef_declarator();
         let prior_generation = store
             .ensure_language_epoch_value("cpp", &prior_epoch)
@@ -14574,7 +14542,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&TypescriptAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::typescript_epoch_before_inline_return_type_members();
         let prior_generation = store
             .ensure_language_epoch_value("typescript", &prior_epoch)
@@ -14617,7 +14585,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&PhpAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::php_epoch_before_conditional_free_function_declarations();
         let prior_generation = store
             .ensure_language_epoch_value("php", &prior_epoch)
@@ -14657,7 +14625,7 @@ mod tests {
         );
         let state = Arc::new(parse_state(&ScalaAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
 
         // Commit 20f61961 recovered declarations that tree-sitter attaches to
         // malformed significant-indentation template bodies. That changed
@@ -14746,7 +14714,7 @@ mod tests {
         let oid = oid_for(source.as_bytes());
         let adapter = PythonAdapter;
         let state = parse_state(&adapter, &file);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
 
         store
             .write_parsed_blob(oid, "python", &adapter, &state)
@@ -14768,7 +14736,7 @@ mod tests {
 
     #[test]
     fn gc_drops_unreachable_blob_registry_rows() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let reachable = Oid::hash_object(ObjectType::Blob, b"reachable").unwrap();
         let unreachable = Oid::hash_object(ObjectType::Blob, b"unreachable").unwrap();
         store
@@ -14799,7 +14767,7 @@ mod tests {
         let java_state = parse_state(&java, &java_file);
         let ts_state = parse_state(&ts, &ts_file);
 
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .ensure_language_epoch_value("java", "epoch-a")
             .unwrap();
@@ -14836,7 +14804,7 @@ mod tests {
         // Epoch visibility is keyed by storage language independently of the parser adapter.
         let adapter = JavaAdapter;
         let state = parse_state(&adapter, &file);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store.ensure_language_epoch_value("cpp", "epoch-a").unwrap();
         store
             .write_parsed_blob(oid, "cpp", &adapter, &state)
@@ -14878,7 +14846,7 @@ mod tests {
         let file = write_file(temp.path(), "Model.java", "class Model {}\n");
         let oid = oid_for(file.read_to_string().unwrap().as_bytes());
         let state = parse_state(&JavaAdapter, &file);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
 
         let a1 = store
             .ensure_language_epoch_value("java", "epoch-a")
@@ -14911,7 +14879,7 @@ mod tests {
         let file = write_file(temp.path(), "Model.java", "class Model {}\n");
         let oid = oid_for(file.read_to_string().unwrap().as_bytes());
         let state = Arc::new(parse_state(&JavaAdapter, &file));
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let a = store
             .ensure_language_epoch_value("java", "epoch-a")
             .unwrap();
@@ -14972,7 +14940,7 @@ mod tests {
         let file = write_file(temp.path(), "Model.java", "class Model {}\n");
         let oid = oid_for(file.read_to_string().unwrap().as_bytes());
         let state = parse_state(&JavaAdapter, &file);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let a = store.ensure_language_epoch_value("java", "a").unwrap();
         store
             .write_parsed_blob_at_generation(oid, "java", a, &JavaAdapter, &state)
@@ -15175,7 +15143,7 @@ mod tests {
         );
         let oid = oid_for(file.read_to_string().unwrap().as_bytes());
         let state = parse_state(&JavaAdapter, &file);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let a = store.ensure_language_epoch_value("java", "a").unwrap();
         store
             .write_parsed_blob_at_generation(oid, "java", a, &JavaAdapter, &state)
@@ -15226,7 +15194,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(temp.path(), "Model.java", "class Model {}\n");
         let state = Arc::new(parse_state(&JavaAdapter, &file));
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store.reset_replacement_cost_lookup_queries_for_test();
         let prepared = (0..PREPARED_BLOBS)
             .map(|index| {
@@ -15273,7 +15241,7 @@ mod tests {
             write_file(temp.path(), "Replacement.java", "class Replacement {}\n");
         let old_state = parse_state(&JavaAdapter, &old_file);
         let replacement_state = Arc::new(parse_state(&JavaAdapter, &replacement_file));
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation_a = store
             .ensure_language_epoch_value("java", "replacement-query-a")
             .unwrap();
@@ -15355,7 +15323,7 @@ mod tests {
             "package café; class Résumé { String naïve; }\n",
         );
         let state = Arc::new(parse_state(&JavaAdapter, &file));
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation_a = store
             .ensure_language_epoch_value("java", "unicode-legacy-a")
             .unwrap();
@@ -15432,7 +15400,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(temp.path(), "Model.java", "class Model {}\n");
         let state = Arc::new(parse_state(&JavaAdapter, &file));
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation_a = store
             .ensure_language_epoch_value("java", "conflicting-generation-a")
             .unwrap();
@@ -15493,7 +15461,7 @@ mod tests {
         let complete_oid = oid_for(b"complete replacement cost");
         let root_only_oid = oid_for(b"root-only replacement cost");
         let missing_oid = oid_for(b"missing replacement cost");
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store
             .ensure_language_epoch_value("java", "mixed-replacement-costs")
             .unwrap();
@@ -15594,7 +15562,7 @@ mod tests {
 
     #[test]
     fn replacement_cost_set_uses_only_bounded_primary_key_probes() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
         let explain = |query: &str, parameters: &[&str]| {
             let sql = format!("EXPLAIN QUERY PLAN {query}");
@@ -15677,7 +15645,7 @@ mod tests {
     // 443.1 s on the measured workspaces).
     #[test]
     fn identifier_prefix_lookup_seeks_the_identifier_index() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
         let sql = format!("EXPLAIN QUERY PLAN {}", identifier_prefix_candidate_sql());
         let mut statement = conn.prepare(&sql).unwrap();
@@ -15727,7 +15695,7 @@ mod tests {
         let sample = make(99);
         let row_cap = sample.logical_rows().saturating_mul(2);
         let byte_cap = sample.payload_bytes().saturating_mul(2);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let (_, stats) = store.persist_prepared_blobs(
             vec![make(0), make(1), make(2)],
             PersistBatchLimits {
@@ -15756,7 +15724,7 @@ mod tests {
         let peer_state = Arc::new(parse_state(&JavaAdapter, &peer_file));
         let replaced_oid = oid_for(b"replaced logical identity");
         let peer_oid = oid_for(b"peer logical identity");
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation_a = store
             .ensure_language_epoch_value("java", "replacement-budget-a")
             .unwrap();
@@ -15848,7 +15816,7 @@ mod tests {
         let (bad_oid, mut bad) = prepare(b"bad");
         bad.inject_invalid_range_for_test();
         let (good_b_oid, good_b) = prepare(b"good-b");
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
 
         let (outcomes, stats) = store.persist_prepared_blobs(
             vec![good_a, bad, good_b],
@@ -15967,7 +15935,7 @@ mod tests {
         let oid = oid_for(source.as_bytes());
         let adapter = PythonAdapter;
         let parsed = parse_state(&adapter, &python_file);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "python", &adapter, &parsed)
             .unwrap();
@@ -16016,7 +15984,7 @@ mod tests {
 
         let source = python_file.read_to_string().unwrap();
         let oid = oid_for(source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(
                 oid,
@@ -16082,7 +16050,7 @@ mod tests {
         let adapter = PythonAdapter;
         let state_a = parse_state(&adapter, &file_a);
         let state_b = parse_state(&adapter, &file_b);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
 
         store
             .write_parsed_blob(oid, "python", &adapter, &state_a)
@@ -16169,7 +16137,7 @@ mod tests {
         assert_eq!((boundary_in_tail, pop), (0, 0));
         assert_eq!(tail, "JsError.describe");
 
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "rust", &adapter, &state)
             .unwrap();
@@ -16218,7 +16186,7 @@ mod tests {
         assert_eq!((boundary_in_tail, pop), (0, 0));
         assert_eq!(tail, "Client.connect");
 
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "rust", &adapter, &state)
             .unwrap();
@@ -16293,7 +16261,7 @@ mod tests {
         assert_eq!((boundary_in_tail, pop), (0, 0));
         assert_eq!(tail, "m.T.f");
 
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "rust", &adapter, &state)
             .unwrap();
@@ -16335,7 +16303,7 @@ mod tests {
         assert_eq!((boundary_in_tail, pop), (1, 0));
         assert_eq!(tail, "foo.Bar.f");
 
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "rust", &adapter, &state)
             .unwrap();
@@ -16371,7 +16339,7 @@ mod tests {
         assert_eq!((boundary_in_tail, pop), (0, 1));
         assert_eq!(tail, "T.f");
 
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "rust", &adapter, &state)
             .unwrap();
@@ -16408,7 +16376,7 @@ mod tests {
         assert_eq!(mode, FQ_SEGMENTS_FULL);
         assert_eq!(tail, "serde.Value.f");
 
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "rust", &adapter, &state)
             .unwrap();
@@ -16449,7 +16417,7 @@ mod tests {
         let go_state = Arc::new(parse_state(&GoAdapter, &go_file));
         let go_oid = oid_for(go_state.source.as_bytes());
 
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_rust_generation = store
             .ensure_language_epoch_value("rust", &epoch::rust_epoch_before_anchored_fq_encoding())
             .unwrap();
@@ -16504,7 +16472,7 @@ mod tests {
         let oid = oid_for(content.as_bytes());
         let adapter = GoAdapter;
         let state = parse_state(&adapter, &file_a);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
 
         store
             .write_parsed_blob(oid, "go", &adapter, &state)
@@ -16547,7 +16515,7 @@ mod tests {
         let oid = oid_for(file.read_to_string().unwrap().as_bytes());
         let adapter = JavaAdapter;
         let state = parse_state(&adapter, &file);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
 
         store
             .write_parsed_blob(oid, "java", &adapter, &state)
@@ -16561,7 +16529,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_blob_oid_hex() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().unwrap();
         let err = conn
             .execute(
@@ -16574,7 +16542,7 @@ mod tests {
 
     #[test]
     fn rejects_inverted_unit_range() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().unwrap();
         insert_test_blob_and_unit(&conn);
         let err = conn
@@ -16590,7 +16558,7 @@ mod tests {
 
     #[test]
     fn rejects_self_parent_child_edge() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().unwrap();
         insert_test_blob_and_unit(&conn);
         let err = conn
@@ -16605,7 +16573,7 @@ mod tests {
 
     #[test]
     fn rejects_satellite_row_without_code_unit_parent() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
@@ -16624,7 +16592,7 @@ mod tests {
 
     #[test]
     fn rejects_forbidden_persisted_code_unit_kinds() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
@@ -16666,7 +16634,7 @@ mod tests {
         let source = file.read_to_string().unwrap();
         let oid = oid_for(source.as_bytes());
         let parsed = parse_state(adapter, file);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, lang, adapter, &parsed)
             .unwrap();
@@ -16687,11 +16655,11 @@ mod tests {
         let source = file.read_to_string().unwrap();
         let oid = oid_for(source.as_bytes());
         let parsed = Arc::new(parse_state(adapter, file));
-        let legacy = AnalyzerStore::open_in_memory().unwrap();
+        let legacy = AnalyzerStore::open_ephemeral().unwrap();
         legacy
             .write_parsed_blob(oid, lang, adapter, parsed.as_ref())
             .unwrap();
-        let prepared_store = AnalyzerStore::open_in_memory().unwrap();
+        let prepared_store = AnalyzerStore::open_ephemeral().unwrap();
         let prepared = AnalyzerStore::prepare_parsed_blob(
             oid,
             lang,
@@ -16747,7 +16715,7 @@ mod tests {
         let source = file.read_to_string().unwrap();
         let oid = oid_for(source.as_bytes());
         let parsed = parse_state(adapter, file);
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, lang, adapter, &parsed)
             .unwrap();
@@ -17149,7 +17117,7 @@ mod tests {
     #[test]
     fn import_rows_hydrate_what_the_frozen_blob_decoder_produced() {
         let imports = import_shape_fixture();
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         write_import_fixture(&store, "rust", &imports);
 
         let conn = store.conn.lock().expect("store mutex");
@@ -17171,7 +17139,7 @@ mod tests {
     #[test]
     fn import_child_rows_follow_the_structured_path() {
         let imports = import_shape_fixture();
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         write_import_fixture(&store, "rust", &imports);
         let conn = store.conn.lock().expect("store mutex");
 
@@ -17213,7 +17181,7 @@ mod tests {
     #[test]
     fn deleting_a_blob_cascades_every_import_table() {
         let imports = import_shape_fixture();
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         write_import_fixture(&store, "rust", &imports);
         let conn = store.conn.lock().expect("store mutex");
         conn.execute("DELETE FROM blobs WHERE blob_oid = ?1", [TEST_OID])
@@ -17238,7 +17206,7 @@ mod tests {
     /// The schema, not Rust, rejects a malformed import row.
     #[test]
     fn import_row_constraints_are_enforced_by_the_schema() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
         conn.execute(
             "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
@@ -17329,7 +17297,7 @@ mod tests {
 
         let dump = |file: &ProjectFile| {
             let state = parse_state(&ScalaAdapter, file);
-            let store = AnalyzerStore::open_in_memory().unwrap();
+            let store = AnalyzerStore::open_ephemeral().unwrap();
             store
                 .write_parsed_blob(oid, "scala", &ScalaAdapter, &state)
                 .unwrap();
@@ -17420,7 +17388,7 @@ mod tests {
 
         let source = file.read_to_string().unwrap();
         let oid = oid_for(source.as_bytes());
-        let prepared = AnalyzerStore::open_in_memory().unwrap();
+        let prepared = AnalyzerStore::open_ephemeral().unwrap();
         let generation = prepared
             .ensure_language_epoch_value("scala", "import-cost-accounting-v1")
             .unwrap();
@@ -17432,7 +17400,7 @@ mod tests {
             Arc::new(state.clone()),
         )
         .unwrap();
-        let direct = AnalyzerStore::open_in_memory().unwrap();
+        let direct = AnalyzerStore::open_ephemeral().unwrap();
         let direct_generation = direct
             .ensure_language_epoch_value("scala", "import-cost-accounting-v1")
             .unwrap();
@@ -17461,7 +17429,7 @@ mod tests {
     /// they must not need an ordering b-tree either.
     #[test]
     fn import_reads_use_the_import_primary_keys() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
         let explain = |query: &str, parameters: &[&str]| {
             let sql = format!("EXPLAIN QUERY PLAN {query}");
@@ -17607,7 +17575,7 @@ mod tests {
             }
         }
 
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store
             .ensure_language_epoch_value("ruby", "materialization-round-trip-v1")
             .unwrap();
@@ -18278,7 +18246,7 @@ mod tests {
 
     #[test]
     fn rust_module_import_candidates_seek_occurrences_then_blob_import_rows() {
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
         let mut statement = conn
             .prepare(&format!(
@@ -18363,7 +18331,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(temp.path(), "src/lib.rs", RUST_USAGE_FACT_FIXTURE);
         let oid = oid_for(RUST_USAGE_FACT_FIXTURE.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
             .unwrap();
@@ -18604,7 +18572,7 @@ include!(\"generated/table.rs\");
     fn rust_usage_fact_store(temp: &Path) -> (AnalyzerStore, Oid) {
         let file = write_file(temp, "src/lib.rs", RUST_USAGE_FACT_FIXTURE);
         let oid = oid_for(RUST_USAGE_FACT_FIXTURE.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
             .unwrap();
@@ -18637,7 +18605,7 @@ replay! { mod replayed; }
     fn rust_module_route_store(temp: &Path, rel_path: &str) -> (AnalyzerStore, Oid) {
         let file = write_file(temp, rel_path, RUST_MODULE_ROUTE_FIXTURE);
         let oid = oid_for(RUST_MODULE_ROUTE_FIXTURE.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "rust", &RustAdapter, &parse_state(&RustAdapter, &file))
             .unwrap();
@@ -18662,7 +18630,7 @@ replay! { mod replayed; }
     ) -> Vec<String> {
         let state = parse_state(adapter, file);
         let oid = oid_for(state.source.as_bytes());
-        let store = AnalyzerStore::open_in_memory().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store
             .ensure_language_epoch_value(lang, "short-name-vocabulary-pin-v1")
             .unwrap();

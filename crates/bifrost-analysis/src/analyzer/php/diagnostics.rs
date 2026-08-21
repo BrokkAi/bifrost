@@ -30,7 +30,7 @@ pub(crate) fn collect_php_semantic_diagnostics(
     let Some(php) = resolve_analyzer::<PhpAnalyzer>(analyzer) else {
         return SemanticDiagnosticReport::new();
     };
-    let support = analyzer.global_usage_definition_index();
+    let support = crate::analyzer::AnalyzerDefinitionLookup::new(analyzer, Language::None);
     // Both reads are of state a host already published. Neither starts
     // dependency discovery nor touches a vendor tree.
     let external = AnalyzerPhpExternalSurface {

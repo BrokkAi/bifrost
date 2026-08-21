@@ -167,6 +167,33 @@ package, and attaches it to the existing GitHub Release. If you perform those
 packaging steps manually, run the same script against the release `dist/`
 directory instead of hand-editing checksums.
 
+### Changelog
+
+Before tagging each release, update `CHANGELOG.md` with a concise, curated
+summary of meaningful public changes. Group related work by capability or user
+impact, and call out compatibility changes, migrations, and notable fixes when
+they apply. Do not copy commit subjects, enumerate commits, or use a tag
+comparison as the release notes.
+
+The public repository is projected from this private canonical source, so its
+commit history is not a complete record of the work in a release. Derive each
+entry from the complete private release range, while keeping private
+implementation details and private-only capabilities out of the public
+changelog. GitHub-generated release notes and tag comparisons are supplemental;
+they do not replace the curated entry.
+
+Keep an `Unreleased` entry for the next intended version at the top of the
+changelog. Preview the exact GitHub Release body during release preparation:
+
+```bash
+node scripts/public/extract-changelog-entry.mjs --version X.Y.Z
+```
+
+Before tagging, replace `Unreleased` with the actual release date. The release
+workflow extracts the same entry from the qualified tag and fails rather than
+falling back to generated pull-request notes when it is missing, duplicated, or
+empty.
+
 To cut a release:
 
 1. Audit every publishable workspace crate against the inventory below.
@@ -179,16 +206,19 @@ To cut a release:
    Do not merge the moving `master` tip into the RC branch during stabilization;
    bring over only changes that are deliberately required for the release.
 3. Regenerate the tracked projection inventory from the frozen RC commit, using
-   the checked-in inventory as its baseline. Review every new or mode-changed
-   path left with a `review` decision, record each explicit `public` or
-   `private` approval, and inspect the inventory diff before cutting the tag.
+   the checked-in deterministic namespace shards as its baseline. Review every
+   new or mode-changed path left with a `review` decision, record each explicit
+   `public` or `private` approval, and inspect the affected shard diffs before
+   cutting the tag. Do not combine or omit shards: their union is the exact
+   fail-closed inventory.
    Private-only paths and other private additions remain outside the public
    projection. Do not proceed while the inventory is unreviewed or the
    projection reports an unclassified source path.
 4. On the RC branch, bump `[workspace.package].version` in `Cargo.toml`, run the
-   version-sync command above, and review the generated metadata. Release
-   workflows generate the Rust dependency report from the tagged `Cargo.lock`;
-   it is not committed.
+   version-sync command above, update `CHANGELOG.md` for the release, and review
+   the generated metadata and curated changelog entry. Release workflows
+   generate the Rust dependency report from the tagged `Cargo.lock`; it is not
+   committed.
 5. If agents, launcher files, MCP config, or plugin manifests changed, validate
    the plugin bundles:
 
@@ -425,7 +455,14 @@ the VS Code release attachment and Marketplace publication separately.
 
 Use one explicit handoff from source projection to release publication:
 
-1. Project the reviewed private source commit to public `master`, then wait for
+0. Cut a release branch in the private repository at the reviewed source
+   commit, and treat that branch as the release line for every later step. A
+   qualification takes about an hour and private `master` takes a commit every
+   few minutes, so a correction based on the qualified source is routinely not
+   a fast-forward of `master` by the time it can be made. The release branch is
+   the ref that holds still for the length of a release. Merge it back into
+   `master` after the tag exists.
+1. Project the release branch's commit to public `master`, then wait for
    public CI to validate that projection.
 2. Dispatch `Release readiness` from the public repository with the exact
    public commit, release version, and independently observed public head.
@@ -440,11 +477,17 @@ Use one explicit handoff from source projection to release publication:
    sidecars are the first point at which the release's archive digests exist,
    and tracked source still records the previous release's. Dispatch
    `Sync qualified release metadata` (private repository) with the release
-   tag, the qualification run, artifact, digest, and the private source commit.
-   It corrects the three tracked checksum projections, commits them, projects
-   them to public `master`, and adopts that projection's conclusion, so a
-   failure here means the corrected digests are not public and the tag must
-   wait. Skipping this step is what left `v0.10.3` and `v0.10.4` publishing
+   tag, the qualification run, artifact, digest, the private source commit, and
+   the release branch that commit is the tip of. It reads the sidecars from the
+   qualification bundle rather than from published release assets, because at
+   this point the tag does not exist yet and the release publishes its assets
+   out of that same bundle. It corrects the three tracked checksum projections,
+   commits them to the release branch, projects them to public `master`, and
+   adopts that projection's conclusion, so a failure here means the corrected
+   digests are not public and the tag must wait. The commit is pushed
+   fast-forward only, so a release branch that moved under the run fails the
+   operation rather than silently rebasing the correction onto a different
+   source. Skipping this step is what left `v0.10.3` and `v0.10.4` publishing
    plugins whose committed checksums described the previous release, so a
    fresh marketplace install failed closed with `checksum_mismatch`.
 5. Re-qualify the corrected commit. Dispatch `Release readiness` again against
@@ -550,8 +593,9 @@ GitHub Marketplace is a one-time manual step from that repository's release UI.
 
 To announce a published GitHub Release in Discord, set the
 `DISCORD_RELEASE_WEBHOOK_URL` repository Actions secret to the target channel's
-webhook URL. The release workflow reuses GitHub's generated release notes,
-prevents mentions from being parsed, suppresses automatic link embeds, and
+webhook URL. The release workflow reuses the curated changelog entry published
+as the GitHub Release body, prevents mentions from being parsed, suppresses
+automatic link embeds, and
 leaves a failed Discord delivery as a warning so it cannot invalidate an
 already-published release. It uses built-in runner tools, so no additional
 GitHub Actions allowlist entry is needed.

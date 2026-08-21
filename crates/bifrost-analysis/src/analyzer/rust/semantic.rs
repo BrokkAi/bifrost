@@ -17,7 +17,7 @@ use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
-use crate::analyzer::{DispatchExtensibility, Language, ProjectFile, Range, RustAnalyzer};
+use crate::analyzer::{DispatchExtensibility, Language, ProjectFile, RustAnalyzer};
 use crate::hash::{HashMap, HashSet};
 
 const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v4";
@@ -600,14 +600,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         callable: Node<'tree>,
     ) -> Result<(), RustLoweringError> {
-        let declaration_range = node_range(callable);
-        let layout = formal_parameter_slots_for_owner(
-            Language::Rust,
-            callable,
-            self.source,
-            &declaration_range,
-        )
-        .unwrap_or_default();
+        let layout = formal_parameter_slots_for_owner(Language::Rust, callable, self.source)
+            .unwrap_or_default();
         let mut ordinal = 0_u32;
         for slot in layout.slots {
             if self.session.cancellation().is_cancelled() {
@@ -2915,15 +2909,6 @@ fn is_rust_nested_execution_boundary(node: Node<'_>) -> bool {
         node.kind(),
         "function_item" | "closure_expression" | "async_block" | "gen_block"
     )
-}
-
-fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
-    }
 }
 
 fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {

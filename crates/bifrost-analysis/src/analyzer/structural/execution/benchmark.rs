@@ -873,7 +873,7 @@ fn headroom_summary(samples: &[ExecutionSample]) -> Option<IdealizedHeadroomSumm
 }
 
 fn benchmark_workspace(project: Arc<dyn Project>) -> WorkspaceAnalyzer {
-    WorkspaceAnalyzer::build(
+    WorkspaceAnalyzer::build_ephemeral(
         project,
         AnalyzerConfig {
             parallelism: Some(1),
@@ -881,6 +881,7 @@ fn benchmark_workspace(project: Arc<dyn Project>) -> WorkspaceAnalyzer {
             ..AnalyzerConfig::default()
         },
     )
+    .expect("ephemeral workspace should build")
 }
 
 struct TimedExecution {
@@ -1309,14 +1310,15 @@ fn run_case(
     );
     let project: Arc<dyn Project> = Arc::new(TestProject::new(root.to_path_buf(), language));
     let build_started = Instant::now();
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         project,
         AnalyzerConfig {
             parallelism: Some(1),
             memo_cache_budget_bytes: Some(MEMO_CACHE_BUDGET_BYTES),
             ..AnalyzerConfig::default()
         },
-    );
+    )
+    .expect("ephemeral workspace should build");
     let analyzer_build_ns = u64::try_from(build_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let analyzer = workspace.analyzer();
     let workspace_files = analyzer.analyzed_files().len();

@@ -55,6 +55,26 @@ pub enum UsageHitSurface {
 }
 
 impl UsageHitKind {
+    /// The value domain the `usage_kind` row fields publish (issue #2515),
+    /// in [`UsageHitKind::ALL`] order. Pinned by a unit test.
+    pub const WIRE_LABELS: &'static [&'static str] = &[
+        "reference",
+        "import",
+        "reexport",
+        "self_receiver",
+        "definition",
+        "override_declaration",
+    ];
+
+    pub const ALL: [Self; 6] = [
+        UsageHitKind::Reference,
+        UsageHitKind::Import,
+        UsageHitKind::Reexport,
+        UsageHitKind::SelfReceiver,
+        UsageHitKind::Definition,
+        UsageHitKind::OverrideDeclaration,
+    ];
+
     pub fn wire_label(self) -> &'static str {
         match self {
             UsageHitKind::Reference => "reference",
@@ -542,6 +562,18 @@ mod tests {
     use super::*;
     use crate::analyzer::model::{CodeUnit, CodeUnitType, ProjectFile};
     use std::path::PathBuf;
+
+    /// The `usage_kind` row field publishes this list as its value domain, so a
+    /// label that drifts from `wire_label` would let a policy literal be
+    /// rejected that a row can actually hold (issue #2515).
+    #[test]
+    fn every_usage_hit_kind_wire_label_is_published_in_variant_order() {
+        let mapped = UsageHitKind::ALL
+            .iter()
+            .map(|kind| kind.wire_label())
+            .collect::<Vec<_>>();
+        assert_eq!(mapped, UsageHitKind::WIRE_LABELS);
+    }
 
     fn project_file(rel: &str) -> ProjectFile {
         let root = std::env::temp_dir().canonicalize().unwrap_or_else(|_| {

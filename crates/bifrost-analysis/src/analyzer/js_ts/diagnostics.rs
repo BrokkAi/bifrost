@@ -481,10 +481,11 @@ mod tests {
             .write("missingValue;\n")
             .unwrap();
         let project = Arc::new(TestProject::new(root.clone(), Language::JavaScript));
-        let analyzer = crate::analyzer::WorkspaceAnalyzer::build(
+        let analyzer = crate::analyzer::WorkspaceAnalyzer::build_ephemeral(
             project,
             crate::analyzer::AnalyzerConfig::default(),
-        );
+        )
+        .expect("ephemeral workspace should build");
         let file = ProjectFile::new(root.clone(), "app.js");
         let source = analyzer.analyzer().project().read_source(&file).unwrap();
         let diagnostics = analyzer.analyzer().semantic_diagnostics(&file, &source);

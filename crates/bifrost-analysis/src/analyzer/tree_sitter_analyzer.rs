@@ -336,16 +336,9 @@ pub(crate) struct AnalyzerStoreContext {
     pub(crate) liveness: Option<Arc<Liveness>>,
     pub(crate) live_paths: Arc<LivePathMap>,
     pub(crate) generations: Arc<HashMap<String, GenerationId>>,
-    pub(crate) startup_cache_validation: StartupCacheValidation,
     /// Shared by every language delegate the same build fans out to. See
     /// [`BuildAbort`].
     pub(crate) build_abort: Arc<BuildAbort>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum StartupCacheValidation {
-    FullIntegrity,
-    AtomicPublication,
 }
 
 pub(crate) struct StructuralSnapshotKey {
@@ -354,9 +347,12 @@ pub(crate) struct StructuralSnapshotKey {
     generation: GenerationId,
 }
 
-pub(crate) fn default_store_context(project: &dyn Project) -> AnalyzerStoreContext {
-    let store = AnalyzerStore::open_in_memory().expect("failed to open in-memory analyzer store");
-    store_context_from_store(project, store)
+pub(crate) fn ephemeral_store_context(
+    project: &dyn Project,
+) -> std::result::Result<AnalyzerStoreContext, StoreError> {
+    let store = AnalyzerStore::open_ephemeral()
+        .map_err(|error| error.context("opening the ephemeral analyzer store"))?;
+    Ok(store_context_from_store(project, store))
 }
 
 pub(crate) fn persistent_store_context(
@@ -367,13 +363,14 @@ pub(crate) fn persistent_store_context(
             let db_path = crate::analyzer::store::analyzer_db_path(root);
             AnalyzerStore::open_persistent(&db_path).map_err(|error| {
                 error.context(format!(
-                    "opening the persisted analyzer store at {}",
-                    db_path.display()
+                    "opening the persisted analyzer store at {}; this cache is derived state, so remove {} and retry to rebuild it",
+                    db_path.display(),
+                    db_path.display(),
                 ))
             })?
         }
-        None => AnalyzerStore::open_in_memory()
-            .map_err(|error| error.context("opening the in-memory analyzer store"))?,
+        None => AnalyzerStore::open_ephemeral()
+            .map_err(|error| error.context("opening the ephemeral analyzer store"))?,
     };
     Ok(store_context_from_store(project, store))
 }
@@ -386,9 +383,8 @@ fn store_context_from_store(project: &dyn Project, store: AnalyzerStore) -> Anal
         store: Arc::new(store),
         gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
         liveness,
-        live_paths: Arc::new(LivePathMap::default()),
+        live_paths: Arc::new(LivePathMap::trust_filesystem_generation()),
         generations: Arc::new(HashMap::default()),
-        startup_cache_validation: StartupCacheValidation::FullIntegrity,
         build_abort: Arc::new(BuildAbort::default()),
     }
 }
@@ -2553,8 +2549,10 @@ where
         store_context: Option<AnalyzerStoreContext>,
     ) -> std::result::Result<Self, StoreError> {
         let adapter = Arc::new(adapter);
-        let mut store_context =
-            store_context.unwrap_or_else(|| default_store_context(project.as_ref()));
+        let mut store_context = match store_context {
+            Some(store_context) => store_context,
+            None => ephemeral_store_context(project.as_ref())?,
+        };
         let epochs = adapter
             .storage_language_keys()
             .into_iter()
@@ -2707,31 +2705,35 @@ where
         &self.semantic_source_digests
     }
 
-    /// The workspace's own identity for `file`'s current on-disk content,
-    /// answered without reading the file, or `None` when the workspace cannot
-    /// answer that cheaply and soundly.
+    /// The workspace's reusable identity for `file` in the current analyzer
+    /// generation, answered without reading the file, or `None` when the
+    /// workspace cannot answer that cheaply and soundly.
     ///
     /// `None` is returned for every case where the recorded identity is not
     /// provably the file's current content:
     ///
     /// * an unsaved overlay shadows the file, so its disk stat says nothing
     ///   about the content an analysis would see;
-    /// * the live path map has no entry, or its entry was recorded without a
-    ///   filesystem stat to pair the identity with (an overlay entry, or an
-    ///   analyzer configured to trust its filesystem generation);
+    /// * the live path map has no entry, or the entry is an overlay whose
+    ///   revision is not represented by the path map;
     /// * the file's current stat differs from the recorded one.
+    ///
+    /// An analyzer configured to trust its filesystem generation deliberately
+    /// does not stat here. Its snapshot changes only through an explicit
+    /// update, so the recorded OID remains the content identity for that
+    /// generation even if the file changes behind the analyzer's back.
     ///
     /// A `Some` answer costs one stat. It is deliberately not a fallback
     /// chain: a caller uses this to *skip* reading the file, so a hidden read
     /// here would defeat the purpose and hide real work from a budget.
-    pub(crate) fn stat_paired_live_oid(&self, file: &ProjectFile) -> Option<Oid> {
+    pub(crate) fn reusable_live_oid(&self, file: &ProjectFile) -> Option<Oid> {
         if self.project.has_overlay(file) {
             return None;
         }
         self.store_context
             .live_paths
             .snapshot()
-            .stat_paired_oid_for_path(file)
+            .reusable_oid_for_path(file)
     }
 
     pub(crate) fn materialize_semantics_with_lowerer(
@@ -2779,7 +2781,7 @@ where
         file: &ProjectFile,
         source: &str,
     ) -> Option<StructuralSnapshotKey> {
-        if self.store_context.store.is_in_memory() {
+        if self.store_context.store.is_ephemeral() {
             return None;
         }
         let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()?;
@@ -4197,20 +4199,12 @@ where
                     })
                     .collect();
                 let _missing_scope = profiling::scope("reconcile.find_missing_blobs");
-                let missing_result = match store_context.startup_cache_validation {
-                    StartupCacheValidation::FullIntegrity => {
-                        store_context.store.missing_parsed_blob_keys_at_generations(
-                            &all_blob_keys,
-                            store_context.generations.as_ref(),
-                        )
-                    }
-                    StartupCacheValidation::AtomicPublication => store_context
-                        .store
-                        .missing_published_parsed_blob_keys_at_generations(
-                            &all_blob_keys,
-                            store_context.generations.as_ref(),
-                        ),
-                };
+                let missing_result = store_context
+                    .store
+                    .missing_published_parsed_blob_keys_at_generations(
+                        &all_blob_keys,
+                        store_context.generations.as_ref(),
+                    );
                 let missing = match missing_result {
                     Ok(missing) => missing,
                     Err(_) => {
@@ -11326,7 +11320,7 @@ mod tests {
             timed_out: Arc::clone(&timed_out),
             fail_reads: true,
         };
-        let store_context = default_store_context(&project);
+        let store_context = ephemeral_store_context(&project).unwrap();
 
         let error = TreeSitterAnalyzer::<JavaAdapter>::resolve_live_oids(
             &project,
@@ -11355,7 +11349,7 @@ mod tests {
         let source = "package demo; class Existing {}\n";
         file.write(source).expect("existing Java source");
         let project = TestProject::new(&root, Language::Java);
-        let store_context = default_store_context(&project);
+        let store_context = ephemeral_store_context(&project).unwrap();
         let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).expect("source OID");
         store_context
             .live_paths
@@ -11419,7 +11413,6 @@ mod tests {
             liveness: None,
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
-            startup_cache_validation: StartupCacheValidation::FullIntegrity,
             build_abort: Arc::new(BuildAbort::default()),
         };
 
@@ -11462,7 +11455,7 @@ mod tests {
             blocked_parse_started: blocked_parse_started_tx,
             release: Arc::clone(&release),
         });
-        let store_context = default_store_context(project.as_ref());
+        let store_context = ephemeral_store_context(project.as_ref()).unwrap();
         let store = Arc::clone(&store_context.store);
         let progress: BuildProgress = Arc::new(move |event| {
             if event.phase == BuildProgressPhase::Persist && event.completed > 0 {
@@ -11517,7 +11510,7 @@ mod tests {
                 .expect("Java source");
         }
         let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Java));
-        let store_context = default_store_context(project.as_ref());
+        let store_context = ephemeral_store_context(project.as_ref()).unwrap();
         let store = Arc::clone(&store_context.store);
 
         let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
@@ -11567,7 +11560,7 @@ mod tests {
             .lock()
             .expect("preparation failure path mutex poisoned") = Some(bad.abs_path().to_path_buf());
         let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Java));
-        let store_context = default_store_context(project.as_ref());
+        let store_context = ephemeral_store_context(project.as_ref()).unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
         let progress_events = Arc::clone(&events);
         let progress: BuildProgress = Arc::new(move |event| {
@@ -11856,7 +11849,6 @@ mod tests {
             liveness: None,
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
-            startup_cache_validation: StartupCacheValidation::FullIntegrity,
             build_abort: Arc::new(BuildAbort::default()),
         };
         let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
@@ -11971,7 +11963,6 @@ mod tests {
             liveness: None,
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
-            startup_cache_validation: StartupCacheValidation::FullIntegrity,
             build_abort: Arc::new(BuildAbort::default()),
         };
         let reopened = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
@@ -12054,7 +12045,7 @@ mod tests {
 
         let live_paths = Arc::new(LivePathMap::default());
         live_paths.refresh([LivePathEntry::overlay(file.clone(), oid)]);
-        let store = Arc::new(AnalyzerStore::open_in_memory().unwrap());
+        let store = Arc::new(AnalyzerStore::open_ephemeral().unwrap());
         let store_context = AnalyzerStoreContext {
             store: Arc::clone(&store),
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
@@ -12064,7 +12055,6 @@ mod tests {
                 "python".to_string(),
                 GenerationId::BOOTSTRAP,
             )])),
-            startup_cache_validation: StartupCacheValidation::FullIntegrity,
             build_abort: Arc::new(BuildAbort::default()),
         };
         let config = AnalyzerConfig::default();
@@ -12691,7 +12681,7 @@ mod tests {
         let live_paths = Arc::new(LivePathMap::default());
         live_paths.refresh([LivePathEntry::overlay(file.clone(), oid)]);
         let store_context = AnalyzerStoreContext {
-            store: Arc::new(AnalyzerStore::open_in_memory().unwrap()),
+            store: Arc::new(AnalyzerStore::open_ephemeral().unwrap()),
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             live_paths,
@@ -12699,7 +12689,6 @@ mod tests {
                 "python".to_string(),
                 GenerationId::BOOTSTRAP,
             )])),
-            startup_cache_validation: StartupCacheValidation::FullIntegrity,
             build_abort: Arc::new(BuildAbort::default()),
         };
         let config = AnalyzerConfig::default();
@@ -12769,7 +12758,7 @@ mod tests {
 
         let live_paths = Arc::new(LivePathMap::default());
         live_paths.refresh([LivePathEntry::overlay(file.clone(), oid)]);
-        let store = Arc::new(AnalyzerStore::open_in_memory().unwrap());
+        let store = Arc::new(AnalyzerStore::open_ephemeral().unwrap());
         let store_context = AnalyzerStoreContext {
             store: Arc::clone(&store),
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
@@ -12779,7 +12768,6 @@ mod tests {
                 "python".to_string(),
                 GenerationId::BOOTSTRAP,
             )])),
-            startup_cache_validation: StartupCacheValidation::FullIntegrity,
             build_abort: Arc::new(BuildAbort::default()),
         };
         let config = AnalyzerConfig::default();
@@ -13544,12 +13532,10 @@ mod tests {
         );
     }
 
-    /// Direct analyzers do not own a watcher, so later query contexts must
-    /// revalidate filesystem-backed live paths. The request cache still
-    /// prevents duplicate sweeps within one query context, but an unrelated
-    /// later call must be able to notice an out-of-band disk edit.
+    /// Direct analyzers keep a stable filesystem generation until callers
+    /// explicitly report an edit with `update`.
     #[test]
-    fn analyzed_live_files_revalidates_filesystem_paths_across_query_contexts() {
+    fn analyzed_live_files_refresh_only_after_explicit_update() {
         // Git-backed on purpose: `resolve_live_oids` only routes through
         // `LivePathValidation::Filesystem` (the `PathState.stat: Some(_)`
         // shape M3 memoizes) when `store_context.liveness` resolves a repo
@@ -13570,11 +13556,9 @@ mod tests {
         let files_first = analyzer.analyzed_live_files();
         assert_eq!(files_first.len(), 1, "files: {files_first:?}");
         let stats_after_listing = crate::analyzer::store::liveness::stat_call_count_for_test();
-        assert!(
-            analyzer
-                .resolve_live_oid_for_file(&files_first[0])
-                .is_some()
-        );
+        let oid_first = analyzer
+            .resolve_live_oid_for_file(&files_first[0])
+            .expect("initial live oid");
         assert_eq!(
             crate::analyzer::store::liveness::stat_call_count_for_test(),
             stats_after_listing,
@@ -13582,61 +13566,60 @@ mod tests {
         );
         analyzer.end_query(&first);
 
-        // A later direct-analyzer query must still validate the filesystem:
-        // no SearchToolsService watcher is available here to bump the live
-        // path generation after an out-of-band edit.
-        crate::analyzer::store::liveness::reset_stat_call_count_for_test();
-        let second = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
-        analyzer.begin_query(&second);
-        let files_second = analyzer.analyzed_live_files();
-        analyzer.end_query(&second);
-        assert_eq!(files_second, files_first);
-        assert!(
-            crate::analyzer::store::liveness::stat_call_count_for_test() > 0,
-            "an unrelated direct-analyzer query context must re-stat live filesystem paths"
-        );
-
-        // A real update to the changed file (the watcher/Manual write path's
-        // `resolve_live_oids` -> `live_paths.refresh`) must bump `live_paths`'
-        // generation and stat the changed file to record its new state...
+        // An out-of-band edit remains invisible until the caller reports it.
         std::fs::write(
             temp.path().join("A.java"),
             "public class A { void m() {} }\n",
         )
         .unwrap();
-        let file = ProjectFile::new(temp.path().to_path_buf(), PathBuf::from("A.java"));
         crate::analyzer::store::liveness::reset_stat_call_count_for_test();
-        let updated = analyzer.update(&BTreeSet::from([file]));
-        assert!(
-            crate::analyzer::store::liveness::stat_call_count_for_test() > 0,
-            "update() must re-stat the changed file before recording its new live oid"
+        let second = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&second);
+        let files_second = analyzer.analyzed_live_files();
+        let oid_before_update = analyzer
+            .resolve_live_oid_for_file(&files_second[0])
+            .expect("retained live oid");
+        analyzer.end_query(&second);
+        assert_eq!(files_second, files_first);
+        assert_eq!(oid_before_update, oid_first);
+        assert_eq!(
+            crate::analyzer::store::liveness::stat_call_count_for_test(),
+            0,
+            "an unrelated query must trust the analyzer's current filesystem generation"
         );
 
-        // ...the *first* query context to build a `LiveSnapshot` off that new
-        // generation performs its own one-time validation pass over the
-        // (here, single-file) live set and observes the new content...
+        // The explicit update bumps the generation and records the new state.
+        let file = ProjectFile::new(temp.path().to_path_buf(), PathBuf::from("A.java"));
+        let updated = analyzer.update(&BTreeSet::from([file]));
+
+        // The updated analyzer exposes the new identity without another sweep.
         crate::analyzer::store::liveness::reset_stat_call_count_for_test();
         let third = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
         updated.begin_query(&third);
         let files_third = updated.analyzed_live_files();
+        let oid_after_update = updated
+            .resolve_live_oid_for_file(&files_third[0])
+            .expect("updated live oid");
         updated.end_query(&third);
         assert_eq!(files_third.len(), 1, "files: {files_third:?}");
-        assert!(
-            crate::analyzer::store::liveness::stat_call_count_for_test() > 0,
-            "the first LiveSnapshot build for the post-update generation must validate on disk"
+        assert_ne!(oid_after_update, oid_first);
+        assert_eq!(
+            crate::analyzer::store::liveness::stat_call_count_for_test(),
+            0,
+            "the explicit update already established the new filesystem generation"
         );
 
-        // ...and every later, unrelated query context against that same
-        // direct analyzer still revalidates the filesystem.
+        // Later query contexts continue reusing that generation.
         crate::analyzer::store::liveness::reset_stat_call_count_for_test();
         let fourth = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
         updated.begin_query(&fourth);
         let files_fourth = updated.analyzed_live_files();
         updated.end_query(&fourth);
         assert_eq!(files_fourth, files_third);
-        assert!(
-            crate::analyzer::store::liveness::stat_call_count_for_test() > 0,
-            "a second direct-analyzer query context must re-stat post-update filesystem paths"
+        assert_eq!(
+            crate::analyzer::store::liveness::stat_call_count_for_test(),
+            0,
+            "a later query must not re-stat the updated filesystem generation"
         );
     }
 
@@ -14064,7 +14047,7 @@ mod tests {
 
         let live_paths = Arc::new(LivePathMap::default());
         live_paths.refresh([LivePathEntry::overlay(file.clone(), oid)]);
-        let store = Arc::new(AnalyzerStore::open_in_memory().unwrap());
+        let store = Arc::new(AnalyzerStore::open_ephemeral().unwrap());
         let store_context = AnalyzerStoreContext {
             store,
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
@@ -14074,7 +14057,6 @@ mod tests {
                 "python".to_string(),
                 GenerationId::BOOTSTRAP,
             )])),
-            startup_cache_validation: StartupCacheValidation::FullIntegrity,
             build_abort: Arc::new(BuildAbort::default()),
         };
         let config = AnalyzerConfig::default();
@@ -14471,7 +14453,6 @@ mod tests {
             liveness: None,
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
-            startup_cache_validation: StartupCacheValidation::FullIntegrity,
             build_abort: Arc::new(BuildAbort::default()),
         };
         let config = AnalyzerConfig::default();

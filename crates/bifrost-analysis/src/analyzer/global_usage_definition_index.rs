@@ -6,7 +6,7 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use std::borrow::Borrow;
-use std::cell::{Cell, OnceCell, RefCell};
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Default)]
 pub struct GlobalUsageDefinitionIndex {
@@ -95,31 +95,54 @@ pub(crate) use impl_forward_query_provider;
 /// sites that accept only `BoundedDefinitionLookup`.
 pub(crate) struct AnalyzerDefinitionLookup<'a> {
     analyzer: &'a dyn IAnalyzer,
-    language: Cell<Language>,
-    workspace_languages: OnceCell<Vec<Language>>,
-    fqn_cache: RefCell<HashMap<(Language, String), Vec<CodeUnit>>>,
-    file_identifier_cache: RefCell<HashMap<(ProjectFile, String), Vec<CodeUnit>>>,
-    children_cache: RefCell<HashMap<(Language, String), Vec<CodeUnit>>>,
-    package_cache: RefCell<HashMap<(Language, String), bool>>,
-    prefix_cache: RefCell<HashMap<(Language, String), bool>>,
+    language: Mutex<Language>,
+    workspace_languages: OnceLock<Vec<Language>>,
+    fqn_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
+    file_identifier_cache: Mutex<HashMap<(ProjectFile, String), Vec<CodeUnit>>>,
+    children_cache: Mutex<HashMap<(Language, String), Vec<CodeUnit>>>,
+    package_cache: Mutex<HashMap<(Language, String), bool>>,
+    prefix_cache: Mutex<HashMap<(Language, String), bool>>,
 }
 
 impl<'a> AnalyzerDefinitionLookup<'a> {
     pub(crate) fn new(analyzer: &'a dyn IAnalyzer, language: Language) -> Self {
         Self {
             analyzer,
-            language: Cell::new(language),
-            workspace_languages: OnceCell::new(),
-            fqn_cache: RefCell::new(HashMap::default()),
-            file_identifier_cache: RefCell::new(HashMap::default()),
-            children_cache: RefCell::new(HashMap::default()),
-            package_cache: RefCell::new(HashMap::default()),
-            prefix_cache: RefCell::new(HashMap::default()),
+            language: Mutex::new(language),
+            workspace_languages: OnceLock::new(),
+            fqn_cache: Mutex::new(HashMap::default()),
+            file_identifier_cache: Mutex::new(HashMap::default()),
+            children_cache: Mutex::new(HashMap::default()),
+            package_cache: Mutex::new(HashMap::default()),
+            prefix_cache: Mutex::new(HashMap::default()),
         }
     }
 
     pub(crate) fn set_language(&self, language: Language) {
-        self.language.set(language);
+        *self
+            .language
+            .lock()
+            .expect("definition language mutex poisoned") = language;
+    }
+
+    fn query_languages(&self) -> Vec<Language> {
+        let language = *self
+            .language
+            .lock()
+            .expect("definition language mutex poisoned");
+        if language == Language::None {
+            self.workspace_languages().to_vec()
+        } else {
+            vec![language]
+        }
+    }
+
+    pub(crate) fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        <Self as BoundedDefinitionLookup>::fqn(self, fqn)
+    }
+
+    pub(crate) fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
+        <Self as BoundedDefinitionLookup>::file_identifier(self, file, identifier)
     }
 
     fn language_analyzer(&self, language: Language) -> Option<&dyn ForwardQueryProvider> {
@@ -135,14 +158,22 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
 
     fn fqn_for_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
         let key = (language, fqn.to_string());
-        if let Some(cached) = self.fqn_cache.borrow().get(&key) {
+        if let Some(cached) = self
+            .fqn_cache
+            .lock()
+            .expect("definition fqn cache poisoned")
+            .get(&key)
+        {
             return cached.clone();
         }
         let matches = self
             .language_analyzer(language)
             .map(|analyzer| analyzer.forward_definition_fqn(fqn))
             .unwrap_or_default();
-        self.fqn_cache.borrow_mut().insert(key, matches.clone());
+        self.fqn_cache
+            .lock()
+            .expect("definition fqn cache poisoned")
+            .insert(key, matches.clone());
         matches
     }
 }
@@ -214,7 +245,14 @@ impl BoundedDefinitionLookup for GlobalUsageDefinitionIndex {
 
 impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        self.fqn_for_language(fqn, self.language.get())
+        let mut units = self
+            .query_languages()
+            .into_iter()
+            .flat_map(|language| self.fqn_for_language(fqn, language))
+            .collect::<Vec<_>>();
+        sort_units(&mut units);
+        units.dedup();
+        units
     }
 
     fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
@@ -239,7 +277,12 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
 
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
         let key = (file.clone(), ident.to_string());
-        if let Some(cached) = self.file_identifier_cache.borrow().get(&key) {
+        if let Some(cached) = self
+            .file_identifier_cache
+            .lock()
+            .expect("file identifier cache poisoned")
+            .get(&key)
+        {
             return cached.clone();
         }
         let matches = self
@@ -247,29 +290,42 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
             .map(|analyzer| analyzer.forward_file_identifier(file, ident))
             .unwrap_or_default();
         self.file_identifier_cache
-            .borrow_mut()
+            .lock()
+            .expect("file identifier cache poisoned")
             .insert(key, matches.clone());
         matches
     }
 
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
-        let language = self.language.get();
-        let key = (language, fqn.to_string());
-        if let Some(cached) = self.children_cache.borrow().get(&key) {
-            return cached.clone();
-        }
-        let mut children = Vec::new();
-        if let Some(analyzer) = self.language_analyzer(language) {
-            for owner in self.fqn_for_language(fqn, language) {
-                children.extend(analyzer.forward_direct_children(&owner));
+        let mut all_children = Vec::new();
+        for language in self.query_languages() {
+            let key = (language, fqn.to_string());
+            if let Some(cached) = self
+                .children_cache
+                .lock()
+                .expect("definition children cache poisoned")
+                .get(&key)
+            {
+                all_children.extend(cached.clone());
+                continue;
             }
+            let mut children = Vec::new();
+            if let Some(analyzer) = self.language_analyzer(language) {
+                for owner in self.fqn_for_language(fqn, language) {
+                    children.extend(analyzer.forward_direct_children(&owner));
+                }
+            }
+            sort_units(&mut children);
+            children.dedup();
+            self.children_cache
+                .lock()
+                .expect("definition children cache poisoned")
+                .insert(key, children.clone());
+            all_children.extend(children);
         }
-        sort_units(&mut children);
-        children.dedup();
-        self.children_cache
-            .borrow_mut()
-            .insert(key, children.clone());
-        children
+        sort_units(&mut all_children);
+        all_children.dedup();
+        all_children
     }
 
     fn fqn_exists(&self, fqn: &str) -> bool {
@@ -277,32 +333,57 @@ impl BoundedDefinitionLookup for AnalyzerDefinitionLookup<'_> {
     }
 
     fn package_exists(&self, package: &str) -> bool {
-        self.package_exists_in_language(package, self.language.get())
+        self.query_languages()
+            .into_iter()
+            .any(|language| self.package_exists_in_language(package, language))
     }
 
     fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
         let key = (language, package.to_string());
-        if let Some(cached) = self.package_cache.borrow().get(&key) {
+        if let Some(cached) = self
+            .package_cache
+            .lock()
+            .expect("package cache poisoned")
+            .get(&key)
+        {
             return *cached;
         }
         let exists = self
             .language_analyzer(language)
             .is_some_and(|analyzer| analyzer.forward_package_exists(package));
-        self.package_cache.borrow_mut().insert(key, exists);
+        self.package_cache
+            .lock()
+            .expect("package cache poisoned")
+            .insert(key, exists);
         exists
     }
 
     fn fqn_prefix_exists(&self, prefix: &str) -> bool {
-        let language = self.language.get();
-        let key = (language, prefix.to_string());
-        if let Some(cached) = self.prefix_cache.borrow().get(&key) {
-            return *cached;
+        for language in self.query_languages() {
+            let key = (language, prefix.to_string());
+            if let Some(cached) = self
+                .prefix_cache
+                .lock()
+                .expect("fqn prefix cache poisoned")
+                .get(&key)
+            {
+                if *cached {
+                    return true;
+                }
+                continue;
+            }
+            let exists = self
+                .language_analyzer(language)
+                .is_some_and(|analyzer| analyzer.forward_fqn_prefix_exists(prefix));
+            self.prefix_cache
+                .lock()
+                .expect("fqn prefix cache poisoned")
+                .insert(key, exists);
+            if exists {
+                return true;
+            }
         }
-        let exists = self
-            .language_analyzer(language)
-            .is_some_and(|analyzer| analyzer.forward_fqn_prefix_exists(prefix));
-        self.prefix_cache.borrow_mut().insert(key, exists);
-        exists
+        false
     }
 }
 

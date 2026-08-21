@@ -40,7 +40,7 @@ impl SearchToolsNativeSession {
                 if let Some(sources) = sources {
                     create_scoped_service(root, &sources, revision.as_deref())
                 } else if manual {
-                    SearchToolsService::new_for_python_manual(root)
+                    SearchToolsService::new_manual_persisted(root)
                 } else {
                     SearchToolsService::new_for_python(root)
                 }

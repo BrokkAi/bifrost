@@ -192,6 +192,14 @@ pub enum FindingCertainty {
 }
 
 impl FindingCertainty {
+    /// The stable snake_case tag, byte-identical to the serde tag.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Definite => "definite",
+            Self::Possible { .. } => "possible",
+        }
+    }
+
     pub fn possible(mut reasons: Vec<CertaintyReason>) -> Result<Self, CompletionReasonError> {
         normalize_nonempty(&mut reasons)?;
         for reason in &reasons {
@@ -237,6 +245,14 @@ pub enum FindingCompleteness {
 }
 
 impl FindingCompleteness {
+    /// The stable snake_case tag, byte-identical to the serde tag.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial { .. } => "partial",
+        }
+    }
+
     pub fn partial(
         mut reasons: Vec<FindingIncompleteReason>,
     ) -> Result<Self, CompletionReasonError> {
@@ -331,6 +347,18 @@ pub enum CertaintyReason {
 }
 
 impl CertaintyReason {
+    /// The stable snake_case tag. An analyzer ambiguity carries its own code,
+    /// which is the more specific answer, so the code is the label.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::AmbiguousReceiver => "ambiguous_receiver",
+            Self::AmbiguousDispatch => "ambiguous_dispatch",
+            Self::NameBasedResolution => "name_based_resolution",
+            Self::MultipleCandidateDeclarations => "multiple_candidate_declarations",
+            Self::AnalyzerAmbiguity { code } => code.as_str(),
+        }
+    }
+
     pub fn analyzer_ambiguity(code: impl Into<String>) -> Result<Self, ReportValueError> {
         let mut code = code.into();
         validate_report_identifier(&code)?;
@@ -408,6 +436,24 @@ pub enum FindingIncompleteReason {
     DeclaredNonExhaustive,
     ProofPartial,
     StableAnchorWeak,
+}
+
+impl FindingIncompleteReason {
+    /// The stable snake_case tag, byte-identical to the serde serialization.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::QueryProvenanceTruncated => "query_provenance_truncated",
+            Self::RelatedLocationsTruncated => "related_locations_truncated",
+            Self::OriginsTruncated => "origins_truncated",
+            Self::SourceScenariosTruncated => "source_scenarios_truncated",
+            Self::TypestateScenariosTruncated => "typestate_scenarios_truncated",
+            Self::WitnessTruncated => "witness_truncated",
+            Self::EvidenceTruncated => "evidence_truncated",
+            Self::DeclaredNonExhaustive => "declared_non_exhaustive",
+            Self::ProofPartial => "proof_partial",
+            Self::StableAnchorWeak => "stable_anchor_weak",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -1473,6 +1519,17 @@ pub enum ProofState {
     Ambiguous,
 }
 
+impl ProofState {
+    /// The stable snake_case tag, byte-identical to the serde serialization.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Proven => "proven",
+            Self::Unproven => "unproven",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProofReason {
@@ -1497,6 +1554,23 @@ pub enum ProofReason {
 }
 
 impl ProofReason {
+    /// The stable snake_case tag. Analyzer evidence carries its own code, which
+    /// is the more specific answer, so the code is the label.
+    pub fn label(&self) -> &str {
+        match self {
+            Self::DirectStructuralMatch => "direct_structural_match",
+            Self::ResolvedDeclaration => "resolved_declaration",
+            Self::ResolvedReference => "resolved_reference",
+            Self::ExactCallTarget => "exact_call_target",
+            Self::DataflowWitness => "dataflow_witness",
+            Self::TypestateWitness => "typestate_witness",
+            Self::AmbiguousTarget => "ambiguous_target",
+            Self::PartialWitness => "partial_witness",
+            Self::AnalyzerEvidence { code } => code.as_str(),
+            Self::AuthoredArmClosure { .. } => "authored_arm_closure",
+        }
+    }
+
     pub fn analyzer_evidence(code: impl Into<String>) -> Result<Self, ReportValueError> {
         let mut code = code.into();
         validate_report_identifier(&code)?;
@@ -1782,6 +1856,22 @@ pub enum WitnessStepKind {
     Transform,
     Transition,
     Violation,
+}
+
+impl WitnessStepKind {
+    /// The stable snake_case tag, byte-identical to the serde serialization.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Propagation => "propagation",
+            Self::Call => "call",
+            Self::Return => "return",
+            Self::Sanitizer => "sanitizer",
+            Self::Transform => "transform",
+            Self::Transition => "transition",
+            Self::Violation => "violation",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -56,7 +56,7 @@ pub(crate) fn collect_python_semantic_diagnostics(
         );
         return report;
     };
-    let support = analyzer.global_usage_definition_index();
+    let support = crate::analyzer::AnalyzerDefinitionLookup::new(analyzer, Language::None);
     let environment = RetainedPythonEnvironment {
         overlay: analyzer.semantic_model_overlay(),
         evidence: analyzer.dependency_discovery_evidence(Language::Python),

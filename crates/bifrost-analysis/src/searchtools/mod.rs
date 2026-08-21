@@ -24,9 +24,9 @@ use crate::analyzer::usages::{
     UsageQueryCompletion,
 };
 use crate::analyzer::{
-    AnalyzerDefinitionLookup, BoundedDefinitionLookup, CodeUnit, CodeUnitType, DeclarationKind,
-    GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, IAnalyzer, Language, ProjectFile, Range,
-    SearchSymbolPatternBatch, SummaryFileProjection, go_module_roots,
+    AnalyzerDefinitionLookup, CodeUnit, CodeUnitType, DeclarationKind, GO_MODULE_SCOPE_SEGMENT,
+    GoModuleRoot, IAnalyzer, Language, ProjectFile, Range, SearchSymbolPatternBatch,
+    SummaryFileProjection, go_module_roots,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::model_context;

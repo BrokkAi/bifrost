@@ -13,11 +13,10 @@ use crate::{
     analyzer::packs_document::{activate_workspace_packs, load_workspace_packs_config_at},
     analyzer::semantic::WorkspaceRelativePath,
     analyzer::semantic_model::{
-        CatalogCoordinate, CatalogOpenMode, CatalogOptions, CompilerOptions,
-        SemanticModelActivationEvidence, SemanticModelActivationRequest,
-        SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome, SemanticPackCatalog,
-        SessionPackSource, SessionPackSourceKind, SourceFormat, WorkspaceSemanticModelOptions,
-        acquire_active_semantic_models, compile_source, discover_workspace_semantic_models,
+        CatalogCoordinate, CatalogOpenMode, CatalogOptions, SemanticModelActivationEvidence,
+        SemanticModelActivationRequest, SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome,
+        SemanticPackCatalog, WorkspaceSemanticModelOptions, acquire_active_semantic_models,
+        register_workspace_semantic_models, workspace_semantic_models_not_active,
     },
     analyzer::{IndexWarmer, Language},
     code_intelligence::CodeIntelligenceRuntime,
@@ -33,11 +32,12 @@ use crate::{
     path_normalization::NormalizePath,
     policy::{
         BuiltInPolicySelection, ExplainError, ExplanationCandidate, ExplanationLimits,
-        ExplanationTarget, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
-        PolicyBaselineOptions, PolicyBaselineSource, PolicyEvaluationDate, PolicyEvaluationInput,
-        PolicyEvaluationOptions, PolicyExplanation, PolicyFailOn, PolicyFindingId, PolicyId,
-        PolicyReportDocument, PolicyScopeOptions, PolicyScopeSource, PolicySuppressionOptions,
-        PolicySuppressionSource, built_in_policy_catalog, explain_policy_inputs,
+        ExplanationTarget, NearMissCandidates, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING,
+        POLICY_EXIT_UNRELIABLE, PolicyBaselineOptions, PolicyBaselineSource, PolicyEvaluationDate,
+        PolicyEvaluationInput, PolicyEvaluationOptions, PolicyExplanation, PolicyFailOn,
+        PolicyFindingId, PolicyId, PolicyNearMissRanking, PolicyReportDocument, PolicyScopeOptions,
+        PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource,
+        built_in_policy_catalog, explain_policy_inputs, rank_policy_near_misses,
         workspace_snapshot_deadline_outcome,
     },
     profiling,
@@ -314,8 +314,20 @@ fn activate_configured_semantic_models(
             evidence.extend(intrinsic_language_evidence(workspace));
         }
     }
-    let workspace_digests = if configured.workspace_models {
-        register_workspace_semantic_models(workspace_root, &catalog, &mut evidence)?
+    // The reviewed workspace-local route is the shared analysis helper, the
+    // same one the CLI policy coordinator drives through its pack-activation
+    // transaction (#2493). Registration is loud: a checked-in model this host
+    // cannot read, compile, or register fails the bind rather than being
+    // skipped.
+    let workspace_models = if configured.workspace_models {
+        let registration = register_workspace_semantic_models(
+            workspace_root,
+            &catalog,
+            WorkspaceSemanticModelOptions::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        evidence.extend(registration.evidence);
+        registration.models
     } else {
         Vec::new()
     };
@@ -340,17 +352,18 @@ fn activate_configured_semantic_models(
     };
     match outcome {
         SemanticModelRuntimeOutcome::Ready { active, .. } => {
-            for (path, digest) in &workspace_digests {
-                if !active
-                    .shards()
-                    .iter()
-                    .any(|shard| shard.manifest.content_sha256 == *digest)
-                {
-                    return Err(format!(
-                        "workspace semantic model {path} did not activate: {:?}",
-                        active.activation_report()
-                    ));
-                }
+            // Post-activation proof: a registered model that never reaches the
+            // active set is invisible, and an invisible model decides answers
+            // by its absence. MCP treats every such case, review gate
+            // included, as a hard bind error.
+            if let Some(inactive) =
+                workspace_semantic_models_not_active(&workspace_models, &active).first()
+            {
+                return Err(format!(
+                    "workspace semantic model {} did not activate: {:?}",
+                    inactive.model.path,
+                    active.activation_report()
+                ));
             }
             eprintln!(
                 "bifrost: semantic-pack activation active_set={} shards={} records={}",
@@ -421,99 +434,6 @@ fn intrinsic_ecosystem(language: Language) -> &'static str {
     }
 }
 
-fn register_workspace_semantic_models(
-    workspace_root: &Path,
-    catalog: &SemanticPackCatalog,
-    evidence: &mut Vec<SemanticModelActivationEvidence>,
-) -> Result<Vec<(String, String)>, String> {
-    let report = discover_workspace_semantic_models(
-        workspace_root,
-        WorkspaceSemanticModelOptions::default(),
-    );
-    if !report.complete {
-        let diagnostics = report
-            .diagnostics
-            .iter()
-            .map(|diagnostic| {
-                format!(
-                    "{} {}: {}",
-                    diagnostic.path, diagnostic.code, diagnostic.message
-                )
-            })
-            .chain(report.files.iter().flat_map(|file| {
-                file.diagnostics.iter().map(|diagnostic| {
-                    format!(
-                        "{} {} {}: {}",
-                        file.path, diagnostic.path, diagnostic.code, diagnostic.message
-                    )
-                })
-            }))
-            .collect::<Vec<_>>();
-        return Err(format!(
-            "workspace semantic-model discovery failed: {}",
-            diagnostics.join("; ")
-        ));
-    }
-    if !report.enabled {
-        return Ok(Vec::new());
-    }
-
-    let mut registered = Vec::with_capacity(report.files.len());
-    for file in report.files {
-        let format = match file.source_format.as_str() {
-            "json" => SourceFormat::Json,
-            "yaml" => SourceFormat::Yaml,
-            value => {
-                return Err(format!(
-                    "workspace semantic model {} has unsupported source format {value}",
-                    file.path
-                ));
-            }
-        };
-        let source_path = workspace_root.join(Path::new(&file.path));
-        let bytes = std::fs::read(&source_path).map_err(|error| {
-            format!(
-                "failed to read workspace semantic model {}: {error}",
-                file.path
-            )
-        })?;
-        let compiled =
-            compile_source(format, &bytes, &CompilerOptions::default()).map_err(|diagnostics| {
-                format!(
-                    "failed to compile workspace semantic model {}: {diagnostics:?}",
-                    file.path
-                )
-            })?;
-        let source_id = format!("workspace:{}#sha256={}", file.path, file.source_sha256);
-        let digest = catalog
-            .register_session_pack(
-                &compiled,
-                &SessionPackSource {
-                    kind: SessionPackSourceKind::EphemeralWorkspace,
-                    source_id,
-                },
-            )
-            .map_err(|error| {
-                format!(
-                    "failed to register workspace semantic model {}: {error}",
-                    file.path
-                )
-            })?;
-        evidence.push(SemanticModelActivationEvidence {
-            language: compiled.manifest.language.clone(),
-            ecosystem: compiled.manifest.ecosystem.clone(),
-            package: None,
-            module: None,
-            toolchain: None,
-            target: None,
-            configuration: Some(compiled.manifest.pack_id.clone()),
-            artifact_sha256: None,
-        });
-        registered.push((file.path, digest));
-    }
-    Ok(registered)
-}
-
 #[cfg(test)]
 mod workspace_semantic_model_configuration_tests {
     use super::*;
@@ -567,7 +487,8 @@ mod workspace_semantic_model_configuration_tests {
         std::fs::write(model_root.join("job-maker.json"), source).unwrap();
         let root = temp.path().canonicalize().unwrap().normalize();
         let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(root).unwrap());
-        let analyzer = WorkspaceAnalyzer::build_for_service(project, AnalyzerConfig::default());
+        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral test workspace should build");
         (temp, analyzer)
     }
 
@@ -592,7 +513,8 @@ mod workspace_semantic_model_configuration_tests {
         .unwrap();
         let root = temp.path().canonicalize().unwrap().normalize();
         let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(root.clone()).unwrap());
-        let analyzer = WorkspaceAnalyzer::build_for_service(project, AnalyzerConfig::default());
+        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral test workspace should build");
 
         // No environment variables, no host options: the document alone is
         // the opt-in, so a bound MCP session activates the same packs the LSP
@@ -855,6 +777,7 @@ struct ExplainPolicyParams {
     policy_ids: Vec<String>,
     finding_id: Option<String>,
     candidate: Option<ExplainPolicyCandidate>,
+    near_misses: Option<ExplainPolicyNearMisses>,
 }
 
 /// One explicit source position a caller believes should have matched.
@@ -867,15 +790,38 @@ struct ExplainPolicyCandidate {
     byte_end: Option<u64>,
 }
 
-/// The `explain_policy` result: the structured explanation and nothing else.
+/// The near-miss request form: where the candidates come from, and the two
+/// bounds the ranking honours.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExplainPolicyNearMisses {
+    /// Rank exactly these positions. Nothing is searched for.
+    candidates: Option<Vec<ExplainPolicyCandidate>>,
+    /// Search inside the policy's own seed scope instead.
+    enumerate_from_policy_seed: Option<bool>,
+    max_candidates: Option<usize>,
+    max_executions: Option<usize>,
+}
+
+/// The `explain_policy` result: the structured answer and nothing else.
 ///
 /// An explanation is a query about a policy, not a gate, so this result
 /// carries no status and no exit code. Everything a caller needs -- the
-/// question, the outcome, the node tree, the truncation record -- is inside
-/// the versioned explanation document.
+/// question, the outcome, the node tree or the ranked entries, the truncation
+/// record -- is inside the versioned document.
+///
+/// Both documents are boxed: they are large, they are built once per request,
+/// and the enum is moved several times on the way to the transport, so the
+/// indirection is cheaper than carrying the wider variant everywhere.
 #[derive(Serialize)]
-pub(crate) struct ExplainPolicyToolResult {
-    explanation: PolicyExplanation,
+#[serde(untagged)]
+pub(crate) enum ExplainPolicyToolResult {
+    Explanation {
+        explanation: Box<PolicyExplanation>,
+    },
+    NearMiss {
+        near_miss_ranking: Box<PolicyNearMissRanking>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1096,43 +1042,131 @@ fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// Which question `explain_policy` was asked.
-///
-/// Exactly one of the two targets must be present: a request with both would
-/// have two answers and a request with neither has no question.
-fn explain_policy_target(
-    params: &ExplainPolicyParams,
-) -> Result<ExplanationTarget, SearchToolsServiceError> {
-    match (&params.finding_id, &params.candidate) {
-        (Some(_), Some(_)) => Err(SearchToolsServiceError::invalid_params(
-            "explain_policy accepts finding_id or candidate, not both".to_string(),
-        )),
-        (None, None) => Err(SearchToolsServiceError::invalid_params(
-            "explain_policy requires either finding_id (why) or candidate (why-not)".to_string(),
-        )),
-        (Some(finding_id), None) => {
-            let parsed = finding_id.parse::<PolicyFindingId>().map_err(|error| {
-                SearchToolsServiceError::invalid_params(format!(
-                    "invalid explain_policy finding_id `{finding_id}`: {error}"
-                ))
-            })?;
-            Ok(ExplanationTarget::Finding(parsed))
+/// Which question `explain_policy` was asked, and the bounds it carries.
+pub(crate) enum ExplainPolicyQuestion {
+    /// Why, or why-not, about one exact subject.
+    Explanation(ExplanationTarget),
+    /// Which subjects came closest, over a bounded candidate set.
+    NearMiss(NearMissCandidates, ExplanationLimits),
+}
+
+fn explain_policy_candidate(
+    candidate: &ExplainPolicyCandidate,
+) -> Result<ExplanationCandidate, SearchToolsServiceError> {
+    match candidate.byte_end {
+        Some(byte_end) => {
+            ExplanationCandidate::in_range(&candidate.path, candidate.byte_start, byte_end)
         }
-        (None, Some(candidate)) => {
-            let parsed = match candidate.byte_end {
-                Some(byte_end) => {
-                    ExplanationCandidate::in_range(&candidate.path, candidate.byte_start, byte_end)
-                }
-                None => ExplanationCandidate::at_offset(&candidate.path, candidate.byte_start),
-            }
-            .map_err(|error| {
-                SearchToolsServiceError::invalid_params(format!(
-                    "invalid explain_policy candidate: {error}"
-                ))
-            })?;
-            Ok(ExplanationTarget::Candidate(parsed))
-        }
+        None => ExplanationCandidate::at_offset(&candidate.path, candidate.byte_start),
     }
+    .map_err(|error| {
+        SearchToolsServiceError::invalid_params(format!(
+            "invalid explain_policy candidate: {error}"
+        ))
+    })
+}
+
+/// Resolve the request into exactly one question.
+///
+/// Exactly one of the three targets must be present: a request with more than
+/// one would have more than one answer, and a request with none has no
+/// question. The schema states the exclusion and this enforces it.
+fn explain_policy_question(
+    params: &ExplainPolicyParams,
+) -> Result<ExplainPolicyQuestion, SearchToolsServiceError> {
+    let asked = usize::from(params.finding_id.is_some())
+        + usize::from(params.candidate.is_some())
+        + usize::from(params.near_misses.is_some());
+    if asked > 1 {
+        return Err(SearchToolsServiceError::invalid_params(
+            "explain_policy accepts exactly one of finding_id, candidate, or near_misses"
+                .to_string(),
+        ));
+    }
+    if let Some(finding_id) = &params.finding_id {
+        let parsed = finding_id.parse::<PolicyFindingId>().map_err(|error| {
+            SearchToolsServiceError::invalid_params(format!(
+                "invalid explain_policy finding_id `{finding_id}`: {error}"
+            ))
+        })?;
+        return Ok(ExplainPolicyQuestion::Explanation(
+            ExplanationTarget::Finding(parsed),
+        ));
+    }
+    if let Some(candidate) = &params.candidate {
+        return Ok(ExplainPolicyQuestion::Explanation(
+            ExplanationTarget::Candidate(explain_policy_candidate(candidate)?),
+        ));
+    }
+    let Some(near_misses) = &params.near_misses else {
+        return Err(SearchToolsServiceError::invalid_params(
+            "explain_policy requires finding_id (why), candidate (why-not), or near_misses \
+             (which came closest)"
+                .to_string(),
+        ));
+    };
+
+    let candidates = match (
+        &near_misses.candidates,
+        near_misses.enumerate_from_policy_seed,
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(SearchToolsServiceError::invalid_params(
+                "explain_policy near_misses accepts candidates or enumerate_from_policy_seed, \
+                 not both"
+                    .to_string(),
+            ));
+        }
+        (None, None) | (None, Some(false)) => {
+            return Err(SearchToolsServiceError::invalid_params(
+                "explain_policy near_misses requires either candidates or \
+                 enumerate_from_policy_seed: candidates are never scanned for by default"
+                    .to_string(),
+            ));
+        }
+        (Some(candidates), None) => {
+            if candidates.is_empty()
+                || candidates.len() > crate::mcp_extended::MAX_EXPLAIN_POLICY_NEAR_MISS_CANDIDATES
+            {
+                return Err(SearchToolsServiceError::invalid_params(format!(
+                    "explain_policy near_misses candidates must contain between 1 and {} entries",
+                    crate::mcp_extended::MAX_EXPLAIN_POLICY_NEAR_MISS_CANDIDATES
+                )));
+            }
+            NearMissCandidates::Supplied(
+                candidates
+                    .iter()
+                    .map(explain_policy_candidate)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        }
+        (None, Some(true)) => NearMissCandidates::PolicySeedSearch,
+    };
+
+    let mut limits = ExplanationLimits::default();
+    if let Some(max_candidates) = near_misses.max_candidates {
+        if max_candidates == 0
+            || max_candidates > crate::mcp_extended::MAX_EXPLAIN_POLICY_NEAR_MISS_CANDIDATES
+        {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "explain_policy near_misses max_candidates must be between 1 and {}",
+                crate::mcp_extended::MAX_EXPLAIN_POLICY_NEAR_MISS_CANDIDATES
+            )));
+        }
+        limits = limits.with_max_near_miss_candidates(max_candidates);
+    }
+    if let Some(max_executions) = near_misses.max_executions {
+        if max_executions == 0
+            || max_executions > crate::mcp_extended::MAX_EXPLAIN_POLICY_NEAR_MISS_EXECUTIONS
+        {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "explain_policy near_misses max_executions must be between 1 and {}",
+                crate::mcp_extended::MAX_EXPLAIN_POLICY_NEAR_MISS_EXECUTIONS
+            )));
+        }
+        limits = limits.with_max_near_miss_executions(max_executions);
+    }
+    Ok(ExplainPolicyQuestion::NearMiss(candidates, limits))
 }
 
 /// Resolve `explain_policy`'s policy selection into exactly one policy input.
@@ -1267,7 +1301,9 @@ mod explain_policy_tests {
         :selector (rql (name "store")) :dangerous-operand matched-value
         :accepts [untrusted])])))"#;
 
-    const SOURCE: &str = "class Widget {\n  int render() { return 1; }\n}\n";
+    /// Two classes, so a near-miss ranking has a subject at distance 0 and a
+    /// subject the selector's one declared predicate drops.
+    const SOURCE: &str = "class Widget {\n  int render() { return 1; }\n}\nclass Gadget {\n  int render() { return 2; }\n}\n";
 
     fn service() -> (tempfile::TempDir, SearchToolsService) {
         let temp = tempfile::tempdir().unwrap();
@@ -1281,8 +1317,8 @@ mod explain_policy_tests {
             std::fs::write(temp.path().join("policies").join(name), source).unwrap();
         }
         let root = temp.path().canonicalize().unwrap().normalize();
-        let service = SearchToolsService::new_manual_without_semantic_index(root)
-            .expect("manual service should start");
+        let service =
+            SearchToolsService::new_manual_ephemeral(root).expect("manual service should start");
         (temp, service)
     }
 
@@ -1371,22 +1407,29 @@ mod explain_policy_tests {
             .expect_err("a request with no question has no answer");
         assert_eq!(neither.code, SearchToolsServiceErrorCode::InvalidParams);
         assert!(
-            neither.message.contains("finding_id (why) or candidate"),
+            neither
+                .message
+                .contains("requires finding_id (why), candidate (why-not), or near_misses"),
             "{}",
             neither.message
         );
 
-        let both = service
-            .call_tool_value(
-                "explain_policy",
-                json!({
-                    "policy_files": ["policies/match.rqlp"],
-                    "finding_id": "0".repeat(64),
-                    "candidate": { "path": "Widget.java", "byte_start": 0 }
-                }),
-            )
-            .expect_err("a request with two questions has two answers");
-        assert!(both.message.contains("not both"), "{}", both.message);
+        for extra in [
+            json!({ "candidate": { "path": "Widget.java", "byte_start": 0 } }),
+            json!({ "near_misses": { "enumerate_from_policy_seed": true } }),
+        ] {
+            let mut arguments = json!({
+                "policy_files": ["policies/match.rqlp"],
+                "finding_id": "0".repeat(64),
+            });
+            for (key, value) in extra.as_object().expect("an object") {
+                arguments[key] = value.clone();
+            }
+            let both = service
+                .call_tool_value("explain_policy", arguments)
+                .expect_err("a request with two questions has two answers");
+            assert!(both.message.contains("exactly one of"), "{}", both.message);
+        }
     }
 
     #[test]
@@ -1403,6 +1446,131 @@ mod explain_policy_tests {
             .expect_err("an explanation is about one policy");
         assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
         assert!(error.message.contains("resolved to 2"), "{}", error.message);
+    }
+
+    /// Issue 2500 on the wire: the seed-scoped search returns the sibling
+    /// ranking document, ordered by declared-predicate distance.
+    #[test]
+    fn explain_policy_ranks_near_misses_from_the_policys_own_seed_scope() {
+        let (_temp, service) = service();
+        let value = service
+            .call_tool_value(
+                "explain_policy",
+                json!({
+                    "policy_files": ["policies/match.rqlp"],
+                    "near_misses": { "enumerate_from_policy_seed": true }
+                }),
+            )
+            .expect("explain_policy should rank near misses");
+        let ranking = &value["near_miss_ranking"];
+        assert_eq!(
+            ranking["format"],
+            brokk_bifrost_policy::POLICY_NEAR_MISS_FORMAT,
+            "{value:#}"
+        );
+        assert_eq!(ranking["question"], "near_miss", "{value:#}");
+        assert_eq!(ranking["policy_id"], "test.explain.mcp.match");
+        assert_eq!(ranking["analysis_type"], "match");
+        assert_eq!(ranking["conjuncts"], json!(["scope", "root.name"]));
+        assert_eq!(ranking["enumeration"]["type"], "policy_seed", "{value:#}");
+        // An explanation tree is not what a ranking answers with.
+        assert!(value.get("explanation").is_none(), "{value:#}");
+        assert!(value.get("status").is_none(), "{value:#}");
+
+        let entries = ranking["entries"].as_array().expect("ranked entries");
+        assert_eq!(entries.len(), 2, "{value:#}");
+        assert_eq!(entries[0]["rank"], 1);
+        assert_eq!(entries[0]["outcome"], "satisfied");
+        assert_eq!(entries[0]["unsatisfied_conjuncts"], 0);
+        assert_eq!(entries[1]["rank"], 2);
+        assert_eq!(entries[1]["outcome"], "failed", "{value:#}");
+        assert_eq!(entries[1]["unsatisfied_conjuncts"], 1);
+        assert_eq!(entries[1]["failing_conjunct"], "root.name", "{value:#}");
+        assert_eq!(entries[1]["subject"]["type"], "candidate");
+        assert_eq!(entries[1]["subject"]["path"], "Widget.java");
+    }
+
+    /// A supplied list is ranked without any search, and the retention bound
+    /// reports what it removed.
+    #[test]
+    fn explain_policy_ranks_a_supplied_candidate_list_under_its_bounds() {
+        let (_temp, service) = service();
+        let value = service
+            .call_tool_value(
+                "explain_policy",
+                json!({
+                    "policy_files": ["policies/match.rqlp"],
+                    "near_misses": {
+                        "candidates": [
+                            { "path": "Widget.java", "byte_start": byte_offset("class Gadget"),
+                              "byte_end": byte_offset("class Gadget") + 12 },
+                            { "path": "Widget.java", "byte_start": byte_offset("class Widget"),
+                              "byte_end": byte_offset("class Widget") + 12 }
+                        ],
+                        "max_candidates": 1
+                    }
+                }),
+            )
+            .expect("explain_policy should rank a supplied list");
+        let ranking = &value["near_miss_ranking"];
+        assert_eq!(
+            ranking["enumeration"],
+            json!({ "type": "supplied", "supplied": 2 })
+        );
+        assert_eq!(ranking["candidates_considered"], 2, "{value:#}");
+        let entries = ranking["entries"].as_array().expect("ranked entries");
+        assert_eq!(entries.len(), 1, "{value:#}");
+        assert_eq!(entries[0]["unsatisfied_conjuncts"], 0, "{value:#}");
+        assert_eq!(ranking["truncation"]["candidates_truncated"], true);
+        assert_eq!(ranking["truncation"]["omitted_candidates_lower_bound"], 1);
+    }
+
+    /// The near-miss form never means "search the repository": one of the two
+    /// enumeration routes must be chosen explicitly.
+    #[test]
+    fn explain_policy_near_misses_requires_an_explicit_enumeration_route() {
+        let (_temp, service) = service();
+        for (arguments, expected) in [
+            (
+                json!({}),
+                "requires either candidates or enumerate_from_policy_seed",
+            ),
+            (
+                json!({ "enumerate_from_policy_seed": false }),
+                "requires either candidates or enumerate_from_policy_seed",
+            ),
+            (
+                json!({
+                    "candidates": [{ "path": "Widget.java", "byte_start": 0 }],
+                    "enumerate_from_policy_seed": true
+                }),
+                "not both",
+            ),
+            (
+                json!({ "enumerate_from_policy_seed": true, "max_candidates": 0 }),
+                "max_candidates must be between 1 and",
+            ),
+            (
+                json!({ "enumerate_from_policy_seed": true, "max_executions": 0 }),
+                "max_executions must be between 1 and",
+            ),
+            (
+                json!({ "candidates": [] }),
+                "candidates must contain between 1 and",
+            ),
+        ] {
+            let error = service
+                .call_tool_value(
+                    "explain_policy",
+                    json!({
+                        "policy_files": ["policies/match.rqlp"],
+                        "near_misses": arguments
+                    }),
+                )
+                .expect_err("a near-miss request states where its candidates come from");
+            assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
+            assert!(error.message.contains(expected), "{}", error.message);
+        }
     }
 
     /// A family with no adapter is a stated condition on the wire, and the
@@ -1771,8 +1939,14 @@ impl SearchToolsService {
 
     /// Construct with no file watcher and no semantic indexer. This is useful
     /// for immutable, short-lived workspaces such as inline test fixtures.
-    pub fn new_manual_without_semantic_index(root: PathBuf) -> Result<Self, String> {
-        Self::new_transient_with_strategy(root, UpdateStrategy::Manual, false)
+    pub fn new_manual_ephemeral(root: PathBuf) -> Result<Self, String> {
+        Self::new_ephemeral_with_strategy(root, UpdateStrategy::Manual, false)
+    }
+
+    /// Construct with persisted analyzer storage, no watcher, and no semantic
+    /// indexer. The caller publishes changes explicitly through `update_paths`.
+    pub fn new_manual_persisted(root: PathBuf) -> Result<Self, String> {
+        Self::new_with_strategy(root, UpdateStrategy::Manual, false)
     }
 
     /// Whether a tool is a pure function of its Git endpoints and never reads
@@ -1797,46 +1971,6 @@ impl SearchToolsService {
         Self::new_lazy_with_strategy(root, UpdateStrategy::Manual, false)
     }
 
-    /// Construct a manual, non-semantic service over an already-selected
-    /// project. One-shot CLI subset workspaces use this to avoid whole-root
-    /// watchers while still sharing the analyzer blob cache for git roots.
-    pub fn new_manual_for_project(project: Arc<dyn Project>) -> Result<Self, String> {
-        let root = project.root().to_path_buf();
-        let watcher_starter = production_watcher_starter();
-        let workspace = WorkspaceAnalyzer::build_persisted_for_service(
-            Arc::clone(&project),
-            AnalyzerConfig::default(),
-        )
-        .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
-        let session = assemble_session(
-            project,
-            workspace,
-            UpdateStrategy::Manual,
-            false,
-            StartupIndexWarm::OnDemand,
-            &watcher_starter,
-        )?;
-        Ok(Self {
-            root: RwLock::new(Some(root)),
-            session: RwLock::new(Some(session)),
-            workspace_generation: AtomicU64::new(1),
-            query_protocols: RwLock::new(Default::default()),
-            query_value_flows: RwLock::new(Default::default()),
-            query_taint_results: RwLock::new(Default::default()),
-            typestate_summaries: RwLock::new(Arc::new(
-                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
-            )),
-            pending_build: Mutex::new(None),
-            build_error: Mutex::new(None),
-            file_listing: RwLock::new(None),
-            update_strategy: UpdateStrategy::Manual,
-            semantic_indexing: false,
-            startup_index_warm: StartupIndexWarm::OnDemand,
-            watcher_starter,
-            diff_snapshot_object_dir: None,
-        })
-    }
-
     /// Construct a manual, non-semantic service over `project` with an
     /// ephemeral (non-persisted) analyzer cache and a caller-supplied analyzer
     /// config. One-shot audit drivers (the MCP property fuzzer) use this:
@@ -1847,7 +1981,9 @@ impl SearchToolsService {
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
     ) -> Result<Self, String> {
-        Self::new_manual_with_cache(project, config, false)
+        let workspace = WorkspaceAnalyzer::build_ephemeral(Arc::clone(&project), config)
+            .map_err(|error| format!("Failed to build ephemeral workspace: {error}"))?;
+        Self::new_manual_from_workspace(project, workspace)
     }
 
     /// Persisted-cache sibling of [`Self::new_manual_ephemeral_for_project`]
@@ -1857,22 +1993,17 @@ impl SearchToolsService {
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
     ) -> Result<Self, String> {
-        Self::new_manual_with_cache(project, config, true)
+        let workspace = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), config)
+            .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
+        Self::new_manual_from_workspace(project, workspace)
     }
 
-    fn new_manual_with_cache(
+    fn new_manual_from_workspace(
         project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        persisted: bool,
+        workspace: WorkspaceAnalyzer,
     ) -> Result<Self, String> {
         let root = project.root().to_path_buf();
         let watcher_starter = production_watcher_starter();
-        let workspace = if persisted {
-            WorkspaceAnalyzer::build_persisted_for_service(Arc::clone(&project), config)
-                .map_err(|error| format!("Failed to build persisted workspace: {error}"))?
-        } else {
-            WorkspaceAnalyzer::build_for_service(Arc::clone(&project), config)
-        };
         let session = assemble_session(
             project,
             workspace,
@@ -2051,13 +2182,6 @@ impl SearchToolsService {
             .write()
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
             .unregister(taint_ref))
-    }
-
-    /// Construct with no file watcher and no semantic indexer: the caller drives
-    /// updates via the incremental `update_paths` tool. For batch consumers that
-    /// re-use one session across many revisions of one worktree.
-    pub fn new_for_python_manual(root: PathBuf) -> Result<Self, String> {
-        Self::new_transient_with_strategy(root, UpdateStrategy::Manual, false)
     }
 
     pub fn call_tool_json(
@@ -2983,12 +3107,12 @@ impl SearchToolsService {
         })
     }
 
-    fn new_transient_with_strategy(
+    fn new_ephemeral_with_strategy(
         root: PathBuf,
         update_strategy: UpdateStrategy,
         semantic_indexing: bool,
     ) -> Result<Self, String> {
-        Self::new_transient_with_strategy_and_watcher_starter(
+        Self::new_ephemeral_with_strategy_and_watcher_starter(
             root,
             update_strategy,
             semantic_indexing,
@@ -2996,7 +3120,7 @@ impl SearchToolsService {
         )
     }
 
-    fn new_transient_with_strategy_and_watcher_starter(
+    fn new_ephemeral_with_strategy_and_watcher_starter(
         root: PathBuf,
         update_strategy: UpdateStrategy,
         semantic_indexing: bool,
@@ -3004,7 +3128,7 @@ impl SearchToolsService {
     ) -> Result<Self, String> {
         let canonical = canonical_service_root(root)?;
         let file_listing = listing_cache_for(update_strategy, &canonical);
-        let (project, workspace) = build_transient_workspace(canonical, file_listing.clone())?;
+        let (project, workspace) = build_ephemeral_workspace(canonical, file_listing.clone())?;
         let root = project.root().to_path_buf();
         let session = assemble_session(
             project,
@@ -3329,7 +3453,7 @@ impl SearchToolsService {
                 move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
                     let _scope = profiling::scope("mcp_cold.analyzer_construction");
                     let project = build_project(canonical.clone(), file_listing)?;
-                    let workspace = WorkspaceAnalyzer::build_persisted_for_service(
+                    let workspace = WorkspaceAnalyzer::build_persisted(
                         Arc::clone(&project),
                         AnalyzerConfig::default(),
                     )
@@ -4526,7 +4650,7 @@ impl SearchToolsService {
                 "Invalid explain_policy arguments: {error}"
             ))
         })?;
-        let target = explain_policy_target(&params)?;
+        let question = explain_policy_question(&params)?;
         let policy_inputs = explain_policy_inputs_from(&params)?;
 
         loop {
@@ -4541,16 +4665,39 @@ impl SearchToolsService {
             let root = snapshot.analyzer().project().root().to_path_buf();
             let result = (|| {
                 let _scope = profiling::scope("explain_policy.explain_policy_inputs");
-                let explanation = explain_policy_inputs(
-                    &root,
-                    &policy_inputs,
-                    &target,
-                    Some(&snapshot),
-                    cancellation,
-                    &ExplanationLimits::default(),
-                )
-                .map_err(explain_error_to_service_error)?;
-                Self::structured_only(ExplainPolicyToolResult { explanation })
+                let answer = match &question {
+                    ExplainPolicyQuestion::Explanation(target) => {
+                        ExplainPolicyToolResult::Explanation {
+                            explanation: Box::new(
+                                explain_policy_inputs(
+                                    &root,
+                                    &policy_inputs,
+                                    target,
+                                    Some(&snapshot),
+                                    cancellation,
+                                    &ExplanationLimits::default(),
+                                )
+                                .map_err(explain_error_to_service_error)?,
+                            ),
+                        }
+                    }
+                    ExplainPolicyQuestion::NearMiss(candidates, limits) => {
+                        ExplainPolicyToolResult::NearMiss {
+                            near_miss_ranking: Box::new(
+                                rank_policy_near_misses(
+                                    &root,
+                                    &policy_inputs,
+                                    candidates,
+                                    Some(&snapshot),
+                                    cancellation,
+                                    limits,
+                                )
+                                .map_err(explain_error_to_service_error)?,
+                            ),
+                        }
+                    }
+                };
+                Self::structured_only(answer)
             })();
             return snapshot.finish("explain_policy", result);
         }
@@ -4761,22 +4908,21 @@ fn build_persisted_workspace(
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
     let _scope = profiling::scope("mcp_cold.analyzer_construction");
     let project = build_project(root, listing)?;
-    let workspace = WorkspaceAnalyzer::build_persisted_for_service(
-        Arc::clone(&project),
-        AnalyzerConfig::default(),
-    )
-    .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
+    let workspace =
+        WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
+            .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
     prewarm_configured_semantic_models(project.root(), &workspace)?;
     Ok((project, workspace))
 }
 
-fn build_transient_workspace(
+fn build_ephemeral_workspace(
     root: PathBuf,
     listing: Option<Arc<WorkspaceFileListingCache>>,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
     let project = build_project(root, listing)?;
     let workspace =
-        WorkspaceAnalyzer::build_for_service(Arc::clone(&project), AnalyzerConfig::default());
+        WorkspaceAnalyzer::build_ephemeral(Arc::clone(&project), AnalyzerConfig::default())
+            .map_err(|error| format!("Failed to build ephemeral workspace: {error}"))?;
     prewarm_configured_semantic_models(project.root(), &workspace)?;
     Ok((project, workspace))
 }
@@ -5242,8 +5388,8 @@ mod watcher_startup_tests {
     #[test]
     fn profiled_query_charges_transport_queue_wait_to_request_timing() {
         let (_temp, root) = workspace("Queued.java", "class Queued {}\n");
-        let service = SearchToolsService::new_manual_without_semantic_index(root)
-            .expect("manual service should start");
+        let service =
+            SearchToolsService::new_manual_ephemeral(root).expect("manual service should start");
         let output = service
             .call_tool_output_with_transport_queue_wait(
                 "query_code",
@@ -5488,8 +5634,7 @@ mod watcher_startup_tests {
     #[test]
     fn issue_1296_registration_deadline_includes_preparation_timings() {
         let (_temp, root) = workspace("Policy.java", "class Policy {}\n");
-        let service =
-            SearchToolsService::new_manual_without_semantic_index(root).expect("manual service");
+        let service = SearchToolsService::new_manual_ephemeral(root).expect("manual service");
         let cancellation = CancellationToken::default().with_timeout(Duration::ZERO);
 
         let output = service
@@ -5707,7 +5852,7 @@ mod watcher_startup_tests {
             "lib.rs",
             "trait Runnable {}\npub struct Worker;\nimpl Runnable for Worker {}\n",
         );
-        let service = SearchToolsService::new_manual_without_semantic_index(root.clone()).unwrap();
+        let service = SearchToolsService::new_manual_ephemeral(root.clone()).unwrap();
         {
             let guard = service.session.read().unwrap();
             assert!(!guard.as_ref().unwrap().snapshot.query_indexes_warm());
@@ -5799,7 +5944,7 @@ mod watcher_startup_tests {
     #[test]
     fn a_one_shot_service_does_not_start_the_usage_index_warm_at_startup() {
         let (_temp, root) = workspace("lib.rs", "pub fn root() {}\npub fn run() { root(); }\n");
-        let service = SearchToolsService::new_manual_without_semantic_index(root).unwrap();
+        let service = SearchToolsService::new_manual_ephemeral(root).unwrap();
 
         let guard = service.session.read().unwrap();
         let session = guard.as_ref().unwrap();
@@ -5869,7 +6014,7 @@ mod watcher_startup_tests {
     fn manual_service_does_not_invoke_watcher_starter() {
         let (_temp, root) = workspace("Manual.java", "class Manual {}\n");
         let calls = Arc::new(AtomicUsize::new(0));
-        let service = SearchToolsService::new_transient_with_strategy_and_watcher_starter(
+        let service = SearchToolsService::new_ephemeral_with_strategy_and_watcher_starter(
             root.clone(),
             UpdateStrategy::Manual,
             false,
@@ -5896,7 +6041,7 @@ mod watcher_startup_tests {
                 ProjectChangeWatcher::start_polling_for_tests(project)
             }
         });
-        let service = SearchToolsService::new_transient_with_strategy_and_watcher_starter(
+        let service = SearchToolsService::new_ephemeral_with_strategy_and_watcher_starter(
             old_root.clone(),
             UpdateStrategy::WatchFiles,
             false,
@@ -6012,7 +6157,11 @@ mod analyzer_failure_boundary_tests {
             root.clone(),
             BTreeSet::from([Language::Java, Language::Python]),
         ));
-        let service = SearchToolsService::new_manual_for_project(project).unwrap();
+        let service = SearchToolsService::new_manual_persisted_for_project(
+            project,
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
         (temp, root, service)
     }
 
@@ -6131,7 +6280,7 @@ mod analyzer_failure_boundary_tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("Model.java"), "class Model {}\n").unwrap();
-        let (_project, workspace) = build_transient_workspace(root, None).unwrap();
+        let (_project, workspace) = build_ephemeral_workspace(root, None).unwrap();
         let document_root =
             Arc::new(WorkspaceRoot::open(workspace.analyzer().project().root()).unwrap());
         let scope = WorkspaceQueryScope::new(Arc::new(workspace), document_root);
@@ -6208,7 +6357,7 @@ public partial class MudDialogContainer
     }
 
     fn watching_service_without_watcher(root: PathBuf) -> SearchToolsService {
-        let (project, workspace) = build_transient_workspace(root, None).unwrap();
+        let (project, workspace) = build_ephemeral_workspace(root, None).unwrap();
         SearchToolsService {
             root: RwLock::new(Some(project.root().to_path_buf())),
             session: RwLock::new(Some(WorkspaceSession {
@@ -6289,7 +6438,7 @@ public partial class MudDialogContainer
     #[test]
     fn candidate_files_are_rechecked_after_the_source_changes() {
         let (_temp, root) = write_project();
-        let (_project, workspace) = build_transient_workspace(root.clone(), None).unwrap();
+        let (_project, workspace) = build_ephemeral_workspace(root.clone(), None).unwrap();
         let result = get_symbol_sources(
             workspace.analyzer(),
             SymbolLookupParams {
@@ -6333,8 +6482,12 @@ public partial class MudDialogContainer
     #[test]
     fn stale_analyzer_and_manual_service_keep_generation_consistent_source() {
         let (_temp, root) = write_project();
-        let (project, workspace) = build_transient_workspace(root.clone(), None).unwrap();
-        let manual = SearchToolsService::new_manual_for_project(project).unwrap();
+        let (project, workspace) = build_ephemeral_workspace(root.clone(), None).unwrap();
+        let manual = SearchToolsService::new_manual_ephemeral_for_project(
+            project,
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
         fs::write(root.join("MudDialogContainer.cs"), SHIFTED_SOURCE).unwrap();
 
         let direct = get_symbol_sources(
@@ -6475,6 +6628,26 @@ mod client_roots_tests {
         root.join(crate::gitblob::PROJECT_DIR_NAME)
             .join(crate::gitblob::CACHE_SUBDIR_NAME)
             .join(crate::cache_db::cache_db_file_name())
+    }
+
+    #[test]
+    fn manual_ephemeral_service_answers_without_creating_a_persisted_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = Repository::init(&root).unwrap();
+        std::fs::write(root.join("Local.java"), "class Local {}\n").unwrap();
+        commit_all(&repo);
+
+        let service = SearchToolsService::new_manual_ephemeral(root.clone()).unwrap();
+        let result = service
+            .call_tool_value(
+                "search_symbols",
+                json!({"patterns": ["Local"], "include_tests": true, "limit": 10}),
+            )
+            .unwrap();
+
+        assert_eq!(result["total_files"], 1, "{result:#}");
+        assert!(!cache_db_for(&root).exists());
     }
 
     /// A client-bound linked worktree resolves its cache the way every other
@@ -6665,9 +6838,7 @@ mod search_symbols_cancellation_tests {
             "pub fn semantic_diagnostics() {}\n",
         )
         .unwrap();
-        let service =
-            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
-                .unwrap();
+        let service = SearchToolsService::new_manual_ephemeral(temp.path().to_path_buf()).unwrap();
         let cancellation = CancellationToken::new();
         cancellation.cancel();
 
@@ -6700,9 +6871,7 @@ mod search_symbols_cancellation_tests {
     fn issue_1304_service_forwards_cancellation_to_most_relevant_files() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();
-        let service =
-            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
-                .unwrap();
+        let service = SearchToolsService::new_manual_ephemeral(temp.path().to_path_buf()).unwrap();
         let cancellation = CancellationToken::new();
         cancellation.cancel();
 
@@ -6737,9 +6906,7 @@ mod search_symbols_cancellation_tests {
             "package local; public class B {}\n",
         )
         .unwrap();
-        let service =
-            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
-                .unwrap();
+        let service = SearchToolsService::new_manual_ephemeral(temp.path().to_path_buf()).unwrap();
         let cancellation = CancellationToken::cancel_after_checks_for_test(4);
 
         let output = service
@@ -6793,9 +6960,7 @@ mod search_symbols_cancellation_tests {
     fn issue_1228_service_forwards_cancellation_to_scan_usages_by_reference() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();
-        let service =
-            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
-                .unwrap();
+        let service = SearchToolsService::new_manual_ephemeral(temp.path().to_path_buf()).unwrap();
         let cancellation = CancellationToken::new();
         cancellation.cancel();
 
@@ -6819,9 +6984,7 @@ mod search_symbols_cancellation_tests {
     fn issue_1228_service_forwards_cancellation_to_scan_usages_by_location() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();
-        let service =
-            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
-                .unwrap();
+        let service = SearchToolsService::new_manual_ephemeral(temp.path().to_path_buf()).unwrap();
         let cancellation = CancellationToken::new();
         cancellation.cancel();
 
@@ -6845,9 +7008,7 @@ mod search_symbols_cancellation_tests {
     fn issue_1199_search_symbols_rejects_unbounded_pattern_batches() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("lib.rs"), "pub fn target() {}\n").unwrap();
-        let service =
-            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
-                .unwrap();
+        let service = SearchToolsService::new_manual_ephemeral(temp.path().to_path_buf()).unwrap();
 
         let oversized = [
             (
@@ -6906,9 +7067,7 @@ mod query_protocol_tests {
             "export function lifecycle(): void {}\n",
         )
         .unwrap();
-        let service =
-            SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
-                .unwrap();
+        let service = SearchToolsService::new_manual_ephemeral(temp.path().to_path_buf()).unwrap();
         let workspace = service.analyzer_snapshot().unwrap();
         let file = ProjectFile::new(workspace.analyzer().project().root(), "main.ts");
         let cancellation = CancellationToken::default();

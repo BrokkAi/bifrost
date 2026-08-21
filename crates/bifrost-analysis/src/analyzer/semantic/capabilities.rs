@@ -20,6 +20,10 @@ macro_rules! semantic_capabilities {
                 $(Self::$capability),+
             ];
 
+            /// Every capability label, in declaration order: the value domain
+            /// the `semantic_unsupported` row fields publish (issue #2515).
+            pub const LABELS: &'static [&'static str] = &[$($label),+];
+
             pub const fn index(self) -> usize {
                 self as usize
             }

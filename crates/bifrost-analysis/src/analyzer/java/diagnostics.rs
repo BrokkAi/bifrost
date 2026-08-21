@@ -9,7 +9,7 @@
 //! unrecognized.
 
 use crate::analyzer::jvm::JvmOverlayModel;
-use crate::analyzer::{IAnalyzer, JavaAnalyzer, ProjectFile, SemanticDiagnosticReport};
+use crate::analyzer::{IAnalyzer, JavaAnalyzer, Language, ProjectFile, SemanticDiagnosticReport};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
 pub(crate) fn collect_java_semantic_diagnostics(
@@ -24,7 +24,7 @@ pub(crate) fn collect_java_semantic_diagnostics(
     let report = brokk_bifrost_jvm::java::diagnostics::collect_java_semantic_diagnostics(
         java,
         token,
-        &analyzer.global_usage_definition_index(),
+        &crate::analyzer::AnalyzerDefinitionLookup::new(analyzer, Language::None),
         &JvmOverlayModel(analyzer.semantic_model_overlay()),
         file,
         source,

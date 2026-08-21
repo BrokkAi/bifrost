@@ -150,13 +150,32 @@ does not recurse. It rejects symbolic links, non-files, files outside the
 canonical workspace, excessive files, and excessive source bytes. Each result
 contains the exact source SHA-256 and compiled semantic digest.
 
-Discovery is not ambient activation. The host must call
-`discover_workspace_semantic_models`, register each accepted compiled pack as
-an `EphemeralWorkspace` or durable `WorkspaceProduced` source, and supply an
-explicit workspace activation control when review is required. The production
+Discovery is not ambient activation. A host calls
+`register_workspace_semantic_models`, which discovers each file, compiles it,
+and registers it as an `EphemeralWorkspace` session pack. The host then puts
+the returned evidence into its activation request and supplies an explicit
+workspace `enable` control for any pack that requires review. The production
 runtime then applies normal source precedence. Workspace sources outrank
 installed and shipped sources. Exact authored source or artifact declarations
 still outrank model-only overlay facts.
+`workspace_semantic_models_not_active` proves what actually activated, so a
+registered model can never go missing without the host noticing.
+
+These hosts run the reviewed workspace route:
+
+| Host | When it runs | On failure |
+| --- | --- | --- |
+| `bifrost --policy-file` | every policy run, including the diff base, when the directory exists | a `workspace-model-load-failed` report diagnostic and exit 2 |
+| The MCP host | at workspace bind, with `BIFROST_WORKSPACE_SEMANTIC_MODELS=on` | the bind fails with the source path named |
+
+The LSP host does not run this route. It activates dependency packs through
+its own background scheduler, which reads `.bifrost/packs.json` for the
+ecosystems and the catalog only.
+
+A pack that declares `safety.review_required` stays inert on every host until
+an `enable` control names its pack id. `bifrost --policy-file` reads that list
+from `.bifrost/packs.json` and reports an inert pack as a
+`workspace-model-inert` warning.
 
 Workspace files are data only. The loader uses the normal safe YAML or JSON
 parser. It does not load arbitrary code, follow links, execute a generator,

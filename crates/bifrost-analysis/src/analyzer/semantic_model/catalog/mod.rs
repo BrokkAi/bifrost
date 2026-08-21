@@ -1537,7 +1537,7 @@ impl SemanticPackCatalog {
         }
         let desired = SemanticPackActiveSet::from_members(members)
             .map_err(|error| CatalogError::Integrity(error.to_string()))?;
-        if store.is_in_memory() {
+        if store.is_ephemeral() {
             if desired
                 .members
                 .iter()
@@ -1580,7 +1580,7 @@ impl SemanticPackCatalog {
         scope_id: &str,
         store: &AnalyzerStore,
     ) -> Result<Option<SemanticPackActiveSet>, CatalogError> {
-        if store.is_in_memory() {
+        if store.is_ephemeral() {
             let active_set = store
                 .semantic_pack_active_set()
                 .map_err(|error| CatalogError::Integrity(error.to_string()))?;

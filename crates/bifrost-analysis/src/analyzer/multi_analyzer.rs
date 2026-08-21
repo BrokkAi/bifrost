@@ -211,6 +211,7 @@ impl AnalyzerDelegate {
             Self::CSharp(_) => crate::analyzer::csharp::is_csharp_dependency_input(file),
             Self::Cpp(_) => brokk_bifrost_cpp::compile_context::is_cpp_compile_context_input(file),
             Self::JavaScript(_) | Self::TypeScript(_) => is_js_ts_config_file(file),
+            Self::Go(_) => is_go_module_manifest(file),
             _ => false,
         }
     }
@@ -244,14 +245,12 @@ pub(crate) fn build_language_delegate(
     config: AnalyzerConfig,
     mut store_context: AnalyzerStoreContext,
     progress: Option<BuildProgress>,
-    revalidate_filesystem_paths: bool,
 ) -> Result<AnalyzerDelegate, StoreError> {
     let _scope = profiling::scope(format!("WorkspaceAnalyzer::build[{language:?}]"));
-    store_context.live_paths = Arc::new(if revalidate_filesystem_paths {
-        crate::analyzer::store::liveness::LivePathMap::default()
-    } else {
-        crate::analyzer::store::liveness::LivePathMap::trust_filesystem_generation()
-    });
+    // Each delegate owns its language-specific live-path generation while all
+    // delegates share the store and generation identities.
+    store_context.live_paths =
+        Arc::new(crate::analyzer::store::liveness::LivePathMap::trust_filesystem_generation());
     macro_rules! build_delegate {
         ($variant:ident, $analyzer:ty) => {
             AnalyzerDelegate::$variant(<$analyzer>::new_with_config_store_context(
@@ -295,7 +294,6 @@ pub(crate) struct WorkspaceBuildContext {
     config: AnalyzerConfig,
     store_context: AnalyzerStoreContext,
     requested_languages: Option<BTreeSet<Language>>,
-    revalidate_filesystem_paths: bool,
 }
 
 impl WorkspaceBuildContext {
@@ -304,14 +302,12 @@ impl WorkspaceBuildContext {
         config: AnalyzerConfig,
         store_context: AnalyzerStoreContext,
         requested_languages: Option<BTreeSet<Language>>,
-        revalidate_filesystem_paths: bool,
     ) -> Self {
         Self {
             project,
             config,
             store_context,
             requested_languages: requested_languages.filter(|languages| !languages.is_empty()),
-            revalidate_filesystem_paths,
         }
     }
 
@@ -382,7 +378,6 @@ impl WorkspaceBuildContext {
             self.config.clone(),
             self.store_context.clone(),
             None,
-            self.revalidate_filesystem_paths,
         )
     }
 }
@@ -391,6 +386,13 @@ fn is_js_ts_config_file(file: &ProjectFile) -> bool {
     matches!(
         file.rel_path().file_name().and_then(|name| name.to_str()),
         Some("tsconfig.json" | "jsconfig.json")
+    )
+}
+
+fn is_go_module_manifest(file: &ProjectFile) -> bool {
+    matches!(
+        file.rel_path().file_name().and_then(|name| name.to_str()),
+        Some("go.mod" | "go.sum")
     )
 }
 
@@ -2187,6 +2189,19 @@ mod tests {
         assert!(delegate.needs_config_update_for(&project_file("App.csproj")));
         assert!(delegate.needs_config_update_for(&project_file("bin/App.dll")));
         assert!(!delegate.needs_config_update_for(&project_file("src/App.cs")));
+    }
+
+    #[test]
+    fn go_module_manifests_are_routed_as_delegate_relevant_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = FileSetProject::new(
+            temp.path().canonicalize().unwrap(),
+            std::iter::empty::<std::path::PathBuf>(),
+        );
+        let delegate = AnalyzerDelegate::Go(GoAnalyzer::from_project(project));
+        assert!(delegate.needs_config_update_for(&project_file("go.mod")));
+        assert!(delegate.needs_config_update_for(&project_file("go.sum")));
+        assert!(!delegate.needs_config_update_for(&project_file("pkg/foo.go")));
     }
 
     /// A two-language workspace on disk, as a `MultiAnalyzer` over real

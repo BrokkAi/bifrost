@@ -485,6 +485,10 @@ pub enum CandidateCoverage {
 }
 
 impl CandidateCoverage {
+    /// The value domain the `coverage` row fields fed by this type publish
+    /// (issue #2515).
+    pub const LABELS: &'static [&'static str] = &["exhaustive", "open", "truncated"];
+
     /// The stable public spelling of this coverage, for row projections that
     /// must report the oracle's own vocabulary instead of a re-derived one.
     pub const fn label(self) -> &'static str {

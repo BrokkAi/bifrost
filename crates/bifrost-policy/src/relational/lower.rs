@@ -363,6 +363,7 @@ fn lower_projection(
             column: output.clone(),
             scalar_type: field.scalar_type,
             nullable: field.nullable,
+            value_domain: field.value_domain,
         });
         columns.push(IrProjection { source, output });
     }

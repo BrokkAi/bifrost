@@ -141,6 +141,20 @@ pub enum ProcedureKind {
 }
 
 impl ProcedureKind {
+    /// The value domain the `procedure.procedure_kind` row field publishes
+    /// (issue #2515).
+    pub const LABELS: &'static [&'static str] = &[
+        "function",
+        "method",
+        "constructor",
+        "initializer",
+        "local_function",
+        "lambda",
+        "closure",
+        "accessor",
+        "operator",
+    ];
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Function => "function",
@@ -682,6 +696,10 @@ impl ProofStatus {
 }
 
 impl ProofStatus {
+    /// The value domain the `proof` row fields fed by this status publish
+    /// (issue #2515).
+    pub const LABELS: &'static [&'static str] = &["proven", "unproven"];
+
     pub const fn label(&self) -> &'static str {
         match self {
             Self::Proven => "proven",
@@ -707,6 +725,10 @@ impl EvidenceCompleteness {
 }
 
 impl EvidenceCompleteness {
+    /// The value domain the `completeness` row fields fed by this status
+    /// publish (issue #2515).
+    pub const LABELS: &'static [&'static str] = &["complete", "partial"];
+
     pub const fn label(&self) -> &'static str {
         match self {
             Self::Complete => "complete",
@@ -1199,6 +1221,20 @@ pub enum ControlEdgeKind {
 }
 
 impl ControlEdgeKind {
+    /// The value domain the `control_edge.edge_kind` row field publishes
+    /// (issue #2515).
+    pub const LABELS: &'static [&'static str] = &[
+        "normal",
+        "conditional_true",
+        "conditional_false",
+        "switch_case",
+        "loop_back",
+        "exceptional",
+        "cleanup",
+        "async_normal",
+        "async_exceptional",
+    ];
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Normal => "normal",

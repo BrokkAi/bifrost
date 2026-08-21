@@ -37,6 +37,11 @@ pub struct FormalParameterSlot {
     pub declaration_range: Range,
     pub receiver: bool,
     pub variadic: Option<FormalVariadicKind>,
+    /// The span of the default expression this parameter declares, when its
+    /// grammar names one. `None` means the parameter declares no default *or*
+    /// the language has none at all; see [`parameter_default_range`] for which
+    /// grammars record it (issue #2499).
+    pub default_range: Option<Range>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +85,7 @@ pub fn formal_parameter_slots(
     declaration_range: &Range,
 ) -> Option<FormalParameterLayout> {
     let owner = parameter_owner_for_range(language, root, declaration_range)?;
-    formal_parameter_slots_for_owner(language, owner, source, declaration_range)
+    formal_parameter_slots_for_owner(language, owner, source)
 }
 
 /// Return formal parameter slots for a callable node already selected by the
@@ -91,9 +96,8 @@ pub(crate) fn formal_parameter_slots_for_owner(
     language: Language,
     owner: Node<'_>,
     source: &str,
-    declaration_range: &Range,
 ) -> Option<FormalParameterLayout> {
-    formal_parameter_slots_for_owner_bounded(language, owner, source, declaration_range, || true)
+    formal_parameter_slots_for_owner_bounded(language, owner, source, || true)
 }
 
 /// Metered form of [`formal_parameter_slots_for_owner`] for receiver
@@ -104,7 +108,6 @@ pub(crate) fn formal_parameter_slots_for_owner_bounded(
     language: Language,
     owner: Node<'_>,
     source: &str,
-    declaration_range: &Range,
     mut scope_step: impl FnMut() -> bool,
 ) -> Option<FormalParameterLayout> {
     if !scope_step() || !is_parameter_owner(language, owner.kind()) {
@@ -114,7 +117,6 @@ pub(crate) fn formal_parameter_slots_for_owner_bounded(
         Some(python_method_binding_with_step(
             owner,
             source,
-            declaration_range,
             &mut scope_step,
         )?)
     } else {
@@ -153,6 +155,7 @@ pub(crate) fn formal_parameter_slots_for_owner_bounded(
         let receiver = binding.kind == DeclarationKind::ReceiverParameter;
         let declaration_range = node_range(binding.declaration);
         let variadic = is_variadic_parameter(language, binding.declaration);
+        let default_range = parameter_default_range(language, binding.declaration);
         let can_share_slot = language != Language::Go;
         if can_share_slot
             && let Some(slot) = slots.last_mut()
@@ -171,6 +174,7 @@ pub(crate) fn formal_parameter_slots_for_owner_bounded(
             declaration_range,
             receiver,
             variadic,
+            default_range,
         });
     }
 
@@ -180,16 +184,27 @@ pub(crate) fn formal_parameter_slots_for_owner_bounded(
     })
 }
 
+/// The decorators that bind `owner` are the `decorator` children of the
+/// `decorated_definition` whose `definition` field is `owner` itself. That
+/// structural relation is the whole test (#2495).
+///
+/// The previous form additionally required the `decorated_definition` to lie
+/// inside the caller's `declaration_range`. A caller that passes a *declaration*
+/// range, such as `formal_parameter_slots`, spans the decorators and satisfied
+/// it; a caller that passes the `function_definition`'s own range -- which every
+/// Python semantic and lexical caller does -- never could, because the decorators
+/// sit above that node. `@staticmethod` and `@classmethod` were therefore read as
+/// instance methods there, and the first formal was bound as the receiver: a
+/// static method's first argument had no formal to bind, which left every call
+/// of it open.
 fn python_method_binding_with_step(
     owner: Node<'_>,
     source: &str,
-    declaration_range: &Range,
     scope_step: &mut impl FnMut() -> bool,
 ) -> Option<PythonMethodBinding> {
     let Some(decorated) = owner.parent().filter(|parent| {
         parent.kind() == "decorated_definition"
-            && parent.start_byte() >= declaration_range.start_byte
-            && parent.end_byte() <= declaration_range.end_byte
+            && parent.child_by_field_name("definition") == Some(owner)
     }) else {
         return Some(PythonMethodBinding::Instance);
     };
@@ -490,6 +505,67 @@ fn is_variadic_parameter(language: Language, parameter: Node<'_>) -> Option<Form
             None
         }
     }
+}
+
+/// Whether `language` writes a callable's receiver into its declared parameter
+/// list, so a layout with no receiver slot *proves* the callable takes no
+/// receiver (issue #2499).
+///
+/// Rust spells it `self`, Go spells it in the receiver clause, and Python
+/// spells it as the first ordinary parameter -- in all three, the declaration
+/// is complete about it. Every other language here binds an instance receiver
+/// implicitly, so an absent receiver slot says nothing: Java's
+/// `receiver_parameter` exists to carry annotations and is almost never
+/// written, and TypeScript's `this` parameter is optional in the same way. A
+/// caller that needs the answer for one of those languages must read the
+/// declaration's published receiver contract instead.
+pub(crate) fn receiver_is_declared_parameter(language: Language) -> bool {
+    match language {
+        Language::Rust | Language::Go | Language::Python => true,
+        Language::Java
+        | Language::JavaScript
+        | Language::TypeScript
+        | Language::Kotlin
+        | Language::Scala
+        | Language::CSharp
+        | Language::Cpp
+        | Language::Php
+        | Language::Ruby
+        | Language::None => false,
+    }
+}
+
+/// The span of the default expression `parameter` declares, read as a named
+/// field of the parameter node (issue #2499).
+///
+/// Every entry below is a grammar field whose only content is the written
+/// default: Python's `value`, TypeScript's `value`, JavaScript's
+/// `assignment_pattern` right-hand side, and the `default_value` field Scala,
+/// C++ and PHP all spell the same way. Nothing here scans for `=`, so a
+/// language whose grammar does not name the default -- Kotlin, whose parameter
+/// nodes carry no fields at all, and C#, whose default is an unnamed
+/// `expression` child among modifiers and attributes -- reports `None` rather
+/// than a guess, and simply mints no `defaulted` binding row.
+///
+/// Java, Go and Rust have no parameter defaults in the language, so `None`
+/// there is the complete answer rather than a gap.
+fn parameter_default_range(language: Language, parameter: Node<'_>) -> Option<Range> {
+    let value = match language {
+        Language::Python | Language::Ruby => parameter.child_by_field_name("value"),
+        Language::JavaScript | Language::TypeScript => parameter
+            .child_by_field_name("value")
+            .or_else(|| parameter.child_by_field_name("right")),
+        Language::Scala | Language::Cpp | Language::Php => {
+            parameter.child_by_field_name("default_value")
+        }
+        Language::Java
+        | Language::Go
+        | Language::Rust
+        | Language::CSharp
+        | Language::Kotlin
+        | Language::None => None,
+    };
+    value.map(node_range)
 }
 
 fn parameter_bindings(
@@ -1383,15 +1459,8 @@ mod tests {
         let source = "package sample\n\nfun render(prefix: String, count: Int): String = prefix\n";
         let (_parser, tree) = kotlin_root(source);
         let owner = first_named_kind(tree.root_node(), "function_declaration");
-        let declaration_range = Range {
-            start_byte: owner.start_byte(),
-            end_byte: owner.end_byte(),
-            start_line: owner.start_position().row,
-            end_line: owner.end_position().row,
-        };
-        let layout =
-            formal_parameter_slots_for_owner(Language::Kotlin, owner, source, &declaration_range)
-                .expect("Kotlin function must expose formal parameter slots");
+        let layout = formal_parameter_slots_for_owner(Language::Kotlin, owner, source)
+            .expect("Kotlin function must expose formal parameter slots");
         let names: Vec<&str> = layout
             .slots
             .iter()
@@ -1406,15 +1475,8 @@ mod tests {
         let source = "package sample\n\nclass Holder(val seed: Int, label: String)\n";
         let (_parser, tree) = kotlin_root(source);
         let owner = first_named_kind(tree.root_node(), "primary_constructor");
-        let declaration_range = Range {
-            start_byte: owner.start_byte(),
-            end_byte: owner.end_byte(),
-            start_line: owner.start_position().row,
-            end_line: owner.end_position().row,
-        };
-        let layout =
-            formal_parameter_slots_for_owner(Language::Kotlin, owner, source, &declaration_range)
-                .expect("Kotlin primary constructor must expose formal parameter slots");
+        let layout = formal_parameter_slots_for_owner(Language::Kotlin, owner, source)
+            .expect("Kotlin primary constructor must expose formal parameter slots");
         let names: Vec<&str> = layout
             .slots
             .iter()
@@ -1436,32 +1498,21 @@ mod tests {
             .expect("Python grammar");
         let tree = parser.parse(&source, None).expect("Python tree");
         let owner = first_named_kind(tree.root_node(), "function_definition");
-        let declaration_range = node_range(owner);
         let mut remaining = 8usize;
 
-        let limited = formal_parameter_slots_for_owner_bounded(
-            Language::Python,
-            owner,
-            &source,
-            &declaration_range,
-            || {
+        let limited =
+            formal_parameter_slots_for_owner_bounded(Language::Python, owner, &source, || {
                 let admitted = remaining > 0;
                 remaining = remaining.saturating_sub(1);
                 admitted
-            },
-        );
+            });
 
         assert!(limited.is_none());
         assert_eq!(remaining, 0);
 
-        let complete = formal_parameter_slots_for_owner_bounded(
-            Language::Python,
-            owner,
-            &source,
-            &declaration_range,
-            || true,
-        )
-        .expect("ample traversal budget");
+        let complete =
+            formal_parameter_slots_for_owner_bounded(Language::Python, owner, &source, || true)
+                .expect("ample traversal budget");
         assert_eq!(complete.slots.len(), 64);
         assert_eq!(complete.slots[0].names, ["p0"]);
         assert_eq!(complete.slots[63].names, ["p63"]);

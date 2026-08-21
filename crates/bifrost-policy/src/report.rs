@@ -1027,6 +1027,12 @@ pub enum PolicyReportDiagnosticCode {
     BaselineAuditRetentionExceeded,
     PacksLoadFailed,
     PackActivationFailed,
+    /// A reviewed model under `.bifrost/semantic-models/` could not be
+    /// discovered, compiled, registered, or activated (#2493).
+    WorkspaceModelLoadFailed,
+    /// A reviewed workspace model is registered but held back by its own
+    /// review gate, so it contributes nothing to this run (#2493).
+    WorkspaceModelInert,
     PolicyLoadFailed,
     PolicyParseFailed,
     PolicyValidationFailed,
@@ -3868,6 +3874,14 @@ mod tests {
         assert_eq!(
             serde_json::to_value(PolicyReportDiagnosticCode::PackActivationFailed).unwrap(),
             json!("pack-activation-failed")
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyReportDiagnosticCode::WorkspaceModelLoadFailed).unwrap(),
+            json!("workspace-model-load-failed")
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyReportDiagnosticCode::WorkspaceModelInert).unwrap(),
+            json!("workspace-model-inert")
         );
     }
 

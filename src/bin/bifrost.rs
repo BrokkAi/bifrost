@@ -17,13 +17,13 @@ use brokk_bifrost::mcp_registry::{
 };
 use brokk_bifrost::policy::{
     BuiltInPolicySelection, ExplanationCandidate, ExplanationLimits, ExplanationTarget,
-    HumanRenderColor, HumanRenderDetail, HumanRenderOptions, POLICY_EXIT_CLEAN,
+    HumanRenderColor, HumanRenderDetail, HumanRenderOptions, NearMissCandidates, POLICY_EXIT_CLEAN,
     POLICY_EXIT_UNRELIABLE, PolicyBaselineDocument, PolicyBaselineOptions, PolicyBaselineSource,
     PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
     PolicyFailOn, PolicyFindingId, PolicyRenderError, PolicyReportDocument, PolicyScopeOptions,
     PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity,
     built_in_policy_catalog, escape_terminal_text, evaluate_policy_inputs, explain_policy_inputs,
-    write_policy_human, write_policy_json, write_policy_sarif,
+    rank_policy_near_misses, write_policy_human, write_policy_json, write_policy_sarif,
 };
 use brokk_bifrost::rmcp_host::{
     NamedWorkspace, run_named_workspace_stdio_server_with_build_identity,
@@ -113,6 +113,7 @@ fn has_policy_syntax(args: &[String]) -> bool {
                 | "--require-explicit-schema-versions"
                 | "--explain-finding"
                 | "--explain-candidate"
+                | "--explain-near-misses"
         ) {
             return true;
         }
@@ -152,6 +153,7 @@ fn option_requires_value(argument: &str) -> bool {
             | "--color"
             | "--explain-finding"
             | "--explain-candidate"
+            | "--explain-near-misses"
     )
 }
 
@@ -229,6 +231,7 @@ fn run_inner(
     let mut require_explicit_schema_versions = false;
     let mut explain_finding: Option<String> = None;
     let mut explain_candidate: Option<(String, u64, Option<u64>)> = None;
+    let mut explain_near_misses: Option<usize> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -368,6 +371,17 @@ fn run_inner(
                     return Err("--explain-candidate may only be provided once".to_string());
                 }
                 explain_candidate = Some(parse_explain_candidate(&value)?);
+            }
+            "--explain-near-misses" => {
+                let value = args.next().ok_or_else(|| {
+                    format!(
+                        "--explain-near-misses requires how many ranked subjects to retain,                          between 1 and {MAX_EXPLAIN_NEAR_MISSES}"
+                    )
+                })?;
+                if explain_near_misses.is_some() {
+                    return Err("--explain-near-misses may only be provided once".to_string());
+                }
+                explain_near_misses = Some(parse_explain_near_misses(&value)?);
             }
             "--format" => {
                 let value = args
@@ -540,9 +554,12 @@ fn run_inner(
             );
         }
         if list_policies {
-            if explain_finding.is_some() || explain_candidate.is_some() {
+            if explain_finding.is_some()
+                || explain_candidate.is_some()
+                || explain_near_misses.is_some()
+            {
                 return Err(
-                    "--list-policies cannot be combined with --explain-finding or --explain-candidate"
+                    "--list-policies cannot be combined with --explain-finding, --explain-candidate, or --explain-near-misses"
                         .to_string(),
                 );
             }
@@ -594,8 +611,9 @@ fn run_inner(
             }
             policy_fail_on = PolicyFailOn::Never;
         }
-        let explain_target = explanation_target(explain_finding, explain_candidate)?;
-        if explain_target.is_some() {
+        let explain_mode =
+            explanation_mode(explain_finding, explain_candidate, explain_near_misses)?;
+        if explain_mode.is_some() {
             // An explanation is a query about one policy, not a gate over a
             // workspace, so every option that shapes a gate is refused rather
             // than silently ignored.
@@ -611,7 +629,7 @@ fn run_inner(
                 || policy_color_seen
             {
                 return Err(
-                    "--explain-finding and --explain-candidate cannot be combined with --format, --fail-on, --suppressions-file, --scope-file, --baseline-file, --accept-current, --evaluation-date, --diff-base, --verbose, or --color"
+                    "--explain-finding, --explain-candidate, and --explain-near-misses cannot be combined with --format, --fail-on, --suppressions-file, --scope-file, --baseline-file, --accept-current, --evaluation-date, --diff-base, --verbose, or --color"
                         .to_string(),
                 );
             }
@@ -630,8 +648,15 @@ fn run_inner(
                 .into_iter()
                 .map(PolicyEvaluationInput::workspace_file),
         );
-        if let Some(target) = explain_target {
-            let status = run_policy_explain_mode(&root, &policy_inputs, &target, policy_output);
+        if let Some(mode) = explain_mode {
+            let status = match mode {
+                ExplanationMode::Explanation(target) => {
+                    run_policy_explain_mode(&root, &policy_inputs, &target, policy_output)
+                }
+                ExplanationMode::NearMiss(max_candidates) => {
+                    run_policy_near_miss_mode(&root, &policy_inputs, max_candidates, policy_output)
+                }
+            };
             return Ok(CliRunResult::PolicyStatus(status));
         }
         let status = run_policy_mode(
@@ -850,35 +875,71 @@ fn parse_policy_color(value: &str) -> Result<PolicyColorMode, String> {
     }
 }
 
-/// Resolve the two explanation flags into at most one target.
+/// The largest ranking `--explain-near-misses` will retain. The same ceiling
+/// the MCP tool's input schema publishes, so the two surfaces cannot drift.
+const MAX_EXPLAIN_NEAR_MISSES: usize = 64;
+
+/// One `--explain-near-misses` value: how many ranked subjects to retain.
+fn parse_explain_near_misses(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| format!("Invalid --explain-near-misses count `{value}`: {error}"))?;
+    if parsed == 0 || parsed > MAX_EXPLAIN_NEAR_MISSES {
+        return Err(format!(
+            "Invalid --explain-near-misses count `{value}`: expected between 1 and \
+             {MAX_EXPLAIN_NEAR_MISSES}"
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Which explanation question the invocation asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExplanationMode {
+    /// Why, or why-not, about one exact subject.
+    Explanation(ExplanationTarget),
+    /// Which subjects came closest, retaining at most this many.
+    NearMiss(usize),
+}
+
+/// Resolve the three explanation flags into at most one question.
 ///
-/// The two questions exclude each other: a request carrying both would have
-/// two answers, and this is stated at parse time rather than at evaluation
-/// time so a mistyped invocation fails before a workspace is built.
-fn explanation_target(
+/// The questions exclude each other: a request carrying two would have two
+/// answers, and this is stated at parse time rather than at evaluation time so
+/// a mistyped invocation fails before a workspace is built.
+fn explanation_mode(
     finding: Option<String>,
     candidate: Option<(String, u64, Option<u64>)>,
-) -> Result<Option<ExplanationTarget>, String> {
-    match (finding, candidate) {
-        (Some(_), Some(_)) => {
-            Err("--explain-finding cannot be combined with --explain-candidate".to_string())
-        }
-        (None, None) => Ok(None),
-        (Some(finding), None) => {
-            let parsed = finding
-                .parse::<PolicyFindingId>()
-                .map_err(|error| format!("Invalid --explain-finding id `{finding}`: {error}"))?;
-            Ok(Some(ExplanationTarget::Finding(parsed)))
-        }
-        (None, Some((path, byte_start, byte_end))) => {
-            let parsed = match byte_end {
-                Some(byte_end) => ExplanationCandidate::in_range(&path, byte_start, byte_end),
-                None => ExplanationCandidate::at_offset(&path, byte_start),
-            }
-            .map_err(|error| format!("Invalid --explain-candidate: {error}"))?;
-            Ok(Some(ExplanationTarget::Candidate(parsed)))
-        }
+    near_misses: Option<usize>,
+) -> Result<Option<ExplanationMode>, String> {
+    let asked = usize::from(finding.is_some())
+        + usize::from(candidate.is_some())
+        + usize::from(near_misses.is_some());
+    if asked > 1 {
+        return Err(
+            "--explain-finding, --explain-candidate, and --explain-near-misses exclude each other"
+                .to_string(),
+        );
     }
+    if let Some(finding) = finding {
+        let parsed = finding
+            .parse::<PolicyFindingId>()
+            .map_err(|error| format!("Invalid --explain-finding id `{finding}`: {error}"))?;
+        return Ok(Some(ExplanationMode::Explanation(
+            ExplanationTarget::Finding(parsed),
+        )));
+    }
+    if let Some((path, byte_start, byte_end)) = candidate {
+        let parsed = match byte_end {
+            Some(byte_end) => ExplanationCandidate::in_range(&path, byte_start, byte_end),
+            None => ExplanationCandidate::at_offset(&path, byte_start),
+        }
+        .map_err(|error| format!("Invalid --explain-candidate: {error}"))?;
+        return Ok(Some(ExplanationMode::Explanation(
+            ExplanationTarget::Candidate(parsed),
+        )));
+    }
+    Ok(near_misses.map(ExplanationMode::NearMiss))
 }
 
 /// Print one bounded policy explanation as JSON.
@@ -914,9 +975,56 @@ fn run_policy_explain_mode(
             return POLICY_EXIT_UNRELIABLE;
         }
     };
-    let encoded = explanation.to_json();
+    write_explanation_json(&explanation.to_json(), output)
+}
+
+/// Print one bounded near-miss ranking as JSON.
+///
+/// # Enumeration
+///
+/// The CLI form always asks for the seed-scoped search, because a shell
+/// invocation that already knew the exact positions it wanted measured would
+/// have used `--explain-candidate` on each of them. The search is bounded by
+/// the policy's own kind, language and path pruning, and a policy whose seed
+/// declares no such scope is refused rather than scanned.
+///
+/// # Exit status
+///
+/// A ranking is a query about a policy, not a gate, so a produced ranking
+/// always exits `0` -- including an empty one, which is the answer "nothing in
+/// the policy's own scope came close" rather than a failure. Only a failure to
+/// produce one at all exits `POLICY_EXIT_UNRELIABLE`, exactly as the two
+/// explanation flags behave.
+fn run_policy_near_miss_mode(
+    root: &Path,
+    policy_inputs: &[PolicyEvaluationInput],
+    max_candidates: usize,
+    output: Option<PathBuf>,
+) -> u8 {
+    let ranking = match rank_policy_near_misses(
+        root,
+        policy_inputs,
+        &NearMissCandidates::PolicySeedSearch,
+        None,
+        None,
+        &ExplanationLimits::default().with_max_near_miss_candidates(max_candidates),
+    ) {
+        Ok(ranking) => ranking,
+        Err(error) => {
+            eprintln!(
+                "bifrost: policy near-miss ranking failed: {}",
+                escape_terminal_text(&error.to_string())
+            );
+            return POLICY_EXIT_UNRELIABLE;
+        }
+    };
+    write_explanation_json(&ranking.to_json(), output)
+}
+
+/// Emit one explanation or ranking document, to a file or to stdout.
+fn write_explanation_json(encoded: &str, output: Option<PathBuf>) -> u8 {
     let written = match output.as_deref() {
-        Some(path) => write_explanation_output_file(path, &encoded),
+        Some(path) => write_explanation_output_file(path, encoded),
         None => {
             let mut stdout = io::stdout().lock();
             writeln!(stdout, "{encoded}")
@@ -1399,9 +1507,18 @@ OPTIONS:
                            Explain why the selected policy did not report this exact position,
                            and print the bounded explanation JSON. Nothing is scanned for: the
                            position you pass is the one explained
-                           Both explanation flags are queries, not gates: a produced explanation
-                           exits 0 even when its outcome is failed or unknown, and only a failure
-                           to produce one exits 2. Neither can be combined with --format,
+    --explain-near-misses N
+                           Rank the N subjects that came closest to satisfying the selected
+                           policy, and print the bounded ranking JSON. Each entry says how many
+                           of the policy's own declared predicates it missed and names the first
+                           one it failed. Candidates come from the policy's own seed scope --
+                           its kind union, language filter and path globs -- so a policy whose
+                           seed declares no such scope is refused rather than scanned; the
+                           repository is never walked
+                           All three explanation flags are queries, not gates: a produced answer
+                           exits 0 even when its outcome is failed or unknown and even when a
+                           ranking is empty, and only a failure to produce one exits 2. They
+                           exclude each other, and none can be combined with --format,
                            --fail-on, --suppressions-file, --scope-file, --baseline-file,
                            --accept-current, --evaluation-date, --diff-base, --verbose, or --color
     --output PATH          Atomically write policy output to PATH instead of stdout
@@ -1661,8 +1778,8 @@ mod named_workspace_cli_tests {
     }
 }
 
-/// Flag-level coverage for the two policy explanation flags (issue 2439
-/// slice 3).
+/// Flag-level coverage for the three policy explanation flags (issue 2439
+/// slice 3, issue 2500).
 ///
 /// These exercise parsing and the mutual-exclusion discipline without building
 /// a workspace: every case here is decided before any analyzer exists, which is
@@ -1670,7 +1787,8 @@ mod named_workspace_cli_tests {
 #[cfg(test)]
 mod policy_explain_cli_tests {
     use super::{
-        ExplanationTarget, explanation_target, has_policy_syntax, parse_explain_candidate, run,
+        ExplanationMode, ExplanationTarget, MAX_EXPLAIN_NEAR_MISSES, explanation_mode,
+        has_policy_syntax, parse_explain_candidate, parse_explain_near_misses, run,
     };
 
     fn run_error(args: &[&str]) -> String {
@@ -1688,7 +1806,11 @@ mod policy_explain_cli_tests {
 
     #[test]
     fn the_explanation_flags_are_policy_syntax() {
-        for flag in ["--explain-finding", "--explain-candidate"] {
+        for flag in [
+            "--explain-finding",
+            "--explain-candidate",
+            "--explain-near-misses",
+        ] {
             assert!(has_policy_syntax(&[flag.to_string(), "x".to_string()]));
         }
     }
@@ -1714,38 +1836,75 @@ mod policy_explain_cli_tests {
     }
 
     #[test]
-    fn a_target_refuses_both_questions_and_validates_each_one() {
-        assert_eq!(explanation_target(None, None).expect("no question"), None);
+    fn a_near_miss_count_is_bounded_on_both_sides() {
+        assert_eq!(parse_explain_near_misses("5").expect("a count"), 5);
         assert_eq!(
-            explanation_target(
-                Some("0".repeat(64)),
-                Some((String::from("app.ts"), 0, None))
-            )
-            .expect_err("two questions have two answers"),
-            "--explain-finding cannot be combined with --explain-candidate"
+            parse_explain_near_misses(&MAX_EXPLAIN_NEAR_MISSES.to_string()).expect("the ceiling"),
+            MAX_EXPLAIN_NEAR_MISSES
         );
+        for rejected in [
+            "0",
+            &(MAX_EXPLAIN_NEAR_MISSES + 1).to_string(),
+            "-1",
+            "many",
+        ] {
+            assert!(
+                parse_explain_near_misses(rejected).is_err(),
+                "{rejected} is not a ranking size"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mode_refuses_more_than_one_question_and_validates_each_one() {
+        assert_eq!(
+            explanation_mode(None, None, None).expect("no question"),
+            None
+        );
+        for (finding, candidate, near_misses) in [
+            (
+                Some("0".repeat(64)),
+                Some((String::from("app.ts"), 0, None)),
+                None,
+            ),
+            (Some("0".repeat(64)), None, Some(4)),
+            (None, Some((String::from("app.ts"), 0, None)), Some(4)),
+        ] {
+            assert_eq!(
+                explanation_mode(finding, candidate, near_misses)
+                    .expect_err("two questions have two answers"),
+                "--explain-finding, --explain-candidate, and --explain-near-misses exclude each \
+                 other"
+            );
+        }
         assert!(matches!(
-            explanation_target(Some("0".repeat(64)), None).expect("a valid identity"),
-            Some(ExplanationTarget::Finding(_))
+            explanation_mode(Some("0".repeat(64)), None, None).expect("a valid identity"),
+            Some(ExplanationMode::Explanation(ExplanationTarget::Finding(_)))
         ));
         assert!(
-            explanation_target(Some(String::from("nope")), None)
+            explanation_mode(Some(String::from("nope")), None, None)
                 .expect_err("a finding id is a lowercase sha-256")
                 .contains("Invalid --explain-finding")
         );
         assert!(matches!(
-            explanation_target(None, Some((String::from("app.ts"), 3, Some(9))))
+            explanation_mode(None, Some((String::from("app.ts"), 3, Some(9))), None)
                 .expect("a valid candidate"),
-            Some(ExplanationTarget::Candidate(_))
+            Some(ExplanationMode::Explanation(ExplanationTarget::Candidate(
+                _
+            )))
         ));
+        assert_eq!(
+            explanation_mode(None, None, Some(7)).expect("a valid ranking size"),
+            Some(ExplanationMode::NearMiss(7))
+        );
         // A path outside the workspace and a reversed range are both refused.
         assert!(
-            explanation_target(None, Some((String::from("../outside.ts"), 0, None)))
+            explanation_mode(None, Some((String::from("../outside.ts"), 0, None)), None)
                 .expect_err("a candidate stays inside the workspace")
                 .contains("Invalid --explain-candidate")
         );
         assert!(
-            explanation_target(None, Some((String::from("app.ts"), 9, Some(4))))
+            explanation_mode(None, Some((String::from("app.ts"), 9, Some(4))), None)
                 .expect_err("a range does not end before it starts")
                 .contains("exceeds end")
         );
@@ -1765,28 +1924,39 @@ mod policy_explain_cli_tests {
             vec!["--verbose"],
             vec!["--color", "never"],
         ] {
-            let mut args = vec![
-                "--policy-file",
-                "policies/p.rqlp",
-                "--explain-candidate",
-                "app.ts:0",
-            ];
-            args.extend(gate.iter().copied());
-            let message = run_error(&args);
-            assert!(
-                message.contains("--explain-finding and --explain-candidate cannot be combined"),
-                "{gate:?} must be refused beside an explanation: {message}"
-            );
+            for question in [
+                vec!["--explain-candidate", "app.ts:0"],
+                vec!["--explain-near-misses", "5"],
+            ] {
+                let mut args = vec!["--policy-file", "policies/p.rqlp"];
+                args.extend(question.iter().copied());
+                args.extend(gate.iter().copied());
+                let message = run_error(&args);
+                assert!(
+                    message.contains(
+                        "--explain-finding, --explain-candidate, and --explain-near-misses cannot \
+                         be combined"
+                    ),
+                    "{gate:?} must be refused beside {question:?}: {message}"
+                );
+            }
         }
     }
 
     #[test]
     fn an_explanation_cannot_be_combined_with_listing_or_the_other_question() {
-        let message = run_error(&["--list-policies", "--explain-candidate", "app.ts:0"]);
-        assert!(
-            message.contains("--list-policies cannot be combined"),
-            "{message}"
-        );
+        for question in [
+            vec!["--explain-candidate", "app.ts:0"],
+            vec!["--explain-near-misses", "5"],
+        ] {
+            let mut args = vec!["--list-policies"];
+            args.extend(question.iter().copied());
+            let message = run_error(&args);
+            assert!(
+                message.contains("--list-policies cannot be combined"),
+                "{message}"
+            );
+        }
 
         let message = run_error(&[
             "--policy-file",
@@ -1798,7 +1968,7 @@ mod policy_explain_cli_tests {
         ]);
         assert_eq!(
             message,
-            "--explain-finding cannot be combined with --explain-candidate"
+            "--explain-finding, --explain-candidate, and --explain-near-misses exclude each other"
         );
     }
 
@@ -1816,15 +1986,47 @@ mod policy_explain_cli_tests {
 
         let message = run_error(&["--policy-file", "policies/p.rqlp", "--explain-finding"]);
         assert!(message.contains("--explain-finding requires"), "{message}");
+
+        let message = run_error(&[
+            "--policy-file",
+            "policies/p.rqlp",
+            "--explain-near-misses",
+            "5",
+            "--explain-near-misses",
+            "6",
+        ]);
+        assert_eq!(message, "--explain-near-misses may only be provided once");
+
+        let message = run_error(&["--policy-file", "policies/p.rqlp", "--explain-near-misses"]);
+        assert!(
+            message.contains("--explain-near-misses requires"),
+            "{message}"
+        );
+
+        let message = run_error(&[
+            "--policy-file",
+            "policies/p.rqlp",
+            "--explain-near-misses",
+            "0",
+        ]);
+        assert!(
+            message.contains("Invalid --explain-near-misses count"),
+            "{message}"
+        );
     }
 
     #[test]
     fn an_explanation_still_requires_a_policy_selection() {
-        let message = run_error(&["--explain-candidate", "app.ts:0"]);
-        assert!(
-            message.contains("policy mode requires at least one --policy-file"),
-            "{message}"
-        );
+        for question in [
+            vec!["--explain-candidate", "app.ts:0"],
+            vec!["--explain-near-misses", "5"],
+        ] {
+            let message = run_error(&question);
+            assert!(
+                message.contains("policy mode requires at least one --policy-file"),
+                "{message}"
+            );
+        }
     }
 }
 
@@ -1837,7 +2039,7 @@ mod policy_explain_cli_tests {
 mod policy_explain_exit_status_tests {
     use super::{
         ExplanationCandidate, ExplanationTarget, POLICY_EXIT_CLEAN, POLICY_EXIT_UNRELIABLE,
-        PolicyEvaluationInput, run_policy_explain_mode,
+        PolicyEvaluationInput, run_policy_explain_mode, run_policy_near_miss_mode,
     };
     use serde_json::Value;
 
@@ -1901,6 +2103,54 @@ mod policy_explain_exit_status_tests {
                 "policies/absent.rqlp",
             )],
             &ExplanationTarget::Candidate(candidate),
+            None,
+        );
+        assert_eq!(status, POLICY_EXIT_UNRELIABLE);
+    }
+
+    #[test]
+    fn a_produced_ranking_exits_clean_and_writes_the_versioned_json() {
+        let temp = workspace();
+        let root = temp.path().canonicalize().expect("canonical root");
+        let destination = root.join("near-misses.json");
+        let status = run_policy_near_miss_mode(
+            &root,
+            &[PolicyEvaluationInput::workspace_file(
+                "policies/explain.rqlp",
+            )],
+            4,
+            Some(destination.clone()),
+        );
+        assert_eq!(status, POLICY_EXIT_CLEAN);
+
+        let written = std::fs::read_to_string(&destination).expect("the ranking was written");
+        let value: Value = serde_json::from_str(&written).expect("the ranking is JSON");
+        assert_eq!(
+            value["format"],
+            brokk_bifrost::policy::POLICY_NEAR_MISS_FORMAT
+        );
+        assert_eq!(value["question"], "near_miss");
+        assert_eq!(value["policy_id"], "test.cli.explain");
+        assert_eq!(
+            value["conjuncts"],
+            serde_json::json!(["scope", "root.name"])
+        );
+        // The fixture holds one class, which the selector selects, so the
+        // ranking holds exactly that subject at distance 0.
+        assert_eq!(value["entries"][0]["unsatisfied_conjuncts"], 0);
+        assert_eq!(value["entries"][0]["outcome"], "satisfied");
+    }
+
+    #[test]
+    fn a_failure_to_produce_a_ranking_exits_unreliable() {
+        let temp = workspace();
+        let root = temp.path().canonicalize().expect("canonical root");
+        let status = run_policy_near_miss_mode(
+            &root,
+            &[PolicyEvaluationInput::workspace_file(
+                "policies/absent.rqlp",
+            )],
+            4,
             None,
         );
         assert_eq!(status, POLICY_EXIT_UNRELIABLE);

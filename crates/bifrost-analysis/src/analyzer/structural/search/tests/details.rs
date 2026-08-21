@@ -895,10 +895,11 @@ public class Caller {
     ProjectFile::new(root.clone(), "Caller.cs")
         .write(source)
         .expect("write source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::CSharp)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
     let query = |terminal| {
         CodeQuery::from_json(&json!({
             "match": { "kind": "call", "callee": { "name": "Run" } },
@@ -950,10 +951,11 @@ public class Caller {
     ProjectFile::new(root.clone(), "Usage.cs")
         .write(usage)
         .expect("write usage");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::CSharp)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
     let query = CodeQuery::from_json(&json!({
         "where": ["Definitions.cs"],
         "match": { "kind": "method", "name": "Run" },
@@ -1228,6 +1230,73 @@ fn call_row_domains_project_every_registered_field_on_real_rows() {
     }
 }
 
+/// Issue #2515. Every enum-typed row field publishes the value domain a policy
+/// literal is checked against, and nothing else does.
+///
+/// A `ConstrainedEnum` field with no domain would be unvalidatable, so the
+/// constructors make that a compile error; this test states the other half --
+/// that a declared domain is a usable one, and that a field which is not an
+/// enum never claims a domain it cannot honour.
+#[test]
+fn every_enum_row_field_publishes_a_usable_value_domain() {
+    for domain in ALL_DETAILED_CODE_QUERY_DOMAINS {
+        for field in domain.row_fields() {
+            let where_ = format!("{}.{}", domain.label(), field.name);
+            match (field.scalar_type, field.value_domain) {
+                (
+                    CodeQueryRowScalarType::ConstrainedEnum,
+                    Some(CodeQueryEnumDomain::Labels(labels)),
+                ) => {
+                    assert!(
+                        !labels.is_empty(),
+                        "{where_} declares an empty value domain"
+                    );
+                    let mut seen = std::collections::HashSet::new();
+                    for label in labels {
+                        assert!(!label.is_empty(), "{where_} declares an empty label");
+                        assert!(seen.insert(label), "{where_} repeats the label `{label}`");
+                    }
+                }
+                (
+                    CodeQueryRowScalarType::ConstrainedEnum,
+                    Some(CodeQueryEnumDomain::Unenumerable(reason)),
+                ) => assert!(
+                    !reason.is_empty(),
+                    "{where_} is exempt from value checking without stating why"
+                ),
+                (CodeQueryRowScalarType::ConstrainedEnum, None) => {
+                    panic!("{where_} is an enum field with no value domain")
+                }
+                (_, Some(_)) => panic!("{where_} is not an enum field but declares a value domain"),
+                (_, None) => {}
+            }
+        }
+    }
+}
+
+/// `declaration.kind` is refined to a normalized structural kind when the seed
+/// matched the declaration's own span and otherwise falls back to the code
+/// unit's coarse type, so its published domain must be exactly the union of the
+/// two vocabularies -- no more (which would admit a literal no row can hold)
+/// and no less (which would reject a legitimate one).
+#[test]
+fn the_declaration_kind_domain_is_exactly_the_union_of_its_two_producers() {
+    let published = DetailedCodeQueryDomain::Declaration
+        .row_fields()
+        .iter()
+        .find(|field| field.name == "kind")
+        .and_then(|field| field.value_domain)
+        .and_then(CodeQueryEnumDomain::labels)
+        .expect("declaration.kind publishes an enumerated domain");
+    let expected: std::collections::BTreeSet<&str> = NormalizedKind::LABELS
+        .iter()
+        .chain(CodeUnitType::DISPLAY_LOWERCASE_LABELS)
+        .copied()
+        .collect();
+    let published: std::collections::BTreeSet<&str> = published.iter().copied().collect();
+    assert_eq!(published, expected);
+}
+
 #[test]
 fn detailed_row_field_registry_covers_every_domain_without_duplicate_fields() {
     let mut labels = std::collections::HashSet::new();
@@ -1375,10 +1444,11 @@ fn effect_row_domains_project_their_registered_surface_without_an_active_pack() 
     ProjectFile::new(root.clone(), PathBuf::from("App.java"))
         .write(source)
         .expect("write source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::Java)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
 
     let call_effects = execute_workspace(
         &workspace,

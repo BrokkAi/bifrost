@@ -95,13 +95,15 @@ fn run() -> Result<(), String> {
                 | MostRelevantFilesRankingMode::UsageGraphExact
         ) || seed_languages.is_empty()
         {
-            WorkspaceAnalyzer::build(project, AnalyzerConfig::default())
+            WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build")
         } else {
-            WorkspaceAnalyzer::build_for_languages(
+            WorkspaceAnalyzer::build_ephemeral_for_languages(
                 project,
                 AnalyzerConfig::default(),
                 &seed_languages,
             )
+            .map_err(|error| format!("failed to build ephemeral workspace: {error}"))?
         }
     };
     let result = {

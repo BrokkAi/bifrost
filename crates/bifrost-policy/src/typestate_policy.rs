@@ -45,6 +45,7 @@ use crate::resolved::{
     ResolvedTypestateBinding, ResolvedTypestateEventTrigger, ResolvedTypestatePolicySpec,
     ResolvedTypestateTerminalTrigger,
 };
+use crate::selector_compiler::parameter_names_match;
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
 use brokk_bifrost_analysis::analyzer::dataflow::{
@@ -2171,14 +2172,6 @@ enum SelectorBinding {
     ReturnValue,
     ArgumentIndex(u32),
     ArgumentName(String),
-}
-
-fn parameter_names_match(names: &[String], expected_name: &str) -> bool {
-    names.iter().any(|name| {
-        name == expected_name
-            || name.strip_prefix('$') == Some(expected_name)
-            || expected_name.strip_prefix('$') == Some(name)
-    })
 }
 
 impl SelectorBinding {

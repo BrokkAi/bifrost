@@ -1020,7 +1020,8 @@ mod tests {
     fn build_analyzer(root: &Path) -> WorkspaceAnalyzer {
         let project = crate::TestProject::from_root_with_inferred_languages(root.to_path_buf())
             .unwrap_or_else(|_| crate::TestProject::new(root.to_path_buf(), crate::Language::Java));
-        WorkspaceAnalyzer::build(std::sync::Arc::new(project), AnalyzerConfig::default())
+        WorkspaceAnalyzer::build_ephemeral(std::sync::Arc::new(project), AnalyzerConfig::default())
+            .expect("ephemeral workspace should build")
     }
 
     fn write_file(root: &Path, rel: &str, contents: &str) {

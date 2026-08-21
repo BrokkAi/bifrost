@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import test from "node:test";
 
 import {
@@ -141,4 +142,18 @@ test("rejects static or missing pyproject version inheritance", () => {
     () => validatePyprojectVersionInheritance('[project]\nname = "example"\n'),
     /must declare project\.dynamic/u,
   );
+});
+
+// The policy-scan action reached v0.10.5 still defaulting to v0.10.4, because
+// nothing projected the release version into it. The subdirectory form
+// `BrokkAi/bifrost/.github/actions/policy-scan@vX.Y.Z` serves this file
+// verbatim, so that default is what a consumer pinning an exact tag installs.
+// Asserted against the real files rather than a fixture: the defect is drift
+// between two checked-in files, which a fixture cannot reproduce.
+test("the policy-scan action default tracks the workspace version", () => {
+  const version = readCargoVersion(fs.readFileSync("Cargo.toml", "utf8"));
+  const action = fs.readFileSync(".github/actions/policy-scan/action.yml", "utf8");
+  const defaults = action.match(/^    default: v\d+\.\d+\.\d+$/gmu) ?? [];
+  assert.equal(defaults.length, 1, "expected exactly one version default in the policy-scan action");
+  assert.equal(defaults[0].trim(), `default: v${version}`);
 });

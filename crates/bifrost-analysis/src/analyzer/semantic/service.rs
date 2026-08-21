@@ -106,8 +106,8 @@ const SOURCE_CONTENT_IDENTITY_MEMO_ENTRIES: u64 = 32_768;
 /// atomic snapshot: the key is the git blob identity of exactly the bytes the
 /// value digests. An entry therefore cannot become stale, and two files with
 /// identical content share one entry. The freshness question lives entirely on
-/// the lookup side, in the caller's proof that a file's current content still
-/// has that blob identity -- see `TreeSitterAnalyzer::stat_paired_live_oid`.
+/// the lookup side, in the caller's proof that the analyzer generation still
+/// has that blob identity -- see `TreeSitterAnalyzer::reusable_live_oid`.
 ///
 /// Bounded like the artifact cache beside it, and shared by clones of one
 /// analyzer for the same reason: the digests are content-addressed, so sharing
@@ -528,9 +528,9 @@ fn publish_cached(
 /// Three facts have to line up, and any one of them missing falls through to
 /// the ordinary read-and-lower path rather than guessing:
 ///
-/// 1. the workspace has a stat-paired blob identity for the file, which is its
-///    proof that the file's content is unchanged since it recorded that
-///    identity (`stat_paired_live_oid` refuses overlays and unstamped entries);
+/// 1. the workspace has a reusable blob identity for the file, either paired
+///    with an unchanged stat or owned by the current explicit-update
+///    generation (`reusable_live_oid` refuses overlays);
 /// 2. the content digest for that blob identity has already been derived, so
 ///    the artifact key can be rebuilt without hashing the file;
 /// 3. the complete-artifact cache already holds that exact key.
@@ -546,7 +546,7 @@ fn served_from_unchanged_source<A: LanguageAdapter>(
     file: &ProjectFile,
     request: &SemanticRequest<'_>,
 ) -> Result<Option<Arc<SemanticArtifact>>, SemanticProviderError> {
-    let Some(source_identity) = analyzer.stat_paired_live_oid(file) else {
+    let Some(source_identity) = analyzer.reusable_live_oid(file) else {
         return Ok(None);
     };
     let Some(content) = analyzer.semantic_source_digests().get(source_identity) else {
@@ -1501,15 +1501,13 @@ mod tests {
         );
     }
 
-    /// An edited file derives a fresh key and is paid for again.
+    /// An explicitly updated file derives a fresh key and is paid for again.
     ///
     /// This is the soundness half of the derivation memo. The memo is keyed by
     /// the blob identity of exactly the bytes it digested, so an entry cannot
-    /// describe any other content; and the path that uses it first asks the
-    /// workspace to re-confirm that identity against the file's current stat.
-    /// An edit therefore cannot be served the old artifact: the stat no longer
-    /// matches the recorded one, the memo is never consulted, and the ordinary
-    /// read derives the new content's key and pays for its bytes.
+    /// describe any other content. Callers notify the analyzer after mutating
+    /// files behind its back; the update then derives the new content's key and
+    /// pays for its bytes while existing snapshots remain stable.
     #[test]
     fn an_edited_source_derives_a_fresh_key_and_pays_for_its_bytes_again() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -1556,10 +1554,11 @@ mod tests {
         assert_artifact_charged_without_reading(&unchanged_budget, &served);
 
         file.write(after).expect("rewrite fixture");
+        let updated_analyzer = analyzer.update(&BTreeSet::from([file.clone()]));
 
         let mut edited_budget = SemanticBudget::default();
         let SemanticOutcome::Complete { value: edited, .. } = materialize(
-            &analyzer,
+            &updated_analyzer,
             &cache,
             &lowerer,
             &file,

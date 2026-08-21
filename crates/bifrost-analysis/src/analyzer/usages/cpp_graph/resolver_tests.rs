@@ -1177,10 +1177,11 @@ ABSL_NAMESPACE_END
             &root,
             crate::analyzer::Language::Cpp,
         ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build(
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral(
             project,
             crate::analyzer::AnalyzerConfig::default(),
-        );
+        )
+        .expect("ephemeral workspace should build");
         let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
         let mut candidates = cpp
             .get_all_declarations()
@@ -1284,10 +1285,11 @@ ABSL_NAMESPACE_END
             &root,
             crate::analyzer::Language::Cpp,
         ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build(
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral(
             project,
             crate::analyzer::AnalyzerConfig::default(),
-        );
+        )
+        .expect("ephemeral workspace should build");
         let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
         let query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
         let query_token = query_scope.token();
@@ -1401,10 +1403,11 @@ ABSL_NAMESPACE_END
             &root,
             crate::analyzer::Language::Cpp,
         ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build(
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral(
             project,
             crate::analyzer::AnalyzerConfig::default(),
-        );
+        )
+        .expect("ephemeral workspace should build");
         let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
         let query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
         let query_token = query_scope.token();
@@ -1531,10 +1534,11 @@ ABSL_NAMESPACE_END
             &root,
             crate::analyzer::Language::Cpp,
         ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build(
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral(
             project,
             crate::analyzer::AnalyzerConfig::default(),
-        );
+        )
+        .expect("ephemeral workspace should build");
         let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
         let query_scope = crate::analyzer::AnalyzerQueryScope::new(workspace.analyzer());
         let query_token = query_scope.token();
@@ -1607,10 +1611,11 @@ ABSL_NAMESPACE_END
             &root,
             crate::analyzer::Language::Cpp,
         ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build(
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral(
             project,
             crate::analyzer::AnalyzerConfig::default(),
-        );
+        )
+        .expect("ephemeral workspace should build");
         let analyzer = workspace.analyzer();
         let query_scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
         let query_token = query_scope.token();

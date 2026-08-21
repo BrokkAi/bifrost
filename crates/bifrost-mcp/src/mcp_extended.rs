@@ -28,6 +28,45 @@ pub const EXTENDED_TOOL_NAMES: &[&str] = &[
 /// as 32 lowercase hex bytes.
 pub(crate) const EXPLAIN_POLICY_FINDING_ID_LENGTH: usize = 64;
 
+/// The largest explicit near-miss candidate list `explain_policy` accepts.
+/// Larger than the default retained ranking, because a caller may nominate
+/// more subjects than it wants back and let the ranking choose.
+pub(crate) const MAX_EXPLAIN_POLICY_NEAR_MISS_CANDIDATES: usize = 64;
+
+/// The largest bounded query budget one near-miss ranking may ask for. A seed
+/// declares far fewer predicates than this in practice; the ceiling exists so
+/// a request cannot widen the budget without limit.
+pub(crate) const MAX_EXPLAIN_POLICY_NEAR_MISS_EXECUTIONS: usize = 64;
+
+/// One explicit source position, as `explain_policy` spells it in both the
+/// single-candidate and the near-miss request forms.
+fn explain_policy_candidate_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_RUN_POLICY_PATH_BYTES,
+                "description": "Workspace-relative path of the candidate position."
+            },
+            "byte_start": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Byte offset of the candidate position."
+            },
+            "byte_end": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Exclusive end byte offset. Omit for a point candidate at byte_start."
+            }
+        },
+        "required": ["path", "byte_start"],
+        "additionalProperties": false,
+        "description": description
+    })
+}
+
 pub(crate) const MAX_RUN_POLICY_PATH_BYTES: usize = 1_024;
 pub(crate) const MAX_RUN_POLICY_SELECTOR_BYTES: usize = 256;
 pub(crate) const MAX_RUN_POLICY_DIFF_BASE_BYTES: usize = 256;
@@ -566,6 +605,18 @@ fn candidate_boundary_array() -> Value {
     )
 }
 
+/// One explanation adapter's supported analysis families, as prose.
+///
+/// Read from the policy crate's published lists so a new adapter updates the
+/// tool description by rebuilding rather than by remembering.
+fn analysis_type_list(analysis_types: &[brokk_bifrost_policy::PolicyAnalysisType]) -> String {
+    analysis_types
+        .iter()
+        .map(|analysis_type| analysis_type.label())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// One flow-state constrained-value axis, read from the schema registry so the
 /// MCP surface cannot drift from the parser's vocabulary (#1480).
 fn flow_state_label_array(field: QueryStepField) -> Value {
@@ -1029,21 +1080,31 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "explain_policy",
-            // The format tag is read from the policy crate so a schema bump
-            // cannot leave this text stale.
+            // The format tag and both supported-family lists are read from the
+            // policy crate, so a schema bump or a new adapter cannot leave this
+            // text stale.
             &format!(
-                "Explain one policy's verdict about one exact subject against the active \
-                 immutable workspace snapshot. Pass `finding_id` to ask why a retained finding \
-                 exists, or `candidate` to ask why one explicit source position produced none. \
-                 Returns a bounded, deterministic {} document: a node tree whose every node \
-                 carries an outcome of satisfied, failed, or unknown, where unknown means the \
-                 analyzer could not decide and is never evidence of absence. This is a query \
-                 about a policy, not a gate: it returns no status and no exit code. The \
-                 selection must resolve to exactly one policy. Adapters exist for match and \
-                 assertion policies; taint, flow, and typestate policies report an explicit \
-                 adapter-unavailable condition. Candidates are not scanned for: supply the \
-                 position you want explained.",
+                "Explain one policy's verdict against the active immutable workspace snapshot. \
+                 Pass `finding_id` to ask why a retained finding exists, `candidate` to ask why \
+                 one explicit source position produced none, or `near_misses` to ask which \
+                 subjects came closest. The first two return a bounded, deterministic {} \
+                 document: a node tree whose every node carries an outcome of satisfied, failed, \
+                 or unknown, where unknown means the analyzer could not decide and is never \
+                 evidence of absence. `near_misses` returns the sibling {} document: subjects \
+                 ordered by how many of the policy's own declared predicates each one missed, \
+                 each naming the predicate that dropped it, with the same three outcomes and the \
+                 same rule that unknown is never evidence of absence and never counts as \
+                 distance. This is a query about a policy, not a gate: it returns no status and \
+                 no exit code. The selection must resolve to exactly one policy. `finding_id` is \
+                 answered for {} policies, and `candidate` and `near_misses` for {} policies; any \
+                 other family reports an explicit adapter-unavailable condition. Candidates are \
+                 never scanned for by default: supply the position you want explained, supply the \
+                 list you want ranked, or ask `near_misses.enumerate_from_policy_seed` for a \
+                 separately budgeted search that the policy's own seed scope bounds.",
                 brokk_bifrost_policy::POLICY_EXPLANATION_FORMAT,
+                brokk_bifrost_policy::POLICY_NEAR_MISS_FORMAT,
+                analysis_type_list(brokk_bifrost_policy::WHY_ADAPTER_ANALYSIS_TYPES),
+                analysis_type_list(brokk_bifrost_policy::WHY_NOT_ADAPTER_ANALYSIS_TYPES),
             ),
             json!({
                 "type": "object",
@@ -1104,34 +1165,50 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "pattern": "^[0-9a-f]{64}$",
                         "description": "Ask why: the stable identity of a finding the policy's own run retains, as run_policy reports it."
                     },
-                    "candidate": {
+                    "candidate": explain_policy_candidate_schema(
+                        "Ask why-not: one explicit source position the policy did not report."
+                    ),
+                    "near_misses": {
                         "type": "object",
                         "properties": {
-                            "path": {
-                                "type": "string",
-                                "minLength": 1,
-                                "maxLength": MAX_RUN_POLICY_PATH_BYTES,
-                                "description": "Workspace-relative path of the candidate position."
+                            "candidates": {
+                                "type": "array",
+                                "items": explain_policy_candidate_schema(
+                                    "One explicit source position to measure."
+                                ),
+                                "minItems": 1,
+                                "maxItems": MAX_EXPLAIN_POLICY_NEAR_MISS_CANDIDATES,
+                                "description": "Rank exactly these positions. Nothing is searched for."
                             },
-                            "byte_start": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "description": "Byte offset of the candidate position."
+                            "enumerate_from_policy_seed": {
+                                "type": "boolean",
+                                "description": "Search for candidates inside the policy's own seed scope: its kind union, language filter and path globs, with every other declared predicate relaxed. Never a whole-repository scan, and refused when the seed declares no kind union."
                             },
-                            "byte_end": {
+                            "max_candidates": {
                                 "type": "integer",
-                                "minimum": 0,
-                                "description": "Exclusive end byte offset. Omit for a point candidate at byte_start."
+                                "minimum": 1,
+                                "maximum": MAX_EXPLAIN_POLICY_NEAR_MISS_CANDIDATES,
+                                "description": "How many ranked subjects to retain. What the bound removed is reported in the ranking's truncation record."
+                            },
+                            "max_executions": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": MAX_EXPLAIN_POLICY_NEAR_MISS_EXECUTIONS,
+                                "description": "How many bounded queries the ranking may run, the enumerating one included. A ladder the bound cuts short leaves every surviving subject unknown rather than selected."
                             }
                         },
-                        "required": ["path", "byte_start"],
+                        "oneOf": [
+                            { "required": ["candidates"], "not": { "required": ["enumerate_from_policy_seed"] } },
+                            { "required": ["enumerate_from_policy_seed"], "not": { "required": ["candidates"] } }
+                        ],
                         "additionalProperties": false,
-                        "description": "Ask why-not: one explicit source position the policy did not report."
+                        "description": "Ask which came closest: rank candidate subjects by how many of the policy's own declared predicates each one missed."
                     }
                 },
                 "oneOf": [
-                    { "required": ["finding_id"], "not": { "required": ["candidate"] } },
-                    { "required": ["candidate"], "not": { "required": ["finding_id"] } }
+                    { "required": ["finding_id"], "not": { "anyOf": [{ "required": ["candidate"] }, { "required": ["near_misses"] }] } },
+                    { "required": ["candidate"], "not": { "anyOf": [{ "required": ["finding_id"] }, { "required": ["near_misses"] }] } },
+                    { "required": ["near_misses"], "not": { "anyOf": [{ "required": ["finding_id"] }, { "required": ["candidate"] }] } }
                 ],
                 "anyOf": [
                     { "required": ["policy_files"] },
@@ -1621,12 +1698,13 @@ mod tests {
             "at least one selector is required"
         );
 
-        // One question: `finding_id` and `candidate` exclude each other.
+        // One question: the three targets exclude each other pairwise.
         assert_eq!(
             schema["oneOf"],
             json!([
-                { "required": ["finding_id"], "not": { "required": ["candidate"] } },
-                { "required": ["candidate"], "not": { "required": ["finding_id"] } }
+                { "required": ["finding_id"], "not": { "anyOf": [{ "required": ["candidate"] }, { "required": ["near_misses"] }] } },
+                { "required": ["candidate"], "not": { "anyOf": [{ "required": ["finding_id"] }, { "required": ["near_misses"] }] } },
+                { "required": ["near_misses"], "not": { "anyOf": [{ "required": ["finding_id"] }, { "required": ["candidate"] }] } }
             ])
         );
         let finding_id = &schema["properties"]["finding_id"];
@@ -1661,6 +1739,78 @@ mod tests {
         assert!(
             description.contains("not a gate"),
             "the exit-status contract is stated: {description}"
+        );
+    }
+
+    /// Issue 2500: the near-miss request form is bounded by construction, and
+    /// its two enumeration routes exclude each other, so a request can never
+    /// mean "search the repository".
+    #[test]
+    fn explain_policy_near_miss_schema_is_bounded_and_never_a_repository_scan() {
+        let descriptor = extended_tool_descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor["name"] == "explain_policy")
+            .expect("explain_policy descriptor");
+        let near_misses = &descriptor["inputSchema"]["properties"]["near_misses"];
+        assert_eq!(near_misses["additionalProperties"], false);
+
+        // Enumeration is the caller's list or the policy's own seed scope,
+        // never both and never neither.
+        assert_eq!(
+            near_misses["oneOf"],
+            json!([
+                { "required": ["candidates"], "not": { "required": ["enumerate_from_policy_seed"] } },
+                { "required": ["enumerate_from_policy_seed"], "not": { "required": ["candidates"] } }
+            ])
+        );
+
+        let candidates = &near_misses["properties"]["candidates"];
+        assert_eq!(candidates["minItems"], 1);
+        assert_eq!(
+            candidates["maxItems"],
+            MAX_EXPLAIN_POLICY_NEAR_MISS_CANDIDATES
+        );
+        assert_eq!(
+            candidates["items"],
+            descriptor["inputSchema"]["properties"]["candidate"]
+                .as_object()
+                .map(|candidate| {
+                    let mut items = candidate.clone();
+                    items.insert(
+                        "description".to_string(),
+                        Value::String("One explicit source position to measure.".to_string()),
+                    );
+                    Value::Object(items)
+                })
+                .expect("the candidate schema is an object"),
+            "one candidate shape serves both request forms"
+        );
+
+        // Both budgets are bounded on each side.
+        for (bound, maximum) in [
+            ("max_candidates", MAX_EXPLAIN_POLICY_NEAR_MISS_CANDIDATES),
+            ("max_executions", MAX_EXPLAIN_POLICY_NEAR_MISS_EXECUTIONS),
+        ] {
+            let property = &near_misses["properties"][bound];
+            assert_eq!(property["type"], "integer", "{bound}");
+            assert_eq!(property["minimum"], 1, "{bound}");
+            assert_eq!(property["maximum"], maximum, "{bound}");
+        }
+
+        let description = descriptor["description"]
+            .as_str()
+            .expect("explain_policy description");
+        assert!(
+            description.contains(brokk_bifrost_policy::POLICY_NEAR_MISS_FORMAT),
+            "the sibling ranking format is interpolated, never written out: {description}"
+        );
+        assert!(
+            description.contains("never counts as distance"),
+            "the unknown-is-not-distance contract is stated: {description}"
+        );
+        assert!(
+            description.contains("never scanned for by default"),
+            "the enumeration contract is stated: {description}"
         );
     }
 

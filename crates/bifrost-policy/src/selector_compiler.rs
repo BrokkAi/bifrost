@@ -19,6 +19,7 @@ use brokk_bifrost_analysis::analyzer::structural::{
     CodeQuerySemanticWork,
 };
 use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
+use brokk_bifrost_rql::{CallInputSelector, QueryStep};
 
 #[derive(Debug)]
 pub(super) enum PolicySelectorSessionError {
@@ -205,6 +206,62 @@ impl<'a> PolicySelectorSession<'a> {
             self.materialized_files_limit,
             self.query_limits.semantic.max_traversal_steps,
         );
+    }
+
+    /// The source spans of the actuals one selector's call sites pass to the
+    /// formal named `name`, through the analyzer's own actual-to-formal
+    /// relation (`call-input :parameter-name`, issue #2438).
+    ///
+    /// This is the second of the two sources a formal-name port reads. The
+    /// dispatch-aware oracle relation is the first and the authoritative one,
+    /// but the semantic call row records only that an actual is a keyword
+    /// argument, never which keyword, so the oracle retains no mapping for
+    /// `put(value=x)`. The structural relation reads the label from the call's
+    /// own syntax and is exactly what `(call-input :parameter-name "value")`
+    /// publishes, so a port and a query row cannot disagree about which operand
+    /// the formal names.
+    ///
+    /// The result is a flat span list per file, not a per-call map, because a
+    /// row's evidence carries only its own byte span. The caller intersects it
+    /// with one selected call's own operand spans, which is what distinguishes
+    /// a nested call's actual from the enclosing call's.
+    pub(super) fn select_named_actuals(
+        &mut self,
+        selector: &ResolvedPolicySelector,
+        name: &str,
+    ) -> Result<Vec<(ProjectFile, ByteRange<usize>)>, PolicySelectorSessionError> {
+        let mut query = selector.query.clone();
+        query.limit = self.max_selector_results;
+        query
+            .plan
+            .steps
+            .push(QueryStep::CallInput(CallInputSelector::ParameterName(
+                name.to_owned(),
+            )));
+        // A selector that does not end at call sites cannot carry a call-input
+        // step. That is a typed shortfall of this route, not a failure: the
+        // caller falls back to refusing the row with a named reason.
+        if query.validate_steps().is_err() {
+            return Ok(Vec::new());
+        }
+        self.selector_scans = self.selector_scans.saturating_add(1);
+        let detailed = execute_code_query_detailed_eager_index(
+            self.workspace.analyzer(),
+            &query,
+            self.remaining_query_limits()?,
+            Some(self.cancellation),
+        );
+        self.query_work = self.query_work.saturating_add(detailed.work);
+        self.charge_query_semantic_work(detailed.work.semantic)?;
+        if !matches!(detailed.result.completion(), CodeQueryCompletion::Complete) {
+            return Ok(Vec::new());
+        }
+        Ok(detailed
+            .evidence
+            .into_iter()
+            .filter(|evidence| matches!(evidence.domain, DetailedCodeQueryDomain::ExpressionSite))
+            .filter_map(|evidence| Some((evidence.file, evidence.byte_span?)))
+            .collect())
     }
 
     pub(super) fn select(
@@ -989,4 +1046,25 @@ fn proof_from_label(label: &str) -> ProofStatus {
     } else {
         ProofStatus::Unproven(format!("selector evidence is {label}").into())
     }
+}
+
+/// Whether one formal parameter slot names `expected`.
+///
+/// A slot carries every spelling the declaration gives one parameter, because
+/// some languages name a formal twice (Swift's external and internal labels)
+/// and some prefix it in source but not in a call (PHP's `$value`). Matching
+/// any spelling is what lets one authored `(argument :name "value")` bind the
+/// same formal in every language that declares it.
+pub(super) fn parameter_names_match(names: &[String], expected: &str) -> bool {
+    names
+        .iter()
+        .any(|name| parameter_name_matches(name, expected))
+}
+
+/// The single-spelling form of [`parameter_names_match`], for a name taken
+/// from a call's keyword actual rather than from a declaration slot.
+pub(super) fn parameter_name_matches(name: &str, expected: &str) -> bool {
+    name == expected
+        || name.strip_prefix('$') == Some(expected)
+        || expected.strip_prefix('$') == Some(name)
 }

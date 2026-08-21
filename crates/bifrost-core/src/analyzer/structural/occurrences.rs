@@ -35,6 +35,10 @@ macro_rules! occurrence_roles {
         impl OccurrenceRole {
             pub const COUNT: usize = ALL_OCCURRENCE_ROLES.len();
 
+            /// Every role label, in declaration order: the value domain the
+            /// `occurrence.role` row field publishes (issue #2515).
+            pub const LABELS: &'static [&'static str] = &[$($label,)+];
+
             /// Stable slot in the total support table. Matches declaration order.
             pub const fn index(self) -> usize {
                 self as usize
@@ -125,6 +129,13 @@ macro_rules! labelled_enum {
         pub const $all: &[$name] = &[$($name::$variant,)+];
 
         impl $name {
+            /// Every label of this vocabulary, in declaration order.
+            ///
+            /// This is the value domain a row field of this type publishes, so
+            /// a policy literal can be checked against it at load time
+            /// (issue #2515) rather than silently matching nothing.
+            pub const LABELS: &'static [&'static str] = &[$($label,)+];
+
             pub const fn label(self) -> &'static str {
                 match self {
                     $($name::$variant => $label,)+
