@@ -19,7 +19,15 @@ export function validateIdentity(identity) {
   exactKeys(identity, ["release", "source", "qualification"], "identity");
   exactKeys(identity.release, ["version", "tag"], "release identity");
   exactKeys(identity.source, ["repository", "publicCommit", "privateCommit"], "source identity");
-  exactKeys(identity.qualification, ["workflow", "runId", "runAttempt"], "qualification identity");
+  // The re-qualification path re-labels an existing bundle for a corrected
+  // commit and records where its artifacts were actually built. Those two
+  // fields travel together or not at all, the same invariant the writer
+  // enforces; see scripts/public/write-qualification-identity.mjs.
+  exactKeys(
+    identity.qualification,
+    ["workflow", "runId", "runAttempt", "builtByRunId", "builtFromCommit"],
+    "qualification identity",
+  );
 
   const version = string(identity.release.version, "release.version");
   if (!VERSION.test(version)) throw new Error(`Invalid release version: ${version}`);
@@ -40,6 +48,16 @@ export function validateIdentity(identity) {
   }
   const runId = positiveInteger(identity.qualification.runId, "qualification.runId");
   const runAttempt = positiveInteger(identity.qualification.runAttempt, "qualification.runAttempt");
+  const reused = identity.qualification.builtByRunId !== undefined;
+  if (reused !== (identity.qualification.builtFromCommit !== undefined)) {
+    throw new Error("qualification.builtByRunId and qualification.builtFromCommit must be set together.");
+  }
+  const builtByRunId = reused
+    ? positiveInteger(identity.qualification.builtByRunId, "qualification.builtByRunId")
+    : undefined;
+  const builtFromCommit = reused
+    ? commit(identity.qualification.builtFromCommit, "qualification.builtFromCommit")
+    : undefined;
 
   return {
     release: { version, tag },
@@ -48,7 +66,12 @@ export function validateIdentity(identity) {
       publicCommit,
       ...(privateCommit === undefined ? {} : { privateCommit }),
     },
-    qualification: { workflow, runId, runAttempt },
+    qualification: {
+      workflow,
+      runId,
+      runAttempt,
+      ...(reused ? { builtByRunId, builtFromCommit } : {}),
+    },
   };
 }
 
