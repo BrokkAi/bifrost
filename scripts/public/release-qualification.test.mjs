@@ -6,6 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
 
+import { buildIdentity } from "./write-qualification-identity.mjs";
 import {
   classifyArtifact,
   generateManifest,
@@ -31,6 +32,53 @@ const identity = {
     runAttempt: 2,
   },
 };
+
+// The writer and the validator are two halves of one record, and they drifted:
+// the writer learned to record reuse provenance for the re-qualification path,
+// the validator kept refusing any field it had not been told about. Each half
+// had its own passing tests, so nothing failed until a real re-qualification
+// ran and died on "unexpected fields: builtByRunId, builtFromCommit". Feed one
+// into the other so they cannot drift apart again.
+test("a reuse identity from the writer is accepted by the validator", () => {
+  const written = buildIdentity({
+    RELEASE_VERSION: version,
+    RELEASE_TAG: `v${version}`,
+    PUBLIC_REPOSITORY: repository,
+    PUBLIC_COMMIT: commit,
+    PRIVATE_COMMIT: otherCommit,
+    RUN_ID: "999",
+    RUN_ATTEMPT: "1",
+    SOURCE_RUN_ID: "123",
+    SOURCE_COMMIT: otherCommit,
+  });
+  const validated = validateIdentity(written);
+  assert.equal(validated.qualification.builtByRunId, 123);
+  assert.equal(validated.qualification.builtFromCommit, otherCommit);
+  assert.equal(validated.qualification.runId, 999);
+  assert.equal(validated.source.privateCommit, otherCommit);
+});
+
+test("a freshly built identity from the writer carries no reuse provenance", () => {
+  const validated = validateIdentity(buildIdentity({
+    RELEASE_VERSION: version,
+    RELEASE_TAG: `v${version}`,
+    PUBLIC_REPOSITORY: repository,
+    PUBLIC_COMMIT: commit,
+    RUN_ID: "999",
+    RUN_ATTEMPT: "1",
+  }));
+  assert.equal("builtByRunId" in validated.qualification, false);
+  assert.equal("builtFromCommit" in validated.qualification, false);
+});
+
+test("half a reuse record is refused by the validator", () => {
+  for (const half of [{ builtByRunId: 123 }, { builtFromCommit: otherCommit }]) {
+    assert.throws(
+      () => validateIdentity({ ...identity, qualification: { ...identity.qualification, ...half } }),
+      /must be set together/u,
+    );
+  }
+});
 
 test("manifest output is deterministic and sorted independent of creation order", async () => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "bifrost-qualification-"));
