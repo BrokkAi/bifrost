@@ -45,7 +45,7 @@ pub(crate) fn collect_go_semantic_diagnostics(
         go.package_clause_names(),
         |import_path| external.packages().declared_package_name(import_path),
     );
-    let support = analyzer.global_usage_definition_index();
+    let support = crate::analyzer::AnalyzerDefinitionLookup::new(analyzer, Language::None);
     let report = brokk_bifrost_go::diagnostics::collect_go_semantic_diagnostics(
         &bindings, &support, &external, file, source,
     );

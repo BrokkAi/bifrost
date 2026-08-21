@@ -27,8 +27,13 @@ use crate::source::PolicySourceIdentity;
 use super::host::{ExplanationTarget, explain_policy_inputs};
 use super::model::{
     ExplainError, ExplanationBudgetLimit, ExplanationLimits, ExplanationNodeKind,
-    ExplanationOutcome, ExplanationQuestion, ExplanationSubject, POLICY_EXPLANATION_FORMAT,
-    PolicyExplanation, WHY_ADAPTER_ANALYSIS_TYPES, WHY_NOT_ADAPTER_ANALYSIS_TYPES,
+    ExplanationOutcome, ExplanationQuestion, ExplanationSubject, NEAR_MISS_ADAPTER_ANALYSIS_TYPES,
+    POLICY_EXPLANATION_FORMAT, PolicyExplanation, WHY_ADAPTER_ANALYSIS_TYPES,
+    WHY_NOT_ADAPTER_ANALYSIS_TYPES,
+};
+use super::near_miss::{
+    NearMissCandidates, NearMissEnumeration, POLICY_NEAR_MISS_FORMAT, PolicyNearMissRanking,
+    rank_near_misses,
 };
 use super::why::{explain_finding, explain_match_finding};
 use super::why_not::{
@@ -412,29 +417,41 @@ fn the_match_only_why_adapter_still_refuses_a_non_match_run() {
 }
 
 /// Issue 2439 slice 2: the missing-adapter condition names what *is*
-/// supported, so a caller learns the whole answer from one error.
+/// supported, so a caller learns the whole answer from one error. The two
+/// questions support different families, and the error says which.
 #[test]
 fn a_missing_adapter_names_the_supported_analysis_types() {
-    for question in [ExplanationQuestion::Why, ExplanationQuestion::WhyNot] {
-        let error = ExplainError::adapter_unavailable(PolicyAnalysisType::Taint, question);
+    for (question, expected) in [
+        (
+            ExplanationQuestion::Why,
+            "supported analysis types: match, taint, assertion, flow",
+        ),
+        (
+            ExplanationQuestion::WhyNot,
+            "supported analysis types: match, assertion",
+        ),
+    ] {
+        let error = ExplainError::adapter_unavailable(PolicyAnalysisType::Typestate, question);
         let ExplainError::ExplanationAdapterUnavailable { supported, .. } = &error else {
             panic!("the constructor builds the adapter-unavailable condition");
         };
-        assert_eq!(
-            supported,
-            &vec![PolicyAnalysisType::Match, PolicyAnalysisType::Assertion]
-        );
+        assert!(!supported.contains(&PolicyAnalysisType::Typestate));
         let rendered = error.to_string();
         assert!(rendered.contains("not yet implemented"), "{rendered}");
         assert!(
-            rendered.contains("supported analysis types: match, assertion"),
+            rendered.contains(expected),
             "the error names the supported families: {rendered}"
         );
         assert!(rendered.contains(question.label()), "{rendered}");
     }
     assert_eq!(
         WHY_ADAPTER_ANALYSIS_TYPES,
-        [PolicyAnalysisType::Match, PolicyAnalysisType::Assertion]
+        [
+            PolicyAnalysisType::Match,
+            PolicyAnalysisType::Taint,
+            PolicyAnalysisType::Assertion,
+            PolicyAnalysisType::Flow
+        ]
     );
     assert_eq!(
         WHY_NOT_ADAPTER_ANALYSIS_TYPES,
@@ -442,8 +459,8 @@ fn a_missing_adapter_names_the_supported_analysis_types() {
     );
 }
 
-/// Taint, flow and typestate keep the explicit adapter-unavailable condition:
-/// slices 2-3 add the relational adapters only.
+/// `why-not` for a taint policy stays refused: answering it needs
+/// candidate-specific solver queries, not a projection of retained evidence.
 #[test]
 fn why_not_reports_a_missing_adapter_for_a_taint_policy() {
     let fixture = Fixture::new();
@@ -1430,4 +1447,1138 @@ fn the_host_reports_an_unloadable_policy_as_a_stated_condition() {
         matches!(error, ExplainError::PolicyUnavailable { .. }),
         "{error:?}"
     );
+}
+
+// --- flow and taint: why ----------------------------------------------------
+
+/// A flow policy over the same fixture. The solver is faked below, so what the
+/// selectors spell only has to load and resolve.
+const FLOW_POLICY: &str = r#"(policy
+  :id "test.explain.flow"
+  :name "Flow"
+  :message "the tracked value reached the observation"
+  :severity warning
+  :analysis (analysis
+    :type flow
+    :mode may
+    :origins (endpoint-set :entries [
+      (origin :id reader :display-name "Reader.read"
+        :selector (rql (name "alpha")) :bind return-value)])
+    :observations (endpoint-set :entries [
+      (observation :id writer :display-name "Store.put"
+        :selector (rql (name "store")) :observed-operand matched-value)])))"#;
+
+/// How much retained evidence one faked projection carries.
+///
+/// Every field is a retained fact the adapter must project honestly, so each
+/// test names the shape it wants rather than sharing one maximal fixture. The
+/// fake is the solver, not the projection: the run below is assembled,
+/// validated, and retained by the production evaluator.
+#[derive(Debug, Clone, Copy)]
+struct FakePath {
+    /// Retain one witness with three steps.
+    witness: bool,
+    /// That witness itself dropped steps.
+    witness_steps_truncated: bool,
+    /// The finding dropped whole witnesses.
+    witnesses_truncated: bool,
+    /// The path is reported but not proved.
+    unproven: bool,
+    /// Retain one related site no origin states.
+    extra_related: bool,
+}
+
+impl FakePath {
+    const fn proved() -> Self {
+        Self {
+            witness: true,
+            witness_steps_truncated: false,
+            witnesses_truncated: false,
+            unproven: false,
+            extra_related: false,
+        }
+    }
+}
+
+struct FakePathAdapter {
+    shape: FakePath,
+}
+
+impl crate::projection::sealed::TaintAdapter for FakePathAdapter {}
+
+impl crate::evaluator::TaintPolicyEvaluator for FakePathAdapter {
+    fn evaluate_taint(
+        &self,
+        _authority: &crate::projection::TaintProjectionAuthority,
+        _policy: &LoadedPolicy,
+        spec: &crate::resolved::ResolvedTaintPolicySpec,
+        _context: &PolicyEvaluationContext<'_>,
+        _budget: &PolicyBudget,
+    ) -> crate::projection::TaintProjectionPayload {
+        crate::projection::TaintProjectionPayload {
+            projections: vec![fake_projection(spec, self.shape)],
+            completion: PolicyRunCompletion::Complete,
+            diagnostics: Vec::new(),
+            diagnostics_truncated: false,
+            work: crate::finding::PolicyWorkReport::default(),
+            authored_arm_closures: Vec::new(),
+        }
+    }
+}
+
+fn path_location(start: u64, end: u64, line: u64) -> PolicySourceLocation {
+    PolicySourceLocation::span(
+        brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath::new("app.ts")
+            .expect("workspace-relative path"),
+        crate::finding::PolicyByteSpan::new(start, end).expect("a forward span"),
+        crate::finding::PolicyDisplayRegion::new(line, 1, line, 2).expect("a display region"),
+    )
+}
+
+/// The observation site, which is the finding's own anchor.
+fn observation_location() -> PolicySourceLocation {
+    path_location(40, 41, 4)
+}
+
+fn origin_location() -> PolicySourceLocation {
+    path_location(0, 1, 1)
+}
+
+fn fake_projection(
+    spec: &crate::resolved::ResolvedTaintPolicySpec,
+    shape: FakePath,
+) -> crate::projection::TaintProjectedFinding {
+    use crate::definition::TaintLabel;
+    use crate::finding::{
+        BoundedWitness, CertaintyReason, FindingCertainty, FindingCompleteness,
+        FindingIncompleteReason, PolicyLocationRelationship, ProofMetadata, ProofReason,
+        ProofState, RelatedPolicyLocation, WitnessStep, WitnessStepKind,
+    };
+    use crate::finding_identity::{
+        AnalysisEventRef, AnalysisFindingId, EvidenceRef, SourceScenarioId, StableSemanticIdentity,
+        WitnessId,
+    };
+    use crate::future_evidence::{
+        TaintFindingAnchor, TaintPolicyProjectionFacts, TaintSourceProjectionFact,
+    };
+
+    let source = &spec.sources[0];
+    let sink = &spec.sinks[0];
+    let label = source
+        .definition
+        .labels
+        .first()
+        .cloned()
+        .unwrap_or_else(|| TaintLabel::new("untrusted").expect("a valid label"));
+    let scenario = SourceScenarioId::try_new("test", "root").expect("a scenario id");
+    let evidence_ref = EvidenceRef::try_new("test", "origin-alpha").expect("an evidence ref");
+    let source_fact = TaintSourceProjectionFact::try_new(
+        source.identity.clone(),
+        source.semantic_hash,
+        source.analysis_projection_hash,
+        source.definition.display_name.clone(),
+        source.definition.categories.clone(),
+        label.clone(),
+        source.definition.evidence.clone(),
+        vec![scenario.clone()],
+        evidence_ref.clone(),
+    )
+    .expect("a valid source fact");
+    let facts = TaintPolicyProjectionFacts::try_new(
+        sink.identity.clone(),
+        sink.semantic_hash,
+        sink.analysis_projection_hash,
+        sink.definition.display_name.clone(),
+        sink.definition.categories.clone(),
+        sink.definition.tags.clone(),
+        sink.definition.impacts.clone(),
+        vec![label.clone()],
+        vec![source_fact],
+        &PolicyBudget::default(),
+    )
+    .expect("valid projection facts");
+    let anchor = TaintFindingAnchor::strong(
+        StableSemanticIdentity::analyzer_declaration_id(
+            "typescript",
+            brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath::new("app.ts")
+                .expect("workspace-relative path"),
+            "function:store",
+        )
+        .expect("a stable sink identity"),
+        source.analysis_projection_hash,
+        sink.analysis_projection_hash,
+        crate::cvss::SourceScenarioSetHash::try_from_scenarios(vec![scenario.clone()])
+            .expect("a scenario set hash"),
+    )
+    .expect("a strong anchor");
+
+    let witnesses = if shape.witness {
+        vec![
+            BoundedWitness::try_new(
+                WitnessId::try_new("test", "path-0").expect("a witness id"),
+                vec![
+                    WitnessStep::try_new(
+                        WitnessStepKind::Source,
+                        Some(origin_location()),
+                        "value read",
+                        vec![evidence_ref.clone()],
+                    )
+                    .expect("a valid step"),
+                    WitnessStep::try_new(
+                        WitnessStepKind::Call,
+                        Some(path_location(20, 21, 2)),
+                        "helper call",
+                        Vec::new(),
+                    )
+                    .expect("a valid step"),
+                    WitnessStep::try_new(
+                        WitnessStepKind::Propagation,
+                        Some(observation_location()),
+                        "reaches the observed operand",
+                        Vec::new(),
+                    )
+                    .expect("a valid step"),
+                ],
+                shape.witness_steps_truncated,
+                u64::from(shape.witness_steps_truncated),
+            )
+            .expect("a valid witness"),
+        ]
+    } else {
+        Vec::new()
+    };
+    let witness_refs = witnesses
+        .iter()
+        .map(|witness| witness.id().clone())
+        .collect::<Vec<_>>();
+
+    let mut incomplete = Vec::new();
+    if shape.unproven {
+        incomplete.push(FindingIncompleteReason::ProofPartial);
+    }
+    if shape.witness_steps_truncated || shape.witnesses_truncated {
+        incomplete.push(FindingIncompleteReason::WitnessTruncated);
+    }
+    incomplete.sort();
+    incomplete.dedup();
+    let completeness = if incomplete.is_empty() {
+        FindingCompleteness::Complete
+    } else {
+        FindingCompleteness::partial(incomplete).expect("canonical reasons")
+    };
+    let certainty = if shape.unproven {
+        FindingCertainty::possible(vec![
+            CertaintyReason::analyzer_ambiguity("flow-unproven-path")
+                .expect("a valid ambiguity code"),
+        ])
+        .expect("canonical reasons")
+    } else {
+        FindingCertainty::Definite
+    };
+    let mut related = vec![
+        RelatedPolicyLocation::try_new(
+            PolicyLocationRelationship::Source,
+            origin_location(),
+            Vec::new(),
+        )
+        .expect("a valid related location"),
+    ];
+    if shape.extra_related {
+        related.push(
+            RelatedPolicyLocation::try_new(
+                PolicyLocationRelationship::Source,
+                path_location(60, 61, 6),
+                Vec::new(),
+            )
+            .expect("a valid related location"),
+        );
+    }
+
+    crate::projection::TaintProjectedFinding {
+        facts,
+        pairs: vec![crate::projection::TaintPairProjection {
+            source_endpoint: source.identity.clone(),
+            analysis_finding_id: AnalysisFindingId::try_new("test", "path-finding")
+                .expect("an analysis finding id"),
+            anchor,
+            sink: AnalysisEventRef::try_new("test", "observation-0").expect("an event ref"),
+            origins: vec![crate::projection::TaintOriginProjection {
+                source_endpoint: source.identity.clone(),
+                source_label: label,
+                source_evidence: source.definition.evidence.clone(),
+                primary: origin_location(),
+                scenario_id: scenario,
+                evidence_refs: vec![evidence_ref],
+            }],
+            origins_truncated: false,
+            witness_refs,
+            // The projection authority requires this to equal the report's own
+            // witness truncation flag (`validate_witness_references`).
+            witness_refs_truncated: shape.witnesses_truncated,
+            report: crate::projection::ProjectedFindingReport {
+                primary: observation_location(),
+                certainty,
+                completeness,
+                related,
+                related_truncated: false,
+                omitted_related_locations_lower_bound: 0,
+                evidence_refs_truncated: false,
+                omitted_evidence_refs_lower_bound: 0,
+                proof: ProofMetadata::try_new(
+                    if shape.unproven {
+                        ProofState::Unproven
+                    } else {
+                        ProofState::Proven
+                    },
+                    vec![ProofReason::DataflowWitness],
+                    Vec::new(),
+                )
+                .expect("valid proof metadata"),
+                witnesses,
+                witnesses_truncated: shape.witnesses_truncated,
+                omitted_witnesses_lower_bound: u64::from(shape.witnesses_truncated),
+                display_path: None,
+            },
+        }],
+    }
+}
+
+/// One evaluated run of `source` whose solver is the fake above.
+fn path_run(fixture: &Fixture, source: &str, shape: FakePath) -> PolicyRun {
+    let registry = registry(source);
+    let policy = registry.policies().next().expect("one loaded policy");
+    let adapter = FakePathAdapter { shape };
+    let run = DefaultPolicyEvaluator::new()
+        .with_taint(&adapter)
+        .evaluate(policy, &fixture.context(), &mut PolicyBudget::default())
+        .expect("policy evaluation");
+    assert_eq!(
+        run.findings().len(),
+        1,
+        "the fake solver projects one finding; completion={:?} diagnostics={:?}",
+        run.completion(),
+        run.diagnostics()
+    );
+    run
+}
+
+fn root_child<'a>(
+    explanation: &'a PolicyExplanation,
+    label: &str,
+) -> &'a super::model::ExplanationNode {
+    explanation
+        .root()
+        .children()
+        .iter()
+        .find(|node| node.label() == label)
+        .unwrap_or_else(|| panic!("a {label} node: {:#?}", explanation.root().children()))
+}
+
+#[test]
+fn why_explains_a_flow_finding_from_its_retained_witness_path() {
+    let fixture = Fixture::new();
+    let run = path_run(&fixture, FLOW_POLICY, FakePath::proved());
+    assert_eq!(run.analysis_type(), PolicyAnalysisType::Flow);
+    let id = only_finding(&run);
+    let explanation = explain_finding(&run, &id, &ExplanationLimits::default())
+        .expect("the flow adapter answers");
+
+    assert_eq!(explanation.format(), POLICY_EXPLANATION_FORMAT);
+    assert_eq!(explanation.question(), ExplanationQuestion::Why);
+    assert_eq!(explanation.analysis_type(), PolicyAnalysisType::Flow);
+    assert_eq!(explanation.outcome(), ExplanationOutcome::Satisfied);
+    assert_eq!(explanation.root().label(), "flow_finding");
+
+    let finding = &run.findings()[0];
+    assert_eq!(explanation.root().location(), Some(finding.primary()));
+    assert_eq!(explanation.root().actual(), Some(finding.message()));
+    let expected = explanation.root().expected().expect("root prose");
+    assert!(expected.contains("Reader.read"), "{expected}");
+    assert!(expected.contains("Store.put"), "{expected}");
+
+    // The origin is a satisfied source fact at the exact site the run kept.
+    assert_eq!(
+        child_labels(explanation.root(), ExplanationNodeKind::SourceFact),
+        vec![(String::from("origin"), ExplanationOutcome::Satisfied)]
+    );
+    assert_eq!(
+        root_child(&explanation, "origin").location(),
+        Some(&origin_location())
+    );
+
+    // The witness path is one derivation whose children are its steps in path
+    // order, each carrying the step's own kind and exact site.
+    let path = root_child(&explanation, "witness_path");
+    assert_eq!(path.kind(), ExplanationNodeKind::Derivation);
+    let witness = &finding.witnesses()[0];
+    assert!(
+        path.actual()
+            .expect("path prose")
+            .contains(witness.id().as_str())
+    );
+    let steps: Vec<(String, Option<&PolicySourceLocation>)> = path
+        .children()
+        .iter()
+        .map(|node| (node.label().to_string(), node.location()))
+        .collect();
+    assert_eq!(
+        steps,
+        witness
+            .steps()
+            .iter()
+            .map(|step| (step.kind().label().to_string(), step.location()))
+            .collect::<Vec<_>>(),
+        "the path nodes are the retained steps, in the retained order"
+    );
+    assert!(
+        path.children()
+            .iter()
+            .all(|step| step.outcome() == ExplanationOutcome::Satisfied)
+    );
+
+    // A proved, complete, definite finding over a reliable run has no unknown.
+    assert!(
+        explanation
+            .nodes()
+            .iter()
+            .all(|node| node.outcome() == ExplanationOutcome::Satisfied),
+        "{:#?}",
+        explanation
+            .nodes()
+            .iter()
+            .filter(|node| node.outcome() != ExplanationOutcome::Satisfied)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The parity discipline the match adapter established, in both directions:
+/// every location an explanation publishes was retained by the finding, and
+/// every site the finding retained is published.
+#[test]
+fn flow_why_locations_all_trace_back_to_retained_finding_evidence() {
+    let fixture = Fixture::new();
+    let shape = FakePath {
+        extra_related: true,
+        ..FakePath::proved()
+    };
+    let run = path_run(&fixture, FLOW_POLICY, shape);
+    let id = only_finding(&run);
+    let explanation =
+        explain_finding(&run, &id, &ExplanationLimits::default()).expect("explanation");
+    let finding = &run.findings()[0];
+    let PolicyFindingEvidence::Flow { evidence } = finding.evidence() else {
+        panic!("a flow run retains flow evidence");
+    };
+
+    let mut retained: Vec<PolicySourceLocation> = vec![finding.primary().clone()];
+    retained.extend(
+        evidence
+            .origins()
+            .iter()
+            .map(|origin| origin.primary().clone()),
+    );
+    retained.extend(
+        finding
+            .related()
+            .iter()
+            .map(|related| related.location().clone()),
+    );
+    for witness in finding.witnesses() {
+        retained.extend(
+            witness
+                .steps()
+                .iter()
+                .filter_map(|step| step.location().cloned()),
+        );
+    }
+    for node in explanation.nodes() {
+        if let Some(location) = node.location() {
+            assert!(
+                retained.contains(location),
+                "node {} carries a location the finding never retained: {location:?}",
+                node.label()
+            );
+        }
+    }
+    let published: Vec<&PolicySourceLocation> = explanation
+        .nodes()
+        .iter()
+        .filter_map(|node| node.location())
+        .collect();
+    for location in &retained {
+        assert!(
+            published.contains(&location),
+            "the explanation drops a retained site: {location:?}"
+        );
+    }
+
+    // The related site no origin states is published exactly once, and the
+    // origin's own site is not published twice as a bare row.
+    let rows = explanation
+        .root()
+        .children()
+        .iter()
+        .filter(|node| node.label() == "source_row")
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0].location(), Some(&path_location(60, 61, 6)));
+}
+
+/// Truncated and unproven evidence is `unknown`, never `failed`, and each
+/// obligation says what is missing.
+#[test]
+fn flow_why_reports_missing_evidence_as_unknown_obligations() {
+    let fixture = Fixture::new();
+    let shape = FakePath {
+        witness_steps_truncated: true,
+        witnesses_truncated: true,
+        unproven: true,
+        ..FakePath::proved()
+    };
+    let run = path_run(&fixture, FLOW_POLICY, shape);
+    let id = only_finding(&run);
+    let explanation =
+        explain_finding(&run, &id, &ExplanationLimits::default()).expect("explanation");
+
+    assert!(
+        explanation
+            .nodes()
+            .iter()
+            .all(|node| node.outcome() != ExplanationOutcome::Failed),
+        "a why answer never reports a retained finding's limits as failure"
+    );
+    assert_eq!(
+        child_labels(explanation.root(), ExplanationNodeKind::CoverageObligation),
+        vec![
+            (
+                String::from("finding_certainty"),
+                ExplanationOutcome::Unknown
+            ),
+            (String::from("path_proof"), ExplanationOutcome::Unknown),
+            (
+                String::from("retained_witnesses"),
+                ExplanationOutcome::Unknown
+            ),
+            (
+                String::from("finding_completeness"),
+                ExplanationOutcome::Unknown
+            ),
+            (
+                String::from("run_completion"),
+                ExplanationOutcome::Satisfied
+            ),
+        ]
+    );
+    let prose = |label: &str| {
+        root_child(&explanation, label)
+            .actual()
+            .expect("obligation prose")
+            .to_string()
+    };
+    assert!(
+        prose("finding_certainty").contains("flow-unproven-path"),
+        "the may-evidence reason stays visible: {}",
+        prose("finding_certainty")
+    );
+    assert!(prose("path_proof").contains("unproven"));
+    assert!(
+        prose("retained_witnesses").contains("omitted"),
+        "{}",
+        prose("retained_witnesses")
+    );
+    assert!(
+        prose("finding_completeness").contains("witness_truncated"),
+        "{}",
+        prose("finding_completeness")
+    );
+
+    // The truncated path states its own dropped steps, and the root states the
+    // whole paths the finding dropped.
+    let path = root_child(&explanation, "witness_path");
+    assert!(path.children_truncated());
+    assert_eq!(path.omitted_children_lower_bound(), 1);
+    assert!(explanation.root().children_truncated());
+    assert!(explanation.root().omitted_children_lower_bound() >= 1);
+}
+
+/// A finding with no retained witness explains what is missing instead of
+/// pretending the path is walkable.
+#[test]
+fn flow_why_states_an_absent_witness_rather_than_an_empty_path() {
+    let fixture = Fixture::new();
+    let shape = FakePath {
+        witness: false,
+        ..FakePath::proved()
+    };
+    let run = path_run(&fixture, FLOW_POLICY, shape);
+    let id = only_finding(&run);
+    let explanation =
+        explain_finding(&run, &id, &ExplanationLimits::default()).expect("explanation");
+
+    assert!(
+        !explanation
+            .nodes()
+            .iter()
+            .any(|node| node.kind() == ExplanationNodeKind::Derivation),
+        "no witness was retained, so no path is invented"
+    );
+    let node = root_child(&explanation, "retained_witnesses");
+    assert_eq!(node.outcome(), ExplanationOutcome::Unknown);
+    assert!(
+        node.actual()
+            .expect("prose")
+            .contains("no path is available to walk"),
+        "{:?}",
+        node.actual()
+    );
+}
+
+#[test]
+fn why_explains_a_taint_finding_in_the_security_vocabulary() {
+    let fixture = Fixture::new();
+    let run = path_run(&fixture, TAINT_POLICY, FakePath::proved());
+    assert_eq!(run.analysis_type(), PolicyAnalysisType::Taint);
+    let id = only_finding(&run);
+    let explanation = explain_finding(&run, &id, &ExplanationLimits::default())
+        .expect("the taint adapter answers");
+
+    assert_eq!(explanation.analysis_type(), PolicyAnalysisType::Taint);
+    assert_eq!(explanation.root().label(), "taint_finding");
+    let expected = explanation.root().expected().expect("root prose");
+    assert!(expected.contains("user input"), "{expected}");
+    assert!(expected.contains("sensitive store"), "{expected}");
+
+    let PolicyFindingEvidence::Taint { evidence } = run.findings()[0].evidence() else {
+        panic!("a taint run retains taint evidence");
+    };
+    let origin = root_child(&explanation, "taint_origin");
+    assert!(
+        origin
+            .actual()
+            .expect("origin prose")
+            .contains(evidence.origins()[0].scenario_id().as_str()),
+        "the retained source scenario is named: {:?}",
+        origin.actual()
+    );
+    assert!(
+        origin
+            .expected()
+            .expect("origin prose")
+            .contains(evidence.origins()[0].source_label().as_str())
+    );
+}
+
+#[test]
+fn flow_why_explanations_serialize_byte_identically_across_runs() {
+    let fixture = Fixture::new();
+    let run = path_run(&fixture, FLOW_POLICY, FakePath::proved());
+    let id = only_finding(&run);
+    let first = explain_finding(&run, &id, &ExplanationLimits::default()).expect("first");
+    let second = explain_finding(&run, &id, &ExplanationLimits::default()).expect("second");
+    assert_eq!(first.to_json(), second.to_json());
+
+    let other_fixture = Fixture::new();
+    let other_run = path_run(&other_fixture, FLOW_POLICY, FakePath::proved());
+    let other_id = only_finding(&other_run);
+    let third =
+        explain_finding(&other_run, &other_id, &ExplanationLimits::default()).expect("third");
+    assert_eq!(first.to_json(), third.to_json());
+    assert_eq!(first.root().id(), third.root().id());
+}
+
+#[test]
+fn the_node_limit_bounds_a_flow_why_answer() {
+    let fixture = Fixture::new();
+    let run = path_run(&fixture, FLOW_POLICY, FakePath::proved());
+    let id = only_finding(&run);
+    let full = explain_finding(&run, &id, &ExplanationLimits::default()).expect("full");
+    assert!(full.node_count() > 3);
+    let bounded = explain_finding(&run, &id, &ExplanationLimits::default().with_max_nodes(3))
+        .expect("bounded");
+    assert_eq!(bounded.node_count(), 3);
+    assert!(bounded.truncation().nodes_truncated());
+    assert_eq!(
+        bounded.truncation().omitted_nodes_lower_bound(),
+        full.node_count() - 3
+    );
+}
+
+// --- near-miss ranking (issue 2500) -----------------------------------------
+
+/// Three methods across two classes: the exact target, a near miss that shares
+/// the member name on the wrong class, and a member that shares neither. This
+/// is the P0 near-miss shape in miniature.
+const NEAR_MISS_FIXTURE: &str = "export class Widget {\n  render() {}\n}\nexport class Gadget {\n  render() {}\n  reset() {}\n}\n";
+
+/// A seed with exactly two declared predicates over a bounded kind scope, so
+/// the ladder is `scope`, `root.name`, `inside_decl` and the three fixture
+/// members land at three distinct distances.
+const EXACT_MEMBER_POLICY: &str = r#"(policy
+  :id "test.near-miss.exact-member"
+  :name "Widget.render"
+  :message "Widget.render is reported"
+  :severity warning
+  :analysis (analysis :type match :selector
+    (rql (inside-decl (class :name "Widget") (method :name "render")))))"#;
+
+/// The same invariant with no kind union on the seed root, which therefore has
+/// no bounded search scope at all.
+const UNSCOPED_POLICY: &str = r#"(policy
+  :id "test.near-miss.unscoped"
+  :name "Anything called render"
+  :message "render is reported"
+  :severity warning
+  :analysis (analysis :type match :selector (rql (name "render"))))"#;
+
+fn near_miss_fixture() -> Fixture {
+    Fixture::with_source(NEAR_MISS_FIXTURE)
+}
+
+fn rank(
+    fixture: &Fixture,
+    source: &str,
+    candidates: &NearMissCandidates,
+    limits: &ExplanationLimits,
+) -> PolicyNearMissRanking {
+    with_policy(source, |policy| {
+        rank_near_misses(
+            policy,
+            &fixture.context(),
+            candidates,
+            &PolicyBudget::default(),
+            limits,
+        )
+        .expect("the fixture policy ranks")
+    })
+}
+
+/// The fixture text one ranked subject covers.
+fn ranked_source(ranking: &PolicyNearMissRanking, rank: usize) -> &str {
+    let ExplanationSubject::Candidate {
+        byte_start,
+        byte_end,
+        ..
+    } = ranking.entries()[rank].subject()
+    else {
+        panic!("a near-miss subject is always a candidate position");
+    };
+    &NEAR_MISS_FIXTURE[usize::try_from(*byte_start).unwrap()..usize::try_from(*byte_end).unwrap()]
+}
+
+#[test]
+fn near_miss_ranks_by_declared_predicate_distance_and_names_the_failing_conjunct() {
+    let fixture = near_miss_fixture();
+    let ranking = rank(
+        &fixture,
+        EXACT_MEMBER_POLICY,
+        &NearMissCandidates::PolicySeedSearch,
+        &ExplanationLimits::default(),
+    );
+
+    assert_eq!(ranking.format(), POLICY_NEAR_MISS_FORMAT);
+    assert_eq!(ranking.format(), "bifrost_policy_near_miss/v1");
+    assert_eq!(ranking.question(), ExplanationQuestion::NearMiss);
+    assert_eq!(ranking.analysis_type(), PolicyAnalysisType::Match);
+    assert_eq!(
+        ranking.conjuncts(),
+        ["scope", "root.name", "inside_decl"],
+        "the ladder restores the root's own predicate before its context"
+    );
+    assert_eq!(ranking.executions_used(), 3);
+    assert!(!ranking.truncation().is_truncated(), "{ranking:#?}");
+
+    // Enumeration came from the policy's own seed scope, not a workspace walk.
+    let NearMissEnumeration::PolicySeed {
+        scope,
+        rows,
+        exhaustive,
+    } = ranking.enumeration()
+    else {
+        panic!("the seed search reports its scope: {ranking:#?}");
+    };
+    assert!(scope.contains("method"), "{scope}");
+    assert!(*exhaustive, "{ranking:#?}");
+    assert_eq!(*rows, ranking.candidates_considered());
+    assert_eq!(ranking.entries().len(), 3, "{ranking:#?}");
+
+    // Distance 0: the subject the policy actually selects.
+    let matched = &ranking.entries()[0];
+    assert_eq!(matched.rank(), 1);
+    assert_eq!(matched.outcome(), ExplanationOutcome::Satisfied);
+    assert_eq!(matched.unsatisfied_conjuncts(), 0);
+    assert_eq!(matched.satisfied_conjuncts(), 3);
+    assert_eq!(matched.declared_conjuncts(), 3);
+    assert_eq!(matched.failing_conjunct(), None);
+
+    // Distance 1: the near miss. It satisfies the member name and fails only
+    // the class it sits in, and the failing conjunct says exactly that.
+    let near = &ranking.entries()[1];
+    assert_eq!(near.rank(), 2);
+    assert_eq!(
+        near.outcome(),
+        ExplanationOutcome::Failed,
+        "an exhaustive rung that did not return the subject is failed, not unknown: {near:#?}"
+    );
+    assert_eq!(near.unsatisfied_conjuncts(), 1);
+    assert_eq!(near.failing_conjunct(), Some("inside_decl"));
+    assert!(near.reasons().is_empty(), "{near:#?}");
+
+    // Distance 2: unrelated code, which fails the member name too.
+    let unrelated = &ranking.entries()[2];
+    assert_eq!(unrelated.unsatisfied_conjuncts(), 2);
+    assert_eq!(unrelated.failing_conjunct(), Some("root.name"));
+
+    // The near miss really is the same-named member on the wrong class, and it
+    // ranks above the member that shares nothing.
+    assert!(
+        ranked_source(&ranking, 1).starts_with("render"),
+        "{ranking:#?}"
+    );
+    assert!(
+        ranked_source(&ranking, 2).starts_with("reset"),
+        "{ranking:#?}"
+    );
+    assert!(
+        near.unsatisfied_conjuncts() < unrelated.unsatisfied_conjuncts(),
+        "{ranking:#?}"
+    );
+}
+
+#[test]
+fn near_miss_rankings_serialize_byte_identically_across_runs() {
+    let limits = ExplanationLimits::default();
+    let first = rank(
+        &near_miss_fixture(),
+        EXACT_MEMBER_POLICY,
+        &NearMissCandidates::PolicySeedSearch,
+        &limits,
+    );
+    let second = rank(
+        &near_miss_fixture(),
+        EXACT_MEMBER_POLICY,
+        &NearMissCandidates::PolicySeedSearch,
+        &limits,
+    );
+    assert_eq!(first.to_json(), second.to_json());
+    assert!(first.to_json().contains("bifrost_policy_near_miss/v1"));
+}
+
+#[test]
+fn a_supplied_candidate_outside_the_scope_fails_the_scope_conjunct() {
+    let fixture = near_miss_fixture();
+    let inside = u64::try_from(NEAR_MISS_FIXTURE.find("reset").expect("fixture")).unwrap();
+    let outside = u64::try_from(NEAR_MISS_FIXTURE.find("export").expect("fixture")).unwrap();
+    let ranking = rank(
+        &fixture,
+        EXACT_MEMBER_POLICY,
+        &NearMissCandidates::Supplied(vec![
+            ExplanationCandidate::at_offset("app.ts", outside).expect("candidate"),
+            ExplanationCandidate::at_offset("app.ts", inside).expect("candidate"),
+        ]),
+        &ExplanationLimits::default(),
+    );
+
+    assert_eq!(
+        ranking.enumeration(),
+        &NearMissEnumeration::Supplied { supplied: 2 },
+        "a supplied list is never searched for"
+    );
+    assert_eq!(ranking.entries().len(), 2);
+    assert_eq!(ranking.entries()[0].failing_conjunct(), Some("root.name"));
+    assert_eq!(ranking.entries()[0].unsatisfied_conjuncts(), 2);
+    let refused = &ranking.entries()[1];
+    assert_eq!(
+        refused.failing_conjunct(),
+        Some("scope"),
+        "a subject the policy's own kind pruning excludes fails the scope conjunct: {refused:#?}"
+    );
+    assert_eq!(refused.unsatisfied_conjuncts(), 3);
+}
+
+#[test]
+fn the_candidate_limit_bounds_a_ranking_and_reports_the_truncation() {
+    let fixture = near_miss_fixture();
+    let full = rank(
+        &fixture,
+        EXACT_MEMBER_POLICY,
+        &NearMissCandidates::PolicySeedSearch,
+        &ExplanationLimits::default(),
+    );
+    let bounded = rank(
+        &fixture,
+        EXACT_MEMBER_POLICY,
+        &NearMissCandidates::PolicySeedSearch,
+        &ExplanationLimits::default().with_max_near_miss_candidates(1),
+    );
+
+    assert_eq!(bounded.entries().len(), 1);
+    assert_eq!(
+        bounded.candidates_considered(),
+        full.candidates_considered(),
+        "the bound retains fewer subjects; it does not measure fewer"
+    );
+    assert!(bounded.truncation().candidates_truncated());
+    assert_eq!(
+        bounded.truncation().omitted_candidates_lower_bound(),
+        full.candidates_considered() - 1
+    );
+    assert_eq!(bounded.entries()[0], full.entries()[0]);
+}
+
+#[test]
+fn the_retained_byte_limit_bounds_a_ranking_and_reports_the_truncation() {
+    let bounded = rank(
+        &near_miss_fixture(),
+        EXACT_MEMBER_POLICY,
+        &NearMissCandidates::PolicySeedSearch,
+        &ExplanationLimits::default().with_max_retained_bytes(1),
+    );
+    assert!(bounded.entries().is_empty());
+    assert!(bounded.truncation().bytes_truncated());
+    assert!(bounded.truncation().omitted_bytes_lower_bound() > 0);
+    assert!(bounded.truncation().candidates_truncated());
+}
+
+#[test]
+fn the_text_limit_cuts_ranking_prose_and_reports_the_bytes() {
+    let bounded = rank(
+        &near_miss_fixture(),
+        EXACT_MEMBER_POLICY,
+        &NearMissCandidates::PolicySeedSearch,
+        &ExplanationLimits::default().with_max_text_bytes(8),
+    );
+    assert!(bounded.truncation().text_truncated());
+    assert!(bounded.truncation().omitted_text_bytes_lower_bound() > 0);
+    for entry in bounded.entries() {
+        assert!(entry.actual().len() <= 8, "{entry:#?}");
+    }
+}
+
+#[test]
+fn the_execution_limit_leaves_every_surviving_subject_unknown_rather_than_selected() {
+    let bounded = rank(
+        &near_miss_fixture(),
+        EXACT_MEMBER_POLICY,
+        &NearMissCandidates::PolicySeedSearch,
+        &ExplanationLimits::default().with_max_near_miss_executions(1),
+    );
+
+    assert_eq!(bounded.executions_used(), 1);
+    assert!(bounded.truncation().executions_truncated());
+    assert_eq!(bounded.truncation().omitted_executions_lower_bound(), 2);
+    for entry in bounded.entries() {
+        assert_eq!(
+            entry.outcome(),
+            ExplanationOutcome::Unknown,
+            "a ladder the budget cut short can never report selection: {entry:#?}"
+        );
+        assert_eq!(
+            entry.reasons(),
+            [PolicyIncompleteReason::ReportRetentionBudget]
+        );
+        assert_eq!(entry.satisfied_conjuncts(), 1);
+        assert_eq!(entry.unsatisfied_conjuncts(), 2);
+        assert_eq!(entry.failing_conjunct(), None);
+    }
+}
+
+#[test]
+fn an_undecided_subject_never_outranks_a_decided_one_at_the_same_distance() {
+    // A one-row pipeline budget makes every rung non-exhaustive, so an absence
+    // inside it is undecided rather than evidence of absence.
+    let budget = PolicyBudget::builder()
+        .with_query_limits(CodeQueryExecutionLimits {
+            max_pipeline_rows: 1,
+            ..CodeQueryExecutionLimits::default()
+        })
+        .expect("query limits")
+        .build()
+        .expect("budget");
+    let fixture = near_miss_fixture();
+    let ranking = with_policy(EXACT_MEMBER_POLICY, |policy| {
+        rank_near_misses(
+            policy,
+            &fixture.context(),
+            &NearMissCandidates::PolicySeedSearch,
+            &budget,
+            &ExplanationLimits::default(),
+        )
+        .expect("a truncated ranking is still well formed")
+    });
+
+    let NearMissEnumeration::PolicySeed { exhaustive, .. } = ranking.enumeration() else {
+        panic!("the seed search reports its scope");
+    };
+    assert!(
+        !exhaustive,
+        "a truncated scope query is not an exhaustive candidate set: {ranking:#?}"
+    );
+    for entry in ranking.entries() {
+        if entry.outcome() == ExplanationOutcome::Unknown {
+            assert!(
+                !entry.reasons().is_empty(),
+                "an undecided subject names why: {entry:#?}"
+            );
+        }
+        assert!(
+            entry.unsatisfied_conjuncts() <= entry.declared_conjuncts(),
+            "incompleteness never inflates distance past the declared conjuncts: {entry:#?}"
+        );
+    }
+    // Ordering: distance first, then decidedness, so incompleteness never
+    // reorders two subjects that are equally far away.
+    let keys = ranking
+        .entries()
+        .iter()
+        .map(|entry| (entry.unsatisfied_conjuncts(), entry.outcome()))
+        .collect::<Vec<_>>();
+    let mut sorted = keys.clone();
+    sorted.sort_by_key(|(distance, outcome)| {
+        (
+            *distance,
+            match outcome {
+                ExplanationOutcome::Satisfied => 0u8,
+                ExplanationOutcome::Failed => 1,
+                ExplanationOutcome::Unknown => 2,
+            },
+        )
+    });
+    assert_eq!(keys, sorted, "{ranking:#?}");
+}
+
+#[test]
+fn a_policy_with_no_bounded_scope_is_refused_rather_than_scanned() {
+    let fixture = near_miss_fixture();
+    let error = with_policy(UNSCOPED_POLICY, |policy| {
+        rank_near_misses(
+            policy,
+            &fixture.context(),
+            &NearMissCandidates::PolicySeedSearch,
+            &PolicyBudget::default(),
+            &ExplanationLimits::default(),
+        )
+        .expect_err("an unscoped seed has nothing bounded to enumerate")
+    });
+    assert!(
+        matches!(error, ExplainError::NearMissScopeUnavailable { .. }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("kind union"), "{error}");
+}
+
+#[test]
+fn near_miss_refuses_the_families_it_has_no_adapter_for() {
+    let fixture = near_miss_fixture();
+    let error = with_policy(TAINT_POLICY, |policy| {
+        rank_near_misses(
+            policy,
+            &fixture.context(),
+            &NearMissCandidates::PolicySeedSearch,
+            &PolicyBudget::default(),
+            &ExplanationLimits::default(),
+        )
+        .expect_err("a taint policy has no selector plan to relax")
+    });
+    assert!(
+        matches!(
+            &error,
+            ExplainError::ExplanationAdapterUnavailable { question, supported, .. }
+                if *question == ExplanationQuestion::NearMiss
+                    && supported == NEAR_MISS_ADAPTER_ANALYSIS_TYPES
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("supported analysis types: match, assertion"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_ranking_that_cannot_hold_one_execution_or_one_candidate_is_refused() {
+    let fixture = near_miss_fixture();
+    for (limits, expected) in [
+        (
+            ExplanationLimits::default().with_max_near_miss_executions(0),
+            ExplanationBudgetLimit::NearMissExecutions,
+        ),
+        (
+            ExplanationLimits::default().with_max_near_miss_candidates(0),
+            ExplanationBudgetLimit::NearMissCandidates,
+        ),
+    ] {
+        let error = with_policy(EXACT_MEMBER_POLICY, |policy| {
+            rank_near_misses(
+                policy,
+                &fixture.context(),
+                &NearMissCandidates::PolicySeedSearch,
+                &PolicyBudget::default(),
+                &limits,
+            )
+            .expect_err("a zero bound cannot hold a ranking")
+        });
+        assert_eq!(error, ExplainError::BudgetExhausted { limit: expected });
+    }
+}
+
+#[test]
+fn a_relational_ranking_measures_binding_membership_without_claiming_a_finding() {
+    let fixture = Fixture::with_source(RELATIONAL_FIXTURE);
+    let ranking = rank(
+        &fixture,
+        FORBID_READS_RELATIONAL,
+        &NearMissCandidates::PolicySeedSearch,
+        &ExplanationLimits::default(),
+    );
+    assert_eq!(ranking.analysis_type(), PolicyAnalysisType::Assertion);
+    assert_eq!(
+        ranking.conjuncts()[0],
+        "binding:read/scope",
+        "a relational ladder is scoped by the first binding's source query: {ranking:#?}"
+    );
+    assert!(!ranking.entries().is_empty(), "{ranking:#?}");
+    for entry in ranking.entries() {
+        if entry.unsatisfied_conjuncts() == 0 {
+            assert_eq!(
+                entry.outcome(),
+                ExplanationOutcome::Unknown,
+                "row-binding membership is not a finding: {entry:#?}"
+            );
+            assert_eq!(
+                entry.reasons(),
+                [PolicyIncompleteReason::CapabilityIncomplete]
+            );
+            assert!(entry.actual().contains("join"), "{entry:#?}");
+        }
+    }
+}
+
+#[test]
+fn a_relational_ranking_reports_an_unreplayed_row_expansion_as_unknown() {
+    let fixture = Fixture::with_source(MEMBER_FIXTURE);
+    let ranking = rank(
+        &fixture,
+        TWO_BINDING_RELATIONAL,
+        &NearMissCandidates::PolicySeedSearch,
+        &ExplanationLimits::default(),
+    );
+    assert!(
+        ranking
+            .conjuncts()
+            .iter()
+            .any(|label| label == "binding:receiver"),
+        "each further row binding is one membership conjunct: {ranking:#?}"
+    );
+    for entry in ranking.entries() {
+        if entry.failing_conjunct() == Some("binding:receiver") {
+            assert_eq!(entry.outcome(), ExplanationOutcome::Unknown);
+            assert_eq!(
+                entry.reasons(),
+                [PolicyIncompleteReason::CapabilityIncomplete]
+            );
+            assert!(entry.actual().contains("not replayed"), "{entry:#?}");
+        }
+    }
 }

@@ -16,7 +16,7 @@ use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
-use crate::analyzer::{CSharpAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{CSharpAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 
@@ -959,19 +959,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         procedure_kind: ProcedureKind,
         properties: ProcedureProperties,
     ) -> Result<(), CSharpLoweringError> {
-        let declaration_range = node_range(callable);
         if self.session.cancellation().is_cancelled() {
             return Err(CSharpLoweringError::Cancelled(Box::new(
                 builder.prospective_work(),
             )));
         }
-        let layout = formal_parameter_slots_for_owner(
-            Language::CSharp,
-            callable,
-            self.prepared.source(),
-            &declaration_range,
-        )
-        .unwrap_or_default();
+        let layout =
+            formal_parameter_slots_for_owner(Language::CSharp, callable, self.prepared.source())
+                .unwrap_or_default();
         if self.session.cancellation().is_cancelled() {
             return Err(CSharpLoweringError::Cancelled(Box::new(
                 builder.prospective_work(),
@@ -3884,15 +3879,6 @@ fn is_pattern_syntax(kind: &str) -> bool {
                 | "subpattern"
                 | "when_clause"
         )
-}
-
-fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
-    }
 }
 
 fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {

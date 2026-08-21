@@ -12,8 +12,8 @@ use super::{
     CatalogPackInventory, CompiledSemanticModelPack, CompilerOptions, Diagnostic,
     DiagnosticSeverity, EmittedDeclaration, GeneratorRule, ResolvedActiveSemanticModels,
     RuleEmission, RuleTrigger, SemanticModelActivationEvidence, SemanticModelActivationStatus,
-    SemanticPackCatalog, SourceFormat, TemplateExpression, TemplateSignature, TemplateTypeRef,
-    compile_pack, compile_source,
+    SemanticPackCatalog, SessionPackSource, SessionPackSourceKind, SourceFormat,
+    TemplateExpression, TemplateSignature, TemplateTypeRef, compile_pack, compile_source,
 };
 use crate::hash::HashSet;
 
@@ -708,6 +708,290 @@ pub fn discover_workspace_semantic_models(
     }
     report.complete &= report.files.iter().all(|file| file.valid);
     report
+}
+
+/// One reviewed workspace-local semantic model, registered into a catalog as
+/// an ephemeral session pack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredWorkspaceSemanticModel {
+    /// Workspace-relative source path, exactly as discovery reported it.
+    pub path: String,
+    /// The pack id the compiled manifest publishes.
+    pub pack_id: String,
+    /// The catalog digest the registration returned. It equals the
+    /// `manifest.content_sha256` of the shard the model activates as, so an
+    /// active set or an activation explanation can be matched against it.
+    pub manifest_digest: String,
+}
+
+/// What one workspace contributes to a semantic-model activation transaction
+/// through the reviewed `.bifrost/semantic-models/` route.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceSemanticModelRegistration {
+    /// Whether the reviewed directory is present at all. An absent directory
+    /// is the opt-out, not an error.
+    pub enabled: bool,
+    /// The registered models, in discovery order.
+    pub models: Vec<RegisteredWorkspaceSemanticModel>,
+    /// Activation evidence naming each registered pack id on the
+    /// `configuration` axis, which is the axis an authored shard selector
+    /// matches. Callers merge it into their activation request.
+    pub evidence: Vec<SemanticModelActivationEvidence>,
+}
+
+/// Why the reviewed workspace-local route could not contribute its models.
+///
+/// Every variant is a refusal to proceed, never a skipped file: a checked-in
+/// model that a host cannot read, compile, or register would otherwise decide
+/// a verdict by its absence.
+#[derive(Debug)]
+pub enum WorkspaceSemanticModelRegistrationError {
+    /// Discovery did not finish: a limit was hit, an entry was rejected, or a
+    /// file failed to lint. The report carries every diagnostic.
+    DiscoveryIncomplete {
+        report: Box<WorkspaceSemanticModelReport>,
+    },
+    UnsupportedSourceFormat {
+        path: String,
+        format: String,
+    },
+    ReadFailed {
+        path: String,
+        source: std::io::Error,
+    },
+    CompileFailed {
+        path: String,
+        diagnostics: Vec<Diagnostic>,
+    },
+    RegistrationFailed {
+        path: String,
+        source: CatalogError,
+    },
+}
+
+impl WorkspaceSemanticModelRegistrationError {
+    /// The workspace-relative source path this failure is about, when it is
+    /// about one file rather than the directory as a whole.
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::DiscoveryIncomplete { .. } => None,
+            Self::UnsupportedSourceFormat { path, .. }
+            | Self::ReadFailed { path, .. }
+            | Self::CompileFailed { path, .. }
+            | Self::RegistrationFailed { path, .. } => Some(path),
+        }
+    }
+}
+
+impl std::fmt::Display for WorkspaceSemanticModelRegistrationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DiscoveryIncomplete { report } => {
+                let diagnostics = report
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| {
+                        format!(
+                            "{} {}: {}",
+                            diagnostic.path, diagnostic.code, diagnostic.message
+                        )
+                    })
+                    .chain(report.files.iter().flat_map(|file| {
+                        file.diagnostics.iter().map(|diagnostic| {
+                            format!(
+                                "{} {} {}: {}",
+                                file.path, diagnostic.path, diagnostic.code, diagnostic.message
+                            )
+                        })
+                    }))
+                    .collect::<Vec<_>>();
+                write!(
+                    formatter,
+                    "workspace semantic-model discovery failed: {}",
+                    diagnostics.join("; ")
+                )
+            }
+            Self::UnsupportedSourceFormat { path, format } => write!(
+                formatter,
+                "workspace semantic model {path} has unsupported source format {format}"
+            ),
+            Self::ReadFailed { path, source } => write!(
+                formatter,
+                "failed to read workspace semantic model {path}: {source}"
+            ),
+            Self::CompileFailed { path, diagnostics } => write!(
+                formatter,
+                "failed to compile workspace semantic model {path}: {diagnostics:?}"
+            ),
+            Self::RegistrationFailed { path, source } => write!(
+                formatter,
+                "failed to register workspace semantic model {path}: {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceSemanticModelRegistrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ReadFailed { source, .. } => Some(source),
+            Self::RegistrationFailed { source, .. } => Some(source),
+            Self::DiscoveryIncomplete { .. }
+            | Self::UnsupportedSourceFormat { .. }
+            | Self::CompileFailed { .. } => None,
+        }
+    }
+}
+
+/// Discover, compile, and register the reviewed workspace-local semantic
+/// models beneath `workspace_root` into `catalog`.
+///
+/// This is the one route every host uses for `.bifrost/semantic-models/`: the
+/// MCP bind path, the CLI policy runner through the pack-activation
+/// transaction, and the LSP through the same transaction. Each accepted file
+/// becomes an [`SessionPackSourceKind::EphemeralWorkspace`] session pack whose
+/// source id names the path and the reviewed source digest, so activation
+/// provenance says the model came from the workspace.
+///
+/// Registration is not activation. The caller still has to put the returned
+/// evidence into its activation request, and a `review_required` pack still
+/// needs an explicit compatible `Enable` control before it becomes active.
+/// [`workspace_semantic_models_not_active`] proves what actually happened.
+pub fn register_workspace_semantic_models(
+    workspace_root: &Path,
+    catalog: &SemanticPackCatalog,
+    options: WorkspaceSemanticModelOptions,
+) -> Result<WorkspaceSemanticModelRegistration, WorkspaceSemanticModelRegistrationError> {
+    let report = discover_workspace_semantic_models(workspace_root, options);
+    if !report.complete {
+        return Err(
+            WorkspaceSemanticModelRegistrationError::DiscoveryIncomplete {
+                report: Box::new(report),
+            },
+        );
+    }
+    if !report.enabled {
+        return Ok(WorkspaceSemanticModelRegistration::default());
+    }
+
+    let mut registration = WorkspaceSemanticModelRegistration {
+        enabled: true,
+        models: Vec::with_capacity(report.files.len()),
+        evidence: Vec::with_capacity(report.files.len()),
+    };
+    for file in report.files {
+        let format = match file.source_format.as_str() {
+            "json" => SourceFormat::Json,
+            "yaml" => SourceFormat::Yaml,
+            value => {
+                return Err(
+                    WorkspaceSemanticModelRegistrationError::UnsupportedSourceFormat {
+                        path: file.path,
+                        format: value.to_owned(),
+                    },
+                );
+            }
+        };
+        let source_path = workspace_root.join(Path::new(&file.path));
+        let bytes = fs::read(&source_path).map_err(|source| {
+            WorkspaceSemanticModelRegistrationError::ReadFailed {
+                path: file.path.clone(),
+                source,
+            }
+        })?;
+        let compiled =
+            compile_source(format, &bytes, &options.compiler).map_err(|diagnostics| {
+                WorkspaceSemanticModelRegistrationError::CompileFailed {
+                    path: file.path.clone(),
+                    diagnostics,
+                }
+            })?;
+        let source_id = format!("workspace:{}#sha256={}", file.path, file.source_sha256);
+        let manifest_digest = catalog
+            .register_session_pack(
+                &compiled,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::EphemeralWorkspace,
+                    source_id,
+                },
+            )
+            .map_err(
+                |source| WorkspaceSemanticModelRegistrationError::RegistrationFailed {
+                    path: file.path.clone(),
+                    source,
+                },
+            )?;
+        registration.evidence.push(SemanticModelActivationEvidence {
+            language: compiled.manifest.language.clone(),
+            ecosystem: compiled.manifest.ecosystem.clone(),
+            package: None,
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: Some(compiled.manifest.pack_id.clone()),
+            artifact_sha256: None,
+        });
+        registration.models.push(RegisteredWorkspaceSemanticModel {
+            path: file.path,
+            pack_id: compiled.manifest.pack_id.clone(),
+            manifest_digest,
+        });
+    }
+    Ok(registration)
+}
+
+/// One registered workspace model that did not reach the active set, with the
+/// status the resolver recorded for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InactiveWorkspaceSemanticModel<'a> {
+    pub model: &'a RegisteredWorkspaceSemanticModel,
+    /// The recorded activation status, when the report explains this digest.
+    /// [`SemanticModelActivationStatus::ReviewRequired`] is the review gate
+    /// working as designed; every other status means the registration itself
+    /// did not take effect.
+    pub status: Option<SemanticModelActivationStatus>,
+    /// The reason the resolver recorded, when it recorded one.
+    pub reason: Option<&'a str>,
+}
+
+impl InactiveWorkspaceSemanticModel<'_> {
+    /// Whether this model is inert only because it awaits an explicit enable
+    /// control, which is a review decision rather than a defect.
+    pub fn awaits_review(&self) -> bool {
+        self.status == Some(SemanticModelActivationStatus::ReviewRequired)
+    }
+}
+
+/// Prove that every registered workspace model reached the active set.
+///
+/// A registered model that never activates is invisible, and an invisible
+/// model decides verdicts by its absence. Hosts call this straight after
+/// activation and report what comes back; the empty result is the proof.
+pub fn workspace_semantic_models_not_active<'a>(
+    models: &'a [RegisteredWorkspaceSemanticModel],
+    active: &'a ResolvedActiveSemanticModels,
+) -> Vec<InactiveWorkspaceSemanticModel<'a>> {
+    let mut inactive = Vec::new();
+    for model in models {
+        if active
+            .shards()
+            .iter()
+            .any(|shard| shard.manifest.content_sha256 == model.manifest_digest)
+        {
+            continue;
+        }
+        let explanation = active
+            .activation_report()
+            .explanations
+            .iter()
+            .find(|explanation| explanation.manifest_digest == model.manifest_digest);
+        inactive.push(InactiveWorkspaceSemanticModel {
+            model,
+            status: explanation.map(|explanation| explanation.status),
+            reason: explanation.map(|explanation| explanation.reason.as_str()),
+        });
+    }
+    inactive
 }
 
 fn source_format_for_path(path: &Path) -> Option<SourceFormat> {

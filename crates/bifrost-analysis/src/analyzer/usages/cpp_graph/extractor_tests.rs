@@ -54,7 +54,8 @@ mod effective_using_scale_tests {
             .expect("write right consumer");
 
         let project = Arc::new(TestProject::new(&root, Language::Cpp));
-        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
         let analyzer = workspace.analyzer();
         let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
         let query_scope = AnalyzerQueryScope::new(analyzer);
@@ -242,7 +243,8 @@ mod effective_using_scale_tests {
             .expect("write consumer");
 
         let project = Arc::new(TestProject::new(&root, Language::Cpp));
-        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
         let analyzer = workspace.analyzer();
         let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
         let query_scope = AnalyzerQueryScope::new(analyzer);

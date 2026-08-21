@@ -38,7 +38,8 @@ fn main() -> Result<(), String> {
     eprintln!("[embed] building workspace for {}", root.display());
     let project: Arc<dyn Project> =
         Arc::new(FilesystemProject::new(root.clone()).map_err(|e| e.to_string())?);
-    let snapshot = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let snapshot = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+        .expect("ephemeral workspace should build");
     let analyzer = snapshot.analyzer();
     let files: Vec<_> = analyzer.analyzed_files().into_iter().collect();
     eprintln!(

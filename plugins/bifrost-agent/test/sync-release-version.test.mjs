@@ -41,6 +41,7 @@ const allProjections = [
   "CITATION.cff",
   "plugins/bifrost-agent/README.md",
   "docs/src/content/docs/rust-library.md",
+  ".github/actions/policy-scan/action.yml",
 ];
 
 test("release version check accepts synced CRLF projections", async () => {
@@ -354,6 +355,23 @@ async function createFixture(cargoVersion, projectionVersion, lineEnding) {
     root,
     "docs/src/content/docs/rust-library.md",
     `Install:${lineEnding}${lineEnding}brokk-bifrost = "${projectionVersion}"${lineEnding}`,
+  );
+  // The composite action's `version` input default. Only the shape the
+  // projection matches matters here: one four-space-indented default carrying a
+  // vX.Y.Z tag, which is what a consumer pinning an exact tag installs.
+  await writeFixtureFile(
+    root,
+    ".github/actions/policy-scan/action.yml",
+    [
+      "name: Bifrost Policy Scan",
+      "description: Fixture.",
+      "",
+      "inputs:",
+      "  version:",
+      "    description: Bifrost release tag to install.",
+      `    default: v${projectionVersion}`,
+      "",
+    ].join(lineEnding),
   );
   return root;
 }

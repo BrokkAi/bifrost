@@ -341,6 +341,7 @@ dependencies = [
  "brokk-bifrost-core",
  "rayon",
  "regex",
+ "tempfile",
  "tree-sitter",
  "tree-sitter-go",
 ]

@@ -39,18 +39,22 @@ use crate::resolved::{
     LoadedPolicy, ResolvedEndpointIdentity, ResolvedPolicySelector, ResolvedTaintEndpoint,
     ResolvedTaintPolicySpec, ResolvedTaintSourceDefinition,
 };
+use crate::selector_compiler::{parameter_name_matches, parameter_names_match};
 use crate::{ProductionTaintAnalysisResult, ProductionTaintPhaseMetrics};
 use brokk_bifrost_analysis::CancellationToken;
+use brokk_bifrost_analysis::analyzer::common::language_for_file;
 use brokk_bifrost_analysis::analyzer::dataflow::{
     DataflowRequest, ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey,
     SemanticInputStatus, SolverBudget, SummaryBehaviorKey, SummaryContextKey, SummarySchemaVersion,
     SummarySemanticsVersion, SummaryWitness, SummaryWitnessStepKind, WitnessReconstructionLimits,
     WitnessRetentionLimits,
 };
+use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots;
 use brokk_bifrost_analysis::analyzer::semantic::{
-    CandidateCoverage, EvidenceCompleteness, ExactExternalProcedureTarget, ObservationPhase,
-    OracleCallContext, ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticArtifactKey,
-    SemanticBudget, SemanticOutcome, UnmaterializedExternalTarget, ValueHandle,
+    CallArgumentMapping, CallArgumentMember, CallBinding, CallSiteHandle, CandidateCoverage,
+    EvidenceCompleteness, ExactExternalProcedureTarget, ObservationPhase, OracleCallContext,
+    ProcedureHandle, ProcedurePortKind, ProgramPointHandle, ProofStatus, SemanticArtifactKey,
+    SemanticBudget, SemanticOutcome, SemanticValueKind, UnmaterializedExternalTarget, ValueHandle,
     WorkspaceIcfgProvider, WorkspaceRelativePath, split_qualified_member,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
@@ -69,12 +73,13 @@ use brokk_bifrost_analysis::analyzer::taint::{
     TaintOriginFindingEvidence, TaintPolicyPlan, TaintSanitizerBinding, TaintSinkBinding,
     TaintSourceBinding, TaintUniverse, collect_taint_findings_with_limits,
 };
+use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
 use brokk_bifrost_analysis::analyzer::value_flow::{
     ValueFlowCarrier, ValueFlowCarrierId, ValueFlowEventKey, ValueFlowEventKind,
     ValueFlowIncompleteCause, ValueFlowInput, ValueFlowObservationPhase, ValueFlowPlan,
     ValueFlowSinkSpec, ValueFlowSourceSpec,
 };
-use brokk_bifrost_analysis::analyzer::{ProjectFile, WorkspaceAnalyzer};
+use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
 
 #[derive(Debug)]
 pub(crate) enum TaintPolicyCompileError {
@@ -86,6 +91,15 @@ pub(crate) enum TaintPolicyCompileError {
     SemanticProvider(String),
     SemanticUnavailable(String),
     AmbiguousSemanticSite(String),
+    /// A `(argument :name ...)` port named a formal the selected call's exactly
+    /// resolved target does not declare. The target is proven and its parameter
+    /// list is known, so this is an authoring mistake rather than an analysis
+    /// limit, and it is reported instead of silently matching nothing (#2496).
+    UnknownFormalName {
+        name: String,
+        target: String,
+        declared: Vec<String>,
+    },
     UnsupportedBinding(String),
     UnsupportedAuxiliarySemantics(&'static str),
     EmptyCompiledSources,
@@ -115,6 +129,17 @@ impl fmt::Display for TaintPolicyCompileError {
             }
             Self::AmbiguousSemanticSite(message) => {
                 write!(formatter, "taint semantic binding is ambiguous: {message}")
+            }
+            Self::UnknownFormalName {
+                name,
+                target,
+                declared,
+            } => {
+                write!(
+                    formatter,
+                    "taint binding names formal `{name}`, which `{target}` does not declare; \
+                     its formals are {declared:?}"
+                )
             }
             Self::UnsupportedBinding(message) => {
                 write!(formatter, "taint binding is unsupported: {message}")
@@ -234,15 +259,22 @@ fn refusal_messages(refused: &[RefusedCallSite]) -> Vec<String> {
     refused
         .iter()
         .map(|refusal| {
-            format!(
-                "taint semantic binding refused one site: the selector row at {}:{}..{} \
-                 identifies {} distinct semantic call sites {:?}, so it names no single call",
-                refusal.file,
-                refusal.span.start,
-                refusal.span.end,
-                refusal.ranges.len(),
-                refusal.ranges,
-            )
+            let site = format!(
+                "{}:{}..{}",
+                refusal.file, refusal.span.start, refusal.span.end
+            );
+            match &refusal.reason {
+                RefusalReason::AmbiguousCallSite(ranges) => format!(
+                    "taint semantic binding refused one site: the selector row at {site} \
+                     identifies {} distinct semantic call sites {ranges:?}, so it names no \
+                     single call",
+                    ranges.len(),
+                ),
+                RefusalReason::UnidentifiedFormal { name, detail } => format!(
+                    "taint semantic binding refused one site: the port `(argument :name \
+                     \"{name}\")` at {site} does not identify one actual there: {detail}"
+                ),
+            }
         })
         .collect()
 }
@@ -581,25 +613,73 @@ pub(crate) struct TaintPolicyCompiler<'a> {
     selectors: super::selector_compiler::PolicySelectorSession<'a>,
     active_semantic_models: Option<Arc<ResolvedActiveSemanticModels>>,
     /// Selector rows this compile refused to bind because they named more than
-    /// one distinct semantic call site. Kept per row rather than raised as a
-    /// compile failure so one unresolvable row costs its own sites and not the
-    /// whole run (#2308).
+    /// one distinct semantic call site, or because a `(argument :name ...)`
+    /// port identified no single actual there. Kept per row rather than raised
+    /// as a compile failure so one unresolvable row costs its own sites and not
+    /// the whole run (#2308).
     refused_sites: Vec<RefusedCallSite>,
+    /// Per-callee formal parameter names, in declaration order, for
+    /// `(argument :name ...)` resolution. The names are syntax-derived, so the
+    /// cache is keyed on the materialization-scoped procedure handle the
+    /// dispatch candidate names.
+    formal_slot_names: HashMap<ProcedureHandle, Option<FormalSlotNames>>,
+    /// Parsed declaration trees reused by formal-name resolution.
+    syntax_trees: HashMap<ProjectFile, tree_sitter::Tree>,
+    /// Per (selector, formal name), the source spans of the actuals the
+    /// analyzer's structural actual-to-formal relation bound to that formal.
+    /// It is consulted only where the oracle relation retains no mapping, and
+    /// computed once per pair because it costs one extra selector scan.
+    named_actuals: HashMap<(PolicySelectorPath, String), NamedActualSpans>,
 }
 
 type SelectedSite = super::selector_compiler::PolicySelectedSite;
 
-/// One selector row that binding refused because its best-matching candidates
-/// name more than one distinct source call site.
+/// One callee's formal parameter names, in declaration order. A slot holds
+/// every spelling its declaration gives one parameter.
+type FormalSlotNames = Arc<[Box<[String]>]>;
+
+/// The source spans of the actuals one selector binds to one formal name.
+type NamedActualSpans = Arc<[(ProjectFile, ByteRange<usize>)]>;
+
+/// One selector row that binding refused, with the reason it refused.
 struct RefusedCallSite {
     file: ProjectFile,
     /// The selector row's own byte range.
     span: ByteRange<usize>,
-    /// The tied candidates' source ranges, for the diagnostic.
-    ranges: Vec<ByteRange<usize>>,
-    /// Every procedure that holds a tied candidate. A region containing none of
-    /// these cannot contain the refused site.
+    reason: RefusalReason,
+    /// Every procedure that holds a candidate for the refused row. A region
+    /// containing none of these cannot contain the refused site.
     procedures: Vec<DurableProcedureKey>,
+}
+
+/// What `(argument :name ...)` resolved to at one semantic call site.
+enum NamedArgumentResolution {
+    Bound(NamedArgumentBinding),
+    /// The evidence did not identify one actual. The endpoint is refused with
+    /// this reason rather than dropped, so the run reports a capability gap.
+    Unidentified(String),
+}
+
+/// One actual identified by formal name, with the quality of the evidence that
+/// identified it. The quality is conjoined into the endpoint exactly like the
+/// selector row's own proof and completeness, so a name resolved through an
+/// unproven dispatch degrades the endpoint instead of overstating it.
+struct NamedArgumentBinding {
+    index: u32,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+}
+
+/// Why one selector row did not become a bound endpoint.
+enum RefusalReason {
+    /// The row's best-matching candidates name more than one distinct source
+    /// call site, so it names no single call (#2308). Carries the tied ranges.
+    AmbiguousCallSite(Vec<ByteRange<usize>>),
+    /// A `(argument :name ...)` port did not identify exactly one actual at the
+    /// selected call, because the callee is unresolved, because the retained
+    /// argument binding is open, or because two dispatch candidates map the
+    /// formal to different actuals (#2496).
+    UnidentifiedFormal { name: String, detail: String },
 }
 
 #[derive(Clone)]
@@ -824,6 +904,9 @@ impl<'a> TaintPolicyCompiler<'a> {
             ),
             active_semantic_models,
             refused_sites: Vec::new(),
+            formal_slot_names: HashMap::new(),
+            syntax_trees: HashMap::new(),
+            named_actuals: HashMap::new(),
         }
     }
 
@@ -879,7 +962,9 @@ impl<'a> TaintPolicyCompiler<'a> {
         for source in &spec.sources {
             let selector = required_selector(&selectors, &source.definition.selector_path)?;
             for selected in self.select(selector, &source.definition.bind)? {
-                for resolved in self.resolve_selected_values(selected, &source.definition.bind)? {
+                for resolved in
+                    self.resolve_selected_values(selected, selector, &source.definition.bind)?
+                {
                     all_sources.push(BoundEndpoint {
                         endpoint: source.identity.clone(),
                         point: resolved.point,
@@ -895,9 +980,11 @@ impl<'a> TaintPolicyCompiler<'a> {
         for sink in &spec.sinks {
             let selector = required_selector(&selectors, &sink.definition.selector_path)?;
             for selected in self.select(selector, &sink.definition.dangerous_operand)? {
-                for resolved in
-                    self.resolve_selected_values(selected, &sink.definition.dangerous_operand)?
-                {
+                for resolved in self.resolve_selected_values(
+                    selected,
+                    selector,
+                    &sink.definition.dangerous_operand,
+                )? {
                     all_sinks.push(BoundEndpoint {
                         endpoint: sink.identity.clone(),
                         point: resolved.point,
@@ -922,7 +1009,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             let selector = required_selector(&selectors, &sanitizer.selector_path)?;
             for selected in self.select(selector, &sanitizer.definition.output)? {
                 for resolved in
-                    self.resolve_selected_values(selected, &sanitizer.definition.output)?
+                    self.resolve_selected_values(selected, selector, &sanitizer.definition.output)?
                 {
                     all_kills.push(BoundEndpoint {
                         endpoint: sanitizer.identity.clone(),
@@ -1194,6 +1281,7 @@ impl<'a> TaintPolicyCompiler<'a> {
     fn resolve_selected_values(
         &mut self,
         selection: SelectedSite,
+        selector: &ResolvedPolicySelector,
         binding: &PolicyPort,
     ) -> Result<Vec<ResolvedTaintValue>, TaintPolicyCompileError> {
         if matches!(binding, PolicyPort::MatchedValue) {
@@ -1251,7 +1339,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 self.refused_sites.push(RefusedCallSite {
                     file: selection.file.clone(),
                     span: selection.span.clone(),
-                    ranges,
+                    reason: RefusalReason::AmbiguousCallSite(ranges),
                     procedures,
                 });
                 return Ok(Vec::new());
@@ -1260,24 +1348,572 @@ impl<'a> TaintPolicyCompiler<'a> {
         // One source call site, lowered once per control-flow specialization.
         // Every lowering is a program site the value can reach, so bind all of
         // them; binding one would silently drop the others' paths (#2308).
-        sites
-            .iter()
-            .map(|(procedure, call)| {
-                let (value, point) = select_value(procedure, call, &selection.span, binding)?;
-                Ok(ResolvedTaintValue {
-                    point,
-                    // A call port is a carrier the selected point reads or
-                    // receives, never one that point's own local effects
-                    // define: an argument or receiver temporary is assigned at
-                    // the operand's own point, and a return value is bound at
-                    // the call's normal continuation.
-                    phase: ValueFlowObservationPhase::BeforeEffects,
-                    value,
-                    proof: selection.proof.clone(),
-                    completeness: selection.completeness.clone(),
-                })
+        let mut resolved = Vec::with_capacity(sites.len());
+        for (procedure, call) in &sites {
+            // A formal-name port names the callee's parameter list, which the
+            // semantic call row does not carry. Resolve it to this call's own
+            // actual first, then bind exactly as an index port does, so every
+            // port shares one carrier resolver (#2496).
+            let named;
+            let effective = match binding {
+                PolicyPort::ArgumentName { name } => {
+                    match self.resolve_named_argument(call, name, selector, &selection.file)? {
+                        NamedArgumentResolution::Bound(bound) => {
+                            named = PolicyPort::ArgumentIndex { index: bound.index };
+                            Some((&named, bound.proof, bound.completeness))
+                        }
+                        NamedArgumentResolution::Unidentified(detail) => {
+                            self.refused_sites.push(RefusedCallSite {
+                                file: selection.file.clone(),
+                                span: selection.span.clone(),
+                                reason: RefusalReason::UnidentifiedFormal {
+                                    name: name.clone(),
+                                    detail,
+                                },
+                                procedures: vec![procedure.durable_key()],
+                            });
+                            None
+                        }
+                    }
+                }
+                _ => Some((binding, ProofStatus::Proven, EvidenceCompleteness::Complete)),
+            };
+            let Some((port, proof, completeness)) = effective else {
+                continue;
+            };
+            let (value, point) = select_value(procedure, call, &selection.span, port)?;
+            resolved.push(ResolvedTaintValue {
+                point,
+                // A call port is a carrier the selected point reads or
+                // receives, never one that point's own local effects
+                // define: an argument or receiver temporary is assigned at
+                // the operand's own point, and a return value is bound at
+                // the call's normal continuation.
+                phase: ValueFlowObservationPhase::BeforeEffects,
+                value,
+                proof: conjoin_proof(&selection.proof, &proof),
+                completeness: conjoin_completeness(&selection.completeness, &completeness),
+            });
+        }
+        Ok(resolved)
+    }
+
+    /// The structural route's answer for one whole selector, computed once.
+    ///
+    /// It costs an extra selector scan, so it is taken only where the oracle
+    /// relation retained no mapping.
+    fn named_actuals(
+        &mut self,
+        selector: &ResolvedPolicySelector,
+        name: &str,
+    ) -> Result<NamedActualSpans, TaintPolicyCompileError> {
+        let key = (selector.path.clone(), name.to_owned());
+        if let Some(cached) = self.named_actuals.get(&key) {
+            return Ok(Arc::clone(cached));
+        }
+        let actuals: NamedActualSpans = self
+            .selectors
+            .select_named_actuals(selector, name)
+            .map_err(taint_selector_error)?
+            .into();
+        self.named_actuals.insert(key, Arc::clone(&actuals));
+        Ok(actuals)
+    }
+
+    /// Resolve `(argument :name ...)` to the ordinal of the actual this call
+    /// passes to that formal, with the quality of the evidence that mapped it.
+    ///
+    /// The semantic call row records operands, never formals, so the answer
+    /// comes from a caller/callee binding relation. Two of them are read, in
+    /// order.
+    ///
+    /// The oracle's dispatch-aware `CallBindings` is the authoritative one. It
+    /// maps a positional actual to a `ProcedurePortKind::Parameter` ordinal of
+    /// an exact dispatch target, and the name of that ordinal comes from the
+    /// target's own declaration, so it carries per-candidate proof and
+    /// completeness. It says nothing about a keyword actual: the semantic row
+    /// records `ArgumentDomain::Keyword` but not which keyword, so the oracle's
+    /// producer retains no mapping for `put(value=x)`.
+    ///
+    /// The analyzer's structural actual-to-formal relation -- what
+    /// `(call-input :parameter-name ...)` publishes -- reads the label from the
+    /// call's own syntax and answers that case. A binding taken from it is
+    /// neither proven nor complete, because this seam cannot re-derive the
+    /// relation's own dispatch evidence.
+    ///
+    /// Whichever relation answers, the whole resolved candidate set has to
+    /// agree before the port binds. One candidate's mapping is one candidate's
+    /// evidence; a sibling that maps the formal elsewhere, declares no formal
+    /// of that name, or whose declaration this seam could not read leaves the
+    /// actual unidentified rather than letting the confident candidate, or a
+    /// keyword label at the call site, stand for the call.
+    ///
+    /// Nothing here fails silently. An exactly resolved target that does not
+    /// declare the formal is a typed error; every other shortfall -- an
+    /// unresolved callee, an open argument group, a candidate set that does not
+    /// agree, a declaration that could not be read -- either degrades the
+    /// endpoint's proof and completeness or refuses the row with a named
+    /// diagnostic.
+    fn resolve_named_argument(
+        &mut self,
+        call: &CallSiteHandle,
+        name: &str,
+        selector: &ResolvedPolicySelector,
+        file: &ProjectFile,
+    ) -> Result<NamedArgumentResolution, TaintPolicyCompileError> {
+        let oracle = self.selectors.workspace().semantic_oracle_provider();
+        let dispatch = {
+            let mut request = self.selectors.semantic_request();
+            oracle
+                .resolve_call(call, &mut request)
+                .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?
+        };
+        require_uninterrupted_outcome(&dispatch, "formal-name dispatch")?;
+        self.selectors
+            .require_execution_budget("formal-name dispatch")
+            .map_err(taint_selector_error)?;
+        // Dispatch quality is the first half of the endpoint's evidence. An
+        // unproven or non-exhaustive answer still names candidates worth
+        // consulting; it just cannot make the resulting endpoint proven.
+        let mut proof = ProofStatus::Proven;
+        let mut completeness = EvidenceCompleteness::Complete;
+        if !dispatch.is_complete() {
+            completeness =
+                EvidenceCompleteness::Partial("formal-name dispatch did not complete".into());
+        }
+        // A callee that does not resolve leaves the oracle nothing to say. It
+        // is not a decision, so it does not return here: the structural
+        // relation below still reads a keyword label off the call's own syntax,
+        // and that is the whole Python case.
+        let candidates = dispatch
+            .available_value()
+            .map(|dispatch| {
+                if dispatch.coverage() != CandidateCoverage::Exhaustive {
+                    completeness = EvidenceCompleteness::Partial(
+                        "formal-name dispatch coverage is not exhaustive".into(),
+                    );
+                }
+                dispatch.candidates().to_vec()
             })
-            .collect()
+            .unwrap_or_default();
+        if candidates.is_empty() {
+            proof = ProofStatus::Unproven("the callee of this call does not resolve".into());
+            completeness =
+                EvidenceCompleteness::Partial("formal-name binding has no resolved callee".into());
+        }
+        // An exact target set is what makes "this formal does not exist" a
+        // statement about the code rather than about the analysis.
+        let exact = !candidates.is_empty()
+            && dispatch
+                .available_value()
+                .is_some_and(|dispatch| dispatch.coverage() == CandidateCoverage::Exhaustive)
+            && candidates
+                .iter()
+                .all(|candidate| matches!(candidate.proof(), ProofStatus::Proven));
+        let mut index: Option<u32> = None;
+        // A name binds this call only if the whole resolved candidate set says
+        // so. What one candidate declares is that candidate's evidence, not the
+        // call's, so the loop below gathers facts about the set and the
+        // refusals after it are stated over the set:
+        //
+        // - `read_formals`: some candidate's parameter list was read at all. A
+        //   declaration nobody could parse is an evidence gap, and must not be
+        //   reported as "the target has no such formal".
+        // - `declares_formal`: some candidate declares a formal of this name.
+        // - `known_nondeclared_candidate`: some candidate's list was read and
+        //   does not declare it.
+        // - `formal_names_unavailable`: some candidate's table was withheld.
+        //   `formal_slot_names` returns `None` both when the declaration could
+        //   not be parsed and when the table it would have built has a gap --
+        //   a minted parameter this seam could not locate in the declaration's
+        //   layout withholds the whole table rather than reporting a formal
+        //   absent. Either way this seam does not know what that candidate
+        //   declares, so it may neither bind through the structural relation
+        //   nor raise `UnknownFormalName`.
+        // - `mapped_candidates`: how many candidates mapped the name onto the
+        //   single actual `index` holds. Anything short of every candidate is
+        //   a set that does not agree.
+        //
+        // A keyword mapping is the one route exempt from all of this: it states
+        // the formal's name itself, so it binds without consulting any table.
+        let mut read_formals = false;
+        let mut declares_formal = false;
+        let mut known_nondeclared_candidate = false;
+        let mut formal_names_unavailable = false;
+        let mut declared = Vec::new();
+        let mut mapped_candidates = 0_usize;
+        for candidate in &candidates {
+            if let ProofStatus::Unproven(reason) = candidate.proof() {
+                proof = ProofStatus::Unproven(reason.clone());
+            }
+            if let EvidenceCompleteness::Partial(reason) = candidate.completeness() {
+                completeness = EvidenceCompleteness::Partial(reason.clone());
+            }
+            let names = self.formal_slot_names(candidate.target())?;
+            if let Some(names) = &names {
+                read_formals = true;
+                let candidate_declares = names.iter().any(|slot| parameter_names_match(slot, name));
+                if candidate_declares {
+                    declares_formal = true;
+                } else {
+                    known_nondeclared_candidate = true;
+                    if declared.is_empty() {
+                        declared = names
+                            .iter()
+                            .map(|slot| slot.first().cloned().unwrap_or_default())
+                            .collect();
+                    }
+                }
+            } else {
+                formal_names_unavailable = true;
+            }
+            let bindings = {
+                let mut request = self.selectors.semantic_request();
+                oracle
+                    .call_bindings(call, candidate, &OracleCallContext::empty(), &mut request)
+                    .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?
+            };
+            require_uninterrupted_outcome(&bindings, "formal-name argument binding")?;
+            self.selectors
+                .require_execution_budget("formal-name argument binding")
+                .map_err(taint_selector_error)?;
+            if !bindings.is_complete() {
+                completeness = EvidenceCompleteness::Partial(
+                    "formal-name argument binding did not complete".into(),
+                );
+            }
+            let Some(bindings) = bindings.available_value() else {
+                return Ok(NamedArgumentResolution::Unidentified(
+                    "the caller/callee argument relation is unavailable".to_owned(),
+                ));
+            };
+            if bindings.coverage() != CandidateCoverage::Exhaustive {
+                completeness = EvidenceCompleteness::Partial(
+                    "formal-name argument coverage is not exhaustive".into(),
+                );
+            }
+            let mut mapped = Vec::new();
+            for binding in bindings.bindings() {
+                let CallBinding::ArgumentGroup(group) = binding else {
+                    continue;
+                };
+                if group.coverage() != CandidateCoverage::Exhaustive {
+                    completeness = EvidenceCompleteness::Partial(
+                        "formal-name binding crosses an open argument group".into(),
+                    );
+                }
+                for mapping in group.mappings() {
+                    if !self.mapping_names_formal(mapping.value(), name, names.as_deref()) {
+                        continue;
+                    }
+                    if let ProofStatus::Unproven(reason) = mapping.proof() {
+                        proof = ProofStatus::Unproven(reason.clone());
+                    }
+                    if let EvidenceCompleteness::Partial(reason) = mapping.completeness() {
+                        completeness = EvidenceCompleteness::Partial(reason.clone());
+                    }
+                    mapped.push(mapping.value().source_index());
+                }
+            }
+            mapped.sort_unstable();
+            mapped.dedup();
+            match mapped.as_slice() {
+                [] => {}
+                [only] => match index {
+                    None => {
+                        index = Some(*only);
+                        mapped_candidates = mapped_candidates.saturating_add(1);
+                    }
+                    Some(previous) if previous == *only => {
+                        mapped_candidates = mapped_candidates.saturating_add(1);
+                    }
+                    Some(previous) => {
+                        return Ok(NamedArgumentResolution::Unidentified(format!(
+                            "dispatch candidates map it to argument {previous} and argument \
+                             {only}"
+                        )));
+                    }
+                },
+                many => {
+                    return Ok(NamedArgumentResolution::Unidentified(format!(
+                        "one target maps it to {} actuals {many:?}",
+                        many.len()
+                    )));
+                }
+            }
+        }
+        // Agreement is the binding condition. A sibling candidate that declares
+        // no such formal, or that maps the name nowhere, leaves this call's
+        // actual unidentified however confidently another candidate answered.
+        // The non-declaring case is reported first because it is the cause the
+        // author can act on; the count is what catches the rest, including a
+        // candidate whose table was withheld and so mapped nothing.
+        if index.is_some() && known_nondeclared_candidate {
+            return Ok(NamedArgumentResolution::Unidentified(
+                "a dispatch candidate does not declare the named formal".to_owned(),
+            ));
+        }
+        if index.is_some() && mapped_candidates != candidates.len() {
+            return Ok(NamedArgumentResolution::Unidentified(
+                "dispatch candidates do not all map the formal to one actual".to_owned(),
+            ));
+        }
+        // The semantic call row records that an actual is a keyword argument
+        // but not which keyword, so the oracle relation retains no mapping for
+        // `put(value=x)`. Fall back to the analyzer's structural
+        // actual-to-formal relation, which reads the label from the call's own
+        // syntax. It is the same relation `(call-input :parameter-name ...)`
+        // publishes, and the mapping it makes is not oracle-proven, so a
+        // binding taken from it is complete only up to that relation.
+        let index = match index {
+            Some(index) => Some(index),
+            None => {
+                let actuals = self.named_actuals(selector, name)?;
+                let actuals = actuals
+                    .iter()
+                    .filter(|(actual_file, _)| actual_file == file)
+                    .map(|(_, span)| span.clone())
+                    .collect::<Vec<_>>();
+                let matched = self.structural_named_argument(call, &actuals);
+                // The structural relation reads a label off this call's syntax
+                // and knows nothing about the callee. That is enough when the
+                // candidate set's declarations are understood, and it is not
+                // enough to overrule them: a candidate that does not declare
+                // the formal, or whose table was withheld, is a fact about the
+                // target that a label at the call site cannot answer.
+                if matched.is_some() && (known_nondeclared_candidate || formal_names_unavailable) {
+                    return Ok(NamedArgumentResolution::Unidentified(
+                        if known_nondeclared_candidate {
+                            "a dispatch candidate does not declare the named formal".to_owned()
+                        } else {
+                            "a dispatch candidate's formal names are unavailable".to_owned()
+                        },
+                    ));
+                }
+                if matched.is_some() {
+                    proof = ProofStatus::Unproven(
+                        "formal-name binding rests on the structural actual-to-formal relation"
+                            .into(),
+                    );
+                    completeness = EvidenceCompleteness::Partial(
+                        "formal-name binding rests on the structural actual-to-formal relation"
+                            .into(),
+                    );
+                }
+                matched
+            }
+        };
+        let Some(index) = index else {
+            // Exactly one proven target, its parameter list read, and no
+            // formal of that name: the policy names something that is not
+            // there. Say so rather than quietly binding nothing (#2496).
+            if exact && read_formals && !formal_names_unavailable && !declares_formal {
+                let target = candidates
+                    .first()
+                    .map(|candidate| format!("{:?}", candidate.target().semantics().locator()))
+                    .unwrap_or_default();
+                return Err(TaintPolicyCompileError::UnknownFormalName {
+                    name: name.to_owned(),
+                    target,
+                    declared,
+                });
+            }
+            return Ok(NamedArgumentResolution::Unidentified(
+                if candidates.is_empty() {
+                    "the callee does not resolve here, and no actual at this call is written \
+                     with that formal's name"
+                        .to_owned()
+                } else {
+                    "no retained argument binding reaches that formal".to_owned()
+                },
+            ));
+        };
+        Ok(NamedArgumentResolution::Bound(NamedArgumentBinding {
+            index,
+            proof,
+            completeness,
+        }))
+    }
+
+    /// The ordinal of this call's own operand that the structural
+    /// actual-to-formal relation bound to the requested formal.
+    ///
+    /// `actuals` holds every such operand of the whole selector, because a row
+    /// carries only its own span. Intersecting it with this call's operand
+    /// spans is what keeps a nested call's actual out: `store.put(wrap(value))`
+    /// contains the inner call's `value` operand inside the outer call's span,
+    /// but only `wrap(value)` is an operand of the outer call.
+    fn structural_named_argument(
+        &self,
+        call: &CallSiteHandle,
+        actuals: &[ByteRange<usize>],
+    ) -> Option<u32> {
+        if actuals.is_empty() {
+            return None;
+        }
+        let semantics = call.procedure().semantics();
+        let row = semantics.call_site(call.id())?;
+        let mut matched = Vec::new();
+        for (index, argument) in row.arguments.iter().enumerate() {
+            let Some(value) = semantics.value(argument.value) else {
+                continue;
+            };
+            let Some(mapping) = semantics.source_mapping(value.source) else {
+                continue;
+            };
+            let span = mapping.locator.anchor().span();
+            let operand = span.start_byte() as usize..span.end_byte() as usize;
+            if actuals
+                .iter()
+                .any(|actual| actual.start <= operand.start && actual.end >= operand.end)
+            {
+                matched.push(u32::try_from(index).ok()?);
+            }
+        }
+        match matched.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
+    }
+
+    /// Whether one retained actual-to-formal mapping reaches the named formal.
+    ///
+    /// A positional actual states an ordinal, and the name of that ordinal is a
+    /// property of the resolved target's own declaration. A mapping whose
+    /// member is a keyword states the formal's name itself and binds without
+    /// any knowledge of the callee; today's workspace oracle mints no such
+    /// member, because the semantic call row drops the label, but the oracle
+    /// contract allows one and reading it here is what makes the structural
+    /// fallback below removable when the row carries it.
+    fn mapping_names_formal(
+        &self,
+        mapping: &CallArgumentMapping,
+        name: &str,
+        formals: Option<&[Box<[String]>]>,
+    ) -> bool {
+        if let CallArgumentMember::Keyword(keyword) = mapping.member()
+            && parameter_name_matches(keyword, name)
+        {
+            return true;
+        }
+        let ProcedurePortKind::Parameter { ordinal } = mapping.formal().kind() else {
+            return false;
+        };
+        formals
+            .and_then(|formals| formals.get(ordinal as usize))
+            .is_some_and(|slot| parameter_names_match(slot, name))
+    }
+
+    /// The formal parameter names of one callee, indexed by the parameter
+    /// ordinal a `call_binding` row names.
+    ///
+    /// Names are syntax-derived from the declaration the procedure is anchored
+    /// at, which is the same source the `call_binding` relation reads, so a
+    /// port and a relation row cannot disagree about what formal `n` is called.
+    /// `None` means the declaration could not be read here; that is an evidence
+    /// shortfall, never a decision that the formal is absent, and
+    /// `resolve_named_argument` treats it as one: a candidate whose names are
+    /// unavailable can neither be bound through the structural relation nor
+    /// reported as declaring no such formal.
+    fn formal_slot_names(
+        &mut self,
+        procedure: &ProcedureHandle,
+    ) -> Result<Option<FormalSlotNames>, TaintPolicyCompileError> {
+        if let Some(cached) = self.formal_slot_names.get(procedure) {
+            return Ok(cached.clone());
+        }
+        if self.selectors.cancellation().is_cancelled() {
+            return Err(TaintPolicyCompileError::QueryIncomplete {
+                completion: CodeQueryCompletion::Cancelled,
+                detail: "formal-parameter layout resolution was cancelled".to_owned(),
+            });
+        }
+        if !self.selectors.execution_budget().charge_traversal(1) {
+            return Err(query_budget_error(
+                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                "formal-parameter layout resolution exhausted the shared traversal budget",
+            ));
+        }
+        let names = self.read_formal_slot_names(procedure);
+        self.formal_slot_names
+            .insert(procedure.clone(), names.clone());
+        Ok(names)
+    }
+
+    fn read_formal_slot_names(&mut self, procedure: &ProcedureHandle) -> Option<FormalSlotNames> {
+        let semantics = procedure.semantics();
+        let locator = semantics
+            .source_mapping(semantics.source())
+            .map(|mapping| mapping.locator.clone())?;
+        let span = locator.anchor().span();
+        let file = ProjectFile::new(
+            self.selectors
+                .workspace()
+                .analyzer()
+                .project()
+                .root()
+                .to_path_buf(),
+            locator.path().as_path(),
+        );
+        let source = self
+            .selectors
+            .workspace()
+            .analyzer()
+            .indexed_source(&file)?;
+        let language = language_for_file(&file);
+        if !self.syntax_trees.contains_key(&file) {
+            let tree = parse_tree_for_language(&file, language, &source)?;
+            self.syntax_trees.insert(file.clone(), tree);
+        }
+        let tree = self
+            .syntax_trees
+            .get(&file)
+            .expect("cached parameter syntax tree is retained");
+        let declaration_range = Range {
+            start_byte: span.start_byte() as usize,
+            end_byte: span.end_byte() as usize,
+            start_line: 0,
+            end_line: 0,
+        };
+        let layout =
+            formal_parameter_slots(language, tree.root_node(), &source, &declaration_range)?;
+        // Declaration order is not ordinal order. A language may bind a
+        // declared formal as the receiver -- Python's `self` and `cls` are
+        // ordinary entries in the parameter list, and Go and Java carry a
+        // receiver slot the layout marks -- and the lowering that mints the
+        // ordinals skips whichever one it consumed. Naming ordinal `n` after
+        // the `n`th slot is therefore one slot early on every Python instance
+        // method, which silently binds a port to its neighbour's operand.
+        //
+        // Each ordinal is taken from the procedure's own parameter value
+        // instead. That value's source mapping points into the slot that
+        // declared it, so the table is the lowering's own answer about which
+        // syntax declared formal `n` and cannot drift from it.
+        let mut names: Vec<Box<[String]>> = Vec::new();
+        for value in semantics.values() {
+            let SemanticValueKind::Parameter { ordinal, .. } = &value.kind else {
+                continue;
+            };
+            let mapping = semantics.source_mapping(value.source)?;
+            let span = mapping.locator.anchor().span();
+            let (start, end) = (span.start_byte() as usize, span.end_byte() as usize);
+            let slot = layout.slots.iter().find(|slot| {
+                slot.declaration_range.start_byte <= start && slot.declaration_range.end_byte >= end
+            })?;
+            let ordinal = *ordinal as usize;
+            if names.len() <= ordinal {
+                names.resize(ordinal + 1, Box::default());
+            }
+            names[ordinal] = slot.names.clone().into_boxed_slice();
+        }
+        // A dense table is what makes "the target declares no such formal" a
+        // statement about the declaration rather than about this lookup. A gap
+        // means a parameter the lowering minted was not located in the layout,
+        // so the whole answer is withheld as the shortfall it is.
+        if names.iter().any(|slot| slot.is_empty()) {
+            return None;
+        }
+        Some(names.into())
     }
 
     fn resolve_matched_value(
@@ -2954,6 +3590,7 @@ fn prepared_compile_failure_payload(failure: TaintPolicyCompileFailure) -> Taint
         }
         TaintPolicyCompileError::SemanticUnavailable(_)
         | TaintPolicyCompileError::AmbiguousSemanticSite(_)
+        | TaintPolicyCompileError::UnknownFormalName { .. }
         | TaintPolicyCompileError::UnsupportedBinding(_)
         | TaintPolicyCompileError::UnsupportedAuxiliarySemantics(_) => {
             Some(PolicyIncompleteReason::CapabilityIncomplete)
@@ -3189,10 +3826,8 @@ fn select_value(
                 })?
                 .value
         }
-        PolicyPort::ArgumentName { name } => {
-            return Err(TaintPolicyCompileError::UnsupportedBinding(format!(
-                "named argument `{name}` requires complete dispatch-aware formal binding"
-            )));
+        PolicyPort::ArgumentName { .. } => {
+            unreachable!("formal-name ports resolve to an ordinal before carrier selection")
         }
     };
     let point_id = if matches!(binding, PolicyPort::ReturnValue) {

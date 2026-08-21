@@ -14,9 +14,12 @@ use serde::Deserialize;
 
 use crate::analyzer::semantic_model::{
     CatalogError, CatalogOpenMode, CatalogOptions, DependencyPackLimits,
-    SemanticModelActivationControl, SemanticModelActivationRequest, SemanticModelControlAction,
-    SemanticModelControlScope, SemanticModelPackSelector, SemanticModelRuntimeLimits,
-    SemanticPackCatalog,
+    RegisteredWorkspaceSemanticModel, SemanticModelActivationControl,
+    SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
+    SemanticModelPackSelector, SemanticModelRuntimeLimits, SemanticPackCatalog,
+    WORKSPACE_SEMANTIC_MODEL_DIRECTORY, WorkspaceSemanticModelOptions,
+    WorkspaceSemanticModelRegistration, WorkspaceSemanticModelRegistrationError,
+    register_workspace_semantic_models,
 };
 use crate::analyzer::{
     AnalyzerConfig, DependencyPackActivationOutcome, DependencyPackEcosystem,
@@ -195,13 +198,65 @@ fn bounded_error_message(error: &serde_json::Error) -> Box<str> {
     message[..end].into()
 }
 
-/// The outcome of one document-driven activation transaction.
+/// The outcome of one workspace activation transaction.
 #[derive(Debug)]
 pub struct WorkspacePacksActivation {
     /// The document ecosystems that serve a language present in this
     /// workspace, in `DependencyPackEcosystem::ALL` order.
     pub ecosystems: Vec<DependencyPackEcosystem>,
+    /// The reviewed workspace-local models this transaction registered, in
+    /// discovery order. Empty when the workspace-local route did not run or
+    /// `.bifrost/semantic-models/` is absent.
+    pub workspace_models: Vec<RegisteredWorkspaceSemanticModel>,
     pub outcome: DependencyPackActivationOutcome,
+}
+
+/// Where one activation transaction reads its semantic sources from.
+///
+/// The two roots are separate on purpose. A diff-base run activates against an
+/// exported base tree, so its reviewed models come from that tree, while the
+/// catalog stays machine-local infrastructure beneath the head workspace.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkspaceActivationSources<'a> {
+    /// The root a document-configured catalog path resolves beneath.
+    pub catalog_root: &'a Path,
+    /// The root `.bifrost/semantic-models/` is discovered beneath. `None`
+    /// leaves the reviewed workspace-local route out of the transaction.
+    pub workspace_model_root: Option<&'a Path>,
+    /// The pack-activation document, when the workspace has one.
+    pub config: Option<&'a WorkspacePacksConfig>,
+}
+
+/// Why one activation transaction could not be built.
+#[derive(Debug)]
+pub enum WorkspaceActivationError {
+    Catalog(CatalogError),
+    /// The reviewed workspace-local route refused to contribute its models.
+    WorkspaceModels(WorkspaceSemanticModelRegistrationError),
+}
+
+impl fmt::Display for WorkspaceActivationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Catalog(error) => error.fmt(formatter),
+            Self::WorkspaceModels(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceActivationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Catalog(error) => Some(error),
+            Self::WorkspaceModels(error) => Some(error),
+        }
+    }
+}
+
+impl From<CatalogError> for WorkspaceActivationError {
+    fn from(error: CatalogError) -> Self {
+        Self::Catalog(error)
+    }
 }
 
 /// Activate the document's opted-in ecosystems on `workspace` (#1868).
@@ -211,6 +266,10 @@ pub struct WorkspacePacksActivation {
 /// ephemeral. Ecosystems that serve no language present in the workspace are
 /// skipped: naming one is configuration, not proof the workspace uses it.
 /// Returns `Ok(None)` when no requested ecosystem is relevant.
+///
+/// This is the document route alone. Use
+/// [`activate_workspace_semantic_sources`] to join the reviewed
+/// `.bifrost/semantic-models/` route into the same transaction.
 pub fn activate_workspace_packs(
     workspace: &WorkspaceAnalyzer,
     analyzer_config: &AnalyzerConfig,
@@ -218,9 +277,52 @@ pub fn activate_workspace_packs(
     config: &WorkspacePacksConfig,
     cancellation: &crate::CancellationToken,
 ) -> Result<Option<WorkspacePacksActivation>, CatalogError> {
+    match activate_workspace_semantic_sources(
+        workspace,
+        analyzer_config,
+        WorkspaceActivationSources {
+            catalog_root: workspace_root,
+            workspace_model_root: None,
+            config: Some(config),
+        },
+        cancellation,
+    ) {
+        Ok(activation) => Ok(activation),
+        Err(WorkspaceActivationError::Catalog(error)) => Err(error),
+        // Unreachable: the reviewed workspace-local route is switched off
+        // above, and it is the only producer of this variant.
+        Err(WorkspaceActivationError::WorkspaceModels(error)) => {
+            Err(CatalogError::Integrity(error.to_string()))
+        }
+    }
+}
+
+/// Activate every semantic source one workspace opts into, as one transaction.
+///
+/// Two routes feed one activation request, because they have to: the resolver
+/// publishes exactly one active model set onto an analyzer, so running the
+/// routes separately would leave the second overwriting the first.
+///
+/// - The pack-activation document names the dependency ecosystems and the
+///   catalog, and its `enable` list supplies the review controls. It may also
+///   enable a reviewed workspace-local pack by id.
+/// - `.bifrost/semantic-models/` supplies the reviewed models the repository
+///   checked in beside its policies. Their presence is the opt-in; an absent
+///   directory contributes nothing.
+///
+/// Returns `Ok(None)` when neither route contributes anything, so a workspace
+/// with no configuration keeps paying nothing.
+pub fn activate_workspace_semantic_sources(
+    workspace: &WorkspaceAnalyzer,
+    analyzer_config: &AnalyzerConfig,
+    sources: WorkspaceActivationSources<'_>,
+    cancellation: &crate::CancellationToken,
+) -> Result<Option<WorkspacePacksActivation>, WorkspaceActivationError> {
     let languages = workspace.analyzer().languages();
-    let ecosystems: Vec<_> = config
-        .ecosystems()
+    let ecosystems: Vec<_> = sources
+        .config
+        .map(WorkspacePacksConfig::ecosystems)
+        .unwrap_or_default()
         .iter()
         .copied()
         .filter(|ecosystem| {
@@ -230,24 +332,56 @@ pub fn activate_workspace_packs(
                 .any(|language| languages.contains(language))
         })
         .collect();
-    if ecosystems.is_empty() {
+    // Does this workspace opt into the reviewed route at all? Presence of the
+    // directory is the whole opt-in, and asking costs one stat. Discovery
+    // asks again and properly, rejecting a symlink or a non-directory; an
+    // absent directory reaches the same answer either way, so nothing is
+    // weakened by asking early. What it buys is not opening a catalog for a
+    // workspace that has nothing to put in one.
+    let workspace_model_root = sources.workspace_model_root.filter(|root| {
+        std::fs::symlink_metadata(root.join(WORKSPACE_SEMANTIC_MODEL_DIRECTORY)).is_ok()
+    });
+    // Nothing to open a catalog for: no relevant ecosystem and no reviewed
+    // workspace-local route. This keeps a configured catalog directory from
+    // being created by a run that would activate nothing.
+    if ecosystems.is_empty() && workspace_model_root.is_none() {
         return Ok(None);
     }
-    let catalog = match config.catalog() {
+    let catalog = match sources.config.and_then(WorkspacePacksConfig::catalog) {
         Some(relative) => SemanticPackCatalog::open(
-            &workspace_root.join(relative),
+            &sources.catalog_root.join(relative),
             CatalogOpenMode::ReadWrite,
             CatalogOptions::default(),
         )?,
         None => SemanticPackCatalog::open_ephemeral(CatalogOptions::default())?,
     };
+    // The reviewed workspace-local models join the same catalog handle and the
+    // same evidence, before the dependency route resolves. A discovery,
+    // compile, or registration failure aborts the transaction: a checked-in
+    // model that quietly fails to load would decide verdicts by its absence
+    // (#2493).
+    let registration = match workspace_model_root {
+        Some(model_root) => register_workspace_semantic_models(
+            model_root,
+            &catalog,
+            WorkspaceSemanticModelOptions::default(),
+        )
+        .map_err(WorkspaceActivationError::WorkspaceModels)?,
+        None => WorkspaceSemanticModelRegistration::default(),
+    };
+    if ecosystems.is_empty() && registration.models.is_empty() {
+        return Ok(None);
+    }
     // Every shipped pack declares `safety.review_required`, so activation
     // needs an explicit compatible `Enable` control keyed by pack id --
     // matching evidence alone leaves it selected but inactive
     // (`ReviewRequired`). The document's `enable` list is that control,
     // matching the in-process control build in `owasp_benchmark.rs` (#1937).
-    let controls = config
-        .enable()
+    // A reviewed workspace-local pack id is nameable there too.
+    let controls = sources
+        .config
+        .map(WorkspacePacksConfig::enable)
+        .unwrap_or_default()
         .iter()
         .map(|pack_id| SemanticModelActivationControl {
             scope: SemanticModelControlScope::Workspace,
@@ -259,13 +393,19 @@ pub fn activate_workspace_packs(
             },
         })
         .collect();
+    let mut evidence = registration.evidence;
+    evidence.sort();
+    evidence.dedup();
     let activation = SemanticModelActivationRequest {
         bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("package version must be semver"),
-        evidence: Vec::new(),
+        evidence,
         controls,
         limits: SemanticModelRuntimeLimits::default(),
     };
+    // An empty ecosystem list still resolves: the dependency loop simply has
+    // nothing to discover, and the request's workspace evidence is what
+    // selects. That keeps one code path for both routes.
     let outcome = workspace.activate_dependency_packs(
         analyzer_config,
         &ecosystems,
@@ -279,6 +419,7 @@ pub fn activate_workspace_packs(
     );
     Ok(Some(WorkspacePacksActivation {
         ecosystems,
+        workspace_models: registration.models,
         outcome,
     }))
 }

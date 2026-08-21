@@ -3669,7 +3669,10 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
 fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
     let mut hasher = Sha256::new();
     update_hash(&mut hasher, WEAK_KEY_DOMAIN);
-    update_hash(&mut hasher, domain_label(evidence.domain).as_bytes());
+    // The registry's own label, never a second copy of it: this byte
+    // sequence is inside a pinned finding identity, so a divergent
+    // duplicate would silently change every finding id (issue #2498).
+    update_hash(&mut hasher, evidence.domain.label().as_bytes());
     update_hash(
         &mut hasher,
         evidence.file.rel_path().to_string_lossy().as_bytes(),
@@ -3956,57 +3959,6 @@ fn update_optional_hash(hasher: &mut Sha256, value: Option<&str>) {
             update_hash(hasher, value.as_bytes());
         }
         None => update_hash(hasher, b"none"),
-    }
-}
-
-fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
-    match domain {
-        DetailedCodeQueryDomain::StructuralMatch => "structural_match",
-        DetailedCodeQueryDomain::Declaration => "declaration",
-        DetailedCodeQueryDomain::Procedure => "procedure",
-        DetailedCodeQueryDomain::ProgramPoint => "program_point",
-        DetailedCodeQueryDomain::ControlEdge => "control_edge",
-        DetailedCodeQueryDomain::TypestateFinding => "typestate_finding",
-        DetailedCodeQueryDomain::TypestateWitness => "typestate_witness",
-        DetailedCodeQueryDomain::FlowEndpoint => "flow_endpoint",
-        DetailedCodeQueryDomain::FlowWitness => "flow_witness",
-        DetailedCodeQueryDomain::TaintFinding => "taint_finding",
-        DetailedCodeQueryDomain::ReferenceSite => "reference_site",
-        DetailedCodeQueryDomain::CallSite => "call_site",
-        DetailedCodeQueryDomain::ExpressionSite => "expression_site",
-        DetailedCodeQueryDomain::ReceiverAnalysis => "receiver_analysis",
-        DetailedCodeQueryDomain::ReceiverOutcome => "receiver_outcome",
-        DetailedCodeQueryDomain::ReceiverEvidence => "receiver_evidence",
-        DetailedCodeQueryDomain::CallShape => "call_shape",
-        DetailedCodeQueryDomain::CallArgumentGroup => "call_argument_group",
-        DetailedCodeQueryDomain::CallArgument => "call_argument",
-        DetailedCodeQueryDomain::CallBinding => "call_binding",
-        DetailedCodeQueryDomain::CallEffect => "call_effect",
-        DetailedCodeQueryDomain::ProcedureEffect => "procedure_effect",
-        DetailedCodeQueryDomain::CallableSignature => "callable_signature",
-        DetailedCodeQueryDomain::SignatureParameter => "signature_parameter",
-        DetailedCodeQueryDomain::CallableApplicability => "callable_applicability",
-        DetailedCodeQueryDomain::OverloadSelection => "overload_selection",
-        DetailedCodeQueryDomain::MemberSelection => "member_selection",
-        DetailedCodeQueryDomain::CandidateHop => "candidate_hop",
-        DetailedCodeQueryDomain::DispatchOutcome => "dispatch_outcome",
-        DetailedCodeQueryDomain::DispatchTarget => "dispatch_target",
-        DetailedCodeQueryDomain::MemberFamily => "member_family",
-        DetailedCodeQueryDomain::MemberFamilyEdge => "member_family_edge",
-        DetailedCodeQueryDomain::Occurrence => "occurrence",
-        DetailedCodeQueryDomain::ReferenceEdge => "reference_edge",
-        DetailedCodeQueryDomain::StateEvent => "state_event",
-        DetailedCodeQueryDomain::FlowRelation => "flow_relation",
-        DetailedCodeQueryDomain::RewritePath => "rewrite_path",
-        DetailedCodeQueryDomain::LexicalScope => "lexical_scope",
-        DetailedCodeQueryDomain::Binding => "binding",
-        DetailedCodeQueryDomain::ResolutionCandidate => "resolution_candidate",
-        DetailedCodeQueryDomain::GenerationSite => "generation_site",
-        DetailedCodeQueryDomain::Export => "export",
-        DetailedCodeQueryDomain::DeclarationState => "declaration_state",
-        DetailedCodeQueryDomain::QualifiedPath => "qualified_path",
-        DetailedCodeQueryDomain::PathSegment => "path_segment",
-        DetailedCodeQueryDomain::File => "file",
     }
 }
 

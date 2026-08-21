@@ -573,9 +573,10 @@ pub struct CodeQueryCallBinding {
     /// workspace still indexes a range for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<CodeQueryDeclaration>,
-    /// The `callable_signature` row this binding selects, when the target
-    /// publishes exactly one signature entry. Absent for an overload set, which
-    /// this slice does not choose between.
+    /// The `callable_signature` row this binding selects: the target's only
+    /// published entry, or the entry of a multi-entry set whose declared arity
+    /// accepts this call. Absent when entries with different parameter lists
+    /// both accept it, which is a selection nobody made.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature_id: Option<String>,
     /// The actual's position inside its own argument-list group.
@@ -595,6 +596,11 @@ pub struct CodeQueryCallBinding {
     /// `implicit`. Absent on a terminal row, which binds nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding_kind: Option<&'static str>,
+    /// The conversion or coercion the language applies to this actual before it
+    /// reaches the formal, in the publishing language's own vocabulary. Absent
+    /// on every row Bifrost mints today: no adapter establishes the fact yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversion: Option<String>,
     /// `exact`, `ambiguous`, `incomplete`, or `unsupported`.
     pub mapping: &'static str,
     /// The typed reason this row is not `exact`. An exact row states none.

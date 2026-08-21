@@ -223,6 +223,10 @@ pub(super) fn public_rewrite_path(
     }
 }
 
+/// The value domain the `rewrite_path.completeness` row field publishes,
+/// minted by [`domain_completeness_label`] (issue #2515).
+pub(super) const REWRITE_PATH_COMPLETENESS_LABELS: &[&str] = &["complete", "partial"];
+
 /// `complete` exactly when the derivation answers *this row's own domain*;
 /// otherwise `partial`.
 fn domain_completeness_label(value: &RewritePathValue) -> &'static str {

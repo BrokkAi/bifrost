@@ -313,13 +313,21 @@ jobs:
             echo EOF
           } >> "$GITHUB_OUTPUT"
 
+      - name: Extract curated release notes
+        run: >-
+          node scripts/public/extract-changelog-entry.mjs
+          --version "$RELEASE_VERSION"
+          --require-date
+          --output "$RUNNER_TEMP/release-notes.md"
+
       - name: Publish GitHub Release without overwriting assets
         if: steps.assets.outputs.upload == 'true'
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           tag_name: ${{ needs.release-context.outputs.tag }}
           name: ${{ needs.release-context.outputs.tag }}
-          generate_release_notes: true
+          body_path: ${{ runner.temp }}/release-notes.md
+          generate_release_notes: false
           overwrite_files: false
           files: ${{ steps.assets.outputs.files }}
 
@@ -569,9 +577,20 @@ jobs:
           permission-contents: write
 
       - name: Sync the action into the alias repository
+        id: sync
         env:
           POLICY_SCAN_SYNC_TOKEN: ${{ steps.app-token.outputs.token }}
         run: bash scripts/public/sync-policy-scan-action.sh
+
+      # Marketplace publishes an Action from a release, not from a tag, so an
+      # alias repository holding only tags has nothing to list. Creating the
+      # release is all this can do: GitHub exposes no API for publishing the
+      # listing itself, which stays a manual step in the release UI.
+      - name: Create the alias repository release
+        env:
+          POLICY_SCAN_SYNC_TOKEN: ${{ steps.app-token.outputs.token }}
+          IS_NEWEST: ${{ steps.sync.outputs.is_newest }}
+        run: bash scripts/public/create-policy-scan-release.sh
 
   attach-vscode:
     name: verify qualified VSIX asset

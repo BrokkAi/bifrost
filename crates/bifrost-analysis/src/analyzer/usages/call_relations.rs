@@ -13,11 +13,12 @@ use crate::analyzer::usages::call_binding::{OrdinaryFormalSlots, canonical_param
 use crate::analyzer::usages::get_definition::{
     CallSiteSyntax, CallSyntaxKind, CallTargetLookupOutcome, DefinitionLookupOutcome,
     DefinitionLookupRequest, DefinitionLookupStatus, ExactCallReference, ExactCallReferenceGap,
-    IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC, PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC,
-    PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC, call_reference_ranges_in_tree,
-    call_reference_requires_point_lookup, call_site_syntax_for_reference,
-    exact_call_reference_for_call, parse_tree_for_language, range_is_call_keyword_label,
-    resolve_call_target_batch_with_source, resolve_definition_batch_with_source,
+    IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC, LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+    PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC, PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC,
+    call_reference_ranges_in_tree, call_reference_requires_point_lookup,
+    call_site_syntax_for_reference, exact_call_reference_for_call, parse_tree_for_language,
+    range_is_call_keyword_label, resolve_call_target_batch_with_source,
+    resolve_definition_batch_with_source,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
@@ -1320,7 +1321,8 @@ pub(crate) fn bind_call_site_arguments(
     site: &mut CallSite,
     cache: &mut CallBindingCache,
 ) -> CallBindingStatus {
-    let Some((formal_owner, constructor_binding)) = formal_owner_for_site(analyzer, site) else {
+    let Some((formal_owner, constructor_binding)) = formal_owner_for_callee(analyzer, &site.callee)
+    else {
         return CallBindingStatus::Unavailable;
     };
     let Some(layout) = cache.formal_layout(analyzer, &formal_owner) else {
@@ -1328,7 +1330,8 @@ pub(crate) fn bind_call_site_arguments(
     };
     let Some(bind_first) = python_first_formal_is_bound(
         analyzer,
-        site,
+        &site.file,
+        site.receiver,
         &formal_owner,
         &layout,
         cache,
@@ -1353,15 +1356,27 @@ pub(crate) fn bind_call_site_arguments(
     CallBindingStatus::Complete
 }
 
-fn formal_owner_for_site(analyzer: &dyn IAnalyzer, site: &CallSite) -> Option<(CodeUnit, bool)> {
-    if !site.callee.is_class() {
-        return Some((site.callee.clone(), false));
+/// The callable whose formal list one resolved callee's arguments bind, and
+/// whether the language binds its first declared formal to the constructed
+/// object.
+///
+/// A callee that is already a callable owns its own formals. A *class* callee
+/// is a Python constructor call, whose formals are `__init__`'s and whose
+/// `self` the allocation binds; a class in any other language names no
+/// parameter list this seam can read. Shared with the `call_binding` row
+/// producer so both answer from one rule (issue #2499).
+pub(crate) fn formal_owner_for_callee(
+    analyzer: &dyn IAnalyzer,
+    callee: &CodeUnit,
+) -> Option<(CodeUnit, bool)> {
+    if !callee.is_class() {
+        return Some((callee.clone(), false));
     }
-    if language_for_file(site.callee.source()) != Language::Python {
+    if language_for_file(callee.source()) != Language::Python {
         return None;
     }
     let mut constructors = analyzer
-        .direct_children(&site.callee)
+        .direct_children(callee)
         .into_iter()
         .filter(|unit| unit.is_callable() && unit.identifier() == "__init__")
         .collect::<Vec<_>>();
@@ -1370,9 +1385,18 @@ fn formal_owner_for_site(analyzer: &dyn IAnalyzer, site: &CallSite) -> Option<(C
     (constructors.len() == 1).then(|| (constructors.remove(0), true))
 }
 
-fn python_first_formal_is_bound(
+/// Whether the callee's first declared formal is consumed by the call's
+/// receiver rather than by a written actual.
+///
+/// This is Python's whole receiver discipline: `self` and `cls` occupy declared
+/// slots, so what the receiver expression resolves to decides which slot the
+/// first written actual reaches. `None` means the receiver's own resolution
+/// failed, which is undecidable rather than "not bound" -- a caller that
+/// guessed here would report every actual one slot off.
+pub(crate) fn python_first_formal_is_bound(
     analyzer: &dyn IAnalyzer,
-    site: &CallSite,
+    file: &ProjectFile,
+    receiver: Option<Range>,
     formal_owner: &CodeUnit,
     layout: &FormalParameterLayout,
     cache: &mut CallBindingCache,
@@ -1390,12 +1414,12 @@ fn python_first_formal_is_bound(
     }
     match layout.python_binding {
         Some(PythonMethodBinding::Static) | None => Some(false),
-        Some(PythonMethodBinding::Class) => Some(site.receiver.is_some()),
+        Some(PythonMethodBinding::Class) => Some(receiver.is_some()),
         Some(PythonMethodBinding::Instance) => {
-            let Some(receiver) = site.receiver else {
+            let Some(receiver) = receiver else {
                 return Some(false);
             };
-            python_receiver_resolves_to_class(analyzer, site, receiver, cache)
+            python_receiver_resolves_to_class(analyzer, file, receiver, cache)
                 .map(|is_class| !is_class)
         }
     }
@@ -1403,36 +1427,53 @@ fn python_first_formal_is_bound(
 
 fn python_receiver_resolves_to_class(
     analyzer: &dyn IAnalyzer,
-    site: &CallSite,
+    file: &ProjectFile,
     receiver: Range,
     cache: &mut CallBindingCache,
 ) -> Option<bool> {
-    let key = (site.file.clone(), receiver.start_byte, receiver.end_byte);
+    let key = (file.clone(), receiver.start_byte, receiver.end_byte);
     if let Some(is_class) = cache.python_receiver_is_class.get(&key) {
         return *is_class;
     }
     let is_class = analyzer
-        .indexed_source(&site.file)
+        .indexed_source(file)
         .map(Arc::<str>::from)
         .and_then(|source| {
             resolve_definition_batch_with_source(
                 analyzer,
                 vec![DefinitionLookupRequest {
-                    file: site.file.clone(),
+                    file: file.clone(),
                     line: None,
                     column: None,
                     start_byte: Some(receiver.start_byte),
                     end_byte: Some(receiver.end_byte),
                 }],
-                site.file.clone(),
+                file.clone(),
                 source,
             )
             .into_iter()
             .next()
         })
-        .and_then(|outcome| {
-            (outcome.status == DefinitionLookupStatus::Resolved)
-                .then(|| outcome.definitions.iter().any(CodeUnit::is_class))
+        .and_then(|outcome| match outcome.status {
+            DefinitionLookupStatus::Resolved => {
+                Some(outcome.definitions.iter().any(CodeUnit::is_class))
+            }
+            // The resolver identified what the name binds to and answered that
+            // it is a local binder no analyzer publishes as a CodeUnit -- a
+            // parameter, or a variable assigned in this body. That is an
+            // adjudicated answer, not a miss, and a local binder is not the
+            // class-reference spelling `Class.method(instance)` needs. The
+            // known boundary is a local that holds a class object, such as
+            // `alias = Store` followed by `alias.put(store, key)`; deciding
+            // that needs value flow, and nothing here pretends to have it.
+            DefinitionLookupStatus::NoDefinition
+                if outcome.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.kind == LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND
+                }) =>
+            {
+                Some(false)
+            }
+            _ => None,
         });
     cache.python_receiver_is_class.insert(key, is_class);
     is_class

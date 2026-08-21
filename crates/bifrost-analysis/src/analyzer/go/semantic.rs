@@ -16,7 +16,7 @@ use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
-use crate::analyzer::{GoAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{GoAnalyzer, Language, ProjectFile};
 use crate::hash::HashMap;
 
 const ADAPTER_VERSION: &[u8] = b"go-value-semantics-v2";
@@ -577,14 +577,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         callable: Node<'tree>,
     ) -> Result<(), GoLoweringError> {
-        let declaration_range = node_range(callable);
-        let layout = formal_parameter_slots_for_owner(
-            Language::Go,
-            callable,
-            self.prepared.source(),
-            &declaration_range,
-        )
-        .unwrap_or_default();
+        let layout =
+            formal_parameter_slots_for_owner(Language::Go, callable, self.prepared.source())
+                .unwrap_or_default();
         let mut ordinal = 0_u32;
         for slot in layout.slots {
             if self.session.cancellation().is_cancelled() {
@@ -3246,15 +3241,6 @@ fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
         | "nil"
         | "iota" => SemanticValueKind::Constant,
         _ => SemanticValueKind::Temporary,
-    }
-}
-
-fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
     }
 }
 

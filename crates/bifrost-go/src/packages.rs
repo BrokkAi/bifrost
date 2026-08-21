@@ -12,6 +12,7 @@ use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::project::Project;
 use brokk_bifrost_core::hash::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 /// Synthetic scope segment owning a Go package's module-level `var`, `const`
 /// and type-alias declarations, which have no enclosing type of their own.
@@ -252,21 +253,71 @@ fn nearest_go_module(file: &ProjectFile) -> Option<(String, String)> {
     let root = file.root();
     let abs = file.abs_path();
     let file_dir = abs.parent()?;
-    let mut cursor = file_dir;
-    loop {
+    let (anchor, module_path) = nearest_go_module_anchor(file_dir, root)?;
+    let rel_dir = file_dir
+        .strip_prefix(&anchor)
+        .ok()?
+        .to_string_lossy()
+        .replace('\\', "/");
+    Some((module_path, rel_dir))
+}
+
+type GoModuleAnchor = (PathBuf, String);
+type GoModuleCacheKey = (PathBuf, PathBuf);
+
+fn nearest_go_module_cache() -> &'static Mutex<HashMap<GoModuleCacheKey, Option<GoModuleAnchor>>> {
+    static CACHE: OnceLock<Mutex<HashMap<GoModuleCacheKey, Option<GoModuleAnchor>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::default()))
+}
+
+/// Clear cached nearest-module answers after the workspace file set changes.
+pub fn invalidate_nearest_go_module_cache() {
+    nearest_go_module_cache()
+        .lock()
+        .expect("go module cache mutex")
+        .clear();
+}
+
+#[cfg(test)]
+static GO_MOD_PROBE_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn nearest_go_module_anchor(dir: &Path, root: &Path) -> Option<GoModuleAnchor> {
+    let cache = nearest_go_module_cache();
+    let mut visited = Vec::new();
+    let mut cursor = dir;
+    let result = loop {
+        let key = (root.to_path_buf(), cursor.to_path_buf());
+        if let Some(cached) = cache
+            .lock()
+            .expect("go module cache mutex")
+            .get(&key)
+            .cloned()
+        {
+            break cached;
+        }
+        visited.push(key);
+        #[cfg(test)]
+        GO_MOD_PROBE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(module_path) = read_go_module_path(cursor) {
-            let rel_dir = file_dir
-                .strip_prefix(cursor)
-                .ok()?
-                .to_string_lossy()
-                .replace('\\', "/");
-            return Some((module_path, rel_dir));
+            break Some((cursor.to_path_buf(), module_path));
         }
         if cursor == root {
-            return None;
+            break None;
         }
-        cursor = cursor.parent()?;
+        match cursor.parent() {
+            Some(parent) => cursor = parent,
+            None => break None,
+        }
+    };
+    if !visited.is_empty() {
+        let mut guard = cache.lock().expect("go module cache mutex");
+        for key in visited {
+            guard.entry(key).or_insert_with(|| result.clone());
+        }
     }
+    result
 }
 
 /// Import path with no `go.mod`: the project-relative parent directory, or the
@@ -388,7 +439,91 @@ fn next_go_mod_token(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::go_module_path_from_source;
+    use super::{
+        GO_MOD_PROBE_ATTEMPTS, canonical_go_package_name, go_module_path_from_source,
+        invalidate_nearest_go_module_cache,
+    };
+    use brokk_bifrost_core::analyzer::ProjectFile;
+    use std::sync::Mutex;
+
+    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn write_file(root: &std::path::Path, rel_path: &str, contents: &str) {
+        let path = root.join(rel_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn reset_cache_probe_count() {
+        invalidate_nearest_go_module_cache();
+        GO_MOD_PROBE_ATTEMPTS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn sibling_files_reuse_the_cached_go_mod_walk() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        reset_cache_probe_count();
+        write_file(repo.path(), "go.mod", "module example.com/repo\n");
+
+        for name in ["a.go", "b.go", "c.go"] {
+            let file = ProjectFile::new(
+                repo.path().to_path_buf(),
+                format!("vendor/k8s.io/utils/strings/{name}"),
+            );
+            assert_eq!(
+                canonical_go_package_name(&file, "strings"),
+                "example.com/repo/vendor/k8s.io/utils/strings"
+            );
+        }
+
+        assert_eq!(
+            GO_MOD_PROBE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+            5
+        );
+    }
+
+    #[test]
+    fn invalidation_refreshes_an_edited_module_path() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        reset_cache_probe_count();
+        write_file(repo.path(), "go.mod", "module example.com/old\n");
+        let file = ProjectFile::new(repo.path().to_path_buf(), "pkg/foo.go");
+
+        assert_eq!(
+            canonical_go_package_name(&file, "foo"),
+            "example.com/old/pkg"
+        );
+        write_file(repo.path(), "go.mod", "module example.com/new\n");
+        assert_eq!(
+            canonical_go_package_name(&file, "foo"),
+            "example.com/old/pkg"
+        );
+        invalidate_nearest_go_module_cache();
+        assert_eq!(
+            canonical_go_package_name(&file, "foo"),
+            "example.com/new/pkg"
+        );
+    }
+
+    #[test]
+    fn cache_keeps_project_root_boundaries_distinct() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        reset_cache_probe_count();
+        write_file(repo.path(), "go.mod", "module example.com/outer\n");
+        let nested_root = repo.path().join("nested");
+        std::fs::create_dir_all(nested_root.join("pkg")).unwrap();
+        let outer_file = ProjectFile::new(repo.path().to_path_buf(), "nested/pkg/foo.go");
+        let nested_file = ProjectFile::new(nested_root, "pkg/foo.go");
+
+        assert_eq!(
+            canonical_go_package_name(&outer_file, "foo"),
+            "example.com/outer/nested/pkg"
+        );
+        assert_eq!(canonical_go_package_name(&nested_file, "foo"), "pkg");
+    }
 
     #[test]
     fn plain_module_path() {

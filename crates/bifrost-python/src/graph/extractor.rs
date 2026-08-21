@@ -2477,6 +2477,7 @@ fn collect_scope_facts_from_events(
             engine.declare_shadow(symbol.clone());
         }
     }
+    let merged = merged_assignment_symbols(events, current_class, factory_return_types);
 
     let mut changed = true;
     while changed {
@@ -2511,6 +2512,15 @@ fn collect_scope_facts_from_events(
                         engine.declare_shadow(lhs.clone());
                     }
                     if lhs.starts_with("self.") && !allow_self_receivers {
+                        continue;
+                    }
+                    // A symbol that two assignments give two different types is
+                    // a merge, not a proof. This inference is flow-insensitive,
+                    // so it cannot say which assignment reaches a later use; the
+                    // symbol stays declared and unresolved rather than taking the
+                    // first type it saw (#2495). The declaration above still runs,
+                    // so the name shadows any outer binding of the same spelling.
+                    if merged.contains(lhs.as_str()) {
                         continue;
                     }
 
@@ -2568,6 +2578,63 @@ fn collect_scope_facts_from_events(
     }
 
     engine.snapshot()
+}
+
+/// The symbols this scope assigns two or more *different* receiver types.
+///
+/// `store = AcmeStore()` followed by `store = AcmeCache()` -- in a branch, a
+/// loop, or straight-line code -- leaves the receiver's type open. Seeding the
+/// first assignment and ignoring the rest made a later `store.put(...)` read as
+/// a proven call of `AcmeStore.put`, which the program may never dispatch to.
+///
+/// Only assignments that name a type directly participate. An `AssignmentRhs`
+/// this scope cannot type at all contributes nothing, because an untypable
+/// right-hand side is already the absence of evidence rather than a second,
+/// conflicting type.
+fn merged_assignment_symbols<'events>(
+    events: &'events [ScopeFactEvent],
+    current_class: Option<&str>,
+    factory_return_types: &HashMap<String, String>,
+) -> HashSet<&'events str> {
+    let mut seen: HashMap<&str, String> = HashMap::default();
+    let mut merged = HashSet::default();
+    for event in events {
+        let ScopeFactEvent::Assignment { lhs, rhs } = event else {
+            continue;
+        };
+        let Some(assigned_type) = direct_assignment_type(rhs, current_class, factory_return_types)
+        else {
+            continue;
+        };
+        match seen.get(lhs.as_str()) {
+            Some(first) if first == &assigned_type => {}
+            Some(_) => {
+                merged.insert(lhs.as_str());
+            }
+            None => {
+                seen.insert(lhs.as_str(), assigned_type);
+            }
+        }
+    }
+    merged
+}
+
+/// The receiver type one assignment's right-hand side names on its own, using
+/// exactly the two routes [`collect_scope_facts_from_events`] seeds from.
+fn direct_assignment_type(
+    rhs: &AssignmentRhs,
+    current_class: Option<&str>,
+    factory_return_types: &HashMap<String, String>,
+) -> Option<String> {
+    match rhs {
+        AssignmentRhs::Call(callee) => {
+            factory_return_type_for_callee(callee, current_class, factory_return_types)
+                .cloned()
+                .or_else(|| normalized_receiver_type(callee))
+        }
+        AssignmentRhs::Symbol(symbol) => normalized_receiver_type(symbol),
+        AssignmentRhs::Unknown => None,
+    }
 }
 
 fn factory_return_type_for_callee<'a>(

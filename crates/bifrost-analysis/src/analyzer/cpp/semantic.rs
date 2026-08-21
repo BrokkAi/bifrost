@@ -16,7 +16,7 @@ use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
-use crate::analyzer::{CppAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{CppAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
 const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v3";
@@ -1079,14 +1079,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         callable: Node<'tree>,
         has_implicit_object_context: bool,
     ) -> Result<(), CppLoweringError> {
-        let declaration_range = node_range(callable);
-        let layout = formal_parameter_slots_for_owner(
-            Language::Cpp,
-            callable,
-            self.source,
-            &declaration_range,
-        )
-        .unwrap_or_default();
+        let layout = formal_parameter_slots_for_owner(Language::Cpp, callable, self.source)
+            .unwrap_or_default();
         let mut ordinal = 0_u32;
         for slot in layout.slots {
             if self.session.cancellation().is_cancelled() {
@@ -4101,15 +4095,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), CppLoweringError> {
         self.session
             .add_edge(builder, source_point, target.point, target.kind)
-    }
-}
-
-fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
     }
 }
 

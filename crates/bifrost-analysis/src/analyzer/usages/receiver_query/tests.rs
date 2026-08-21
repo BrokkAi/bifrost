@@ -130,10 +130,11 @@ export function caller(flag: boolean) {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::TypeScript)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
 
     let service = ReceiverQueryService::from_workspace(&workspace);
     let receiver_range = last_marker_range(source, "factory");
@@ -249,10 +250,11 @@ export function caller() {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::TypeScript)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
 
     let service = ReceiverQueryService::from_workspace(&workspace);
     let receiver_range = last_marker_range(source, "factory");
@@ -393,10 +395,11 @@ fn workspace_semantic_gate_and_compatibility_provider_share_one_budget() {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
     file.write(&source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::TypeScript)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
     let range = marker_range(&source, "service.run");
     let workspace_service = ReceiverQueryService::from_workspace(&workspace);
     let warm = workspace_service
@@ -509,10 +512,11 @@ void Call(Service service) {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("Receiver.cs"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::CSharp)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
     let service = ReceiverQueryService::from_workspace(&workspace);
     let facts = csharp_structural_facts(&workspace, &file);
     let range = marker_range(source, "service.Run");
@@ -685,10 +689,11 @@ void Call()
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("Receiver.cs"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::CSharp)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
     let service = ReceiverQueryService::from_workspace(&workspace);
     let facts = csharp_structural_facts(&workspace, &file);
     let range = marker_range(source, "local.Next.Run");
@@ -1008,10 +1013,11 @@ void Call(DifferentService service) { service.Execute(); }
     unrelated_file
         .write(unrelated_source)
         .expect("write unrelated source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::CSharp)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
     let service = ReceiverQueryService::from_workspace(&workspace);
     let facts = csharp_structural_facts(&workspace, &file);
     let unrelated_facts = csharp_structural_facts(&workspace, &unrelated_file);
@@ -1091,10 +1097,11 @@ class Caller {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("Partial.cs"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::CSharp)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
     let facts = csharp_structural_facts(&workspace, &file);
     let report = ReceiverQueryService::from_workspace(&workspace)
         .analyze_with_structural_facts(
@@ -1145,10 +1152,11 @@ void Call(Service service, dynamic opaque) {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("Dynamic.cs"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::CSharp)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
     let receiver_range = last_marker_range(source, "opaque");
     let mut semantic =
         ReceiverSemanticBridge::new(ReceiverAnalysisBudget::default()).expect("bridge");
@@ -1202,10 +1210,11 @@ void Call() { this.Touch(); }
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("Current.cs"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::CSharp)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
     let service = ReceiverQueryService::from_workspace(&workspace);
     let gate = service
         .semantic_receiver_gate(
@@ -1299,10 +1308,11 @@ void caller() {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("Sample.java"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::Java)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
     let service = ReceiverQueryService::from_workspace(&workspace);
     let range = marker_range(source, "service.run");
 
@@ -1522,10 +1532,11 @@ fn java_compatibility_resolution_bounds_deep_hierarchy_and_precancellation() {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("DeepHierarchy.java"));
     file.write(&source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::Java)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
     let service = ReceiverQueryService::from_workspace(&workspace);
     let tree = parse_tree_for_language(&file, Language::Java, &source).expect("Java tree");
     let line_starts = compute_line_starts(&source);
@@ -1725,10 +1736,11 @@ fn java_allocation_projection_stops_at_target_cap_lookahead() {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("Allocations.java"));
     file.write(&source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::Java)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
     let service = ReceiverQueryService::from_workspace(&workspace);
     let receiver_start = source.rfind("service.run").expect("receiver call");
     let receiver_range = range_at(&source, "service", receiver_start);
@@ -1841,10 +1853,11 @@ void caller(boolean choice) {
     cartesian_file
         .write(cartesian_source)
         .expect("write cartesian source");
-    let cartesian_workspace = WorkspaceAnalyzer::build(
+    let cartesian_workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(cartesian_root, Language::Java)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
     let cartesian_service = ReceiverQueryService::from_workspace(&cartesian_workspace);
     let cartesian_receiver_start = cartesian_source
         .rfind("service.run")
@@ -1956,10 +1969,11 @@ static class Worker {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("Nested.java"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::Java)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
     let report = ReceiverQueryService::from_workspace(&workspace)
         .analyze(
             ReceiverQueryOperation::ReceiverTargets,
@@ -2236,10 +2250,11 @@ fn semantic_receiver_gate_preserves_provider_identity_failures() {
     let root = temp.path().canonicalize().expect("canonical root");
     let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build(
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
         Arc::new(TestProject::new(root, Language::TypeScript)),
         AnalyzerConfig::default(),
-    );
+    )
+    .expect("ephemeral workspace should build");
     let foreign = tempfile::tempdir().expect("foreign temp dir");
     let foreign_file = ProjectFile::new(
         foreign.path().canonicalize().expect("foreign root"),

@@ -77,105 +77,6 @@ pub enum CodeQueryStableOwnerDerivation {
     SemanticWireId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DetailedCodeQueryDomain {
-    StructuralMatch,
-    Declaration,
-    Procedure,
-    ProgramPoint,
-    ControlEdge,
-    TypestateFinding,
-    TypestateWitness,
-    FlowEndpoint,
-    FlowWitness,
-    TaintFinding,
-    File,
-    ReferenceSite,
-    CallSite,
-    ExpressionSite,
-    ReceiverAnalysis,
-    ReceiverOutcome,
-    CallShape,
-    CallArgumentGroup,
-    CallArgument,
-    CallBinding,
-    CallEffect,
-    ProcedureEffect,
-    CallableSignature,
-    SignatureParameter,
-    CallableApplicability,
-    OverloadSelection,
-    ReceiverEvidence,
-    MemberSelection,
-    DispatchOutcome,
-    DispatchTarget,
-    MemberFamily,
-    MemberFamilyEdge,
-    Occurrence,
-    LexicalScope,
-    Binding,
-    ResolutionCandidate,
-    CandidateHop,
-    GenerationSite,
-    Export,
-    DeclarationState,
-    ReferenceEdge,
-    StateEvent,
-    FlowRelation,
-    RewritePath,
-    QualifiedPath,
-    PathSegment,
-}
-
-pub const ALL_DETAILED_CODE_QUERY_DOMAINS: &[DetailedCodeQueryDomain] = &[
-    DetailedCodeQueryDomain::StructuralMatch,
-    DetailedCodeQueryDomain::Declaration,
-    DetailedCodeQueryDomain::Procedure,
-    DetailedCodeQueryDomain::ProgramPoint,
-    DetailedCodeQueryDomain::ControlEdge,
-    DetailedCodeQueryDomain::TypestateFinding,
-    DetailedCodeQueryDomain::TypestateWitness,
-    DetailedCodeQueryDomain::FlowEndpoint,
-    DetailedCodeQueryDomain::FlowWitness,
-    DetailedCodeQueryDomain::TaintFinding,
-    DetailedCodeQueryDomain::File,
-    DetailedCodeQueryDomain::ReferenceSite,
-    DetailedCodeQueryDomain::CallSite,
-    DetailedCodeQueryDomain::ExpressionSite,
-    DetailedCodeQueryDomain::ReceiverAnalysis,
-    DetailedCodeQueryDomain::ReceiverOutcome,
-    DetailedCodeQueryDomain::CallShape,
-    DetailedCodeQueryDomain::CallArgumentGroup,
-    DetailedCodeQueryDomain::CallArgument,
-    DetailedCodeQueryDomain::CallBinding,
-    DetailedCodeQueryDomain::CallEffect,
-    DetailedCodeQueryDomain::ProcedureEffect,
-    DetailedCodeQueryDomain::CallableSignature,
-    DetailedCodeQueryDomain::SignatureParameter,
-    DetailedCodeQueryDomain::CallableApplicability,
-    DetailedCodeQueryDomain::OverloadSelection,
-    DetailedCodeQueryDomain::ReceiverEvidence,
-    DetailedCodeQueryDomain::MemberSelection,
-    DetailedCodeQueryDomain::DispatchOutcome,
-    DetailedCodeQueryDomain::DispatchTarget,
-    DetailedCodeQueryDomain::MemberFamily,
-    DetailedCodeQueryDomain::MemberFamilyEdge,
-    DetailedCodeQueryDomain::Occurrence,
-    DetailedCodeQueryDomain::LexicalScope,
-    DetailedCodeQueryDomain::Binding,
-    DetailedCodeQueryDomain::ResolutionCandidate,
-    DetailedCodeQueryDomain::CandidateHop,
-    DetailedCodeQueryDomain::GenerationSite,
-    DetailedCodeQueryDomain::Export,
-    DetailedCodeQueryDomain::DeclarationState,
-    DetailedCodeQueryDomain::ReferenceEdge,
-    DetailedCodeQueryDomain::StateEvent,
-    DetailedCodeQueryDomain::FlowRelation,
-    DetailedCodeQueryDomain::RewritePath,
-    DetailedCodeQueryDomain::QualifiedPath,
-    DetailedCodeQueryDomain::PathSegment,
-];
-
 /// The scalar type of one stable, addressable CodeQuery row field.
 ///
 /// These types deliberately exclude source ranges and rendered text. Ranges
@@ -191,30 +92,331 @@ pub enum CodeQueryRowScalarType {
     DeclarationIdentity,
 }
 
+/// The value domain of one `ConstrainedEnum` row field: every label the
+/// producing vocabulary can write.
+///
+/// A relational policy compares an enum-typed column against a bare label. With
+/// the domain published, an unknown label is an authoring error the loader
+/// rejects, instead of a filter that matches nothing and reports a clean run
+/// forever (issue #2515).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CodeQueryEnumDomain {
+    /// Every label the producer can write, in the producing vocabulary's own
+    /// declaration order.
+    Labels(&'static [&'static str]),
+    /// The producer's vocabulary is genuinely not a finite enumerated set, so
+    /// no literal can be rejected. The reason is recorded so the exemption is a
+    /// decision rather than an omission.
+    Unenumerable(&'static str),
+}
+
+impl CodeQueryEnumDomain {
+    /// The labels a literal is checked against, or `None` when the domain is
+    /// explicitly not enumerable.
+    pub const fn labels(self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::Labels(labels) => Some(labels),
+            Self::Unenumerable(_) => None,
+        }
+    }
+
+    /// Whether `label` is a value this field can actually hold.
+    pub fn admits(self, label: &str) -> bool {
+        match self {
+            Self::Labels(labels) => labels.contains(&label),
+            Self::Unenumerable(_) => true,
+        }
+    }
+}
+
 /// Declarative schema for one addressable field on a detailed result domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CodeQueryRowField {
     pub name: &'static str,
     pub scalar_type: CodeQueryRowScalarType,
     pub nullable: bool,
+    /// Present exactly for a [`CodeQueryRowScalarType::ConstrainedEnum`] field,
+    /// which is enforced at compile time by the constructors below.
+    pub value_domain: Option<CodeQueryEnumDomain>,
 }
 
 impl CodeQueryRowField {
-    const fn required(name: &'static str, scalar_type: CodeQueryRowScalarType) -> Self {
+    /// A required field of a scalar type that carries no value domain.
+    ///
+    /// The assertion runs during const evaluation, so an enum-typed field
+    /// declared through this constructor fails to compile rather than reaching
+    /// policy validation with no domain to check against.
+    pub const fn required(name: &'static str, scalar_type: CodeQueryRowScalarType) -> Self {
+        assert!(
+            !matches!(scalar_type, CodeQueryRowScalarType::ConstrainedEnum),
+            "a ConstrainedEnum row field must declare its value domain"
+        );
         Self {
             name,
             scalar_type,
             nullable: false,
+            value_domain: None,
         }
     }
 
-    const fn optional(name: &'static str, scalar_type: CodeQueryRowScalarType) -> Self {
+    pub const fn optional(name: &'static str, scalar_type: CodeQueryRowScalarType) -> Self {
+        assert!(
+            !matches!(scalar_type, CodeQueryRowScalarType::ConstrainedEnum),
+            "a ConstrainedEnum row field must declare its value domain"
+        );
         Self {
             name,
             scalar_type,
             nullable: true,
+            value_domain: None,
         }
     }
+
+    /// A required enum field over a finite label set.
+    pub const fn required_enum(name: &'static str, labels: &'static [&'static str]) -> Self {
+        Self {
+            name,
+            scalar_type: CodeQueryRowScalarType::ConstrainedEnum,
+            nullable: false,
+            value_domain: Some(CodeQueryEnumDomain::Labels(labels)),
+        }
+    }
+
+    /// An optional enum field over a finite label set.
+    pub const fn optional_enum(name: &'static str, labels: &'static [&'static str]) -> Self {
+        Self {
+            name,
+            scalar_type: CodeQueryRowScalarType::ConstrainedEnum,
+            nullable: true,
+            value_domain: Some(CodeQueryEnumDomain::Labels(labels)),
+        }
+    }
+
+    /// A required enum field whose producer's vocabulary cannot be enumerated.
+    /// `reason` states why, and no literal over it is ever rejected.
+    pub const fn required_open_enum(name: &'static str, reason: &'static str) -> Self {
+        Self {
+            name,
+            scalar_type: CodeQueryRowScalarType::ConstrainedEnum,
+            nullable: false,
+            value_domain: Some(CodeQueryEnumDomain::Unenumerable(reason)),
+        }
+    }
+
+    /// An optional enum field whose producer's vocabulary cannot be enumerated.
+    pub const fn optional_open_enum(name: &'static str, reason: &'static str) -> Self {
+        Self {
+            name,
+            scalar_type: CodeQueryRowScalarType::ConstrainedEnum,
+            nullable: true,
+            value_domain: Some(CodeQueryEnumDomain::Unenumerable(reason)),
+        }
+    }
+}
+
+/// The published value domain of every enum-typed row field, named once here so
+/// the registry below reads as data (issue #2515).
+///
+/// Each name resolves to the vocabulary its *producer* writes from. Where the
+/// producer is a typed enum, that enum's own `LABELS` const is used, so the
+/// registry cannot drift from the values a row can hold. Where the producer
+/// mints bare strings at a render site, the exact literal set is recorded
+/// beside that site and re-exported here rather than restated.
+mod value_domain {
+    use super::{NormalizedKind, ReceiverQueryOperation, UsageHitKind};
+    use crate::analyzer::CodeUnitType;
+    use crate::analyzer::dataflow::SemanticInputStatus;
+    use crate::analyzer::semantic::CandidateCoverage;
+    use crate::analyzer::semantic::capabilities::SemanticCapability;
+    use crate::analyzer::semantic::provider::SemanticBudgetDimension;
+    use crate::analyzer::semantic::{
+        ControlEdgeKind, DispatchBoundaryKind, EvidenceCompleteness, ProcedureKind, ProofStatus,
+    };
+    use crate::analyzer::structural::search::results::environment::CodeQueryCandidateRef;
+    use crate::analyzer::structural::search::{dispatch, member_family, receiver, render};
+    use crate::analyzer::usages::call_binding::{
+        CallBindingCoverage, CallBindingKind, CallBindingMapping, CallBindingReason,
+    };
+    use crate::analyzer::usages::effects::{
+        EffectCertainty, EffectClassification, EffectCoverage, EffectDerivation, EffectProof,
+        EffectReason, EffectTiming,
+    };
+    use crate::analyzer::usages::get_definition::trace::TraceCompleteness;
+    use brokk_bifrost_core::analyzer::Language;
+    use brokk_bifrost_core::analyzer::structural::callable::{
+        ApplicabilityVerdict, ArgumentListKind, CallKind, CallShapeCoverage,
+        CallableRejectionReason, DeclarationRole, ReceiverContract, SelectionResolution,
+        SignatureCoverage,
+    };
+    use brokk_bifrost_core::analyzer::structural::edges::{OwnerRelation, SiteClass};
+    use brokk_bifrost_core::analyzer::structural::flow_state::{
+        FlowCertainty, FlowRelation, FlowSubjectKind, StateEventClass,
+    };
+    use brokk_bifrost_core::analyzer::structural::materialization::{
+        DeclarationOrigin, ExportForm, GenerationInputClass, GenerationKind,
+    };
+    use brokk_bifrost_core::analyzer::structural::occurrences::{
+        Namespace, OccurrenceClass, OccurrenceRole,
+    };
+    use brokk_bifrost_core::analyzer::structural::resolution::{
+        BindingKind, BoundaryStatus, CandidateOutcome, DeclaredVisibility, HierarchyRelation,
+        HoistingClass, MemberDispatchTier, MemberFamilyCapability, MemberFamilyOutcome,
+        MemberFamilyReason, MethodFamilyRelation, PrecedenceTier, RejectionReason,
+    };
+    use brokk_bifrost_core::analyzer::structural::rewrite_path::{
+        RewriteDomainKind, RewriteOutcomeKind,
+    };
+    use brokk_bifrost_core::analyzer::structural::routes::SegmentResolutionStatus;
+
+    pub(super) const LANGUAGE: &[&str] = Language::CONFIG_LABELS;
+    pub(super) const STRUCTURAL_KIND: &[&str] = NormalizedKind::LABELS;
+    pub(super) const CODE_UNIT_KIND: &[&str] = CodeUnitType::DISPLAY_LOWERCASE_LABELS;
+
+    /// `declaration.kind` is refined to a normalized structural kind when the
+    /// seed's own span matched the declaration exactly, and otherwise falls
+    /// back to the code unit's coarse type, so the field's domain is the union
+    /// of both vocabularies. A unit test pins the union against its two parts.
+    pub(super) const DECLARATION_KIND: &[&str] = &[
+        "declaration",
+        "callable",
+        "function",
+        "method",
+        "constructor",
+        "lambda",
+        "class",
+        "import",
+        "call",
+        "assignment",
+        "field_access",
+        "identifier",
+        "literal",
+        "string_literal",
+        "numeric_literal",
+        "boolean_literal",
+        "null_literal",
+        "return",
+        "throw",
+        "catch",
+        "if",
+        "loop",
+        "for_loop",
+        "while_loop",
+        "decorator",
+        "block",
+        "field",
+        "module",
+        "macro",
+        "file scope",
+    ];
+
+    /// The five shapes of `occurrence.target`, decided in the projector itself
+    /// because the public row carries the target as a tagged union rather than
+    /// as a label.
+    pub(super) const OCCURRENCE_TARGET_KIND: &[&str] =
+        &["none", "resolved", "lexical", "unresolved", "not_derived"];
+
+    pub(super) const PROCEDURE_KIND: &[&str] = ProcedureKind::LABELS;
+    pub(super) const CONTROL_EDGE_KIND: &[&str] = ControlEdgeKind::LABELS;
+    pub(super) const SEMANTIC_STATUS: &[&str] = SemanticInputStatus::LABELS;
+    pub(super) const SEMANTIC_CAPABILITY: &[&str] = SemanticCapability::LABELS;
+    pub(super) const SEMANTIC_BUDGET_DIMENSION: &[&str] = SemanticBudgetDimension::LABELS;
+
+    pub(super) const USAGE_KIND: &[&str] = UsageHitKind::WIRE_LABELS;
+    pub(super) const USAGE_PROOF: &[&str] = brokk_bifrost_rql::schema::USAGE_PROOF_LABELS;
+    pub(super) const REFERENCE_KIND: &[&str] = brokk_bifrost_rql::schema::REFERENCE_KIND_LABELS;
+    pub(super) const CALL_SYNTAX_KIND: &[&str] = render::CALL_SYNTAX_KIND_LABELS;
+    pub(super) const EXPRESSION_INPUT_KIND: &[&str] = render::EXPRESSION_INPUT_KIND_LABELS;
+
+    pub(super) const RECEIVER_ANALYSIS_KIND: &[&str] = ReceiverQueryOperation::LABELS;
+    pub(super) const RECEIVER_OUTCOME: &[&str] = render::RECEIVER_OUTCOME_LABELS;
+    pub(super) const RECEIVER_COVERAGE: &[&str] = render::RECEIVER_COVERAGE_LABELS;
+    pub(super) const RECEIVER_EVIDENCE_KIND: &[&str] = receiver::RECEIVER_EVIDENCE_KIND_LABELS;
+    pub(super) const RECEIVER_EVIDENCE_PROOF: &[&str] = render::RECEIVER_EVIDENCE_PROOF_LABELS;
+
+    pub(super) const DISPATCH_OUTCOME: &[&str] = dispatch::DISPATCH_OUTCOME_LABELS;
+    pub(super) const DISPATCH_ARM: &[&str] = dispatch::DISPATCH_ARM_LABELS;
+    pub(super) const CANDIDATE_COVERAGE: &[&str] = CandidateCoverage::LABELS;
+    pub(super) const EVIDENCE_PROOF: &[&str] = ProofStatus::LABELS;
+    pub(super) const EVIDENCE_COMPLETENESS: &[&str] = EvidenceCompleteness::LABELS;
+    pub(super) const DISPATCH_BOUNDARY_KIND: &[&str] = DispatchBoundaryKind::LABELS;
+
+    pub(super) const MEMBER_FAMILY_OUTCOME: &[&str] = MemberFamilyOutcome::LABELS;
+    pub(super) const MEMBER_FAMILY_REASON: &[&str] = MemberFamilyReason::LABELS;
+    pub(super) const MEMBER_FAMILY_CAPABILITY: &[&str] = MemberFamilyCapability::LABELS;
+    pub(super) const MEMBER_FAMILY_COVERAGE: &[&str] = member_family::MEMBER_FAMILY_COVERAGE_LABELS;
+    pub(super) const MEMBER_FAMILY_RELATION: &[&str] = MethodFamilyRelation::LABELS;
+    pub(super) const MEMBER_FAMILY_EDGE_PROOF: &[&str] =
+        member_family::MEMBER_FAMILY_EDGE_PROOF_LABELS;
+    pub(super) const MEMBER_FAMILY_EDGE_COMPLETENESS: &[&str] =
+        render::MEMBER_FAMILY_EDGE_COMPLETENESS_LABELS;
+
+    pub(super) const CALL_KIND: &[&str] = CallKind::LABELS;
+    pub(super) const CALL_SHAPE_COVERAGE: &[&str] = CallShapeCoverage::LABELS;
+    pub(super) const ARGUMENT_LIST_KIND: &[&str] = ArgumentListKind::LABELS;
+    pub(super) const CALL_BINDING_KIND: &[&str] = CallBindingKind::LABELS;
+    pub(super) const CALL_BINDING_MAPPING: &[&str] = CallBindingMapping::LABELS;
+    pub(super) const CALL_BINDING_REASON: &[&str] = CallBindingReason::LABELS;
+    pub(super) const CALL_BINDING_COVERAGE: &[&str] = CallBindingCoverage::LABELS;
+
+    pub(super) const EFFECT_CLASSIFICATION: &[&str] = EffectClassification::LABELS;
+    pub(super) const EFFECT_TIMING: &[&str] = EffectTiming::LABELS;
+    pub(super) const EFFECT_CERTAINTY: &[&str] = EffectCertainty::LABELS;
+    pub(super) const EFFECT_PROOF: &[&str] = EffectProof::LABELS;
+    pub(super) const EFFECT_DERIVATION: &[&str] = EffectDerivation::LABELS;
+    pub(super) const EFFECT_REASON: &[&str] = EffectReason::LABELS;
+    pub(super) const EFFECT_COVERAGE: &[&str] = EffectCoverage::LABELS;
+
+    pub(super) const SIGNATURE_COVERAGE: &[&str] = SignatureCoverage::LABELS;
+    pub(super) const DECLARATION_ROLE: &[&str] = DeclarationRole::LABELS;
+    pub(super) const RECEIVER_CONTRACT: &[&str] = ReceiverContract::LABELS;
+    pub(super) const APPLICABILITY_VERDICT: &[&str] = ApplicabilityVerdict::LABELS;
+    pub(super) const CALLABLE_REJECTION_REASON: &[&str] = CallableRejectionReason::LABELS;
+    pub(super) const PRECEDENCE_TIER: &[&str] = PrecedenceTier::LABELS;
+    pub(super) const SELECTION_RESOLUTION: &[&str] = SelectionResolution::LABELS;
+
+    pub(super) const MEMBER_SELECTION_OUTCOME: &[&str] = render::MEMBER_SELECTION_OUTCOME_LABELS;
+    pub(super) const MEMBER_SELECTION_TRACE_COMPLETENESS: &[&str] =
+        render::MEMBER_SELECTION_TRACE_COMPLETENESS_LABELS;
+    pub(super) const MEMBER_SELECTION_COVERAGE: &[&str] = render::MEMBER_SELECTION_COVERAGE_LABELS;
+
+    pub(super) const OCCURRENCE_CLASS: &[&str] = OccurrenceClass::LABELS;
+    pub(super) const OCCURRENCE_ROLE: &[&str] = OccurrenceRole::LABELS;
+    pub(super) const NAMESPACE: &[&str] = Namespace::LABELS;
+
+    pub(super) const BINDING_KIND: &[&str] = BindingKind::LABELS;
+    pub(super) const HOISTING_CLASS: &[&str] = HoistingClass::LABELS;
+    pub(super) const DECLARED_VISIBILITY: &[&str] = DeclaredVisibility::LABELS;
+
+    pub(super) const CANDIDATE_OUTCOME: &[&str] = CandidateOutcome::LABELS;
+    pub(super) const REJECTION_REASON: &[&str] = RejectionReason::LABELS;
+    pub(super) const BOUNDARY_STATUS: &[&str] = BoundaryStatus::LABELS;
+    pub(super) const TRACE_COMPLETENESS: &[&str] = TraceCompleteness::LABELS;
+    pub(super) const CANDIDATE_KIND: &[&str] = CodeQueryCandidateRef::LABELS;
+    pub(super) const MEMBER_DISPATCH_TIER: &[&str] = MemberDispatchTier::LABELS;
+    pub(super) const HIERARCHY_RELATION: &[&str] = HierarchyRelation::LABELS;
+
+    pub(super) const GENERATION_KIND: &[&str] = GenerationKind::LABELS;
+    pub(super) const GENERATION_INPUT: &[&str] = GenerationInputClass::LABELS;
+    pub(super) const EXPORT_FORM: &[&str] = ExportForm::LABELS;
+    pub(super) const DECLARATION_ORIGIN: &[&str] = DeclarationOrigin::LABELS;
+    pub(super) const SEGMENT_RESOLUTION_STATUS: &[&str] = SegmentResolutionStatus::LABELS;
+
+    pub(super) const SITE_CLASS: &[&str] = SiteClass::LABELS;
+    pub(super) const OWNER_RELATION: &[&str] = OwnerRelation::LABELS;
+    pub(super) const EDGE_PROVENANCE: &[&str] =
+        brokk_bifrost_core::analyzer::structural::edges::EdgeProvenance::LABELS;
+
+    pub(super) const STATE_EVENT_CLASS: &[&str] = StateEventClass::LABELS;
+    pub(super) const FLOW_SUBJECT: &[&str] = FlowSubjectKind::LABELS;
+    pub(super) const FLOW_RELATION: &[&str] = FlowRelation::LABELS;
+    pub(super) const FLOW_CERTAINTY: &[&str] = FlowCertainty::LABELS;
+    pub(super) const FLOW_STATE_COMPLETENESS: &[&str] =
+        crate::analyzer::structural::search::flow_state::FLOW_STATE_COMPLETENESS_LABELS;
+
+    pub(super) const REWRITE_DOMAIN: &[&str] = RewriteDomainKind::LABELS;
+    pub(super) const REWRITE_OUTCOME: &[&str] = RewriteOutcomeKind::LABELS;
+    pub(super) const REWRITE_PATH_COMPLETENESS: &[&str] =
+        crate::analyzer::structural::search::rewrite_paths::REWRITE_PATH_COMPLETENESS_LABELS;
 }
 
 macro_rules! code_query_row_fields {
@@ -283,708 +485,924 @@ pub struct CodeQueryRowRef<'a> {
     value: &'a CodeQueryResultValue,
 }
 
-impl DetailedCodeQueryDomain {
-    pub const fn from_query_value_kind(kind: QueryValueKind) -> Self {
-        match kind {
-            QueryValueKind::StructuralMatch => Self::StructuralMatch,
-            QueryValueKind::Declaration => Self::Declaration,
-            QueryValueKind::Procedure => Self::Procedure,
-            QueryValueKind::ProgramPoint => Self::ProgramPoint,
-            QueryValueKind::ControlEdge => Self::ControlEdge,
-            QueryValueKind::TypestateFinding => Self::TypestateFinding,
-            QueryValueKind::TypestateWitness => Self::TypestateWitness,
-            QueryValueKind::FlowEndpoint => Self::FlowEndpoint,
-            QueryValueKind::FlowWitness => Self::FlowWitness,
-            QueryValueKind::TaintFinding => Self::TaintFinding,
-            QueryValueKind::ReferenceSite => Self::ReferenceSite,
-            QueryValueKind::CallSite => Self::CallSite,
-            QueryValueKind::ExpressionSite => Self::ExpressionSite,
-            QueryValueKind::ReceiverAnalysis => Self::ReceiverAnalysis,
-            QueryValueKind::ReceiverOutcome => Self::ReceiverOutcome,
-            QueryValueKind::CallShape => Self::CallShape,
-            QueryValueKind::CallArgumentGroup => Self::CallArgumentGroup,
-            QueryValueKind::CallArgument => Self::CallArgument,
-            QueryValueKind::CallBinding => Self::CallBinding,
-            QueryValueKind::CallEffect => Self::CallEffect,
-            QueryValueKind::ProcedureEffect => Self::ProcedureEffect,
-            QueryValueKind::CallableSignature => Self::CallableSignature,
-            QueryValueKind::SignatureParameter => Self::SignatureParameter,
-            QueryValueKind::CallableApplicability => Self::CallableApplicability,
-            QueryValueKind::OverloadSelection => Self::OverloadSelection,
-            QueryValueKind::ReceiverEvidence => Self::ReceiverEvidence,
-            QueryValueKind::MemberSelection => Self::MemberSelection,
-            QueryValueKind::DispatchOutcome => Self::DispatchOutcome,
-            QueryValueKind::DispatchTarget => Self::DispatchTarget,
-            QueryValueKind::MemberFamily => Self::MemberFamily,
-            QueryValueKind::MemberFamilyEdge => Self::MemberFamilyEdge,
-            QueryValueKind::Occurrence => Self::Occurrence,
-            QueryValueKind::LexicalScope => Self::LexicalScope,
-            QueryValueKind::Binding => Self::Binding,
-            QueryValueKind::ResolutionCandidate => Self::ResolutionCandidate,
-            QueryValueKind::CandidateHop => Self::CandidateHop,
-            QueryValueKind::GenerationSite => Self::GenerationSite,
-            QueryValueKind::Export => Self::Export,
-            QueryValueKind::DeclarationState => Self::DeclarationState,
-            QueryValueKind::QualifiedPath => Self::QualifiedPath,
-            QueryValueKind::PathSegment => Self::PathSegment,
-            QueryValueKind::ReferenceEdge => Self::ReferenceEdge,
-            QueryValueKind::StateEvent => Self::StateEvent,
-            QueryValueKind::FlowRelation => Self::FlowRelation,
-            QueryValueKind::RewritePath => Self::RewritePath,
-            QueryValueKind::File => Self::File,
+/// Declare one detailed row domain, once (issue #2498).
+///
+/// Adding a domain used to mean editing roughly eleven exhaustive-match sites
+/// across four crates. Two of them drifted silently: the hand-mirrored
+/// `ALL_DETAILED_CODE_QUERY_DOMAINS` slice, and the `(domain, provenance
+/// identities)` allow-list, which a new domain missed without a compile error
+/// and failed only at run time inside a detailed query that returned the row.
+///
+/// One entry below now derives all of it: the enum variant, the mirror slice,
+/// the label, the `QueryValueKind` mapping, the addressable field surface, the
+/// display anchor, the domain a typed key addresses, and the terminal identity
+/// shape.
+///
+/// What it deliberately does not derive is per-domain *data*. The projector's
+/// field expressions, `detailed_semantic_identity` and `semantic_wire_id` each
+/// read fields that differ per row, and each is an exhaustive match that a new
+/// domain cannot pass without a compile error. Collapsing them into this macro
+/// would trade a mechanical list for a table of expressions, which is not the
+/// drift this removes.
+///
+/// `display_range` takes its binding from the caller because macro hygiene
+/// would otherwise hide a binding the macro introduced from the caller's
+/// expression.
+macro_rules! detailed_row_domains {
+    (
+        // The five declared types the registry ties together, named so a test
+        // can instantiate the whole registry over a toy domain and prove that
+        // one entry really is the only declaration site.
+        domain: $domain:ident,
+        all: $all:ident,
+        key: $key:ident,
+        row: $row:ident,
+        kind: $kind:ident,
+        $(
+        $variant:ident => $label:literal {
+            display_range: |$value:pat_param| $range:expr,
+            identities: $identities:ident,
+            fields: [$($field:expr),* $(,)?],
+        },
+        )+
+    ) => {
+        /// One addressable public result shape. Every detailed evidence row,
+        /// typed key, and relational row relation is scoped by one of these.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum $domain {
+            $($variant,)+
         }
-    }
 
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::StructuralMatch => "structural_match",
-            Self::Declaration => "declaration",
-            Self::Procedure => "procedure",
-            Self::ProgramPoint => "program_point",
-            Self::ControlEdge => "control_edge",
-            Self::TypestateFinding => "typestate_finding",
-            Self::TypestateWitness => "typestate_witness",
-            Self::FlowEndpoint => "flow_endpoint",
-            Self::FlowWitness => "flow_witness",
-            Self::TaintFinding => "taint_finding",
-            Self::File => "file",
-            Self::ReferenceSite => "reference_site",
-            Self::CallSite => "call_site",
-            Self::ExpressionSite => "expression_site",
-            Self::ReceiverAnalysis => "receiver_analysis",
-            Self::ReceiverOutcome => "receiver_outcome",
-            Self::CallShape => "call_shape",
-            Self::CallArgumentGroup => "call_argument_group",
-            Self::CallArgument => "call_argument",
-            Self::CallBinding => "call_binding",
-            Self::CallEffect => "call_effect",
-            Self::ProcedureEffect => "procedure_effect",
-            Self::CallableSignature => "callable_signature",
-            Self::SignatureParameter => "signature_parameter",
-            Self::CallableApplicability => "callable_applicability",
-            Self::OverloadSelection => "overload_selection",
-            Self::ReceiverEvidence => "receiver_evidence",
-            Self::MemberSelection => "member_selection",
-            Self::DispatchOutcome => "dispatch_outcome",
-            Self::DispatchTarget => "dispatch_target",
-            Self::MemberFamily => "member_family",
-            Self::MemberFamilyEdge => "member_family_edge",
-            Self::Occurrence => "occurrence",
-            Self::LexicalScope => "lexical_scope",
-            Self::Binding => "binding",
-            Self::ResolutionCandidate => "resolution_candidate",
-            Self::CandidateHop => "candidate_hop",
-            Self::GenerationSite => "generation_site",
-            Self::Export => "export",
-            Self::DeclarationState => "declaration_state",
-            Self::QualifiedPath => "qualified_path",
-            Self::PathSegment => "path_segment",
-            Self::ReferenceEdge => "reference_edge",
-            Self::StateEvent => "state_event",
-            Self::FlowRelation => "flow_relation",
-            Self::RewritePath => "rewrite_path",
-        }
-    }
+        /// Every domain, in declaration order.
+        pub const $all: &[$domain] = &[$($domain::$variant,)+];
 
-    /// The complete stable scalar surface addressable by relational policy
-    /// evaluation for this domain.
-    pub fn row_fields(self) -> &'static [CodeQueryRowField] {
-        use CodeQueryRowScalarType as Scalar;
-        match self {
-            Self::StructuralMatch => code_query_row_fields![
-                CodeQueryRowField::optional("id", Scalar::StableId),
-                CodeQueryRowField::optional("ast_id", Scalar::StableId),
-                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("kind", Scalar::ConstrainedEnum),
-            ],
-            Self::Declaration => code_query_row_fields![
-                CodeQueryRowField::optional("id", Scalar::DeclarationIdentity),
-                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("fq_name", Scalar::String),
-            ],
-            Self::Procedure => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("artifact_id", Scalar::StableId),
-                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("procedure_kind", Scalar::ConstrainedEnum),
-            ],
-            Self::ProgramPoint => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("procedure_id", Scalar::StableId),
-                CodeQueryRowField::required("event_count", Scalar::Integer),
-            ],
-            Self::ControlEdge => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("procedure_id", Scalar::StableId),
-                CodeQueryRowField::required("edge_kind", Scalar::ConstrainedEnum),
-            ],
-            Self::TypestateFinding => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("protocol_ref", Scalar::StableId),
-                CodeQueryRowField::required("path_proven", Scalar::Boolean),
-                CodeQueryRowField::required("path_complete", Scalar::Boolean),
-                CodeQueryRowField::required("analysis_complete", Scalar::Boolean),
-                CodeQueryRowField::required("abstained", Scalar::Boolean),
-            ],
-            Self::TypestateWitness => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("finding_id", Scalar::StableId),
-                CodeQueryRowField::required("witness_index", Scalar::Integer),
-                CodeQueryRowField::required("truncated", Scalar::Boolean),
-            ],
-            Self::FlowEndpoint => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("plan_ref", Scalar::StableId),
-                CodeQueryRowField::required("ambiguous", Scalar::Boolean),
-                CodeQueryRowField::required("semantic_status", Scalar::ConstrainedEnum),
-            ],
-            Self::FlowWitness => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("endpoint_id", Scalar::StableId),
-                CodeQueryRowField::required("witness_index", Scalar::Integer),
-                CodeQueryRowField::required("truncated", Scalar::Boolean),
-            ],
-            Self::TaintFinding => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("sink_event_id", Scalar::StableId),
-                CodeQueryRowField::required("origins_truncated", Scalar::Boolean),
-                CodeQueryRowField::required("witnesses_truncated", Scalar::Boolean),
-                CodeQueryRowField::required("ambiguous", Scalar::Boolean),
-            ],
-            Self::File => code_query_row_fields![
-                CodeQueryRowField::required("path", Scalar::String),
-                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("package_fq", Scalar::String),
-                CodeQueryRowField::optional("package_syntactic", Scalar::Boolean),
-            ],
-            Self::ReferenceSite => code_query_row_fields![
-                CodeQueryRowField::optional("target_id", Scalar::DeclarationIdentity),
-                CodeQueryRowField::required("usage_kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("proof", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("reference_kind", Scalar::ConstrainedEnum),
-            ],
-            Self::CallSite => code_query_row_fields![
-                CodeQueryRowField::optional("caller_id", Scalar::DeclarationIdentity),
-                CodeQueryRowField::optional("callee_id", Scalar::DeclarationIdentity),
-                CodeQueryRowField::required("call_kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("proof", Scalar::ConstrainedEnum),
-            ],
-            Self::ExpressionSite => code_query_row_fields![
-                CodeQueryRowField::required("input_kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("parameter_index", Scalar::Integer),
-                CodeQueryRowField::optional("parameter_name", Scalar::String),
-            ],
-            Self::ReceiverAnalysis => code_query_row_fields![
-                CodeQueryRowField::required("site_id", Scalar::StableId),
-                CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
-                CodeQueryRowField::required("analysis_kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("outcome", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("capture", Scalar::String),
-            ],
-            Self::ReceiverOutcome => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("site_id", Scalar::StableId),
-                CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
-                CodeQueryRowField::required("analysis_kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("outcome", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("candidate_count", Scalar::Integer),
-                CodeQueryRowField::required("candidates_truncated", Scalar::Boolean),
-                CodeQueryRowField::optional("semantic_unsupported", Scalar::ConstrainedEnum),
-            ],
-            Self::ReceiverEvidence => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("site_id", Scalar::StableId),
-                CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
-                CodeQueryRowField::optional("parent_evidence_id", Scalar::StableId),
-                CodeQueryRowField::required("ordinal", Scalar::Integer),
-                CodeQueryRowField::required("chain_hop", Scalar::Integer),
-                CodeQueryRowField::required("evidence_kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("declaration_id", Scalar::DeclarationIdentity),
-                CodeQueryRowField::optional("factory_id", Scalar::DeclarationIdentity),
-                CodeQueryRowField::required("proof", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("completeness", Scalar::ConstrainedEnum),
-            ],
-            Self::DispatchOutcome => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("site_id", Scalar::StableId),
-                CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
-                CodeQueryRowField::required("outcome", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("call_site_count", Scalar::Integer),
-                CodeQueryRowField::required("target_count", Scalar::Integer),
-                CodeQueryRowField::required("targets_truncated", Scalar::Boolean),
-                CodeQueryRowField::optional("semantic_unsupported", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("exceeded_limit", Scalar::ConstrainedEnum),
-            ],
-            Self::DispatchTarget => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("site_id", Scalar::StableId),
-                CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
-                CodeQueryRowField::required("ordinal", Scalar::Integer),
-                CodeQueryRowField::required("target_id", Scalar::StableId),
-                CodeQueryRowField::optional("target_declaration_id", Scalar::DeclarationIdentity),
-                CodeQueryRowField::required("proof", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("completeness", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("dispatch", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("boundary_kind", Scalar::ConstrainedEnum),
-            ],
-            Self::MemberFamily => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("member_id", Scalar::StableId),
-                CodeQueryRowField::required("outcome", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("reason", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("capability", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("family_id", Scalar::StableId),
-                CodeQueryRowField::required("overrides_count", Scalar::Integer),
-                CodeQueryRowField::required("implements_count", Scalar::Integer),
-                CodeQueryRowField::required("overridden_by_count", Scalar::Integer),
-                CodeQueryRowField::required("implemented_by_count", Scalar::Integer),
-                CodeQueryRowField::required("edge_count", Scalar::Integer),
-                CodeQueryRowField::required("root_count", Scalar::Integer),
-                CodeQueryRowField::optional("member_declaration_id", Scalar::DeclarationIdentity),
-            ],
-            Self::MemberFamilyEdge => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("member_id", Scalar::StableId),
-                CodeQueryRowField::required("ordinal", Scalar::Integer),
-                CodeQueryRowField::required("target_id", Scalar::StableId),
-                CodeQueryRowField::required("relation", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("family_id", Scalar::StableId),
-                CodeQueryRowField::required("hierarchy_depth", Scalar::Integer),
-                CodeQueryRowField::required("proof", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("completeness", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("target_declaration_id", Scalar::DeclarationIdentity),
-            ],
-            Self::CallShape => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("site_id", Scalar::StableId),
-                CodeQueryRowField::required("site_ast_id", Scalar::StableId),
-                CodeQueryRowField::required("call_kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("group_count", Scalar::Integer),
-            ],
-            Self::CallArgumentGroup => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("site_id", Scalar::StableId),
-                CodeQueryRowField::required("group_index", Scalar::Integer),
-                CodeQueryRowField::required("kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("argument_count", Scalar::Integer),
-            ],
-            Self::CallArgument => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("group_id", Scalar::StableId),
-                CodeQueryRowField::required("site_id", Scalar::StableId),
-                CodeQueryRowField::required("argument_index", Scalar::Integer),
-                CodeQueryRowField::optional("name", Scalar::String),
-                CodeQueryRowField::required("spread", Scalar::Boolean),
-            ],
-            // Issue #2438. The complete addressable surface is declared now,
-            // including the columns only a later slice fills (`signature_id`
-            // for an overload set, `binding_kind` values beyond the positional
-            // family), so refining named, default, variadic and spread states
-            // adds rows rather than columns.
-            Self::CallBinding => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("site_id", Scalar::StableId),
-                CodeQueryRowField::required("site_ast_id", Scalar::StableId),
-                CodeQueryRowField::optional("group_id", Scalar::StableId),
-                CodeQueryRowField::optional("argument_id", Scalar::StableId),
-                CodeQueryRowField::optional("target_id", Scalar::DeclarationIdentity),
-                CodeQueryRowField::optional("signature_id", Scalar::StableId),
-                CodeQueryRowField::optional("actual_index", Scalar::Integer),
-                CodeQueryRowField::optional("actual_name", Scalar::String),
-                CodeQueryRowField::optional("formal_index", Scalar::Integer),
-                CodeQueryRowField::optional("formal_name", Scalar::String),
-                CodeQueryRowField::optional("binding_kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("mapping", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("reason", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("actual_count", Scalar::Integer),
-                CodeQueryRowField::required("bound_count", Scalar::Integer),
-                CodeQueryRowField::required("terminal", Scalar::Boolean),
-            ],
-            // Issue #2437. One row per (call site, dispatch arm, declared
-            // effect), plus the mandatory terminal row that states a site whose
-            // effects could not be established. `coverage` is the site's, so a
-            // single row is enough to reject an absence claim.
-            Self::CallEffect => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("site_id", Scalar::StableId),
-                CodeQueryRowField::required("site_ast_id", Scalar::StableId),
-                CodeQueryRowField::optional("target_id", Scalar::StableId),
-                CodeQueryRowField::optional("callee_id", Scalar::DeclarationIdentity),
-                CodeQueryRowField::optional("callee_symbol", Scalar::String),
-                CodeQueryRowField::optional("effect_id", Scalar::String),
-                CodeQueryRowField::required("classification", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("timing", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("certainty", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("proof", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("derivation", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("reason", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("pack_id", Scalar::String),
-                CodeQueryRowField::optional("model_id", Scalar::String),
-                CodeQueryRowField::optional("summary_id", Scalar::String),
-                CodeQueryRowField::required("arm_count", Scalar::Integer),
-                CodeQueryRowField::required("modeled_arm_count", Scalar::Integer),
-                CodeQueryRowField::required("terminal", Scalar::Boolean),
-            ],
-            // Issue #2437. One row per (procedure, effect id), plus the
-            // mandatory terminal row. The witness columns are a bounded,
-            // deterministic chain of `call_shape` site identities, so a policy
-            // reaches the exact direct effect by joining ids.
-            Self::ProcedureEffect => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("procedure_id", Scalar::DeclarationIdentity),
-                CodeQueryRowField::required("procedure_name", Scalar::String),
-                CodeQueryRowField::optional("effect_id", Scalar::String),
-                CodeQueryRowField::optional("classification", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("certainty", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("timing", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("depth", Scalar::Integer),
-                CodeQueryRowField::required("derivation", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("reason", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("witness_available", Scalar::Boolean),
-                CodeQueryRowField::required("witness_steps", Scalar::Integer),
-                CodeQueryRowField::optional("witness_site_id", Scalar::StableId),
-                CodeQueryRowField::optional("witness_effect_site_id", Scalar::StableId),
-                CodeQueryRowField::optional("witness_chain", Scalar::String),
-                CodeQueryRowField::required("witness_truncated", Scalar::Boolean),
-                CodeQueryRowField::optional("pack_id", Scalar::String),
-                CodeQueryRowField::optional("model_id", Scalar::String),
-                CodeQueryRowField::optional("summary_id", Scalar::String),
-                CodeQueryRowField::required("terminal", Scalar::Boolean),
-            ],
-            Self::CallableSignature => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::optional("declaration_id", Scalar::DeclarationIdentity),
-                CodeQueryRowField::required("ordinal", Scalar::Integer),
-                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("role", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("required_arity", Scalar::Integer),
-                CodeQueryRowField::optional("total_arity", Scalar::Integer),
-                CodeQueryRowField::required("repeated", Scalar::Boolean),
-                CodeQueryRowField::required("generic_arity", Scalar::Integer),
-                CodeQueryRowField::optional("receiver_contract", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("return_type", Scalar::String),
-                CodeQueryRowField::required("declaration_only", Scalar::Boolean),
-                CodeQueryRowField::required("parameter_count", Scalar::Integer),
-            ],
-            Self::SignatureParameter => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("signature_id", Scalar::StableId),
-                CodeQueryRowField::required("parameter_index", Scalar::Integer),
-                CodeQueryRowField::required("label", Scalar::String),
-                CodeQueryRowField::optional("declared_type", Scalar::String),
-                CodeQueryRowField::optional("optional", Scalar::Boolean),
-                CodeQueryRowField::optional("repeated", Scalar::Boolean),
-            ],
-            Self::CallableApplicability => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("site_ast_id", Scalar::StableId),
-                CodeQueryRowField::required("ordinal", Scalar::Integer),
-                CodeQueryRowField::required("verdict", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("reason", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("tier", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("selected", Scalar::Boolean),
-                // The candidate declaration's identity, so an applicability row
-                // joins to the `callable_signature` row of the very callable it
-                // judged. Absent when the resolver weighed something that is not
-                // an indexed declaration (a lexical binder, an import route, an
-                // external target), exactly as the `candidates` domain reports.
-                CodeQueryRowField::optional("candidate_id", Scalar::DeclarationIdentity),
-            ],
-            Self::OverloadSelection => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("site_ast_id", Scalar::StableId),
-                CodeQueryRowField::required("resolution", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("supported", Scalar::Boolean),
-                CodeQueryRowField::required("considered_count", Scalar::Integer),
-                CodeQueryRowField::required("applicable_count", Scalar::Integer),
-                CodeQueryRowField::required("inapplicable_count", Scalar::Integer),
-                CodeQueryRowField::required("unknown_count", Scalar::Integer),
-            ],
-            Self::MemberSelection => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("site_ast_id", Scalar::StableId),
-                CodeQueryRowField::required("member", Scalar::String),
-                CodeQueryRowField::required("role", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("outcome", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("selected_count", Scalar::Integer),
-                CodeQueryRowField::required("candidate_count", Scalar::Integer),
-                CodeQueryRowField::required("trace_completeness", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
-            ],
-            Self::Occurrence => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("ast_id", Scalar::StableId),
-                CodeQueryRowField::required("class", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("role", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("namespace", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("target_kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("target_id", Scalar::DeclarationIdentity),
-                CodeQueryRowField::required("target_count", Scalar::Integer),
-            ],
-            Self::LexicalScope => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::optional("ast_id", Scalar::StableId),
-                CodeQueryRowField::required("index", Scalar::Integer),
-                CodeQueryRowField::optional("kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("parent_index", Scalar::Integer),
-            ],
-            Self::Binding => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::optional("ast_id", Scalar::StableId),
-                CodeQueryRowField::optional("reached_from_ast_id", Scalar::StableId),
-                CodeQueryRowField::required("name", Scalar::String),
-                CodeQueryRowField::required("kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("hoisting", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("namespace", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("declaring_scope_index", Scalar::Integer),
-                CodeQueryRowField::required("visibility", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("shadowed", Scalar::Boolean),
-            ],
-            Self::ResolutionCandidate => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("ast_id", Scalar::StableId),
-                CodeQueryRowField::required("ordinal", Scalar::Integer),
-                CodeQueryRowField::optional("tier", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("outcome", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("rejection_reason", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("boundary", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("visibility", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("trace_completeness", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("candidate_kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("candidate_id", Scalar::DeclarationIdentity),
-                CodeQueryRowField::optional("canonical_member_id", Scalar::StableId),
-                CodeQueryRowField::optional("owner_id", Scalar::DeclarationIdentity),
-                CodeQueryRowField::optional("hierarchy_depth", Scalar::Integer),
-                CodeQueryRowField::optional("dispatch_tier", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("applicability", Scalar::ConstrainedEnum),
-            ],
-            Self::CandidateHop => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("candidate_id", Scalar::StableId),
-                CodeQueryRowField::required("ast_id", Scalar::StableId),
-                CodeQueryRowField::required("hop", Scalar::Integer),
-                CodeQueryRowField::required("relation", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("from_id", Scalar::DeclarationIdentity),
-                CodeQueryRowField::optional("to_id", Scalar::DeclarationIdentity),
-            ],
-            Self::GenerationSite => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::optional("ast_id", Scalar::StableId),
-                CodeQueryRowField::required("path", Scalar::String),
-                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("input", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("generated_count", Scalar::Integer),
-            ],
-            Self::Export => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::optional("ast_id", Scalar::StableId),
-                CodeQueryRowField::required("path", Scalar::String),
-                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("form", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("exported_name", Scalar::String),
-                CodeQueryRowField::optional("target_fq_name", Scalar::String),
-            ],
-            Self::DeclarationState => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::optional("ast_id", Scalar::StableId),
-                CodeQueryRowField::required("path", Scalar::String),
-                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("fq_name", Scalar::String),
-                CodeQueryRowField::required("unit_kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("origin", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("declaration_only", Scalar::Boolean),
-                CodeQueryRowField::required("config_gated", Scalar::Boolean),
-            ],
-            Self::QualifiedPath => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("ast_id", Scalar::StableId),
-                CodeQueryRowField::required("segment_count", Scalar::Integer),
-            ],
-            Self::PathSegment => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::optional("ast_id", Scalar::StableId),
-                CodeQueryRowField::required("path_ast_id", Scalar::StableId),
-                CodeQueryRowField::required("ordinal", Scalar::Integer),
-                CodeQueryRowField::required("text", Scalar::String),
-                CodeQueryRowField::optional("namespace", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("generic_arity", Scalar::Integer),
-                CodeQueryRowField::optional("resolution_status", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("target_count", Scalar::Integer),
-            ],
-            Self::ReferenceEdge => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::optional("ast_id", Scalar::StableId),
-                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("target_id", Scalar::DeclarationIdentity),
-                CodeQueryRowField::optional("reference_kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("proof", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("usage_kind", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("site_class", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("owner_relation", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("edge_provenance", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("generation", Scalar::Integer),
-            ],
-            Self::StateEvent => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::optional("ast_id", Scalar::StableId),
-                CodeQueryRowField::required("procedure_id", Scalar::StableId),
-                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("event_class", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("subject", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("member", Scalar::String),
-                CodeQueryRowField::required("subject_value", Scalar::Integer),
-                CodeQueryRowField::required("program_point", Scalar::Integer),
-                CodeQueryRowField::required("value", Scalar::Integer),
-                CodeQueryRowField::required("completeness", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("generation", Scalar::Integer),
-            ],
-            Self::RewritePath => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("domain", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("origin_specifier", Scalar::String),
-                CodeQueryRowField::required("declared_bound", Scalar::Integer),
-                CodeQueryRowField::required("step_count", Scalar::Integer),
-                CodeQueryRowField::required("outcome", Scalar::ConstrainedEnum),
-                CodeQueryRowField::optional("fixed_point", Scalar::String),
-                CodeQueryRowField::required("completeness", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("generation", Scalar::Integer),
-            ],
-            Self::FlowRelation => code_query_row_fields![
-                CodeQueryRowField::required("id", Scalar::StableId),
-                CodeQueryRowField::required("procedure_id", Scalar::StableId),
-                CodeQueryRowField::required("language", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("relation", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("certainty", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("source_id", Scalar::StableId),
-                CodeQueryRowField::required("target_id", Scalar::StableId),
-                CodeQueryRowField::optional("source_ast_id", Scalar::StableId),
-                CodeQueryRowField::optional("target_ast_id", Scalar::StableId),
-                CodeQueryRowField::required("completeness", Scalar::ConstrainedEnum),
-                CodeQueryRowField::required("generation", Scalar::Integer),
-            ],
+        impl $domain {
+            pub const fn from_query_value_kind(kind: $kind) -> Self {
+                match kind {
+                    $($kind::$variant => Self::$variant,)+
+                }
+            }
+
+            pub const fn label(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $label,)+
+                }
+            }
+
+            /// The complete stable scalar surface addressable by relational
+            /// policy evaluation for this domain.
+            pub fn row_fields(self) -> &'static [CodeQueryRowField] {
+                #[allow(unused_imports)]
+                use CodeQueryRowScalarType as Scalar;
+                match self {
+                    $(Self::$variant => code_query_row_fields![$($field),*],)+
+                }
+            }
+
+            /// The provenance identities every terminal row of this domain
+            /// carries. Declared with the domain, so a new domain cannot reach
+            /// a run-time assertion with no entry.
+            const fn terminal_identities(self) -> DetailedTerminalIdentities {
+                match self {
+                    $(Self::$variant => DetailedTerminalIdentities::$identities,)+
+                }
+            }
+        }
+
+        impl $key {
+            /// The domain this typed key addresses.
+            pub const fn domain(&self) -> $domain {
+                match self {
+                    $(Self::$variant { .. } => $domain::$variant,)+
+                }
+            }
+        }
+
+        impl $row {
+            /// The exact display region of this row's own source anchor. `None`
+            /// when the row has no source region of its own (a file row, or an
+            /// evidence row whose location is its site's outcome row).
+            pub fn display_range(&self) -> Option<CodeQueryRange> {
+                match self {
+                    $(Self::$variant { value: $value } => $range,)+
+                }
+            }
+
+            pub const fn detailed_domain(&self) -> $domain {
+                match self {
+                    $(Self::$variant { .. } => $domain::$variant,)+
+                }
+            }
+        }
+    };
+}
+
+/// Which provenance identities a terminal row of one domain carries.
+///
+/// This is the shape only; the identity values themselves travel on the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailedTerminalIdentities {
+    None,
+    Primary,
+    ReferenceTarget,
+    Call,
+}
+
+impl DetailedTerminalIdentities {
+    fn of(identities: &DetailedCodeQueryProvenanceIdentities) -> Self {
+        match identities {
+            DetailedCodeQueryProvenanceIdentities::None => Self::None,
+            DetailedCodeQueryProvenanceIdentities::Primary(_) => Self::Primary,
+            DetailedCodeQueryProvenanceIdentities::ReferenceTarget(_) => Self::ReferenceTarget,
+            DetailedCodeQueryProvenanceIdentities::Call { .. } => Self::Call,
         }
     }
+}
+
+detailed_row_domains! {
+    domain: DetailedCodeQueryDomain,
+    all: ALL_DETAILED_CODE_QUERY_DOMAINS,
+    key: DetailedCodeQueryKey,
+    row: CodeQueryResultValue,
+    kind: QueryValueKind,
+
+    StructuralMatch => "structural_match" {
+        display_range: |value| value.node_range,
+        identities: Primary,
+        fields: [
+                    CodeQueryRowField::optional("id", Scalar::StableId),
+                    CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::required_enum("kind", value_domain::STRUCTURAL_KIND),
+        ],
+    },
+    Declaration => "declaration" {
+        display_range: |value| value.node_range,
+        identities: Primary,
+        fields: [
+                    CodeQueryRowField::optional("id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::required_enum("kind", value_domain::DECLARATION_KIND),
+                    CodeQueryRowField::required("fq_name", Scalar::String),
+        ],
+    },
+    Procedure => "procedure" {
+        display_range: |value| Some(value.range),
+        identities: Primary,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("artifact_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::required_enum("procedure_kind", value_domain::PROCEDURE_KIND),
+        ],
+    },
+    ProgramPoint => "program_point" {
+        display_range: |value| Some(value.range),
+        identities: Primary,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("procedure_id", Scalar::StableId),
+                    CodeQueryRowField::required("event_count", Scalar::Integer),
+        ],
+    },
+    ControlEdge => "control_edge" {
+        display_range: |value| Some(value.range),
+        identities: Primary,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("procedure_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("edge_kind", value_domain::CONTROL_EDGE_KIND),
+        ],
+    },
+    TypestateFinding => "typestate_finding" {
+        display_range: |value| Some(value.range),
+        identities: Primary,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("protocol_ref", Scalar::StableId),
+                    CodeQueryRowField::required("path_proven", Scalar::Boolean),
+                    CodeQueryRowField::required("path_complete", Scalar::Boolean),
+                    CodeQueryRowField::required("analysis_complete", Scalar::Boolean),
+                    CodeQueryRowField::required("abstained", Scalar::Boolean),
+        ],
+    },
+    TypestateWitness => "typestate_witness" {
+        display_range: |value| Some(value.range),
+        identities: Primary,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("finding_id", Scalar::StableId),
+                    CodeQueryRowField::required("witness_index", Scalar::Integer),
+                    CodeQueryRowField::required("truncated", Scalar::Boolean),
+        ],
+    },
+    FlowEndpoint => "flow_endpoint" {
+        display_range: |value| Some(value.range),
+        identities: Primary,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("plan_ref", Scalar::StableId),
+                    CodeQueryRowField::required("ambiguous", Scalar::Boolean),
+                    CodeQueryRowField::required_enum("semantic_status", value_domain::SEMANTIC_STATUS),
+        ],
+    },
+    FlowWitness => "flow_witness" {
+        display_range: |value| Some(value.range),
+        identities: Primary,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("endpoint_id", Scalar::StableId),
+                    CodeQueryRowField::required("witness_index", Scalar::Integer),
+                    CodeQueryRowField::required("truncated", Scalar::Boolean),
+        ],
+    },
+    TaintFinding => "taint_finding" {
+        display_range: |value| Some(value.range),
+        identities: Primary,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("sink_event_id", Scalar::StableId),
+                    CodeQueryRowField::required("origins_truncated", Scalar::Boolean),
+                    CodeQueryRowField::required("witnesses_truncated", Scalar::Boolean),
+                    CodeQueryRowField::required("ambiguous", Scalar::Boolean),
+        ],
+    },
+    File => "file" {
+        display_range: |_value| None,
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("path", Scalar::String),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::optional("package_fq", Scalar::String),
+                    CodeQueryRowField::optional("package_syntactic", Scalar::Boolean),
+        ],
+    },
+    ReferenceSite => "reference_site" {
+        display_range: |value| Some(value.range),
+        identities: ReferenceTarget,
+        fields: [
+                    CodeQueryRowField::optional("target_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::required_enum("usage_kind", value_domain::USAGE_KIND),
+                    CodeQueryRowField::required_enum("proof", value_domain::USAGE_PROOF),
+                    CodeQueryRowField::optional_enum("reference_kind", value_domain::REFERENCE_KIND),
+        ],
+    },
+    CallSite => "call_site" {
+        display_range: |value| Some(value.range),
+        identities: Call,
+        fields: [
+                    CodeQueryRowField::optional("caller_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::optional("callee_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::required_enum("call_kind", value_domain::CALL_SYNTAX_KIND),
+                    CodeQueryRowField::required_enum("proof", value_domain::USAGE_PROOF),
+        ],
+    },
+    ExpressionSite => "expression_site" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required_enum("input_kind", value_domain::EXPRESSION_INPUT_KIND),
+                    CodeQueryRowField::optional("parameter_index", Scalar::Integer),
+                    CodeQueryRowField::optional("parameter_name", Scalar::String),
+        ],
+    },
+    ReceiverAnalysis => "receiver_analysis" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("site_id", Scalar::StableId),
+                    CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum(
+                        "analysis_kind",
+                        value_domain::RECEIVER_ANALYSIS_KIND
+                    ),
+                    CodeQueryRowField::required_enum("outcome", value_domain::RECEIVER_OUTCOME),
+                    CodeQueryRowField::optional("capture", Scalar::String),
+        ],
+    },
+    ReceiverOutcome => "receiver_outcome" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("site_id", Scalar::StableId),
+                    CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum(
+                        "analysis_kind",
+                        value_domain::RECEIVER_ANALYSIS_KIND
+                    ),
+                    CodeQueryRowField::required_enum("outcome", value_domain::RECEIVER_OUTCOME),
+                    CodeQueryRowField::required_enum("coverage", value_domain::RECEIVER_COVERAGE),
+                    CodeQueryRowField::required("candidate_count", Scalar::Integer),
+                    CodeQueryRowField::required("candidates_truncated", Scalar::Boolean),
+                    CodeQueryRowField::optional_enum(
+                        "semantic_unsupported",
+                        value_domain::SEMANTIC_CAPABILITY
+                    ),
+        ],
+    },
+    CallShape => "call_shape" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("site_id", Scalar::StableId),
+                    CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("call_kind", value_domain::CALL_KIND),
+                    CodeQueryRowField::required_enum("coverage", value_domain::CALL_SHAPE_COVERAGE),
+                    CodeQueryRowField::required("group_count", Scalar::Integer),
+        ],
+    },
+    CallArgumentGroup => "call_argument_group" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("site_id", Scalar::StableId),
+                    CodeQueryRowField::required("group_index", Scalar::Integer),
+                    CodeQueryRowField::required_enum("kind", value_domain::ARGUMENT_LIST_KIND),
+                    CodeQueryRowField::required("argument_count", Scalar::Integer),
+        ],
+    },
+    CallArgument => "call_argument" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("group_id", Scalar::StableId),
+                    CodeQueryRowField::required("site_id", Scalar::StableId),
+                    CodeQueryRowField::required("argument_index", Scalar::Integer),
+                    CodeQueryRowField::optional("name", Scalar::String),
+                    CodeQueryRowField::required("spread", Scalar::Boolean),
+        ],
+    },
+    CallBinding => "call_binding" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        // Issue #2438, completed by #2499. The surface carries every column
+        // the relation was specified with, including `conversion`, which no
+        // language adapter publishes yet: a language that gains the fact
+        // adds a value, not a column.
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("site_id", Scalar::StableId),
+                    CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("group_id", Scalar::StableId),
+                    CodeQueryRowField::optional("argument_id", Scalar::StableId),
+                    CodeQueryRowField::optional("target_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::optional("signature_id", Scalar::StableId),
+                    CodeQueryRowField::optional("actual_index", Scalar::Integer),
+                    CodeQueryRowField::optional("actual_name", Scalar::String),
+                    CodeQueryRowField::optional("formal_index", Scalar::Integer),
+                    CodeQueryRowField::optional("formal_name", Scalar::String),
+                    CodeQueryRowField::optional_enum("binding_kind", value_domain::CALL_BINDING_KIND),
+                    CodeQueryRowField::optional_open_enum(
+                        "conversion",
+                        "the conversion vocabulary is each language's own (Java widening \
+                         and boxing, Rust deref and unsizing coercions, TypeScript \
+                         structural assignability) and no adapter publishes one yet, so \
+                         enumerating it here would be a table with no producer",
+                    ),
+                    CodeQueryRowField::required_enum("mapping", value_domain::CALL_BINDING_MAPPING),
+                    CodeQueryRowField::optional_enum("reason", value_domain::CALL_BINDING_REASON),
+                    CodeQueryRowField::required_enum("coverage", value_domain::CALL_BINDING_COVERAGE),
+                    CodeQueryRowField::required("actual_count", Scalar::Integer),
+                    CodeQueryRowField::required("bound_count", Scalar::Integer),
+                    CodeQueryRowField::required("terminal", Scalar::Boolean),
+        ],
+    },
+    CallEffect => "call_effect" {
+        display_range: |value| Some(value.range),
+        // An effect row is identified by its own content-scoped digest
+        // over the site or procedure identity and the effect id, so it
+        // carries no semantic-artifact identity candidate (#2437).
+        identities: None,
+        // Issue #2437. One row per (call site, dispatch arm, declared
+        // effect), plus the mandatory terminal row that states a site whose
+        // effects could not be established. `coverage` is the site's, so a
+        // single row is enough to reject an absence claim.
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("site_id", Scalar::StableId),
+                    CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("target_id", Scalar::StableId),
+                    CodeQueryRowField::optional("callee_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::optional("callee_symbol", Scalar::String),
+                    CodeQueryRowField::optional("effect_id", Scalar::String),
+                    CodeQueryRowField::required_enum(
+                        "classification",
+                        value_domain::EFFECT_CLASSIFICATION
+                    ),
+                    CodeQueryRowField::optional_enum("timing", value_domain::EFFECT_TIMING),
+                    CodeQueryRowField::optional_enum("certainty", value_domain::EFFECT_CERTAINTY),
+                    CodeQueryRowField::optional_enum("proof", value_domain::EFFECT_PROOF),
+                    CodeQueryRowField::required_enum("derivation", value_domain::EFFECT_DERIVATION),
+                    CodeQueryRowField::optional_enum("reason", value_domain::EFFECT_REASON),
+                    CodeQueryRowField::required_enum("coverage", value_domain::EFFECT_COVERAGE),
+                    CodeQueryRowField::optional("pack_id", Scalar::String),
+                    CodeQueryRowField::optional("model_id", Scalar::String),
+                    CodeQueryRowField::optional("summary_id", Scalar::String),
+                    CodeQueryRowField::required("arm_count", Scalar::Integer),
+                    CodeQueryRowField::required("modeled_arm_count", Scalar::Integer),
+                    CodeQueryRowField::required("terminal", Scalar::Boolean),
+        ],
+    },
+    ProcedureEffect => "procedure_effect" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        // Issue #2437. One row per (procedure, effect id), plus the
+        // mandatory terminal row. The witness columns are a bounded,
+        // deterministic chain of `call_shape` site identities, so a policy
+        // reaches the exact direct effect by joining ids.
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("procedure_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::required("procedure_name", Scalar::String),
+                    CodeQueryRowField::optional("effect_id", Scalar::String),
+                    CodeQueryRowField::optional_enum(
+                        "classification",
+                        value_domain::EFFECT_CLASSIFICATION
+                    ),
+                    CodeQueryRowField::optional_enum("certainty", value_domain::EFFECT_CERTAINTY),
+                    CodeQueryRowField::optional_enum("timing", value_domain::EFFECT_TIMING),
+                    CodeQueryRowField::optional("depth", Scalar::Integer),
+                    CodeQueryRowField::required_enum("derivation", value_domain::EFFECT_DERIVATION),
+                    CodeQueryRowField::optional_enum("reason", value_domain::EFFECT_REASON),
+                    CodeQueryRowField::required_enum("coverage", value_domain::EFFECT_COVERAGE),
+                    CodeQueryRowField::required("witness_available", Scalar::Boolean),
+                    CodeQueryRowField::required("witness_steps", Scalar::Integer),
+                    CodeQueryRowField::optional("witness_site_id", Scalar::StableId),
+                    CodeQueryRowField::optional("witness_effect_site_id", Scalar::StableId),
+                    CodeQueryRowField::optional("witness_chain", Scalar::String),
+                    CodeQueryRowField::required("witness_truncated", Scalar::Boolean),
+                    CodeQueryRowField::optional("pack_id", Scalar::String),
+                    CodeQueryRowField::optional("model_id", Scalar::String),
+                    CodeQueryRowField::optional("summary_id", Scalar::String),
+                    CodeQueryRowField::required("terminal", Scalar::Boolean),
+        ],
+    },
+    CallableSignature => "callable_signature" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::optional("declaration_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::required("ordinal", Scalar::Integer),
+                    CodeQueryRowField::required_enum("coverage", value_domain::SIGNATURE_COVERAGE),
+                    CodeQueryRowField::required_enum("role", value_domain::DECLARATION_ROLE),
+                    CodeQueryRowField::optional("required_arity", Scalar::Integer),
+                    CodeQueryRowField::optional("total_arity", Scalar::Integer),
+                    CodeQueryRowField::required("repeated", Scalar::Boolean),
+                    CodeQueryRowField::required("generic_arity", Scalar::Integer),
+                    CodeQueryRowField::optional_enum(
+                        "receiver_contract",
+                        value_domain::RECEIVER_CONTRACT
+                    ),
+                    CodeQueryRowField::optional("return_type", Scalar::String),
+                    CodeQueryRowField::required("declaration_only", Scalar::Boolean),
+                    CodeQueryRowField::required("parameter_count", Scalar::Integer),
+        ],
+    },
+    SignatureParameter => "signature_parameter" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("signature_id", Scalar::StableId),
+                    CodeQueryRowField::required("parameter_index", Scalar::Integer),
+                    CodeQueryRowField::required("label", Scalar::String),
+                    CodeQueryRowField::optional("declared_type", Scalar::String),
+                    CodeQueryRowField::optional("optional", Scalar::Boolean),
+                    CodeQueryRowField::optional("repeated", Scalar::Boolean),
+        ],
+    },
+    CallableApplicability => "callable_applicability" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("ordinal", Scalar::Integer),
+                    CodeQueryRowField::required_enum("verdict", value_domain::APPLICABILITY_VERDICT),
+                    CodeQueryRowField::optional_enum("reason", value_domain::CALLABLE_REJECTION_REASON),
+                    CodeQueryRowField::optional_enum("tier", value_domain::PRECEDENCE_TIER),
+                    CodeQueryRowField::required("selected", Scalar::Boolean),
+                    // The candidate declaration's identity, so an applicability row
+                    // joins to the `callable_signature` row of the very callable it
+                    // judged. Absent when the resolver weighed something that is not
+                    // an indexed declaration (a lexical binder, an import route, an
+                    // external target), exactly as the `candidates` domain reports.
+                    CodeQueryRowField::optional("candidate_id", Scalar::DeclarationIdentity),
+        ],
+    },
+    OverloadSelection => "overload_selection" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("resolution", value_domain::SELECTION_RESOLUTION),
+                    CodeQueryRowField::required("supported", Scalar::Boolean),
+                    CodeQueryRowField::required("considered_count", Scalar::Integer),
+                    CodeQueryRowField::required("applicable_count", Scalar::Integer),
+                    CodeQueryRowField::required("inapplicable_count", Scalar::Integer),
+                    CodeQueryRowField::required("unknown_count", Scalar::Integer),
+        ],
+    },
+    ReceiverEvidence => "receiver_evidence" {
+        display_range: |_value| None,
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("site_id", Scalar::StableId),
+                    CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("parent_evidence_id", Scalar::StableId),
+                    CodeQueryRowField::required("ordinal", Scalar::Integer),
+                    CodeQueryRowField::required("chain_hop", Scalar::Integer),
+                    CodeQueryRowField::required_enum(
+                        "evidence_kind",
+                        value_domain::RECEIVER_EVIDENCE_KIND
+                    ),
+                    CodeQueryRowField::optional("declaration_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::optional("factory_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::required_enum("proof", value_domain::RECEIVER_EVIDENCE_PROOF),
+                    CodeQueryRowField::required_enum("completeness", value_domain::RECEIVER_COVERAGE),
+        ],
+    },
+    MemberSelection => "member_selection" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("member", Scalar::String),
+                    CodeQueryRowField::required_enum("role", value_domain::OCCURRENCE_ROLE),
+                    CodeQueryRowField::required_enum("outcome", value_domain::MEMBER_SELECTION_OUTCOME),
+                    CodeQueryRowField::required("selected_count", Scalar::Integer),
+                    CodeQueryRowField::required("candidate_count", Scalar::Integer),
+                    CodeQueryRowField::required_enum(
+                        "trace_completeness",
+                        value_domain::MEMBER_SELECTION_TRACE_COMPLETENESS
+                    ),
+                    CodeQueryRowField::required_enum(
+                        "coverage",
+                        value_domain::MEMBER_SELECTION_COVERAGE
+                    ),
+        ],
+    },
+    DispatchOutcome => "dispatch_outcome" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("site_id", Scalar::StableId),
+                    CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("outcome", value_domain::DISPATCH_OUTCOME),
+                    CodeQueryRowField::required_enum("coverage", value_domain::CANDIDATE_COVERAGE),
+                    CodeQueryRowField::required("call_site_count", Scalar::Integer),
+                    CodeQueryRowField::required("target_count", Scalar::Integer),
+                    CodeQueryRowField::required("targets_truncated", Scalar::Boolean),
+                    CodeQueryRowField::optional_enum(
+                        "semantic_unsupported",
+                        value_domain::SEMANTIC_CAPABILITY
+                    ),
+                    CodeQueryRowField::optional_enum(
+                        "exceeded_limit",
+                        value_domain::SEMANTIC_BUDGET_DIMENSION
+                    ),
+        ],
+    },
+    DispatchTarget => "dispatch_target" {
+        display_range: |_value| None,
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("site_id", Scalar::StableId),
+                    CodeQueryRowField::optional("site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("ordinal", Scalar::Integer),
+                    CodeQueryRowField::required("target_id", Scalar::StableId),
+                    CodeQueryRowField::optional("target_declaration_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::required_enum("proof", value_domain::EVIDENCE_PROOF),
+                    CodeQueryRowField::required_enum(
+                        "completeness",
+                        value_domain::EVIDENCE_COMPLETENESS
+                    ),
+                    CodeQueryRowField::required_enum("coverage", value_domain::CANDIDATE_COVERAGE),
+                    CodeQueryRowField::required_enum("dispatch", value_domain::DISPATCH_ARM),
+                    CodeQueryRowField::optional_enum(
+                        "boundary_kind",
+                        value_domain::DISPATCH_BOUNDARY_KIND
+                    ),
+        ],
+    },
+    MemberFamily => "member_family" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("member_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("outcome", value_domain::MEMBER_FAMILY_OUTCOME),
+                    CodeQueryRowField::optional_enum("reason", value_domain::MEMBER_FAMILY_REASON),
+                    CodeQueryRowField::required_enum(
+                        "capability",
+                        value_domain::MEMBER_FAMILY_CAPABILITY
+                    ),
+                    CodeQueryRowField::required_enum("coverage", value_domain::MEMBER_FAMILY_COVERAGE),
+                    CodeQueryRowField::optional("family_id", Scalar::StableId),
+                    CodeQueryRowField::required("overrides_count", Scalar::Integer),
+                    CodeQueryRowField::required("implements_count", Scalar::Integer),
+                    CodeQueryRowField::required("overridden_by_count", Scalar::Integer),
+                    CodeQueryRowField::required("implemented_by_count", Scalar::Integer),
+                    CodeQueryRowField::required("edge_count", Scalar::Integer),
+                    CodeQueryRowField::required("root_count", Scalar::Integer),
+                    CodeQueryRowField::optional("member_declaration_id", Scalar::DeclarationIdentity),
+        ],
+    },
+    MemberFamilyEdge => "member_family_edge" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("member_id", Scalar::StableId),
+                    CodeQueryRowField::required("ordinal", Scalar::Integer),
+                    CodeQueryRowField::required("target_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("relation", value_domain::MEMBER_FAMILY_RELATION),
+                    CodeQueryRowField::optional("family_id", Scalar::StableId),
+                    CodeQueryRowField::required("hierarchy_depth", Scalar::Integer),
+                    CodeQueryRowField::required_enum("proof", value_domain::MEMBER_FAMILY_EDGE_PROOF),
+                    CodeQueryRowField::required_enum(
+                        "completeness",
+                        value_domain::MEMBER_FAMILY_EDGE_COMPLETENESS
+                    ),
+                    CodeQueryRowField::required_enum("coverage", value_domain::MEMBER_FAMILY_COVERAGE),
+                    CodeQueryRowField::optional("target_declaration_id", Scalar::DeclarationIdentity),
+        ],
+    },
+    Occurrence => "occurrence" {
+        display_range: |value| Some(value.range),
+        // An occurrence's identity is its own content-scoped digest,
+        // carried in the typed key rather than in a semantic-artifact
+        // identity candidate. The three lexical-environment domains
+        // are identified the same way, for the same reason.
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("ast_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("class", value_domain::OCCURRENCE_CLASS),
+                    CodeQueryRowField::required_enum("role", value_domain::OCCURRENCE_ROLE),
+                    CodeQueryRowField::required_enum("namespace", value_domain::NAMESPACE),
+                    CodeQueryRowField::required_enum(
+                        "target_kind",
+                        value_domain::OCCURRENCE_TARGET_KIND
+                    ),
+                    CodeQueryRowField::optional("target_id", Scalar::DeclarationIdentity),
+                    // Absent when the query ran with identity-only occurrence
+                    // derivation: a row whose targets were never derived has no
+                    // target count, and the registry must not promise one. The
+                    // always-on projection check found this registration lying
+                    // (issue #2498).
+                    CodeQueryRowField::optional("target_count", Scalar::Integer),
+        ],
+    },
+    LexicalScope => "lexical_scope" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("index", Scalar::Integer),
+                    CodeQueryRowField::optional_enum("kind", value_domain::STRUCTURAL_KIND),
+                    CodeQueryRowField::optional("parent_index", Scalar::Integer),
+        ],
+    },
+    Binding => "binding" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("reached_from_ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("name", Scalar::String),
+                    CodeQueryRowField::required_enum("kind", value_domain::BINDING_KIND),
+                    CodeQueryRowField::required_enum("hoisting", value_domain::HOISTING_CLASS),
+                    CodeQueryRowField::required_enum("namespace", value_domain::NAMESPACE),
+                    CodeQueryRowField::required("declaring_scope_index", Scalar::Integer),
+                    CodeQueryRowField::required_enum("visibility", value_domain::DECLARED_VISIBILITY),
+                    CodeQueryRowField::required("shadowed", Scalar::Boolean),
+        ],
+    },
+    ResolutionCandidate => "resolution_candidate" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("ordinal", Scalar::Integer),
+                    CodeQueryRowField::optional_enum("tier", value_domain::PRECEDENCE_TIER),
+                    CodeQueryRowField::required_enum("outcome", value_domain::CANDIDATE_OUTCOME),
+                    CodeQueryRowField::optional_enum(
+                        "rejection_reason",
+                        value_domain::REJECTION_REASON
+                    ),
+                    CodeQueryRowField::required_enum("boundary", value_domain::BOUNDARY_STATUS),
+                    CodeQueryRowField::required_enum("visibility", value_domain::DECLARED_VISIBILITY),
+                    CodeQueryRowField::required_enum(
+                        "trace_completeness",
+                        value_domain::TRACE_COMPLETENESS
+                    ),
+                    CodeQueryRowField::required_enum("candidate_kind", value_domain::CANDIDATE_KIND),
+                    CodeQueryRowField::optional("candidate_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::optional("canonical_member_id", Scalar::StableId),
+                    CodeQueryRowField::optional("owner_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::optional("hierarchy_depth", Scalar::Integer),
+                    CodeQueryRowField::optional_enum(
+                        "dispatch_tier",
+                        value_domain::MEMBER_DISPATCH_TIER
+                    ),
+                    CodeQueryRowField::optional_enum(
+                        "applicability",
+                        value_domain::APPLICABILITY_VERDICT
+                    ),
+        ],
+    },
+    CandidateHop => "candidate_hop" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("candidate_id", Scalar::StableId),
+                    CodeQueryRowField::required("ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("hop", Scalar::Integer),
+                    CodeQueryRowField::required_enum("relation", value_domain::HIERARCHY_RELATION),
+                    CodeQueryRowField::optional("from_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::optional("to_id", Scalar::DeclarationIdentity),
+        ],
+    },
+    GenerationSite => "generation_site" {
+        display_range: |value| Some(value.range),
+        // The three materialization domains are identified by their
+        // own content-scoped digests too (#1476).
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("path", Scalar::String),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::required_enum("kind", value_domain::GENERATION_KIND),
+                    CodeQueryRowField::required_enum("input", value_domain::GENERATION_INPUT),
+                    CodeQueryRowField::required("generated_count", Scalar::Integer),
+        ],
+    },
+    Export => "export" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("path", Scalar::String),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::required_enum("form", value_domain::EXPORT_FORM),
+                    CodeQueryRowField::required("exported_name", Scalar::String),
+                    CodeQueryRowField::optional("target_fq_name", Scalar::String),
+        ],
+    },
+    DeclarationState => "declaration_state" {
+        display_range: |value| value.range,
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("path", Scalar::String),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::required("fq_name", Scalar::String),
+                    CodeQueryRowField::required_enum("unit_kind", value_domain::CODE_UNIT_KIND),
+                    CodeQueryRowField::required_enum("origin", value_domain::DECLARATION_ORIGIN),
+                    CodeQueryRowField::required("declaration_only", Scalar::Boolean),
+                    CodeQueryRowField::required("config_gated", Scalar::Boolean),
+        ],
+    },
+    ReferenceEdge => "reference_edge" {
+        display_range: |value| Some(value.range),
+        // The identity-route domains carry their digests the same
+        // way (#1475).
+        // A reference edge's identity is its own content-scoped
+        // digest, carried in the typed key like the environment
+        // domains above.
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::optional("target_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::optional_enum("reference_kind", value_domain::REFERENCE_KIND),
+                    CodeQueryRowField::required_enum("proof", value_domain::USAGE_PROOF),
+                    CodeQueryRowField::required_enum("usage_kind", value_domain::USAGE_KIND),
+                    CodeQueryRowField::required_enum("site_class", value_domain::SITE_CLASS),
+                    CodeQueryRowField::required_enum("owner_relation", value_domain::OWNER_RELATION),
+                    CodeQueryRowField::required_enum("edge_provenance", value_domain::EDGE_PROVENANCE),
+                    CodeQueryRowField::required("generation", Scalar::Integer),
+        ],
+    },
+    StateEvent => "state_event" {
+        display_range: |value| Some(value.range),
+        // A state event and a flow relation are identified by their
+        // own content-scoped digests in the typed key too; neither is
+        // artifact-backed, so neither carries a semantic identity
+        // (#1480).
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("procedure_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::required_enum("event_class", value_domain::STATE_EVENT_CLASS),
+                    CodeQueryRowField::required_enum("subject", value_domain::FLOW_SUBJECT),
+                    CodeQueryRowField::optional("member", Scalar::String),
+                    CodeQueryRowField::required("subject_value", Scalar::Integer),
+                    CodeQueryRowField::required("program_point", Scalar::Integer),
+                    CodeQueryRowField::required("value", Scalar::Integer),
+                    CodeQueryRowField::required_enum(
+                        "completeness",
+                        value_domain::FLOW_STATE_COMPLETENESS
+                    ),
+                    CodeQueryRowField::required("generation", Scalar::Integer),
+        ],
+    },
+    FlowRelation => "flow_relation" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("procedure_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::required_enum("relation", value_domain::FLOW_RELATION),
+                    CodeQueryRowField::required_enum("certainty", value_domain::FLOW_CERTAINTY),
+                    CodeQueryRowField::required("source_id", Scalar::StableId),
+                    CodeQueryRowField::required("target_id", Scalar::StableId),
+                    CodeQueryRowField::optional("source_ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("target_ast_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum(
+                        "completeness",
+                        value_domain::FLOW_STATE_COMPLETENESS
+                    ),
+                    CodeQueryRowField::required("generation", Scalar::Integer),
+        ],
+    },
+    RewritePath => "rewrite_path" {
+        display_range: |value| Some(value.range),
+        // A rewrite path is identified by its own content-scoped
+        // digest over the domain, origin and derivation (#1480).
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::required_enum("domain", value_domain::REWRITE_DOMAIN),
+                    CodeQueryRowField::required("origin_specifier", Scalar::String),
+                    CodeQueryRowField::required("declared_bound", Scalar::Integer),
+                    CodeQueryRowField::required("step_count", Scalar::Integer),
+                    CodeQueryRowField::required_enum("outcome", value_domain::REWRITE_OUTCOME),
+                    CodeQueryRowField::optional("fixed_point", Scalar::String),
+                    CodeQueryRowField::required_enum(
+                        "completeness",
+                        value_domain::REWRITE_PATH_COMPLETENESS
+                    ),
+                    CodeQueryRowField::required("generation", Scalar::Integer),
+        ],
+    },
+    QualifiedPath => "qualified_path" {
+        display_range: |value| Some(value.range),
+        // A path and its segments are likewise identified by their
+        // own content-scoped digests in the typed key.
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("segment_count", Scalar::Integer),
+        ],
+    },
+    PathSegment => "path_segment" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("path_ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("ordinal", Scalar::Integer),
+                    CodeQueryRowField::required("text", Scalar::String),
+                    CodeQueryRowField::optional_enum("namespace", value_domain::NAMESPACE),
+                    CodeQueryRowField::optional("generic_arity", Scalar::Integer),
+                    CodeQueryRowField::optional_enum(
+                        "resolution_status",
+                        value_domain::SEGMENT_RESOLUTION_STATUS
+                    ),
+                    CodeQueryRowField::optional("target_count", Scalar::Integer),
+        ],
+    },
 }
 
 impl CodeQueryResultValue {
     pub fn row(&self) -> CodeQueryRowRef<'_> {
         CodeQueryRowRef { value: self }
-    }
-
-    /// The exact display region of this row's own source anchor. `None` when
-    /// the row has no source region of its own (a file row, or an evidence row
-    /// whose location is its site's outcome row).
-    pub fn display_range(&self) -> Option<CodeQueryRange> {
-        match self {
-            Self::StructuralMatch { value } => value.node_range,
-            Self::Declaration { value } => value.node_range,
-            Self::Procedure { value } => Some(value.range),
-            Self::ProgramPoint { value } => Some(value.range),
-            Self::ControlEdge { value } => Some(value.range),
-            Self::TypestateFinding { value } => Some(value.range),
-            Self::TypestateWitness { value } => Some(value.range),
-            Self::FlowEndpoint { value } => Some(value.range),
-            Self::FlowWitness { value } => Some(value.range),
-            Self::TaintFinding { value } => Some(value.range),
-            Self::File { .. } | Self::ReceiverEvidence { .. } => None,
-            Self::ReferenceSite { value } => Some(value.range),
-            Self::CallSite { value } => Some(value.range),
-            Self::ExpressionSite { value } => Some(value.range),
-            Self::ReceiverAnalysis { value } => Some(value.range),
-            Self::ReceiverOutcome { value } => Some(value.range),
-            Self::MemberSelection { value } => Some(value.range),
-            Self::DispatchOutcome { value } => Some(value.range),
-            Self::DispatchTarget { .. } => None,
-            Self::MemberFamily { value } => Some(value.range),
-            Self::MemberFamilyEdge { value } => Some(value.range),
-            Self::CallShape { value } => Some(value.range),
-            Self::CallArgumentGroup { value } => Some(value.range),
-            Self::CallArgument { value } => Some(value.range),
-            Self::CallBinding { value } => Some(value.range),
-            Self::CallEffect { value } => Some(value.range),
-            Self::ProcedureEffect { value } => Some(value.range),
-            Self::CallableSignature { value } => Some(value.range),
-            Self::SignatureParameter { value } => Some(value.range),
-            Self::CallableApplicability { value } => Some(value.range),
-            Self::OverloadSelection { value } => Some(value.range),
-            Self::Occurrence { value } => Some(value.range),
-            Self::LexicalScope { value } => Some(value.range),
-            Self::Binding { value } => Some(value.range),
-            Self::ResolutionCandidate { value } => Some(value.range),
-            Self::CandidateHop { value } => Some(value.range),
-            Self::GenerationSite { value } => Some(value.range),
-            Self::Export { value } => Some(value.range),
-            Self::DeclarationState { value } => value.range,
-            Self::ReferenceEdge { value } => Some(value.range),
-            Self::StateEvent { value } => Some(value.range),
-            Self::FlowRelation { value } => Some(value.range),
-            Self::RewritePath { value } => Some(value.range),
-            Self::QualifiedPath { value } => Some(value.range),
-            Self::PathSegment { value } => Some(value.range),
-        }
-    }
-
-    pub const fn detailed_domain(&self) -> DetailedCodeQueryDomain {
-        match self {
-            Self::StructuralMatch { .. } => DetailedCodeQueryDomain::StructuralMatch,
-            Self::Declaration { .. } => DetailedCodeQueryDomain::Declaration,
-            Self::Procedure { .. } => DetailedCodeQueryDomain::Procedure,
-            Self::ProgramPoint { .. } => DetailedCodeQueryDomain::ProgramPoint,
-            Self::ControlEdge { .. } => DetailedCodeQueryDomain::ControlEdge,
-            Self::TypestateFinding { .. } => DetailedCodeQueryDomain::TypestateFinding,
-            Self::TypestateWitness { .. } => DetailedCodeQueryDomain::TypestateWitness,
-            Self::FlowEndpoint { .. } => DetailedCodeQueryDomain::FlowEndpoint,
-            Self::FlowWitness { .. } => DetailedCodeQueryDomain::FlowWitness,
-            Self::TaintFinding { .. } => DetailedCodeQueryDomain::TaintFinding,
-            Self::File { .. } => DetailedCodeQueryDomain::File,
-            Self::ReferenceSite { .. } => DetailedCodeQueryDomain::ReferenceSite,
-            Self::CallSite { .. } => DetailedCodeQueryDomain::CallSite,
-            Self::ExpressionSite { .. } => DetailedCodeQueryDomain::ExpressionSite,
-            Self::ReceiverAnalysis { .. } => DetailedCodeQueryDomain::ReceiverAnalysis,
-            Self::ReceiverOutcome { .. } => DetailedCodeQueryDomain::ReceiverOutcome,
-            Self::ReceiverEvidence { .. } => DetailedCodeQueryDomain::ReceiverEvidence,
-            Self::CallShape { .. } => DetailedCodeQueryDomain::CallShape,
-            Self::CallArgumentGroup { .. } => DetailedCodeQueryDomain::CallArgumentGroup,
-            Self::CallArgument { .. } => DetailedCodeQueryDomain::CallArgument,
-            Self::CallBinding { .. } => DetailedCodeQueryDomain::CallBinding,
-            Self::CallEffect { .. } => DetailedCodeQueryDomain::CallEffect,
-            Self::ProcedureEffect { .. } => DetailedCodeQueryDomain::ProcedureEffect,
-            Self::CallableSignature { .. } => DetailedCodeQueryDomain::CallableSignature,
-            Self::SignatureParameter { .. } => DetailedCodeQueryDomain::SignatureParameter,
-            Self::CallableApplicability { .. } => DetailedCodeQueryDomain::CallableApplicability,
-            Self::OverloadSelection { .. } => DetailedCodeQueryDomain::OverloadSelection,
-            Self::MemberSelection { .. } => DetailedCodeQueryDomain::MemberSelection,
-            Self::DispatchOutcome { .. } => DetailedCodeQueryDomain::DispatchOutcome,
-            Self::DispatchTarget { .. } => DetailedCodeQueryDomain::DispatchTarget,
-            Self::MemberFamily { .. } => DetailedCodeQueryDomain::MemberFamily,
-            Self::MemberFamilyEdge { .. } => DetailedCodeQueryDomain::MemberFamilyEdge,
-            Self::Occurrence { .. } => DetailedCodeQueryDomain::Occurrence,
-            Self::LexicalScope { .. } => DetailedCodeQueryDomain::LexicalScope,
-            Self::Binding { .. } => DetailedCodeQueryDomain::Binding,
-            Self::ResolutionCandidate { .. } => DetailedCodeQueryDomain::ResolutionCandidate,
-            Self::CandidateHop { .. } => DetailedCodeQueryDomain::CandidateHop,
-            Self::GenerationSite { .. } => DetailedCodeQueryDomain::GenerationSite,
-            Self::Export { .. } => DetailedCodeQueryDomain::Export,
-            Self::DeclarationState { .. } => DetailedCodeQueryDomain::DeclarationState,
-            Self::QualifiedPath { .. } => DetailedCodeQueryDomain::QualifiedPath,
-            Self::PathSegment { .. } => DetailedCodeQueryDomain::PathSegment,
-            Self::ReferenceEdge { .. } => DetailedCodeQueryDomain::ReferenceEdge,
-            Self::StateEvent { .. } => DetailedCodeQueryDomain::StateEvent,
-            Self::FlowRelation { .. } => DetailedCodeQueryDomain::FlowRelation,
-            Self::RewritePath { .. } => DetailedCodeQueryDomain::RewritePath,
-        }
     }
 }
 
@@ -1014,10 +1432,36 @@ impl<'a> CodeQueryRowRef<'a> {
         );
         debug_assert!(
             schema.nullable || value.is_some(),
-            "required CodeQuery row field projector returned no value"
+            "required CodeQuery row field `{}.{}` projected no value",
+            self.domain().label(),
+            schema.name
+        );
+        debug_assert!(
+            field_value_is_in_domain(*schema, value),
+            "CodeQuery row field `{}.{}` projected a value outside its registered domain: {value:?}",
+            self.domain().label(),
+            schema.name
         );
         Ok(value)
     }
+}
+
+/// Whether one projected scalar respects the value domain its field declares.
+///
+/// Enum-typed fields are the only ones with a domain, and an absent optional
+/// value is always in domain. This is the producer-side half of issue #2515:
+/// the loader rejects a policy literal that no row can hold, and this rejects a
+/// producer that writes a label the registry does not publish.
+pub fn field_value_is_in_domain(
+    field: CodeQueryRowField,
+    value: Option<CodeQueryRowScalarRef<'_>>,
+) -> bool {
+    let (Some(domain), Some(CodeQueryRowScalarRef::ConstrainedEnum(label))) =
+        (field.value_domain, value)
+    else {
+        return true;
+    };
+    domain.admits(label)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1417,6 +1861,9 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::CallBinding { value }, "binding_kind") => {
             value.binding_kind.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "conversion") => {
+            value.conversion.as_deref().map(Scalar::ConstrainedEnum)
         }
         (CodeQueryResultValue::CallBinding { value }, "mapping") => {
             Some(Scalar::ConstrainedEnum(value.mapping))
@@ -2375,186 +2822,16 @@ impl DetailedCodeQueryResult {
                 evidence.result_index, result_index,
                 "detailed CodeQuery evidence index must equal its vector index"
             );
+            #[cfg(debug_assertions)]
+            assert_row_projects_its_registered_surface(&result.value);
             if let Some((expected_domain, expected_key)) = detailed_semantic_identity(&result.value)
             {
                 assert_eq!(evidence.domain, expected_domain);
                 assert_eq!(evidence.key, expected_key);
             }
-            assert!(
-                matches!(
-                    (evidence.domain, &evidence.key),
-                    (
-                        DetailedCodeQueryDomain::StructuralMatch,
-                        DetailedCodeQueryKey::StructuralMatch { .. }
-                    ) | (
-                        DetailedCodeQueryDomain::Declaration,
-                        DetailedCodeQueryKey::Declaration { .. }
-                    ) | (
-                        DetailedCodeQueryDomain::Procedure,
-                        DetailedCodeQueryKey::Procedure { .. }
-                    ) | (
-                        DetailedCodeQueryDomain::ProgramPoint,
-                        DetailedCodeQueryKey::ProgramPoint { .. }
-                    ) | (
-                        DetailedCodeQueryDomain::ControlEdge,
-                        DetailedCodeQueryKey::ControlEdge { .. }
-                    ) | (
-                        DetailedCodeQueryDomain::TypestateFinding,
-                        DetailedCodeQueryKey::TypestateFinding { .. }
-                    ) | (
-                        DetailedCodeQueryDomain::TypestateWitness,
-                        DetailedCodeQueryKey::TypestateWitness { .. }
-                    ) | (
-                        DetailedCodeQueryDomain::FlowEndpoint,
-                        DetailedCodeQueryKey::FlowEndpoint { .. }
-                    ) | (
-                        DetailedCodeQueryDomain::FlowWitness,
-                        DetailedCodeQueryKey::FlowWitness { .. }
-                    ) | (
-                        DetailedCodeQueryDomain::TaintFinding,
-                        DetailedCodeQueryKey::TaintFinding { .. }
-                    ) | (DetailedCodeQueryDomain::File, DetailedCodeQueryKey::File)
-                        | (
-                            DetailedCodeQueryDomain::ReferenceSite,
-                            DetailedCodeQueryKey::ReferenceSite { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::CallSite,
-                            DetailedCodeQueryKey::CallSite { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::ExpressionSite,
-                            DetailedCodeQueryKey::ExpressionSite { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::ReceiverAnalysis,
-                            DetailedCodeQueryKey::ReceiverAnalysis { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::ReceiverOutcome,
-                            DetailedCodeQueryKey::ReceiverOutcome { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::ReceiverEvidence,
-                            DetailedCodeQueryKey::ReceiverEvidence { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::DispatchOutcome,
-                            DetailedCodeQueryKey::DispatchOutcome { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::DispatchTarget,
-                            DetailedCodeQueryKey::DispatchTarget { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::MemberFamily,
-                            DetailedCodeQueryKey::MemberFamily { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::MemberFamilyEdge,
-                            DetailedCodeQueryKey::MemberFamilyEdge { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::CallShape,
-                            DetailedCodeQueryKey::CallShape { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::CallArgumentGroup,
-                            DetailedCodeQueryKey::CallArgumentGroup { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::CallArgument,
-                            DetailedCodeQueryKey::CallArgument { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::CallBinding,
-                            DetailedCodeQueryKey::CallBinding { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::CallEffect,
-                            DetailedCodeQueryKey::CallEffect { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::ProcedureEffect,
-                            DetailedCodeQueryKey::ProcedureEffect { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::CallableSignature,
-                            DetailedCodeQueryKey::CallableSignature { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::SignatureParameter,
-                            DetailedCodeQueryKey::SignatureParameter { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::CallableApplicability,
-                            DetailedCodeQueryKey::CallableApplicability { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::OverloadSelection,
-                            DetailedCodeQueryKey::OverloadSelection { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::MemberSelection,
-                            DetailedCodeQueryKey::MemberSelection { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::Occurrence,
-                            DetailedCodeQueryKey::Occurrence { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::LexicalScope,
-                            DetailedCodeQueryKey::LexicalScope { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::Binding,
-                            DetailedCodeQueryKey::Binding { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::ResolutionCandidate,
-                            DetailedCodeQueryKey::ResolutionCandidate { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::CandidateHop,
-                            DetailedCodeQueryKey::CandidateHop { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::GenerationSite,
-                            DetailedCodeQueryKey::GenerationSite { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::Export,
-                            DetailedCodeQueryKey::Export { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::DeclarationState,
-                            DetailedCodeQueryKey::DeclarationState { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::ReferenceEdge,
-                            DetailedCodeQueryKey::ReferenceEdge { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::StateEvent,
-                            DetailedCodeQueryKey::StateEvent { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::FlowRelation,
-                            DetailedCodeQueryKey::FlowRelation { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::RewritePath,
-                            DetailedCodeQueryKey::RewritePath { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::QualifiedPath,
-                            DetailedCodeQueryKey::QualifiedPath { .. }
-                        )
-                        | (
-                            DetailedCodeQueryDomain::PathSegment,
-                            DetailedCodeQueryKey::PathSegment { .. }
-                        )
-                ),
+            assert_eq!(
+                evidence.domain,
+                evidence.key.domain(),
                 "detailed CodeQuery domain and typed key must agree"
             );
             if evidence.source_slice_sha256.is_some() {
@@ -2609,6 +2886,27 @@ impl DetailedCodeQueryResult {
                 }
             }
         }
+    }
+}
+
+/// Every field the registry declares for this row's domain projects, with the
+/// declared scalar type, the declared nullability, and a value inside the
+/// declared enum domain.
+///
+/// This is the schema/projector reconciliation of issue #2498, run on every row
+/// of every detailed query rather than only on the fields a caller happens to
+/// ask for. It is compiled out of release builds, so every test in the tree --
+/// whichever domains it produces -- proves the registry against real rows at no
+/// production cost.
+#[cfg(debug_assertions)]
+fn assert_row_projects_its_registered_surface(value: &CodeQueryResultValue) {
+    let row = value.row();
+    let domain = row.domain();
+    for field in domain.row_fields() {
+        // `field` itself asserts the scalar type, the nullability and the
+        // value domain; reaching every registered name is what this adds.
+        row.field(field.name)
+            .unwrap_or_else(|error| panic!("registered field must project: {error}"));
     }
 }
 
@@ -2726,90 +3024,19 @@ fn assert_detailed_provenance_ref(evidence: &DetailedCodeQueryProvenanceRefEvide
     }
 }
 
+/// Every terminal row of one domain carries exactly the identity shape that
+/// domain declares. The table lives beside the domain's own declaration, so a
+/// new domain cannot reach this assertion without one.
 fn assert_detailed_terminal_identities(
     domain: DetailedCodeQueryDomain,
     identities: &DetailedCodeQueryProvenanceIdentities,
 ) {
-    assert!(matches!(
-        (domain, identities),
-        (
-            DetailedCodeQueryDomain::StructuralMatch
-                | DetailedCodeQueryDomain::Declaration
-                | DetailedCodeQueryDomain::Procedure
-                | DetailedCodeQueryDomain::ProgramPoint
-                | DetailedCodeQueryDomain::ControlEdge
-                | DetailedCodeQueryDomain::TypestateFinding
-                | DetailedCodeQueryDomain::TypestateWitness
-                | DetailedCodeQueryDomain::FlowEndpoint
-                | DetailedCodeQueryDomain::FlowWitness
-                | DetailedCodeQueryDomain::TaintFinding,
-            DetailedCodeQueryProvenanceIdentities::Primary(_),
-        ) | (
-            DetailedCodeQueryDomain::File
-                | DetailedCodeQueryDomain::ExpressionSite
-                | DetailedCodeQueryDomain::ReceiverAnalysis
-                | DetailedCodeQueryDomain::ReceiverOutcome
-                | DetailedCodeQueryDomain::ReceiverEvidence
-                | DetailedCodeQueryDomain::DispatchOutcome
-                | DetailedCodeQueryDomain::DispatchTarget
-                | DetailedCodeQueryDomain::MemberFamily
-                | DetailedCodeQueryDomain::MemberFamilyEdge
-                | DetailedCodeQueryDomain::CallShape
-                | DetailedCodeQueryDomain::CallArgumentGroup
-                | DetailedCodeQueryDomain::CallArgument
-                | DetailedCodeQueryDomain::CallBinding
-                // An effect row is identified by its own content-scoped digest
-                // over the site or procedure identity and the effect id, so it
-                // carries no semantic-artifact identity candidate (#2437).
-                | DetailedCodeQueryDomain::CallEffect
-                | DetailedCodeQueryDomain::ProcedureEffect
-                | DetailedCodeQueryDomain::CallableSignature
-                | DetailedCodeQueryDomain::SignatureParameter
-                | DetailedCodeQueryDomain::CallableApplicability
-                | DetailedCodeQueryDomain::OverloadSelection
-                | DetailedCodeQueryDomain::MemberSelection
-                // An occurrence's identity is its own content-scoped digest,
-                // carried in the typed key rather than in a semantic-artifact
-                // identity candidate. The three lexical-environment domains
-                // are identified the same way, for the same reason.
-                | DetailedCodeQueryDomain::Occurrence
-                | DetailedCodeQueryDomain::LexicalScope
-                | DetailedCodeQueryDomain::Binding
-                | DetailedCodeQueryDomain::ResolutionCandidate
-                | DetailedCodeQueryDomain::CandidateHop
-                // The three materialization domains are identified by their
-                // own content-scoped digests too (#1476).
-                | DetailedCodeQueryDomain::GenerationSite
-                | DetailedCodeQueryDomain::Export
-                | DetailedCodeQueryDomain::DeclarationState
-                // The identity-route domains carry their digests the same
-                // way (#1475).
-                // A reference edge's identity is its own content-scoped
-                // digest, carried in the typed key like the environment
-                // domains above.
-                | DetailedCodeQueryDomain::ReferenceEdge
-                // A state event and a flow relation are identified by their
-                // own content-scoped digests in the typed key too; neither is
-                // artifact-backed, so neither carries a semantic identity
-                // (#1480).
-                | DetailedCodeQueryDomain::StateEvent
-                | DetailedCodeQueryDomain::FlowRelation
-                // A rewrite path is identified by its own content-scoped
-                // digest over the domain, origin and derivation (#1480).
-                | DetailedCodeQueryDomain::RewritePath
-                // A path and its segments are likewise identified by their
-                // own content-scoped digests in the typed key.
-                | DetailedCodeQueryDomain::QualifiedPath
-                | DetailedCodeQueryDomain::PathSegment,
-            DetailedCodeQueryProvenanceIdentities::None,
-        ) | (
-            DetailedCodeQueryDomain::ReferenceSite,
-            DetailedCodeQueryProvenanceIdentities::ReferenceTarget(_),
-        ) | (
-            DetailedCodeQueryDomain::CallSite,
-            DetailedCodeQueryProvenanceIdentities::Call { .. },
-        )
-    ));
+    assert_eq!(
+        DetailedTerminalIdentities::of(identities),
+        domain.terminal_identities(),
+        "domain `{}` carries the wrong provenance identities: {identities:?}",
+        domain.label()
+    );
 }
 
 fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
@@ -2861,5 +3088,106 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         DetailedCodeQueryKey::QualifiedPath { .. } | DetailedCodeQueryKey::PathSegment { .. } => {
             None
         }
+    }
+}
+
+/// Issue #2498's acceptance, executed: adding a domain touches one declaration
+/// site plus its producer.
+///
+/// The registry macro is instantiated a second time over a toy domain whose
+/// producer is the `ToyRow`/`ToyKey` pair declared here. One entry -- one
+/// variant name, one label, one display anchor, one identity shape, one field
+/// list -- derives the enum, the mirror slice, the label table, the value-kind
+/// mapping, the field surface, the identity shape, the key's domain, the row's
+/// display anchor, and the row's domain. Nine tables, no second edit.
+///
+/// Before this, the same nine lived in nine hand-written exhaustive matches,
+/// two of which -- the mirror slice and the identity allow-list -- a new domain
+/// could miss without a compile error.
+#[cfg(test)]
+mod toy_domain {
+    use super::*;
+
+    /// The producer half: a row shape and the typed key that addresses it.
+    /// Real domains declare these in the analyzer that emits them.
+    #[derive(Debug)]
+    pub enum ToyRow {
+        Widget { value: ToyWidget },
+    }
+
+    #[derive(Debug)]
+    pub struct ToyWidget {
+        pub range: CodeQueryRange,
+    }
+
+    #[derive(Debug)]
+    pub enum ToyKey {
+        Widget {
+            #[allow(dead_code)]
+            id: String,
+        },
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub enum ToyKind {
+        Widget,
+    }
+
+    detailed_row_domains! {
+        domain: ToyDomain,
+        all: ALL_TOY_DOMAINS,
+        key: ToyKey,
+        row: ToyRow,
+        kind: ToyKind,
+
+        Widget => "widget" {
+            display_range: |value| Some(value.range),
+            identities: None,
+            fields: [
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required_enum("kind", &["round", "square"]),
+            ],
+        },
+    }
+
+    #[test]
+    fn one_declaration_site_derives_every_registry_table() {
+        let range = CodeQueryRange {
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 2,
+        };
+        let row = ToyRow::Widget {
+            value: ToyWidget { range },
+        };
+        let key = ToyKey::Widget {
+            id: "widget-1".to_string(),
+        };
+
+        assert_eq!(ALL_TOY_DOMAINS, &[ToyDomain::Widget]);
+        assert_eq!(ToyDomain::Widget.label(), "widget");
+        assert_eq!(
+            ToyDomain::from_query_value_kind(ToyKind::Widget),
+            ToyDomain::Widget
+        );
+        assert_eq!(
+            ToyDomain::Widget.terminal_identities(),
+            DetailedTerminalIdentities::None
+        );
+        assert_eq!(key.domain(), ToyDomain::Widget);
+        assert_eq!(row.detailed_domain(), ToyDomain::Widget);
+        assert_eq!(row.display_range(), Some(range));
+
+        let fields = ToyDomain::Widget.row_fields();
+        assert_eq!(
+            fields.iter().map(|field| field.name).collect::<Vec<_>>(),
+            ["id", "kind"]
+        );
+        assert_eq!(
+            fields[1].value_domain,
+            Some(CodeQueryEnumDomain::Labels(&["round", "square"])),
+            "an enum field carries its value domain through the same entry"
+        );
     }
 }

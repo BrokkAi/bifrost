@@ -730,7 +730,12 @@ fn push_member_hit(
     hits: &mut BTreeSet<UsageHit>,
     same_owner: bool,
 ) {
-    let start = node.start_byte() + usize::from(node_text(node, source).starts_with('$'));
+    // PHP writes the sigil at a static property usage (`self::$sent`) and not at
+    // an instance one (`$this->last`), so the member token's own extent is the
+    // usage range in both shapes. Intelephense and phpactor report it that way,
+    // and php_declaration_name_range already restores it on the declaration
+    // side; skipping the `$` here left static usages one column short.
+    let start = node.start_byte();
     if same_owner {
         push_self_receiver_hit_range(
             start,

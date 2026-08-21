@@ -44,6 +44,18 @@ impl SemanticInputStatus {
         }
     }
 
+    /// The value domain the `flow_endpoint.semantic_status` row field
+    /// publishes (issue #2515).
+    pub const LABELS: &'static [&'static str] = &[
+        "complete",
+        "ambiguous",
+        "unknown",
+        "unsupported",
+        "unproven",
+        "exceeded_budget",
+        "cancelled",
+    ];
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Complete => "complete",

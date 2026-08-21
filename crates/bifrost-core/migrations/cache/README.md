@@ -2,8 +2,8 @@
 
 `0018-current-baseline.sql` is the schema every store starts from. It is the
 fold of the former migrations 0001..0018 and is named for the version it
-produces, not for its position. The four files beside it carry a store from
-version 18 to version 22, one version each.
+produces, not for its position. The six files beside it carry a store from
+version 18 to version 24, one version each.
 
 `BASELINE_MIGRATION_VERSION` and `CURRENT_MIGRATION_VERSION` in
 `src/cache_db.rs` name the two ends, and `CACHE_MIGRATIONS` writes the version
@@ -37,3 +37,8 @@ only served the deleted lexical (BM25) retrieval arm:
 `semantic_file_chunks.fts_tokens` and `cache_state.bm25_tokenizer_version`.
 Retrieval is dense only, so nothing reads them. Chunk and vector rows keep
 their identities, so no cache is invalidated by this migration.
+
+Migration `0024-live-definition-views.sql` makes completed-parse and
+active-generation membership reusable schema interfaces for definition
+queries. It adds views only: it does not persist a second path, package, or
+declaration projection.

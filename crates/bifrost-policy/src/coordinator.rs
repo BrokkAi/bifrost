@@ -15,15 +15,17 @@ use sha2::{Digest, Sha256};
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::FileSetProject;
 use brokk_bifrost_analysis::analyzer::packs_document::{
-    WORKSPACE_PACKS_DOCUMENT_PATH, WorkspacePacksActivation, WorkspacePacksConfig,
-    activate_workspace_packs, load_workspace_packs_config, load_workspace_packs_config_at,
+    WORKSPACE_PACKS_DOCUMENT_PATH, WorkspaceActivationError, WorkspaceActivationSources,
+    WorkspacePacksActivation, WorkspacePacksConfig, activate_workspace_semantic_sources,
+    load_workspace_packs_config, load_workspace_packs_config_at,
 };
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActiveSemanticModelShard, SemanticModelActivationExplanation,
     SemanticModelActivationPersistence, SemanticModelActivationRequest,
     SemanticModelActivationStatus, SemanticModelRuntimeOutcome, SemanticPackCatalog,
-    acquire_active_semantic_models,
+    WORKSPACE_SEMANTIC_MODEL_DIRECTORY, acquire_active_semantic_models,
+    workspace_semantic_models_not_active,
 };
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
@@ -737,24 +739,43 @@ fn analyzed_source_volume(workspace: &WorkspaceAnalyzer) -> (u64, usize) {
     (bytes, files.len())
 }
 
-/// Project one document-driven activation transaction into the report's
-/// pack-activation review (#1868, #1884).
+/// The workspace location the pack-activation review is attributed to.
 ///
-/// `None` activation means the document named no ecosystem that serves a
-/// language present in the workspace; the review still records the document
-/// so the opt-in is auditable.
+/// A run with a pack-activation document is attributed to that document. A run
+/// that activates only reviewed workspace-local models is attributed to the
+/// directory those models live in, because that directory is the opt-in
+/// (#2493).
+fn pack_activation_source_path(config: Option<&WorkspacePacksConfig>) -> String {
+    if config.is_some() {
+        WORKSPACE_PACKS_DOCUMENT_PATH.to_owned()
+    } else {
+        WORKSPACE_SEMANTIC_MODEL_DIRECTORY.to_owned()
+    }
+}
+
+/// Project one workspace activation transaction into the report's
+/// pack-activation review (#1868, #1884, #2493).
+///
+/// `None` activation means neither route contributed: the document named no
+/// ecosystem that serves a language present in the workspace and no reviewed
+/// workspace model was found. The review still records the opt-in so it stays
+/// auditable.
 fn pack_activation_review(
-    config: &WorkspacePacksConfig,
+    config: Option<&WorkspacePacksConfig>,
     activation: Option<&WorkspacePacksActivation>,
 ) -> PolicyPackActivationReview {
     let Some(activation) = activation else {
         return PolicyPackActivationReview::new(
-            WORKSPACE_PACKS_DOCUMENT_PATH.to_owned(),
+            pack_activation_source_path(config),
             config
-                .ecosystems()
-                .iter()
-                .map(|ecosystem| ecosystem.label().to_owned())
-                .collect(),
+                .map(|config| {
+                    config
+                        .ecosystems()
+                        .iter()
+                        .map(|ecosystem| ecosystem.label().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
             true,
             Vec::new(),
         );
@@ -812,7 +833,7 @@ fn pack_activation_review(
         None => {}
     }
     PolicyPackActivationReview::new(
-        WORKSPACE_PACKS_DOCUMENT_PATH.to_owned(),
+        pack_activation_source_path(config),
         activation
             .ecosystems
             .iter()
@@ -821,6 +842,126 @@ fn pack_activation_review(
         activation.outcome.complete(),
         decisions,
     )
+}
+
+/// The report diagnostic for a workspace activation that could not be built.
+///
+/// A failed catalog open is attributed to the document that named the catalog.
+/// A refused workspace-local model is attributed to the file itself when the
+/// failure names one, and to the reviewed directory otherwise, so the author
+/// is pointed at the thing to fix.
+fn workspace_activation_diagnostic(
+    error: &WorkspaceActivationError,
+) -> Result<PolicyReportDiagnostic, PolicyCoordinatorError> {
+    match error {
+        WorkspaceActivationError::Catalog(error) => report_diagnostic(
+            PolicyReportDiagnosticCode::PackActivationFailed,
+            format!("failed to activate workspace packs: {error}"),
+            Some(PolicySourceIdentity::new(WORKSPACE_PACKS_DOCUMENT_PATH)),
+            None,
+            Vec::new(),
+        ),
+        WorkspaceActivationError::WorkspaceModels(models) => {
+            // The per-file variants already carry the full workspace-relative
+            // path discovery reported; only a whole-directory failure has to
+            // fall back to the directory itself.
+            let path = models.path().unwrap_or(WORKSPACE_SEMANTIC_MODEL_DIRECTORY);
+            report_diagnostic(
+                PolicyReportDiagnosticCode::WorkspaceModelLoadFailed,
+                format!("failed to activate the reviewed workspace semantic models: {models}"),
+                Some(PolicySourceIdentity::new(path)),
+                None,
+                Vec::new(),
+            )
+        }
+    }
+}
+
+/// Report every reviewed workspace model that did not reach the active set.
+///
+/// A model held back by the review gate is inert by design: it is reported as
+/// a warning that names the missing `enable` entry, and the run stays as
+/// reliable as its own evaluation makes it. Any other reason is a defect in
+/// the activation and fails the run, because a model that registered and then
+/// vanished would decide verdicts by its absence (#2493).
+fn inactive_workspace_model_diagnostics(
+    activation: Option<&WorkspacePacksActivation>,
+) -> Result<Vec<PolicyReportDiagnostic>, PolicyCoordinatorError> {
+    let Some(activation) = activation else {
+        return Ok(Vec::new());
+    };
+    if activation.workspace_models.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(runtime) = activation.outcome.runtime.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let active = match runtime {
+        SemanticModelRuntimeOutcome::Ready { active, .. } => active,
+        SemanticModelRuntimeOutcome::Incomplete { usable, .. } => {
+            let Some(active) = usable else {
+                return Ok(Vec::new());
+            };
+            active
+        }
+        SemanticModelRuntimeOutcome::Cancelled(_) | SemanticModelRuntimeOutcome::Unavailable(_) => {
+            return Ok(Vec::new());
+        }
+    };
+    let mut diagnostics = Vec::new();
+    for inactive in workspace_semantic_models_not_active(&activation.workspace_models, active) {
+        let source = Some(PolicySourceIdentity::new(&inactive.model.path));
+        let reason = inactive
+            .reason
+            .unwrap_or("the activation recorded no reason");
+        if inactive.awaits_review() {
+            diagnostics.push(workspace_model_warning(
+                format!(
+                    "the reviewed workspace semantic model `{}` is inert: {reason}. Name `{}` in \
+                     the `enable` list of {WORKSPACE_PACKS_DOCUMENT_PATH} to activate it.",
+                    inactive.model.path, inactive.model.pack_id
+                ),
+                source,
+            )?);
+        } else {
+            diagnostics.push(report_diagnostic(
+                PolicyReportDiagnosticCode::WorkspaceModelLoadFailed,
+                format!(
+                    "the reviewed workspace semantic model `{}` registered but did not activate: \
+                     {reason}",
+                    inactive.model.path
+                ),
+                source,
+                None,
+                Vec::new(),
+            )?);
+        }
+    }
+    Ok(diagnostics)
+}
+
+/// One report diagnostic that informs without condemning the run.
+///
+/// `report_diagnostic` mints errors, and an error makes a run unreliable. An
+/// inert review-gated model is not an error: the gate did its job, and the
+/// author still needs to see why the model contributed nothing.
+fn workspace_model_warning(
+    message: String,
+    source: Option<PolicySourceIdentity>,
+) -> Result<PolicyReportDiagnostic, PolicyCoordinatorError> {
+    PolicyReportDiagnostic::try_new(
+        PolicyReportDiagnosticCode::WorkspaceModelInert,
+        PolicyDiagnosticSeverity::Warning,
+        safe_report_text(message),
+        source,
+        None,
+        Vec::new(),
+    )
+    .map_err(|error| {
+        PolicyCoordinatorError::new(format!(
+            "failed to construct policy report diagnostic: {error}"
+        ))
+    })
 }
 
 fn record_active_shards(
@@ -1139,7 +1280,10 @@ fn evaluate_prepared_policy_inputs(
             ))
         })?;
         let project: Arc<dyn Project> = Arc::new(project);
-        Some(WorkspaceAnalyzer::build(project, AnalyzerConfig::default()))
+        Some(
+            WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build"),
+        )
     };
     if policy_deadline_reached(cancellation)? {
         return deadline_before_evaluation_outcome(
@@ -1178,55 +1322,81 @@ fn evaluate_prepared_policy_inputs(
     };
     let uncancelled = CancellationToken::default();
     let semantic_cancellation = cancellation.unwrap_or(&uncancelled);
-    // Document-driven pack activation runs only on the coordinator's own
+    // Workspace-driven pack activation runs only on the coordinator's own
     // analyzer: a supplied workspace belongs to a host that owns its own
     // activation lifecycle (LSP, MCP), and re-activating here would race it.
     // The diff-base run activates against its exported base tree inside
     // `evaluate_policy_diff_baseline` for the same ownership reason.
-    // The document-driven activation transaction is retained, not just
-    // projected into the review: its already-resolved runtime carries the
-    // procedure summaries the taint evaluator reads, so the CLI/document route
-    // reuses this one activation rather than opening a second (#1915). The
-    // declaration-facts strand (#1893) reaches the resolver through the overlay
-    // this same transaction publishes onto the owned analyzer.
-    let document_activation = match (&packs_config, owned_analyzer.as_ref()) {
-        (Some(config), Some(analyzer_workspace)) => {
-            match activate_workspace_packs(
+    // The activation transaction is retained, not just projected into the
+    // review: its already-resolved runtime carries the procedure summaries the
+    // taint evaluator reads, so the CLI route reuses this one activation rather
+    // than opening a second (#1915). The declaration-facts strand (#1893)
+    // reaches the resolver through the overlay this same transaction publishes
+    // onto the owned analyzer.
+    //
+    // Two sources feed the one transaction (#2493): the `.bifrost/packs.json`
+    // document, and the reviewed models the repository checked in at
+    // `.bifrost/semantic-models/`. The directory's presence is the opt-in for
+    // the second, so a policy that depends on a checked-in model runs from
+    // `bifrost --policy-file` alone.
+    let workspace_activation = match owned_analyzer.as_ref() {
+        Some(analyzer_workspace) => {
+            match activate_workspace_semantic_sources(
                 analyzer_workspace,
                 &AnalyzerConfig::default(),
-                root,
-                config,
+                WorkspaceActivationSources {
+                    catalog_root: root,
+                    workspace_model_root: Some(root),
+                    config: packs_config.as_ref(),
+                },
                 semantic_cancellation,
             ) {
                 Ok(activation) => Some(activation),
                 Err(error) => {
-                    secondary_diagnostics.push(report_diagnostic(
-                        PolicyReportDiagnosticCode::PackActivationFailed,
-                        format!("failed to activate workspace packs: {error}"),
-                        Some(PolicySourceIdentity::new(WORKSPACE_PACKS_DOCUMENT_PATH)),
-                        None,
-                        Vec::new(),
-                    )?);
+                    secondary_diagnostics.push(workspace_activation_diagnostic(&error)?);
                     None
                 }
             }
         }
-        _ => None,
+        None => None,
     };
-    let packs_review = match (&packs_config, document_activation.as_ref()) {
-        (Some(config), Some(activation)) => {
-            Some(pack_activation_review(config, activation.as_ref()))
-        }
-        _ => None,
+    let packs_review = match workspace_activation.as_ref() {
+        // The transaction ran and has something to audit.
+        Some(Some(activation)) => Some(pack_activation_review(
+            packs_config.as_ref(),
+            Some(activation),
+        )),
+        // The transaction ran and neither route contributed. A document still
+        // earns a review row so its opt-in stays auditable; a run with no
+        // document and no reviewed model keeps its exact schema-version-5
+        // shape and attaches nothing.
+        Some(None) => packs_config
+            .as_ref()
+            .map(|config| pack_activation_review(Some(config), None)),
+        // No coordinator-owned analyzer, or the transaction failed and already
+        // reported why.
+        None => None,
     };
+    // A registered workspace model that never reaches the active set is
+    // invisible, and an invisible model decides verdicts by its absence. The
+    // review gate is the one honest exception: a `review_required` model with
+    // no matching `enable` entry is inert by design, so it is reported as a
+    // warning the author can read rather than as a failed run.
+    for diagnostic in inactive_workspace_model_diagnostics(
+        workspace_activation
+            .as_ref()
+            .and_then(|activation| activation.as_ref()),
+    )? {
+        secondary_diagnostics.push(diagnostic);
+    }
     // The summaries an activated pack publishes reach taint only through
     // `PolicySemanticModelContext`. An API caller supplies that context; the
-    // CLI/document route supplies none, so without this strand an activated
-    // summary pack changed taint results for an API caller alone (#1915).
-    // Reuse the resolved runtime the document activation already built, exactly
-    // as an API caller would, and only when it is `Ready`: an incomplete
-    // activation must not silently model calls it never resolved.
-    let document_summary_models = document_activation
+    // CLI route supplies none, so without this strand an activated summary pack
+    // changed taint results for an API caller alone (#1915).
+    // Reuse the resolved runtime the activation already built, exactly as an
+    // API caller would, and only when it is `Ready`: an incomplete activation
+    // must not silently model calls it never resolved.
+    let document_summary_models = workspace_activation
         .as_ref()
         .and_then(|activation| activation.as_ref())
         .and_then(|activation| activation.outcome.runtime.as_ref())
@@ -1777,21 +1947,29 @@ fn evaluate_policy_diff_baseline(
                 "failed to build the diff base analyzer for `{revision}`: {error}"
             ))
         })?;
-    // The base activates the packs its own committed document names, the same
-    // way it loads its own committed suppressions (#1868). The catalog is
-    // machine-local infrastructure, not revision state, so its configured
-    // path resolves beneath the head workspace, where installed packs and
-    // generated productions already live. A malformed base document is not
-    // handled here: the base evaluation loads the same document, reports
-    // `packs-load-failed`, and the baseline degrades through the standard
-    // unreliability path.
-    if let Ok(Some(base_packs)) = load_workspace_packs_config_at(export.root()) {
+    // The base activates the packs its own committed document names and the
+    // reviewed semantic models its own tree checks in, the same way it loads
+    // its own committed suppressions (#1868, #2493). Both sides of the
+    // comparison therefore see the same model universe, so a model added or
+    // removed in the diff shows up as changed findings instead of as noise.
+    // The catalog is machine-local infrastructure, not revision state, so its
+    // configured path resolves beneath the head workspace, where installed
+    // packs and generated productions already live; the reviewed models come
+    // from the exported base tree, because they are revision state. A
+    // malformed base document is not handled here: the base evaluation loads
+    // the same document, reports `packs-load-failed`, and the baseline
+    // degrades through the standard unreliability path.
+    {
+        let base_packs = load_workspace_packs_config_at(export.root()).ok().flatten();
         let uncancelled = CancellationToken::default();
-        if let Err(error) = activate_workspace_packs(
+        if let Err(error) = activate_workspace_semantic_sources(
             &base_workspace,
             &AnalyzerConfig::default(),
-            head_root,
-            &base_packs,
+            WorkspaceActivationSources {
+                catalog_root: head_root,
+                workspace_model_root: Some(export.root()),
+                config: base_packs.as_ref(),
+            },
             cancellation.unwrap_or(&uncancelled),
         ) {
             return Ok(PolicyDiffBaseline {
@@ -2697,8 +2875,18 @@ fn report_exit_status(report: &PolicyReportDocument, threshold_exceeded: bool) -
             .suppressions()
             .iter()
             .any(PolicySuppressionReview::is_orphaned);
+    // A report diagnostic condemns the run when it is an error. Every load,
+    // parse, and activation failure is one, so this is the same rule the
+    // report has always applied. Advisory report diagnostics -- today only the
+    // inert reviewed workspace model (#2493) -- state a fact the author needs
+    // without claiming the run could not be trusted: whether an inert model
+    // matters is decided by the evaluation that runs without it, which reports
+    // its own incompleteness when it has any.
     let unreliable = report.execution().termination().is_some()
-        || !report.diagnostics().is_empty()
+        || report
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.severity() == PolicyDiagnosticSeverity::Error)
         || report.diagnostics_truncated()
         || report
             .runs()
@@ -3317,7 +3505,8 @@ mod tests {
 
         let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
         let project: Arc<dyn Project> = Arc::new(project);
-        let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
         let live_source = match_policy("test.unsaved", "Unsaved source");
 
         let outcome = evaluate_policy_source(
@@ -3354,7 +3543,8 @@ mod tests {
             .expect("source fixture");
         let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
         let project: Arc<dyn Project> = Arc::new(project);
-        let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
         let endpoint = r#"(endpoint
   :id "endpoint.input"
   :name "Input"
@@ -3400,7 +3590,8 @@ mod tests {
             .expect("source fixture");
         let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
         let project: Arc<dyn Project> = Arc::new(project);
-        let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
         let cancellation = CancellationToken::default();
         cancellation.cancel();
 
@@ -3426,7 +3617,8 @@ mod tests {
             .expect("source fixture");
         let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
         let project: Arc<dyn Project> = Arc::new(project);
-        let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
         let cancellation = CancellationToken::timeout_after_checks_for_test(9);
 
         let outcome = evaluate_policy_source(
@@ -3467,7 +3659,8 @@ mod tests {
             .expect("source fixture");
         let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
         let project: Arc<dyn Project> = Arc::new(project);
-        let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
         let cancellation = CancellationToken::default().with_timeout(std::time::Duration::ZERO);
 
         let outcome = evaluate_policy_source(
@@ -3575,7 +3768,8 @@ mod tests {
             .expect("source fixture");
         let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
         let project: Arc<dyn Project> = Arc::new(project);
-        let analyzer = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
         let cancellation = CancellationToken::default().with_timeout(std::time::Duration::ZERO);
         cancellation.cancel();
 

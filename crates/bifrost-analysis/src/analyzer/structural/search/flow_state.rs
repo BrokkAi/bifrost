@@ -390,6 +390,11 @@ fn state_event_ref(
     }
 }
 
+/// The value domain the `state_event.completeness` and
+/// `flow_relation.completeness` row fields publish, minted by
+/// [`axis_completeness_label`] (issue #2515).
+pub(super) const FLOW_STATE_COMPLETENESS_LABELS: &[&str] = &["complete", "partial"];
+
 /// `complete` exactly when the derivation answers *this row's own axis*;
 /// otherwise `partial`. A row whose family was fully enumerated is not made
 /// partial by a hole in an unrelated axis, and `uncovered_axes` still names

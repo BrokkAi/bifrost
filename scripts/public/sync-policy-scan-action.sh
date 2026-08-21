@@ -9,9 +9,13 @@
 #     uses: BrokkAi/bifrost/.github/actions/policy-scan@vX.Y.Z
 #
 # The canonical source stays at .github/actions/policy-scan/action.yml in
-# this repository. This script publishes a verbatim copy with one rewrite:
-# the `version` input default becomes the release tag being published, so
-# the alias at any tag installs its own matching Bifrost binary by default.
+# this repository. This script publishes a copy with two rewrites, both
+# turning a version literal into the release tag being published: the
+# `version` input default, so the alias at any tag installs its own matching
+# Bifrost binary by default, and the README's pinned-usage example, so the
+# tag it tells a reader to pin is the tag they are reading. Both literals
+# would otherwise ship one release stale -- v0.10.5 shipped a README saying
+# to pin @v0.10.4, which is the front page of the Marketplace listing.
 #
 # The alias repository receives one commit per release, the exact release
 # tag as a lightweight tag, and a force-moved floating major tag (v0, v1,
@@ -28,6 +32,10 @@
 #   POLICY_SCAN_ALIAS_REPO  owner/name (default BrokkAi/bifrost-policy-scan)
 #   POLICY_SCAN_ALIAS_URL   full clone URL override; local tests point this
 #                           at a file:// bare repository
+#   GITHUB_OUTPUT           when set, receives is_newest and target_commit, so
+#                           the release step can reuse this run's decision about
+#                           which release consumers follow instead of deriving
+#                           it a second time
 set -euo pipefail
 
 RELEASE_TAG="${RELEASE_TAG:?RELEASE_TAG is required (vX.Y.Z)}"
@@ -62,18 +70,39 @@ cp .github/actions/policy-scan/action.yml "${stage}/action.yml"
 cp packaging/policy-scan-action/README.md "${stage}/README.md"
 cp LICENSE.md "${stage}/LICENSE.md"
 
-# Pin the `version` input default to the release being published. The
-# version input is the only input whose default is a release tag, so the
-# rewrite requires exactly one matching line before and after.
-default_pattern='^    default: v[0-9][0-9.]*$'
-matches="$(grep -c "${default_pattern}" "${stage}/action.yml" || true)"
-if [ "${matches}" != 1 ]; then
-  echo "expected exactly one version default line in action.yml, found ${matches}" >&2
-  exit 1
-fi
-sed -i.bak "s/${default_pattern}/    default: ${RELEASE_TAG}/" "${stage}/action.yml"
-rm -f "${stage}/action.yml.bak"
-grep -q "^    default: ${RELEASE_TAG}\$" "${stage}/action.yml"
+# Rewrite each version literal to the release being published. Both are
+# required to match exactly once before and after: a canonical file that
+# grew a second version literal, or lost this one, must fail the release
+# rather than publish a copy that silently points at the wrong release.
+rewrite_one() {
+  local file=$1 pattern=$2 replacement=$3 label=$4 matches
+  matches="$(grep -c "${pattern}" "${file}" || true)"
+  if [ "${matches}" != 1 ]; then
+    echo "expected exactly one ${label} in $(basename "${file}"), found ${matches}" >&2
+    exit 1
+  fi
+  sed -i.bak "s|${pattern}|${replacement}|" "${file}"
+  rm -f "${file}.bak"
+  matches="$(grep -c -- "${replacement}" "${file}" || true)"
+  if [ "${matches}" != 1 ]; then
+    echo "rewriting the ${label} in $(basename "${file}") did not produce exactly one ${RELEASE_TAG}" >&2
+    exit 1
+  fi
+}
+
+# The version input is the only input whose default is a release tag.
+rewrite_one "${stage}/action.yml" \
+  '^    default: v[0-9][0-9.]*$' \
+  "    default: ${RELEASE_TAG}" \
+  'version default'
+
+# The README's pinned-usage example. The quick start deliberately uses the
+# floating major tag and must not be rewritten, so the pattern matches the
+# exact-tag form only.
+rewrite_one "${stage}/README.md" \
+  '^      - uses: BrokkAi/bifrost-policy-scan@v[0-9][0-9.]*\.[0-9][0-9.]*$' \
+  "      - uses: BrokkAi/bifrost-policy-scan@${RELEASE_TAG}" \
+  'pinned usage example'
 
 clone="${stage}/alias-repo"
 git clone --depth 1 "${ALIAS_URL}" "${clone}"
@@ -143,6 +172,13 @@ else
   else
     git -C "${clone}" push origin "refs/tags/${RELEASE_TAG}"
   fi
+fi
+
+if [ -n "${GITHUB_OUTPUT:-}" ]; then
+  {
+    echo "is_newest=${is_newest}"
+    echo "target_commit=${target_commit}"
+  } >> "${GITHUB_OUTPUT}"
 fi
 
 if [ "${is_newest}" != 1 ]; then

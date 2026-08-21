@@ -161,6 +161,36 @@ fn gap_impacts_heap(gap: &SemanticGap) -> bool {
         || gap.impacts.contains(SemanticGapImpact::Aliasing)
 }
 
+/// Whether `gap` can open a heap, alias, or points-to answer at all.
+///
+/// An adapter's implicit-abort gap states that a runtime operation's edge to
+/// the exceptional exit is not lowered. Heap and points-to answers are may
+/// analyses, so a missing edge can only remove paths from them -- unless a
+/// handler or cleanup body on some abort path runs user code, which is the one
+/// way the removed path could have carried a store. That is exactly the rule
+/// the value-flow plan already applies to the same gap (#1952); applying it
+/// here keeps one rule instead of two, and stops an adapter that scopes its
+/// implicit-abort gap to the program point, as JavaScript, C# and Python do,
+/// from opening every traced value in the procedure (#2495).
+///
+/// `abort_user_code` memoizes the CFG walk: the answer is a property of the
+/// procedure, and most gaps never reach the question.
+fn gap_can_open_heap(
+    procedure: &ProcedureHandle,
+    gap: &SemanticGap,
+    abort_user_code: &mut Option<bool>,
+) -> bool {
+    if !gap_impacts_heap(gap) {
+        return false;
+    }
+    if gap.capability != SemanticCapability::ExceptionalControlFlow {
+        return true;
+    }
+    let user_code = *abort_user_code
+        .get_or_insert_with(|| super::abort_paths_run_user_code(procedure.semantics()));
+    !super::implicit_abort_gap_is_discharged(gap, user_code)
+}
+
 fn heap_gaps_are_open(
     procedure: &ProcedureHandle,
     staged: &mut WorkStager,
@@ -168,6 +198,7 @@ fn heap_gaps_are_open(
     mut relevant: impl FnMut(&SemanticGap) -> bool,
 ) -> Result<bool, Interruption> {
     let mut open = false;
+    let mut abort_user_code = None;
     for gap in procedure.semantics().gaps() {
         if cancellation.is_cancelled() {
             return Err(Interruption::Cancelled);
@@ -176,7 +207,7 @@ fn heap_gaps_are_open(
             gaps: 1,
             ..SemanticWork::default()
         })?;
-        open |= relevant(gap) && gap_impacts_heap(gap);
+        open |= relevant(gap) && gap_can_open_heap(procedure, gap, &mut abort_user_code);
     }
     Ok(open)
 }
@@ -805,6 +836,7 @@ fn resolve_objects(
     let mut drafts = Vec::new();
     let mut truncated = false;
     let mut ambiguous = false;
+    let mut abort_user_code = None;
 
     while let Some((state, inherited_evidence)) = stack.pop() {
         if cancellation.is_cancelled() {
@@ -848,7 +880,7 @@ fn resolve_objects(
                         "semantic gap event has a stale gap ID",
                     ))
                 })?;
-                if gap_impacts_heap(gap)
+                if gap_can_open_heap(procedure, gap, &mut abort_user_code)
                     && traced_gap_affects_value(procedure, gap, state.value, staged, cancellation)?
                     && !constructor_allocation_identity_discharges_gap(
                         procedure.semantics(),

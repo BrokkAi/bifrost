@@ -38,7 +38,7 @@ use super::model::{
 };
 
 /// The selector path a match policy's one selector always occupies.
-const MATCH_SELECTOR_PATH: &str = "/analysis/selector";
+pub(super) const MATCH_SELECTOR_PATH: &str = "/analysis/selector";
 
 /// Explain why one explicit candidate is not reported, choosing the adapter
 /// from the loaded policy's analysis.
@@ -483,7 +483,7 @@ pub(super) fn run_prefixes(
 /// diagnostic codes through the evaluator's existing code-to-reason mapping,
 /// so a `why-not` answer names incompleteness in the same vocabulary a run
 /// does.
-fn absence_reasons(
+pub(super) fn absence_reasons(
     completion: &CodeQueryCompletion,
     truncated: bool,
 ) -> Vec<PolicyIncompleteReason> {

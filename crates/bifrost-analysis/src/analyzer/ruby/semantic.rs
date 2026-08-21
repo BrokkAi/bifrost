@@ -19,7 +19,7 @@ use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapte
 use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
 use crate::analyzer::tree_walk::named_children;
-use crate::analyzer::{Language, ProjectFile, Range, RubyAnalyzer};
+use crate::analyzer::{Language, ProjectFile, RubyAnalyzer};
 use crate::hash::HashMap;
 
 const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v3";
@@ -1203,14 +1203,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         self.receiver = Some(receiver);
         self.parameters.insert("self".into(), receiver);
 
-        let declaration_range = node_range(callable);
-        let layout = formal_parameter_slots_for_owner(
-            Language::Ruby,
-            callable,
-            self.source,
-            &declaration_range,
-        )
-        .unwrap_or_default();
+        let layout = formal_parameter_slots_for_owner(Language::Ruby, callable, self.source)
+            .unwrap_or_default();
         let mut ordinal = 0_u32;
         for slot in layout.slots {
             if self.session.cancellation().is_cancelled() {
@@ -4133,15 +4127,6 @@ fn ruby_constructor_call(node: Node<'_>, source: &str) -> bool {
     }
     node.child_by_field_name("receiver")
         .is_some_and(|receiver| matches!(receiver.kind(), "constant" | "scope_resolution"))
-}
-
-fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
-    }
 }
 
 #[cfg(test)]

@@ -821,7 +821,14 @@ struct SarifInvocation<'a> {
 
 impl<'a> SarifInvocation<'a> {
     fn from_report(report: &'a PolicyReportDocument) -> Self {
-        let execution_successful = report.diagnostics().is_empty()
+        // The same rule the exit status uses: an error report diagnostic means
+        // the run cannot be trusted, an advisory one states a fact the reader
+        // needs. Both are still published as notifications; only the verdict
+        // differs, so `executionSuccessful` and the process exit code agree.
+        let execution_successful = report
+            .diagnostics()
+            .iter()
+            .all(|diagnostic| diagnostic.severity() != PolicyDiagnosticSeverity::Error)
             && !report.diagnostics_truncated()
             && report
                 .runs()

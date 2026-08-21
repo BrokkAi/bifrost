@@ -13,7 +13,7 @@ use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
 use crate::analyzer::tree_walk::{named_children, subtree_contains};
-use crate::analyzer::{DispatchExtensibility, Language, ProjectFile, Range, ScalaAnalyzer};
+use crate::analyzer::{DispatchExtensibility, Language, ProjectFile, ScalaAnalyzer};
 use crate::hash::HashMap;
 use std::sync::Arc;
 
@@ -756,14 +756,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         callable: Node<'tree>,
         procedure_kind: ProcedureKind,
     ) -> Result<(), ScalaLoweringError> {
-        let declaration_range = node_range(callable);
-        let layout = formal_parameter_slots_for_owner(
-            Language::Scala,
-            callable,
-            self.prepared.source(),
-            &declaration_range,
-        )
-        .unwrap_or_default();
+        let layout =
+            formal_parameter_slots_for_owner(Language::Scala, callable, self.prepared.source())
+                .unwrap_or_default();
         let mut ordinal = 0_u32;
         for slot in layout.slots {
             if self.session.cancellation().is_cancelled() {
@@ -3020,15 +3015,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), ScalaLoweringError> {
         self.session
             .add_edge(builder, source_point, target.point, target.kind)
-    }
-}
-
-fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
     }
 }
 

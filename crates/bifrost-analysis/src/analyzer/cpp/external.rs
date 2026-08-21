@@ -1248,7 +1248,8 @@ mod tests {
             .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
             .expect("database");
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
-        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
         let cancellation = CancellationToken::new();
         let start = source.find("push_back").expect("member start");
         let request = || DefinitionLookupRequest {

@@ -464,10 +464,11 @@ mod tests {
             let file = ProjectFile::new(root.clone(), relative_path);
             file.write(source).expect("write fixture source");
             let project = TestProject::new(root, language);
-            let workspace = WorkspaceAnalyzer::build(
+            let workspace = WorkspaceAnalyzer::build_ephemeral(
                 Arc::new(project) as Arc<dyn Project>,
                 AnalyzerConfig::default(),
-            );
+            )
+            .expect("ephemeral workspace should build");
             Self {
                 _temp: temp,
                 workspace,

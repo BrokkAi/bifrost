@@ -78,6 +78,42 @@ impl Language {
         Language::Kotlin,
     ];
 
+    /// Every language variant, including [`Language::None`], which a file
+    /// outside the analyzable set still carries.
+    pub const ALL: [Self; 13] = [
+        Language::None,
+        Language::Java,
+        Language::Go,
+        Language::Cpp,
+        Language::JavaScript,
+        Language::TypeScript,
+        Language::Python,
+        Language::Rust,
+        Language::Php,
+        Language::Scala,
+        Language::CSharp,
+        Language::Ruby,
+        Language::Kotlin,
+    ];
+
+    /// The value domain every `language` row field publishes (issue #2515),
+    /// in [`Language::ALL`] order. Pinned against the enum by a unit test.
+    pub const CONFIG_LABELS: &'static [&'static str] = &[
+        "none",
+        "java",
+        "go",
+        "cpp",
+        "javascript",
+        "typescript",
+        "python",
+        "rust",
+        "php",
+        "scala",
+        "csharp",
+        "ruby",
+        "kotlin",
+    ];
+
     pub fn config_label(self) -> &'static str {
         match self {
             Language::None => "none",
@@ -327,6 +363,27 @@ impl CodeUnitType {
     /// Lowercase English label suitable for inline use in human-facing
     /// report sentences (e.g. "large class spans 423 lines"). Distinct from
     /// the on-disk persistence label so the two evolve independently.
+    /// The value domain the declaration `kind` and `unit_kind` row fields
+    /// draw on when no normalized structural kind refined them (issue #2515).
+    /// Pinned against the enum by a unit test.
+    pub const DISPLAY_LOWERCASE_LABELS: &'static [&'static str] = &[
+        "class",
+        "function",
+        "field",
+        "module",
+        "macro",
+        "file scope",
+    ];
+
+    pub const ALL: [Self; 6] = [
+        CodeUnitType::Class,
+        CodeUnitType::Function,
+        CodeUnitType::Field,
+        CodeUnitType::Module,
+        CodeUnitType::Macro,
+        CodeUnitType::FileScope,
+    ];
+
     pub fn display_lowercase(&self) -> &'static str {
         match self {
             CodeUnitType::Class => "class",
@@ -3710,6 +3767,44 @@ impl IntoIterator for SemanticDiagnosticReport {
 
     fn into_iter(self) -> Self::IntoIter {
         self.diagnostics.into_iter()
+    }
+}
+
+/// The published value domains of the `language` and `unit_kind` row fields are
+/// hand-written label lists, because neither `config_label` nor
+/// `display_lowercase` can be mapped over its enum in a const. These tests pin
+/// each list to the function it mirrors (issue #2515).
+#[cfg(test)]
+mod value_domain_tests {
+    use super::*;
+
+    #[test]
+    fn every_language_config_label_is_published_in_variant_order() {
+        let mapped = Language::ALL
+            .iter()
+            .map(|language| language.config_label())
+            .collect::<Vec<_>>();
+        assert_eq!(mapped, Language::CONFIG_LABELS);
+        for language in Language::ANALYZABLE {
+            assert!(Language::ALL.contains(&language), "{language:?}");
+        }
+        // `none` is a published value a row can carry, but it names no
+        // analyzable language, so only the analyzable labels round-trip.
+        for language in Language::ANALYZABLE {
+            assert_eq!(
+                Language::from_config_label(language.config_label()),
+                Some(language)
+            );
+        }
+    }
+
+    #[test]
+    fn every_code_unit_kind_label_is_published_in_variant_order() {
+        let mapped = CodeUnitType::ALL
+            .iter()
+            .map(CodeUnitType::display_lowercase)
+            .collect::<Vec<_>>();
+        assert_eq!(mapped, CodeUnitType::DISPLAY_LOWERCASE_LABELS);
     }
 }
 

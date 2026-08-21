@@ -612,14 +612,11 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
 
     fn seed_parameter_shadows(&mut self, callable: Node<'_>) {
         let provider = self.provider;
-        let layout = formal_parameter_slots_for_owner_bounded(
-            Language::Ruby,
-            callable,
-            self.source,
-            &ruby_node_range(callable),
-            || provider.scope_step(),
-        )
-        .unwrap_or_default();
+        let layout =
+            formal_parameter_slots_for_owner_bounded(Language::Ruby, callable, self.source, || {
+                provider.scope_step()
+            })
+            .unwrap_or_default();
         let Some(locals) = self.local_scopes.last_mut() else {
             return;
         };

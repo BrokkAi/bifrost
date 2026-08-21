@@ -63,6 +63,10 @@ pub(crate) enum ReceiverQueryInput {
 }
 
 impl ReceiverQueryOperation {
+    /// The value domain the `analysis_kind` row fields publish (issue #2515).
+    pub(crate) const LABELS: &'static [&'static str] =
+        &["receiver_targets", "points_to", "member_targets"];
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ReceiverTargets => "receiver_targets",

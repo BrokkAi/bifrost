@@ -30,14 +30,17 @@ const MATCH_SELECTOR_PATH: &str = "/analysis/selector";
 ///
 /// - `match` evidence projects through [`explain_match_finding`];
 /// - `assertion` evidence -- including every relational assertion -- projects
-///   through [`super::why_assertion::explain_assertion_finding`].
+///   through [`super::why_assertion::explain_assertion_finding`];
+/// - `flow` and `taint` evidence project through the two entry points of
+///   [`super::why_flow`], which read the witness paths, origins, certainty,
+///   proof and completeness the run retained.
 ///
 /// # Errors
 ///
 /// - [`ExplainError::FindingNotFound`] when the run retains no finding with
 ///   this identity.
-/// - [`ExplainError::ExplanationAdapterUnavailable`] for a `taint`, `flow`, or
-///   `typestate` finding. The error names the families that *are* supported.
+/// - [`ExplainError::ExplanationAdapterUnavailable`] for a `typestate`
+///   finding. The error names the families that *are* supported.
 /// - [`ExplainError::BudgetExhausted`] when `limits` cannot hold even a root.
 pub fn explain_finding(
     run: &PolicyRun,
@@ -49,6 +52,12 @@ pub fn explain_finding(
         PolicyFindingEvidence::Match { .. } => explain_match_finding(run, finding_id, limits),
         PolicyFindingEvidence::Assertion { evidence } => {
             super::why_assertion::explain_assertion_finding(run, finding, evidence, limits)
+        }
+        PolicyFindingEvidence::Flow { evidence } => {
+            super::why_flow::explain_flow_finding(run, finding, evidence, limits)
+        }
+        PolicyFindingEvidence::Taint { evidence } => {
+            super::why_flow::explain_taint_finding(run, finding, evidence, limits)
         }
         other => Err(ExplainError::adapter_unavailable(
             other.analysis_type(),

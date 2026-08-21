@@ -194,6 +194,21 @@ test("GitHub release recovery uses fail-closed curl status handling", () => {
   assert.match(release, /Unexpected GitHub release lookup status/u);
 });
 
+test("GitHub releases use the exact curated changelog entry", () => {
+  const releaseJob = jobBlock(release, "release");
+  assert.match(
+    releaseJob,
+    /node scripts\/public\/extract-changelog-entry\.mjs[\s\S]{0,200}--version "\$RELEASE_VERSION"[\s\S]{0,100}--require-date/u,
+  );
+  assert.match(releaseJob, /body_path: \$\{\{ runner\.temp \}\}\/release-notes\.md/u);
+  assert.match(releaseJob, /generate_release_notes: false/u);
+  assert.doesNotMatch(releaseJob, /generate_release_notes: true/u);
+  assert.match(
+    readiness,
+    /Validate curated release notes[\s\S]{0,300}extract-changelog-entry\.mjs[\s\S]{0,200}--require-date/u,
+  );
+});
+
 test("promotion is byte-only and does not rebuild, package, or repack", () => {
   for (const workflow of [release, cratePublisher]) {
     for (const forbidden of [

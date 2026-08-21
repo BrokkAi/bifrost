@@ -61,7 +61,7 @@ The client indexes on first use, keeps the index warm for the session, and watch
 
 `SearchToolsClient.refresh()` forces a full rebuild. Query methods already apply watcher-detected file changes automatically, so treat `refresh()` as a recovery or explicit full-rescan operation rather than a step before every request.
 
-Use `manual=True` with `update_paths(...)` when the caller wants to control incremental updates explicitly.
+Use `manual=True` with `update_paths(...)` when the caller wants to control incremental updates explicitly. Manual sessions reuse the repository's persisted analyzer cache; linked Git worktrees share the primary worktree's cache.
 
 ## Methods
 

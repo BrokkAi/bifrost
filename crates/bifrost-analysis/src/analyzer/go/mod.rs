@@ -53,7 +53,7 @@ use brokk_bifrost_go::graph::resolver::{GoEdgeIndex, GoGraphSource, build_go_edg
 use brokk_bifrost_go::hierarchy::GoHierarchyIndex;
 pub(crate) use brokk_bifrost_go::packages;
 pub(crate) use brokk_bifrost_go::packages::GO_MODULE_SCOPE_SEGMENT;
-use brokk_bifrost_go::packages::canonical_go_package_name;
+use brokk_bifrost_go::packages::{canonical_go_package_name, invalidate_nearest_go_module_cache};
 use brokk_bifrost_go::test_detection::detect_go_test_assertion_smells;
 use cache::GoMemoCaches;
 use clones::build_go_clone_candidate_data;
@@ -595,6 +595,7 @@ impl IAnalyzer for GoAnalyzer {
 
     fn invalidate_cached_file_identities(&self) {
         self.inner.invalidate_cached_file_identities();
+        invalidate_nearest_go_module_cache();
     }
 
     fn working_tree_identity(&self) -> Option<std::sync::Arc<crate::gitblob::WorkingTreeIdentity>> {

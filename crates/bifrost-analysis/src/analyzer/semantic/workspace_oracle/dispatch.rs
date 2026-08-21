@@ -273,6 +273,18 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
         let mut final_candidates_truncated = false;
         let mut cancelled_targets_truncated = false;
         let mut materialization_quality = DispatchQuality::Complete;
+        // #2480: whether every concrete (materialized-body) match this call
+        // resolved to has a class-hierarchy-proven *empty* override set. A
+        // concrete match starts this `true`; it becomes `false` the moment
+        // any matched declaration's override set is unproven or non-empty.
+        // Distinct from `hierarchy_expansion().concrete_overrides` (#2277),
+        // which controls whether a *non-empty* proven override set widens the
+        // candidate list with `Unproven` entries -- a precision question this
+        // wave does not touch. Proving the set empty is not a precision
+        // question: an empty, proven override set cannot select a different
+        // target, so it is sound to trust regardless of that flag.
+        let mut concrete_overrides_proven_absent = true;
+        let mut matched_concrete_groups = false;
         let exploration_exceeded = lookup.truncated.then(|| {
             request
                 .budget
@@ -522,31 +534,60 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                 // of a body-less declaration, so the answer says "the callee
                 // the types name runs, and these overrides could run instead"
                 // and never claims a proven edge to an override.
-                if complete_materialization && self.hierarchy_expansion().concrete_overrides {
+                //
+                // #2480: the class-hierarchy question is asked here
+                // unconditionally (not just under `concrete_overrides`) so a
+                // *proven-empty* answer can discharge the call's own
+                // "may select an override" gap below. This mirrors
+                // `virtual_dispatch_implementor_targets`'s other caller (the
+                // body-less arm), which already asks unconditionally. Only
+                // *acting* on a non-empty answer by widening the candidate
+                // set stays behind the flag.
+                if complete_materialization {
                     if staged_request.charge_execution_traversal(1) {
-                        if let Some(overrides) = virtual_dispatch_implementor_targets(
+                        matched_concrete_groups = true;
+                        match virtual_dispatch_implementor_targets(
                             self.workspace.analyzer(),
                             &group.representative,
                             request.cancellation,
                         ) {
-                            for overriding in overrides {
-                                if queued_declarations.insert(overriding.clone()) {
-                                    target_groups.push_back(DispatchTargetGroup {
-                                        representative: overriding,
-                                        proof: UsageProof::Unproven,
-                                    });
+                            Some(overrides) if overrides.is_empty() => {
+                                // Proven: no workspace declaration overrides
+                                // this member. `concrete_overrides_proven_absent`
+                                // stays true.
+                            }
+                            Some(overrides) => {
+                                concrete_overrides_proven_absent = false;
+                                if self.hierarchy_expansion().concrete_overrides {
+                                    for overriding in overrides {
+                                        if queued_declarations.insert(overriding.clone()) {
+                                            target_groups.push_back(DispatchTargetGroup {
+                                                representative: overriding,
+                                                proof: UsageProof::Unproven,
+                                            });
+                                        }
+                                    }
                                 }
+                            }
+                            None => {
+                                // The question does not apply or the member
+                                // family is unproven: the override set is not
+                                // established either way.
+                                concrete_overrides_proven_absent = false;
                             }
                         }
                     } else {
                         // The expansion could not be charged, so the target set
-                        // is knowingly short of the overrides that could run.
-                        // Say so instead of answering as if the hierarchy had
-                        // been consulted.
-                        materialization_quality = merge_dispatch_quality(
-                            materialization_quality,
-                            DispatchQuality::Truncated,
-                        );
+                        // is knowingly short of the overrides that could run,
+                        // and the empty-override proof this call would have
+                        // needed to discharge its dispatch gap was not taken.
+                        concrete_overrides_proven_absent = false;
+                        if self.hierarchy_expansion().concrete_overrides {
+                            materialization_quality = merge_dispatch_quality(
+                                materialization_quality,
+                                DispatchQuality::Truncated,
+                            );
+                        }
                     }
                 }
             } else if interruption.is_none() {
@@ -654,6 +695,12 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                     lookup.status == Some(DefinitionLookupStatus::Resolved),
                     materialization_quality,
                     gap,
+                )
+                && !concrete_overrides_proven_absent_discharges_gap(
+                    &candidates,
+                    gap,
+                    matched_concrete_groups,
+                    concrete_overrides_proven_absent,
                 )
         });
         let gap_exceeded = call_dispatch_gap
@@ -1000,6 +1047,47 @@ fn closed_dispatch_discharges_gap(candidates: &[DispatchCandidate], gap: &Semant
                 .dispatch_extensibility
                 == DispatchExtensibility::Closed
         })
+}
+
+/// Whether a class-hierarchy-proven *empty* override set discharges a call's
+/// dynamic-dispatch gap, for an overridable (non-final, non-private,
+/// non-static) concrete method (#2480).
+///
+/// `closed_dispatch_discharges_gap` only answers the structural half: a
+/// `final`/`private`/`static` member cannot be overridden, so its call sites
+/// never carry a residual dispatch arm. An ordinary overridable instance
+/// method called on a same-class or same-object receiver -- `doPost(...)`
+/// inside `doGet`'s own body, say -- is `DispatchExtensibility::Open`
+/// regardless of whether any override actually exists, so that predicate
+/// never discharges it, and the call's own "may select an override" gap
+/// (added unconditionally at Java-adapter lowering) stays open on every such
+/// call in the corpus.
+///
+/// The class-hierarchy answer this call's own resolution already computed
+/// (`concrete_overrides_proven_absent` in `resolve_call`, independent of the
+/// `concrete_overrides` widen flag) closes exactly that residual honestly: if
+/// class-hierarchy analysis *proves* the override set of every concrete match
+/// is empty, no other target could have run, so the single retained candidate
+/// is the whole answer. This can only discharge more, never select a
+/// different target: an empty proven set contributes no candidate of its own,
+/// so a wrong answer here would require `virtual_dispatch_implementor_targets`
+/// itself to be unsound, which is the same proof #2205 and #2371 already rely
+/// on for the body-less and external-interface cases.
+///
+/// `matched_concrete_groups` guards against the vacuous case where no
+/// concrete match happened at all (`concrete_overrides_proven_absent` starts
+/// `true` and is never touched): a call resolved only through a body-less
+/// declaration, or not resolved at all, must not discharge here.
+fn concrete_overrides_proven_absent_discharges_gap(
+    candidates: &[DispatchCandidate],
+    gap: &SemanticGap,
+    matched_concrete_groups: bool,
+    concrete_overrides_proven_absent: bool,
+) -> bool {
+    gap.capability == SemanticCapability::DynamicDispatch
+        && !candidates.is_empty()
+        && matched_concrete_groups
+        && concrete_overrides_proven_absent
 }
 
 /// Whether a statically proven target set discharges an avoidable per-call

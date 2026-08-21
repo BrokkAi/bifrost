@@ -1909,10 +1909,11 @@ mod tests {
         );
         let expected = distinct_definitions(fresh, token, fresh_definitions);
 
-        let reopened = WorkspaceAnalyzer::build(
+        let reopened = WorkspaceAnalyzer::build_ephemeral(
             Arc::new(fixture.test_project().clone()),
             AnalyzerConfig::default(),
-        );
+        )
+        .expect("ephemeral workspace should build");
         let analyzer = reopened.analyzer();
         let definitions: Vec<_> = analyzer.definitions(lookup).collect();
         assert_eq!(
@@ -2258,10 +2259,11 @@ mod tests {
         let initial = fixture.analyzer.analyzer();
         assert_eq!(2, initial.definitions("compute").count());
 
-        let reopened = WorkspaceAnalyzer::build(
+        let reopened = WorkspaceAnalyzer::build_ephemeral(
             Arc::new(fixture.test_project().clone()),
             AnalyzerConfig::default(),
-        );
+        )
+        .expect("ephemeral workspace should build");
         let analyzer = reopened.analyzer();
         let cpp = resolve_analyzer::<CppAnalyzer>(analyzer).expect("C++ analyzer");
         let definitions: Vec<_> = analyzer.definitions("compute").collect();

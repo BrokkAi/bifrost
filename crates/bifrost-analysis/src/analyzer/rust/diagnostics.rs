@@ -42,7 +42,7 @@ pub(crate) fn collect_rust_semantic_diagnostics(
         );
         return report;
     };
-    let support = analyzer.global_usage_definition_index();
+    let support = crate::analyzer::AnalyzerDefinitionLookup::new(analyzer, Language::None);
     let external = RetainedRustDependencies {
         overlay: analyzer.semantic_model_overlay(),
         discovery: analyzer.dependency_discovery_evidence(Language::Rust),

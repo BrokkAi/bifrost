@@ -67,6 +67,24 @@ impl DispatchTargetValue {
     }
 }
 
+/// The value domain the `dispatch_outcome.outcome` row field publishes. The
+/// labels are minted by the semantic seam's own outcome match rather than by a
+/// typed vocabulary, so the set is recorded here beside the field that carries
+/// it (issue #2515).
+pub(super) const DISPATCH_OUTCOME_LABELS: &[&str] = &[
+    "resolved",
+    "ambiguous",
+    "unknown",
+    "unsupported",
+    "unproven",
+    "exceeded_budget",
+    "cancelled",
+];
+
+/// The value domain the `dispatch_target.dispatch` row field publishes, minted
+/// by [`DispatchSiteAnswer::dispatch_label`].
+pub(super) const DISPATCH_ARM_LABELS: &[&str] = &["proven_dispatch", "may_dispatch"];
+
 /// One site's dispatch answer, already reduced to the row vocabulary.
 ///
 /// Every field is the oracle's own statement. Nothing here is re-derived from

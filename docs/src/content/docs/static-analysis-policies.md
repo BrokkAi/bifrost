@@ -951,7 +951,10 @@ tests/fixtures/policy-substrate-p0/
   flow/java/finding/App.java                        one proven violating path
   flow/java/clean/App.java                          validated directly and through a helper
   flow/java/unreliable/App.java                     an unresolvable wrapper
-  flow/python/                                      positional and named argument syntax
+  flow/python/api.py                                the same APIs and near miss, `@final`
+  flow/python/finding_app.py                        one proven violating path
+  flow/python/clean_app.py                          validated directly, plus the near miss
+  flow/python/inconclusive_app.py                   the two shapes Python cannot conclude
   effects/java/api/                                 the @Pure marker and the modeled API
   effects/java/finding/App.java                     a direct and a transitive effect
   effects/java/clean/App.java                       a proven-clean call graph
@@ -996,16 +999,17 @@ The invariant: every value `AcmeStore.put` stores must have been established by
 ;
 ; Actual-to-formal binding
 ; ------------------------
-; The observation binds `(argument :index 0)`, which is the operand of the
-; selected call, not the operand of a formal named `value`. The analyzer does
-; publish the actual-to-formal relation -- `(call-input :parameter-name "value"
-; (call-sites-to ...))` returns the actual bound to formal `value` for both
-; positional and named syntax -- but the value-flow port resolver still cannot
-; spell `(argument :name ...)`; see the milestone-6 entry in
-; `.agents/plans/issue-2433-policy-substrate.md`. Selecting through
-; `call-input` and binding `matched-value` is also not a substitute: when the
-; actual is itself a call, `call-input` names that inner call exactly and the
-; port then binds the inner call's operand.
+; The observation binds `(argument :name "value")`, the formal `AcmeStore.put`
+; declares, not `(argument :index 0)`, the ordinal the call happens to write it
+; at. The port resolves the name through the caller/callee binding of the
+; selected call, so it names the same operand whether the call is written
+; positionally, as Java writes it here, or by keyword, as the Python edition of
+; this policy writes it. `issue_2496_named_flow_port.rs` pins that the two
+; spellings report the same sites on this tree.
+;
+; Selecting through `call-input` and binding `matched-value` is still not a
+; substitute: when the actual is itself a call, `call-input` names that inner
+; call exactly and the port then binds the inner call's operand.
 ;
 ; Unmodeled calls stay paranoid so a call whose body the analyzer cannot see
 ; still propagates. The abstention fixture runs the same rule with
@@ -1043,7 +1047,7 @@ The invariant: every value `AcmeStore.put` stores must have been established by
                 (call-sites-to :proof proven
                   (enclosing-decl
                     (inside-decl (class :name "AcmeStore") (method :name "put"))))))
-            :observed-operand (argument :index 0))])
+            :observed-operand (argument :name "value"))])
       :kills
         (endpoint-set :entries [
           (kill :id acme-validate
@@ -1052,7 +1056,7 @@ The invariant: every value `AcmeStore.put` stores must have been established by
                 (call-sites-to :proof proven
                   (enclosing-decl
                     (inside-decl (class :name "AcmeValidator") (method :name "validate"))))))
-            :input (argument :index 0)
+            :input (argument :name "value")
             :output return-value)])))
 ```
 
@@ -1086,6 +1090,33 @@ the origin and the observation, the run exits 2 under both
 `:unmodeled paranoid` and `:unmodeled require-model`. An unresolved call is
 never a clean verdict.
 
+#### The same policy on Python
+
+`acme-validated-value-reaches-store-python.rqlp` is the same document with
+`(language python)` and the same `:proof proven` on every endpoint. It reaches
+the same verdicts over `flow/python/`: exit 1 with one finding on
+`store.put(value)` and none on the near-miss `cache.put(value)`, and exit 0 on
+the validated tree.
+
+Two facts have to hold for that, and both are visible in the source:
+
+1. The receiver's type is evident at the call. An annotated parameter
+   (`store: AcmeStore`), a local assigned exactly one visible constructor call
+   (`store = AcmeStore()`), a direct `AcmeStore().put(...)` chain, and `self`
+   all qualify. A bare untyped parameter does not, and a local that two
+   assignments give two different classes does not; those return no proven row
+   rather than a guess.
+2. The target's dispatch is closed. Java gets this from `final`; Python gets it
+   from PEP 591's `@final`, on the method or on its class. Without it the same
+   tree still reports the same finding, but a clean verdict is refused: a
+   subclass could override `put`, so the resolved member is not proven to be
+   the complete target set.
+
+Two Python shapes still exit 2, and `flow/python/inconclusive_app.py` carries
+both: a keyword actual (`store.put(value=value)`), which has no formal to map
+onto as a value-flow input, and a kill that runs inside a workspace helper
+rather than on the observed value's own path.
+
 ### Binding the actual passed to a named formal
 
 The analyzer publishes the actual-to-formal relation, and it is exact in both
@@ -1104,11 +1135,63 @@ the Python tree it returns the operand of both `store.put(value)` and
 `store.put(value=value)`, so a named call binds formal `value` the same way a
 positional one does.
 
-Reference policy A still binds `(argument :index 0)`, because
-`(argument :name ...)` is not yet a value-flow port. Selecting through
-`call-input` and binding `matched-value` is not a substitute either: when the
-actual is itself a call, `call-input` names that inner call exactly, and the
-port then binds the inner call's operand instead of the outer one.
+Reference policy A binds the same formal directly, as a value-flow port:
+
+```lisp
+:observed-operand (argument :name "value")
+```
+
+The port resolves the name against the selected call's own caller/callee
+binding, so it names the operand of formal `value` in either syntax. It reads
+two sources. The dispatch-aware binding relation is the authoritative one: it
+maps a positional actual to the formal ordinal the resolved target declares.
+That relation records only that an actual is a keyword argument, not which
+keyword, so a keyword call falls back to the structural actual-to-formal
+relation above, which reads the label from the call's own syntax; a binding
+taken from it is complete only up to that relation. Both editions of reference
+policy A use the port, and `issue_2496_named_flow_port.rs` pins that
+`(argument :name "value")` and `(argument :index 0)` report the same sites, and
+reach the same verdict, on every fixture tree. Every call in the Python
+verdict trees is positional, so the named spelling takes the authoritative
+route and keeps the complete clean verdict those trees earn; the keyword actual
+in `flow/python/inconclusive_app.py` takes the structural one, and the run
+reports that rather than concluding.
+
+The ordinal a name resolves to is the callee's, not the call's. Python declares
+its receiver, `self`, in the parameter list, and the lowering that mints formal
+ordinals consumes it, so formal `value` of `AcmeStore.put(self, value)` is
+ordinal 0 and not ordinal 1. The port reads each ordinal off the procedure's own
+parameter value rather than off declaration order, which is what keeps
+`(argument :name "value")` and `(argument :index 0)` the same claim in a
+language that writes its receiver down. Naming the receiver itself is not a
+binding at all: `(argument :name "self")` is the same diagnostic as any other
+formal the target does not declare as a port.
+
+The resolution is evidence-carrying, not name-shaped:
+
+- A formal name the selected call's exactly resolved target does not declare is
+  a diagnostic, not a silent non-match. The run reports `capability_incomplete`
+  and exits 2.
+- A callee the analyzer cannot resolve exactly degrades the endpoint's proof and
+  completeness, exactly as any other unproven binding does, so a run over that
+  code cannot be clean. Python's untyped receivers are this case.
+- A call site where the name identifies no single actual -- neither a resolved
+  formal ordinal nor a written keyword, an open argument group, or two dispatch
+  targets that map the formal to different operands -- is a refused row: the run
+  names the port and the site and reports `capability_incomplete`.
+- Every resolved dispatch candidate has to agree. A call through an interface
+  resolves to each implementation, and Java binds an implementation by signature
+  rather than by parameter name, so one of them may declare the formal under
+  another name. That call is refused too: what one candidate declares is that
+  candidate's evidence, not the call's, and neither a confident sibling nor a
+  keyword label written at the call site may answer for the set. A candidate
+  whose parameter list cannot be read is the same refusal, because an unreadable
+  declaration is a shortfall and not a statement that the formal is absent.
+
+Selecting through `call-input` and binding `matched-value` is still not a
+substitute: when the actual is itself a call, `call-input` names that inner call
+exactly, and the port then binds the inner call's operand instead of the outer
+one.
 
 ### Reference policy B: a forbidden transitive effect
 
@@ -1299,29 +1382,65 @@ obligation is the absence of a claim and not a claim about a source location.
 
 ### Activating the model
 
-A semantic model reaches the analyzer through one of two routes, and they are
-not interchangeable today:
+A semantic model reaches the analyzer through one of two routes. Both routes
+feed one activation, so a workspace can use either or both:
 
-| Route | Location | Activated by |
-| --- | --- | --- |
-| Workspace authoring | `.bifrost/semantic-models/*.json` | The MCP host, with `BIFROST_WORKSPACE_SEMANTIC_MODELS=on` |
-| Installed catalog | the catalog `.bifrost/packs.json` names | The MCP host, the LSP host, and `bifrost --policy-file` |
+| Route | Location | Opt-in | Activated by |
+| --- | --- | --- | --- |
+| Reviewed workspace models | `.bifrost/semantic-models/*.json` and `*.yaml` | the directory exists | `bifrost --policy-file`, and the MCP host with `BIFROST_WORKSPACE_SEMANTIC_MODELS=on` |
+| Installed catalog | the catalog `.bifrost/packs.json` names | the document exists | `bifrost --policy-file`, the LSP host, and the MCP host |
 
-**The CLI policy runner does not read `.bifrost/semantic-models/`.** It
-activates only through `.bifrost/packs.json`, whose activation evidence comes
-from dependency discovery. A workspace that wants reference policy B on the CLI
-today must install the model into the catalog the packs document names, with an
-activation selector the workspace's own dependency evidence can satisfy.
-`policy_substrate_p0_cli.rs` pins both halves: the CLI outcome with the model
-installed, and the absence of any finding when the model is present only at the
-authoring location.
+Use the reviewed workspace route for a model you write and check in beside your
+policies. Put the file in `.bifrost/semantic-models/`, commit it, and
+`bifrost --policy-file` activates it. You need no packs document and no catalog
+install. Reference policy B runs this way, and
+`policy_substrate_p0_cli.rs` pins the outcome.
 
-### Explaining a match and a near miss
+Use the installed catalog for a pack that ships with a dependency. The packs
+document names the catalog and the dependency ecosystems the workspace opts
+into, and its activation evidence comes from dependency discovery.
 
-`explain_match_finding` says why a retained `match` finding exists, by
-projecting the evidence the run already kept; it executes nothing.
-`explain_match_candidate` says why one explicit candidate position did not
-match, by re-executing bounded prefixes of the selector plan.
+Three rules keep the reviewed route honest.
+
+- **A model that cannot be read fails the run.** If discovery cannot finish, or
+  a file will not compile or register, the report carries a
+  `workspace-model-load-failed` diagnostic and the run exits 2. A checked-in
+  model is never skipped in silence, because a missing model changes verdicts.
+- **The review gate is not bypassed.** A model with
+  `safety.review_required: true` stays inert until an `enable` entry in
+  `.bifrost/packs.json` names its pack id. While it is inert, the report
+  carries a `workspace-model-inert` warning that names the pack id and the
+  remedy. The warning does not by itself make the run unreliable: the
+  evaluation that ran without the model reports its own incompleteness when it
+  has any.
+- **A diff run activates both sides.** The base revision activates the reviewed
+  models its own tree checked in, so adding or removing a model shows up as
+  changed findings rather than as noise.
+
+Workspace sources outrank installed and shipped sources when both offer a
+model for the same key. The activation provenance names the workspace source,
+and the report's `packs` review lists every activation decision.
+
+### Explaining a finding and a near miss
+
+`explain_finding` says why a retained finding exists, by projecting the
+evidence the run already kept; it executes nothing, so it cannot disagree with
+the report it reads. `explain_candidate` says why one explicit candidate
+position was not reported, by re-executing bounded prefixes of the selector
+plan. `rank_near_misses` says which subjects came closest, by relaxing the
+policy's own declared predicates over a bounded candidate set.
+
+Over reference policy A's own flow run, `explain_finding` answers about the
+`store.put` finding directly. The root sits on the observation the tracked
+value reached; under it are the origin the value entered at, the retained
+witness path as one `derivation` node per step in path order with each step's
+exact site, and the finding's certainty, proof, witness retention,
+completeness, and the run's completion. Each of those last five is `satisfied`
+when the retained evidence licenses the claim and `unknown` when it does not —
+never `failed`. A finding whose witness was truncated, or which retained no
+witness at all, says so in that node rather than presenting a short path as a
+whole one. Taint findings explain the same way in the security vocabulary,
+naming each origin's label and source scenario.
 
 Over the exact-selection view of reference policy A — the same selector as a
 `match` policy — the `store.put` call explains as `satisfied`, and the
@@ -1331,35 +1450,110 @@ there. That is different from `unknown`, which means the analyzer never
 established the answer. A consumer may act on `failed`; a consumer must not
 read `unknown` as evidence of absence.
 
-These two adapters serve `match` runs. The general entry points
-`explain_finding` and `explain_candidate` additionally serve `assertion` runs,
-including relational row plans: a relational finding explains its assertion,
-group key, contributing rows, and any coverage obligations, and a relational
-candidate reports the first row binding it is absent from. Flow, taint, and
-typestate runs are refused with an explicit adapter-unavailable answer that
-names the supported analysis types, which is why the walkthrough explains an
-equivalent match view rather than reference policy A's flow run: the
-acceptance test asserts the refusal rather than leaving it to prose.
+`explain_finding` serves `match`, `assertion`, `flow`, and `taint` findings; a
+relational assertion finding explains its assertion, group key, contributing
+rows, and any coverage obligations. `explain_candidate` serves `match` and
+`assertion` policies, and a relational candidate reports the first row binding
+it is absent from. The families each entry point does not serve — `typestate`
+for `why`, and `flow`, `taint`, and `typestate` for `why-not` — are refused
+with an explicit adapter-unavailable answer that names the supported analysis
+types. `why-not` over a flow or taint policy is not a projection of anything
+the run retained: it needs candidate-specific solver queries, and it is
+designed separately.
 
-The same explanations are reachable without library code: the MCP tool
-`explain_policy` takes one policy selection plus either a `finding_id` or a
-`candidate` position and returns the structured explanation document, and the
-CLI accepts `--explain-finding <ID>` or `--explain-candidate
-<PATH:BYTE_START[-BYTE_END]>` beside `--policy-file` and prints the same JSON.
-An explanation run exits 0 whenever an explanation was produced, whatever its
-outcome, and 2 only when none could be.
+### Ranking the near misses
+
+`explain_candidate` answers about a position you already suspect. When you are
+refining a rule you usually want the opposite question: which subjects nearly
+matched, and which predicate stopped each one. That is the bounded near-miss
+ranking, published as its own versioned document,
+`bifrost_policy_near_miss/v1`, rather than as a node kind inside
+`bifrost_policy_explanation/v1` — an explanation is a tree about one subject,
+and a ranking is an ordered list over many.
+
+The distance is the policy's own declared predicates and nothing else. A
+selector's seed carries a **scope** — its kind union, language filter, and path
+globs — and a set of **predicates**: the root's name, text, arity, visibility,
+parameter type, and role sub-patterns, plus the `inside`, `inside_decl`, and
+`not_inside` containment. The ranking runs a ladder of selectors: the scope
+alone, then the scope with one declared predicate restored, and so on up to the
+selector you wrote. Every rung runs the whole pipeline, so its rows are
+subjects in the policy's own final domain. A subject's distance is how many
+conjuncts remain from the first rung that stopped returning it, and that rung's
+predicate is named as its `failing_conjunct`. Nothing else contributes: no
+embedding, no model score, no text similarity, no proximity.
+
+Containment is restored last on purpose, and that ordering is what makes the
+answer useful. Over the exact-selection view of reference policy A the ladder
+is `scope`, `root.name`, `inside_decl`. The `store.put` call clears all three
+and ranks first at distance 0. The near-miss `cache.put` call satisfies the
+member name and fails only the class it is declared inside, so it ranks second
+at distance 1 with `inside_decl` named. The unrelated `AcmeSource.read()` call
+in the same file fails the member name too and ranks third at distance 2 with
+`root.name` named.
+
+Candidates are never scanned for by default. You either supply the list of
+positions to measure, or you ask for a separately budgeted search whose scope
+is the policy's own seed. A policy whose seed declares no kind union has no
+bounded scope at all — relaxing its name would leave a wildcard over every node
+in the workspace — so it is refused rather than searched. A supplied position
+that the scope excludes reports `scope` as its failing conjunct instead of
+being dropped without comment.
+
+`failed` and `unknown` mean here exactly what they mean everywhere else in the
+schema, and `unknown` is never distance. A subject is `failed` only when the
+rung that dropped it completed and declared itself exhaustive; otherwise it is
+`unknown` and carries the incomplete reasons. A ladder the execution budget cut
+short leaves every subject still standing `unknown`, never `satisfied`.
+Undecided subjects report the conjunct count they were observed to reach, the
+same as decided ones, and the ranking breaks ties by decidedness, so
+incompleteness never moves a subject further away than the evidence puts it.
+
+A ranking serves `match` and `assertion` policies, the same two families
+`why-not` serves and for the same reason: it relaxes a selector plan, and a
+flow, taint, or typestate policy has none. Reference policy A is itself a flow
+policy, which is why the ranking above is asked about its equivalent `match`
+view. For a relational policy the candidates come from the first row binding's
+source query and each further binding is one membership conjunct; a subject
+that clears every binding is `unknown`, not `satisfied`, because the joins,
+group keys, and aggregates still stand between a row and a violation and none
+of them is replayed.
+
+### Reaching the explanations without library code
+
+The MCP tool `explain_policy` takes one policy selection plus exactly one of
+`finding_id`, `candidate`, or `near_misses`, and returns the structured
+document. The CLI accepts `--explain-finding <ID>`, `--explain-candidate
+<PATH:BYTE_START[-BYTE_END]>`, or `--explain-near-misses <N>` beside
+`--policy-file` and prints the same JSON. All three exit 0 whenever an answer
+was produced, whatever its outcome and even when a ranking is empty, and 2 only
+when none could be.
+
+Both surfaces bound the ranking explicitly: how many subjects to retain, and
+how many queries the ladder may run. What a bound removed is reported in the
+document's truncation record in the same `*_truncated` plus
+`omitted_*_lower_bound` form the explanation schema uses, so a caller can raise
+the right one.
+
+A `why` question through either surface evaluates the policy once to obtain the
+run its finding came from. That evaluation does not activate semantic-model
+packs, because activation belongs to the host that owns the analyzer's
+lifecycle. A finding that exists only because an activated pack modeled a call
+is therefore reported as "the run retains no finding with identity …" rather
+than explained from a differently-modeled run.
 
 ### P0 capability boundaries
 
 | Capability | Today | Boundary |
 | --- | --- | --- |
-| Exact call selection | `call-sites-to :proof proven` over an `inside-decl` seed | Java proves the receiver's type here; Python returns no proven row at all, and its unproven answer over-approximates to same-named members of other classes |
-| Actual-to-formal binding | `call-input :parameter-name` binds positional and named syntax exactly | Value-flow ports still spell `(argument :index N)`; `(argument :name ...)` is unsupported |
+| Exact call selection | `call-sites-to :proof proven` over an `inside-decl` seed | Java and Python both answer. Python proves the row whenever the receiver's type is evident at the call — annotated, constructed in the same procedure, or `self` — and returns nothing rather than a guess when it is not. A clean *flow* verdict additionally needs the target's dispatch closed, which on Python means `@final` |
+| Actual-to-formal binding | `call-input :parameter-name` binds positional and named syntax exactly, and `(argument :name "...")` is a value-flow port for flow and taint endpoints, which both editions of reference policy A bind through | The port needs the callee's parameter list, so an unresolved callee degrades the endpoint rather than binding; a formal the resolved target does not declare is a diagnostic, and a declared receiver such as Python's `self` is not a formal; a keyword actual reaches the port only through the unproven structural relation, so a tree that writes one cannot be clean; and every resolved dispatch candidate must agree that the name reaches this operand, so a call through an interface whose implementations name the formal differently is refused |
 | Declared effects | `declared_effects` on a procedure summary, propagated with depth, certainty, timing, and coverage | Path-conditional effects are a P0 non-goal; effect timing is the pack's declaration, not an inference about scheduling syntax |
 | Annotation markers | The normalized `decorators` role | Matches the written annotation name, not a resolved annotation type |
 | Negative claims | Absence requires exhaustive coverage; an unmet obligation is structured data on the run | An open effect set or an unresolved callee is exit 2, never exit 0 |
-| Explanations | `explain_finding` and `explain_candidate` over `match` and `assertion` runs, plus the MCP `explain_policy` tool and the CLI `--explain-finding`/`--explain-candidate` flags | Flow, taint, and typestate runs are refused rather than answered |
-| Model activation | Two routes, above | The CLI policy runner reads only the installed-catalog route |
+| Explanations | `explain_finding` over `match`, `assertion`, `flow`, and `taint` findings and `explain_candidate` over `match` and `assertion` policies, plus the MCP `explain_policy` tool and the CLI `--explain-finding`/`--explain-candidate` flags | A `why` answer projects retained evidence only, so it is exactly as complete as the report; typestate findings, and every `why-not` over a flow or taint policy, are refused rather than answered |
+| Near-miss ranking | `rank_near_misses` over `match` and `assertion` policies, published as `bifrost_policy_near_miss/v1`, plus the MCP `explain_policy` `near_misses` form and the CLI `--explain-near-misses N` flag | Distance is the count of unsatisfied declared predicates and nothing else; candidates are the caller's list or the policy's own seed scope, never a repository scan, and a seed with no kind union is refused; a relational subject that clears every row binding is `unknown`, because the joins, group keys, and aggregates are not replayed |
+| Model activation | Two routes, above; the CLI policy runner activates both | A `review_required` workspace model stays inert without an `enable` entry, reported as a warning |
 
 ## Completeness, Findings, And Report Parity
 

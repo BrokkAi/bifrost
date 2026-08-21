@@ -3,7 +3,7 @@
 //! The scan itself is [`brokk_bifrost_rust::graph::inverted::scan_file`]. What
 //! stays here is the shared driver -- `build_edge_output`'s parallel walk plus
 //! `parse_and_collect`'s on-demand parsing -- the downcast that produces the two
-//! sources, and the one `IAnalyzer::global_usage_definition_index` call.
+//! sources, and the request-scoped bounded definition lookup.
 
 use crate::analyzer::usages::inverted_edges::{
     UsageEdgeBuildOutput, build_edge_output, parse_and_collect,
@@ -30,7 +30,8 @@ where
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
     let files: Vec<ProjectFile> = rust.get_analyzed_files().into_iter().collect();
-    let support = analyzer.global_usage_definition_index();
+    let support =
+        crate::analyzer::AnalyzerDefinitionLookup::new(analyzer, crate::analyzer::Language::None);
     let language = tree_sitter_rust::LANGUAGE.into();
     let keep_file = &keep_file;
     let seeds_cache = RustSeedsCache::default();

@@ -131,6 +131,14 @@ pub enum RelationalAssertionPlanError {
     NullTestOnRequiredField {
         field: String,
     },
+    /// A literal was compared against a `ConstrainedEnum` column whose value
+    /// domain does not contain it. The comparison could never be true, so the
+    /// whole plan would report a clean run forever (issue #2515).
+    UnknownEnumLabel {
+        field: String,
+        label: String,
+        legal: &'static [&'static str],
+    },
     /// A membership test enumerated no literals, or more than the bound allows.
     InvalidSetMembership {
         field: String,
@@ -304,6 +312,15 @@ impl fmt::Display for RelationalAssertionPlanError {
             Self::NullTestOnRequiredField { field } => write!(
                 formatter,
                 "field `{field}` is always present, so a null test over it is constant"
+            ),
+            Self::UnknownEnumLabel {
+                field,
+                label,
+                legal,
+            } => write!(
+                formatter,
+                "`{label}` is not a value of `{field}`; the accepted values are {}",
+                legal.join(", ")
             ),
             Self::InvalidSetMembership { field, count, max } => write!(
                 formatter,
@@ -552,12 +569,50 @@ fn column_type(
     schema: &IrSchema,
     column: &IrColumn,
 ) -> Result<CodeQueryRowScalarType, RelationalAssertionPlanError> {
-    schema.field(column).map(|field| field.scalar_type).ok_or(
-        RelationalAssertionPlanError::UnknownField {
+    column_field(schema, column).map(|field| field.scalar_type)
+}
+
+fn column_field<'a>(
+    schema: &'a IrSchema,
+    column: &IrColumn,
+) -> Result<&'a super::ir::IrField, RelationalAssertionPlanError> {
+    schema
+        .field(column)
+        .ok_or_else(|| RelationalAssertionPlanError::UnknownField {
             binding: column.qualifier.clone(),
             field: column.name.clone(),
-        },
-    )
+        })
+}
+
+/// Reject a literal a `ConstrainedEnum` column can never hold.
+///
+/// The registry publishes the finite label set of every enum-typed column, so a
+/// mistyped label is an authoring error the loader can name -- rather than a
+/// filter that matches nothing while the run reports `complete; clean`
+/// (issue #2515). A column whose domain is explicitly not enumerable admits
+/// every label, by that domain's own statement.
+fn validate_enum_literal(
+    field: &super::ir::IrField,
+    column: &IrColumn,
+    literal: &RowLiteral,
+) -> Result<(), RelationalAssertionPlanError> {
+    let RowLiteral::ConstrainedEnum(label) = literal else {
+        return Ok(());
+    };
+    let Some(domain) = field.value_domain else {
+        return Ok(());
+    };
+    let Some(legal) = domain.labels() else {
+        return Ok(());
+    };
+    if legal.contains(&label.as_str()) {
+        return Ok(());
+    }
+    Err(RelationalAssertionPlanError::UnknownEnumLabel {
+        field: column.to_string(),
+        label: label.clone(),
+        legal,
+    })
 }
 
 fn validate_predicate(
@@ -566,7 +621,8 @@ fn validate_predicate(
 ) -> Result<(), RelationalAssertionPlanError> {
     match predicate {
         IrPredicate::Compare { left, op, right } => {
-            let left_type = column_type(schema, left)?;
+            let left_field = column_field(schema, left)?;
+            let left_type = left_field.scalar_type;
             match right {
                 IrOperand::Column(right) => {
                     let right_type = column_type(schema, right)?;
@@ -587,6 +643,7 @@ fn validate_predicate(
                             literal: row_literal_kind(literal),
                         });
                     }
+                    validate_enum_literal(left_field, left, literal)?;
                 }
             }
             if op.is_ordered() && left_type != CodeQueryRowScalarType::Integer {
@@ -612,7 +669,8 @@ fn validate_predicate(
             }
         }
         IrPredicate::InSet { column, values } => {
-            let column_type = column_type(schema, column)?;
+            let field = column_field(schema, column)?;
+            let column_type = field.scalar_type;
             if values.is_empty() || values.len() > MAX_IR_SET_MEMBERS {
                 return Err(RelationalAssertionPlanError::InvalidSetMembership {
                     field: column.to_string(),
@@ -628,6 +686,7 @@ fn validate_predicate(
                         literal: row_literal_kind(literal),
                     });
                 }
+                validate_enum_literal(field, column, literal)?;
             }
         }
     }

@@ -27,6 +27,10 @@ macro_rules! normalized_kinds {
         ];
 
         impl NormalizedKind {
+            /// Every kind label, in declaration order: the value domain the
+            /// `kind` row fields publish (issue #2515).
+            pub const LABELS: &'static [&'static str] = &[$($label,)+];
+
             /// The snake_case label used in query JSON and rendered output. Kept in
             /// lock-step with the serde representation (asserted by test).
             pub fn label(self) -> &'static str {

@@ -4495,7 +4495,8 @@ mod tests {
         )
         .unwrap();
         let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(temp.path()).unwrap());
-        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
         let range = CodeQueryRange {
             start_line: 1,
             start_column: 1,

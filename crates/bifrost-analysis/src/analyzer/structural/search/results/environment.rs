@@ -549,6 +549,16 @@ pub enum CodeQueryCandidateRef {
 }
 
 impl CodeQueryCandidateRef {
+    /// The value domain the `resolution_candidate.candidate_kind` row field
+    /// publishes (issue #2515).
+    pub const LABELS: &'static [&'static str] = &[
+        "unit",
+        "lexical",
+        "binding",
+        "import_binder",
+        "external_route",
+    ];
+
     /// The stable label of the shape, used in rendering and in the detailed
     /// terminal key.
     pub fn label(&self) -> &'static str {

@@ -80,6 +80,17 @@ pub(super) fn correlate_receiver_expansions(expansions: &mut [PipelineExpansion]
     }
 }
 
+/// The value domain the `receiver_evidence.evidence_kind` row field
+/// publishes, minted by [`receiver_evidence_kind`] (issue #2515).
+pub(super) const RECEIVER_EVIDENCE_KIND_LABELS: &[&str] = &[
+    "allocation_site",
+    "instance_type",
+    "class_or_static_object",
+    "module_or_export_object",
+    "current_receiver",
+    "factory_return",
+];
+
 pub(super) fn receiver_evidence_kind(value: &ReceiverValue) -> &'static str {
     match value {
         ReceiverValue::AllocationSite { .. } => "allocation_site",

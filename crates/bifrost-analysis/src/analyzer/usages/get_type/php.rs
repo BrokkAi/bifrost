@@ -73,10 +73,11 @@ mod tests {
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let file = ProjectFile::new(root.clone(), PathBuf::from("Receiver.php"));
         file.write(source).expect("write PHP fixture");
-        let workspace = WorkspaceAnalyzer::build(
+        let workspace = WorkspaceAnalyzer::build_ephemeral(
             Arc::new(TestProject::new(root, Language::Php)),
             AnalyzerConfig::default(),
-        );
+        )
+        .expect("ephemeral workspace should build");
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
@@ -142,10 +143,11 @@ class Service {
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let file = ProjectFile::new(root.clone(), PathBuf::from("Receiver.php"));
         file.write(source).expect("write PHP fixture");
-        let workspace = WorkspaceAnalyzer::build(
+        let workspace = WorkspaceAnalyzer::build_ephemeral(
             Arc::new(TestProject::new(root, Language::Php)),
             AnalyzerConfig::default(),
-        );
+        )
+        .expect("ephemeral workspace should build");
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_php::LANGUAGE_PHP.into())

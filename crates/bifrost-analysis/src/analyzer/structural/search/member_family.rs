@@ -182,6 +182,16 @@ fn finish(
 /// were all enumerated, and a proven exclusion whose empty edge set is the
 /// whole truth. Everything else is `open`, so an exact-set assertion over an
 /// unsupported or unproven member can never come out clean.
+/// The value domain the `member_family.coverage` and
+/// `member_family_edge.coverage` row fields publish, minted by
+/// [`family_coverage`] (issue #2515).
+pub(super) const MEMBER_FAMILY_COVERAGE_LABELS: &[&str] = &["exhaustive", "open"];
+
+/// The value domain the `member_family_edge.proof` row field publishes: an
+/// edge is proven exactly when its target's arity is unique, decided inline
+/// where the row is built (issue #2515).
+pub(super) const MEMBER_FAMILY_EDGE_PROOF_LABELS: &[&str] = &["proven", "unproven"];
+
 pub(super) fn family_coverage(outcome: MemberFamilyOutcome) -> &'static str {
     match outcome {
         MemberFamilyOutcome::Proven | MemberFamilyOutcome::NoFamily => "exhaustive",

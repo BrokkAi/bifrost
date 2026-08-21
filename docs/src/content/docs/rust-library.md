@@ -120,7 +120,8 @@ use brokk_bifrost::{AnalyzerConfig, FilesystemProject, WorkspaceAnalyzer};
 
 fn main() -> Result<(), String> {
     let project = Arc::new(FilesystemProject::new(".")?);
-    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+        .expect("ephemeral workspace should build");
     let analyzer = workspace.analyzer();
 
     println!("languages: {:?}", analyzer.languages());

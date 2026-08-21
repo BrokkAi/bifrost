@@ -51,7 +51,8 @@ fn main() -> Result<(), String> {
     let started = Instant::now();
     let project: Arc<dyn Project> =
         Arc::new(FilesystemProject::new(root.clone()).map_err(|err| err.to_string())?);
-    let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+    let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+        .expect("ephemeral workspace should build");
     let build_seconds = started.elapsed().as_secs_f64();
 
     let mut files = workspace.analyzer().analyzed_files();

@@ -38,6 +38,14 @@ const NODE_ID_DOMAIN: &[u8] = b"bifrost-policy-explanation-node/v1";
 const NODE_ID_BYTES: usize = 16;
 
 /// Which question an explanation answers.
+///
+/// # Additive vocabulary
+///
+/// `NearMiss` was added with the bounded near-miss ranking (issue 2500). It
+/// never appears in a `bifrost_policy_explanation/v1` document -- a ranking is
+/// the sibling `bifrost_policy_near_miss/v1` document -- so no previously
+/// emitted explanation contains the new tag and the explanation format string
+/// stays `v1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExplanationQuestion {
@@ -46,6 +54,9 @@ pub enum ExplanationQuestion {
     /// Why is this candidate not reported? Answered by bounded prefix
     /// re-execution of the policy selector.
     WhyNot,
+    /// Which candidates came closest? Answered by a bounded ladder over the
+    /// policy's own declared predicates.
+    NearMiss,
 }
 
 impl ExplanationQuestion {
@@ -53,6 +64,7 @@ impl ExplanationQuestion {
         match self {
             Self::Why => "why",
             Self::WhyNot => "why_not",
+            Self::NearMiss => "near_miss",
         }
     }
 }
@@ -65,22 +77,29 @@ impl ExplanationQuestion {
 ///
 /// # Additive vocabulary
 ///
-/// `relation_binding` was added after `bifrost_policy_explanation/v1` shipped.
-/// The addition is strictly additive -- no existing node changed kind, shape,
-/// or identity, and no previously emitted document contains the new tag -- so
-/// the format string stays `v1` (see the ExecPlan Decision Log for issue 2439
+/// `relation_binding` was added after `bifrost_policy_explanation/v1` shipped,
+/// and `derivation` was added with the flow/taint adapter (issue 2497). Each
+/// addition is strictly additive -- no existing node changed kind, shape, or
+/// identity, and no previously emitted document contains the new tag -- so the
+/// format string stays `v1` (see the ExecPlan Decision Log for issue 2439
 /// slices 2-3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExplanationNodeKind {
     /// One analyzer row: a seed row, a step result, the `via` row a step
-    /// travelled through, or one representative row behind an assertion.
+    /// travelled through, one representative row behind an assertion, or one
+    /// origin a tracked value entered at.
     SourceFact,
     /// One stage of the selector pipeline: the plan source, or one typed step.
     SelectorStage,
     /// One authored relational row binding: a named relation and what its
     /// executed query said. Its children are that binding's selector stages.
     RelationBinding,
+    /// One retained derivation the solver proved: a whole witness path, or one
+    /// step of that path in path order. A derivation is not a selector stage --
+    /// nothing about it was re-executed, and its order is the path's, not the
+    /// plan's.
+    Derivation,
     /// One authored assertion and the verdict its aggregate produced.
     Assertion,
     /// What the run's coverage does or does not license.
@@ -96,6 +115,7 @@ impl ExplanationNodeKind {
             Self::SourceFact => "source_fact",
             Self::SelectorStage => "selector_stage",
             Self::RelationBinding => "relation_binding",
+            Self::Derivation => "derivation",
             Self::Assertion => "assertion",
             Self::CoverageObligation => "coverage_obligation",
             Self::FindingProjection => "finding_projection",
@@ -466,6 +486,8 @@ pub struct ExplanationLimits {
     max_retained_bytes: usize,
     max_text_bytes: usize,
     max_prefix_executions: usize,
+    max_near_miss_candidates: usize,
+    max_near_miss_executions: usize,
 }
 
 impl Default for ExplanationLimits {
@@ -481,6 +503,13 @@ impl Default for ExplanationLimits {
             // this one total, so the default holds three full-depth bindings
             // and truncates honestly beyond that.
             max_prefix_executions: 64,
+            // A ranking is read by a human refining a rule, so the default
+            // retains a page of subjects rather than a corpus.
+            max_near_miss_candidates: 16,
+            // One execution per declared conjunct plus the scope rung. A seed
+            // pattern declares far fewer than 16 predicates in practice, and a
+            // relational plan's extra row bindings draw on the same total.
+            max_near_miss_executions: 16,
         }
     }
 }
@@ -505,6 +534,15 @@ impl ExplanationLimits {
     /// How many bounded prefix queries `why-not` may execute.
     pub const fn max_prefix_executions(&self) -> usize {
         self.max_prefix_executions
+    }
+    /// How many ranked subjects a near-miss ranking retains.
+    pub const fn max_near_miss_candidates(&self) -> usize {
+        self.max_near_miss_candidates
+    }
+    /// How many bounded queries a near-miss ranking may execute, including the
+    /// one that enumerates the candidate set.
+    pub const fn max_near_miss_executions(&self) -> usize {
+        self.max_near_miss_executions
     }
 
     #[must_use]
@@ -537,6 +575,16 @@ impl ExplanationLimits {
         self.max_prefix_executions = value;
         self
     }
+    #[must_use]
+    pub const fn with_max_near_miss_candidates(mut self, value: usize) -> Self {
+        self.max_near_miss_candidates = value;
+        self
+    }
+    #[must_use]
+    pub const fn with_max_near_miss_executions(mut self, value: usize) -> Self {
+        self.max_near_miss_executions = value;
+        self
+    }
 }
 
 /// Which explicit bound could not accommodate even the mandatory root.
@@ -547,6 +595,8 @@ pub enum ExplanationBudgetLimit {
     Depth,
     RetainedBytes,
     PrefixExecutions,
+    NearMissCandidates,
+    NearMissExecutions,
 }
 
 impl ExplanationBudgetLimit {
@@ -556,6 +606,8 @@ impl ExplanationBudgetLimit {
             Self::Depth => "max_depth",
             Self::RetainedBytes => "max_retained_bytes",
             Self::PrefixExecutions => "max_prefix_executions",
+            Self::NearMissCandidates => "max_near_miss_candidates",
+            Self::NearMissExecutions => "max_near_miss_executions",
         }
     }
 }
@@ -564,11 +616,23 @@ impl ExplanationBudgetLimit {
 ///
 /// Published as data so a caller -- and the adapter-unavailable error itself --
 /// can state what *is* supported instead of only what is not.
-pub const WHY_ADAPTER_ANALYSIS_TYPES: &[PolicyAnalysisType] =
-    &[PolicyAnalysisType::Match, PolicyAnalysisType::Assertion];
+pub const WHY_ADAPTER_ANALYSIS_TYPES: &[PolicyAnalysisType] = &[
+    PolicyAnalysisType::Match,
+    PolicyAnalysisType::Taint,
+    PolicyAnalysisType::Assertion,
+    PolicyAnalysisType::Flow,
+];
 
 /// The analysis families [`super::explain_candidate`] can answer `why-not` for.
 pub const WHY_NOT_ADAPTER_ANALYSIS_TYPES: &[PolicyAnalysisType] =
+    &[PolicyAnalysisType::Match, PolicyAnalysisType::Assertion];
+
+/// The analysis families [`super::rank_near_misses`] can rank candidates for.
+///
+/// The same two families `why-not` serves, and for the same reason: a ranking
+/// relaxes the policy's own declared predicates and re-executes them, so it
+/// needs a selector plan to relax. A flow, taint or typestate policy has none.
+pub const NEAR_MISS_ADAPTER_ANALYSIS_TYPES: &[PolicyAnalysisType] =
     &[PolicyAnalysisType::Match, PolicyAnalysisType::Assertion];
 
 /// Why an explanation could not be produced.
@@ -596,6 +660,10 @@ pub enum ExplainError {
     RelationalPlanUnavailable,
     /// The relational plan names a binding whose resolved selector is missing.
     BindingSelectorUnavailable { binding: String },
+    /// The policy's own seed declares no bounded search scope, so a near-miss
+    /// ranking has nothing to enumerate from short of the whole repository,
+    /// which it never does. The message is diagnostic text, never parsed.
+    NearMissScopeUnavailable { reason: String },
     /// The nominated candidate path is not a workspace-relative path.
     CandidateOutsideWorkspace {
         path: String,
@@ -623,6 +691,7 @@ impl ExplainError {
         let supported = match question {
             ExplanationQuestion::Why => WHY_ADAPTER_ANALYSIS_TYPES,
             ExplanationQuestion::WhyNot => WHY_NOT_ADAPTER_ANALYSIS_TYPES,
+            ExplanationQuestion::NearMiss => NEAR_MISS_ADAPTER_ANALYSIS_TYPES,
         };
         Self::ExplanationAdapterUnavailable {
             analysis_type,
@@ -668,6 +737,10 @@ impl fmt::Display for ExplainError {
             Self::BindingSelectorUnavailable { binding } => write!(
                 formatter,
                 "the relational plan's binding `{binding}` carries no resolved selector"
+            ),
+            Self::NearMissScopeUnavailable { reason } => write!(
+                formatter,
+                "the policy declares no bounded near-miss search scope: {reason}"
             ),
             Self::CandidateOutsideWorkspace { path, reason } => write!(
                 formatter,
@@ -953,17 +1026,25 @@ impl Bounded<'_> {
     }
 
     fn truncate_text(&mut self, text: &mut String) {
-        if text.len() <= self.limits.max_text_bytes {
-            return;
-        }
-        let mut cut = self.limits.max_text_bytes;
-        while cut > 0 && !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        let omitted = u64::try_from(text.len().saturating_sub(cut)).unwrap_or(u64::MAX);
-        text.truncate(cut);
+        let omitted = truncate_text_to(text, self.limits.max_text_bytes);
         self.truncation.omit_text_bytes(omitted);
     }
+}
+
+/// Cut `text` to at most `max_bytes`, never inside a UTF-8 sequence, and
+/// report how many bytes went. Shared by the node tree and the near-miss
+/// ranking so both spell the `max_text_bytes` bound the same way.
+pub(super) fn truncate_text_to(text: &mut String, max_bytes: usize) -> u64 {
+    if text.len() <= max_bytes {
+        return 0;
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let omitted = u64::try_from(text.len().saturating_sub(cut)).unwrap_or(u64::MAX);
+    text.truncate(cut);
+    omitted
 }
 
 fn assign_ids(mut node: RetainedRaw, path: &mut Vec<u32>) -> ExplanationNode {
