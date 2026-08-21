@@ -583,10 +583,6 @@ impl CSharpSource for CSharpAnalyzer {
         CSharpAnalyzer::workspace_namespace_exists(self, namespace)
     }
 
-    fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        self.inner.forward_definition_fqn(fqn)
-    }
-
     fn usage_definitions(&self, token: QueryToken<'_>) -> &dyn BoundedDefinitionLookup {
         self.inner.global_usage_definition_index_ref(token)
     }

@@ -1084,6 +1084,7 @@ fn update_analysis_kind(hasher: &mut Sha256, analysis_type: PolicyAnalysisType) 
         PolicyAnalysisType::Taint => b"taint".as_slice(),
         PolicyAnalysisType::Typestate => b"typestate".as_slice(),
         PolicyAnalysisType::Assertion => b"assertion".as_slice(),
+        PolicyAnalysisType::Flow => b"flow".as_slice(),
     };
     update_length_prefixed(hasher, value);
 }

@@ -1966,19 +1966,18 @@ struct QueryReadCache {
     /// key would cost more than it saves.
     parent_units: Arc<RwLock<HashMap<String, Option<CodeUnit>>>>,
     /// Definition candidates keyed by fq name, resolved at most once per name
-    /// per request.
+    /// per request and per concurrent same-name burst.
     ///
     /// `definitions` is the single hottest store read in candidate discovery:
     /// the shared import-graph walk asks it once per import statement in the
     /// workspace, and a workspace's import statements name far fewer distinct
-    /// targets than there are import statements (#1748). Same plain-`HashMap`
-    /// shape and reasoning as `parent_units`: each entry is one bounded
-    /// lookup, so a racing duplicate is cheaper than per-key single flight.
-    /// The expensive half of a duplicate -- the persisted row read -- is
-    /// single-flighted one level down by `definition_candidate_rows`, so what
-    /// a racing duplicate here repeats is the per-name assembly, not a store
-    /// round trip.
-    definition_units: Arc<RwLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
+    /// targets than there are import statements (#1748). Candidate scanning is
+    /// parallel, so a check-then-insert map allowed every worker in a same-name
+    /// burst to repeat the candidate assembly and path-symbol read. Use the
+    /// pool-independent per-key cells here as well as for the persisted rows
+    /// below: distinct names remain parallel, while one fq name has one complete
+    /// answer and one publication point.
+    definition_units: Arc<KeyedPoolSafeMemo<String, Vec<CodeUnit>>>,
     /// The persisted candidate rows for one short name, read at most once per
     /// (short name, lookup kind) per request.
     ///
@@ -2075,7 +2074,7 @@ impl QueryReadCache {
             top_level_class_units_by_package: Arc::new(OnceLock::new()),
             workspace_file_index: Arc::new(OnceLock::new()),
             parent_units: Arc::new(RwLock::new(HashMap::default())),
-            definition_units: Arc::new(RwLock::new(HashMap::default())),
+            definition_units: Arc::new(KeyedPoolSafeMemo::new()),
             definition_candidate_rows: Arc::new(KeyedPoolSafeMemo::new()),
             workspace_module_walk: Arc::new(RwLock::new(None)),
         }
@@ -2122,7 +2121,7 @@ impl QueryReadCache {
         self.file_states = Arc::new(RwLock::new(QueryFileStateCache::new(max_bytes)));
         self.prepared_syntax = Arc::new(RwLock::new(HashMap::default()));
         self.parent_units = Arc::new(RwLock::new(HashMap::default()));
-        self.definition_units = Arc::new(RwLock::new(HashMap::default()));
+        self.definition_units = Arc::new(KeyedPoolSafeMemo::new());
         self.definition_candidate_rows = Arc::new(KeyedPoolSafeMemo::new());
         self.workspace_module_walk = Arc::new(RwLock::new(None));
     }
@@ -7458,34 +7457,27 @@ where
     fn sql_definitions_vec(&self, fq_name: &str) -> std::result::Result<Vec<CodeUnit>, StoreError> {
         self.sql_definitions_query_count
             .fetch_add(1, Ordering::Relaxed);
-        let memo = self.active_query_cache_handle(|cache| &cache.definition_units);
-        if let Some(cached) = memo.as_ref().and_then(|memo| {
-            memo.read()
-                .expect("query definition-unit cache read lock poisoned")
-                .get(fq_name)
-                .cloned()
-        }) {
-            return Ok((*cached).clone());
-        }
-        let definitions = self.sql_definition_candidates_vec(fq_name, false)?;
-        // A failed read is never memoized: the `?` above leaves the entry
-        // missing so the next caller retries instead of inheriting an empty
-        // answer that reads as proven absence. A read that stopped at the
-        // request's deadline is the same case: `definition_candidate_rows`
-        // hands back nothing, and memoizing that would serve proven absence to
-        // every later caller of this name in the request.
-        if self
-            .active_query_cancellation()
-            .is_some_and(|cancellation| cancellation.is_cancelled())
-        {
-            return Ok(definitions);
-        }
-        if let Some(memo) = memo.as_ref() {
-            memo.write()
-                .expect("query definition-unit cache write lock poisoned")
-                .insert(fq_name.to_string(), Arc::new(definitions.clone()));
-        }
-        Ok(definitions)
+        let Some(memo) = self.active_query_cache_handle(|cache| &cache.definition_units) else {
+            return self.sql_definition_candidates_vec(fq_name, false);
+        };
+        let key = fq_name.to_string();
+        let cell = memo.cell(&key);
+        let Some(cancellation) = self.active_query_cancellation() else {
+            return cell
+                .get_or_try_build_pool_independent(|| {
+                    self.sql_definition_candidates_vec(fq_name, false)
+                })
+                .map(|definitions| (*definitions).clone());
+        };
+
+        let keep_going = || !cancellation.is_cancelled();
+        let definitions = cell.get_or_try_build_pool_independent_while(&keep_going, || {
+            let definitions = self.sql_definition_candidates_vec(fq_name, false)?;
+            Ok::<Option<Vec<CodeUnit>>, StoreError>(keep_going().then_some(definitions))
+        })?;
+        Ok(definitions
+            .map(|definitions| (*definitions).clone())
+            .unwrap_or_default())
     }
 
     fn sql_bounded_definitions_vec(
@@ -7747,18 +7739,13 @@ where
             return;
         }
         let _scope = crate::profiling::scope("TreeSitterAnalyzer::prefetch_definitions");
-        let missing: Vec<String> = {
-            let seen = memo
-                .read()
-                .expect("query definition-unit cache read lock poisoned");
-            let mut unique: BTreeSet<&str> = BTreeSet::new();
-            fq_names
-                .iter()
-                .filter(|fq_name| !seen.contains_key(fq_name.as_str()))
-                .filter(|fq_name| unique.insert(fq_name.as_str()))
-                .cloned()
-                .collect()
-        };
+        let mut unique: BTreeSet<&str> = BTreeSet::new();
+        let missing: Vec<String> = fq_names
+            .iter()
+            .filter(|fq_name| unique.insert(fq_name.as_str()))
+            .filter(|fq_name| !memo.cell(*fq_name).is_ready())
+            .cloned()
+            .collect();
         if missing.is_empty() {
             return;
         }
@@ -7833,21 +7820,18 @@ where
             let normalized = self.adapter.normalize_full_name(fq_name);
             resolved.push((
                 fq_name.clone(),
-                Arc::new(self.assemble_definition_candidates(
+                self.assemble_definition_candidates(
                     fq_name,
                     &normalized,
                     name_rows,
                     path_units,
                     false,
-                )),
+                ),
             ));
         }
 
-        let mut sink = memo
-            .write()
-            .expect("query definition-unit cache write lock poisoned");
         for (fq_name, units) in resolved {
-            sink.entry(fq_name).or_insert(units);
+            memo.cell(&fq_name).get_or_build_pool_independent(|| units);
         }
     }
 
@@ -12404,6 +12388,43 @@ mod tests {
         assert_eq!(
             1, queries,
             "a request must resolve one definition name with one store read"
+        );
+    }
+
+    /// Parallel graph workers can reach one fq name before any worker has
+    /// published its answer. The complete definition memo must single-flight
+    /// that burst, not merely deduplicate its lower-level short-name row read.
+    #[test]
+    fn issue_1748_concurrent_definition_lookups_of_one_name_charge_one_query() {
+        const WORKERS: usize = 8;
+
+        let (_temp, project) = shared_short_name_project(64);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let fq_name = "pkg.mod_0.Shared";
+        let expected: Vec<CodeUnit> = CodeUnitIndex::definitions(&analyzer, fq_name).collect();
+
+        let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&scope);
+        analyzer.reset_definition_candidates_query_count_for_test();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(WORKERS)
+            .build()
+            .expect("rayon pool");
+        let start = std::sync::Barrier::new(WORKERS);
+        let concurrent = pool.broadcast(|_| {
+            start.wait();
+            CodeUnitIndex::definitions(&analyzer, fq_name).collect::<Vec<CodeUnit>>()
+        });
+        let queries = analyzer.definition_candidates_query_count_for_test();
+        analyzer.end_query(&scope);
+
+        assert!(
+            concurrent.iter().all(|answer| answer == &expected),
+            "single flight must preserve the definition answer: {concurrent:#?}"
+        );
+        assert_eq!(
+            1, queries,
+            "concurrent callers of one fq name must build one complete answer"
         );
     }
 

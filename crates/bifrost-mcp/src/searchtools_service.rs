@@ -32,11 +32,13 @@ use crate::{
     file_tools::{find_files_containing, get_file_contents, search_file_contents},
     path_normalization::NormalizePath,
     policy::{
-        BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
+        BuiltInPolicySelection, ExplainError, ExplanationCandidate, ExplanationLimits,
+        ExplanationTarget, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
         PolicyBaselineOptions, PolicyBaselineSource, PolicyEvaluationDate, PolicyEvaluationInput,
-        PolicyEvaluationOptions, PolicyFailOn, PolicyId, PolicyReportDocument, PolicyScopeOptions,
-        PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource,
-        built_in_policy_catalog, workspace_snapshot_deadline_outcome,
+        PolicyEvaluationOptions, PolicyExplanation, PolicyFailOn, PolicyFindingId, PolicyId,
+        PolicyReportDocument, PolicyScopeOptions, PolicyScopeSource, PolicySuppressionOptions,
+        PolicySuppressionSource, built_in_policy_catalog, explain_policy_inputs,
+        workspace_snapshot_deadline_outcome,
     },
     profiling,
     searchtools::{
@@ -833,6 +835,49 @@ pub(crate) struct RunPolicyToolResult {
     report: PolicyReportDocument,
 }
 
+/// `explain_policy` arguments.
+///
+/// The policy selection is `run_policy`'s, narrowed to exactly one resolved
+/// policy: a finding identity belongs to one run and a candidate is tested
+/// against one plan, so explaining a batch is not a question that has an
+/// answer. The target is exactly one of `finding_id` (why) or `candidate`
+/// (why-not); the schema states the exclusion and the handler enforces it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExplainPolicyParams {
+    #[serde(default)]
+    policy_files: Vec<String>,
+    #[serde(default)]
+    policy_packs: Vec<String>,
+    #[serde(default)]
+    policy_categories: Vec<String>,
+    #[serde(default)]
+    policy_ids: Vec<String>,
+    finding_id: Option<String>,
+    candidate: Option<ExplainPolicyCandidate>,
+}
+
+/// One explicit source position a caller believes should have matched.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExplainPolicyCandidate {
+    path: String,
+    byte_start: u64,
+    /// Omitted means a point candidate at `byte_start`.
+    byte_end: Option<u64>,
+}
+
+/// The `explain_policy` result: the structured explanation and nothing else.
+///
+/// An explanation is a query about a policy, not a gate, so this result
+/// carries no status and no exit code. Everything a caller needs -- the
+/// question, the outcome, the node tree, the truncation record -- is inside
+/// the versioned explanation document.
+#[derive(Serialize)]
+pub(crate) struct ExplainPolicyToolResult {
+    explanation: PolicyExplanation,
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchToolsServiceError {
     pub code: SearchToolsServiceErrorCode,
@@ -1049,6 +1094,406 @@ struct QueryCodeExecutionTiming {
 
 fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Which question `explain_policy` was asked.
+///
+/// Exactly one of the two targets must be present: a request with both would
+/// have two answers and a request with neither has no question.
+fn explain_policy_target(
+    params: &ExplainPolicyParams,
+) -> Result<ExplanationTarget, SearchToolsServiceError> {
+    match (&params.finding_id, &params.candidate) {
+        (Some(_), Some(_)) => Err(SearchToolsServiceError::invalid_params(
+            "explain_policy accepts finding_id or candidate, not both".to_string(),
+        )),
+        (None, None) => Err(SearchToolsServiceError::invalid_params(
+            "explain_policy requires either finding_id (why) or candidate (why-not)".to_string(),
+        )),
+        (Some(finding_id), None) => {
+            let parsed = finding_id.parse::<PolicyFindingId>().map_err(|error| {
+                SearchToolsServiceError::invalid_params(format!(
+                    "invalid explain_policy finding_id `{finding_id}`: {error}"
+                ))
+            })?;
+            Ok(ExplanationTarget::Finding(parsed))
+        }
+        (None, Some(candidate)) => {
+            let parsed = match candidate.byte_end {
+                Some(byte_end) => {
+                    ExplanationCandidate::in_range(&candidate.path, candidate.byte_start, byte_end)
+                }
+                None => ExplanationCandidate::at_offset(&candidate.path, candidate.byte_start),
+            }
+            .map_err(|error| {
+                SearchToolsServiceError::invalid_params(format!(
+                    "invalid explain_policy candidate: {error}"
+                ))
+            })?;
+            Ok(ExplanationTarget::Candidate(parsed))
+        }
+    }
+}
+
+/// Resolve `explain_policy`'s policy selection into exactly one policy input.
+///
+/// The bounds are `run_policy`'s -- the same path, selector, and extension
+/// rules -- narrowed to one policy, because an explanation is about one.
+fn explain_policy_inputs_from(
+    params: &ExplainPolicyParams,
+) -> Result<Vec<PolicyEvaluationInput>, SearchToolsServiceError> {
+    for (label, values) in [
+        ("policy_packs", &params.policy_packs),
+        ("policy_categories", &params.policy_categories),
+        ("policy_ids", &params.policy_ids),
+    ] {
+        for value in values {
+            if value.is_empty() || value.len() > crate::mcp_extended::MAX_RUN_POLICY_SELECTOR_BYTES
+            {
+                return Err(SearchToolsServiceError::invalid_params(format!(
+                    "explain_policy {label} entries must contain between 1 and {} bytes",
+                    crate::mcp_extended::MAX_RUN_POLICY_SELECTOR_BYTES
+                )));
+            }
+        }
+    }
+    let mut inputs = Vec::new();
+    for raw_path in &params.policy_files {
+        if raw_path.len() > crate::mcp_extended::MAX_RUN_POLICY_PATH_BYTES {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "explain_policy policy path exceeds {} bytes",
+                crate::mcp_extended::MAX_RUN_POLICY_PATH_BYTES
+            )));
+        }
+        let path = WorkspaceRelativePath::new(raw_path).map_err(|error| {
+            SearchToolsServiceError::invalid_params(format!(
+                "invalid explain_policy policy path `{raw_path}`: {error}"
+            ))
+        })?;
+        if Path::new(path.as_str())
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("rqlp")
+        {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "explain_policy policy path `{}` must use the .rqlp extension",
+                path.as_str()
+            )));
+        }
+        inputs.push(PolicyEvaluationInput::workspace_file(path.as_str()));
+    }
+
+    let selection = BuiltInPolicySelection {
+        packs: params.policy_packs.clone(),
+        categories: params.policy_categories.clone(),
+        policy_ids: params.policy_ids.clone(),
+    };
+    let selected = built_in_policy_catalog()
+        .map_err(|error| {
+            SearchToolsServiceError::internal(format!(
+                "failed to load built-in policy catalog: {error}"
+            ))
+        })?
+        .select(&selection)
+        .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+    let mut built_in = selected
+        .into_iter()
+        .map(|policy| PolicyEvaluationInput::embedded(policy.source_identity(), policy.source()))
+        .collect::<Vec<_>>();
+    built_in.append(&mut inputs);
+    if built_in.len() != 1 {
+        return Err(SearchToolsServiceError::invalid_params(format!(
+            "explain_policy explains one policy, but the selection resolved to {}",
+            built_in.len()
+        )));
+    }
+    Ok(built_in)
+}
+
+/// Map one explanation condition onto the transport's error vocabulary.
+///
+/// Every condition the caller can fix -- a policy that does not load, an
+/// adapter that does not exist for the policy's family, a finding identity the
+/// run does not carry -- is an invalid-parameter error carrying the library's
+/// own message, so an agent reads one stated condition rather than a stack of
+/// wrappers.
+fn explain_error_to_service_error(error: ExplainError) -> SearchToolsServiceError {
+    SearchToolsServiceError::invalid_params(format!("explain_policy could not answer: {error}"))
+}
+
+/// Wire-level coverage for `explain_policy` (issue 2439 slice 3).
+///
+/// Every assertion here reads the tool's structured result, never rendered
+/// text: the whole point of the tool is that an authoring agent does not parse
+/// prose.
+#[cfg(test)]
+mod explain_policy_tests {
+    use super::*;
+    use crate::path_normalization::NormalizePath;
+    use serde_json::json;
+
+    const MATCH_POLICY: &str = r#"(policy
+  :id "test.explain.mcp.match"
+  :name "Widget"
+  :message "Widget is reported"
+  :severity warning
+  :analysis (analysis :type match :selector (rql (class :name "Widget"))))"#;
+
+    const RELATIONAL_POLICY: &str = r#"(policy
+  :id "test.explain.mcp.relational"
+  :name "No value reads"
+  :message "value reads are forbidden in this fixture"
+  :severity warning
+  :analysis (analysis
+    :type assertion
+    (bind :name read :query (rql (occurrences :role [value_reference])))
+    (group :name by-read :by (read.ast_id)
+      (aggregate :name reads :op count))
+    (assert :group by-read :value reads :cardinality (exactly 0))))"#;
+
+    const TAINT_POLICY: &str = r#"(policy
+  :id "test.explain.mcp.taint"
+  :name "Taint"
+  :message (generated-message :relation can-reach)
+  :severity warning
+  :analysis (analysis
+    :type taint
+    :mode may
+    :sources (endpoint-set :entries [
+      (source :id alpha :display-name "user input" :categories [input.user]
+        :selector (rql (name "alpha")) :bind return-value :labels [untrusted])])
+    :sinks (endpoint-set :entries [
+      (sink :id store :display-name "sensitive store" :categories [data.sensitive]
+        :selector (rql (name "store")) :dangerous-operand matched-value
+        :accepts [untrusted])])))"#;
+
+    const SOURCE: &str = "class Widget {\n  int render() { return 1; }\n}\n";
+
+    fn service() -> (tempfile::TempDir, SearchToolsService) {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("Widget.java"), SOURCE).unwrap();
+        std::fs::create_dir_all(temp.path().join("policies")).unwrap();
+        for (name, source) in [
+            ("match.rqlp", MATCH_POLICY),
+            ("relational.rqlp", RELATIONAL_POLICY),
+            ("taint.rqlp", TAINT_POLICY),
+        ] {
+            std::fs::write(temp.path().join("policies").join(name), source).unwrap();
+        }
+        let root = temp.path().canonicalize().unwrap().normalize();
+        let service = SearchToolsService::new_manual_without_semantic_index(root)
+            .expect("manual service should start");
+        (temp, service)
+    }
+
+    fn byte_offset(needle: &str) -> u64 {
+        u64::try_from(SOURCE.find(needle).expect("the fixture holds the needle")).unwrap()
+    }
+
+    #[test]
+    fn explain_policy_answers_why_not_with_a_structured_explanation() {
+        let (_temp, service) = service();
+        let value = service
+            .call_tool_value(
+                "explain_policy",
+                json!({
+                    "policy_files": ["policies/match.rqlp"],
+                    "candidate": { "path": "Widget.java", "byte_start": byte_offset("Widget") }
+                }),
+            )
+            .expect("explain_policy should answer");
+        let explanation = &value["explanation"];
+        assert_eq!(
+            explanation["format"],
+            brokk_bifrost_policy::POLICY_EXPLANATION_FORMAT,
+            "{value:#}"
+        );
+        assert_eq!(explanation["question"], "why_not", "{value:#}");
+        assert_eq!(explanation["policy_id"], "test.explain.mcp.match");
+        assert_eq!(explanation["analysis_type"], "match");
+        assert_eq!(explanation["subject"]["type"], "candidate");
+        assert_eq!(explanation["subject"]["path"], "Widget.java");
+        // The result carries no gate: an explanation is a query.
+        assert!(value.get("status").is_none(), "{value:#}");
+        assert!(value.get("exit_status").is_none(), "{value:#}");
+        // The tree is a tree, and its root states an outcome.
+        assert!(explanation["node_count"].as_u64().is_some_and(|n| n >= 1));
+        assert!(
+            ["satisfied", "failed", "unknown"]
+                .contains(&explanation["outcome"].as_str().expect("an outcome")),
+            "{value:#}"
+        );
+        assert!(
+            explanation["root"]["id"]
+                .as_str()
+                .is_some_and(|id| id.len() == 32)
+        );
+    }
+
+    /// The relational adapter reaches the wire: an assertion policy answers
+    /// per row binding, and the node vocabulary the slice added is published.
+    #[test]
+    fn explain_policy_answers_why_not_for_a_relational_policy() {
+        let (_temp, service) = service();
+        let value = service
+            .call_tool_value(
+                "explain_policy",
+                json!({
+                    "policy_files": ["policies/relational.rqlp"],
+                    "candidate": {
+                        "path": "Widget.java",
+                        "byte_start": byte_offset("return 1"),
+                        "byte_end": byte_offset("return 1") + 8
+                    }
+                }),
+            )
+            .expect("explain_policy should answer for a relational policy");
+        let explanation = &value["explanation"];
+        assert_eq!(explanation["analysis_type"], "assertion", "{value:#}");
+        assert_eq!(explanation["root"]["label"], "relational_candidate");
+        let bindings = explanation["root"]["children"]
+            .as_array()
+            .expect("the root has children")
+            .iter()
+            .filter(|node| node["kind"] == "relation_binding")
+            .count();
+        assert_eq!(bindings, 1, "{value:#}");
+    }
+
+    #[test]
+    fn explain_policy_requires_exactly_one_question() {
+        let (_temp, service) = service();
+        let neither = service
+            .call_tool_value(
+                "explain_policy",
+                json!({ "policy_files": ["policies/match.rqlp"] }),
+            )
+            .expect_err("a request with no question has no answer");
+        assert_eq!(neither.code, SearchToolsServiceErrorCode::InvalidParams);
+        assert!(
+            neither.message.contains("finding_id (why) or candidate"),
+            "{}",
+            neither.message
+        );
+
+        let both = service
+            .call_tool_value(
+                "explain_policy",
+                json!({
+                    "policy_files": ["policies/match.rqlp"],
+                    "finding_id": "0".repeat(64),
+                    "candidate": { "path": "Widget.java", "byte_start": 0 }
+                }),
+            )
+            .expect_err("a request with two questions has two answers");
+        assert!(both.message.contains("not both"), "{}", both.message);
+    }
+
+    #[test]
+    fn explain_policy_explains_exactly_one_policy() {
+        let (_temp, service) = service();
+        let error = service
+            .call_tool_value(
+                "explain_policy",
+                json!({
+                    "policy_files": ["policies/match.rqlp", "policies/relational.rqlp"],
+                    "candidate": { "path": "Widget.java", "byte_start": 0 }
+                }),
+            )
+            .expect_err("an explanation is about one policy");
+        assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
+        assert!(error.message.contains("resolved to 2"), "{}", error.message);
+    }
+
+    /// A family with no adapter is a stated condition on the wire, and the
+    /// message names the families that do have one.
+    #[test]
+    fn explain_policy_reports_an_unavailable_adapter_with_the_supported_families() {
+        let (_temp, service) = service();
+        let error = service
+            .call_tool_value(
+                "explain_policy",
+                json!({
+                    "policy_files": ["policies/taint.rqlp"],
+                    "candidate": { "path": "Widget.java", "byte_start": 0 }
+                }),
+            )
+            .expect_err("taint has no why-not adapter yet");
+        assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
+        assert!(
+            error
+                .message
+                .contains("supported analysis types: match, assertion"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn explain_policy_rejects_a_malformed_finding_identity_and_a_bad_path() {
+        let (_temp, service) = service();
+        let bad_id = service
+            .call_tool_value(
+                "explain_policy",
+                json!({
+                    "policy_files": ["policies/match.rqlp"],
+                    "finding_id": "not-a-digest"
+                }),
+            )
+            .expect_err("a finding identity is a lowercase sha-256");
+        assert_eq!(bad_id.code, SearchToolsServiceErrorCode::InvalidParams);
+
+        let escaping = service
+            .call_tool_value(
+                "explain_policy",
+                json!({
+                    "policy_files": ["policies/match.rqlp"],
+                    "candidate": { "path": "../outside.java", "byte_start": 0 }
+                }),
+            )
+            .expect_err("a candidate stays inside the workspace");
+        assert!(
+            escaping.message.contains("not inside the workspace"),
+            "{}",
+            escaping.message
+        );
+
+        let reversed = service
+            .call_tool_value(
+                "explain_policy",
+                json!({
+                    "policy_files": ["policies/match.rqlp"],
+                    "candidate": { "path": "Widget.java", "byte_start": 9, "byte_end": 4 }
+                }),
+            )
+            .expect_err("a candidate range does not end before it starts");
+        assert!(
+            reversed.message.contains("exceeds end"),
+            "{}",
+            reversed.message
+        );
+    }
+
+    /// Determinism on the wire: two calls over one immutable snapshot
+    /// serialize byte-identically.
+    #[test]
+    fn explain_policy_is_deterministic_across_calls() {
+        let (_temp, service) = service();
+        let arguments = json!({
+            "policy_files": ["policies/match.rqlp"],
+            "candidate": { "path": "Widget.java", "byte_start": byte_offset("render") }
+        });
+        let first = service
+            .call_tool_value("explain_policy", arguments.clone())
+            .expect("first answer");
+        let second = service
+            .call_tool_value("explain_policy", arguments)
+            .expect("second answer");
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+    }
 }
 pub(crate) struct PreparedRunPolicy {
     snapshot: WorkspaceQueryScope,
@@ -1767,6 +2212,9 @@ impl SearchToolsService {
                 }
                 RunPolicyPreparation::Deadline(result) => Self::structured_only(result),
             };
+        }
+        if name == "explain_policy" {
+            return self.handle_explain_policy(arguments, cancellation);
         }
 
         let arguments =
@@ -4062,6 +4510,52 @@ impl SearchToolsService {
         }
     }
 
+    /// Answer one bounded `why` or `why-not` question about one policy.
+    ///
+    /// This reuses the same immutable workspace snapshot `run_policy` uses, so
+    /// an explanation describes the generation the caller is already querying.
+    /// It loads no suppressions, scope, or baseline and computes no exit
+    /// status: an explanation is a query, not a gate.
+    pub(crate) fn handle_explain_policy(
+        &self,
+        arguments: Value,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
+        let params = serde_json::from_value::<ExplainPolicyParams>(arguments).map_err(|error| {
+            SearchToolsServiceError::invalid_params(format!(
+                "Invalid explain_policy arguments: {error}"
+            ))
+        })?;
+        let target = explain_policy_target(&params)?;
+        let policy_inputs = explain_policy_inputs_from(&params)?;
+
+        loop {
+            let workspace_generation = self.workspace_generation();
+            let snapshot = {
+                let _scope = profiling::scope("explain_policy.snapshot_for_query");
+                self.snapshot_for_query_with_cancellation(cancellation)?
+            };
+            if workspace_generation != self.workspace_generation() {
+                continue;
+            }
+            let root = snapshot.analyzer().project().root().to_path_buf();
+            let result = (|| {
+                let _scope = profiling::scope("explain_policy.explain_policy_inputs");
+                let explanation = explain_policy_inputs(
+                    &root,
+                    &policy_inputs,
+                    &target,
+                    Some(&snapshot),
+                    cancellation,
+                    &ExplanationLimits::default(),
+                )
+                .map_err(explain_error_to_service_error)?;
+                Self::structured_only(ExplainPolicyToolResult { explanation })
+            })();
+            return snapshot.finish("explain_policy", result);
+        }
+    }
+
     pub(crate) fn execute_prepared_run_policy(
         &self,
         prepared: PreparedRunPolicy,
@@ -4823,7 +5317,7 @@ mod watcher_startup_tests {
 
         assert_eq!(result.status, "unreliable");
         assert_eq!(result.exit_status, POLICY_EXIT_UNRELIABLE);
-        assert_eq!(result.report.schema_version(), 4);
+        assert_eq!(result.report.schema_version(), 5);
         assert!(result.report.rules().is_empty());
         assert!(result.report.runs().is_empty());
         assert_eq!(
@@ -5015,7 +5509,7 @@ mod watcher_startup_tests {
         };
 
         assert_eq!(structured["status"], "unreliable");
-        assert_eq!(structured["report"]["schema_version"], 4);
+        assert_eq!(structured["report"]["schema_version"], 5);
         assert_eq!(
             structured["report"]["execution"]["termination"],
             "deadline_exceeded"

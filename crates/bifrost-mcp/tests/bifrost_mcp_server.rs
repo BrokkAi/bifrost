@@ -238,6 +238,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "query_code",
             "list_policies",
             "run_policy",
+            "explain_policy",
             "get_symbol_locations",
             "get_symbol_ancestors",
             "most_relevant_files",
@@ -1061,7 +1062,7 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     assert_eq!(structured["status"], "finding", "{baseline}");
     assert_eq!(structured["exit_status"], 1, "{baseline}");
     assert_eq!(structured["report"], expected_report, "{baseline}");
-    assert_eq!(structured["report"]["schema_version"], 4);
+    assert_eq!(structured["report"]["schema_version"], 5);
     assert_eq!(
         structured["report"]["execution"]["stage_timings"],
         json!([])

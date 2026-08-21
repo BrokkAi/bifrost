@@ -1478,6 +1478,78 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         group_id,
                     ));
                 }
+                CodeQueryResultValue::CallBinding { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let site_id = sanitize_terminal_text(&value.site_id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {}{}{}\n  site {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "call binding:", use_color),
+                        value.binding_kind.unwrap_or("terminal"),
+                        value.mapping,
+                        value
+                            .formal_name
+                            .as_deref()
+                            .map(|name| format!(" formal={}", sanitize_terminal_text(name)))
+                            .unwrap_or_default(),
+                        value
+                            .reason
+                            .map(|reason| format!(" reason={reason}"))
+                            .unwrap_or_default(),
+                        site_id,
+                    ));
+                }
+                CodeQueryResultValue::CallEffect { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let site_id = sanitize_terminal_text(&value.site_id);
+                    let effect = value
+                        .effect_id
+                        .as_deref()
+                        .map(sanitize_terminal_text)
+                        .unwrap_or_else(|| "no declared effect".to_owned());
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {} {}{}\n  site {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "call effect:", use_color),
+                        effect,
+                        value.derivation,
+                        value.coverage,
+                        value
+                            .certainty
+                            .map(|certainty| format!(" {certainty}"))
+                            .unwrap_or_default(),
+                        site_id,
+                    ));
+                }
+                CodeQueryResultValue::ProcedureEffect { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let name = sanitize_terminal_text(&value.procedure_name);
+                    let effect = value
+                        .effect_id
+                        .as_deref()
+                        .map(sanitize_terminal_text)
+                        .unwrap_or_else(|| "no declared effect".to_owned());
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {} {} {}{}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "procedure effect:", use_color),
+                        paint(Style::new().bold(), &name, use_color),
+                        effect,
+                        value.derivation,
+                        value.coverage,
+                        value
+                            .witness_chain
+                            .as_deref()
+                            .map(|chain| format!("\n  witness {}", sanitize_terminal_text(chain)))
+                            .unwrap_or_default(),
+                    ));
+                }
                 CodeQueryResultValue::OverloadSelection { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     out.push_str(&format!(

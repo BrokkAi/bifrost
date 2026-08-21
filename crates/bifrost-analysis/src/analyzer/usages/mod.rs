@@ -13,6 +13,7 @@
 //!   Java, Kotlin, C#, C++, Go, Ruby, and Scala targets.
 
 pub mod applicability;
+pub mod call_binding;
 pub mod call_relations;
 pub mod call_shape;
 pub mod callable_signature;
@@ -20,6 +21,7 @@ mod candidates;
 pub(crate) mod common;
 pub mod cpp_graph;
 pub(crate) mod csharp_graph;
+pub mod effects;
 pub(crate) mod file_usage_graph;
 mod finder;
 pub mod get_definition;

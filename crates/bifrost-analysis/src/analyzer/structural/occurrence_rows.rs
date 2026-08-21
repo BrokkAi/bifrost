@@ -268,6 +268,25 @@ pub fn occurrences_for_file_with_options(
     options: OccurrenceDerivationOptions,
     cancellation: &CancellationToken,
 ) -> Result<OccurrenceFileResult, OccurrencesCancelled> {
+    occurrences_for_file_with_options_and_roles(analyzer, file, options, None, cancellation)
+}
+
+/// Query-local occurrence derivation restricted to the roles a typed seed can
+/// observe.
+///
+/// The public per-file producer above remains exhaustive. A query with an
+/// explicit role or class filter, however, cannot observe rows outside the
+/// corresponding role set. Avoiding those rows also avoids their source
+/// strings, enclosing-declaration lookups, and target resolutions. The result
+/// retains the producer's complete role-support account, so an empty selected
+/// role remains trustworthy only when the adapter proves it complete.
+pub(crate) fn occurrences_for_file_with_options_and_roles(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    options: OccurrenceDerivationOptions,
+    roles: Option<&[OccurrenceRole]>,
+    cancellation: &CancellationToken,
+) -> Result<OccurrenceFileResult, OccurrencesCancelled> {
     if cancellation.is_cancelled() {
         return Err(OccurrencesCancelled);
     }
@@ -293,7 +312,7 @@ pub fn occurrences_for_file_with_options(
         .map(OccurrenceIncompleteReason::RoleUnsupported)
         .collect();
 
-    let mut rows = classify_rows(spec, file, &facts, &mut reasons);
+    let mut rows = classify_rows(spec, file, &facts, roles, &mut reasons);
     if cancellation.is_cancelled() {
         return Err(OccurrencesCancelled);
     }
@@ -343,6 +362,7 @@ fn classify_rows(
     spec: &dyn StructuralSpec,
     file: &ProjectFile,
     facts: &FileFacts,
+    selected_roles: Option<&[OccurrenceRole]>,
     reasons: &mut Vec<OccurrenceIncompleteReason>,
 ) -> Vec<OccurrenceRow> {
     let content_identity = facts.source_identity();
@@ -357,6 +377,9 @@ fn classify_rows(
         let normalized = facts.node(node);
         let declared_kind = declared_fact_kind(facts, node);
         for &role in roles {
+            if selected_roles.is_some_and(|selected| !selected.contains(&role)) {
+                continue;
+            }
             let Some(namespace) = spec.occurrence_namespace(role, declared_kind) else {
                 let reason = OccurrenceIncompleteReason::NamespaceUnknown(role);
                 if !reasons.contains(&reason) {
@@ -616,6 +639,17 @@ mod tests {
             .expect("uncancelled occurrence derivation")
         }
 
+        fn identity_only_roles(&self, roles: &[OccurrenceRole]) -> OccurrenceFileResult {
+            occurrences_for_file_with_options_and_roles(
+                self.workspace.analyzer(),
+                &self.file,
+                OccurrenceDerivationOptions::IDENTITY_ONLY,
+                Some(roles),
+                &CancellationToken::new(),
+            )
+            .expect("uncancelled role-scoped occurrence derivation")
+        }
+
         fn traced_result(&self) -> OccurrenceFileResult {
             occurrences_for_file_with_options(
                 self.workspace.analyzer(),
@@ -637,6 +671,30 @@ mod tests {
 
     fn row_at(rows: &[OccurrenceRow], start_byte: usize) -> Option<&OccurrenceRow> {
         rows.iter().find(|row| row.range.start_byte == start_byte)
+    }
+
+    #[test]
+    fn role_scoped_derivation_retains_only_observable_rows_and_full_completeness() {
+        let source = concat!(
+            "function render(value: string) {\n",
+            "    return value.trim().length;\n",
+            "}\n",
+        );
+        let fixture = Fixture::new(Language::TypeScript, "src/app.ts", source);
+        let exhaustive = fixture.identity_only_result();
+        let scoped = fixture.identity_only_roles(&[OccurrenceRole::ReceiverPosition]);
+
+        assert!(!scoped.rows.is_empty());
+        assert!(
+            scoped
+                .rows
+                .iter()
+                .all(|row| row.role == OccurrenceRole::ReceiverPosition),
+            "a role-scoped producer must not materialize unobservable rows: {:?}",
+            scoped.rows.iter().map(|row| row.role).collect::<Vec<_>>()
+        );
+        assert!(exhaustive.rows.len() > scoped.rows.len());
+        assert_eq!(scoped.completeness, exhaustive.completeness);
     }
 
     fn expect_row<'rows>(

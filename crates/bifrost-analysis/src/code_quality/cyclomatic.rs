@@ -5,7 +5,7 @@
 //! `CodeQualityToolsMcp.computeCyclomaticComplexity` byte-for-byte.
 
 #[cfg(test)]
-use super::cyclomatic_complexity_for;
+use super::cyclomatic_complexity_for_sources;
 use super::{
     MAX_REPORT_LINES, ReportLines, append_ambiguous_path_notes, cyclomatic_complexities_for_file,
     resolve_project_files,
@@ -93,7 +93,7 @@ pub fn compute_cyclomatic_complexity(
 
 #[cfg(test)]
 mod tests {
-    use super::super::MAX_FILE_PATHS;
+    use super::super::{MAX_FILE_PATHS, MAX_SOURCE_BYTES};
     use super::*;
     use crate::test_support::AnalyzerFixture;
 
@@ -319,19 +319,19 @@ mod tests {
 
     #[test]
     fn oversize_source_falls_back_to_base_complexity() {
-        // Build a function whose body is well over MAX_SOURCE_BYTES; the
-        // heuristic should bail and report base complexity 1.
+        // Keep the source shape small while exceeding MAX_SOURCE_BYTES.
+        // Repeating statement nodes and recovering their declaration through
+        // an analyzer would test independent indexing budgets instead of this
+        // byte guard. A few decision nodes ensure an uncapped scan would
+        // return more than the base complexity.
         let body = format!(
-            "fn huge() -> i32 {{\n{}    0\n}}\n",
-            "    if true {}\n".repeat(200_000)
+            "fn huge() -> i32 {{\n{}{}    0\n}}\n",
+            "    if true {}\n".repeat(11),
+            " ".repeat(MAX_SOURCE_BYTES + 1),
         );
-        let fix = AnalyzerFixture::new(&[("src/lib.rs", body.as_str())]);
-        let analyzer = fix.analyzer.analyzer();
-        let huge = analyzer
-            .get_all_declarations()
-            .into_iter()
-            .find(|cu| cu.is_function() && cu.identifier() == "huge")
-            .expect("huge fn declared");
-        assert_eq!(cyclomatic_complexity_for(analyzer, &huge), 1);
+        assert_eq!(
+            cyclomatic_complexity_for_sources(std::iter::once(body.as_str())),
+            1
+        );
     }
 }

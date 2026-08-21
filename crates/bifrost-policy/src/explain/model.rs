@@ -59,19 +59,29 @@ impl ExplanationQuestion {
 
 /// What one explanation node stands for.
 ///
-/// The five kinds are the vocabulary issue 2439 fixes for slice 1. A kind is
-/// presentation-independent: a consumer groups and filters on it without
-/// parsing prose.
+/// The five kinds slice 1 fixed are joined by one relational kind in slice 2.
+/// A kind is presentation-independent: a consumer groups and filters on it
+/// without parsing prose.
+///
+/// # Additive vocabulary
+///
+/// `relation_binding` was added after `bifrost_policy_explanation/v1` shipped.
+/// The addition is strictly additive -- no existing node changed kind, shape,
+/// or identity, and no previously emitted document contains the new tag -- so
+/// the format string stays `v1` (see the ExecPlan Decision Log for issue 2439
+/// slices 2-3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExplanationNodeKind {
-    /// One analyzer row: a seed row, a step result, or the `via` row a step
-    /// travelled through.
+    /// One analyzer row: a seed row, a step result, the `via` row a step
+    /// travelled through, or one representative row behind an assertion.
     SourceFact,
     /// One stage of the selector pipeline: the plan source, or one typed step.
     SelectorStage,
-    /// One authored assertion. Reserved for the assertion adapter; no match
-    /// explanation emits it yet.
+    /// One authored relational row binding: a named relation and what its
+    /// executed query said. Its children are that binding's selector stages.
+    RelationBinding,
+    /// One authored assertion and the verdict its aggregate produced.
     Assertion,
     /// What the run's coverage does or does not license.
     CoverageObligation,
@@ -85,6 +95,7 @@ impl ExplanationNodeKind {
         match self {
             Self::SourceFact => "source_fact",
             Self::SelectorStage => "selector_stage",
+            Self::RelationBinding => "relation_binding",
             Self::Assertion => "assertion",
             Self::CoverageObligation => "coverage_obligation",
             Self::FindingProjection => "finding_projection",
@@ -465,9 +476,11 @@ impl Default for ExplanationLimits {
             max_children_per_node: 64,
             max_retained_bytes: 64 * 1024,
             max_text_bytes: 512,
-            // MAX_QUERY_STEPS is 16, so a selector's source plus every step
-            // fits in 17 executions.
-            max_prefix_executions: 17,
+            // MAX_QUERY_STEPS is 16, so one selector's source plus every step
+            // fits in 17 executions. A relational plan's row bindings share
+            // this one total, so the default holds three full-depth bindings
+            // and truncates honestly beyond that.
+            max_prefix_executions: 64,
         }
     }
 }
@@ -547,6 +560,17 @@ impl ExplanationBudgetLimit {
     }
 }
 
+/// The analysis families [`super::explain_finding`] can answer `why` for.
+///
+/// Published as data so a caller -- and the adapter-unavailable error itself --
+/// can state what *is* supported instead of only what is not.
+pub const WHY_ADAPTER_ANALYSIS_TYPES: &[PolicyAnalysisType] =
+    &[PolicyAnalysisType::Match, PolicyAnalysisType::Assertion];
+
+/// The analysis families [`super::explain_candidate`] can answer `why-not` for.
+pub const WHY_NOT_ADAPTER_ANALYSIS_TYPES: &[PolicyAnalysisType] =
+    &[PolicyAnalysisType::Match, PolicyAnalysisType::Assertion];
+
 /// Why an explanation could not be produced.
 ///
 /// Every variant is a stated, recoverable condition. In particular, asking for
@@ -556,10 +580,22 @@ impl ExplanationBudgetLimit {
 pub enum ExplainError {
     /// No retained finding in the run carries this identity.
     FindingNotFound { finding: PolicyFindingId },
-    /// This policy family has no explanation adapter yet.
-    ExplanationAdapterUnavailable { analysis_type: PolicyAnalysisType },
+    /// This policy family has no explanation adapter for this question yet.
+    ///
+    /// `supported` names the families that *do* have one, so a caller learns
+    /// the whole answer from one error rather than by probing.
+    ExplanationAdapterUnavailable {
+        analysis_type: PolicyAnalysisType,
+        question: ExplanationQuestion,
+        supported: Vec<PolicyAnalysisType>,
+    },
     /// The loaded match policy carries no `/analysis/selector`.
     SelectorUnavailable,
+    /// The loaded assertion policy carries no relational row plan, so it has
+    /// no row bindings a candidate could be tested against.
+    RelationalPlanUnavailable,
+    /// The relational plan names a binding whose resolved selector is missing.
+    BindingSelectorUnavailable { binding: String },
     /// The nominated candidate path is not a workspace-relative path.
     CandidateOutsideWorkspace {
         path: String,
@@ -569,6 +605,31 @@ pub enum ExplainError {
     ReversedCandidateRange { start: u64, end: u64 },
     /// The limits cannot hold even the mandatory root of an explanation.
     BudgetExhausted { limit: ExplanationBudgetLimit },
+    /// The host could not load, select, or evaluate the policy an explanation
+    /// was requested for. The message is diagnostic text, never parsed.
+    PolicyUnavailable { message: String },
+    /// The selection named more than one policy. An explanation is about one
+    /// policy, so the caller must narrow it.
+    AmbiguousPolicySelection { selected: usize },
+}
+
+impl ExplainError {
+    /// The adapter-unavailable condition for one question, carrying the list
+    /// of families that question *does* support.
+    pub fn adapter_unavailable(
+        analysis_type: PolicyAnalysisType,
+        question: ExplanationQuestion,
+    ) -> Self {
+        let supported = match question {
+            ExplanationQuestion::Why => WHY_ADAPTER_ANALYSIS_TYPES,
+            ExplanationQuestion::WhyNot => WHY_NOT_ADAPTER_ANALYSIS_TYPES,
+        };
+        Self::ExplanationAdapterUnavailable {
+            analysis_type,
+            question,
+            supported: supported.to_vec(),
+        }
+    }
 }
 
 impl fmt::Display for ExplainError {
@@ -580,14 +641,34 @@ impl fmt::Display for ExplainError {
                     "the run retains no finding with identity {finding}"
                 )
             }
-            Self::ExplanationAdapterUnavailable { analysis_type } => write!(
-                formatter,
-                "an explanation adapter for {} policies is not yet implemented",
-                analysis_type.label()
-            ),
+            Self::ExplanationAdapterUnavailable {
+                analysis_type,
+                question,
+                supported,
+            } => {
+                let supported = supported
+                    .iter()
+                    .map(|analysis_type| analysis_type.label())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    formatter,
+                    "a {} explanation adapter for {} policies is not yet implemented; \
+                     supported analysis types: {supported}",
+                    question.label(),
+                    analysis_type.label()
+                )
+            }
             Self::SelectorUnavailable => {
                 formatter.write_str("the loaded match policy carries no resolved selector")
             }
+            Self::RelationalPlanUnavailable => {
+                formatter.write_str("the loaded assertion policy carries no relational row plan")
+            }
+            Self::BindingSelectorUnavailable { binding } => write!(
+                formatter,
+                "the relational plan's binding `{binding}` carries no resolved selector"
+            ),
             Self::CandidateOutsideWorkspace { path, reason } => write!(
                 formatter,
                 "candidate path {path:?} is not inside the workspace: {reason}"
@@ -600,6 +681,14 @@ impl fmt::Display for ExplainError {
                 formatter,
                 "the explanation limit {} cannot hold a minimal explanation",
                 limit.label()
+            ),
+            Self::PolicyUnavailable { message } => write!(
+                formatter,
+                "the policy an explanation was requested for is unavailable: {message}"
+            ),
+            Self::AmbiguousPolicySelection { selected } => write!(
+                formatter,
+                "an explanation is about one policy, but the selection named {selected}"
             ),
         }
     }

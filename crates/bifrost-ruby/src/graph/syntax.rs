@@ -34,36 +34,14 @@ fn is_assignment_left_constant(node: Node<'_>) -> bool {
     false
 }
 
-pub fn method_receiver_mode(node: Node<'_>) -> ReceiverMode {
+pub fn method_receiver_mode(
+    node: Node<'_>,
+    enclosing_receiver_mode: Option<ReceiverMode>,
+) -> ReceiverMode {
     if node.kind() == "singleton_method" {
         return ReceiverMode::Class;
     }
-    let mut parent = node.parent();
-    while let Some(current) = parent {
-        if current.kind() == "singleton_class" {
-            return ReceiverMode::Class;
-        }
-        if matches!(current.kind(), "class" | "module") {
-            break;
-        }
-        parent = current.parent();
-    }
-    if has_enclosing_type(node) {
-        ReceiverMode::Instance
-    } else {
-        ReceiverMode::TopLevel
-    }
-}
-
-fn has_enclosing_type(node: Node<'_>) -> bool {
-    let mut parent = node.parent();
-    while let Some(current) = parent {
-        if matches!(current.kind(), "class" | "module") {
-            return true;
-        }
-        parent = current.parent();
-    }
-    false
+    enclosing_receiver_mode.unwrap_or(ReceiverMode::TopLevel)
 }
 
 pub fn is_declaration_identifier(node: Node<'_>) -> bool {

@@ -978,31 +978,47 @@ impl CSharpDiagnosticCollector<'_> {
         owner_fqn: &str,
         member: &str,
     ) -> InheritedMember {
-        let mut seen: HashSet<String> = HashSet::default();
-        seen.insert(owner_fqn.to_string());
-        let mut queue: Vec<String> = vec![owner_fqn.to_string()];
+        let owner = InheritedTypeName::Proved(owner_fqn.to_string());
+        let mut seen = HashSet::from_iter([owner.clone()]);
+        let mut queue = vec![owner];
         while let Some(current) = queue.pop() {
-            let Some(unit) = self.workspace_type_unit(token, &current) else {
-                // The chain leaves the workspace. Only the index can say what
-                // the rest of the surface holds.
-                if let Some(reason) = &self.unreadable_external {
-                    return InheritedMember::IncompleteSurface {
-                        detail: format!(
-                            "ancestor `{current}` of `{owner_fqn}` is outside the workspace and {}",
-                            describe_reason(reason)
-                        ),
+            let unit = match &current {
+                InheritedTypeName::Proved(fqn) => {
+                    let Some(unit) = self.proved_workspace_type_unit(token, fqn) else {
+                        // This identity was resolved in the same analyzer
+                        // generation. Losing it is an internal inconsistency,
+                        // never evidence that the chain left the workspace.
+                        return InheritedMember::IncompleteSurface {
+                            detail: format!(
+                                "proved ancestor `{fqn}` of `{owner_fqn}` is unavailable in the current workspace generation"
+                            ),
+                        };
                     };
+                    unit
                 }
-                match self.external.resolve_member(&current, member) {
-                    CSharpMemberSurface::Published => {
-                        return InheritedMember::Found {
-                            boundary: BoundaryStatus::ExternalIndexed,
+                InheritedTypeName::Spelled(raw) => {
+                    // This spelling was already searched relative to the
+                    // declaring workspace type and proved absent there. Only
+                    // the retained external surface can continue the chain.
+                    if let Some(reason) = &self.unreadable_external {
+                        return InheritedMember::IncompleteSurface {
+                            detail: format!(
+                                "ancestor `{raw}` of `{owner_fqn}` is outside the workspace and {}",
+                                describe_reason(reason)
+                            ),
                         };
                     }
-                    CSharpMemberSurface::IncompleteOwner { detail } => {
-                        return InheritedMember::IncompleteSurface { detail };
+                    match self.external.resolve_member(raw, member) {
+                        CSharpMemberSurface::Published => {
+                            return InheritedMember::Found {
+                                boundary: BoundaryStatus::ExternalIndexed,
+                            };
+                        }
+                        CSharpMemberSurface::IncompleteOwner { detail } => {
+                            return InheritedMember::IncompleteSurface { detail };
+                        }
+                        CSharpMemberSurface::Absent => continue,
                     }
-                    CSharpMemberSurface::Absent => continue,
                 }
             };
             for raw in self.csharp.raw_supertypes_of(&unit) {
@@ -1021,8 +1037,9 @@ impl CSharpDiagnosticCollector<'_> {
                                 boundary: BoundaryStatus::WorkspaceLocal,
                             };
                         }
-                        if seen.insert(fqn.clone()) {
-                            queue.push(fqn);
+                        let proved = InheritedTypeName::Proved(fqn);
+                        if seen.insert(proved.clone()) {
+                            queue.push(proved);
                         }
                     }
                     0 => {
@@ -1030,8 +1047,9 @@ impl CSharpDiagnosticCollector<'_> {
                         // either an indexed assembly type or an unknown one.
                         // Either way the chain continues outside, so hand the
                         // raw name to the next turn of the loop.
-                        if seen.insert(raw.clone()) {
-                            queue.push(raw);
+                        let spelled = InheritedTypeName::Spelled(raw);
+                        if seen.insert(spelled.clone()) {
+                            queue.push(spelled);
                         }
                     }
                     count => {
@@ -1047,8 +1065,13 @@ impl CSharpDiagnosticCollector<'_> {
         InheritedMember::Absent
     }
 
-    fn workspace_type_unit(&self, token: QueryToken<'_>, fqn: &str) -> Option<CodeUnit> {
-        let candidates = self.visible_types(token, fqn);
+    fn proved_workspace_type_unit(&self, token: QueryToken<'_>, fqn: &str) -> Option<CodeUnit> {
+        let candidates = self.visible_types(token, &format!("global::{fqn}"));
+        debug_assert_eq!(
+            logical_type_count(&candidates),
+            1,
+            "proved inherited type `{fqn}` looked up as {candidates:?}"
+        );
         (logical_type_count(&candidates) == 1)
             .then(|| {
                 candidates
@@ -1094,6 +1117,15 @@ enum InheritedMember {
     Found { boundary: BoundaryStatus },
     Absent,
     IncompleteSurface { detail: String },
+}
+
+/// A type identity already proved in the workspace is not interchangeable
+/// with an unresolved source spelling. Only spellings may cross into the
+/// retained external surface; proved identities always round-trip absolutely.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum InheritedTypeName {
+    Proved(String),
+    Spelled(String),
 }
 
 fn describe_reason(reason: &SemanticDiagnosticIncompleteReason) -> String {

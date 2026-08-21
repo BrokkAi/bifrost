@@ -18,10 +18,15 @@ pub const EXTENDED_TOOL_NAMES: &[&str] = &[
     "query_code",
     "list_policies",
     "run_policy",
+    "explain_policy",
     "get_symbol_locations",
     "get_symbol_ancestors",
     "most_relevant_files",
 ];
+
+/// The longest `explain_policy` finding identity: a policy finding id renders
+/// as 32 lowercase hex bytes.
+pub(crate) const EXPLAIN_POLICY_FINDING_ID_LENGTH: usize = 64;
 
 pub(crate) const MAX_RUN_POLICY_PATH_BYTES: usize = 1_024;
 pub(crate) const MAX_RUN_POLICY_SELECTOR_BYTES: usize = 256;
@@ -915,7 +920,15 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "run_policy",
-            "Evaluate built-in policy selections and/or explicit workspace-relative .rqlp files against the active immutable workspace snapshot. Returns the canonical schema-2 report and computed policy status.",
+            // The report schema version is read from the policy crate rather
+            // than written out, so a schema bump cannot leave this text stale
+            // the way "schema-2" did through versions 3 and 4.
+            &format!(
+                "Evaluate built-in policy selections and/or explicit workspace-relative .rqlp \
+                 files against the active immutable workspace snapshot. Returns the canonical \
+                 schema-{} report and computed policy status.",
+                brokk_bifrost_policy::PolicyReportDocument::SCHEMA_VERSION,
+            ),
             json!({
                 "type": "object",
                 "properties": {
@@ -1015,6 +1028,121 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
             }),
         ),
         tool_descriptor(
+            "explain_policy",
+            // The format tag is read from the policy crate so a schema bump
+            // cannot leave this text stale.
+            &format!(
+                "Explain one policy's verdict about one exact subject against the active \
+                 immutable workspace snapshot. Pass `finding_id` to ask why a retained finding \
+                 exists, or `candidate` to ask why one explicit source position produced none. \
+                 Returns a bounded, deterministic {} document: a node tree whose every node \
+                 carries an outcome of satisfied, failed, or unknown, where unknown means the \
+                 analyzer could not decide and is never evidence of absence. This is a query \
+                 about a policy, not a gate: it returns no status and no exit code. The \
+                 selection must resolve to exactly one policy. Adapters exist for match and \
+                 assertion policies; taint, flow, and typestate policies report an explicit \
+                 adapter-unavailable condition. Candidates are not scanned for: supply the \
+                 position you want explained.",
+                brokk_bifrost_policy::POLICY_EXPLANATION_FORMAT,
+            ),
+            json!({
+                "type": "object",
+                "properties": {
+                    "policy_files": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_RUN_POLICY_PATH_BYTES,
+                            "description": "One workspace-relative .rqlp policy path."
+                        },
+                        "minItems": 1,
+                        "maxItems": 1,
+                        "uniqueItems": true,
+                        "description": "The workspace policy file to explain."
+                    },
+                    "policy_packs": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_RUN_POLICY_SELECTOR_BYTES
+                        },
+                        "minItems": 1,
+                        "maxItems": 1,
+                        "uniqueItems": true,
+                        "description": "A built-in pack id that selects exactly one policy."
+                    },
+                    "policy_categories": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_RUN_POLICY_SELECTOR_BYTES
+                        },
+                        "minItems": 1,
+                        "maxItems": 1,
+                        "uniqueItems": true,
+                        "description": "A built-in policy category that selects exactly one policy."
+                    },
+                    "policy_ids": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_RUN_POLICY_SELECTOR_BYTES
+                        },
+                        "minItems": 1,
+                        "maxItems": 1,
+                        "uniqueItems": true,
+                        "description": "One stable built-in policy id."
+                    },
+                    "finding_id": {
+                        "type": "string",
+                        "minLength": EXPLAIN_POLICY_FINDING_ID_LENGTH,
+                        "maxLength": EXPLAIN_POLICY_FINDING_ID_LENGTH,
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "Ask why: the stable identity of a finding the policy's own run retains, as run_policy reports it."
+                    },
+                    "candidate": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_RUN_POLICY_PATH_BYTES,
+                                "description": "Workspace-relative path of the candidate position."
+                            },
+                            "byte_start": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "Byte offset of the candidate position."
+                            },
+                            "byte_end": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "Exclusive end byte offset. Omit for a point candidate at byte_start."
+                            }
+                        },
+                        "required": ["path", "byte_start"],
+                        "additionalProperties": false,
+                        "description": "Ask why-not: one explicit source position the policy did not report."
+                    }
+                },
+                "oneOf": [
+                    { "required": ["finding_id"], "not": { "required": ["candidate"] } },
+                    { "required": ["candidate"], "not": { "required": ["finding_id"] } }
+                ],
+                "anyOf": [
+                    { "required": ["policy_files"] },
+                    { "required": ["policy_packs"] },
+                    { "required": ["policy_categories"] },
+                    { "required": ["policy_ids"] }
+                ],
+                "additionalProperties": false
+            }),
+        ),
+        tool_descriptor(
             "get_symbol_locations",
             "Get project-relative file paths and line ranges for known symbols after search_symbols; use before opening exact definitions.",
             crate::mcp_common::symbol_names_schema(),
@@ -1098,6 +1226,9 @@ mod tests {
                 "call_shape",
                 "call_argument_groups",
                 "call_arguments",
+                "call_effects",
+                "procedure_effects",
+                "call_bindings",
                 "callable_signature",
                 "signature_parameters",
                 "callable_applicability",
@@ -1449,6 +1580,87 @@ mod tests {
                 .expect("description")
                 .contains("test_support"),
             "{descriptor:#}"
+        );
+    }
+
+    /// Issue 2439 slice 3: the explanation surface is a separate tool, not a
+    /// `run_policy` mode, and its input schema is bounded and mutually
+    /// exclusive by construction.
+    #[test]
+    fn explain_policy_schema_is_bounded_to_one_policy_and_one_question() {
+        let descriptor = extended_tool_descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor["name"] == "explain_policy")
+            .expect("explain_policy descriptor");
+        let schema = &descriptor["inputSchema"];
+        assert_eq!(schema["additionalProperties"], false);
+
+        // One policy: every selector accepts exactly one entry.
+        for selector in [
+            "policy_files",
+            "policy_packs",
+            "policy_categories",
+            "policy_ids",
+        ] {
+            let property = &schema["properties"][selector];
+            assert_eq!(property["minItems"], 1, "{selector}");
+            assert_eq!(property["maxItems"], 1, "{selector}");
+            assert_eq!(property["uniqueItems"], true, "{selector}");
+        }
+        assert_eq!(
+            schema["properties"]["policy_files"]["items"]["maxLength"],
+            MAX_RUN_POLICY_PATH_BYTES
+        );
+        assert_eq!(
+            schema["properties"]["policy_ids"]["items"]["maxLength"],
+            MAX_RUN_POLICY_SELECTOR_BYTES
+        );
+        assert_eq!(
+            schema["anyOf"].as_array().map(Vec::len),
+            Some(4),
+            "at least one selector is required"
+        );
+
+        // One question: `finding_id` and `candidate` exclude each other.
+        assert_eq!(
+            schema["oneOf"],
+            json!([
+                { "required": ["finding_id"], "not": { "required": ["candidate"] } },
+                { "required": ["candidate"], "not": { "required": ["finding_id"] } }
+            ])
+        );
+        let finding_id = &schema["properties"]["finding_id"];
+        assert_eq!(finding_id["pattern"], "^[0-9a-f]{64}$");
+        assert_eq!(finding_id["minLength"], EXPLAIN_POLICY_FINDING_ID_LENGTH);
+        assert_eq!(finding_id["maxLength"], EXPLAIN_POLICY_FINDING_ID_LENGTH);
+        let candidate = &schema["properties"]["candidate"];
+        assert_eq!(candidate["required"], json!(["path", "byte_start"]));
+        assert_eq!(candidate["additionalProperties"], false);
+        assert_eq!(candidate["properties"]["byte_end"]["type"], "integer");
+        assert_eq!(candidate["properties"]["byte_start"]["minimum"], 0);
+
+        // Nothing gate-shaped: an explanation is a query.
+        for gating in ["fail_on", "diff_base", "baseline_file", "evaluation_date"] {
+            assert!(
+                schema["properties"].get(gating).is_none(),
+                "`{gating}` has no meaning for an explanation: {descriptor:#}"
+            );
+        }
+
+        let description = descriptor["description"]
+            .as_str()
+            .expect("explain_policy description");
+        assert!(
+            description.contains(brokk_bifrost_policy::POLICY_EXPLANATION_FORMAT),
+            "the versioned format is interpolated, never written out: {description}"
+        );
+        assert!(
+            description.contains("never evidence of absence"),
+            "the unknown-is-not-failed contract is stated: {description}"
+        );
+        assert!(
+            description.contains("not a gate"),
+            "the exit-status contract is stated: {description}"
         );
     }
 

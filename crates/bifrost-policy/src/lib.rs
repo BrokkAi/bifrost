@@ -43,6 +43,8 @@ mod witness_projection;
 
 #[cfg(test)]
 mod adapter_seam_tests;
+#[cfg(test)]
+mod flow_policy_tests;
 
 pub use assertion_policy::*;
 pub use baseline::*;

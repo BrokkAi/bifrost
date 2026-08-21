@@ -7,12 +7,12 @@ use crate::graph::resolver::{
     first_type_child, is_type_reference_node, member_name_is_locally_bound,
     nearest_member_candidates_for_owner, node_text, normalize_type_text,
     object_initializer_for_label, object_initializer_owner_type_node, receiver_targets_owner,
-    reference_type_text, resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner,
-    resolves_to_target, resolves_to_target_at, same_node, seed_visible_bindings_at,
-    type_identity_matches, unqualified_member_has_local_binding,
-    unqualified_member_has_structured_shadow, unqualified_member_resolves_to_owner,
-    usage_relational_generic_call_has_type_argument, usage_unqualified_value_member_shadows_type,
-    usage_visible_extension_method_candidates,
+    reference_type_text, resolve_arity_free_type_fq_name_at, resolve_type_fq_name_at,
+    resolve_unqualified_method_group_for_owner, resolves_to_target, resolves_to_target_at,
+    same_node, seed_visible_bindings_at, type_identity_matches,
+    unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
+    unqualified_member_resolves_to_owner, usage_relational_generic_call_has_type_argument,
+    usage_unqualified_value_member_shadows_type, usage_visible_extension_method_candidates,
 };
 use crate::graph_support::{self, CSharpSource};
 use crate::hierarchy;
@@ -242,15 +242,29 @@ fn scan_structured_type_candidate(
     }
 
     let reference = reference_type_text(candidate, ctx.source);
-    match resolve_type_fq_name_at(
-        ctx.csharp,
-        token,
-        ctx.file,
-        &ctx.class_ranges,
-        &reference,
-        candidate,
-        ctx.source,
-    ) {
+    let resolved = match role {
+        TypeCandidateRole::Nameof => resolve_arity_free_type_fq_name_at(
+            ctx.csharp,
+            token,
+            ctx.file,
+            &ctx.class_ranges,
+            &reference,
+            candidate,
+            ctx.source,
+        ),
+        TypeCandidateRole::Ordinary | TypeCandidateRole::Pattern | TypeCandidateRole::Receiver => {
+            resolve_type_fq_name_at(
+                ctx.csharp,
+                token,
+                ctx.file,
+                &ctx.class_ranges,
+                &reference,
+                candidate,
+                ctx.source,
+            )
+        }
+    };
+    match resolved {
         Some(resolved) if type_identity_matches(&resolved, &ctx.spec.target.fq_name()) => {
             push_hit(candidate, ctx);
             true

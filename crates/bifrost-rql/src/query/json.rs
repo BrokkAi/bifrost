@@ -706,6 +706,9 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::CallShape
         | QueryStep::CallArgumentGroups
         | QueryStep::CallArguments
+        | QueryStep::CallBindings
+        | QueryStep::CallEffects
+        | QueryStep::ProcedureEffects
         | QueryStep::CallableSignature
         | QueryStep::SignatureParameters
         | QueryStep::CallableApplicability

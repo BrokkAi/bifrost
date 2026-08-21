@@ -925,6 +925,442 @@ Typestate terminal obligations:
 ]
 ```
 
+## An Executable P0 Walkthrough
+
+Everything below runs from a checked-in fixture directory,
+`tests/fixtures/policy-substrate-p0/`. Two reference policies exercise the
+whole substrate: exact semantic selection, policy-authored value flow,
+declarative effects, bounded relational assertions, explicit behaviour when
+analysis is incomplete, and one canonical report behind the human, JSON, SARIF,
+CLI, and MCP surfaces.
+
+Neither policy needs new analyzer code. Each is a `.rqlp` document; the second
+also needs one reviewed semantic model, which is data as well.
+
+### The fixture directory
+
+```text
+tests/fixtures/policy-substrate-p0/
+  policies/
+    acme-validated-value-reaches-store.rqlp         reference policy A (Java)
+    acme-validated-value-reaches-store-python.rqlp  reference policy A (Python)
+    acme-pure-has-no-network-io.rqlp                reference policy B
+  semantic-models/
+    acme-http-client.json                           the reviewed effect model
+  flow/java/api/AcmeApi.java                        the exact APIs and the near miss
+  flow/java/finding/App.java                        one proven violating path
+  flow/java/clean/App.java                          validated directly and through a helper
+  flow/java/unreliable/App.java                     an unresolvable wrapper
+  flow/python/                                      positional and named argument syntax
+  effects/java/api/                                 the @Pure marker and the modeled API
+  effects/java/finding/App.java                     a direct and a transitive effect
+  effects/java/clean/App.java                       a proven-clean call graph
+  effects/java/unreliable/App.java                  an unresolvable callee
+  effects/java/deferred/App.java                    a declared deferred effect
+```
+
+The acceptance tests are `tests/suite_bench_policy/policy_substrate_p0.rs`
+(library surfaces), `tests/suite_bench_policy/policy_substrate_p0_cli.rs`
+(CLI), and `crates/bifrost-mcp/tests/bifrost_mcp_policy_substrate_p0.rs`
+(MCP `run_policy`).
+
+### Reference policy A: a validated value reaches an exact API
+
+The invariant: every value `AcmeStore.put` stores must have been established by
+`AcmeValidator.validate`.
+
+<!-- policy-doc-test:rqlp:tests/fixtures/policy-substrate-p0/policies/acme-validated-value-reaches-store.rqlp -->
+```lisp
+; Reference policy A of the issue-2433 P0 epic, Java edition:
+; "a validated value reaches an exact API".
+;
+; The invariant is a correctness rule, not a security rule. Every value
+; AcmeStore.put stores must have been established by AcmeValidator.validate.
+; The analysis carries no labels, categories, tags or impacts: a flow policy
+; tracks one thing, whether the value an origin establishes reaches an
+; observation without passing a kill.
+;
+; Exact selection
+; ---------------
+; Each endpoint selects call sites of one exact declaration rather than
+; call text that merely ends in `put`:
+;
+;     (call-sites-to :proof proven
+;       (enclosing-decl (inside-decl (class :name "AcmeStore") (method :name "put"))))
+;
+; `inside-decl` narrows the seed to the member of one named type, and
+; `call-sites-to :proof proven` returns only call sites the definition
+; resolver bound to that declaration. The fixture tree contains
+; `AcmeCache.put(String)`, a same-named member of an unrelated class, and no
+; finding attaches to it.
+;
+; Actual-to-formal binding
+; ------------------------
+; The observation binds `(argument :index 0)`, which is the operand of the
+; selected call, not the operand of a formal named `value`. The analyzer does
+; publish the actual-to-formal relation -- `(call-input :parameter-name "value"
+; (call-sites-to ...))` returns the actual bound to formal `value` for both
+; positional and named syntax -- but the value-flow port resolver still cannot
+; spell `(argument :name ...)`; see the milestone-6 entry in
+; `.agents/plans/issue-2433-policy-substrate.md`. Selecting through
+; `call-input` and binding `matched-value` is also not a substitute: when the
+; actual is itself a call, `call-input` names that inner call exactly and the
+; port then binds the inner call's operand.
+;
+; Unmodeled calls stay paranoid so a call whose body the analyzer cannot see
+; still propagates. The abstention fixture runs the same rule with
+; `:unmodeled require-model`.
+(policy
+  :schema-version 1
+  :id "bifrost.p0.acme-validated-value-reaches-store"
+  :name "Unvalidated value reaches AcmeStore.put"
+  :message "a value AcmeValidator.validate never established reached AcmeStore.put"
+  :severity warning
+  :description "AcmeStore.put must only store values established by AcmeValidator.validate. A value that reaches put from AcmeSource.read without passing validate breaks that invariant."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/"
+  :tags ["flow" "provenance" "java"]
+  :analysis
+    (analysis
+      :type flow
+      :mode may
+      :call-modeling (call-modeling :unmodeled paranoid)
+      :origins
+        (endpoint-set :entries [
+          (origin :id acme-source-read
+            :display-name "AcmeSource.read"
+            :selector (rql :schema-version 1
+              (language java
+                (call-sites-to :proof proven
+                  (enclosing-decl
+                    (inside-decl (class :name "AcmeSource") (method :name "read"))))))
+            :bind return-value)])
+      :observations
+        (endpoint-set :entries [
+          (observation :id acme-store-put
+            :display-name "AcmeStore.put"
+            :selector (rql :schema-version 1
+              (language java
+                (call-sites-to :proof proven
+                  (enclosing-decl
+                    (inside-decl (class :name "AcmeStore") (method :name "put"))))))
+            :observed-operand (argument :index 0))])
+      :kills
+        (endpoint-set :entries [
+          (kill :id acme-validate
+            :selector (rql :schema-version 1
+              (language java
+                (call-sites-to :proof proven
+                  (enclosing-decl
+                    (inside-decl (class :name "AcmeValidator") (method :name "validate"))))))
+            :input (argument :index 0)
+            :output return-value)])))
+```
+
+Three things make this exact rather than name-shaped:
+
+1. `(inside-decl (class :name "AcmeStore") (method :name "put"))` seeds on the
+   member of one named type.
+2. `(enclosing-decl ...)` lifts that match to the declaration.
+3. `(call-sites-to :proof proven ...)` returns only call sites the definition
+   resolver bound to that declaration.
+
+The fixture tree contains `AcmeCache.put(String)`, a same-named member of an
+unrelated class. Run the policy over `flow/java/finding/App.java`, which calls
+both:
+
+```sh
+bifrost --policy-file policies/acme-validated-value-reaches-store.rqlp
+```
+
+One finding, on `store.put(value)`, exit status 1, completion `complete`. No
+finding attaches to `cache.put(value)`.
+
+Over `flow/java/clean/App.java` — one value validated directly, one validated
+through a workspace helper, and an unvalidated value stored in the near-miss
+class — the same command exits 0 with completion `complete`. That clean verdict
+is the kill's doing: delete the `:kills` block and both validated flows are
+reported.
+
+Over `flow/java/unreliable/App.java`, where an unresolvable wrapper sits between
+the origin and the observation, the run exits 2 under both
+`:unmodeled paranoid` and `:unmodeled require-model`. An unresolved call is
+never a clean verdict.
+
+### Binding the actual passed to a named formal
+
+The analyzer publishes the actual-to-formal relation, and it is exact in both
+syntaxes. This query returns the operand bound to formal `value` at every call
+of the exact API:
+
+```lisp
+(call-input :parameter-name "value"
+  (call-sites-to :proof proven
+    (enclosing-decl
+      (inside-decl (class :name "AcmeStore") (method :name "put")))))
+```
+
+Over the Java tree it returns one row, the operand of `store.put(value)`. Over
+the Python tree it returns the operand of both `store.put(value)` and
+`store.put(value=value)`, so a named call binds formal `value` the same way a
+positional one does.
+
+Reference policy A still binds `(argument :index 0)`, because
+`(argument :name ...)` is not yet a value-flow port. Selecting through
+`call-input` and binding `matched-value` is not a substitute either: when the
+actual is itself a call, `call-input` names that inner call exactly, and the
+port then binds the inner call's operand instead of the outer one.
+
+### Reference policy B: a forbidden transitive effect
+
+The invariant: a procedure annotated `@Pure` must not reach the namespaced
+effect `acme.network_io`, directly or through a workspace helper.
+
+First the data. One reviewed semantic model declares the effect on one exact
+API identity:
+
+```json
+{
+  "schema_version": 1,
+  "pack_id": "acme.http-effects",
+  "version": "1.0.0",
+  "producer": { "name": "acme-platform", "version": "1.0.0" },
+  "language": "java",
+  "ecosystem": "maven",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "tests/fixtures/policy-substrate-p0",
+    "revision": "reviewed"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [
+    {
+      "id": "acme.http-effects.client",
+      "activation": [{ "configurations": ["acme.http-effects"] }],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.acme-http-client.send",
+            "target": {
+              "path": "com/acme/AcmeHttpClient.java",
+              "symbol": "com.acme.AcmeHttpClient.send(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [
+              {
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": [],
+            "declared_effects": [
+              { "id": "acme.network_io", "timing": "immediate", "certainty": "definite" }
+            ]
+          },
+          {
+            "id": "summary.acme-http-client.send-later",
+            "target": {
+              "path": "com/acme/AcmeHttpClient.java",
+              "symbol": "com.acme.AcmeHttpClient.sendLater(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [
+              {
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": [],
+            "declared_effects": [
+              { "id": "acme.network_io", "timing": "deferred", "certainty": "definite" }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+Then the policy:
+
+<!-- policy-doc-test:rqlp:tests/fixtures/policy-substrate-p0/policies/acme-pure-has-no-network-io.rqlp -->
+```lisp
+; Reference policy B of the issue-2433 P0 epic:
+; "a forbidden transitive effect".
+;
+; A reviewed semantic model declares that the exact API
+; `com.acme.AcmeHttpClient.send(java.lang.String)` performs the namespaced
+; effect `acme.network_io`. This relational policy asserts that no procedure
+; carrying the `@Pure` annotation reaches that effect, directly or through
+; workspace helpers.
+;
+; The marker
+; ----------
+; `(method :decorators [(name "Pure")])` is the annotation match. The Java
+; adapter normalizes `annotation` and `marker_annotation` nodes under a
+; declaration's modifiers into the shared `decorators` role, so `@Pure` is
+; matched the same way a Python decorator or a C# attribute would be. The
+; match is on the annotation's written name, not on a resolved annotation
+; type, so an unrelated `@Pure` from another package would also match.
+;
+; The join
+; --------
+; `procedure-effects` projects one row per (procedure, effect id), carrying
+; `depth`, `classification` (direct or transitive), `certainty`, `timing`,
+; `coverage`, and a bounded witness chain. The row is keyed on the
+; `declaration` domain's own `procedure_id`, so the join to the marker
+; relation is declaration-identity equality.
+;
+; The absence claim
+; -----------------
+; `(exactly 0)` is an absence claim, so it is conclusive only when the effect
+; relation's coverage is exhaustive. A procedure with an unresolved callee
+; leaves the effect set open; the run then publishes an unmet obligation and
+; exits 2 rather than reporting a clean verdict.
+(policy
+  :schema-version 1
+  :id "bifrost.p0.acme-pure-has-no-network-io"
+  :name "Pure procedures perform no network I/O"
+  :message "a procedure annotated @Pure reaches the acme.network_io effect"
+  :severity error
+  :description "A procedure annotated @Pure must not reach acme.network_io, directly or through a helper. The effect is declared on the exact API AcmeHttpClient.send by a reviewed workspace semantic model."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/"
+  :tags ["effects" "purity" "java"]
+  :analysis (analysis
+    :type assertion
+    (bind :name pure
+      :query (rql :schema-version 1
+        (language java (enclosing-decl (method :decorators [(name "Pure")])))))
+    (bind :name effect
+      :query (rql :schema-version 1
+        (language java
+          (procedure-effects (enclosing-decl (method :decorators [(name "Pure")]))))))
+    (join :left pure :right effect :on ((id procedure_id)))
+    (group :name pure-procedure :by (pure.id)
+      (aggregate :name network-effects :op count
+        :where ((effect.effect_id eq "acme.network_io")
+                (effect.derivation eq declared))))
+    (assert :group pure-procedure :value network-effects :cardinality (exactly 0))))
+```
+
+`(method :decorators [(name "Pure")])` is the annotation match. The Java
+adapter normalizes `annotation` and `marker_annotation` nodes under a
+declaration's modifiers into the shared `decorators` role, so a Java
+annotation, a Python decorator, and a C# attribute are all matched the same
+way. The match is on the annotation's *written name*, not on a resolved
+annotation type: an unrelated `@Pure` from another package would also match.
+
+`procedure-effects` publishes one row per (procedure, effect id) with `depth`,
+`classification`, `certainty`, `timing`, `coverage`, and a bounded witness
+chain, keyed on the `declaration` domain's own `procedure_id`. The join is
+therefore declaration-identity equality, and the witness's
+`witness_effect_site_id` is an id equality against the direct `call_effect`
+row, so "show me the exact call this transitive finding came from" is a join
+rather than a text search.
+
+Over `effects/java/finding/App.java` the policy reports two findings — the
+direct call at depth 1 and the helper call at depth 2 — and exits 1. The same
+helper without the marker is not reported, and neither is a marked procedure
+whose whole reachable call graph is analyzed and clean.
+
+Over `effects/java/clean/App.java` the run exits 0 with completion `complete`,
+because the effect relation's coverage is `exhaustive` and the absence claim is
+therefore provable.
+
+Over `effects/java/unreliable/App.java` the run exits 2 and publishes the
+blocked claim as data:
+
+```json
+{
+  "assertion": "pure-procedure-network-effects",
+  "kind": "absence_requires_exhaustive_coverage",
+  "group": "pure-procedure",
+  "group_key": "src/com/acme/App.java:method:com.acme.App.pureCallsAnUnresolvedTarget:273-385",
+  "reasons": ["capability_incomplete"]
+}
+```
+
+The human report counts the blocked verdicts in its scan view and names each
+one in its audit view. SARIF publishes the census on the run-level
+`BIFROST_POLICY_INCONCLUSIVE` notification and mints no result, because an
+obligation is the absence of a claim and not a claim about a source location.
+
+### Activating the model
+
+A semantic model reaches the analyzer through one of two routes, and they are
+not interchangeable today:
+
+| Route | Location | Activated by |
+| --- | --- | --- |
+| Workspace authoring | `.bifrost/semantic-models/*.json` | The MCP host, with `BIFROST_WORKSPACE_SEMANTIC_MODELS=on` |
+| Installed catalog | the catalog `.bifrost/packs.json` names | The MCP host, the LSP host, and `bifrost --policy-file` |
+
+**The CLI policy runner does not read `.bifrost/semantic-models/`.** It
+activates only through `.bifrost/packs.json`, whose activation evidence comes
+from dependency discovery. A workspace that wants reference policy B on the CLI
+today must install the model into the catalog the packs document names, with an
+activation selector the workspace's own dependency evidence can satisfy.
+`policy_substrate_p0_cli.rs` pins both halves: the CLI outcome with the model
+installed, and the absence of any finding when the model is present only at the
+authoring location.
+
+### Explaining a match and a near miss
+
+`explain_match_finding` says why a retained `match` finding exists, by
+projecting the evidence the run already kept; it executes nothing.
+`explain_match_candidate` says why one explicit candidate position did not
+match, by re-executing bounded prefixes of the selector plan.
+
+Over the exact-selection view of reference policy A — the same selector as a
+`match` policy — the `store.put` call explains as `satisfied`, and the
+near-miss `cache.put` candidate explains as `failed`, which means the analyzer
+finished, declared its result exhaustive, and the candidate was still not
+there. That is different from `unknown`, which means the analyzer never
+established the answer. A consumer may act on `failed`; a consumer must not
+read `unknown` as evidence of absence.
+
+These two adapters serve `match` runs. The general entry points
+`explain_finding` and `explain_candidate` additionally serve `assertion` runs,
+including relational row plans: a relational finding explains its assertion,
+group key, contributing rows, and any coverage obligations, and a relational
+candidate reports the first row binding it is absent from. Flow, taint, and
+typestate runs are refused with an explicit adapter-unavailable answer that
+names the supported analysis types, which is why the walkthrough explains an
+equivalent match view rather than reference policy A's flow run: the
+acceptance test asserts the refusal rather than leaving it to prose.
+
+The same explanations are reachable without library code: the MCP tool
+`explain_policy` takes one policy selection plus either a `finding_id` or a
+`candidate` position and returns the structured explanation document, and the
+CLI accepts `--explain-finding <ID>` or `--explain-candidate
+<PATH:BYTE_START[-BYTE_END]>` beside `--policy-file` and prints the same JSON.
+An explanation run exits 0 whenever an explanation was produced, whatever its
+outcome, and 2 only when none could be.
+
+### P0 capability boundaries
+
+| Capability | Today | Boundary |
+| --- | --- | --- |
+| Exact call selection | `call-sites-to :proof proven` over an `inside-decl` seed | Java proves the receiver's type here; Python returns no proven row at all, and its unproven answer over-approximates to same-named members of other classes |
+| Actual-to-formal binding | `call-input :parameter-name` binds positional and named syntax exactly | Value-flow ports still spell `(argument :index N)`; `(argument :name ...)` is unsupported |
+| Declared effects | `declared_effects` on a procedure summary, propagated with depth, certainty, timing, and coverage | Path-conditional effects are a P0 non-goal; effect timing is the pack's declaration, not an inference about scheduling syntax |
+| Annotation markers | The normalized `decorators` role | Matches the written annotation name, not a resolved annotation type |
+| Negative claims | Absence requires exhaustive coverage; an unmet obligation is structured data on the run | An open effect set or an unresolved callee is exit 2, never exit 0 |
+| Explanations | `explain_finding` and `explain_candidate` over `match` and `assertion` runs, plus the MCP `explain_policy` tool and the CLI `--explain-finding`/`--explain-candidate` flags | Flow, taint, and typestate runs are refused rather than answered |
+| Model activation | Two routes, above | The CLI policy runner reads only the installed-catalog route |
+
 ## Completeness, Findings, And Report Parity
 
 A policy run is not just a list of findings:

@@ -12,21 +12,28 @@ use brokk_bifrost_analysis::analyzer::{Language, ProjectFile, TestProject, Types
 
 use crate::budget::PolicyBudget;
 use crate::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
+use crate::coordinator::PolicyEvaluationInput;
 use crate::definition::PolicyAnalysisType;
 use crate::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
-use crate::finding::{PolicyFindingEvidence, PolicyRun, PolicySourceLocation};
+use crate::finding::{
+    PolicyFindingEvidence, PolicyIncompleteReason, PolicyObligation, PolicyObligationKind,
+    PolicyRun, PolicyRunCompletion, PolicySourceLocation,
+};
 use crate::finding_identity::PolicyFindingId;
 use crate::registry::{PolicyRegistry, PolicyRegistryLimits};
 use crate::resolved::LoadedPolicy;
 use crate::source::PolicySourceIdentity;
 
+use super::host::{ExplanationTarget, explain_policy_inputs};
 use super::model::{
     ExplainError, ExplanationBudgetLimit, ExplanationLimits, ExplanationNodeKind,
     ExplanationOutcome, ExplanationQuestion, ExplanationSubject, POLICY_EXPLANATION_FORMAT,
-    PolicyExplanation,
+    PolicyExplanation, WHY_ADAPTER_ANALYSIS_TYPES, WHY_NOT_ADAPTER_ANALYSIS_TYPES,
 };
-use super::why::explain_match_finding;
-use super::why_not::{ExplanationCandidate, explain_match_candidate, row_covers_candidate};
+use super::why::{explain_finding, explain_match_finding};
+use super::why_not::{
+    ExplanationCandidate, explain_candidate, explain_match_candidate, row_covers_candidate,
+};
 
 /// One class with one member plus a free function, so a candidate can sit
 /// inside a class but outside every member.
@@ -65,6 +72,67 @@ const ASSERTION_POLICY: &str = r#"(policy
               :cardinality (exactly 1))
     ]))"#;
 
+/// A taint policy, used to prove the missing-adapter condition survives slices
+/// 2-3 for the families that still have no adapter.
+const TAINT_POLICY: &str = r#"(policy
+  :id "test.explain.taint"
+  :name "Taint"
+  :message (generated-message :relation can-reach)
+  :severity warning
+  :analysis (analysis
+    :type taint
+    :mode may
+    :sources (endpoint-set :entries [
+      (source :id alpha :display-name "user input" :categories [input.user]
+        :selector (rql (name "alpha")) :bind return-value :labels [untrusted])])
+    :sinks (endpoint-set :entries [
+      (sink :id store :display-name "sensitive store" :categories [data.sensitive]
+        :selector (rql (name "store")) :dangerous-operand matched-value
+        :accepts [untrusted])])))"#;
+
+/// A relational assertion source: one `render` declaration plus one value read
+/// of it, so the value-read plan below has exactly one violating group.
+const RELATIONAL_FIXTURE: &str =
+    "export function render(): number {\n  return 1;\n}\n\nexport const alias = render;\n";
+
+/// The same shape with a second value read, so a one-row pipeline budget
+/// truncates the binding and leaves the run inconclusive with a finding.
+const RELATIONAL_TWO_READS: &str = "export function render(): number {\n  return 1;\n}\n\nexport const alias = render;\nexport const second = render;\n";
+
+/// A member access, so the two-binding plan's `member_position` binding has a
+/// row and its row expansion is reached.
+const MEMBER_FIXTURE: &str = "class Service {\n  run(): number {\n    return 1;\n  }\n}\n\nexport function caller(service: Service) {\n  return service.run();\n}\n";
+
+/// Forbid value reads through a relational row plan. One binding, one group,
+/// one assertion, so each read violates on its own exact source range.
+const FORBID_READS_RELATIONAL: &str = r#"(policy
+  :id "test.explain.relational"
+  :name "No value reads"
+  :message "value reads are forbidden in this fixture"
+  :severity warning
+  :analysis (analysis
+    :type assertion
+    (bind :name read :query (rql (occurrences :role [value_reference])))
+    (group :name by-read :by (read.ast_id)
+      (aggregate :name reads :op count))
+    (assert :group by-read :value reads :cardinality (exactly 0))))"#;
+
+/// The same invariant over two bindings, the second of which is a row
+/// expansion this slice does not replay.
+const TWO_BINDING_RELATIONAL: &str = r#"(policy
+  :id "test.explain.relational.two"
+  :name "Member sites have receiver outcomes"
+  :message "every member occurrence must produce a receiver outcome row"
+  :severity error
+  :analysis (analysis
+    :type assertion
+    (bind :name site :query (rql (occurrences :role [member_position])))
+    (bind :name receiver :from site :step receiver-outcome)
+    (join :left site :right receiver :kind anti :on ((ast_id site_ast_id)))
+    (group :name orphaned :by (site.ast_id)
+      (aggregate :name sites :op count))
+    (assert :group orphaned :value sites :cardinality (exactly 0))))"#;
+
 struct Fixture {
     _temp: tempfile::TempDir,
     analyzer: TypescriptAnalyzer,
@@ -72,10 +140,14 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_source(FIXTURE)
+    }
+
+    fn with_source(source: &str) -> Self {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical root");
         ProjectFile::new(root.clone(), "app.ts")
-            .write(FIXTURE)
+            .write(source)
             .expect("write fixture");
         let analyzer =
             TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
@@ -96,10 +168,14 @@ impl Fixture {
     }
 
     fn run(&self, source: &str) -> PolicyRun {
+        self.run_with_budget(source, PolicyBudget::default())
+    }
+
+    fn run_with_budget(&self, source: &str, mut budget: PolicyBudget) -> PolicyRun {
         let registry = registry(source);
         let policy = registry.policies().next().expect("one loaded policy");
         DefaultPolicyEvaluator::new()
-            .evaluate(policy, &self.context(), &mut PolicyBudget::default())
+            .evaluate(policy, &self.context(), &mut budget)
             .expect("policy evaluation")
     }
 }
@@ -322,45 +398,89 @@ fn why_rejects_a_finding_the_run_does_not_retain() {
 }
 
 #[test]
-fn why_reports_a_missing_adapter_for_a_non_match_run() {
+fn the_match_only_why_adapter_still_refuses_a_non_match_run() {
     let fixture = Fixture::new();
     let run = fixture.run(ASSERTION_POLICY);
     assert_eq!(run.analysis_type(), PolicyAnalysisType::Assertion);
     let absent = "0".repeat(64).parse::<PolicyFindingId>().expect("parsable");
     let error = explain_match_finding(&run, &absent, &ExplanationLimits::default())
-        .expect_err("assertion runs have no explanation adapter yet");
+        .expect_err("the match-only adapter refuses an assertion run");
     assert_eq!(
         error,
-        ExplainError::ExplanationAdapterUnavailable {
-            analysis_type: PolicyAnalysisType::Assertion
-        }
-    );
-    assert!(
-        error.to_string().contains("not yet implemented"),
-        "the missing adapter states itself: {error}"
+        ExplainError::adapter_unavailable(PolicyAnalysisType::Assertion, ExplanationQuestion::Why)
     );
 }
 
+/// Issue 2439 slice 2: the missing-adapter condition names what *is*
+/// supported, so a caller learns the whole answer from one error.
 #[test]
-fn why_not_reports_a_missing_adapter_for_a_non_match_policy() {
+fn a_missing_adapter_names_the_supported_analysis_types() {
+    for question in [ExplanationQuestion::Why, ExplanationQuestion::WhyNot] {
+        let error = ExplainError::adapter_unavailable(PolicyAnalysisType::Taint, question);
+        let ExplainError::ExplanationAdapterUnavailable { supported, .. } = &error else {
+            panic!("the constructor builds the adapter-unavailable condition");
+        };
+        assert_eq!(
+            supported,
+            &vec![PolicyAnalysisType::Match, PolicyAnalysisType::Assertion]
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("not yet implemented"), "{rendered}");
+        assert!(
+            rendered.contains("supported analysis types: match, assertion"),
+            "the error names the supported families: {rendered}"
+        );
+        assert!(rendered.contains(question.label()), "{rendered}");
+    }
+    assert_eq!(
+        WHY_ADAPTER_ANALYSIS_TYPES,
+        [PolicyAnalysisType::Match, PolicyAnalysisType::Assertion]
+    );
+    assert_eq!(
+        WHY_NOT_ADAPTER_ANALYSIS_TYPES,
+        [PolicyAnalysisType::Match, PolicyAnalysisType::Assertion]
+    );
+}
+
+/// Taint, flow and typestate keep the explicit adapter-unavailable condition:
+/// slices 2-3 add the relational adapters only.
+#[test]
+fn why_not_reports_a_missing_adapter_for_a_taint_policy() {
     let fixture = Fixture::new();
     let candidate = candidate("render");
-    let error = with_policy(ASSERTION_POLICY, |policy| {
-        explain_match_candidate(
+    let error = with_policy(TAINT_POLICY, |policy| {
+        explain_candidate(
             policy,
             &fixture.context(),
             &candidate,
             &PolicyBudget::default(),
             &ExplanationLimits::default(),
         )
-        .expect_err("assertion policies have no why-not adapter yet")
+        .expect_err("taint policies have no why-not adapter yet")
     });
     assert_eq!(
         error,
-        ExplainError::ExplanationAdapterUnavailable {
-            analysis_type: PolicyAnalysisType::Assertion
-        }
+        ExplainError::adapter_unavailable(PolicyAnalysisType::Taint, ExplanationQuestion::WhyNot)
     );
+}
+
+/// An assertion policy whose asserts are the capture-oriented families carries
+/// no row plan, which is a different condition from a missing adapter.
+#[test]
+fn why_not_reports_a_missing_row_plan_for_a_capture_assertion_policy() {
+    let fixture = Fixture::new();
+    let candidate = candidate("render");
+    let error = with_policy(ASSERTION_POLICY, |policy| {
+        explain_candidate(
+            policy,
+            &fixture.context(),
+            &candidate,
+            &PolicyBudget::default(),
+            &ExplanationLimits::default(),
+        )
+        .expect_err("a capture-oriented assertion policy has no row bindings")
+    });
+    assert_eq!(error, ExplainError::RelationalPlanUnavailable);
 }
 
 // --- bounds -----------------------------------------------------------------
@@ -742,4 +862,572 @@ fn why_not_stops_at_the_prefix_limit_and_reports_unknown() {
     assert_eq!(explanation.outcome(), ExplanationOutcome::Unknown);
     assert!(explanation.root().children_truncated());
     assert_eq!(explanation.root().omitted_children_lower_bound(), 1);
+}
+
+// --- relational assertions: why ---------------------------------------------
+
+/// A fixture over `RELATIONAL_FIXTURE`, so a relational plan has a real
+/// violating group to explain.
+fn relational_fixture() -> Fixture {
+    Fixture::with_source(RELATIONAL_FIXTURE)
+}
+
+fn candidate_in(source: &str, needle: &str) -> ExplanationCandidate {
+    let offset = u64::try_from(source.find(needle).expect("fixture contains the needle"))
+        .expect("fixture offsets fit u64");
+    ExplanationCandidate::at_offset("app.ts", offset).expect("workspace-relative path")
+}
+
+fn relational_candidate(needle: &str) -> ExplanationCandidate {
+    candidate_in(RELATIONAL_FIXTURE, needle)
+}
+
+fn child_labels(
+    node: &super::model::ExplanationNode,
+    kind: ExplanationNodeKind,
+) -> Vec<(String, ExplanationOutcome)> {
+    node.children()
+        .iter()
+        .filter(|child| child.kind() == kind)
+        .map(|child| (child.label().to_string(), child.outcome()))
+        .collect()
+}
+
+#[test]
+fn why_explains_a_relational_assertion_finding_from_retained_evidence() {
+    let fixture = relational_fixture();
+    let run = fixture.run(FORBID_READS_RELATIONAL);
+    assert_eq!(run.analysis_type(), PolicyAnalysisType::Assertion);
+    let id = only_finding(&run);
+    let explanation = explain_finding(&run, &id, &ExplanationLimits::default())
+        .expect("the relational adapter answers why");
+
+    assert_eq!(explanation.format(), POLICY_EXPLANATION_FORMAT);
+    assert_eq!(explanation.question(), ExplanationQuestion::Why);
+    assert_eq!(explanation.analysis_type(), PolicyAnalysisType::Assertion);
+    // The finding is established, so the projection root is satisfied.
+    assert_eq!(explanation.outcome(), ExplanationOutcome::Satisfied);
+    assert_eq!(explanation.root().label(), "assertion_finding");
+
+    let finding = &run.findings()[0];
+    let PolicyFindingEvidence::Assertion { evidence } = finding.evidence() else {
+        panic!("a relational run retains assertion evidence");
+    };
+    let assertion = explanation
+        .root()
+        .children()
+        .iter()
+        .find(|node| node.kind() == ExplanationNodeKind::Assertion)
+        .expect("one assertion node");
+    // The assertion itself failed; that is exactly why the finding exists.
+    assert_eq!(assertion.outcome(), ExplanationOutcome::Failed);
+    assert_eq!(assertion.label(), evidence.anchor().assert_id());
+    let expected = assertion.expected().expect("an authored expectation");
+    assert!(expected.contains(evidence.expectation()), "{expected}");
+    assert!(expected.contains(evidence.expected_class()), "{expected}");
+    assert!(
+        expected.contains(evidence.anchor().subject_ast_id()),
+        "the group key is stated: {expected}"
+    );
+    assert_eq!(
+        assertion.actual(),
+        evidence.observed(),
+        "the observed aggregate is published verbatim"
+    );
+    assert_eq!(assertion.location(), Some(finding.primary()));
+}
+
+#[test]
+fn why_carries_every_retained_representative_row_with_its_exact_location() {
+    let fixture = relational_fixture();
+    let run = fixture.run(FORBID_READS_RELATIONAL);
+    let id = only_finding(&run);
+    let explanation =
+        explain_finding(&run, &id, &ExplanationLimits::default()).expect("explanation");
+    let finding = &run.findings()[0];
+
+    let assertion = explanation
+        .root()
+        .children()
+        .iter()
+        .find(|node| node.kind() == ExplanationNodeKind::Assertion)
+        .expect("one assertion node");
+    let rows = assertion
+        .children()
+        .iter()
+        .filter(|node| node.kind() == ExplanationNodeKind::SourceFact)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.len(),
+        finding.related().len() + 1,
+        "the anchor row plus every retained related location"
+    );
+    assert_eq!(rows[0].label(), "anchor_row");
+    assert_eq!(rows[0].location(), Some(finding.primary()));
+    for (row, related) in rows[1..].iter().zip(finding.related()) {
+        assert_eq!(row.location(), Some(related.location()));
+        assert!(
+            row.label() == "subject_row" || row.label() == "evidence_row",
+            "the relational driver tags rows subject or evidence: {}",
+            row.label()
+        );
+        assert_eq!(row.outcome(), ExplanationOutcome::Satisfied);
+    }
+    // Every location an explanation publishes was retained by the finding.
+    let retained: Vec<PolicySourceLocation> = std::iter::once(finding.primary().clone())
+        .chain(finding.related().iter().map(|r| r.location().clone()))
+        .collect();
+    for node in explanation.nodes() {
+        if let Some(location) = node.location() {
+            assert!(
+                retained.contains(location),
+                "node {} carries a location the finding never retained",
+                node.label()
+            );
+        }
+    }
+}
+
+#[test]
+fn why_joins_the_runs_unmet_obligations_for_the_same_assertion() {
+    // A truncated binding leaves the run inconclusive while the witnessed
+    // positive violation survives (the milestone-1 contract), which is the run
+    // shape that can carry both a finding and an unmet obligation.
+    let budget = PolicyBudget::builder()
+        .with_query_limits(CodeQueryExecutionLimits {
+            max_pipeline_rows: 1,
+            ..CodeQueryExecutionLimits::default()
+        })
+        .expect("query limits")
+        .build()
+        .expect("budget");
+    let fixture = Fixture::with_source(RELATIONAL_TWO_READS);
+    let mut run = fixture.run_with_budget(FORBID_READS_RELATIONAL, budget);
+    assert!(
+        matches!(run.completion(), PolicyRunCompletion::Inconclusive { .. }),
+        "{:?}",
+        run.completion()
+    );
+    let finding = run.findings()[0].clone();
+    let PolicyFindingEvidence::Assertion { evidence } = finding.evidence() else {
+        panic!("a relational run retains assertion evidence");
+    };
+    let assert_id = evidence.anchor().assert_id().to_string();
+
+    // The canonical obligation list is the join key this adapter reads. A run
+    // that carries one for this assertion and one for another must publish
+    // exactly the first: an unrelated blocked verdict says nothing about this
+    // finding.
+    let mine = PolicyObligation::try_new(
+        &assert_id,
+        PolicyObligationKind::AbsenceRequiresExhaustiveCoverage,
+        "by-read",
+        Some("app.ts#alias"),
+        vec![PolicyIncompleteReason::PipelineRowBudget],
+    )
+    .expect("a valid obligation");
+    let other = PolicyObligation::try_new(
+        "some-other-assertion",
+        PolicyObligationKind::VerdictRequiresWitnessedRows,
+        "by-read",
+        None,
+        vec![PolicyIncompleteReason::PartialDiscovery],
+    )
+    .expect("a valid obligation");
+    run.set_obligations(&[mine, other], false, 0, &PolicyBudget::default())
+        .expect("the run accepts its obligations");
+
+    let explanation =
+        explain_finding(&run, &finding.id(), &ExplanationLimits::default()).expect("explanation");
+    let obligations = child_labels(explanation.root(), ExplanationNodeKind::CoverageObligation);
+    assert_eq!(
+        obligations,
+        vec![
+            (String::from("run_completion"), ExplanationOutcome::Unknown),
+            (
+                String::from("absence_requires_exhaustive_coverage"),
+                ExplanationOutcome::Unknown
+            ),
+        ],
+        "only this assertion's obligation is joined, and an unmet obligation is unknown"
+    );
+    let obligation = explanation
+        .root()
+        .children()
+        .iter()
+        .find(|node| node.label() == "absence_requires_exhaustive_coverage")
+        .expect("the joined obligation");
+    assert_eq!(
+        obligation.reasons(),
+        [PolicyIncompleteReason::PipelineRowBudget]
+    );
+    assert!(
+        obligation
+            .actual()
+            .expect("obligation prose")
+            .contains("app.ts#alias"),
+        "the blocked group key is named"
+    );
+}
+
+#[test]
+fn relational_why_explanations_serialize_byte_identically_across_runs() {
+    let fixture = relational_fixture();
+    let run = fixture.run(FORBID_READS_RELATIONAL);
+    let id = only_finding(&run);
+    let first = explain_finding(&run, &id, &ExplanationLimits::default()).expect("first");
+    let second = explain_finding(&run, &id, &ExplanationLimits::default()).expect("second");
+    assert_eq!(first.to_json(), second.to_json());
+
+    let other_fixture = relational_fixture();
+    let other_run = other_fixture.run(FORBID_READS_RELATIONAL);
+    let other_id = only_finding(&other_run);
+    let third =
+        explain_finding(&other_run, &other_id, &ExplanationLimits::default()).expect("third");
+    assert_eq!(first.to_json(), third.to_json());
+    assert_eq!(first.root().id(), third.root().id());
+}
+
+#[test]
+fn the_node_limit_bounds_a_relational_why_answer() {
+    let fixture = relational_fixture();
+    let run = fixture.run(FORBID_READS_RELATIONAL);
+    let id = only_finding(&run);
+    let full = explain_finding(&run, &id, &ExplanationLimits::default()).expect("full");
+    assert!(full.node_count() > 2);
+    let bounded = explain_finding(&run, &id, &ExplanationLimits::default().with_max_nodes(2))
+        .expect("bounded");
+    assert_eq!(bounded.node_count(), 2);
+    assert!(bounded.truncation().nodes_truncated());
+    assert_eq!(
+        bounded.truncation().omitted_nodes_lower_bound(),
+        full.node_count() - 2
+    );
+}
+
+// --- relational assertions: why-not -----------------------------------------
+
+fn relational_why_not(
+    fixture: &Fixture,
+    source: &str,
+    candidate: &ExplanationCandidate,
+    limits: &ExplanationLimits,
+) -> PolicyExplanation {
+    with_policy(source, |policy| {
+        explain_candidate(
+            policy,
+            &fixture.context(),
+            candidate,
+            &PolicyBudget::default(),
+            limits,
+        )
+        .expect("explanation")
+    })
+}
+
+fn binding_labels(explanation: &PolicyExplanation) -> Vec<(String, ExplanationOutcome)> {
+    child_labels(explanation.root(), ExplanationNodeKind::RelationBinding)
+}
+
+#[test]
+fn why_not_reports_the_binding_the_candidate_is_absent_from() {
+    let fixture = relational_fixture();
+    // `return` is a keyword, so no value-reference occurrence covers it.
+    let explanation = relational_why_not(
+        &fixture,
+        FORBID_READS_RELATIONAL,
+        &relational_candidate("return 1"),
+        &ExplanationLimits::default(),
+    );
+
+    assert_eq!(explanation.question(), ExplanationQuestion::WhyNot);
+    assert_eq!(explanation.analysis_type(), PolicyAnalysisType::Assertion);
+    assert_eq!(explanation.root().label(), "relational_candidate");
+    assert_eq!(explanation.outcome(), ExplanationOutcome::Failed);
+    assert_eq!(
+        binding_labels(&explanation),
+        vec![(String::from("read"), ExplanationOutcome::Failed)]
+    );
+    assert!(
+        explanation
+            .root()
+            .actual()
+            .expect("root prose")
+            .contains("absent from row binding `read`"),
+        "{:?}",
+        explanation.root().actual()
+    );
+
+    // The binding's own stages say which stage inside it dropped the row.
+    let binding = &explanation.root().children()[0];
+    let stages = child_labels(binding, ExplanationNodeKind::SelectorStage);
+    assert_eq!(
+        stages,
+        vec![(String::from("occurrences"), ExplanationOutcome::Failed)]
+    );
+}
+
+#[test]
+fn why_not_stops_short_of_claiming_a_finding_when_every_binding_retains_the_row() {
+    let fixture = relational_fixture();
+    let explanation = relational_why_not(
+        &fixture,
+        FORBID_READS_RELATIONAL,
+        &relational_candidate("render;"),
+        &ExplanationLimits::default(),
+    );
+
+    assert_eq!(
+        binding_labels(&explanation),
+        vec![(String::from("read"), ExplanationOutcome::Satisfied)]
+    );
+    assert_eq!(
+        explanation.outcome(),
+        ExplanationOutcome::Unknown,
+        "membership in every binding is not a finding; the joins are not replayed"
+    );
+    let gap = explanation
+        .root()
+        .children()
+        .iter()
+        .find(|node| node.label() == "join_replay_unavailable")
+        .expect("the unreplayed join is stated as a node, not only as prose");
+    assert_eq!(gap.kind(), ExplanationNodeKind::CoverageObligation);
+    assert_eq!(gap.outcome(), ExplanationOutcome::Unknown);
+    assert_eq!(
+        gap.reasons(),
+        [PolicyIncompleteReason::CapabilityIncomplete]
+    );
+}
+
+#[test]
+fn why_not_reports_unknown_for_a_row_expansion_binding_it_cannot_replay() {
+    let fixture = Fixture::with_source(MEMBER_FIXTURE);
+    let explanation = relational_why_not(
+        &fixture,
+        TWO_BINDING_RELATIONAL,
+        &candidate_in(MEMBER_FIXTURE, "run();"),
+        &ExplanationLimits::default(),
+    );
+
+    let bindings = binding_labels(&explanation);
+    assert_eq!(bindings.len(), 2, "{bindings:?}");
+    assert_eq!(bindings[0].0, "site");
+    assert_eq!(
+        bindings[1],
+        (String::from("receiver"), ExplanationOutcome::Unknown)
+    );
+    assert_eq!(explanation.outcome(), ExplanationOutcome::Unknown);
+    let expansion = &explanation.root().children()[1];
+    assert_eq!(
+        expansion.reasons(),
+        [PolicyIncompleteReason::CapabilityIncomplete]
+    );
+    assert!(
+        expansion
+            .actual()
+            .expect("expansion prose")
+            .contains("not replayed"),
+        "{:?}",
+        expansion.actual()
+    );
+    assert!(
+        expansion.children().is_empty(),
+        "an unreplayed binding executed no prefix"
+    );
+}
+
+#[test]
+fn why_not_shares_one_prefix_budget_across_relational_bindings() {
+    let fixture = Fixture::with_source(MEMBER_FIXTURE);
+    let limits = ExplanationLimits::default().with_max_prefix_executions(1);
+    let explanation = relational_why_not(
+        &fixture,
+        TWO_BINDING_RELATIONAL,
+        &candidate_in(MEMBER_FIXTURE, "run();"),
+        &limits,
+    );
+
+    assert_eq!(
+        binding_labels(&explanation).len(),
+        1,
+        "one execution funds one binding's single stage"
+    );
+    assert_eq!(explanation.outcome(), ExplanationOutcome::Unknown);
+    assert!(explanation.root().children_truncated());
+    assert_eq!(explanation.root().omitted_children_lower_bound(), 1);
+    assert!(
+        explanation
+            .root()
+            .actual()
+            .expect("root prose")
+            .contains("prefix-execution limit"),
+        "{:?}",
+        explanation.root().actual()
+    );
+}
+
+#[test]
+fn relational_why_not_explanations_serialize_byte_identically_across_runs() {
+    let fixture = relational_fixture();
+    let candidate = relational_candidate("return 1");
+    let first = relational_why_not(
+        &fixture,
+        FORBID_READS_RELATIONAL,
+        &candidate,
+        &ExplanationLimits::default(),
+    );
+    let second = relational_why_not(
+        &fixture,
+        FORBID_READS_RELATIONAL,
+        &candidate,
+        &ExplanationLimits::default(),
+    );
+    assert_eq!(first.to_json(), second.to_json());
+
+    let other = relational_fixture();
+    let third = relational_why_not(
+        &other,
+        FORBID_READS_RELATIONAL,
+        &candidate,
+        &ExplanationLimits::default(),
+    );
+    assert_eq!(first.to_json(), third.to_json());
+}
+
+#[test]
+fn a_relational_why_not_refuses_an_impossible_prefix_budget() {
+    let fixture = relational_fixture();
+    let candidate = relational_candidate("render;");
+    let error = with_policy(FORBID_READS_RELATIONAL, |policy| {
+        explain_candidate(
+            policy,
+            &fixture.context(),
+            &candidate,
+            &PolicyBudget::default(),
+            &ExplanationLimits::default().with_max_prefix_executions(0),
+        )
+        .expect_err("no prefix may be executed")
+    });
+    assert_eq!(
+        error,
+        ExplainError::BudgetExhausted {
+            limit: ExplanationBudgetLimit::PrefixExecutions
+        }
+    );
+}
+
+// --- the host entry point ---------------------------------------------------
+
+/// A workspace on disk holding one source file and one `.rqlp` policy, which
+/// is what the CLI and MCP surfaces hand to [`explain_policy_inputs`].
+fn host_workspace(source: &str, policy: &str) -> tempfile::TempDir {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    std::fs::write(root.join("app.ts"), source).expect("write source");
+    std::fs::create_dir_all(root.join("policies")).expect("policy directory");
+    std::fs::write(root.join("policies").join("explain.rqlp"), policy).expect("write policy");
+    temp
+}
+
+#[test]
+fn the_host_explains_a_relational_finding_from_a_workspace_policy_file() {
+    let temp = host_workspace(RELATIONAL_FIXTURE, FORBID_READS_RELATIONAL);
+    let root = temp.path().canonicalize().expect("canonical root");
+    let inputs = vec![PolicyEvaluationInput::workspace_file(
+        "policies/explain.rqlp",
+    )];
+
+    // A candidate answer needs no finding identity, so it is the cheapest way
+    // to prove the host path loads, resolves and dispatches.
+    let candidate = ExplanationCandidate::at_offset("app.ts", 0).expect("candidate");
+    let explanation = explain_policy_inputs(
+        &root,
+        &inputs,
+        &ExplanationTarget::Candidate(candidate),
+        None,
+        None,
+        &ExplanationLimits::default(),
+    )
+    .expect("the host answers why-not");
+    assert_eq!(explanation.question(), ExplanationQuestion::WhyNot);
+    assert_eq!(explanation.policy_id().as_str(), "test.explain.relational");
+
+    // The same workspace, asked why about the finding its own run produced.
+    let fixture = Fixture::with_source(RELATIONAL_FIXTURE);
+    let id = only_finding(&fixture.run(FORBID_READS_RELATIONAL));
+    let explanation = explain_policy_inputs(
+        &root,
+        &inputs,
+        &ExplanationTarget::Finding(id),
+        None,
+        None,
+        &ExplanationLimits::default(),
+    )
+    .expect("the host answers why");
+    assert_eq!(explanation.question(), ExplanationQuestion::Why);
+    assert!(matches!(
+        explanation.subject(),
+        ExplanationSubject::Finding { finding_id, .. } if *finding_id == id
+    ));
+}
+
+#[test]
+fn the_host_refuses_a_selection_that_is_not_exactly_one_policy() {
+    let temp = host_workspace(RELATIONAL_FIXTURE, FORBID_READS_RELATIONAL);
+    let root = temp.path().canonicalize().expect("canonical root");
+    let candidate = ExplanationCandidate::at_offset("app.ts", 0).expect("candidate");
+
+    let empty = explain_policy_inputs(
+        &root,
+        &[],
+        &ExplanationTarget::Candidate(candidate.clone()),
+        None,
+        None,
+        &ExplanationLimits::default(),
+    )
+    .expect_err("an explanation is about one policy");
+    assert_eq!(
+        empty,
+        ExplainError::AmbiguousPolicySelection { selected: 0 }
+    );
+
+    let two = explain_policy_inputs(
+        &root,
+        &[
+            PolicyEvaluationInput::workspace_file("policies/explain.rqlp"),
+            PolicyEvaluationInput::embedded(
+                PolicySourceIdentity::new("test:explain-second"),
+                LOOSE_POLICY,
+            ),
+        ],
+        &ExplanationTarget::Candidate(candidate),
+        None,
+        None,
+        &ExplanationLimits::default(),
+    )
+    .expect_err("an explanation is about one policy");
+    assert_eq!(two, ExplainError::AmbiguousPolicySelection { selected: 2 });
+}
+
+#[test]
+fn the_host_reports_an_unloadable_policy_as_a_stated_condition() {
+    let temp = host_workspace(RELATIONAL_FIXTURE, FORBID_READS_RELATIONAL);
+    let root = temp.path().canonicalize().expect("canonical root");
+    let candidate = ExplanationCandidate::at_offset("app.ts", 0).expect("candidate");
+    let error = explain_policy_inputs(
+        &root,
+        &[PolicyEvaluationInput::workspace_file(
+            "policies/absent.rqlp",
+        )],
+        &ExplanationTarget::Candidate(candidate),
+        None,
+        None,
+        &ExplanationLimits::default(),
+    )
+    .expect_err("a missing policy file is a stated condition, not a panic");
+    assert!(
+        matches!(error, ExplainError::PolicyUnavailable { .. }),
+        "{error:?}"
+    );
 }

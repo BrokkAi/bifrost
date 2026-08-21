@@ -1864,7 +1864,7 @@ fn evaluate_relational_assertion_policy(
     }
 
     let work = work_report(total_work, findings.len(), 0);
-    finish_assembled_run(
+    let mut run = finish_assembled_run(
         policy,
         PolicyAnalysisType::Assertion,
         completion,
@@ -1874,7 +1874,94 @@ fn evaluate_relational_assertion_policy(
         work,
         "relational assertion evaluation produced an invalid policy run",
         budget,
-    )
+    )?;
+    attach_relational_obligations(&mut run, &evaluation, budget);
+    Ok(run)
+}
+
+/// Publish every unmet obligation as structured report data beside the
+/// diagnostics that already name it.
+///
+/// The diagnostics are the human-visible summary channel and stay exactly as
+/// they were; this list is what an agent reads. Both are built from the same
+/// evaluation in the same order, so they can never disagree about which
+/// verdict was blocked.
+///
+/// Nothing here can make a run more trustworthy: obligations are attached only
+/// to an `Inconclusive` run, and a run whose assembly degraded to `Failed`
+/// published no verdict at all, so it carries none. The retained-bytes bound
+/// is respected by dropping obligations from the end of the deterministic
+/// order and recording the loss in the truncation pair.
+fn attach_relational_obligations(
+    run: &mut PolicyRun,
+    evaluation: &super::super::assertion_policy::RelationalAssertionEvaluation,
+    budget: &PolicyBudget,
+) {
+    use super::super::finding::PolicyObligation;
+
+    if !matches!(run.completion(), PolicyRunCompletion::Inconclusive { .. }) {
+        return;
+    }
+    let mut obligations = Vec::new();
+    let mut truncated = evaluation.obligations_truncated;
+    let mut omitted = evaluation.omitted_obligations_lower_bound;
+    for obligation in &evaluation.unmet_obligations {
+        if obligations.len() >= budget.max_obligations_per_run() {
+            truncated = true;
+            omitted = omitted.saturating_add(1);
+            continue;
+        }
+        let key = render_relational_key(&obligation.key);
+        let projected = PolicyObligation::try_new(
+            obligation.assertion.as_str(),
+            policy_obligation_kind(obligation.kind),
+            obligation.group.as_str(),
+            (!key.is_empty()).then_some(key.as_str()),
+            obligation.reasons.clone(),
+        );
+        match projected {
+            Ok(projected) => obligations.push(projected),
+            Err(_) => {
+                truncated = true;
+                omitted = omitted.saturating_add(1);
+            }
+        }
+    }
+    // `omitted > 0` without `truncated` is unrepresentable, and so is the
+    // reverse; the evaluation's own pair already agrees, and every increment
+    // above sets both.
+    if truncated && omitted == 0 {
+        omitted = 1;
+    }
+    loop {
+        if run
+            .set_obligations(&obligations, truncated, omitted, budget)
+            .is_ok()
+        {
+            return;
+        }
+        if obligations.pop().is_none() {
+            return;
+        }
+        truncated = true;
+        omitted = omitted.saturating_add(1);
+    }
+}
+
+/// The report's published spelling of one evaluator obligation kind.
+const fn policy_obligation_kind(
+    kind: super::super::relational::RelationalObligationKind,
+) -> super::super::finding::PolicyObligationKind {
+    use super::super::finding::PolicyObligationKind;
+    use super::super::relational::RelationalObligationKind;
+    match kind {
+        RelationalObligationKind::AbsenceRequiresExhaustiveCoverage => {
+            PolicyObligationKind::AbsenceRequiresExhaustiveCoverage
+        }
+        RelationalObligationKind::VerdictRequiresWitnessedRows => {
+            PolicyObligationKind::VerdictRequiresWitnessedRows
+        }
+    }
 }
 
 /// Retain the one diagnostic that says this relational run could not observe

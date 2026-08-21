@@ -13,7 +13,8 @@
 use super::super::capabilities::{QueryFeature, QueryFeatures};
 use super::super::occurrence_rows::{
     OccurrenceCompleteness, OccurrenceDerivationOptions, OccurrenceFileResult,
-    OccurrenceIncompleteReason, OccurrenceRow, OccurrenceTarget, occurrences_for_file_with_options,
+    OccurrenceIncompleteReason, OccurrenceRow, OccurrenceTarget,
+    occurrences_for_file_with_options_and_roles,
 };
 use super::super::occurrences::OccurrenceRole;
 use super::results::{
@@ -30,7 +31,7 @@ use std::sync::Arc;
 /// once no matter how many pipeline rows touch it.
 #[derive(Default)]
 pub(super) struct OccurrenceTraversalCache {
-    files: HashMap<ProjectFile, Arc<OccurrenceFileResult>>,
+    files: HashMap<(ProjectFile, Vec<OccurrenceRole>), Arc<OccurrenceFileResult>>,
     reported: HashSet<(Language, OccurrenceRole, CodeQueryDiagnosticCode)>,
     reported_files: HashSet<(ProjectFile, CodeQueryDiagnosticCode)>,
     /// What this execution asked occurrence derivation for. One choice per
@@ -55,16 +56,27 @@ impl OccurrenceTraversalCache {
         &mut self,
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
+        filter: &OccurrenceFilter,
         cancellation: Option<&CancellationToken>,
     ) -> Option<Arc<OccurrenceFileResult>> {
-        if let Some(cached) = self.files.get(file) {
+        let mut roles = filter.required_roles();
+        roles.sort_unstable();
+        roles.dedup();
+        let key = (file.clone(), roles);
+        if let Some(cached) = self.files.get(&key) {
             return Some(Arc::clone(cached));
         }
         let token = cancellation.cloned().unwrap_or_default();
-        let derived =
-            occurrences_for_file_with_options(analyzer, file, self.options, &token).ok()?;
+        let derived = occurrences_for_file_with_options_and_roles(
+            analyzer,
+            file,
+            self.options,
+            Some(&key.1),
+            &token,
+        )
+        .ok()?;
         let derived = Arc::new(derived);
-        self.files.insert(file.clone(), Arc::clone(&derived));
+        self.files.insert(key, Arc::clone(&derived));
         Some(derived)
     }
 

@@ -2005,6 +2005,62 @@ pub(super) fn resolve_type_fq_name_at(
         .or_else(|| class_unit_for_fq_name(csharp, token, &normalized).map(|unit| unit.fq_name()))
 }
 
+/// Resolve a type name in a grammar-proven context that permits omitted
+/// generic arity, such as `nameof(Box)` (#2209). Each lexical scope still
+/// probes the exact arity-zero identity first; only an exact miss in that same
+/// scope widens to generic declarations with the normalized name.
+pub(super) fn resolve_arity_free_type_fq_name_at(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    class_ranges: &ClassRangeIndex,
+    reference: &str,
+    node: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    let normalized = expand_alias_qualified_type(csharp, file, &normalize_type_text(reference));
+    if normalized.is_empty() || type_parameter_shadows_reference(node, source, &normalized) {
+        return None;
+    }
+    if let Some(canonical) = canonical_builtin_type_identity(&normalized) {
+        return Some(canonical.to_string());
+    }
+
+    let nested = class_ranges
+        .enclosing(node.start_byte())
+        .and_then(|declaring_type_fqn| {
+            let candidates = graph_support::enclosing_type_candidates_with_lookups(
+                declaring_type_fqn,
+                &normalized,
+                &mut |fqn| {
+                    Some(graph_support::usage_arity_free_type_candidates_by_fqn(
+                        csharp, token, fqn,
+                    ))
+                },
+            )?;
+            graph_support::unique_logical_type(candidates)
+        });
+    nested
+        .map(|unit| unit.fq_name())
+        .or_else(|| {
+            graph_support::unique_logical_type(
+                graph_support::usage_arity_free_visible_type_candidates(
+                    csharp,
+                    token,
+                    file,
+                    &normalized,
+                ),
+            )
+            .map(|unit| unit.fq_name())
+        })
+        .or_else(|| {
+            graph_support::unique_logical_type(
+                graph_support::usage_arity_free_type_candidates_by_fqn(csharp, token, &normalized),
+            )
+            .map(|unit| unit.fq_name())
+        })
+}
+
 pub fn resolve_type_fq_name(
     csharp: &dyn CSharpSource,
     token: QueryToken<'_>,

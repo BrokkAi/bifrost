@@ -577,6 +577,12 @@ impl AnalyzerSnapshotCaches {
         self.semantic_models.overlay()
     }
 
+    fn active_semantic_models(
+        &self,
+    ) -> Option<Arc<crate::analyzer::semantic_model::ResolvedActiveSemanticModels>> {
+        self.semantic_models.active()
+    }
+
     #[cfg(test)]
     pub(crate) fn retain_dependency_discovery_evidence(
         &self,
@@ -1017,6 +1023,23 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     ) -> Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>> {
         self.snapshot_caches()
             .and_then(AnalyzerSnapshotCaches::semantic_model_overlay)
+    }
+
+    /// The activated semantic-model set published for this analyzer snapshot,
+    /// if a host has acquired active semantic models against it (#2437).
+    ///
+    /// This is the same publication `semantic_model_overlay` reads, and it is
+    /// how the detailed-query path reaches a pack's `declared_effects` without
+    /// opening its own activation: a host that already ran
+    /// `acquire_active_semantic_models` — the policy coordinator, the MCP
+    /// service, a test — makes those declarations visible here. An analyzer
+    /// with no publication answers `None`, and every effect row then states an
+    /// unmodeled callee rather than a proven absence.
+    fn active_semantic_models(
+        &self,
+    ) -> Option<Arc<crate::analyzer::semantic_model::ResolvedActiveSemanticModels>> {
+        self.snapshot_caches()
+            .and_then(AnalyzerSnapshotCaches::active_semantic_models)
     }
 
     /// Dependency-discovery evidence a host retained for `language`'s

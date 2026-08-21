@@ -2485,10 +2485,14 @@ fn handle_jsx_element(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     // visit the leaf identifier directly when it isn't a member_expression child;
     // by recording here we ensure JSX qualifications show up regardless.
     if let Some((rightmost, leaf_text)) = rightmost_jsx_identifier(name_node, ctx.source)
-        && ctx.binds_target(leaf_text)
+        && jsx_element_name_matches_target(ctx.target_member, ctx.binds_target(leaf_text))
     {
         record_hit(rightmost, ctx);
     }
+}
+
+fn jsx_element_name_matches_target(target_member: Option<&str>, binds_target: bool) -> bool {
+    target_member.is_none() && binds_target
 }
 
 /// Walks a JSX element name (identifier or member_expression) and returns the rightmost
@@ -3431,5 +3435,12 @@ mod tests {
             binder.binding("ns").map(|b| b.kind),
             Some(ImportKind::Namespace)
         );
+    }
+
+    #[test]
+    fn jsx_component_name_does_not_match_an_instance_member_target() {
+        assert!(jsx_element_name_matches_target(None, true));
+        assert!(!jsx_element_name_matches_target(Some("_onEdit"), true));
+        assert!(!jsx_element_name_matches_target(None, false));
     }
 }

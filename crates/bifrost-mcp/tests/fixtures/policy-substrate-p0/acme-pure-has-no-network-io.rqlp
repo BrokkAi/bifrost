@@ -1,0 +1,56 @@
+; Reference policy B of the issue-2433 P0 epic:
+; "a forbidden transitive effect".
+;
+; A reviewed semantic model declares that the exact API
+; `com.acme.AcmeHttpClient.send(java.lang.String)` performs the namespaced
+; effect `acme.network_io`. This relational policy asserts that no procedure
+; carrying the `@Pure` annotation reaches that effect, directly or through
+; workspace helpers.
+;
+; The marker
+; ----------
+; `(method :decorators [(name "Pure")])` is the annotation match. The Java
+; adapter normalizes `annotation` and `marker_annotation` nodes under a
+; declaration's modifiers into the shared `decorators` role, so `@Pure` is
+; matched the same way a Python decorator or a C# attribute would be. The
+; match is on the annotation's written name, not on a resolved annotation
+; type, so an unrelated `@Pure` from another package would also match.
+;
+; The join
+; --------
+; `procedure-effects` projects one row per (procedure, effect id), carrying
+; `depth`, `classification` (direct or transitive), `certainty`, `timing`,
+; `coverage`, and a bounded witness chain. The row is keyed on the
+; `declaration` domain's own `procedure_id`, so the join to the marker
+; relation is declaration-identity equality.
+;
+; The absence claim
+; -----------------
+; `(exactly 0)` is an absence claim, so it is conclusive only when the effect
+; relation's coverage is exhaustive. A procedure with an unresolved callee
+; leaves the effect set open; the run then publishes an unmet obligation and
+; exits 2 rather than reporting a clean verdict.
+(policy
+  :schema-version 1
+  :id "bifrost.p0.acme-pure-has-no-network-io"
+  :name "Pure procedures perform no network I/O"
+  :message "a procedure annotated @Pure reaches the acme.network_io effect"
+  :severity error
+  :description "A procedure annotated @Pure must not reach acme.network_io, directly or through a helper. The effect is declared on the exact API AcmeHttpClient.send by a reviewed workspace semantic model."
+  :help-uri "https://bifrost.brokk.ai/static-analysis-policies/"
+  :tags ["effects" "purity" "java"]
+  :analysis (analysis
+    :type assertion
+    (bind :name pure
+      :query (rql :schema-version 1
+        (language java (enclosing-decl (method :decorators [(name "Pure")])))))
+    (bind :name effect
+      :query (rql :schema-version 1
+        (language java
+          (procedure-effects (enclosing-decl (method :decorators [(name "Pure")]))))))
+    (join :left pure :right effect :on ((id procedure_id)))
+    (group :name pure-procedure :by (pure.id)
+      (aggregate :name network-effects :op count
+        :where ((effect.effect_id eq "acme.network_io")
+                (effect.derivation eq declared))))
+    (assert :group pure-procedure :value network-effects :cardinality (exactly 0))))

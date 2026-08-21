@@ -913,6 +913,20 @@ impl Decoder {
                 "cvss-severity requires a classification with a CVSS policy",
             ));
         }
+        // CVSS is a vulnerability-severity model whose typed evidence is taint
+        // source scenarios. A flow policy has none -- it states a correctness
+        // invariant, not a vulnerability -- so authoring CVSS on one is
+        // rejected here rather than silently scored from synthetic evidence.
+        if matches!(analysis, PolicyAnalysis::Flow { .. })
+            && let Some(classification) = classification.as_ref()
+            && classification.cvss.is_some()
+        {
+            return Err(source_error(
+                "cvss-not-allowed-for-flow",
+                fields.required("analysis").range.clone(),
+                "a flow analysis carries no CVSS evidence; remove the classification's :cvss policy",
+            ));
+        }
 
         Ok(PolicyDefinition {
             schema_version,
@@ -1099,6 +1113,9 @@ impl Decoder {
             PolicyAnalysisKind::Assertion => Ok(PolicyAnalysis::Assertion {
                 spec: self.decode_assertion_analysis(&fields, path)?,
             }),
+            PolicyAnalysisKind::Flow => Ok(PolicyAnalysis::Flow {
+                spec: self.decode_flow_analysis(&fields, path)?,
+            }),
         }
     }
 
@@ -1275,6 +1292,251 @@ impl Decoder {
         Ok(RowBinding { name, source })
     }
 
+    /// Decode `(analysis :type flow ...)` into the shared taint-shaped model.
+    ///
+    /// Flow authoring has no label, category, tag, impact or evidence
+    /// vocabulary: a flow policy tracks one thing, whether the value an origin
+    /// establishes reaches an observation. The decoder therefore closes every
+    /// entry over the two internal constants -- one label and one category --
+    /// so the composed model is a well-formed member of the same typed system
+    /// taint uses and runs through the same production pipeline (#2436).
+    fn decode_flow_analysis(
+        &mut self,
+        fields: &RecordCursor<'_>,
+        path: &str,
+    ) -> Result<TaintPolicySpec, PolicySourceError> {
+        match expect_atom(fields.required("mode"), AtomDomain::TaintMode, "flow mode")? {
+            PolicyAtomValue::ModeMay => {}
+            value => unreachable!("TaintMode registry returned {value:?}"),
+        }
+        let origins = self.decode_flow_origin_set(
+            fields.required("origins"),
+            &format!("{path}/{}", FLOW_SET_SEGMENTS.sources),
+        )?;
+        let observations = self.decode_flow_observation_set(
+            fields.required("observations"),
+            &format!("{path}/{}", FLOW_SET_SEGMENTS.sinks),
+        )?;
+        let kills = fields
+            .get("kills")
+            .map(|value| {
+                self.decode_flow_kill_set(
+                    value,
+                    &format!("{path}/{}", FLOW_SET_SEGMENTS.sanitizers),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(TaintPolicySpec {
+            mode: MayMode::May,
+            call_modeling: fields
+                .get("call-modeling")
+                .map(|value| self.decode_call_modeling(value, PolicyAnalysisKind::Flow))
+                .transpose()?
+                .unwrap_or_default(),
+            sources: origins,
+            sinks: observations,
+            sanitizers: kills,
+            transforms: TaintEndpointSet::default(),
+            external_models: TaintEndpointSet::default(),
+            finding_combinations: Vec::new(),
+        })
+    }
+
+    fn decode_flow_origin_set(
+        &mut self,
+        expr: &Expr,
+        path: &str,
+    ) -> Result<TaintEndpointSet<TaintSourceSpec>, PolicySourceError> {
+        let parts = self.decode_taint_set_parts(
+            expr,
+            PolicyAnalysisKind::Flow,
+            PolicyRecordContext::FlowOrigins,
+            false,
+            path,
+        )?;
+        let mut entries = Vec::with_capacity(parts.entries.len());
+        let mut ids = HashSet::with_capacity(parts.entries.len());
+        for entry in &parts.entries {
+            let value = self.decode_flow_origin(entry, path)?;
+            if !ids.insert(value.id.as_str().to_string()) {
+                return Err(source_error(
+                    "duplicate-entry-id",
+                    entry.range.clone(),
+                    format!("duplicate origin ID `{}`", value.id),
+                ));
+            }
+            entries.push(value);
+        }
+        entries.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        Ok(TaintEndpointSet {
+            include_sets: parts.include_sets,
+            include_matches: parts.include_matches,
+            entries,
+        })
+    }
+
+    fn decode_flow_observation_set(
+        &mut self,
+        expr: &Expr,
+        path: &str,
+    ) -> Result<TaintEndpointSet<TaintSinkSpec>, PolicySourceError> {
+        let parts = self.decode_taint_set_parts(
+            expr,
+            PolicyAnalysisKind::Flow,
+            PolicyRecordContext::FlowObservations,
+            false,
+            path,
+        )?;
+        let mut entries = Vec::with_capacity(parts.entries.len());
+        let mut ids = HashSet::with_capacity(parts.entries.len());
+        for entry in &parts.entries {
+            let value = self.decode_flow_observation(entry, path)?;
+            if !ids.insert(value.id.as_str().to_string()) {
+                return Err(source_error(
+                    "duplicate-entry-id",
+                    entry.range.clone(),
+                    format!("duplicate observation ID `{}`", value.id),
+                ));
+            }
+            entries.push(value);
+        }
+        entries.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        Ok(TaintEndpointSet {
+            include_sets: parts.include_sets,
+            include_matches: parts.include_matches,
+            entries,
+        })
+    }
+
+    fn decode_flow_kill_set(
+        &mut self,
+        expr: &Expr,
+        path: &str,
+    ) -> Result<TaintEndpointSet<TaintSanitizerSpec>, PolicySourceError> {
+        let parts = self.decode_taint_set_parts(
+            expr,
+            PolicyAnalysisKind::Flow,
+            PolicyRecordContext::FlowKills,
+            false,
+            path,
+        )?;
+        let mut entries = Vec::with_capacity(parts.entries.len());
+        let mut ids = HashSet::with_capacity(parts.entries.len());
+        for entry in &parts.entries {
+            let value = self.decode_flow_kill(entry, path)?;
+            if !ids.insert(value.id.as_str().to_string()) {
+                return Err(source_error(
+                    "duplicate-entry-id",
+                    entry.range.clone(),
+                    format!("duplicate kill ID `{}`", value.id),
+                ));
+            }
+            entries.push(value);
+        }
+        entries.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        Ok(TaintEndpointSet {
+            include_sets: parts.include_sets,
+            include_matches: parts.include_matches,
+            entries,
+        })
+    }
+
+    fn decode_flow_origin(
+        &mut self,
+        expr: &Expr,
+        path: &str,
+    ) -> Result<TaintSourceSpec, PolicySourceError> {
+        let context = DecodeContext::policy(PolicyAnalysisKind::Flow);
+        let fields = RecordCursor::parse(expr, PolicyRecord::Origin, context)?;
+        let id: TaintEntryId = parse_identifier(fields.required("id"), "origin ID")?;
+        self.register_local_taint_entry(&id, fields.required("id"))?;
+        let selector_path = format!(
+            "{path}/entries/{}/selector",
+            json_pointer_segment(id.as_str())
+        );
+        Ok(TaintSourceSpec {
+            id,
+            display_name: expect_string(
+                fields.required("display-name"),
+                "origin display name",
+                MAX_DISPLAY_TEXT_BYTES,
+            )?,
+            categories: vec![flow_internal_category()],
+            selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
+            bind: decoded_binding_to_port(decode_binding(
+                fields.required("bind"),
+                context,
+                PolicyValueShape::PolicyPort,
+            )?),
+            labels: vec![flow_internal_label()],
+            evidence: None,
+        })
+    }
+
+    fn decode_flow_observation(
+        &mut self,
+        expr: &Expr,
+        path: &str,
+    ) -> Result<TaintSinkSpec, PolicySourceError> {
+        let context = DecodeContext::policy(PolicyAnalysisKind::Flow);
+        let fields = RecordCursor::parse(expr, PolicyRecord::Observation, context)?;
+        let id: TaintEntryId = parse_identifier(fields.required("id"), "observation ID")?;
+        self.register_local_taint_entry(&id, fields.required("id"))?;
+        let selector_path = format!(
+            "{path}/entries/{}/selector",
+            json_pointer_segment(id.as_str())
+        );
+        Ok(TaintSinkSpec {
+            id,
+            display_name: expect_string(
+                fields.required("display-name"),
+                "observation display name",
+                MAX_DISPLAY_TEXT_BYTES,
+            )?,
+            categories: vec![flow_internal_category()],
+            selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
+            dangerous_operand: decoded_binding_to_port(decode_binding(
+                fields.required("observed-operand"),
+                context,
+                PolicyValueShape::PolicyPort,
+            )?),
+            accepts: vec![flow_internal_label()],
+            tags: Vec::new(),
+            impacts: Vec::new(),
+        })
+    }
+
+    fn decode_flow_kill(
+        &mut self,
+        expr: &Expr,
+        path: &str,
+    ) -> Result<TaintSanitizerSpec, PolicySourceError> {
+        let context = DecodeContext::policy(PolicyAnalysisKind::Flow);
+        let fields = RecordCursor::parse(expr, PolicyRecord::Kill, context)?;
+        let id: TaintEntryId = parse_identifier(fields.required("id"), "kill ID")?;
+        self.register_local_taint_entry(&id, fields.required("id"))?;
+        let selector_path = format!(
+            "{path}/entries/{}/selector",
+            json_pointer_segment(id.as_str())
+        );
+        Ok(TaintSanitizerSpec {
+            id,
+            selector: self.decode_selector(fields.required("selector"), context, &selector_path)?,
+            input: decoded_binding_to_port(decode_binding(
+                fields.required("input"),
+                context,
+                PolicyValueShape::PolicyPort,
+            )?),
+            output: decoded_binding_to_port(decode_binding(
+                fields.required("output"),
+                context,
+                PolicyValueShape::PolicyPort,
+            )?),
+            removes: vec![flow_internal_label()],
+        })
+    }
+
     fn decode_taint_analysis(
         &mut self,
         fields: &RecordCursor<'_>,
@@ -1330,8 +1592,13 @@ impl Decoder {
         expr: &Expr,
         path: &str,
     ) -> Result<TaintEndpointSet<TaintSourceSpec>, PolicySourceError> {
-        let parts =
-            self.decode_taint_set_parts(expr, PolicyRecordContext::TaintSources, true, path)?;
+        let parts = self.decode_taint_set_parts(
+            expr,
+            PolicyAnalysisKind::Taint,
+            PolicyRecordContext::TaintSources,
+            true,
+            path,
+        )?;
         let mut entries = Vec::with_capacity(parts.entries.len());
         let mut ids = HashSet::with_capacity(parts.entries.len());
         for entry in &parts.entries {
@@ -1358,8 +1625,13 @@ impl Decoder {
         expr: &Expr,
         path: &str,
     ) -> Result<TaintEndpointSet<TaintSinkSpec>, PolicySourceError> {
-        let parts =
-            self.decode_taint_set_parts(expr, PolicyRecordContext::TaintSinks, true, path)?;
+        let parts = self.decode_taint_set_parts(
+            expr,
+            PolicyAnalysisKind::Taint,
+            PolicyRecordContext::TaintSinks,
+            true,
+            path,
+        )?;
         let mut entries = Vec::with_capacity(parts.entries.len());
         let mut ids = HashSet::with_capacity(parts.entries.len());
         for entry in &parts.entries {
@@ -1386,8 +1658,13 @@ impl Decoder {
         expr: &Expr,
         path: &str,
     ) -> Result<TaintEndpointSet<TaintSanitizerSpec>, PolicySourceError> {
-        let parts =
-            self.decode_taint_set_parts(expr, PolicyRecordContext::TaintSanitizers, false, path)?;
+        let parts = self.decode_taint_set_parts(
+            expr,
+            PolicyAnalysisKind::Taint,
+            PolicyRecordContext::TaintSanitizers,
+            false,
+            path,
+        )?;
         let mut entries = Vec::with_capacity(parts.entries.len());
         let mut ids = HashSet::with_capacity(parts.entries.len());
         for entry in &parts.entries {
@@ -1414,8 +1691,13 @@ impl Decoder {
         expr: &Expr,
         path: &str,
     ) -> Result<TaintEndpointSet<TaintTransformSpec>, PolicySourceError> {
-        let parts =
-            self.decode_taint_set_parts(expr, PolicyRecordContext::TaintTransforms, false, path)?;
+        let parts = self.decode_taint_set_parts(
+            expr,
+            PolicyAnalysisKind::Taint,
+            PolicyRecordContext::TaintTransforms,
+            false,
+            path,
+        )?;
         let mut entries = Vec::with_capacity(parts.entries.len());
         let mut ids = HashSet::with_capacity(parts.entries.len());
         for entry in &parts.entries {
@@ -1444,6 +1726,7 @@ impl Decoder {
     ) -> Result<TaintEndpointSet<TaintExternalModelSpec>, PolicySourceError> {
         let parts = self.decode_taint_set_parts(
             expr,
+            PolicyAnalysisKind::Taint,
             PolicyRecordContext::TaintExternalModels,
             false,
             path,
@@ -1472,11 +1755,12 @@ impl Decoder {
     fn decode_taint_set_parts<'a>(
         &mut self,
         expr: &'a Expr,
+        analysis: PolicyAnalysisKind,
         record_context: PolicyRecordContext,
         allow_match_endpoints: bool,
         path: &str,
     ) -> Result<DecodedTaintSetParts<'a>, PolicySourceError> {
-        let context = DecodeContext::policy(PolicyAnalysisKind::Taint).with_record(record_context);
+        let context = DecodeContext::policy(analysis).with_record(record_context);
         let fields = RecordCursor::parse(expr, PolicyRecord::EndpointSet, context)?;
         let include_sets = fields
             .get("include-sets")
@@ -4372,12 +4656,24 @@ fn decoded_binding_to_call(
     }
 }
 
+/// The one internal label every flow policy is closed over.
+fn flow_internal_label() -> TaintLabel {
+    TaintLabel::new(FLOW_INTERNAL_LABEL).expect("the internal flow label is a valid identifier")
+}
+
+/// The one internal category minted for flow origins and observations.
+fn flow_internal_category() -> PolicyCategoryId {
+    PolicyCategoryId::new(FLOW_INTERNAL_CATEGORY)
+        .expect("the internal flow category is a valid identifier")
+}
+
 fn schema_analysis_kind(analysis: PolicyAnalysisType) -> PolicyAnalysisKind {
     match analysis {
         PolicyAnalysisType::Match => PolicyAnalysisKind::Match,
         PolicyAnalysisType::Taint => PolicyAnalysisKind::Taint,
         PolicyAnalysisType::Typestate => PolicyAnalysisKind::Typestate,
         PolicyAnalysisType::Assertion => PolicyAnalysisKind::Assertion,
+        PolicyAnalysisType::Flow => PolicyAnalysisKind::Flow,
     }
 }
 
@@ -4387,6 +4683,7 @@ fn decode_analysis_type(expr: &Expr) -> Result<PolicyAnalysisType, PolicySourceE
         PolicyAtomValue::AnalysisTaint => Ok(PolicyAnalysisType::Taint),
         PolicyAtomValue::AnalysisTypestate => Ok(PolicyAnalysisType::Typestate),
         PolicyAtomValue::AnalysisAssertion => Ok(PolicyAnalysisType::Assertion),
+        PolicyAtomValue::AnalysisFlow => Ok(PolicyAnalysisType::Flow),
         value => unreachable!("AnalysisType registry returned {value:?}"),
     }
 }

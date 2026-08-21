@@ -1207,6 +1207,23 @@ impl SemanticModelRuntimeCache {
             .map(|published| Arc::clone(&published.overlay))
     }
 
+    /// The activated model set the published overlay was built from (#2437).
+    ///
+    /// The overlay itself carries declaration facts only; procedure summaries —
+    /// and therefore `declared_effects` — live on the resolved active set. This
+    /// accessor publishes that same already-resolved set beside the overlay so
+    /// a reader that already has an analyzer can consult a declaration without
+    /// opening a second activation. It performs no activation, discovery, or
+    /// package I/O, exactly like `overlay`.
+    pub(crate) fn active(&self) -> Option<Arc<ResolvedActiveSemanticModels>> {
+        self.published
+            .lock()
+            .expect("semantic-model publication mutex poisoned")
+            .overlay
+            .as_ref()
+            .map(|published| Arc::clone(&published.active))
+    }
+
     fn publish_overlay(
         &self,
         analyzer: &dyn IAnalyzer,

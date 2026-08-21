@@ -58,6 +58,15 @@ pub struct ParsedFile {
     /// single module -- then spends quadratic time comparing `CodeUnit`s
     /// against each other (#2358).
     child_owners: HashMap<CodeUnit, Vec<CodeUnit>>,
+    /// The declarations currently exposed through `top_level_declarations`.
+    ///
+    /// This inverse membership lets deferred replacement preserve the public
+    /// ordering contract without scanning the whole top-level vec to discover
+    /// whether one declaration occurs there.
+    top_level_units: HashSet<CodeUnit>,
+    /// Units whose old physical ordering entries remain until one batched
+    /// compaction at the end of a language walk.
+    deferred_replacements: HashMap<CodeUnit, DeferredReplacement>,
     /// Declarations that lie in a structurally-evidenced test region: a
     /// test-attributed item or any declaration nested inside a `#[cfg(test)]`
     /// (or otherwise test-attributed) module/item. Populated by language walks
@@ -75,6 +84,11 @@ pub struct ParsedFile {
     /// declarations, recovered declarations, and preprocessor-conditional
     /// intervals. Persisted with the file's other analysis facts.
     pub materialization_records: Vec<MaterializationRecord>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DeferredReplacement {
+    affected_owners: HashSet<CodeUnit>,
 }
 
 const MAX_NAVIGATION_RANGES_PER_CODE_UNIT: usize = 257;
@@ -193,6 +207,8 @@ impl ParsedFile {
             navigation_ranges_truncated: HashSet::default(),
             children: HashMap::default(),
             child_owners: HashMap::default(),
+            top_level_units: HashSet::default(),
+            deferred_replacements: HashMap::default(),
             test_region_units: HashSet::default(),
             rust_usage_facts: RustUsageFacts::default(),
             materialization_records: Vec::new(),
@@ -235,6 +251,7 @@ impl ParsedFile {
 
         if inserted && parent.is_none() {
             self.top_level_declarations.push(code_unit.clone());
+            self.top_level_units.insert(code_unit.clone());
         }
 
         let ranges = self.ranges.entry(code_unit.clone()).or_default();
@@ -280,6 +297,7 @@ impl ParsedFile {
 
         if inserted && parent.is_none() {
             self.top_level_declarations.push(code_unit.clone());
+            self.top_level_units.insert(code_unit.clone());
         }
 
         if let Some(parent) = parent {
@@ -298,6 +316,7 @@ impl ParsedFile {
         }
 
         self.top_level_declarations.push(code_unit.clone());
+        self.top_level_units.insert(code_unit.clone());
         let line_starts = compute_line_starts(source);
         let end_line = line_starts.len().saturating_sub(1);
         self.ranges.entry(code_unit).or_default().push(Range {
@@ -329,6 +348,98 @@ impl ParsedFile {
     ) {
         self.remove_code_unit(&code_unit);
         self.add_code_unit_with_range(code_unit, range, parent, top_level);
+    }
+
+    /// Replaces a declaration while deferring physical ordering cleanup.
+    ///
+    /// Call [`Self::finalize_deferred_replacements`] after the language walk.
+    /// This variant is for parsers such as C++ that first record many forward
+    /// declarations and later replace them with definitions. Keeping the old
+    /// ordering entries temporarily and compacting every affected vec once
+    /// avoids a full sibling/top-level scan for every definition (#2358).
+    pub fn replace_code_unit_deferred(
+        &mut self,
+        code_unit: CodeUnit,
+        node: Node<'_>,
+        _source: &str,
+        parent: Option<CodeUnit>,
+        top_level: Option<CodeUnit>,
+    ) {
+        let range = node_range(node);
+        self.replace_code_unit_with_range_deferred(code_unit, range, parent, top_level);
+    }
+
+    /// Range-based form of [`Self::replace_code_unit_deferred`].
+    pub fn replace_code_unit_with_range_deferred(
+        &mut self,
+        code_unit: CodeUnit,
+        range: Range,
+        parent: Option<CodeUnit>,
+        top_level: Option<CodeUnit>,
+    ) {
+        if !self.prepare_deferred_replacement(&code_unit) {
+            self.add_code_unit_with_range(code_unit, range, parent, top_level);
+            return;
+        }
+
+        self.record_navigation_range(code_unit.clone(), range);
+        if parent.is_none() {
+            self.top_level_declarations.push(code_unit.clone());
+            self.top_level_units.insert(code_unit.clone());
+        }
+        self.ranges.insert(code_unit.clone(), vec![range]);
+        if let Some(parent) = parent {
+            // The old physical edge is deliberately still present, so this
+            // must append the replacement occurrence even when it is equal.
+            self.link_child(parent, code_unit.clone(), false);
+        }
+        if let Some(top_level) = top_level {
+            self.children.entry(top_level).or_default();
+        }
+    }
+
+    /// Compacts all ordering vectors touched by deferred replacements.
+    ///
+    /// For each replaced unit the last newly appended occurrence wins, which
+    /// is exactly the ordering produced by eager remove-and-reappend. Unrelated
+    /// duplicate child edges retain their original multiplicity.
+    pub fn finalize_deferred_replacements(&mut self) {
+        if self.deferred_replacements.is_empty() {
+            return;
+        }
+
+        let replacements: HashSet<CodeUnit> = self.deferred_replacements.keys().cloned().collect();
+        compact_replacement_occurrences(
+            &mut self.top_level_declarations,
+            &replacements,
+            &self.top_level_units,
+        );
+
+        let mut affected_owners = HashSet::default();
+        for replacement in self.deferred_replacements.values() {
+            affected_owners.extend(replacement.affected_owners.iter().cloned());
+        }
+
+        let mut desired_by_owner: HashMap<CodeUnit, HashSet<CodeUnit>> = HashMap::default();
+        for unit in &replacements {
+            if let Some(owners) = self.child_owners.get(unit) {
+                for owner in owners {
+                    affected_owners.insert(owner.clone());
+                    desired_by_owner
+                        .entry(owner.clone())
+                        .or_default()
+                        .insert(unit.clone());
+                }
+            }
+        }
+
+        for owner in affected_owners {
+            if let Some(children) = self.children.get_mut(&owner) {
+                let desired = desired_by_owner.get(&owner).cloned().unwrap_or_default();
+                compact_replacement_occurrences(children, &replacements, &desired);
+            }
+        }
+        self.deferred_replacements.clear();
     }
 
     pub fn record_navigation_range(&mut self, code_unit: CodeUnit, range: Range) {
@@ -487,10 +598,8 @@ impl ParsedFile {
                 }
             }
 
-            // A unit reaches `top_level_declarations` only on the insertion
-            // that also adds it to `declarations`, so a unit absent from
-            // `declarations` cannot be in that vec and needs no scan.
-            if self.remove_declaration(&unit) {
+            self.remove_declaration(&unit);
+            if self.top_level_units.remove(&unit) {
                 record_removal_scan(self.top_level_declarations.len());
                 self.top_level_declarations
                     .retain(|existing| existing != &unit);
@@ -506,6 +615,39 @@ impl ParsedFile {
             self.type_aliases.remove(&unit);
             self.ranges.remove(&unit);
         }
+    }
+
+    /// Clears replaceable facts while leaving incoming ordering entries until
+    /// the batch finalizer can compact their vectors once.
+    fn prepare_deferred_replacement(&mut self, code_unit: &CodeUnit) -> bool {
+        if !self.declarations.contains(code_unit) {
+            return false;
+        }
+
+        let mut affected_owners = self.child_owners.remove(code_unit).unwrap_or_default();
+        self.deferred_replacements
+            .entry(code_unit.clone())
+            .or_default()
+            .affected_owners
+            .extend(affected_owners.drain(..));
+        self.top_level_units.remove(code_unit);
+
+        if let Some(children) = self.children.remove(code_unit) {
+            for child in children {
+                self.remove_code_unit(&child);
+            }
+        }
+        self.definition_lookup_units.remove(code_unit);
+        self.raw_supertypes.remove(code_unit);
+        self.supertype_lookup_paths.remove(code_unit);
+        self.signatures.remove(code_unit);
+        self.signature_metadata.remove(code_unit);
+        self.cpp_template_metadata.remove(code_unit);
+        self.ruby_method_dispatch_modes.remove(code_unit);
+        self.scala_traits.remove(code_unit);
+        self.type_aliases.remove(code_unit);
+        self.ranges.remove(code_unit);
+        true
     }
 
     fn insert_declaration(&mut self, code_unit: CodeUnit) -> bool {
@@ -539,6 +681,22 @@ impl ParsedFile {
         }
         true
     }
+}
+
+fn compact_replacement_occurrences(
+    units: &mut Vec<CodeUnit>,
+    replacements: &HashSet<CodeUnit>,
+    desired: &HashSet<CodeUnit>,
+) {
+    let mut seen = HashSet::default();
+    let mut compacted = Vec::with_capacity(units.len());
+    while let Some(unit) = units.pop() {
+        if !replacements.contains(&unit) || desired.contains(&unit) && seen.insert(unit.clone()) {
+            compacted.push(unit);
+        }
+    }
+    compacted.reverse();
+    *units = compacted;
 }
 
 #[cfg(test)]
@@ -659,5 +817,51 @@ mod tests {
         parsed.remove_code_unit(&parent);
         assert!(!parsed.contains_declaration_identity(&parent));
         assert!(!parsed.contains_declaration_identity(&child_identity));
+    }
+
+    #[test]
+    fn deferred_replacements_batch_ordering_cleanup_and_keep_last_occurrence() {
+        let file = ProjectFile::new(std::env::temp_dir(), "deferred.cpp");
+        let owner = CodeUnit::new(file.clone(), CodeUnitType::Module, "", "generated");
+        let unit = |name: &str| CodeUnit::new(file.clone(), CodeUnitType::Class, "generated", name);
+        let a = unit("A");
+        let b = unit("B");
+        let c = unit("C");
+        let unrelated = unit("Unrelated");
+        let stale_child = CodeUnit::new(file, CodeUnitType::Function, "generated.B", "stale");
+        let mut parsed = ParsedFile::new(String::new());
+        for (index, declaration) in [&a, &b, &c].into_iter().enumerate() {
+            parsed.add_code_unit_with_range(declaration.clone(), test_range(index), None, None);
+            parsed.add_child(owner.clone(), declaration.clone());
+        }
+        parsed.add_child(owner.clone(), unrelated.clone());
+        parsed.add_child(owner.clone(), unrelated.clone());
+        parsed.add_code_unit_with_range(stale_child.clone(), test_range(4), Some(b.clone()), None);
+
+        start_code_unit_removal_scan_probe();
+        parsed.replace_code_unit_with_range_deferred(b.clone(), test_range(10), None, None);
+        parsed.add_child(owner.clone(), b.clone());
+        parsed.replace_code_unit_with_range_deferred(a.clone(), test_range(11), None, None);
+        parsed.add_child(owner.clone(), a.clone());
+        parsed.finalize_deferred_replacements();
+        assert_eq!(0, finish_code_unit_removal_scan_probe());
+
+        assert_eq!(
+            vec![c.clone(), b.clone(), a.clone()],
+            parsed.top_level_declarations
+        );
+        assert_eq!(
+            &vec![c, unrelated.clone(), unrelated, b.clone(), a.clone(),],
+            parsed.children.get(&owner).unwrap()
+        );
+        assert_eq!(&[test_range(10)], parsed.declaration_ranges(&b));
+        assert_eq!(&[test_range(11)], parsed.declaration_ranges(&a));
+        assert!(!parsed.contains_declaration(&stale_child));
+
+        let top_level = parsed.top_level_declarations.clone();
+        let children = parsed.children.clone();
+        parsed.finalize_deferred_replacements();
+        assert_eq!(top_level, parsed.top_level_declarations);
+        assert_eq!(children, parsed.children);
     }
 }

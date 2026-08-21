@@ -84,6 +84,9 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::CallShape(_)
                     | PipelineValue::CallArgumentGroup(_)
                     | PipelineValue::CallArgument(_)
+                    | PipelineValue::CallBinding(_)
+                    | PipelineValue::CallEffect(_)
+                    | PipelineValue::ProcedureEffect(_)
                     | PipelineValue::CallableSignature(_)
                     | PipelineValue::SignatureParameter(_)
                     | PipelineValue::CallableApplicability(_)
@@ -156,6 +159,9 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::CallShape(_)
                                 | PipelineValue::CallArgumentGroup(_)
                                 | PipelineValue::CallArgument(_)
+                                | PipelineValue::CallBinding(_)
+                                | PipelineValue::CallEffect(_)
+                                | PipelineValue::ProcedureEffect(_)
                                 | PipelineValue::CallableSignature(_)
                                 | PipelineValue::SignatureParameter(_)
                                 | PipelineValue::CallableApplicability(_)
@@ -240,6 +246,9 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::CallShape(_)
                         | PipelineValue::CallArgumentGroup(_)
                         | PipelineValue::CallArgument(_)
+                        | PipelineValue::CallBinding(_)
+                        | PipelineValue::CallEffect(_)
+                        | PipelineValue::ProcedureEffect(_)
                         | PipelineValue::CallableSignature(_)
                         | PipelineValue::SignatureParameter(_)
                         | PipelineValue::CallableApplicability(_)
@@ -1345,6 +1354,21 @@ pub(super) fn apply_pipeline_step(
                     value.shape.report.outcome.file.clone(),
                 ))]
             }
+            (PipelineValue::CallBinding(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
+            (PipelineValue::CallEffect(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
+            (PipelineValue::ProcedureEffect(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(
+                    value.file().clone(),
+                ))]
+            }
             (PipelineValue::ReceiverEvidence(value), QueryStep::FileOf) => {
                 vec![pipeline_expansion(PipelineValue::File(
                     value.receiver.report.site.file.clone(),
@@ -1824,6 +1848,44 @@ pub(super) fn apply_pipeline_step(
             }
             (PipelineValue::CallArgumentGroup(value), QueryStep::CallArguments) => {
                 call_shape::call_argument_expansions(value)
+            }
+            (PipelineValue::CallShape(value), QueryStep::CallEffects) => {
+                effects::call_effect_expansions(
+                    analyzer,
+                    semantic
+                        .as_mut()
+                        .expect("semantic context exists for semantic steps"),
+                    &mut call_cache.effects,
+                    diagnostics,
+                    value,
+                )
+            }
+            (PipelineValue::Declaration(declaration), QueryStep::ProcedureEffects) => {
+                effects::procedure_effect_expansions(
+                    analyzer,
+                    semantic
+                        .as_mut()
+                        .expect("semantic context exists for semantic steps"),
+                    &mut call_cache.effects,
+                    budget,
+                    limits,
+                    cancellation,
+                    diagnostics,
+                    cache_profile,
+                    declaration,
+                )
+            }
+            (PipelineValue::CallShape(value), QueryStep::CallBindings) => {
+                let indexed = indexed_declarations
+                    .as_deref_mut()
+                    .expect("semantic declaration index exists");
+                call_binding::call_binding_expansions(
+                    analyzer,
+                    indexed,
+                    &mut call_cache.bindings,
+                    value,
+                    cancellation,
+                )
             }
             (PipelineValue::File(file), QueryStep::OccurrencesIn(filter)) => {
                 occurrence_expansions_for_file(

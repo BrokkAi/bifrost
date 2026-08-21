@@ -16,16 +16,16 @@ use super::super::{
     MatchResultDomain, OrganizationalRiskAssessment, PolicyAnalysisType, PolicyCapability,
     PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyEndpointBinding, PolicyFailureReason,
     PolicyFinding, PolicyFindingEvidence, PolicyIncompleteReason, PolicyLevel,
-    PolicyLocationRelationship, PolicyMessageSpec, PolicyOverlayScope, PolicyQueryProof,
-    PolicyQueryProvenance, PolicyQueryResultRef, PolicyReportDocument, PolicyRuleDescriptor,
-    PolicyRun, PolicyRunCompletion, PolicySemanticEvent, PolicySeveritySpec, PolicySourceLocation,
-    PolicySuppressionDecision, PolicySuppressionMatchState, PolicySuppressionOrphanState,
-    PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicySuppressionTemporalState,
-    ProofMetadata, ProofReason, ProofState, ResolvedEndpointDependency, ResolvedEndpointIdentity,
-    ResolvedEndpointManifestEntry, ResolvedMatchDirectoryManifest, ResolvedPrecedenceEdge,
-    ResolvedTypestateTerminal, SchemaVersionOrigin, SchemaVersionResolution,
-    StableSemanticIdentity, TaintSourceEvidence, TaintSystemEntry, TaintTrustBoundary,
-    TypestateViolationEvidence, WitnessStepKind,
+    PolicyLocationRelationship, PolicyMessageSpec, PolicyObligation, PolicyOverlayScope,
+    PolicyQueryProof, PolicyQueryProvenance, PolicyQueryResultRef, PolicyReportDocument,
+    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySemanticEvent, PolicySeveritySpec,
+    PolicySourceLocation, PolicySuppressionDecision, PolicySuppressionMatchState,
+    PolicySuppressionOrphanState, PolicySuppressionPolicyHashState, PolicySuppressionReview,
+    PolicySuppressionTemporalState, ProofMetadata, ProofReason, ProofState,
+    ResolvedEndpointDependency, ResolvedEndpointIdentity, ResolvedEndpointManifestEntry,
+    ResolvedMatchDirectoryManifest, ResolvedPrecedenceEdge, ResolvedTypestateTerminal,
+    SchemaVersionOrigin, SchemaVersionResolution, StableSemanticIdentity, TaintSourceEvidence,
+    TaintSystemEntry, TaintTrustBoundary, TypestateViolationEvidence, WitnessStepKind,
 };
 
 use super::{
@@ -156,6 +156,7 @@ pub fn write_policy_human<W: Write>(
             }
         }
         write_run_diagnostics(&mut output, run)?;
+        write_run_obligations(&mut output, run, options.detail())?;
         if !run.completion().is_exhaustive() || run.diagnostics_truncated() {
             let rule = report
                 .rules()
@@ -328,12 +329,21 @@ fn write_concise_witness<W: Write>(
     finding: &PolicyFinding,
     witness: &BoundedWitness,
 ) -> Result<(), PolicyRenderError> {
-    let taint_sink = (finding.analysis_type() == PolicyAnalysisType::Taint).then(|| {
-        (
+    // Flow findings retain the same display path as taint findings, so the
+    // concise table gets the same terminal row; only its label changes.
+    let taint_sink = match finding.analysis_type() {
+        PolicyAnalysisType::Taint => Some((
             finding.primary(),
             concise_terminal_symbol(finding).unwrap_or("taint sink"),
-        )
-    });
+        )),
+        PolicyAnalysisType::Flow => Some((
+            finding.primary(),
+            concise_terminal_symbol(finding).unwrap_or("flow observation"),
+        )),
+        PolicyAnalysisType::Match
+        | PolicyAnalysisType::Typestate
+        | PolicyAnalysisType::Assertion => None,
+    };
     write_concise_witness_rows(output, witness, taint_sink)
 }
 
@@ -1687,6 +1697,23 @@ fn write_evidence_summary<W: Write>(
             .map_err(map_io_error)?;
             writeln!(output).map_err(map_io_error)?;
         }
+        PolicyFindingEvidence::Flow { evidence } => {
+            write!(
+                output,
+                "  evidence: flow {} [origin ",
+                escape_terminal_text(evidence.origin_display_name()),
+            )
+            .map_err(map_io_error)?;
+            write_endpoint_identity(output, evidence.origin_endpoint())?;
+            write!(
+                output,
+                "] -> {} [observation ",
+                escape_terminal_text(evidence.observation_display_name()),
+            )
+            .map_err(map_io_error)?;
+            write_endpoint_identity(output, evidence.observation_endpoint())?;
+            writeln!(output, "]").map_err(map_io_error)?;
+        }
         PolicyFindingEvidence::Typestate { evidence } => {
             write!(
                 output,
@@ -1895,6 +1922,70 @@ fn write_evidence_detail<W: Write>(
             writeln!(
                 output,
                 "  taint projection: {}",
+                evidence.projection_facts_hash(),
+            )
+            .map_err(map_io_error)?;
+        }
+        PolicyFindingEvidence::Flow { evidence } => {
+            if let Some(anchor) = evidence.anchor().strong_fields() {
+                write!(output, "  flow anchor: strong; observation identity ")
+                    .map_err(map_io_error)?;
+                write_optional_stable_identity(output, Some(anchor.sink_identity()))?;
+                writeln!(output).map_err(map_io_error)?;
+                writeln!(
+                    output,
+                    "    origin endpoint projection: {}",
+                    anchor.source_endpoint_analysis_projection_hash(),
+                )
+                .map_err(map_io_error)?;
+                writeln!(
+                    output,
+                    "    observation endpoint projection: {}",
+                    anchor.sink_endpoint_analysis_projection_hash(),
+                )
+                .map_err(map_io_error)?;
+            } else if let Some(anchor) = evidence.anchor().weak_fields() {
+                writeln!(
+                    output,
+                    "  flow anchor: weak; typed key {}",
+                    escape_terminal_text(anchor.typed_key().as_str()),
+                )
+                .map_err(map_io_error)?;
+            }
+            writeln!(
+                output,
+                "  analysis finding: {}",
+                escape_terminal_text(evidence.analysis_finding_id().as_str()),
+            )
+            .map_err(map_io_error)?;
+            writeln!(
+                output,
+                "  observation event: {}",
+                escape_terminal_text(evidence.observation().as_str()),
+            )
+            .map_err(map_io_error)?;
+            for origin in evidence.origins() {
+                write!(output, "  flow origin: from ").map_err(map_io_error)?;
+                write_endpoint_identity(output, origin.source_endpoint())?;
+                write!(output, " at ").map_err(map_io_error)?;
+                write_location(output, origin.primary()).map_err(map_io_error)?;
+                write_evidence_refs_suffix(output, origin.evidence_refs())?;
+                writeln!(output).map_err(map_io_error)?;
+            }
+            if evidence.origins_truncated() {
+                writeln!(output, "  flow origins: truncated").map_err(map_io_error)?;
+            }
+            write_text_items(
+                output,
+                "  flow witness reference",
+                evidence.witness_refs().iter().map(|value| value.as_str()),
+            )?;
+            if evidence.witness_refs_truncated() {
+                writeln!(output, "  flow witness references: truncated").map_err(map_io_error)?;
+            }
+            writeln!(
+                output,
+                "  flow projection: {}",
                 evidence.projection_facts_hash(),
             )
             .map_err(map_io_error)?;
@@ -2536,6 +2627,83 @@ fn write_run_diagnostics<W: Write>(
     Ok(())
 }
 
+/// Name the verdicts this run could not publish.
+///
+/// The audit view names each one -- which assertion, which group partition,
+/// which obligation kind, and the typed reasons -- because that is what makes
+/// a blocked claim addressable. The scan view states the count only, the same
+/// way it states a completion rather than every reason behind it: a reader who
+/// wants the list runs `--verbose`.
+fn write_run_obligations<W: Write>(
+    output: &mut BoundedWriter<W>,
+    run: &PolicyRun,
+    detail: HumanRenderDetail,
+) -> Result<(), PolicyRenderError> {
+    if run.obligations().is_empty() && !run.obligations_truncated() {
+        return Ok(());
+    }
+    let policy_id = escape_terminal_text(run.policy_id().as_str()).to_string();
+    if detail == HumanRenderDetail::Concise {
+        write!(
+            output,
+            "policy {policy_id} obligations: {} unmet verdict{}",
+            run.obligations().len(),
+            if run.obligations().len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+        )
+        .map_err(map_io_error)?;
+        if run.obligations_truncated() {
+            write!(
+                output,
+                "; at least {} omitted",
+                run.omitted_obligations_lower_bound(),
+            )
+            .map_err(map_io_error)?;
+        }
+        return writeln!(output).map_err(map_io_error);
+    }
+    for obligation in run.obligations() {
+        write_run_obligation(output, policy_id.as_str(), obligation)?;
+    }
+    if run.obligations_truncated() {
+        writeln!(
+            output,
+            "policy {policy_id} obligations truncated: at least {} omitted",
+            run.omitted_obligations_lower_bound(),
+        )
+        .map_err(map_io_error)?;
+    }
+    Ok(())
+}
+
+fn write_run_obligation<W: Write>(
+    output: &mut BoundedWriter<W>,
+    policy_id: &str,
+    obligation: &PolicyObligation,
+) -> Result<(), PolicyRenderError> {
+    write!(
+        output,
+        "policy {policy_id} obligation: assertion {} published no verdict for group {}",
+        escape_terminal_text(obligation.assertion()),
+        escape_terminal_text(obligation.group()),
+    )
+    .map_err(map_io_error)?;
+    if let Some(key) = obligation.group_key() {
+        write!(output, " key {}", escape_terminal_text(key)).map_err(map_io_error)?;
+    }
+    write!(output, ": {} (", obligation.kind().as_str()).map_err(map_io_error)?;
+    for (index, reason) in obligation.reasons().iter().enumerate() {
+        if index > 0 {
+            write!(output, ", ").map_err(map_io_error)?;
+        }
+        write!(output, "{}", incomplete_reason(*reason)).map_err(map_io_error)?;
+    }
+    writeln!(output, ")").map_err(map_io_error)
+}
+
 fn write_run_completion<W: Write>(
     output: &mut BoundedWriter<W>,
     run: &PolicyRun,
@@ -3043,6 +3211,7 @@ const fn analysis_type(value: PolicyAnalysisType) -> &'static str {
         PolicyAnalysisType::Taint => "taint",
         PolicyAnalysisType::Typestate => "typestate",
         PolicyAnalysisType::Assertion => "assertion",
+        PolicyAnalysisType::Flow => "flow",
     }
 }
 

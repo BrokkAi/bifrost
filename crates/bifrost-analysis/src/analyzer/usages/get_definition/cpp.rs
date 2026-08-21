@@ -260,6 +260,7 @@ pub(super) fn select_navigation_targets(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_cpp<'a>(
     analyzer: &'a dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -268,6 +269,7 @@ pub(super) fn resolve_cpp<'a>(
     source: &str,
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
+    exact_token_focus: bool,
 ) -> DefinitionLookupOutcome {
     let Some(cpp) = resolve_analyzer::<CppAnalyzer>(analyzer) else {
         return no_definition("cpp_analyzer_unavailable", "C++ analyzer is unavailable");
@@ -375,6 +377,7 @@ pub(super) fn resolve_cpp<'a>(
             source,
             type_node,
             Some(class_ranges.as_ref()),
+            exact_token_focus,
         );
     }
 
@@ -2531,6 +2534,7 @@ fn resolve_cpp_type(
     source: &str,
     node: Node<'_>,
     class_ranges: Option<&ClassRangeIndex>,
+    exact_token_focus: bool,
 ) -> DefinitionLookupOutcome {
     let scope = AnalyzerQueryScope::new(analyzer);
     let dispatch = CppDispatch::new(analyzer, scope.token());
@@ -2813,24 +2817,32 @@ fn resolve_cpp_type(
                 .collect();
             return candidates_outcome(candidates);
         }
-        // Namespace declarations are not indexed as CodeUnits, so a focused
-        // qualifier such as `Common` in `Common::Status` cannot resolve on its
-        // own. Resolve the complete structured type path before considering a
-        // dependent template-parameter stand-in for the qualifier.
-        if let Some(unit) = cpp_resolve_qualified_via_enclosing_namespaces(
-            analyzer,
-            file,
-            &qualifier.qualified_reference,
-            node.start_byte(),
-            |unit| {
-                cpp_unit_matches_kind(
-                    analyzer,
-                    context.bounded_support(),
-                    unit,
-                    CppTargetKind::Type,
-                ) && visibility.external_type_declaration_visible_at(file, unit, node.start_byte())
-            },
-        ) {
+        // A point-based editor lookup on the leading namespace of a qualified
+        // type historically resolves the complete type because namespaces are
+        // not indexed CodeUnits. Preserve that location-navigation contract,
+        // but never apply it to an explicit byte-range request: callers such
+        // as get_definitions_by_reference use that range to demand an exact
+        // token answer (#2429).
+        if !exact_token_focus
+            && let Some(unit) = cpp_resolve_qualified_via_enclosing_namespaces(
+                analyzer,
+                file,
+                &qualifier.qualified_reference,
+                node.start_byte(),
+                |unit| {
+                    cpp_unit_matches_kind(
+                        analyzer,
+                        context.bounded_support(),
+                        unit,
+                        CppTargetKind::Type,
+                    ) && visibility.external_type_declaration_visible_at(
+                        file,
+                        unit,
+                        node.start_byte(),
+                    )
+                },
+            )
+        {
             let unit = if unit.is_class() && !cpp_unit_is_type_alias(analyzer, &unit) {
                 let Some(unit) =
                     visibility.canonical_visible_full_type_unit(&dispatch.source(), file, &unit)
@@ -4768,6 +4780,85 @@ fn resolve_cpp_call(
                 cpp_bare_call_target_outcome(ctx, token, call, call_arity, name, resolution)
             {
                 return outcome;
+            }
+            if is_c_source_file(ctx.file) {
+                // A FIRD/navigation query may start from an incomplete C
+                // translation unit whose only same-file function declaration
+                // is the later definition. Ordinary language lookup correctly
+                // rejects it, but navigation can still recover that exact
+                // declaration when its file scope and guard environment are
+                // structurally compatible with this call (#2404).
+                let mut later = ctx
+                    .support
+                    .file_identifier(ctx.file, name)
+                    .into_iter()
+                    .filter(|candidate| {
+                        cpp_unit_matches_kind(
+                            ctx.analyzer,
+                            ctx.support,
+                            candidate,
+                            CppTargetKind::FreeFunction,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                later.retain(|candidate| {
+                    ctx.visibility
+                        .same_file_callable_guard_compatible_ignoring_order(
+                            &ctx_dispatch.source(),
+                            ctx.file,
+                            candidate,
+                            call,
+                        )
+                });
+                later = cpp_filter_candidates_by_call_lazy(
+                    later,
+                    call_arity,
+                    || {
+                        cpp_call_argument_types(
+                            ctx.analyzer,
+                            token,
+                            ctx.support,
+                            ctx.visibility,
+                            ctx.file,
+                            ctx.source,
+                            ctx.root,
+                            call,
+                        )
+                    },
+                    ctx.analyzer,
+                    token,
+                    ctx.visibility,
+                    ctx.file,
+                );
+                if !later.is_empty() {
+                    return cpp_callable_candidates_outcome(later);
+                }
+
+                // A file-scope function-pointer variable is an indexed global
+                // field, not a function CodeUnit. Calling it does not erase
+                // the identifier's declaration identity; use the same
+                // structured visibility check as a non-call value reference.
+                let mut callable_variables = cpp_visible_name_candidates(
+                    ctx.analyzer,
+                    token,
+                    ctx.visibility,
+                    ctx.file,
+                    ctx.support,
+                    name,
+                    Some(CppTargetKind::GlobalField),
+                    cpp_lexical_namespace(function, ctx.source).as_deref(),
+                );
+                callable_variables.retain(|candidate| {
+                    ctx.visibility.external_type_candidate_visible_in_context(
+                        &ctx_dispatch.source(),
+                        ctx.file,
+                        candidate,
+                        call,
+                    )
+                });
+                if !callable_variables.is_empty() {
+                    return candidates_outcome(callable_variables);
+                }
             }
             let macros = cpp_macro_candidates(
                 ctx.analyzer,
@@ -8606,11 +8697,15 @@ fn cpp_c_underscore_tag_type_unit(
         return None;
     }
     let tag = format!("_{name}");
-    visibility
+    let candidates = visibility
         .type_name_candidates(file, &tag)
         .into_iter()
-        .find(|unit| unit.is_class() && unit.identifier() == tag)
-        .cloned()
+        .filter(|unit| unit.is_class() && unit.identifier() == tag)
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [candidate] => Some((*candidate).clone()),
+        _ => None,
+    }
 }
 
 fn cpp_resolve_type_alias_unit(
@@ -9077,6 +9172,35 @@ mod bounded_tests {
     use crate::test_support::AnalyzerFixture;
 
     #[test]
+    fn focused_namespace_qualifier_does_not_return_the_adjacent_type() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Cpp,
+            &[(
+                "main.cpp",
+                "namespace helpers { struct Pool {}; }\nvoid owner() { helpers::Pool p; }\n",
+            )],
+        );
+        let result = crate::searchtools::get_definitions_by_reference(
+            fixture.analyzer.analyzer(),
+            crate::searchtools::GetDefinitionByReferenceParams {
+                references: vec![crate::searchtools::DefinitionContextReferenceQuery {
+                    symbol: "owner".to_string(),
+                    context: "void owner() { helpers::Pool p; }".to_string(),
+                    target: "helpers".to_string(),
+                }],
+            },
+        );
+
+        assert!(
+            result.results[0]
+                .definitions
+                .iter()
+                .all(|definition| definition.name != "Pool"),
+            "{result:#?}"
+        );
+    }
+
+    #[test]
     fn reachable_identical_typedef_still_navigates_to_its_tagged_struct_body() {
         let fixture = AnalyzerFixture::new_for_language(
             Language::Cpp,
@@ -9318,6 +9442,7 @@ struct holder {
             &source,
             Some(&tree),
             &site,
+            false,
         );
         let builds = CPP_BINDINGS_BUILD_COUNT.with(std::cell::Cell::get);
 

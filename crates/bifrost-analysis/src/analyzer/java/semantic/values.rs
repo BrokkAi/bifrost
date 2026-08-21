@@ -293,6 +293,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(value)
     }
 
+    pub(super) fn source_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, JavaLoweringError> {
+        let metadata = self.value_mapping(builder, node)?;
+        self.session
+            .add_value_with_metadata(builder, metadata, kind)
+    }
+
     pub(super) fn index_value(
         &mut self,
         builder: &mut ProcedureCfgBuilder,

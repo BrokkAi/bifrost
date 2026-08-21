@@ -120,7 +120,7 @@ When standard roots or sandbox-state metadata controls a rootless connection, `a
 | `symbol` | `search_symbols`, `get_symbol_sources`, `get_summaries`, mode-specific usage and definition lookup tools, `get_type_by_location`, `rename_symbol`, `usage_graph` |
 | `nlp` | `semantic_search` when Bifrost is built with `--features nlp`, the active root is a git repository, and semantic search is available for the session. `semantic_search_status` is accepted for diagnostics but hidden from the advertised tool list. |
 | `workspace` | `refresh`, `activate_workspace`, `get_active_workspace` |
-| `extended` | `query_code`, `list_policies`, `run_policy`, `get_symbol_locations`, `get_symbol_ancestors`, `most_relevant_files` |
+| `extended` | `query_code`, `list_policies`, `run_policy`, `explain_policy`, `get_symbol_locations`, `get_symbol_ancestors`, `most_relevant_files` |
 | `text` | `get_file_contents`, `search_file_contents`, `find_files_containing` |
 | `slopcop` | `compute_cyclomatic_complexity`, `compute_cognitive_complexity`, `report_comment_density_for_code_unit`, `report_exception_handling_smells`, `report_comment_density_for_files`, `analyze_git_hotspots`, `report_test_assertion_smells`, `report_structural_clone_smells`, `report_long_method_and_god_object_smells`, `report_dead_code_and_unused_abstraction_smells`, `report_secret_like_code`, `analyze_diff` |
 | `cli` | `classify_test_files` |
@@ -162,7 +162,7 @@ The tool never discovers or runs every file under `.bifrost/policies/`. Add
 override; otherwise it uses `.bifrost/suppressions.json`. The date is required
 because the shared policy coordinator does not read the clock.
 
-The structured result contains the canonical schema-2 `report`, a `status` of
+The structured result contains the canonical schema-5 `report`, a `status` of
 `clean`, `finding`, or `unreliable`, and the equivalent `exit_status` value
 `0`, `1`, or `2`. MCP itself does not exit for a finding. Evaluation is pinned
 to the active immutable workspace snapshot and is cancelled if the client

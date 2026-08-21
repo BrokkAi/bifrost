@@ -1507,19 +1507,23 @@ pub(super) fn resolve_scan_usages_target(
     let location_units =
         |units: Vec<CodeUnit>,
          selector_arg: Option<&str>,
+         accept_declaration_range: bool,
          matches_selector: &dyn Fn(&CodeUnit, &str) -> bool| {
             units
                 .into_iter()
                 .filter_map(|unit| {
                     let selector_matches =
                         selector_arg.is_some_and(|symbol| matches_selector(&unit, symbol));
-                    let ranges = if selector_matches && unit.is_module() {
-                        analyzer.location_ranges(&unit)
-                    } else if selector_matches || selector_arg.is_none() {
+                    let mut ranges = if selector_matches || selector_arg.is_none() {
                         range_context.location_name_ranges(analyzer, &unit)
                     } else {
                         return None;
                     };
+                    if selector_matches && (accept_declaration_range || unit.is_module()) {
+                        ranges.extend(analyzer.location_ranges(&unit));
+                        ranges.sort_unstable();
+                        ranges.dedup();
+                    }
                     let best_span = ranges
                         .into_iter()
                         .filter(|range| scan_usages_target_matches_range(selection, *range))
@@ -1559,12 +1563,14 @@ pub(super) fn resolve_scan_usages_target(
     let mut matching_units = location_units(
         declarations_here.clone(),
         selector,
+        true,
         &selector_matches_exact_form,
     );
     if matching_units.is_empty() && selector.is_some() {
         matching_units = location_units(
             declarations_here.clone(),
             selector,
+            false,
             &selector_matches_short_name,
         );
     }
@@ -1586,12 +1592,14 @@ pub(super) fn resolve_scan_usages_target(
         matching_units = location_units(
             lookup_only_candidates.clone(),
             selector,
+            true,
             &selector_matches_exact_form,
         );
         if matching_units.is_empty() {
             matching_units = location_units(
                 lookup_only_candidates,
                 selector,
+                false,
                 &selector_matches_short_name,
             );
         }
@@ -1619,7 +1627,7 @@ pub(super) fn resolve_scan_usages_target(
         let here = resolve_location_groups(
             analyzer,
             token,
-            location_units(declarations_here, None, &selector_matches_exact_form),
+            location_units(declarations_here, None, false, &selector_matches_exact_form),
             true,
         );
         let reason = match here.first() {
@@ -4821,6 +4829,46 @@ pub(super) fn classify_resolved_test_file(
 mod tests {
     use super::*;
     use crate::analyzer::{Language, RustAnalyzer, TestProject};
+    use crate::test_support::AnalyzerFixture;
+
+    #[test]
+    fn exact_location_selector_accepts_the_indexed_declaration_range_start() {
+        let source = "package repro\n\ntype Error struct{}\n\nfunc (e *Error) Error() string { return \"\" }\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/repro\n"),
+                ("errors.go", source),
+            ],
+        );
+
+        let result = scan_usages_by_location(
+            fixture.analyzer.analyzer(),
+            ScanUsagesByLocationParams {
+                targets: vec![ScanUsagesTarget {
+                    path: "errors.go".to_string(),
+                    line: 5,
+                    column: Some(10),
+                    symbol: Some("example.com/repro.Error.Error".to_string()),
+                }],
+                include_tests: false,
+                paths: None,
+                include_same_owner: false,
+                max_duration_secs: None,
+            },
+        );
+
+        assert_ne!(
+            ScanUsagesStatus::NotFound,
+            result.results[0].status,
+            "{result:#?}"
+        );
+        assert_eq!(
+            result.results[0].fq_name.as_deref(),
+            Some("example.com/repro.Error.Error"),
+            "{result:#?}"
+        );
+    }
 
     /// The text rendering of a ranked file spells its verdict out by hand, so
     /// the two spellings must not drift from the JSON contract.

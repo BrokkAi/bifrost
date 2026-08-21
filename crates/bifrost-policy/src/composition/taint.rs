@@ -23,6 +23,10 @@ pub(crate) struct ComposedTaintPolicy {
 pub(crate) fn compose_taint_policy(
     policy_id: &PolicyId,
     spec: &TaintPolicySpec,
+    // The JSON-pointer segments the authoring kind publishes for its entry
+    // sets. Taint and flow compose the same model under different names, and
+    // the composed selector paths must match the ones the registry resolved.
+    segments: TaintSetSegments,
     catalogs: &TaintCatalogRegistry,
     endpoint_dependencies: &[ResolvedEndpointDependency],
     match_manifests: &[ResolvedMatchDirectoryManifest],
@@ -52,7 +56,7 @@ pub(crate) fn compose_taint_policy(
     let sanitizers = compose_auxiliary_set(
         policy_id,
         &spec.sanitizers,
-        "sanitizers",
+        segments.sanitizers,
         "sanitizer",
         catalogs,
         &mut resolved_catalogs,
@@ -66,7 +70,7 @@ pub(crate) fn compose_taint_policy(
     let transforms = compose_auxiliary_set(
         policy_id,
         &spec.transforms,
-        "transforms",
+        segments.transforms,
         "transform",
         catalogs,
         &mut resolved_catalogs,
@@ -81,7 +85,7 @@ pub(crate) fn compose_taint_policy(
     let external_models = compose_auxiliary_set(
         policy_id,
         &spec.external_models,
-        "external_models",
+        segments.external_models,
         "external model",
         catalogs,
         &mut resolved_catalogs,
@@ -414,7 +418,7 @@ fn resolved_sink_from_dependency(
 fn compose_auxiliary_set<T, D>(
     policy_id: &PolicyId,
     set: &TaintEndpointSet<T>,
-    set_name: &'static str,
+    set_name: &str,
     kind: &'static str,
     catalogs: &TaintCatalogRegistry,
     resolved_catalogs: &mut Vec<ResolvedCatalogIdentity>,
@@ -889,6 +893,7 @@ mod tests {
         let composed = compose_taint_policy(
             &policy_id,
             &spec,
+            TAINT_SET_SEGMENTS,
             &catalogs,
             &dependencies,
             &[],
@@ -971,6 +976,7 @@ mod tests {
         let composed = compose_taint_policy(
             &policy_id,
             &spec,
+            TAINT_SET_SEGMENTS,
             &catalogs,
             &dependencies,
             &[],
@@ -1040,6 +1046,7 @@ mod tests {
             compose_taint_policy(
                 &policy_id,
                 &ambiguous,
+                TAINT_SET_SEGMENTS,
                 &catalogs,
                 &dependencies,
                 &[],
@@ -1055,6 +1062,7 @@ mod tests {
         let composed = compose_taint_policy(
             &policy_id,
             &ordered,
+            TAINT_SET_SEGMENTS,
             &catalogs,
             &dependencies,
             &[],
@@ -1082,6 +1090,7 @@ mod tests {
         compose_taint_policy(
             &policy_id,
             &jointly_resolved,
+            TAINT_SET_SEGMENTS,
             &catalogs,
             &dependencies,
             &[],
@@ -1103,6 +1112,7 @@ mod tests {
             compose_taint_policy(
                 &policy_id,
                 &two_live_winners,
+                TAINT_SET_SEGMENTS,
                 &catalogs,
                 &dependencies,
                 &[],

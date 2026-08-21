@@ -1435,6 +1435,7 @@ pub(super) fn render_definition_lookup(
     operation: NavigationOperation,
     render_cache: &mut DefinitionCandidateRenderCache,
 ) -> DefinitionLookupResult {
+    let _scope = profiling::scope("searchtools::render_definition_lookup");
     let mut status = if operation == NavigationOperation::Declaration
         && outcome.status
             == crate::analyzer::usages::get_definition::DefinitionLookupStatus::NoDefinition
@@ -1443,8 +1444,10 @@ pub(super) fn render_definition_lookup(
     } else {
         outcome.status.as_str().to_string()
     };
-    let mut definitions =
-        navigation_candidates_with_cache(analyzer, token, &outcome.targets, render_cache);
+    let mut definitions = {
+        let _scope = profiling::scope("searchtools::render_definition_lookup.candidates");
+        navigation_candidates_with_cache(analyzer, token, &outcome.targets, render_cache)
+    };
     if let Some(definition) = outcome.lexical_definition.as_ref()
         && let Some(candidate) = lexical_definition_candidate(analyzer, file, definition)
     {
@@ -1466,14 +1469,29 @@ pub(super) fn render_definition_lookup(
     if let Some(overlay) = analyzer.semantic_model_overlay() {
         if definitions.is_empty() {
             if let Some(target) = reference_target.as_deref() {
-                let receiver_owner = outcome
-                    .reference
-                    .as_ref()
-                    .and_then(|reference| structured_receiver_owner(analyzer, file, reference));
                 let member_name = target
                     .rsplit(['.', '#', ':'])
                     .find(|part| !part.is_empty())
                     .unwrap_or(target);
+                // Receiver inference can materialize a file's complete
+                // structural facts and recursively navigate the receiver. It
+                // cannot produce a model match unless the overlay contains an
+                // owned symbol with this member name, so consult the overlay's
+                // indexed name postings before paying for that analysis. This
+                // keeps cross-language ecosystems such as JVM eligible while
+                // avoiding irrelevant work for names absent from every active
+                // model (#2324).
+                let receiver_owner = overlay
+                    .symbols_named(member_name)
+                    .records
+                    .iter()
+                    .any(|record| record.owner_id.is_some())
+                    .then(|| {
+                        outcome.reference.as_ref().and_then(|reference| {
+                            structured_receiver_owner(analyzer, file, reference)
+                        })
+                    })
+                    .flatten();
                 let mut matched = receiver_owner
                     .as_deref()
                     .map(|owner| modeled_member_named(&overlay, owner, member_name))

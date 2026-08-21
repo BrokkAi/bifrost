@@ -1099,7 +1099,7 @@ impl LoadedPolicy {
         let analysis = match (&definition.analysis, &resolved_taint, &resolved_typestate) {
             (PolicyAnalysis::Match { .. }, None, None) => ResolvedPolicyAnalysisRef::Match,
             (PolicyAnalysis::Assertion { .. }, None, None) => ResolvedPolicyAnalysisRef::Assertion,
-            (PolicyAnalysis::Taint { .. }, Some(spec), None) => {
+            (PolicyAnalysis::Taint { .. } | PolicyAnalysis::Flow { .. }, Some(spec), None) => {
                 ResolvedPolicyAnalysisRef::Taint { spec }
             }
             (PolicyAnalysis::Typestate { .. }, None, Some(spec)) => {
@@ -1438,10 +1438,15 @@ fn validate_loaded_policy_model(
                 return invalid("selector-only policies cannot retain composition dependencies");
             }
         }
-        (PolicyAnalysis::Taint { spec: authored }, Some(resolved), None) => {
+        (
+            PolicyAnalysis::Taint { spec: authored } | PolicyAnalysis::Flow { spec: authored },
+            Some(resolved),
+            None,
+        ) => {
             validate_resolved_taint(
                 &definition.metadata.id,
                 authored,
+                definition.analysis.set_segments(),
                 resolved,
                 catalogs,
                 dependencies,
@@ -1466,6 +1471,7 @@ fn validate_loaded_policy_model(
 fn validate_resolved_taint(
     policy_id: &PolicyId,
     authored: &TaintPolicySpec,
+    segments: TaintSetSegments,
     resolved: &ResolvedTaintPolicySpec,
     catalogs: &[ResolvedCatalogIdentity],
     dependencies: &[ResolvedEndpointDependency],
@@ -1498,13 +1504,13 @@ fn validate_resolved_taint(
         return invalid("resolved auxiliary taint identities must be globally unique");
     }
     for entry in &resolved.sanitizers {
-        validate_resolved_auxiliary(entry, "sanitizers", policy_id, catalogs)?;
+        validate_resolved_auxiliary(entry, segments.sanitizers, policy_id, catalogs)?;
     }
     for entry in &resolved.transforms {
-        validate_resolved_auxiliary(entry, "transforms", policy_id, catalogs)?;
+        validate_resolved_auxiliary(entry, segments.transforms, policy_id, catalogs)?;
     }
     for entry in &resolved.external_models {
-        validate_resolved_auxiliary(entry, "external_models", policy_id, catalogs)?;
+        validate_resolved_auxiliary(entry, segments.external_models, policy_id, catalogs)?;
     }
     let endpoint_identities = resolved
         .sources
@@ -1551,9 +1557,9 @@ fn validate_resolved_taint(
         else {
             return invalid("authored local taint source is absent from the resolved source set");
         };
-        let expected_path = PolicySelectorPath::new(format!(
-            "/analysis/sources/entries/{}/selector",
-            json_pointer_segment(source.id.as_str())
+        let expected_path = PolicySelectorPath::new(taint_entry_selector_path(
+            segments.sources,
+            source.id.as_str(),
         ))
         .map_err(|error| LoadedModelError::CanonicalProjection(error.to_string()))?;
         if endpoint.definition.display_name != source.display_name
@@ -1578,11 +1584,9 @@ fn validate_resolved_taint(
         else {
             return invalid("authored local taint sink is absent from the resolved sink set");
         };
-        let expected_path = PolicySelectorPath::new(format!(
-            "/analysis/sinks/entries/{}/selector",
-            json_pointer_segment(sink.id.as_str())
-        ))
-        .map_err(|error| LoadedModelError::CanonicalProjection(error.to_string()))?;
+        let expected_path =
+            PolicySelectorPath::new(taint_entry_selector_path(segments.sinks, sink.id.as_str()))
+                .map_err(|error| LoadedModelError::CanonicalProjection(error.to_string()))?;
         if endpoint.definition.display_name != sink.display_name
             || !same_set(&endpoint.definition.categories, &sink.categories)
             || endpoint.definition.selector_path != expected_path
@@ -2404,6 +2408,15 @@ fn validate_role_taint(
     Ok(())
 }
 
+/// The JSON pointer of one taint-shaped entry's selector, under the segment
+/// its analysis kind publishes.
+pub(crate) fn taint_entry_selector_path(set_segment: &str, entry_id: &str) -> String {
+    format!(
+        "/analysis/{set_segment}/entries/{}/selector",
+        json_pointer_segment(entry_id)
+    )
+}
+
 fn validate_authored_policy_selectors(
     definition: &PolicyDefinition,
     selectors: &HashMap<&PolicySelectorPath, &ResolvedPolicySelector>,
@@ -2431,53 +2444,39 @@ fn validate_authored_policy_selectors(
                 )?;
             }
         }
-        PolicyAnalysis::Taint { spec } => {
+        PolicyAnalysis::Taint { spec } | PolicyAnalysis::Flow { spec } => {
+            let segments = definition.analysis.set_segments();
             for source in &spec.sources.entries {
                 validate_authored_selector_at(
-                    &format!(
-                        "/analysis/sources/entries/{}/selector",
-                        json_pointer_segment(source.id.as_str())
-                    ),
+                    &taint_entry_selector_path(segments.sources, source.id.as_str()),
                     &source.selector,
                     selectors,
                 )?;
             }
             for sink in &spec.sinks.entries {
                 validate_authored_selector_at(
-                    &format!(
-                        "/analysis/sinks/entries/{}/selector",
-                        json_pointer_segment(sink.id.as_str())
-                    ),
+                    &taint_entry_selector_path(segments.sinks, sink.id.as_str()),
                     &sink.selector,
                     selectors,
                 )?;
             }
             for sanitizer in &spec.sanitizers.entries {
                 validate_authored_selector_at(
-                    &format!(
-                        "/analysis/sanitizers/entries/{}/selector",
-                        json_pointer_segment(sanitizer.id.as_str())
-                    ),
+                    &taint_entry_selector_path(segments.sanitizers, sanitizer.id.as_str()),
                     &sanitizer.selector,
                     selectors,
                 )?;
             }
             for transform in &spec.transforms.entries {
                 validate_authored_selector_at(
-                    &format!(
-                        "/analysis/transforms/entries/{}/selector",
-                        json_pointer_segment(transform.id.as_str())
-                    ),
+                    &taint_entry_selector_path(segments.transforms, transform.id.as_str()),
                     &transform.selector,
                     selectors,
                 )?;
             }
             for model in &spec.external_models.entries {
                 validate_authored_selector_at(
-                    &format!(
-                        "/analysis/external_models/entries/{}/selector",
-                        json_pointer_segment(model.id.as_str())
-                    ),
+                    &taint_entry_selector_path(segments.external_models, model.id.as_str()),
                     &model.selector,
                     selectors,
                 )?;
@@ -2763,8 +2762,11 @@ fn validate_resolved_analysis(
             PolicyAnalysis::Match { .. } | PolicyAnalysis::Assertion { .. },
             None,
             None
-        ) | (PolicyAnalysis::Taint { .. }, Some(_), None)
-            | (PolicyAnalysis::Typestate { .. }, None, Some(_))
+        ) | (
+            PolicyAnalysis::Taint { .. } | PolicyAnalysis::Flow { .. },
+            Some(_),
+            None
+        ) | (PolicyAnalysis::Typestate { .. }, None, Some(_))
     );
     valid
         .then_some(())
@@ -2833,12 +2835,17 @@ fn expected_selector_paths(
                 paths.push(selector_path(ASSERTION_SUBJECT_SELECTOR_PATH)?)
             }
         }
-        PolicyAnalysis::Taint { spec } => {
-            extend_taint_paths(&mut paths, "sources", &spec.sources.entries)?;
-            extend_taint_paths(&mut paths, "sinks", &spec.sinks.entries)?;
-            extend_taint_paths(&mut paths, "sanitizers", &spec.sanitizers.entries)?;
-            extend_taint_paths(&mut paths, "transforms", &spec.transforms.entries)?;
-            extend_taint_paths(&mut paths, "external_models", &spec.external_models.entries)?;
+        PolicyAnalysis::Taint { spec } | PolicyAnalysis::Flow { spec } => {
+            let segments = definition.analysis.set_segments();
+            extend_taint_paths(&mut paths, segments.sources, &spec.sources.entries)?;
+            extend_taint_paths(&mut paths, segments.sinks, &spec.sinks.entries)?;
+            extend_taint_paths(&mut paths, segments.sanitizers, &spec.sanitizers.entries)?;
+            extend_taint_paths(&mut paths, segments.transforms, &spec.transforms.entries)?;
+            extend_taint_paths(
+                &mut paths,
+                segments.external_models,
+                &spec.external_models.entries,
+            )?;
         }
         PolicyAnalysis::Typestate { spec } => {
             for subject in &spec.subjects.entries {

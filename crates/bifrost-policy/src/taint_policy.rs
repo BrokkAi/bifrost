@@ -66,13 +66,13 @@ use brokk_bifrost_analysis::analyzer::structural::{
 use brokk_bifrost_analysis::analyzer::taint::{
     SourceClassId, SourceEventKey, TaintAnalysisPlan, TaintBatch, TaintBatchCompatibilityKey,
     TaintBatchPlanner, TaintClassSet, TaintFindingCollectionLimits, TaintFindingReport,
-    TaintOriginFindingEvidence, TaintPolicyPlan, TaintSinkBinding, TaintSourceBinding,
-    TaintUniverse, collect_taint_findings_with_limits,
+    TaintOriginFindingEvidence, TaintPolicyPlan, TaintSanitizerBinding, TaintSinkBinding,
+    TaintSourceBinding, TaintUniverse, collect_taint_findings_with_limits,
 };
 use brokk_bifrost_analysis::analyzer::value_flow::{
-    ValueFlowCarrier, ValueFlowEventKey, ValueFlowEventKind, ValueFlowIncompleteCause,
-    ValueFlowInput, ValueFlowObservationPhase, ValueFlowPlan, ValueFlowSinkSpec,
-    ValueFlowSourceSpec,
+    ValueFlowCarrier, ValueFlowCarrierId, ValueFlowEventKey, ValueFlowEventKind,
+    ValueFlowIncompleteCause, ValueFlowInput, ValueFlowObservationPhase, ValueFlowPlan,
+    ValueFlowSinkSpec, ValueFlowSourceSpec,
 };
 use brokk_bifrost_analysis::analyzer::{ProjectFile, WorkspaceAnalyzer};
 
@@ -857,11 +857,6 @@ impl<'a> TaintPolicyCompiler<'a> {
         policy: &LoadedPolicy,
         spec: &ResolvedTaintPolicySpec,
     ) -> Result<Vec<CompiledTaintPolicyPlan>, TaintPolicyCompileError> {
-        if !spec.sanitizers.is_empty() {
-            return Err(TaintPolicyCompileError::UnsupportedAuxiliarySemantics(
-                "sanitizer",
-            ));
-        }
         if !spec.transforms.is_empty() {
             return Err(TaintPolicyCompileError::UnsupportedAuxiliarySemantics(
                 "transform",
@@ -915,6 +910,32 @@ impl<'a> TaintPolicyCompiler<'a> {
                 }
             }
         }
+        // Sanitizers (a taint policy's `sanitizer`, a flow policy's `kill`)
+        // bind the value their `:output` port establishes. The lowering keys on
+        // the output alone because `TaintEdgeFunction::kill` is a function of
+        // one carrier at one point and phase: it states that the value the
+        // site produces no longer carries the listed labels. The `:input` port
+        // is authored, validated and hashed, and it is what a later
+        // conditional-kill slice will read; it does not change this lowering.
+        let mut all_kills = Vec::new();
+        for sanitizer in &spec.sanitizers {
+            let selector = required_selector(&selectors, &sanitizer.selector_path)?;
+            for selected in self.select(selector, &sanitizer.definition.output)? {
+                for resolved in
+                    self.resolve_selected_values(selected, &sanitizer.definition.output)?
+                {
+                    all_kills.push(BoundEndpoint {
+                        endpoint: sanitizer.identity.clone(),
+                        point: resolved.point,
+                        phase: resolved.phase,
+                        carrier: ValueFlowCarrier::Value(resolved.value),
+                        proof: resolved.proof,
+                        completeness: resolved.completeness,
+                        labels: sanitizer.definition.removes.clone().into_boxed_slice(),
+                    });
+                }
+            }
+        }
         if all_sources.is_empty() {
             return Err(TaintPolicyCompileError::EmptyCompiledSources);
         }
@@ -931,6 +952,11 @@ impl<'a> TaintPolicyCompiler<'a> {
                     .iter()
                     .flat_map(|sink| sink.definition.accepts.iter()),
             )
+            .chain(
+                spec.sanitizers
+                    .iter()
+                    .flat_map(|sanitizer| sanitizer.definition.removes.iter()),
+            )
             .map(|label| {
                 SourceClassId::new(label.as_str())
                     .map_err(|error| TaintPolicyCompileError::Model(error.to_string()))
@@ -944,6 +970,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         let mut roots = all_sources
             .iter()
             .chain(&all_sinks)
+            .chain(&all_kills)
             .map(|endpoint| endpoint.point.procedure().clone())
             .chain(
                 self.selectors
@@ -1041,6 +1068,10 @@ impl<'a> TaintPolicyCompiler<'a> {
             .iter()
             .map(|endpoint| endpoint.point.procedure().durable_key())
             .collect::<Vec<_>>();
+        let kill_procedures = all_kills
+            .iter()
+            .map(|endpoint| endpoint.point.procedure().durable_key())
+            .collect::<Vec<_>>();
         discoveries.retain(|discovery| {
             source_procedures
                 .iter()
@@ -1080,8 +1111,15 @@ impl<'a> TaintPolicyCompiler<'a> {
                 .filter(|(_, procedure)| discovery.procedures.contains(*procedure))
                 .map(|(endpoint, _)| endpoint.clone())
                 .collect::<Vec<_>>();
+            let mut kills = all_kills
+                .iter()
+                .zip(&kill_procedures)
+                .filter(|(_, procedure)| discovery.procedures.contains(*procedure))
+                .map(|(endpoint, _)| endpoint.clone())
+                .collect::<Vec<_>>();
             sort_bound_endpoints(&mut sources);
             sort_bound_endpoints(&mut sinks);
+            sort_bound_endpoints(&mut kills);
             let source_specs = source_event_specs(&sources)?;
             let sink_specs = sink_event_specs(&sinks)?;
             let value_flow = self.build_value_flow_plan(
@@ -1092,12 +1130,14 @@ impl<'a> TaintPolicyCompiler<'a> {
             )?;
             let taint_sources = bind_taint_sources(&value_flow, &universe, &sources)?;
             let taint_sinks = bind_taint_sinks(&value_flow, &universe, &sinks)?;
+            let taint_sanitizers = bind_taint_sanitizers(&value_flow, &universe, &kills)?;
+            let sanitizer_hash = sanitizer_compatibility_hash(&value_flow, &taint_sanitizers);
             let analysis = TaintAnalysisPlan::new(
                 value_flow,
                 universe.clone(),
                 taint_sources,
                 taint_sinks,
-                Vec::new(),
+                taint_sanitizers,
                 Vec::new(),
             )
             .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
@@ -1107,8 +1147,14 @@ impl<'a> TaintPolicyCompiler<'a> {
             );
             let compatibility = TaintBatchCompatibilityKey::with_call_behavior(
                 root.artifact().key().fingerprint().to_string(),
+                // The value-flow propagation hash deliberately excludes
+                // endpoint observations so compatible demand can share a solve,
+                // but it also excludes sanitizers, which DO change propagation.
+                // Folding them in is what keeps two policies with different
+                // kills in different batches instead of colliding on one key
+                // and failing the planner's own equality check.
                 format!(
-                    "bifrost.production-taint.v1:{:?}:{:016x}",
+                    "bifrost.production-taint.v1:{:?}:{:016x}:{sanitizer_hash:016x}",
                     root.semantics().locator(),
                     value_flow_compatibility_hash(analysis.value_flow()),
                 ),
@@ -3325,6 +3371,75 @@ fn bind_taint_sinks(
         .collect()
 }
 
+/// Lower the region's bound kills into per-carrier taint kill functions.
+///
+/// One `(point, phase, carrier)` slot carries at most one binding: the plan
+/// rejects two transfers that share an ordering slot
+/// (`TaintPlanError::AmbiguousTransferOrder`), and two kills at one slot mean
+/// one kill of the union of their labels, so the union is what this mints. The
+/// event index is therefore always zero and is deterministic by construction;
+/// the solver reads the slot, never the index.
+///
+/// A kill whose carrier is absent from the value-flow plan is skipped. That is
+/// the one direction of error this compile is allowed to make silently: a
+/// missing kill can only leave labels in place, so it can add a finding and can
+/// never turn a real flow into a clean verdict. A kill whose *selector* could
+/// not be executed is a different thing and has already failed the compile with
+/// a query-incompleteness error before this point.
+fn bind_taint_sanitizers(
+    value_flow: &ValueFlowPlan,
+    universe: &TaintUniverse,
+    kills: &[BoundEndpoint],
+) -> Result<Vec<TaintSanitizerBinding>, TaintPolicyCompileError> {
+    let mut slots: Vec<(
+        ProgramPointHandle,
+        ValueFlowObservationPhase,
+        ValueFlowCarrierId,
+        TaintClassSet,
+    )> = Vec::new();
+    for kill in kills {
+        let Some(carrier) = value_flow.carrier_id(&kill.carrier) else {
+            continue;
+        };
+        let removed = class_set(universe, &kill.labels)?;
+        match slots
+            .iter_mut()
+            .find(|slot| slot.0 == kill.point && slot.1 == kill.phase && slot.2 == carrier)
+        {
+            Some(slot) => slot.3 = slot.3.union(&removed),
+            None => slots.push((kill.point.clone(), kill.phase, carrier, removed)),
+        }
+    }
+    Ok(slots
+        .into_iter()
+        .map(|(point, phase, carrier, removed)| {
+            TaintSanitizerBinding::resolved(point, phase, 0, carrier, removed)
+        })
+        .collect())
+}
+
+/// Hash the kill semantics one region compiled, keyed on carrier *keys* rather
+/// than dense carrier IDs so two policies over the same region agree exactly
+/// when the batch planner's own sanitizer equality would.
+fn sanitizer_compatibility_hash(
+    value_flow: &ValueFlowPlan,
+    sanitizers: &[TaintSanitizerBinding],
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write_usize(sanitizers.len());
+    for binding in sanitizers {
+        std::hash::Hash::hash(binding.point(), &mut hasher);
+        std::hash::Hash::hash(&binding.phase(), &mut hasher);
+        hasher.write_u32(binding.event_index());
+        if let Some(key) = value_flow.carrier_key(binding.carrier()) {
+            std::hash::Hash::hash(key, &mut hasher);
+        }
+        std::hash::Hash::hash(binding.removed(), &mut hasher);
+        hasher.write_u8(u8::from(binding.is_resolved()));
+    }
+    hasher.finish()
+}
+
 fn value_flow_sources(
     plan: &TaintPolicyPlan,
     endpoints: &[BoundEndpoint],
@@ -3432,7 +3547,9 @@ mod tests {
     use crate::budget::PolicyBudget;
     use crate::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
     use crate::coordinator::{PolicyEvaluationOptions, evaluate_policy_source};
-    use crate::finding::{PolicyIncompleteReason, PolicyRunCompletion};
+    use crate::finding::{
+        PolicyIncompleteReason, PolicyRunCompletion, PolicyWorkMetric, PolicyWorkReport,
+    };
     use crate::registry::{PolicyRegistry, PolicyRegistryLimits};
     use crate::source::PolicySourceIdentity;
     use crate::suppression::PolicyEvaluationDate;
@@ -4056,6 +4173,190 @@ def entry_0():
             used.nested_entries,
             census.nested_entries,
             roots.len()
+        );
+    }
+
+    /// One value-flow fixture: `read` establishes the tracked value, `put`
+    /// observes it, and `validate` is the kill.
+    const FLOW_FIXTURE_SOURCE: &str = "\
+def read():
+    return \"raw\"
+
+def validate(value):
+    return value
+
+def put(value):
+    pass
+
+def direct():
+    put(read())
+";
+
+    /// A flow policy over the fixture above. `kill_callee` names the procedure
+    /// whose returned value no longer carries the tracked provenance, so two
+    /// policies that differ only in it have different propagation semantics.
+    fn flow_policy(id: &str, kill_callee: &str) -> String {
+        format!(
+            r#"(policy
+              :schema-version 1
+              :id "{id}"
+              :name "Generic value flow"
+              :message "the tracked value reached put"
+              :severity warning
+              :analysis (analysis
+                :type flow
+                :mode may
+                :call-modeling (call-modeling :unmodeled optimistic)
+                :origins (endpoint-set :entries [
+                  (origin :id raw-input :display-name "read"
+                    :selector (rql :schema-version 1
+                      (language python (call :callee (name "read"))))
+                    :bind return-value)])
+                :observations (endpoint-set :entries [
+                  (observation :id store-put :display-name "put"
+                    :selector (rql :schema-version 1
+                      (language python (call :callee (name "put"))))
+                    :observed-operand (argument :index 0))])
+                :kills (endpoint-set :entries [
+                  (kill :id validated
+                    :selector (rql :schema-version 1
+                      (language python (call :callee (name "{kill_callee}"))))
+                    :input (argument :index 0)
+                    :output return-value)])))"#
+        )
+    }
+
+    fn flow_workspace() -> (tempfile::TempDir, WorkspaceAnalyzer) {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        std::fs::write(workspace.path().join("flow.py"), FLOW_FIXTURE_SOURCE)
+            .expect("fixture source");
+        let project: Arc<dyn Project> =
+            Arc::new(FilesystemProject::new(workspace.path()).expect("fixture project"));
+        let analyzer = WorkspaceAnalyzer::build_ephemeral(
+            project,
+            AnalyzerConfig {
+                parallelism: Some(1),
+                ..AnalyzerConfig::default()
+            },
+        )
+        .expect("an analyzer over the fixture");
+        (workspace, analyzer)
+    }
+
+    fn registry_for_sources(sources: &[(&str, &str)]) -> PolicyRegistry {
+        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+            CatalogRegistryLimits::default(),
+        ));
+        let mut registry =
+            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
+        for (identity, source) in sources {
+            registry
+                .register_policy_bytes(PolicySourceIdentity::new(*identity), source.as_bytes())
+                .expect("the fixture policy loads");
+        }
+        registry
+    }
+
+    fn shared_memberships(work: &PolicyWorkReport) -> u64 {
+        work.metrics()
+            .iter()
+            .find(|metric| metric.name() == "taint.propagation_shared_memberships")
+            .map_or(0, PolicyWorkMetric::value)
+    }
+
+    /// #2436: two flow policies whose propagation semantics agree must share
+    /// one solve. The shared-membership metric counts the other members of the
+    /// batch each policy landed in, so a shared batch reports at least one.
+    #[test]
+    fn two_compatible_flow_policies_share_one_propagation_solve() {
+        let (_workspace, analyzer) = flow_workspace();
+        let registry = registry_for_sources(&[
+            ("test:flow-a.rqlp", &flow_policy("test.flow-a", "validate")),
+            ("test:flow-b.rqlp", &flow_policy("test.flow-b", "validate")),
+        ]);
+        let evaluator = ProductionTaintPolicyEvaluator::prepare(
+            registry.policies(),
+            &analyzer,
+            Ok(None),
+            None,
+            &PolicyBudget::default(),
+        );
+        let payloads = evaluator.prepared.borrow();
+        assert_eq!(payloads.len(), 2, "two flow policies produce two payloads");
+        for (policy_id, payload) in payloads.iter() {
+            assert!(
+                shared_memberships(&payload.work) >= 1,
+                "{policy_id} must share its solve with the compatible policy: {:#?}",
+                payload.work
+            );
+        }
+    }
+
+    /// The other half of the same claim: kills change propagation, so two
+    /// policies that disagree about them must not share a solve. Without the
+    /// kill semantics in the batch compatibility key these two would collide
+    /// on one key and the planner's own equality check would fail the run.
+    #[test]
+    fn flow_policies_with_different_kills_do_not_share_a_solve() {
+        let (_workspace, analyzer) = flow_workspace();
+        let registry = registry_for_sources(&[
+            ("test:flow-a.rqlp", &flow_policy("test.flow-a", "validate")),
+            ("test:flow-c.rqlp", &flow_policy("test.flow-c", "read")),
+        ]);
+        let evaluator = ProductionTaintPolicyEvaluator::prepare(
+            registry.policies(),
+            &analyzer,
+            Ok(None),
+            None,
+            &PolicyBudget::default(),
+        );
+        let payloads = evaluator.prepared.borrow();
+        assert_eq!(payloads.len(), 2);
+        for (policy_id, payload) in payloads.iter() {
+            assert!(
+                !matches!(payload.completion, PolicyRunCompletion::Failed { .. }),
+                "{policy_id} must not fail because an incompatible policy exists: {:#?}",
+                payload.completion
+            );
+            assert_eq!(
+                shared_memberships(&payload.work),
+                0,
+                "{policy_id} must not share a solve with an incompatible policy: {:#?}",
+                payload.work
+            );
+        }
+    }
+
+    /// #2436 no-false-green: a spent request-wide findings lane must leave the
+    /// flow run inconclusive. A truncated run that reported `Complete` with
+    /// fewer findings would be a clean verdict the analysis never proved.
+    #[test]
+    fn a_spent_findings_lane_keeps_a_flow_run_inconclusive() {
+        let (_workspace, analyzer) = flow_workspace();
+        let registry = registry_for_sources(&[(
+            "test:flow-budget.rqlp",
+            &flow_policy("test.flow-budget", "validate"),
+        )]);
+        let budget = PolicyBudget::builder()
+            .with_max_findings(0)
+            .expect("a zero-finding cap is inside the host cap")
+            .build()
+            .expect("a zero-finding budget is valid");
+        let evaluator = ProductionTaintPolicyEvaluator::prepare(
+            registry.policies(),
+            &analyzer,
+            Ok(None),
+            None,
+            &budget,
+        );
+        let payloads = evaluator.prepared.borrow();
+        let [(_, payload)] = payloads.iter().collect::<Vec<_>>()[..] else {
+            panic!("one flow policy produces one payload");
+        };
+        assert!(
+            !matches!(payload.completion, PolicyRunCompletion::Complete),
+            "an exhausted findings lane must not report a conclusive clean run: {:#?}",
+            payload.completion
         );
     }
 }

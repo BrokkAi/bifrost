@@ -275,7 +275,8 @@ pub fn receiver_matches_target(
                 // reads a nested type the file scope alone cannot name, so the
                 // lexical chain has to answer it.
                 None if !ctx.bindings.is_shadowed(name) => {
-                    resolve_type_from_node(receiver, token, ctx)
+                    implicit_field_value_type(receiver, token, ctx)
+                        .or_else(|| resolve_type_from_node(receiver, token, ctx))
                         .map(|resolved| receiver_type_matches_target(&resolved, token, ctx))
                         .unwrap_or(ReceiverTargetMatch::Unresolved)
                 }
@@ -383,47 +384,129 @@ fn java_field_declared_type(
     field: &str,
     ctx: &ScanCtx<'_>,
 ) -> Option<CodeUnit> {
-    let mut scopes = vec![owner.clone()];
-    if let Some(provider) = ctx.graph.hierarchy {
-        scopes.extend(provider.get_ancestors(owner));
+    match field_type_in_member_scope(owner, token, field, ctx) {
+        FieldTypeResolution::Resolved(resolved) => Some(resolved),
+        FieldTypeResolution::NotDeclared | FieldTypeResolution::Unresolved => None,
     }
-    for scope in scopes {
-        let candidates =
-            ctx.java
-                .usage_definitions(token)
-                .fqn(&format!("{}.{}", scope.fq_name(), field));
-        if let Some(unit) = candidates.iter().find(|unit| unit.is_field()) {
-            let declared = ctx
-                .java
-                .signature_metadata(unit)
-                .into_iter()
-                .find_map(|metadata| metadata.return_type_text().map(str::to_owned))?;
-            let spelled = normalize_java_type_text(&declared);
-            // The declaration's own lexical chain binds a simple name first --
-            // a sibling nested type such as `MultiMap.MultiMapEntry` is written
-            // unqualified inside `MultiMap` and names no file-scope type -- and
-            // only then the declaring file's imports and package.
-            return match java_lexical_type_from_declaration(
-                ctx.java,
-                token,
-                unit,
-                &parse_symbol_path(Language::Java, spelled),
-            ) {
-                LexicalTypeResolution::Resolved(resolved) => Some(resolved),
-                LexicalTypeResolution::Blocked => None,
-                LexicalTypeResolution::NotFound => ctx.graph.with_definitions(|definitions| {
-                    resolve_java_usage_type_name_in(
-                        ctx.java,
-                        ctx.graph.token,
-                        definitions,
-                        unit.source(),
-                        spelled,
-                    )
-                }),
-            };
+}
+
+/// The outcome of member lookup for a field's declared type. `NotDeclared`
+/// is distinct from `Unresolved`: lexical member lookup may continue to an
+/// enclosing class only when the complete inner member scope declares no such
+/// field. A declaration whose type cannot be resolved still hides outer names.
+enum FieldTypeResolution {
+    NotDeclared,
+    Resolved(CodeUnit),
+    Unresolved,
+}
+
+fn directly_declared_field_type(
+    owner: &CodeUnit,
+    token: QueryToken<'_>,
+    field: &str,
+    ctx: &ScanCtx<'_>,
+) -> FieldTypeResolution {
+    let candidates =
+        ctx.java
+            .usage_definitions(token)
+            .fqn(&format!("{}.{}", owner.fq_name(), field));
+    let Some(unit) = candidates.iter().find(|unit| unit.is_field()) else {
+        return FieldTypeResolution::NotDeclared;
+    };
+    let Some(declared) = ctx
+        .java
+        .signature_metadata(unit)
+        .into_iter()
+        .find_map(|metadata| metadata.return_type_text().map(str::to_owned))
+    else {
+        return FieldTypeResolution::Unresolved;
+    };
+    let spelled = normalize_java_type_text(&declared);
+    // The declaration's own lexical chain binds a simple name first -- a
+    // sibling nested type such as `MultiMap.MultiMapEntry` is written
+    // unqualified inside `MultiMap` and names no file-scope type -- and only
+    // then the declaring file's imports and package.
+    match java_lexical_type_from_declaration(
+        ctx.java,
+        token,
+        unit,
+        &parse_symbol_path(Language::Java, spelled),
+    ) {
+        LexicalTypeResolution::Resolved(resolved) => FieldTypeResolution::Resolved(resolved),
+        LexicalTypeResolution::Blocked => FieldTypeResolution::Unresolved,
+        LexicalTypeResolution::NotFound => ctx
+            .graph
+            .with_definitions(|definitions| {
+                resolve_java_usage_type_name_in(
+                    ctx.java,
+                    ctx.graph.token,
+                    definitions,
+                    unit.source(),
+                    spelled,
+                )
+            })
+            .map_or(
+                FieldTypeResolution::Unresolved,
+                FieldTypeResolution::Resolved,
+            ),
+    }
+}
+
+/// Resolve the field selected by one complete Java member scope: direct
+/// declarations first, then the nearest hierarchy level that declares the
+/// name. Multiple peer interfaces remain unresolved instead of choosing one.
+fn field_type_in_member_scope(
+    owner: &CodeUnit,
+    token: QueryToken<'_>,
+    field: &str,
+    ctx: &ScanCtx<'_>,
+) -> FieldTypeResolution {
+    let direct = directly_declared_field_type(owner, token, field, ctx);
+    if !matches!(&direct, FieldTypeResolution::NotDeclared) {
+        return direct;
+    }
+    let Some(provider) = ctx.graph.hierarchy else {
+        return FieldTypeResolution::NotDeclared;
+    };
+    let Some(declaring) = java_nearest_declaring_ancestors(ctx.java, provider, owner, |ancestor| {
+        matches!(
+            directly_declared_field_type(ancestor, token, field, ctx),
+            FieldTypeResolution::Resolved(_) | FieldTypeResolution::Unresolved
+        )
+    }) else {
+        return FieldTypeResolution::NotDeclared;
+    };
+    let [declaring] = declaring.as_slice() else {
+        return FieldTypeResolution::Unresolved;
+    };
+    let outcome = directly_declared_field_type(declaring, token, field, ctx);
+    debug_assert!(!matches!(&outcome, FieldTypeResolution::NotDeclared));
+    outcome
+}
+
+/// Resolve a bare value name through Java's implicit-`this` lexical member
+/// chain. Each enclosing class contributes its complete member scope; a field
+/// declared there, even one whose type is unresolved, hides outer fields.
+fn implicit_field_value_type(
+    node: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &ScanCtx<'_>,
+) -> Option<CodeUnit> {
+    let field = node_text(node, ctx.source);
+    let mut scope = enclosing_owner(node, ctx);
+    let mut visited = HashSet::default();
+    while let Some(owner) = scope {
+        if !visited.insert(owner.clone()) {
+            return None;
         }
-        if let Some(nested) = candidates.into_iter().find(CodeUnit::is_class) {
-            return Some(nested);
+        scope = ctx.java.parent_of(&owner);
+        if !owner.is_class() {
+            continue;
+        }
+        match field_type_in_member_scope(&owner, token, field, ctx) {
+            FieldTypeResolution::NotDeclared => {}
+            FieldTypeResolution::Resolved(resolved) => return Some(resolved),
+            FieldTypeResolution::Unresolved => return None,
         }
     }
     None
@@ -1223,7 +1306,10 @@ fn receiver_type_from_node_at_depth(
                 return class_definition(ctx, fq_name);
             }
             (!ctx.bindings.is_shadowed(name))
-                .then(|| resolve_type_from_node(node, token, ctx))
+                .then(|| {
+                    implicit_field_value_type(node, token, ctx)
+                        .or_else(|| resolve_type_from_node(node, token, ctx))
+                })
                 .flatten()
         }
         "type_identifier" | "scoped_type_identifier" | "generic_type" => {

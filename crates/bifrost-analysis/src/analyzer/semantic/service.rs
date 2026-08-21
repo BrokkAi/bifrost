@@ -191,7 +191,11 @@ fn retained_artifact_bytes(key: &SemanticArtifactKey, artifact: &SemanticArtifac
         .iter()
         .fold(
             retained_artifact_base_bytes(artifact),
-            |bytes, procedure| bytes.saturating_add(procedure.call_indexes_retained_bytes()),
+            |bytes, procedure| {
+                bytes
+                    .saturating_add(procedure.call_indexes_retained_bytes())
+                    .saturating_add(procedure.value_identity_index_retained_bytes())
+            },
         )
         .max(1)
 }
@@ -1726,6 +1730,11 @@ mod tests {
             .iter()
             .map(ProcedureSemantics::call_indexes_retained_bytes)
             .sum::<u64>();
+        let value_identity_index_bytes = artifact
+            .procedures()
+            .iter()
+            .map(ProcedureSemantics::value_identity_index_retained_bytes)
+            .sum::<u64>();
         assert!(
             call_index_bytes > 0,
             "fixture must retain derived call-phase indexes"
@@ -1734,8 +1743,10 @@ mod tests {
         let retained_bytes = retained_artifact_bytes(artifact.key(), &artifact);
         assert_eq!(
             retained_bytes,
-            base_bytes.saturating_add(call_index_bytes),
-            "cache weight must include every derived call-index allocation"
+            base_bytes
+                .saturating_add(call_index_bytes)
+                .saturating_add(value_identity_index_bytes),
+            "cache weight must include every derived semantic-index allocation"
         );
 
         let undersized = CompleteSemanticArtifactCache::new(base_bytes);

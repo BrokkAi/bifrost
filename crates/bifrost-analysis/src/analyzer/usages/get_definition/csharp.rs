@@ -123,6 +123,20 @@ impl<'a> CSharpDefinitionProvider<'a> {
         }
     }
 
+    fn arity_free_types_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        match self.session {
+            Some(session) => session.query_limited_rows(|limit| {
+                graph_support::arity_free_declaration_type_candidates_by_fqn_limited(
+                    self.csharp,
+                    fqn,
+                    limit,
+                    || session.observe_cancellation(),
+                )
+            }),
+            None => graph_support::arity_free_declaration_type_candidates_by_fqn(self.csharp, fqn),
+        }
+    }
+
     fn members_for_owner_name(&self, owner_fqn: &str, name: &str) -> Vec<CodeUnit> {
         match self.session {
             Some(session) => session.query_limited_rows(|limit| {
@@ -157,6 +171,39 @@ impl<'a> CSharpDefinitionProvider<'a> {
         if self.session.is_none() {
             return graph_support::visible_type_candidates(self.csharp, token, file, name);
         }
+        self.visible_type_candidates_with_lookup(token, file, name, &mut |fqn| self.fqn(fqn))
+    }
+
+    fn arity_free_visible_type_candidates(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        if self.session.is_none() {
+            return graph_support::arity_free_visible_type_candidates(
+                self.csharp,
+                token,
+                file,
+                name,
+            );
+        }
+        self.visible_type_candidates_with_lookup(token, file, name, &mut |fqn| {
+            self.arity_free_types_by_fqn(fqn)
+        })
+    }
+
+    fn visible_type_candidates_with_lookup<Candidates>(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+        name: &str,
+        type_candidates: &mut Candidates,
+    ) -> Vec<CodeUnit>
+    where
+        Candidates: FnMut(&str) -> Vec<CodeUnit>,
+    {
+        debug_assert!(self.session.is_some());
         let mut using_aliases = || {
             let aliases = self.using_aliases(token, file);
             self.observe_cancellation().then_some(aliases)
@@ -195,8 +242,7 @@ impl<'a> CSharpDefinitionProvider<'a> {
                 .unwrap_or(true)
         };
         let mut type_candidates_by_fqn = |fqn: &str| {
-            let candidates = self
-                .fqn(fqn)
+            let candidates = type_candidates(fqn)
                 .into_iter()
                 .filter(CodeUnit::is_class)
                 .collect();
@@ -972,6 +1018,18 @@ fn resolve_csharp_in_session(
                             format!("`{text}` did not resolve to an indexed C# member"),
                         );
                     }
+                }
+                if csharp_identifier_is_arity_free_type_name(identifier, source)
+                    && let Some(outcome) = csharp_arity_free_type_outcome(
+                        analyzer,
+                        token,
+                        definitions,
+                        file,
+                        text,
+                        identifier.start_byte(),
+                    )
+                {
+                    return outcome;
                 }
                 let outcome = csharp_type_outcome(
                     analyzer,
@@ -2314,6 +2372,40 @@ fn csharp_type_outcome(
     )
 }
 
+/// Resolve a type name only in a grammar role that permits its generic arity
+/// to be omitted. Ordinary C# identifiers never enter this path: a bare `Box`
+/// in a declared type position continues to mean arity zero, while
+/// `nameof(Box)` may widen to `Box<T>` after the exact declaration misses
+/// (#2209).
+fn csharp_arity_free_type_outcome(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    reference: &str,
+    byte: usize,
+) -> Option<DefinitionLookupOutcome> {
+    if let Some(unit) = resolve_csharp_arity_free_nested_type_in_enclosing_classes(
+        analyzer,
+        definitions,
+        file,
+        reference,
+        byte,
+    ) {
+        return Some(candidates_outcome(vec![unit]));
+    }
+    let mut candidates = definitions.arity_free_visible_type_candidates(token, file, reference);
+    if candidates.is_empty() {
+        candidates = definitions.arity_free_types_by_fqn(reference);
+    }
+    if !candidates.is_empty() {
+        graph_support::sort_type_candidates(&mut candidates);
+        candidates.dedup();
+        return Some(candidates_outcome(candidates));
+    }
+    None
+}
+
 fn csharp_attribute_outcome(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -3260,6 +3352,10 @@ fn csharp_identifier_allows_type_fallback(node: Node<'_>, source: &str) -> bool 
         return true;
     }
     // `nameof(Structure)` names a type through expression syntax.
+    csharp_identifier_is_arity_free_type_name(node, source)
+}
+
+fn csharp_identifier_is_arity_free_type_name(node: Node<'_>, source: &str) -> bool {
     csharp_nameof_invocation_for_operand(node)
         .and_then(|invocation| csharp_nameof_type_candidates(invocation, source))
         .is_some_and(|(operand, _)| same_node(operand, node))
@@ -4374,6 +4470,44 @@ fn resolve_csharp_nested_type_in_enclosing_classes(
     name: &str,
     byte: usize,
 ) -> Option<CodeUnit> {
+    resolve_csharp_nested_type_in_enclosing_classes_with(
+        analyzer,
+        definitions,
+        file,
+        name,
+        byte,
+        &mut |fqn| definitions.fqn(fqn),
+    )
+}
+
+fn resolve_csharp_arity_free_nested_type_in_enclosing_classes(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    name: &str,
+    byte: usize,
+) -> Option<CodeUnit> {
+    resolve_csharp_nested_type_in_enclosing_classes_with(
+        analyzer,
+        definitions,
+        file,
+        name,
+        byte,
+        &mut |fqn| definitions.arity_free_types_by_fqn(fqn),
+    )
+}
+
+fn resolve_csharp_nested_type_in_enclosing_classes_with<Candidates>(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    name: &str,
+    byte: usize,
+    type_candidates_by_fqn: &mut Candidates,
+) -> Option<CodeUnit>
+where
+    Candidates: FnMut(&str) -> Vec<CodeUnit>,
+{
     if name.is_empty() {
         return None;
     }
@@ -4399,8 +4533,7 @@ fn resolve_csharp_nested_type_in_enclosing_classes(
     .map_while(|owner| definitions.scope_step().then_some(owner));
     for owner in owners {
         let child_fqn = format!("{}.{}", owner.fq_name(), prefix);
-        let Some(prefix_unit) = definitions
-            .fqn(&child_fqn)
+        let Some(prefix_unit) = type_candidates_by_fqn(&child_fqn)
             .into_iter()
             .find(CodeUnit::is_class)
         else {
@@ -4411,10 +4544,11 @@ fn resolve_csharp_nested_type_in_enclosing_classes(
         // than an invitation to bind a further-out type of the same spelling.
         return match suffix {
             None => Some(prefix_unit),
-            Some(suffix) => definitions
-                .fqn(&format!("{}.{}", prefix_unit.fq_name(), suffix))
-                .into_iter()
-                .find(CodeUnit::is_class),
+            Some(suffix) => {
+                type_candidates_by_fqn(&format!("{}.{}", prefix_unit.fq_name(), suffix))
+                    .into_iter()
+                    .find(CodeUnit::is_class)
+            }
         };
     }
     None

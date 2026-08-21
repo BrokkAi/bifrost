@@ -471,9 +471,9 @@ pub struct DefinitionLookupDiagnostic {
     pub message: String,
 }
 
-/// Forward definition evidence stopped at the deepest indexed selector member.
-/// Consumers must not treat the accompanying declaration as the complete target
-/// of the originally requested selector chain.
+/// Historical forward evidence that stopped at an indexed selector prefix.
+/// New resolvers must not emit this for an exact focused token, but the
+/// differential checker still recognizes recorded outcomes carrying it.
 pub const PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND: &str = "partial_selector_chain";
 
 /// The name binds to a local binder -- a `case` pattern binding, a block-local
@@ -699,6 +699,26 @@ pub fn resolve_definition_batch_with_source(
     let token = scope.token();
     let scope = AnalyzerQueryScope::new(analyzer);
     let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
+    context.sources.insert(file, Ok(source));
+    resolve_definition_requests(analyzer, token, &mut context, requests, None, None, true)
+}
+
+/// Resolve explicit target-token requests without allowing a language resolver
+/// to substitute a neighboring token from the expanded reference expression.
+/// The context-reference tool is the sole caller because its `target` field is
+/// an exact-token contract; location, differential, rename, and inverse scans
+/// retain their established point-navigation semantics.
+pub(crate) fn resolve_definition_batch_with_source_exact_token_focus(
+    analyzer: &dyn IAnalyzer,
+    requests: Vec<DefinitionLookupRequest>,
+    file: ProjectFile,
+    source: Arc<str>,
+) -> Vec<DefinitionLookupOutcome> {
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
+    context.exact_token_focus = true;
     context.sources.insert(file, Ok(source));
     resolve_definition_requests(analyzer, token, &mut context, requests, None, None, true)
 }
@@ -942,6 +962,7 @@ struct DefinitionBatchContext<'a> {
     enclosing_owner_chains: HashMap<CodeUnit, Arc<Vec<CodeUnit>>>,
     python_contexts: HashMap<ProjectFile, Arc<python::PythonDefinitionContext>>,
     navigation_target_limit: usize,
+    exact_token_focus: bool,
     #[cfg(test)]
     cpp_class_range_builds: usize,
     #[cfg(test)]
@@ -975,6 +996,7 @@ impl<'a> DefinitionBatchContext<'a> {
             enclosing_owner_chains: HashMap::default(),
             python_contexts: HashMap::default(),
             navigation_target_limit: 256,
+            exact_token_focus: false,
             #[cfg(test)]
             cpp_class_range_builds: 0,
             #[cfg(test)]
@@ -1498,6 +1520,7 @@ fn resolve_one<'a>(
             &source,
             tree.as_ref(),
             &site,
+            context.exact_token_focus,
         ),
         Language::Scala => scala::resolve_scala(
             analyzer,

@@ -10,6 +10,8 @@ use brokk_bifrost_analysis::analyzer::structural::{
     CodeQueryExecutionLimits, CodeQuerySemanticLimits, CodeQueryTypestateLimits,
 };
 
+use super::relational::MAX_RETAINED_RELATIONAL_OBLIGATIONS;
+
 const MAX_SCANNED_FILES: usize = 20_000;
 const MAX_SCANNED_SOURCE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_FACT_NODES: usize = 2_000_000;
@@ -160,6 +162,10 @@ const MAX_CVSS_VARIANTS_PER_FINDING: usize = 32;
 const MAX_CVSS_REDUCTION_STEPS: usize = 32_768;
 const MAX_PROJECTION_SCENARIO_MEMBERSHIPS: usize = 16_384;
 const MAX_ORGANIZATIONAL_RISK_OVERLAYS: usize = 64;
+// One retained obligation per blocked verdict.  This is the evaluator's own
+// retention bound, so the report cap and the evaluation cap are one number and
+// a run can never be asked to retain an obligation the evaluator dropped.
+const MAX_OBLIGATIONS_PER_RUN: usize = MAX_RETAINED_RELATIONAL_OBLIGATIONS;
 const MAX_RETAINED_REPORT_BYTES_PER_POLICY: usize = 16 * 1024 * 1024;
 
 const MAX_POLICIES_PER_BATCH: usize = 256;
@@ -191,6 +197,7 @@ pub struct PolicyBudget {
     max_cvss_reduction_steps: usize,
     max_projection_scenario_memberships: usize,
     max_organizational_risk_overlays: usize,
+    max_obligations_per_run: usize,
     max_retained_report_bytes: usize,
 }
 
@@ -225,6 +232,7 @@ impl Default for PolicyBudget {
             max_cvss_reduction_steps: MAX_CVSS_REDUCTION_STEPS,
             max_projection_scenario_memberships: MAX_PROJECTION_SCENARIO_MEMBERSHIPS,
             max_organizational_risk_overlays: MAX_ORGANIZATIONAL_RISK_OVERLAYS,
+            max_obligations_per_run: MAX_OBLIGATIONS_PER_RUN,
             max_retained_report_bytes: MAX_RETAINED_REPORT_BYTES_PER_POLICY,
         }
     }
@@ -413,6 +421,13 @@ impl PolicyBudget {
         self.max_organizational_risk_overlays
     }
 
+    /// Unmet negative-proof obligations one run may retain.  Obligations are
+    /// report retention like findings and diagnostics, so they take their own
+    /// lane rather than competing for the diagnostic cap.
+    pub const fn max_obligations_per_run(&self) -> usize {
+        self.max_obligations_per_run
+    }
+
     pub const fn max_retained_report_bytes(&self) -> usize {
         self.max_retained_report_bytes
     }
@@ -493,6 +508,7 @@ pub enum PolicyBudgetField {
     CvssReductionSteps,
     ProjectionScenarioMemberships,
     OrganizationalRiskOverlays,
+    ObligationsPerRun,
     RetainedReportBytesPerPolicy,
     PoliciesPerBatch,
     TotalFindingsPerBatch,
@@ -528,6 +544,7 @@ impl PolicyBudgetField {
             Self::CvssReductionSteps => "cvss_reduction_steps",
             Self::ProjectionScenarioMemberships => "projection_scenario_memberships",
             Self::OrganizationalRiskOverlays => "organizational_risk_overlays",
+            Self::ObligationsPerRun => "obligations_per_run",
             Self::RetainedReportBytesPerPolicy => "retained_report_bytes_per_policy",
             Self::PoliciesPerBatch => "policies_per_batch",
             Self::TotalFindingsPerBatch => "total_findings_per_batch",
@@ -771,6 +788,12 @@ impl PolicyBudgetBuilder {
         MAX_ORGANIZATIONAL_RISK_OVERLAYS
     );
     policy_budget_setter!(
+        with_max_obligations_per_run,
+        max_obligations_per_run,
+        ObligationsPerRun,
+        MAX_OBLIGATIONS_PER_RUN
+    );
+    policy_budget_setter!(
         with_max_retained_report_bytes,
         max_retained_report_bytes,
         RetainedReportBytesPerPolicy,
@@ -880,6 +903,7 @@ mod tests {
         assert_eq!(budget.max_cvss_reduction_steps(), 32_768);
         assert_eq!(budget.max_projection_scenario_memberships(), 16_384);
         assert_eq!(budget.max_organizational_risk_overlays(), 64);
+        assert_eq!(budget.max_obligations_per_run(), 64);
         assert_eq!(budget.max_retained_report_bytes(), 16 * 1024 * 1024);
 
         let batch = PolicyBatchBudget::default();
@@ -934,6 +958,8 @@ mod tests {
             .with_max_projection_scenario_memberships(0)
             .unwrap()
             .with_max_organizational_risk_overlays(0)
+            .unwrap()
+            .with_max_obligations_per_run(0)
             .unwrap()
             .with_max_retained_report_bytes(0)
             .unwrap()

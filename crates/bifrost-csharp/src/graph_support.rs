@@ -117,11 +117,6 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
     /// same way.
     fn workspace_namespace_exists(&self, namespace: &str) -> bool;
 
-    /// Definitions of `fqn` after the store forwards renamed or relocated units
-    /// to their current identity. The persisted counterpart of the `usage_*`
-    /// fq-name lookups, which answer from the usage-definition index instead.
-    fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit>;
-
     /// The workspace's usage-definition index, as the bounded lookup contract.
     /// Every `usage_*` spelling below answers from here rather than from the
     /// persisted store.
@@ -424,21 +419,6 @@ pub fn usage_definition_candidates_by_fqn(
         .collect()
 }
 
-/// The arity-preserving key a reference spelling binds by, or `None` when the
-/// spelling states no generic arity at all.
-///
-/// C# writes a generic declaration's arity into its name, so `Box<T>` is
-/// declared as Box\`1. Every fq-name index below this is keyed by the
-/// arity-*stripping* normalization, so Box\`1 and Box collide there. A
-/// reference that states an arity must be held to it. A reference that states
-/// none must not be: `typeof(Box<>)`, `nameof(Box)` and an unbound base
-/// spelling all name the generic declaration without an arity, and holding
-/// those to arity 0 would refuse the only declaration they can mean.
-fn explicit_generic_arity_key(fqn: &str) -> Option<String> {
-    let arity_key = csharp_arity_preserving_full_name(fqn);
-    (csharp_normalize_full_name(&arity_key) != arity_key).then_some(arity_key)
-}
-
 pub fn type_candidates_by_fqn(
     source: &dyn CSharpSource,
     token: QueryToken<'_>,
@@ -448,19 +428,99 @@ pub fn type_candidates_by_fqn(
     if usage {
         return usage_type_candidates_by_fqn(source, token, fqn);
     }
-    let mut candidates = source
-        .forward_definition_fqn(fqn)
+    // One normalized-fqn probe covers both persisted nested separators and
+    // generic identities. The declaration helper re-applies the spelling's
+    // arity before returning, so this does not spend a second store query on
+    // an exact miss (#1806/#2209).
+    declaration_candidates_by_fqn(source, fqn, true)
+        .into_iter()
+        .filter(|unit| unit.is_class())
+        .collect()
+}
+
+/// Type candidates for a syntax role that permits an arity-free type name.
+///
+/// C# normally treats a bare `Box` as arity zero. A small set of grammar-proven
+/// forms, notably `nameof(Box)`, may still name `Box<T>` (#2209). Those callers
+/// opt into this lookup rather than weakening ordinary type lookup globally.
+/// Exact arity-zero declarations retain precedence over normalized generics.
+pub fn usage_arity_free_type_candidates_by_fqn(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    fqn: &str,
+) -> Vec<CodeUnit> {
+    let lookup = source.usage_definitions(token);
+    let exact = lookup
+        .fqn(fqn)
+        .iter()
+        .filter(|unit| unit.is_class())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !exact.is_empty() {
+        return exact;
+    }
+    lookup
+        .by_normalized_fqn(&csharp_normalize_full_name(fqn))
+        .iter()
+        .filter(|unit| unit.is_class())
+        .cloned()
+        .collect()
+}
+
+pub fn arity_free_declaration_type_candidates_by_fqn(
+    source: &dyn CSharpSource,
+    fqn: &str,
+) -> Vec<CodeUnit> {
+    let candidates = source
+        .persisted_declaration_candidates_by_fqn(fqn, true)
         .into_iter()
         .filter(|unit| unit.is_class())
         .collect::<Vec<_>>();
-    // The same filter the usage branch above already applies (#2165). Without
-    // it the external `System.Net.ServerSentEvents.SseItem<T>` bound the
-    // workspace's non-generic `static class SseItem` of the same name, and the
-    // inverse scan then refused every one of those sites as unproven.
-    if let Some(arity_key) = explicit_generic_arity_key(fqn) {
-        candidates.retain(|unit| csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key);
+    let arity_key = csharp_arity_preserving_full_name(fqn);
+    let exact_arity = candidates
+        .iter()
+        .filter(|unit| csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key)
+        .cloned()
+        .collect::<Vec<_>>();
+    if exact_arity.is_empty() {
+        candidates
+    } else {
+        exact_arity
     }
-    candidates
+}
+
+/// The persisted, budgeted counterpart of
+/// [`arity_free_declaration_type_candidates_by_fqn`]. It issues one indexed
+/// normalized-fqn probe, then gives exact arity-zero declarations precedence
+/// over generic candidates in memory (#1806/#2209).
+pub fn arity_free_declaration_type_candidates_by_fqn_limited(
+    source: &dyn CSharpSource,
+    fqn: &str,
+    limit: usize,
+    mut continue_query: impl FnMut() -> bool,
+) -> LimitedQueryRows<CodeUnit> {
+    let mut normalized = source.persisted_declaration_candidates_by_fqn_limited(
+        fqn,
+        true,
+        limit,
+        &mut continue_query,
+    );
+    normalized.rows.retain(CodeUnit::is_class);
+    let arity_key = csharp_arity_preserving_full_name(fqn);
+    let has_exact_arity = normalized
+        .rows
+        .iter()
+        .any(|unit| csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key);
+    if has_exact_arity {
+        normalized
+            .rows
+            .retain(|unit| csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key);
+    } else if !normalized.complete {
+        // A later row may still be an exact arity-zero declaration, which has
+        // precedence over every generic candidate already observed.
+        normalized.rows.clear();
+    }
+    normalized
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,7 +1197,8 @@ pub fn visible_type_candidates(
     file: &ProjectFile,
     name: &str,
 ) -> Vec<CodeUnit> {
-    visible_type_candidates_inner(source, token, file, name, true, false)
+    let mut type_candidates = |fqn: &str| type_candidates_by_fqn(source, token, fqn, false);
+    visible_type_candidates_inner(source, token, file, name, &mut type_candidates)
 }
 
 pub fn usage_visible_type_candidates(
@@ -1146,17 +1207,46 @@ pub fn usage_visible_type_candidates(
     file: &ProjectFile,
     name: &str,
 ) -> Vec<CodeUnit> {
-    visible_type_candidates_inner(source, token, file, name, true, true)
+    let mut type_candidates = |fqn: &str| type_candidates_by_fqn(source, token, fqn, true);
+    visible_type_candidates_inner(source, token, file, name, &mut type_candidates)
 }
 
-fn visible_type_candidates_inner(
+/// Visible candidates for an AST-proven arity-free type-name role. The scope
+/// ladder is identical to ordinary C# lookup; only each fully qualified probe
+/// is allowed to widen from an absent arity-zero declaration to generic
+/// declarations with the same normalized identity.
+pub fn arity_free_visible_type_candidates(
     source: &dyn CSharpSource,
     token: QueryToken<'_>,
     file: &ProjectFile,
     name: &str,
-    resolve_aliases: bool,
-    usage: bool,
 ) -> Vec<CodeUnit> {
+    let mut type_candidates =
+        |fqn: &str| arity_free_declaration_type_candidates_by_fqn(source, fqn);
+    visible_type_candidates_inner(source, token, file, name, &mut type_candidates)
+}
+
+pub fn usage_arity_free_visible_type_candidates(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let mut type_candidates =
+        |fqn: &str| usage_arity_free_type_candidates_by_fqn(source, token, fqn);
+    visible_type_candidates_inner(source, token, file, name, &mut type_candidates)
+}
+
+fn visible_type_candidates_inner<Candidates>(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    name: &str,
+    type_candidates: &mut Candidates,
+) -> Vec<CodeUnit>
+where
+    Candidates: FnMut(&str) -> Vec<CodeUnit>,
+{
     let mut using_aliases = || Some(source.using_aliases_of(file));
     let mut namespace_of_file = || Some(source.namespace_of_file(file));
     let mut file_using_namespaces = || Some(file_using_namespaces(source, token, file));
@@ -1166,16 +1256,16 @@ fn visible_type_candidates_inner(
         Some(namespaces)
     };
     let mut namespace_exists = |namespace: &str| source.workspace_namespace_exists(namespace);
-    let mut type_candidates = |fqn: &str| Some(type_candidates_by_fqn(source, token, fqn, usage));
+    let mut type_candidates_by_fqn = |fqn: &str| Some(type_candidates(fqn));
     visible_type_candidates_with_lookups(
         name,
-        resolve_aliases,
+        true,
         &mut using_aliases,
         &mut namespace_of_file,
         &mut file_using_namespaces,
         &mut global_using_namespaces,
         &mut namespace_exists,
-        &mut type_candidates,
+        &mut type_candidates_by_fqn,
     )
 }
 
@@ -1683,28 +1773,4 @@ pub fn compute_implicit_reference_index(
         },
         parallel,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::explicit_generic_arity_key;
-
-    /// The guard on the forward arity filter (#2165). A spelling that states an
-    /// arity binds by it; one that states none is never held to arity 0, which
-    /// is what keeps `typeof(Box<>)`, `nameof(Box)` and an unbound base
-    /// spelling -- all of which reach resolution as the bare name `Box` -- able
-    /// to name Demo.Box\`1.
-    #[test]
-    fn only_an_explicitly_spelled_arity_produces_a_filter_key() {
-        assert_eq!(explicit_generic_arity_key("Demo.Box"), None);
-        assert_eq!(explicit_generic_arity_key("Demo.Plain"), None);
-        assert_eq!(
-            explicit_generic_arity_key("Demo.Box`1").as_deref(),
-            Some("Demo.Box`1")
-        );
-        assert_eq!(
-            explicit_generic_arity_key("global::Demo.Outer`1+Inner").as_deref(),
-            Some("Demo.Outer`1.Inner")
-        );
-    }
 }

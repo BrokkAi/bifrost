@@ -206,6 +206,36 @@ pub enum CodeQueryResultRef {
         range: CodeQueryRange,
         argument_index: usize,
     },
+    CallBinding {
+        id: String,
+        site_id: String,
+        path: String,
+        range: CodeQueryRange,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        binding_kind: Option<&'static str>,
+        mapping: &'static str,
+        coverage: &'static str,
+    },
+    CallEffect {
+        id: String,
+        site_id: String,
+        path: String,
+        range: CodeQueryRange,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        effect_id: Option<String>,
+        derivation: &'static str,
+        coverage: &'static str,
+    },
+    ProcedureEffect {
+        id: String,
+        procedure_id: String,
+        path: String,
+        range: CodeQueryRange,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        effect_id: Option<String>,
+        derivation: &'static str,
+        coverage: &'static str,
+    },
     CallableSignature {
         id: String,
         declaration_id: Option<String>,

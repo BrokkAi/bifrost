@@ -169,6 +169,31 @@ pub(crate) fn constructor_call_gap_is_discharged(
     allocation_call_is_dischargeable(semantics, call)
 }
 
+/// Whether an unresolved constructor-call gap leaves the identity of this
+/// exact allocation result unchanged.
+///
+/// Constructor dispatch can still leave the constructor body's heap effects
+/// open. It cannot, however, change which object an object-creation
+/// expression allocated. Keep this proof value-specific so other values used
+/// by the call, and non-allocation call results, retain the gap.
+pub(crate) fn constructor_allocation_identity_discharges_gap(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    gap: &crate::analyzer::semantic::SemanticGap,
+    value: ValueId,
+) -> bool {
+    let Some(call) =
+        call_target_refinement_call(semantics, gap).and_then(|call| semantics.call_site(call))
+    else {
+        return false;
+    };
+    call.result == Some(value)
+        && allocation_call_is_dischargeable(semantics, call)
+        && semantics
+            .allocations()
+            .iter()
+            .any(|allocation| allocation.result == value)
+}
+
 /// Whether a call's retained allocation result makes an unresolved
 /// zero-argument constructor boundary fully modeled for value flow.
 pub(crate) fn allocation_call_is_dischargeable(

@@ -21,6 +21,54 @@ use super::model::{
 /// here rather than reaching into the evaluator so this module stays additive.
 const MATCH_SELECTOR_PATH: &str = "/analysis/selector";
 
+/// Explain why one retained finding exists, choosing the adapter from the
+/// evidence the finding carries.
+///
+/// This is the entry point a host calls. It dispatches on the finding's own
+/// evidence variant rather than on the run's analysis type, because the
+/// evidence is what an adapter reads:
+///
+/// - `match` evidence projects through [`explain_match_finding`];
+/// - `assertion` evidence -- including every relational assertion -- projects
+///   through [`super::why_assertion::explain_assertion_finding`].
+///
+/// # Errors
+///
+/// - [`ExplainError::FindingNotFound`] when the run retains no finding with
+///   this identity.
+/// - [`ExplainError::ExplanationAdapterUnavailable`] for a `taint`, `flow`, or
+///   `typestate` finding. The error names the families that *are* supported.
+/// - [`ExplainError::BudgetExhausted`] when `limits` cannot hold even a root.
+pub fn explain_finding(
+    run: &PolicyRun,
+    finding_id: &PolicyFindingId,
+    limits: &ExplanationLimits,
+) -> Result<PolicyExplanation, ExplainError> {
+    let finding = find_finding(run, finding_id)?;
+    match finding.evidence() {
+        PolicyFindingEvidence::Match { .. } => explain_match_finding(run, finding_id, limits),
+        PolicyFindingEvidence::Assertion { evidence } => {
+            super::why_assertion::explain_assertion_finding(run, finding, evidence, limits)
+        }
+        other => Err(ExplainError::adapter_unavailable(
+            other.analysis_type(),
+            ExplanationQuestion::Why,
+        )),
+    }
+}
+
+fn find_finding<'a>(
+    run: &'a PolicyRun,
+    finding_id: &PolicyFindingId,
+) -> Result<&'a PolicyFinding, ExplainError> {
+    run.findings()
+        .iter()
+        .find(|finding| finding.id() == *finding_id)
+        .ok_or(ExplainError::FindingNotFound {
+            finding: *finding_id,
+        })
+}
+
 /// Explain why one retained match finding exists.
 ///
 /// The tree is rooted at the finding projection and carries, in order:
@@ -41,8 +89,7 @@ const MATCH_SELECTOR_PATH: &str = "/analysis/selector";
 /// # Errors
 ///
 /// - [`ExplainError::ExplanationAdapterUnavailable`] when the run is not a
-///   `match` run. Taint, typestate, and assertion adapters are later slices of
-///   issue 2439; asking for one is a stated condition, not a panic.
+///   `match` run. Use [`explain_finding`] to dispatch on the finding instead.
 /// - [`ExplainError::FindingNotFound`] when the run retains no finding with
 ///   this identity.
 /// - [`ExplainError::BudgetExhausted`] when `limits` cannot hold even a root.
@@ -52,21 +99,17 @@ pub fn explain_match_finding(
     limits: &ExplanationLimits,
 ) -> Result<PolicyExplanation, ExplainError> {
     if run.analysis_type() != PolicyAnalysisType::Match {
-        return Err(ExplainError::ExplanationAdapterUnavailable {
-            analysis_type: run.analysis_type(),
-        });
+        return Err(ExplainError::adapter_unavailable(
+            run.analysis_type(),
+            ExplanationQuestion::Why,
+        ));
     }
-    let finding = run
-        .findings()
-        .iter()
-        .find(|finding| finding.id() == *finding_id)
-        .ok_or(ExplainError::FindingNotFound {
-            finding: *finding_id,
-        })?;
+    let finding = find_finding(run, finding_id)?;
     let PolicyFindingEvidence::Match { evidence } = finding.evidence() else {
-        return Err(ExplainError::ExplanationAdapterUnavailable {
-            analysis_type: finding.evidence().analysis_type(),
-        });
+        return Err(ExplainError::adapter_unavailable(
+            finding.evidence().analysis_type(),
+            ExplanationQuestion::Why,
+        ));
     };
     let root = finding_root(finding, evidence, run.completion());
     build_explanation(
@@ -181,7 +224,7 @@ fn provenance_node(provenance: &PolicyQueryProvenance) -> RawNode {
 /// licenses the finding, so the obligation is `satisfied`. Anything else is
 /// `unknown` rather than `failed`: an inconclusive, unsupported, or failed run
 /// did not disprove the coverage claim, it failed to establish it.
-fn coverage_node(completion: &PolicyRunCompletion) -> RawNode {
+pub(super) fn coverage_node(completion: &PolicyRunCompletion) -> RawNode {
     let (outcome, reasons) = match completion {
         PolicyRunCompletion::Complete
         | PolicyRunCompletion::ProvenSubset { .. }

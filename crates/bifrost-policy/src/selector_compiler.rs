@@ -815,6 +815,39 @@ pub(super) fn selected_site_quality(
                 ProofStatus::Proven,
                 EvidenceCompleteness::Complete,
             ),
+            // An effect row's own quality is its derivation and its coverage:
+            // a `declared` row with an exhaustive site or procedure is a
+            // complete claim, and anything else admits a missing effect.
+            CodeQueryResultValue::CallEffect { value } => (
+                ProofStatus::Proven,
+                if value.coverage == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("call effect coverage is {}", value.coverage).into(),
+                    )
+                },
+            ),
+            CodeQueryResultValue::ProcedureEffect { value } => (
+                ProofStatus::Proven,
+                if value.coverage == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("procedure effect coverage is {}", value.coverage).into(),
+                    )
+                },
+            ),
+            CodeQueryResultValue::CallBinding { value } => (
+                ProofStatus::Proven,
+                if value.mapping == "exact" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("call binding mapping is {}", value.mapping).into(),
+                    )
+                },
+            ),
             CodeQueryResultValue::ReceiverOutcome { value } => (
                 ProofStatus::Proven,
                 if value.coverage == "exhaustive" {

@@ -16,12 +16,13 @@ use brokk_bifrost::mcp_registry::{
     resolve_server_spec, resolve_server_spec_for_render_options, searchtools_toolset_order,
 };
 use brokk_bifrost::policy::{
-    BuiltInPolicySelection, HumanRenderColor, HumanRenderDetail, HumanRenderOptions,
-    POLICY_EXIT_CLEAN, POLICY_EXIT_UNRELIABLE, PolicyBaselineDocument, PolicyBaselineOptions,
-    PolicyBaselineSource, PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput,
-    PolicyEvaluationOptions, PolicyFailOn, PolicyRenderError, PolicyReportDocument,
-    PolicyScopeOptions, PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource,
-    SarifToolIdentity, built_in_policy_catalog, escape_terminal_text, evaluate_policy_inputs,
+    BuiltInPolicySelection, ExplanationCandidate, ExplanationLimits, ExplanationTarget,
+    HumanRenderColor, HumanRenderDetail, HumanRenderOptions, POLICY_EXIT_CLEAN,
+    POLICY_EXIT_UNRELIABLE, PolicyBaselineDocument, PolicyBaselineOptions, PolicyBaselineSource,
+    PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
+    PolicyFailOn, PolicyFindingId, PolicyRenderError, PolicyReportDocument, PolicyScopeOptions,
+    PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource, SarifToolIdentity,
+    built_in_policy_catalog, escape_terminal_text, evaluate_policy_inputs, explain_policy_inputs,
     write_policy_human, write_policy_json, write_policy_sarif,
 };
 use brokk_bifrost::rmcp_host::{
@@ -110,6 +111,8 @@ fn has_policy_syntax(args: &[String]) -> bool {
                 | "--color"
                 | "--verbose"
                 | "--require-explicit-schema-versions"
+                | "--explain-finding"
+                | "--explain-candidate"
         ) {
             return true;
         }
@@ -147,7 +150,38 @@ fn option_requires_value(argument: &str) -> bool {
             | "--diff-base"
             | "--output"
             | "--color"
+            | "--explain-finding"
+            | "--explain-candidate"
     )
+}
+
+/// One `--explain-candidate` value: `PATH:BYTE_START` or
+/// `PATH:BYTE_START-BYTE_END`.
+///
+/// The separator is the *last* colon before the offset, so a Windows-style
+/// drive letter or a path containing a colon still parses. The offsets are
+/// bytes, not lines or columns, because that is the domain key the explanation
+/// library takes and inventing a second one would need a source read.
+fn parse_explain_candidate(value: &str) -> Result<(String, u64, Option<u64>), String> {
+    let (path, span) = value.rsplit_once(':').ok_or_else(|| {
+        format!("Invalid --explain-candidate `{value}`: expected PATH:BYTE_START[-BYTE_END]")
+    })?;
+    if path.is_empty() {
+        return Err(format!("Invalid --explain-candidate `{value}`: empty path"));
+    }
+    let parse_offset = |text: &str| -> Result<u64, String> {
+        text.parse::<u64>().map_err(|error| {
+            format!("Invalid --explain-candidate byte offset `{text}` in `{value}`: {error}")
+        })
+    };
+    match span.split_once('-') {
+        Some((start, end)) => Ok((
+            path.to_string(),
+            parse_offset(start)?,
+            Some(parse_offset(end)?),
+        )),
+        None => Ok((path.to_string(), parse_offset(span)?, None)),
+    }
 }
 
 fn run_inner(
@@ -193,6 +227,8 @@ fn run_inner(
     let mut policy_color = PolicyColorMode::Auto;
     let mut policy_color_seen = false;
     let mut require_explicit_schema_versions = false;
+    let mut explain_finding: Option<String> = None;
+    let mut explain_candidate: Option<(String, u64, Option<u64>)> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -314,6 +350,24 @@ fn run_inner(
                     return Err("--list-policies may only be provided once".to_string());
                 }
                 list_policies = true;
+            }
+            "--explain-finding" => {
+                let value = args.next().ok_or_else(|| {
+                    "--explain-finding requires a finding id as run_policy reports it".to_string()
+                })?;
+                if explain_finding.is_some() {
+                    return Err("--explain-finding may only be provided once".to_string());
+                }
+                explain_finding = Some(value);
+            }
+            "--explain-candidate" => {
+                let value = args.next().ok_or_else(|| {
+                    "--explain-candidate requires PATH:BYTE_START[-BYTE_END]".to_string()
+                })?;
+                if explain_candidate.is_some() {
+                    return Err("--explain-candidate may only be provided once".to_string());
+                }
+                explain_candidate = Some(parse_explain_candidate(&value)?);
             }
             "--format" => {
                 let value = args
@@ -486,6 +540,12 @@ fn run_inner(
             );
         }
         if list_policies {
+            if explain_finding.is_some() || explain_candidate.is_some() {
+                return Err(
+                    "--list-policies cannot be combined with --explain-finding or --explain-candidate"
+                        .to_string(),
+                );
+            }
             if !policy_files.is_empty()
                 || !policy_selection.is_empty()
                 || policy_format_seen
@@ -534,6 +594,28 @@ fn run_inner(
             }
             policy_fail_on = PolicyFailOn::Never;
         }
+        let explain_target = explanation_target(explain_finding, explain_candidate)?;
+        if explain_target.is_some() {
+            // An explanation is a query about one policy, not a gate over a
+            // workspace, so every option that shapes a gate is refused rather
+            // than silently ignored.
+            if policy_format_seen
+                || policy_fail_on_seen
+                || policy_suppressions_seen
+                || policy_scope_seen
+                || policy_baseline_seen
+                || accept_current
+                || policy_evaluation_date.is_some()
+                || policy_diff_base.is_some()
+                || policy_verbose_seen
+                || policy_color_seen
+            {
+                return Err(
+                    "--explain-finding and --explain-candidate cannot be combined with --format, --fail-on, --suppressions-file, --scope-file, --baseline-file, --accept-current, --evaluation-date, --diff-base, --verbose, or --color"
+                        .to_string(),
+                );
+            }
+        }
         let mut policy_inputs = built_in_policy_catalog()
             .map_err(|error| error.to_string())?
             .select(&policy_selection)
@@ -548,6 +630,10 @@ fn run_inner(
                 .into_iter()
                 .map(PolicyEvaluationInput::workspace_file),
         );
+        if let Some(target) = explain_target {
+            let status = run_policy_explain_mode(&root, &policy_inputs, &target, policy_output);
+            return Ok(CliRunResult::PolicyStatus(status));
+        }
         let status = run_policy_mode(
             PolicyModeRequest {
                 root,
@@ -762,6 +848,125 @@ fn parse_policy_color(value: &str) -> Result<PolicyColorMode, String> {
             "Invalid --color value: {other}. Expected auto, always, or never."
         )),
     }
+}
+
+/// Resolve the two explanation flags into at most one target.
+///
+/// The two questions exclude each other: a request carrying both would have
+/// two answers, and this is stated at parse time rather than at evaluation
+/// time so a mistyped invocation fails before a workspace is built.
+fn explanation_target(
+    finding: Option<String>,
+    candidate: Option<(String, u64, Option<u64>)>,
+) -> Result<Option<ExplanationTarget>, String> {
+    match (finding, candidate) {
+        (Some(_), Some(_)) => {
+            Err("--explain-finding cannot be combined with --explain-candidate".to_string())
+        }
+        (None, None) => Ok(None),
+        (Some(finding), None) => {
+            let parsed = finding
+                .parse::<PolicyFindingId>()
+                .map_err(|error| format!("Invalid --explain-finding id `{finding}`: {error}"))?;
+            Ok(Some(ExplanationTarget::Finding(parsed)))
+        }
+        (None, Some((path, byte_start, byte_end))) => {
+            let parsed = match byte_end {
+                Some(byte_end) => ExplanationCandidate::in_range(&path, byte_start, byte_end),
+                None => ExplanationCandidate::at_offset(&path, byte_start),
+            }
+            .map_err(|error| format!("Invalid --explain-candidate: {error}"))?;
+            Ok(Some(ExplanationTarget::Candidate(parsed)))
+        }
+    }
+}
+
+/// Print one bounded policy explanation as JSON.
+///
+/// # Exit status
+///
+/// An explanation is a query about a policy, not a gate over a workspace, so a
+/// produced explanation always exits `0` -- including when its outcome is
+/// `failed` or `unknown`, which are answers rather than verdicts. Only a
+/// failure to produce one at all (an unloadable policy, a selection that is
+/// not exactly one policy, a family with no adapter, an unknown finding
+/// identity, or an output write failure) exits `POLICY_EXIT_UNRELIABLE`.
+fn run_policy_explain_mode(
+    root: &Path,
+    policy_inputs: &[PolicyEvaluationInput],
+    target: &ExplanationTarget,
+    output: Option<PathBuf>,
+) -> u8 {
+    let explanation = match explain_policy_inputs(
+        root,
+        policy_inputs,
+        target,
+        None,
+        None,
+        &ExplanationLimits::default(),
+    ) {
+        Ok(explanation) => explanation,
+        Err(error) => {
+            eprintln!(
+                "bifrost: policy explanation failed: {}",
+                escape_terminal_text(&error.to_string())
+            );
+            return POLICY_EXIT_UNRELIABLE;
+        }
+    };
+    let encoded = explanation.to_json();
+    let written = match output.as_deref() {
+        Some(path) => write_explanation_output_file(path, &encoded),
+        None => {
+            let mut stdout = io::stdout().lock();
+            writeln!(stdout, "{encoded}")
+                .and_then(|()| stdout.flush())
+                .map_err(|error| error.to_string())
+        }
+    };
+    if let Err(error) = written {
+        eprintln!(
+            "bifrost: policy explanation output failed: {}",
+            escape_terminal_text(&error)
+        );
+        return POLICY_EXIT_UNRELIABLE;
+    }
+    POLICY_EXIT_CLEAN
+}
+
+/// Atomically replace `destination` with one rendered explanation, following
+/// the same temporary-file discipline the report writer uses.
+fn write_explanation_output_file(destination: &Path, encoded: &str) -> Result<(), String> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = NamedTempFile::new_in(parent).map_err(|error| {
+        format!(
+            "failed to create a temporary output beside {}: {error}",
+            destination.display()
+        )
+    })?;
+    temporary
+        .write_all(encoded.as_bytes())
+        .and_then(|()| temporary.write_all(b"\n"))
+        .and_then(|()| temporary.flush())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| {
+            format!(
+                "failed to write the temporary explanation for {}: {error}",
+                destination.display()
+            )
+        })?;
+    temporary
+        .into_temp_path()
+        .persist(destination)
+        .map_err(|error| {
+            format!(
+                "failed to atomically replace {}: {error}",
+                destination.display()
+            )
+        })
 }
 
 /// Resolved policy-mode invocation state, beyond the policy inputs themselves.
@@ -1187,6 +1392,18 @@ OPTIONS:
                            request's merge base in CI. An unresolvable base is unreliable (exit 2)
     --require-explicit-schema-versions
                            Reject inferred policy and RQL schema versions
+    --explain-finding ID   Explain why the selected policy's run produced the finding with this
+                           stable id, and print the bounded explanation JSON. The selection must
+                           resolve to exactly one policy
+    --explain-candidate PATH:BYTE_START[-BYTE_END]
+                           Explain why the selected policy did not report this exact position,
+                           and print the bounded explanation JSON. Nothing is scanned for: the
+                           position you pass is the one explained
+                           Both explanation flags are queries, not gates: a produced explanation
+                           exits 0 even when its outcome is failed or unknown, and only a failure
+                           to produce one exits 2. Neither can be combined with --format,
+                           --fail-on, --suppressions-file, --scope-file, --baseline-file,
+                           --accept-current, --evaluation-date, --diff-base, --verbose, or --color
     --output PATH          Atomically write policy output to PATH instead of stdout
     --no-line-numbers      Render source output without leading line numbers
     --force-semantic-cpu   Allow semantic_search without a CUDA/Metal accelerator (run the embedder on CPU)
@@ -1441,5 +1658,251 @@ mod named_workspace_cli_tests {
             Ok(_) => panic!("root and workspace must fail"),
         };
         assert_eq!(error.message, "--workspace cannot be combined with --root");
+    }
+}
+
+/// Flag-level coverage for the two policy explanation flags (issue 2439
+/// slice 3).
+///
+/// These exercise parsing and the mutual-exclusion discipline without building
+/// a workspace: every case here is decided before any analyzer exists, which is
+/// exactly the property that makes a mistyped invocation cheap.
+#[cfg(test)]
+mod policy_explain_cli_tests {
+    use super::{
+        ExplanationTarget, explanation_target, has_policy_syntax, parse_explain_candidate, run,
+    };
+
+    fn run_error(args: &[&str]) -> String {
+        match run(args.iter().map(|argument| (*argument).to_string())) {
+            Err(error) => {
+                assert!(
+                    error.policy_invocation,
+                    "an explanation flag is a policy invocation, so its failure exits 2"
+                );
+                error.message
+            }
+            Ok(_) => panic!("expected {args:?} to fail"),
+        }
+    }
+
+    #[test]
+    fn the_explanation_flags_are_policy_syntax() {
+        for flag in ["--explain-finding", "--explain-candidate"] {
+            assert!(has_policy_syntax(&[flag.to_string(), "x".to_string()]));
+        }
+    }
+
+    #[test]
+    fn a_candidate_parses_a_point_and_a_range() {
+        assert_eq!(
+            parse_explain_candidate("src/app.ts:42").expect("a point candidate"),
+            (String::from("src/app.ts"), 42, None)
+        );
+        assert_eq!(
+            parse_explain_candidate("src/app.ts:42-50").expect("a range candidate"),
+            (String::from("src/app.ts"), 42, Some(50))
+        );
+        // The separator is the last colon, so a path containing one survives.
+        assert_eq!(
+            parse_explain_candidate("a:b/app.ts:7").expect("a colon in the path"),
+            (String::from("a:b/app.ts"), 7, None)
+        );
+        assert!(parse_explain_candidate("src/app.ts").is_err());
+        assert!(parse_explain_candidate("src/app.ts:notanumber").is_err());
+        assert!(parse_explain_candidate(":7").is_err());
+    }
+
+    #[test]
+    fn a_target_refuses_both_questions_and_validates_each_one() {
+        assert_eq!(explanation_target(None, None).expect("no question"), None);
+        assert_eq!(
+            explanation_target(
+                Some("0".repeat(64)),
+                Some((String::from("app.ts"), 0, None))
+            )
+            .expect_err("two questions have two answers"),
+            "--explain-finding cannot be combined with --explain-candidate"
+        );
+        assert!(matches!(
+            explanation_target(Some("0".repeat(64)), None).expect("a valid identity"),
+            Some(ExplanationTarget::Finding(_))
+        ));
+        assert!(
+            explanation_target(Some(String::from("nope")), None)
+                .expect_err("a finding id is a lowercase sha-256")
+                .contains("Invalid --explain-finding")
+        );
+        assert!(matches!(
+            explanation_target(None, Some((String::from("app.ts"), 3, Some(9))))
+                .expect("a valid candidate"),
+            Some(ExplanationTarget::Candidate(_))
+        ));
+        // A path outside the workspace and a reversed range are both refused.
+        assert!(
+            explanation_target(None, Some((String::from("../outside.ts"), 0, None)))
+                .expect_err("a candidate stays inside the workspace")
+                .contains("Invalid --explain-candidate")
+        );
+        assert!(
+            explanation_target(None, Some((String::from("app.ts"), 9, Some(4))))
+                .expect_err("a range does not end before it starts")
+                .contains("exceeds end")
+        );
+    }
+
+    #[test]
+    fn an_explanation_cannot_be_combined_with_a_gate() {
+        for gate in [
+            vec!["--format", "json"],
+            vec!["--fail-on", "error"],
+            vec!["--suppressions-file", "s.json"],
+            vec!["--scope-file", "s.json"],
+            vec!["--baseline-file", "b.json"],
+            vec!["--accept-current"],
+            vec!["--evaluation-date", "2026-08-20"],
+            vec!["--diff-base", "HEAD~1"],
+            vec!["--verbose"],
+            vec!["--color", "never"],
+        ] {
+            let mut args = vec![
+                "--policy-file",
+                "policies/p.rqlp",
+                "--explain-candidate",
+                "app.ts:0",
+            ];
+            args.extend(gate.iter().copied());
+            let message = run_error(&args);
+            assert!(
+                message.contains("--explain-finding and --explain-candidate cannot be combined"),
+                "{gate:?} must be refused beside an explanation: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explanation_cannot_be_combined_with_listing_or_the_other_question() {
+        let message = run_error(&["--list-policies", "--explain-candidate", "app.ts:0"]);
+        assert!(
+            message.contains("--list-policies cannot be combined"),
+            "{message}"
+        );
+
+        let message = run_error(&[
+            "--policy-file",
+            "policies/p.rqlp",
+            "--explain-finding",
+            &"0".repeat(64),
+            "--explain-candidate",
+            "app.ts:0",
+        ]);
+        assert_eq!(
+            message,
+            "--explain-finding cannot be combined with --explain-candidate"
+        );
+    }
+
+    #[test]
+    fn each_explanation_flag_may_be_given_once_and_requires_a_value() {
+        let message = run_error(&[
+            "--policy-file",
+            "policies/p.rqlp",
+            "--explain-candidate",
+            "app.ts:0",
+            "--explain-candidate",
+            "app.ts:1",
+        ]);
+        assert_eq!(message, "--explain-candidate may only be provided once");
+
+        let message = run_error(&["--policy-file", "policies/p.rqlp", "--explain-finding"]);
+        assert!(message.contains("--explain-finding requires"), "{message}");
+    }
+
+    #[test]
+    fn an_explanation_still_requires_a_policy_selection() {
+        let message = run_error(&["--explain-candidate", "app.ts:0"]);
+        assert!(
+            message.contains("policy mode requires at least one --policy-file"),
+            "{message}"
+        );
+    }
+}
+
+/// Exit-status coverage for policy explanation mode.
+///
+/// The workspace-level CLI suite exercises the flags end to end; these two
+/// cases pin the documented exit contract itself, which is the part a caller
+/// scripts against.
+#[cfg(test)]
+mod policy_explain_exit_status_tests {
+    use super::{
+        ExplanationCandidate, ExplanationTarget, POLICY_EXIT_CLEAN, POLICY_EXIT_UNRELIABLE,
+        PolicyEvaluationInput, run_policy_explain_mode,
+    };
+    use serde_json::Value;
+
+    const POLICY: &str = r#"(policy
+  :id "test.cli.explain"
+  :name "Widget"
+  :message "Widget is reported"
+  :severity warning
+  :analysis (analysis :type match :selector (rql (class :name "Widget"))))"#;
+
+    fn workspace() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            temp.path().join("Widget.java"),
+            "class Widget {\n  int render() { return 1; }\n}\n",
+        )
+        .expect("write source");
+        std::fs::create_dir_all(temp.path().join("policies")).expect("policy directory");
+        std::fs::write(temp.path().join("policies/explain.rqlp"), POLICY).expect("write policy");
+        temp
+    }
+
+    #[test]
+    fn a_produced_explanation_exits_clean_and_writes_the_versioned_json() {
+        let temp = workspace();
+        let root = temp.path().canonicalize().expect("canonical root");
+        let destination = root.join("explanation.json");
+        // A candidate the selector definitely drops: the outcome is `failed`,
+        // and a failed answer is still an answer, so the status stays 0.
+        let candidate =
+            ExplanationCandidate::at_offset("Widget.java", 0).expect("a workspace candidate");
+        let status = run_policy_explain_mode(
+            &root,
+            &[PolicyEvaluationInput::workspace_file(
+                "policies/explain.rqlp",
+            )],
+            &ExplanationTarget::Candidate(candidate),
+            Some(destination.clone()),
+        );
+        assert_eq!(status, POLICY_EXIT_CLEAN);
+
+        let written = std::fs::read_to_string(&destination).expect("the explanation was written");
+        let value: Value = serde_json::from_str(&written).expect("the explanation is JSON");
+        assert_eq!(
+            value["format"],
+            brokk_bifrost::policy::POLICY_EXPLANATION_FORMAT
+        );
+        assert_eq!(value["question"], "why_not");
+        assert_eq!(value["policy_id"], "test.cli.explain");
+    }
+
+    #[test]
+    fn a_failure_to_produce_an_explanation_exits_unreliable() {
+        let temp = workspace();
+        let root = temp.path().canonicalize().expect("canonical root");
+        let candidate =
+            ExplanationCandidate::at_offset("Widget.java", 0).expect("a workspace candidate");
+        let status = run_policy_explain_mode(
+            &root,
+            &[PolicyEvaluationInput::workspace_file(
+                "policies/absent.rqlp",
+            )],
+            &ExplanationTarget::Candidate(candidate),
+            None,
+        );
+        assert_eq!(status, POLICY_EXIT_UNRELIABLE);
     }
 }

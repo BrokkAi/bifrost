@@ -62,16 +62,24 @@ pub(crate) struct TaintProjectionAuthority<'a> {
 
 impl<'a> TaintProjectionAuthority<'a> {
     pub(crate) fn from_loaded(policy: &'a LoadedPolicy) -> Result<Self, ProjectionAuthorityError> {
-        let spec = policy.resolved_taint().ok_or(
-            ProjectionAuthorityError::MissingResolvedSpecification {
-                analysis_type: PolicyAnalysisType::Taint,
-            },
-        )?;
+        // Taint and flow share this authority: they share one resolved model
+        // and one adapter. The seal records which kind authored the model, so
+        // a projection can never be assembled under the wrong analysis type.
+        let analysis_type = policy.definition().analysis.analysis_type();
+        if !matches!(
+            analysis_type,
+            PolicyAnalysisType::Taint | PolicyAnalysisType::Flow
+        ) {
+            return Err(ProjectionAuthorityError::MissingResolvedSpecification { analysis_type });
+        }
+        let spec = policy
+            .resolved_taint()
+            .ok_or(ProjectionAuthorityError::MissingResolvedSpecification { analysis_type })?;
         Ok(Self {
             seal: ProjectionSeal {
                 policy_id: policy.definition().metadata.id.clone(),
                 policy_hash: policy.semantic_hash(),
-                analysis_type: PolicyAnalysisType::Taint,
+                analysis_type,
                 authoring_projection_hash: None,
                 protocol_hash: None,
                 binding_plan_hash: None,
@@ -79,6 +87,11 @@ impl<'a> TaintProjectionAuthority<'a> {
             spec,
             report: &policy.definition().report,
         })
+    }
+
+    /// The analysis kind this authority was minted for: `Taint` or `Flow`.
+    pub(crate) const fn analysis_type(&self) -> PolicyAnalysisType {
+        self.seal.analysis_type
     }
 
     /// Seal one adapter result to this exact loaded-policy authority.

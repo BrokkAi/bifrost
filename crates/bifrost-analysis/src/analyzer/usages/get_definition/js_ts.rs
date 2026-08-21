@@ -23,7 +23,7 @@ use brokk_bifrost_js_ts::syntax::{
 /// `js_ts/syntax.rs` already is (issue: the js_ts crate extraction, Js-1b).
 use brokk_bifrost_js_ts::ts_owners::{
     TsReceiverResolution, jsts_constructor_owner_candidates, jsts_enclosing_function_scope,
-    jsts_identifier_candidates, jsts_member_candidates, node_text_matches, root_node,
+    jsts_identifier_candidates, jsts_member_candidates, node_text_matches,
     ts_call_expression_callees, ts_direct_object_literal_value,
     ts_expand_call_return_property_owners, ts_nodes_for_code_unit, ts_parameter_name_node,
     ts_receiver_owner_candidates_at_byte, ts_resolve_type_node_to_property_owner_outcome,
@@ -2799,6 +2799,7 @@ fn ts_synthetic_member_is_supported_by_receiver_initializer(
             support,
             receiver.source(),
             &source,
+            tree.root_node(),
             &imports,
             aliases,
             call,
@@ -2875,6 +2876,7 @@ fn ts_call_preserves_argument_shape(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     call: Node<'_>,
@@ -2888,6 +2890,7 @@ fn ts_call_preserves_argument_shape(
         support,
         file,
         source,
+        root,
         imports,
         aliases,
         function,
@@ -3141,6 +3144,7 @@ fn jsts_local_new_receiver_owner_candidates(
         file,
         language,
         source,
+        root,
         scope,
         scope.id(),
         imports,
@@ -3161,6 +3165,7 @@ fn jsts_collect_local_new_receiver_owner_candidates(
     file: &ProjectFile,
     language: Language,
     source: &str,
+    root: Node<'_>,
     node: Node<'_>,
     root_id: usize,
     imports: &JsTsImportBinder,
@@ -3170,7 +3175,6 @@ fn jsts_collect_local_new_receiver_owner_candidates(
     depth: usize,
     state: &mut Option<Vec<CodeUnit>>,
 ) {
-    let root = root_node(node);
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
         if node.start_byte() >= before_byte {

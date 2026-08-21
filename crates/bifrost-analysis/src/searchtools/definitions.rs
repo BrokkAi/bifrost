@@ -142,7 +142,7 @@ pub(super) fn resolve_definition_context_query(
     let outcomes = requests_by_source
         .into_iter()
         .flat_map(|(file, source, requests)| {
-            crate::analyzer::usages::get_definition::resolve_definition_batch_with_source(
+            crate::analyzer::usages::get_definition::resolve_definition_batch_with_source_exact_token_focus(
                 analyzer, requests, file, source,
             )
         })

@@ -89,6 +89,15 @@ pub(super) fn render_pipeline_item(
         PipelineValue::CallArgument(value) => CodeQueryResultValue::CallArgument {
             value: Box::new(render_call_shape_argument(analyzer, &value, cache)),
         },
+        PipelineValue::CallBinding(value) => CodeQueryResultValue::CallBinding {
+            value: Box::new(render_call_binding(analyzer, &value, detail, cache)),
+        },
+        PipelineValue::CallEffect(value) => CodeQueryResultValue::CallEffect {
+            value: Box::new(render_call_effect(analyzer, &value, detail, cache)),
+        },
+        PipelineValue::ProcedureEffect(value) => CodeQueryResultValue::ProcedureEffect {
+            value: Box::new(render_procedure_effect(analyzer, &value, cache)),
+        },
         PipelineValue::CallableSignature(value) => CodeQueryResultValue::CallableSignature {
             value: Box::new(render_callable_signature(analyzer, &value, detail, cache)),
         },
@@ -237,6 +246,42 @@ pub(super) fn render_provenance(
                             path: rendered.path,
                             range: rendered.range,
                             argument_index: rendered.argument_index,
+                        }
+                    }
+                    PipelineTraceValue::CallBinding(value) => {
+                        let rendered = render_call_binding(analyzer, value, detail, cache);
+                        CodeQueryResultRef::CallBinding {
+                            id: rendered.id,
+                            site_id: rendered.site_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            binding_kind: rendered.binding_kind,
+                            mapping: rendered.mapping,
+                            coverage: rendered.coverage,
+                        }
+                    }
+                    PipelineTraceValue::CallEffect(value) => {
+                        let rendered = render_call_effect(analyzer, value, detail, cache);
+                        CodeQueryResultRef::CallEffect {
+                            id: rendered.id,
+                            site_id: rendered.site_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            effect_id: rendered.effect_id,
+                            derivation: rendered.derivation,
+                            coverage: rendered.coverage,
+                        }
+                    }
+                    PipelineTraceValue::ProcedureEffect(value) => {
+                        let rendered = render_procedure_effect(analyzer, value, cache);
+                        CodeQueryResultRef::ProcedureEffect {
+                            id: rendered.id,
+                            procedure_id: rendered.procedure_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            effect_id: rendered.effect_id,
+                            derivation: rendered.derivation,
+                            coverage: rendered.coverage,
                         }
                     }
                     PipelineTraceValue::CallableSignature(value) => {
@@ -1929,6 +1974,125 @@ pub(super) fn render_call_shape_argument(
         argument_index: argument.argument_index,
         name: argument.name.clone(),
         spread: argument.spread,
+    }
+}
+
+pub(super) fn render_call_binding(
+    analyzer: &dyn IAnalyzer,
+    value: &CallBindingValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCallBinding {
+    let report = &value.site.report;
+    let row = value.row();
+    CodeQueryCallBinding {
+        id: row.id.clone(),
+        site_id: row.site_id.clone(),
+        site_ast_id: report.site_ast_id.clone(),
+        path: rel_path_string(&report.file),
+        language: crate::analyzer::common::language_for_file(&report.file).config_label(),
+        range: render_source_range(analyzer, &report.file, &row.range, cache),
+        group_id: row.group_id.clone(),
+        argument_id: row.argument_id.clone(),
+        target: value
+            .site
+            .target
+            .as_ref()
+            .map(|target| render_declaration(analyzer, target, detail, cache)),
+        signature_id: value.site.signature_id.clone(),
+        actual_index: row.actual_index,
+        actual_name: row.actual_name.clone(),
+        formal_index: row.formal_index,
+        formal_name: row.formal_name.clone(),
+        binding_kind: row.binding_kind.map(|kind| kind.label()),
+        mapping: row.mapping.label(),
+        reason: row.reason.map(|reason| reason.label()),
+        coverage: report.coverage.label(),
+        actual_count: report.actual_count,
+        bound_count: report.bound_count,
+        terminal: row.terminal,
+    }
+}
+
+pub(super) fn render_call_effect(
+    analyzer: &dyn IAnalyzer,
+    value: &effects::CallEffectValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCallEffect {
+    let report = &value.report;
+    let row = value.row();
+    let callee = value
+        .callee_declaration()
+        .cloned()
+        .map(|declaration| render_declaration(analyzer, &declaration, detail, cache));
+    CodeQueryCallEffect {
+        id: row.id.clone(),
+        site_id: row.site_id.clone(),
+        site_ast_id: row.site_ast_id.clone(),
+        path: rel_path_string(&report.file),
+        language: crate::analyzer::common::language_for_file(&report.file).config_label(),
+        range: render_source_range(analyzer, &report.file, &row.range, cache),
+        target_id: row.target_id.clone(),
+        callee,
+        callee_symbol: row.callee_symbol.clone(),
+        effect_id: row.effect_id.clone(),
+        classification: row.classification.label(),
+        timing: row.timing.map(|timing| timing.label()),
+        certainty: row.certainty.map(|certainty| certainty.label()),
+        proof: row.proof.map(|proof| proof.label()),
+        derivation: row.derivation.label(),
+        reason: row.reason.map(|reason| reason.label()),
+        coverage: report.coverage.label(),
+        pack_id: row.pack_id.clone(),
+        model_id: row.model_id.clone(),
+        summary_id: row.summary_id.clone(),
+        arm_count: report.arm_count,
+        modeled_arm_count: report.modeled_arm_count,
+        terminal: row.terminal,
+    }
+}
+
+pub(super) fn render_procedure_effect(
+    analyzer: &dyn IAnalyzer,
+    value: &effects::ProcedureEffectValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryProcedureEffect {
+    let declaration = &value.subject.declaration;
+    let row = value.row();
+    CodeQueryProcedureEffect {
+        id: row.id.clone(),
+        procedure_id: row.procedure_declaration_id.clone(),
+        procedure_name: row.procedure_name.clone(),
+        path: rel_path_string(declaration.unit.source()),
+        language: crate::analyzer::common::language_for_file(declaration.unit.source())
+            .config_label(),
+        range: render_source_range(
+            analyzer,
+            declaration.unit.source(),
+            &declaration.range,
+            cache,
+        ),
+        effect_id: row.effect_id.clone(),
+        classification: row
+            .classification
+            .map(|classification| classification.label()),
+        certainty: row.certainty.map(|certainty| certainty.label()),
+        timing: row.timing.map(|timing| timing.label()),
+        depth: row.depth,
+        derivation: row.derivation.label(),
+        reason: row.reason.map(|reason| reason.label()),
+        coverage: row.coverage.label(),
+        witness_available: !row.witness.is_empty(),
+        witness_steps: row.witness.len(),
+        witness_site_id: row.witness_site_id().map(str::to_owned),
+        witness_effect_site_id: row.witness_effect_site_id().map(str::to_owned),
+        witness_chain: row.witness_chain(),
+        witness_truncated: row.witness_truncated,
+        pack_id: row.pack_id.clone(),
+        model_id: row.model_id.clone(),
+        summary_id: row.summary_id.clone(),
+        terminal: row.terminal,
     }
 }
 

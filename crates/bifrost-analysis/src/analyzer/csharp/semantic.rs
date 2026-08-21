@@ -18,6 +18,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 };
 use crate::analyzer::{CSharpAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 
 const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v3";
 
@@ -183,6 +184,7 @@ fn enumerate_procedures<'tree>(
     cancellation: &CancellationToken,
 ) -> Result<ProcedureEnumeration<'tree>, SemanticProviderError> {
     let root = prepared.tree().root_node();
+    let ancestry = ParentIndex::new(root);
     let mut inventory =
         ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "csharp-source", budget)?;
     let mut specs = Vec::new();
@@ -232,7 +234,7 @@ fn enumerate_procedures<'tree>(
 
         let mut child_parent = frame.lexical_parent;
         if let Some((kind, segment_kind, body, properties)) =
-            callable_shape(prepared.source(), frame.node)
+            callable_shape(prepared.source(), frame.node, &ancestry)
         {
             let name = callable_name(prepared.source(), frame.node);
             let anchor =
@@ -464,6 +466,7 @@ fn enclosing_variable_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
 fn callable_shape<'tree>(
     source: &str,
     node: Node<'tree>,
+    ancestry: &ParentIndex<'tree>,
 ) -> Option<(
     ProcedureKind,
     DeclarationSegmentKind,
@@ -545,7 +548,7 @@ fn callable_shape<'tree>(
     let is_generator = body_contains_yield(body);
     let dispatch_extensibility =
         brokk_bifrost_csharp::syntax::csharp_callable_dispatch_extensibility(
-            source, node, is_static,
+            source, node, is_static, ancestry,
         );
     Some((
         kind,

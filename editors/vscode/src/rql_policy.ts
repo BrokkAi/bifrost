@@ -1,7 +1,7 @@
 import { RQL_POLICY_LANGUAGE_ID } from "./rql_validation";
 
 export const RUN_RQL_POLICY_METHOD = "bifrost/runPolicy";
-export const SUPPORTED_POLICY_REPORT_SCHEMA_VERSION = 4;
+export const SUPPORTED_POLICY_REPORT_SCHEMA_VERSION = 5;
 export const SUPPORTED_POLICY_DISPLAY_PATH_SCHEMA_VERSION = 1;
 
 export interface RqlPolicyDocument {
@@ -166,7 +166,7 @@ export interface PolicyReportDiagnostic {
 }
 
 export interface PolicyReport {
-  schema_version: 4;
+  schema_version: 5;
   evaluation: PolicyReportEvaluation;
   execution: PolicyExecutionMetadata;
   rules: PolicyRule[];

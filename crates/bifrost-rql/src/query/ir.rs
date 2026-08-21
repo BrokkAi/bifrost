@@ -86,6 +86,9 @@ pub enum QueryValueKind {
     CallShape,
     CallArgumentGroup,
     CallArgument,
+    CallBinding,
+    CallEffect,
+    ProcedureEffect,
     CallableSignature,
     SignatureParameter,
     CallableApplicability,
@@ -134,6 +137,9 @@ impl QueryValueKind {
             Self::CallShape => "call_shape",
             Self::CallArgumentGroup => "call_argument_group",
             Self::CallArgument => "call_argument",
+            Self::CallBinding => "call_binding",
+            Self::CallEffect => "call_effect",
+            Self::ProcedureEffect => "procedure_effect",
             Self::CallableSignature => "callable_signature",
             Self::SignatureParameter => "signature_parameter",
             Self::CallableApplicability => "callable_applicability",
@@ -345,6 +351,9 @@ pub enum QueryStep {
     CallShape,
     CallArgumentGroups,
     CallArguments,
+    CallBindings,
+    CallEffects,
+    ProcedureEffects,
     CallableSignature,
     SignatureParameters,
     CallableApplicability,
@@ -841,6 +850,9 @@ impl QueryStep {
             Self::CallShape => QueryStepOp::CallShape,
             Self::CallArgumentGroups => QueryStepOp::CallArgumentGroups,
             Self::CallArguments => QueryStepOp::CallArguments,
+            Self::CallBindings => QueryStepOp::CallBindings,
+            Self::CallEffects => QueryStepOp::CallEffects,
+            Self::ProcedureEffects => QueryStepOp::ProcedureEffects,
             Self::CallableSignature => QueryStepOp::CallableSignature,
             Self::SignatureParameters => QueryStepOp::SignatureParameters,
             Self::CallableApplicability => QueryStepOp::CallableApplicability,
@@ -925,6 +937,9 @@ impl QueryStep {
             QueryStepOp::CallShape => Some(Self::CallShape),
             QueryStepOp::CallArgumentGroups => Some(Self::CallArgumentGroups),
             QueryStepOp::CallArguments => Some(Self::CallArguments),
+            QueryStepOp::CallBindings => Some(Self::CallBindings),
+            QueryStepOp::CallEffects => Some(Self::CallEffects),
+            QueryStepOp::ProcedureEffects => Some(Self::ProcedureEffects),
             QueryStepOp::CallableSignature => Some(Self::CallableSignature),
             QueryStepOp::SignatureParameters => Some(Self::SignatureParameters),
             QueryStepOp::CallableApplicability => Some(Self::CallableApplicability),
@@ -1015,6 +1030,9 @@ impl QueryStep {
                 | QueryValueKind::CallShape
                 | QueryValueKind::CallArgumentGroup
                 | QueryValueKind::CallArgument
+                | QueryValueKind::CallBinding
+                | QueryValueKind::CallEffect
+                | QueryValueKind::ProcedureEffect
                 | QueryValueKind::CallableSignature
                 | QueryValueKind::SignatureParameter
                 | QueryValueKind::CallableApplicability
@@ -1089,6 +1107,11 @@ impl QueryStep {
             }
             (Self::CallArguments, QueryValueKind::CallArgumentGroup) => {
                 Some(QueryValueKind::CallArgument)
+            }
+            (Self::CallBindings, QueryValueKind::CallShape) => Some(QueryValueKind::CallBinding),
+            (Self::CallEffects, QueryValueKind::CallShape) => Some(QueryValueKind::CallEffect),
+            (Self::ProcedureEffects, QueryValueKind::Declaration) => {
+                Some(QueryValueKind::ProcedureEffect)
             }
             (Self::CallableSignature, QueryValueKind::Declaration) => {
                 Some(QueryValueKind::CallableSignature)
@@ -1259,6 +1282,9 @@ pub(super) fn validate_query_steps(
             QueryStep::CallShape => "structural_match, call_site, or occurrence",
             QueryStep::CallArgumentGroups => "call_shape",
             QueryStep::CallArguments => "call_argument_group",
+            QueryStep::CallBindings => "call_shape",
+            QueryStep::CallEffects => "call_shape",
+            QueryStep::ProcedureEffects => "declaration",
             QueryStep::CallableSignature => "declaration",
             QueryStep::SignatureParameters => "callable_signature",
             QueryStep::CallableApplicability | QueryStep::OverloadSelection => "occurrence",

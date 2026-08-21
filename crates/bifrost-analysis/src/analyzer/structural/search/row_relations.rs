@@ -54,7 +54,7 @@ pub(super) fn occurrence_expansions_for_file(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
     row_exhausted: &mut bool,
 ) -> Vec<PipelineExpansion> {
-    let Some(result) = cache.rows_for_file(analyzer, file, cancellation) else {
+    let Some(result) = cache.rows_for_file(analyzer, file, filter, cancellation) else {
         *row_exhausted = true;
         return Vec::new();
     };
@@ -118,7 +118,8 @@ pub(super) fn occurrences_of_declaration(
     let mut cancelled = false;
     for file in files {
         let declares_here = file == *declaration.unit.source();
-        let Some(result) = occurrence_cache.rows_for_file(analyzer, &file, cancellation) else {
+        let Some(result) = occurrence_cache.rows_for_file(analyzer, &file, filter, cancellation)
+        else {
             cancelled = true;
             break;
         };
@@ -255,8 +256,13 @@ pub(super) fn binding_occurrence_expansions(
     let Some(node) = value.row().node else {
         return Vec::new();
     };
-    let filter = OccurrenceFilter::default();
-    let Some(result) = occurrence_cache.rows_for_file(analyzer, value.file(), cancellation) else {
+    let filter = OccurrenceFilter {
+        classes: vec![OccurrenceClass::Binding],
+        ..OccurrenceFilter::default()
+    };
+    let Some(result) =
+        occurrence_cache.rows_for_file(analyzer, value.file(), &filter, cancellation)
+    else {
         *row_exhausted = true;
         return Vec::new();
     };
