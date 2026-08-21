@@ -8,13 +8,15 @@
 //! the rest of the C# seam already used.
 
 use brokk_bifrost_core::analyzer::model::{CallableArity, DispatchExtensibility};
+use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex};
 use tree_sitter::Node;
 
-pub fn csharp_callable_dispatch_extensibility(
+pub fn csharp_callable_dispatch_extensibility<'tree>(
     source: &str,
-    node: Node<'_>,
+    node: Node<'tree>,
     is_static: bool,
+    ancestry: &ParentIndex<'tree>,
 ) -> DispatchExtensibility {
     if matches!(
         node.kind(),
@@ -26,12 +28,12 @@ pub fn csharp_callable_dispatch_extensibility(
         return DispatchExtensibility::Closed;
     }
 
-    let modifier_owner = csharp_enclosing_accessor_owner(node).unwrap_or(node);
+    let modifier_owner = csharp_enclosing_accessor_owner(node, ancestry).unwrap_or(node);
     let plain_private = csharp_has_modifier(source, modifier_owner, "private")
         && !csharp_has_modifier(source, modifier_owner, "protected");
     if plain_private
         || csharp_has_modifier(source, modifier_owner, "sealed")
-        || csharp_enclosing_callable_type(modifier_owner).is_some_and(|owner| {
+        || csharp_enclosing_callable_type(modifier_owner, ancestry).is_some_and(|owner| {
             matches!(
                 owner.kind(),
                 "struct_declaration" | "record_struct_declaration"
@@ -45,7 +47,7 @@ pub fn csharp_callable_dispatch_extensibility(
         || ["virtual", "abstract", "override"]
             .into_iter()
             .any(|modifier| csharp_has_modifier(source, modifier_owner, modifier))
-        || csharp_enclosing_callable_type(modifier_owner)
+        || csharp_enclosing_callable_type(modifier_owner, ancestry)
             .is_some_and(|owner| owner.kind() == "interface_declaration" && !is_static);
     if dynamically_dispatched {
         DispatchExtensibility::Open
@@ -64,16 +66,22 @@ pub fn csharp_has_modifier(source: &str, node: Node<'_>, modifier: &str) -> bool
     })
 }
 
-fn csharp_enclosing_accessor_owner(node: Node<'_>) -> Option<Node<'_>> {
+fn csharp_enclosing_accessor_owner<'tree>(
+    node: Node<'tree>,
+    ancestry: &ParentIndex<'tree>,
+) -> Option<Node<'tree>> {
     (node.kind() == "accessor_declaration")
-        .then(|| node.parent())
+        .then(|| ancestry.parent(node))
         .flatten()
-        .and_then(|parent| parent.parent())
+        .and_then(|parent| ancestry.parent(parent))
         .filter(|owner| matches!(owner.kind(), "property_declaration" | "indexer_declaration"))
 }
 
-fn csharp_enclosing_callable_type(node: Node<'_>) -> Option<Node<'_>> {
-    let mut current = node.parent();
+fn csharp_enclosing_callable_type<'tree>(
+    node: Node<'tree>,
+    ancestry: &ParentIndex<'tree>,
+) -> Option<Node<'tree>> {
+    let mut current = ancestry.parent(node);
     while let Some(parent) = current {
         if matches!(
             parent.kind(),
@@ -85,7 +93,7 @@ fn csharp_enclosing_callable_type(node: Node<'_>) -> Option<Node<'_>> {
         ) {
             return Some(parent);
         }
-        current = parent.parent();
+        current = ancestry.parent(parent);
     }
     None
 }
@@ -283,6 +291,27 @@ fn csharp_type_segment_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     )
 }
 
+/// The generic arity represented by a tree-sitter `type_argument_list`.
+///
+/// Bound generic names expose one named `type` child per argument. Unbound
+/// names such as `Box<>` and `Pair<,>` expose no named children; their commas
+/// are still structured tree children, and C# defines their arity as one more
+/// than that comma count. Keeping both shapes here prevents callers from
+/// mistaking an unbound generic name for an arity-zero identifier (#2209).
+fn csharp_type_argument_arity(arguments: Node<'_>) -> usize {
+    debug_assert_eq!(arguments.kind(), "type_argument_list");
+    let bound_arity = arguments.named_child_count();
+    if bound_arity > 0 {
+        return bound_arity;
+    }
+    let mut cursor = arguments.walk();
+    arguments
+        .children(&mut cursor)
+        .filter(|child| child.kind() == ",")
+        .count()
+        + 1
+}
+
 fn csharp_type_node_segments_with_terminal_suffix(
     node: Node<'_>,
     source: &str,
@@ -319,7 +348,7 @@ fn csharp_type_node_segments_with_terminal_suffix(
                     .find(|child| child.kind() == "type_argument_list");
                 if let Some(name) = name {
                     let source_name = csharp_type_segment_text(name, source);
-                    let arity = type_arguments.map_or(0, |arguments| arguments.named_child_count());
+                    let arity = type_arguments.map_or(0, csharp_type_argument_arity);
                     if !source_name.is_empty() {
                         segments.push(if arity == 0 {
                             source_name.to_string()
@@ -964,7 +993,7 @@ pub fn csharp_member_name(node: Node<'_>) -> Option<CSharpMemberName<'_>> {
             })?;
             Some(CSharpMemberName {
                 identifier,
-                explicit_generic_arity: Some(type_arguments.named_child_count()),
+                explicit_generic_arity: Some(csharp_type_argument_arity(type_arguments)),
                 type_arguments: Some(type_arguments),
             })
         }
@@ -1195,4 +1224,44 @@ fn count_top_level_comma_separated(text: &str) -> usize {
     }
 
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::csharp_type_node_identity;
+    use tree_sitter::Parser;
+
+    fn generic_identity(source: &str, spelling: &str) -> String {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .expect("C# grammar loads");
+        let tree = parser.parse(source, None).expect("C# source parses");
+        let start = source.find(spelling).expect("generic spelling exists");
+        let end = start + spelling.len();
+        let mut node = tree
+            .root_node()
+            .named_descendant_for_byte_range(start, end)
+            .expect("generic spelling has a named node");
+        while node.kind() != "generic_name" {
+            node = node.parent().expect("generic_name ancestor exists");
+        }
+        csharp_type_node_identity(node, source)
+    }
+
+    #[test]
+    fn structured_generic_identity_preserves_bound_and_unbound_arity() {
+        assert_eq!(
+            generic_identity("class C { object M() => typeof(Box<>); }", "Box<>"),
+            "Box`1"
+        );
+        assert_eq!(
+            generic_identity("class C { object M() => typeof(Pair<,>); }", "Pair<,>"),
+            "Pair`2"
+        );
+        assert_eq!(
+            generic_identity("class C { Map<string, int> field; }", "Map<string, int>"),
+            "Map`2"
+        );
+    }
 }

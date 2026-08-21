@@ -444,11 +444,12 @@ pub(super) fn execute_occurrence_seed(
         }
         state.budget.scanned_files = projected.scanned_files;
 
-        let Some(result) =
-            state
-                .occurrence_cache
-                .rows_for_file(state.analyzer, &file, state.cancellation)
-        else {
+        let Some(result) = state.occurrence_cache.rows_for_file(
+            state.analyzer,
+            &file,
+            &seed.filter,
+            state.cancellation,
+        ) else {
             return cancelled_plan_execution();
         };
         state

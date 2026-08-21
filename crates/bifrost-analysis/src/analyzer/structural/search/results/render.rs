@@ -25,6 +25,9 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::CallShape { .. }
                 | CodeQueryResultValue::CallArgumentGroup { .. }
                 | CodeQueryResultValue::CallArgument { .. }
+                | CodeQueryResultValue::CallBinding { .. }
+                | CodeQueryResultValue::CallEffect { .. }
+                | CodeQueryResultValue::ProcedureEffect { .. }
                 | CodeQueryResultValue::CallableSignature { .. }
                 | CodeQueryResultValue::SignatureParameter { .. }
                 | CodeQueryResultValue::CallableApplicability { .. }
@@ -391,6 +394,75 @@ impl CodeQueryResult {
                                 .unwrap_or_default(),
                             if value.spread { "; spread" } else { "" },
                             value.group_id
+                        ));
+                    }
+                    CodeQueryResultValue::CallBinding { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [call binding; {}; {}] {} -> {}; site={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.binding_kind.unwrap_or("terminal"),
+                            value.mapping,
+                            value
+                                .actual_name
+                                .as_deref()
+                                .map(|name| format!("actual `{name}`"))
+                                .unwrap_or_else(|| value.actual_index.map_or_else(
+                                    || "no actual".to_string(),
+                                    |index| format!("actual {index}")
+                                )),
+                            value
+                                .formal_name
+                                .as_deref()
+                                .map(|name| format!("formal `{name}`"))
+                                .unwrap_or_else(|| value.formal_index.map_or_else(
+                                    || format!(
+                                        "no formal ({})",
+                                        value.reason.unwrap_or(value.coverage)
+                                    ),
+                                    |index| format!("formal {index}")
+                                )),
+                            value.site_id,
+                        ));
+                    }
+                    CodeQueryResultValue::CallEffect { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [call effect; {}; {}] {}{}; site={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.derivation,
+                            value.coverage,
+                            value.effect_id.as_deref().unwrap_or("no declared effect"),
+                            value
+                                .certainty
+                                .map(|certainty| format!(
+                                    " ({certainty}, {})",
+                                    value.timing.unwrap_or("unknown")
+                                ))
+                                .unwrap_or_else(|| value
+                                    .reason
+                                    .map(|reason| format!(" ({reason})"))
+                                    .unwrap_or_default()),
+                            value.site_id,
+                        ));
+                    }
+                    CodeQueryResultValue::ProcedureEffect { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [procedure effect; {}; {}] {} {}{}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.derivation,
+                            value.coverage,
+                            value.procedure_name,
+                            value.effect_id.as_deref().unwrap_or("no declared effect"),
+                            value
+                                .witness_chain
+                                .as_deref()
+                                .map(|chain| format!("; witness={chain}"))
+                                .unwrap_or_default(),
                         ));
                     }
                     CodeQueryResultValue::CallableSignature { value } => {

@@ -5,8 +5,7 @@ use crate::analyzer::semantic::{
     AbstractLocation, AccessPath, AccessPathRoot, AccessPathTail, AccessSelector, AllocationHandle,
     CallResultHandle, CallSiteHandle, EvidenceCompleteness, IndexSelector, MemoryLocationHandle,
     OracleCallContext, ProcedureHandle, ProcedurePortHandle, ProcedurePortKind, ProgramPointHandle,
-    ProofStatus, ScopedSemanticLocator, SemanticLocator, SemanticValueKind, ValueFlowEndpoint,
-    ValueHandle,
+    ProofStatus, ScopedSemanticLocator, SemanticLocator, ValueFlowEndpoint, ValueHandle,
 };
 
 define_dense_id! {
@@ -544,10 +543,10 @@ fn value_key(value: &ValueHandle) -> Result<ValueFlowCarrierKey, ValueFlowModelE
         .semantics()
         .value(value.id())
         .ok_or(ValueFlowModelError::StaleCarrier)?;
-    let ordinal = match row.kind {
-        SemanticValueKind::Parameter { ordinal, .. } => Some(ordinal),
-        _ => None,
-    };
+    let ordinal = value
+        .procedure()
+        .semantics()
+        .stable_value_ordinal(value.id());
     Ok(ValueFlowCarrierKey::Value {
         locator: source_locator(value.procedure(), row.source)?,
         role: row.kind.label().into(),

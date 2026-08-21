@@ -1587,7 +1587,6 @@ fn resolve_go_local_selector_chain(
                 )
             })
         })?;
-    let mut deepest_workspace_field = None;
     for (index, member) in selector
         .members
         .iter()
@@ -1616,41 +1615,28 @@ fn resolve_go_local_selector_chain(
                 candidates.clone(),
             ));
         }
-        if let GoDefinitionMemberLookup::Unique(candidate) = &lookup {
-            deepest_workspace_field = Some(vec![candidate.clone()]);
-        }
         if index + 1 == selector.focus_segment {
             return match lookup {
                 GoDefinitionMemberLookup::Unique(candidate) => {
                     Some(candidates_outcome(vec![candidate]))
                 }
                 GoDefinitionMemberLookup::Ambiguous(_) => unreachable!("handled above"),
-                GoDefinitionMemberLookup::Missing => deepest_workspace_field
-                    .map(|candidates| go_partial_selector_chain_outcome(candidates, member)),
+                GoDefinitionMemberLookup::Missing => Some(no_definition(
+                    "no_indexed_definition",
+                    format!("`{member}` did not resolve to an indexed Go definition"),
+                )),
             };
         }
         if let Some(owner) = owner_inferred.take() {
-            let Some(next_owner) = go_field_inferred_type_for_receiver(
+            let next_owner = go_field_inferred_type_for_receiver(
                 analyzer, token, support, &owner, &owner_fqn, member,
-            ) else {
-                return deepest_workspace_field
-                    .map(|candidates| go_partial_selector_chain_outcome(candidates, member));
-            };
-            let Some(next_owner_fqn) =
-                go_resolve_inferred_type_fqn(support, token, go, &next_owner)
-            else {
-                return deepest_workspace_field
-                    .map(|candidates| go_partial_selector_chain_outcome(candidates, member));
-            };
+            )?;
+            let next_owner_fqn = go_resolve_inferred_type_fqn(support, token, go, &next_owner)?;
             owner_fqn = next_owner_fqn;
             owner_inferred = Some(next_owner);
         } else {
-            let Some(next_owner) =
-                go_indexed_field_type_fqn(analyzer, token, support, &owner_fqn, member)
-            else {
-                return deepest_workspace_field
-                    .map(|candidates| go_partial_selector_chain_outcome(candidates, member));
-            };
+            let next_owner =
+                go_indexed_field_type_fqn(analyzer, token, support, &owner_fqn, member)?;
             owner_fqn = next_owner;
         }
     }
@@ -1672,20 +1658,6 @@ fn go_ambiguous_selector_outcome(
         return ambiguous_without_candidates(message);
     }
     ambiguous_candidates_outcome(candidates, message)
-}
-
-fn go_partial_selector_chain_outcome(
-    candidates: Vec<CodeUnit>,
-    missing_member: &str,
-) -> DefinitionLookupOutcome {
-    let mut outcome = candidates_outcome(candidates);
-    outcome.diagnostics.push(DefinitionLookupDiagnostic {
-        kind: PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND.to_string(),
-        message: format!(
-            "resolved the deepest indexed Go workspace field before `{missing_member}`"
-        ),
-    });
-    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3507,6 +3479,34 @@ mod bounded_tests {
         let tree = parse_go_tree(&source).expect("Go tree");
         let site = site_for(&file, &source, expression, "Service");
         (fixture, file, source, tree, site)
+    }
+
+    #[test]
+    fn unresolved_terminal_selector_does_not_return_its_receiver_field() {
+        let source = "package repro\n\nimport \"sync\"\n\ntype anonymizer struct { lock sync.Mutex }\nfunc (a *anonymizer) SaveMapping() { a.lock.Lock() }\n";
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(source).expect("Go tree");
+        let site = site_for(&file, source, "a.lock.Lock()", "Lock");
+
+        let outcome = resolve_go_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("Go selector lookup should complete: {outcome:#?}");
+        };
+        assert_eq!(
+            DefinitionLookupStatus::NoDefinition,
+            value.status,
+            "{value:#?}"
+        );
+        assert!(value.definitions.is_empty(), "{value:#?}");
     }
 
     #[test]

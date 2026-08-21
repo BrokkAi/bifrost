@@ -1334,6 +1334,149 @@ fn call_shape_projects_typed_group_and_argument_rows() {
 }
 
 #[test]
+fn call_bindings_project_typed_actual_to_formal_rows() {
+    let rql = CodeQuery::from_sexp(r#"(call-bindings (call-shape (call :callee "run")))"#)
+        .expect("call binding RQL");
+    assert_eq!(rql.validate_steps().unwrap(), QueryValueKind::CallBinding);
+    assert_eq!(rql.schema_version, SCHEMA_VERSION);
+
+    let json = parse_ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "match": { "kind": "call", "callee": { "name": "run" } },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "call_bindings" }
+        ]
+    }));
+    assert_eq!(json.validate_steps().unwrap(), QueryValueKind::CallBinding);
+    assert_eq!(json.to_canonical_json()["steps"][1]["op"], "call_bindings");
+    // Both frontends lower to the same plan, so the S-expression spelling is a
+    // surface and never a second semantics.
+    assert_eq!(rql.to_canonical_json(), json.to_canonical_json());
+
+    // The binding relation is derived where the call-shape identities exist,
+    // so nothing else is a legal upstream.
+    let wrong = CodeQuery::from_json(&json!({
+        "match": { "kind": "call" },
+        "steps": [{ "op": "call_bindings" }]
+    }))
+    .expect_err("call_bindings must reject a structural upstream");
+    assert!(
+        wrong.message.contains("requires call_shape"),
+        "{}",
+        wrong.message
+    );
+
+    // A binding row reaches its file like every other row domain.
+    let files = parse_ok(json!({
+        "match": { "kind": "call", "callee": { "name": "run" } },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "call_bindings" },
+            { "op": "file_of" }
+        ]
+    }));
+    assert_eq!(files.validate_steps().unwrap(), QueryValueKind::File);
+}
+
+#[test]
+fn effect_steps_project_typed_call_and_procedure_effect_rows() {
+    let call_rql = CodeQuery::from_sexp(r#"(call-effects (call-shape (call :callee "send")))"#)
+        .expect("call effect RQL");
+    assert_eq!(
+        call_rql.validate_steps().unwrap(),
+        QueryValueKind::CallEffect
+    );
+    assert_eq!(call_rql.schema_version, SCHEMA_VERSION);
+
+    let call_json = parse_ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "match": { "kind": "call", "callee": { "name": "send" } },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "call_effects" }
+        ]
+    }));
+    assert_eq!(
+        call_json.validate_steps().unwrap(),
+        QueryValueKind::CallEffect
+    );
+    assert_eq!(
+        call_json.to_canonical_json()["steps"][1]["op"],
+        "call_effects"
+    );
+    // Both frontends lower to the same plan, so the S-expression spelling is a
+    // surface and never a second semantics.
+    assert_eq!(call_rql.to_canonical_json(), call_json.to_canonical_json());
+
+    // A direct effect is a fact about a call site, so the call-shape row -- the
+    // only upstream that owns a stable site identity -- is the sole legal input.
+    let wrong_call = CodeQuery::from_json(&json!({
+        "match": { "kind": "call" },
+        "steps": [{ "op": "call_effects" }]
+    }))
+    .expect_err("call_effects must reject a structural upstream");
+    assert!(
+        wrong_call.message.contains("requires call_shape"),
+        "{}",
+        wrong_call.message
+    );
+
+    let procedure_rql =
+        CodeQuery::from_sexp(r#"(procedure-effects (enclosing-decl (method (name "handle"))))"#)
+            .expect("procedure effect RQL");
+    assert_eq!(
+        procedure_rql.validate_steps().unwrap(),
+        QueryValueKind::ProcedureEffect
+    );
+    let procedure_json = parse_ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "match": { "kind": "method", "name": "handle" },
+        "steps": [{ "op": "enclosing_decl" }, { "op": "procedure_effects" }]
+    }));
+    assert_eq!(
+        procedure_json.validate_steps().unwrap(),
+        QueryValueKind::ProcedureEffect
+    );
+    assert_eq!(
+        procedure_rql.to_canonical_json(),
+        procedure_json.to_canonical_json()
+    );
+
+    // A summary is keyed on a declaration, so a call-shape upstream is refused.
+    let wrong_procedure = CodeQuery::from_json(&json!({
+        "match": { "kind": "call", "callee": { "name": "send" } },
+        "steps": [{ "op": "call_shape" }, { "op": "procedure_effects" }]
+    }))
+    .expect_err("procedure_effects must reject a call-shape upstream");
+    assert!(
+        wrong_procedure.message.contains("requires declaration"),
+        "{}",
+        wrong_procedure.message
+    );
+
+    // Both effect rows reach their file like every other row domain.
+    for steps in [
+        vec![
+            json!({ "op": "call_shape" }),
+            json!({ "op": "call_effects" }),
+        ],
+        vec![
+            json!({ "op": "enclosing_decl" }),
+            json!({ "op": "procedure_effects" }),
+        ],
+    ] {
+        let mut steps = steps;
+        steps.push(json!({ "op": "file_of" }));
+        let files = parse_ok(json!({
+            "match": { "kind": "method", "name": "handle" },
+            "steps": steps
+        }));
+        assert_eq!(files.validate_steps().unwrap(), QueryValueKind::File);
+    }
+}
+
+#[test]
 fn callable_signature_projects_typed_signature_and_parameter_rows() {
     let signature =
         CodeQuery::from_sexp(r#"(callable-signature (enclosing-decl (method (name "run"))))"#)

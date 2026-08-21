@@ -2809,9 +2809,11 @@ impl<'a> CppVisitor<'a> {
         &self,
         declaration_node: Node<'_>,
         scope: &ScopeInfo,
+        ancestry: &ParentIndex<'_>,
     ) -> bool {
         self.c_tag_semantics
             && scope.class_unit.is_some()
+            && class_like_name(declaration_node, self.source, ancestry).is_some()
             && matches!(
                 declaration_node.kind(),
                 "struct_specifier" | "union_specifier" | "enum_specifier"
@@ -2854,15 +2856,16 @@ impl<'a> CppVisitor<'a> {
         // below still owns its members, so fields and enumerators are
         // unaffected.
         let c_tag_scope;
-        let scope = if self.mints_tag_at_enclosing_c_scope(declaration_node, &recovered_scope) {
-            c_tag_scope = ScopeInfo {
-                class_unit: None,
-                ..recovered_scope.clone()
+        let scope =
+            if self.mints_tag_at_enclosing_c_scope(declaration_node, &recovered_scope, ancestry) {
+                c_tag_scope = ScopeInfo {
+                    class_unit: None,
+                    ..recovered_scope.clone()
+                };
+                &c_tag_scope
+            } else {
+                &recovered_scope
             };
-            &c_tag_scope
-        } else {
-            &recovered_scope
-        };
         let short_name = if let Some(parent) = &scope.class_unit {
             cpp_join_nested_short(parent.short_name(), &name)
         } else {
@@ -2922,10 +2925,14 @@ impl<'a> CppVisitor<'a> {
         }
         if has_body {
             if let Some(range) = explicit_range {
-                self.parsed
-                    .replace_code_unit_with_range(code_unit.clone(), range, None, None);
+                self.parsed.replace_code_unit_with_range_deferred(
+                    code_unit.clone(),
+                    range,
+                    None,
+                    None,
+                );
             } else {
-                self.parsed.replace_code_unit(
+                self.parsed.replace_code_unit_deferred(
                     code_unit.clone(),
                     declaration_node,
                     self.source,
@@ -3851,6 +3858,10 @@ impl<'a> CppVisitor<'a> {
             self.add_type_aliases(node, scope, recovered_alias_names);
             return;
         }
+        if self.visit_c_anonymous_aggregate_declaration(node, scope, in_class_body, stack, ancestry)
+        {
+            return;
+        }
 
         if let Some(recovered) = recover_exported_class_declaration(node, self.source) {
             if let Some(fragmented) = recovered.fragmented_body.as_ref() {
@@ -4010,6 +4021,73 @@ impl<'a> CppVisitor<'a> {
                 self.visit_global_variables_from_declaration(node, scope, ancestry);
             }
         }
+    }
+
+    /// Preserve the member structure of an anonymous C aggregate.
+    ///
+    /// An anonymous union with no declarator promotes its fields into the
+    /// containing aggregate. An anonymous struct/union followed by a named
+    /// declarator, such as `struct { T *ops; } sock`, declares both the field
+    /// `sock` and an otherwise unnamed receiver type. Give that receiver type
+    /// the declarator's structured nested identity so a later `value.sock.ops`
+    /// chain can traverse it without parsing a type spelling (#2407).
+    fn visit_c_anonymous_aggregate_declaration<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &ScopeInfo,
+        in_class_body: bool,
+        stack: &mut Vec<CppWork<'tree>>,
+        ancestry: &ParentIndex<'tree>,
+    ) -> bool {
+        if !self.c_tag_semantics || !in_class_body || scope.class_unit.is_none() {
+            return false;
+        }
+        let Some(aggregate) = node.child_by_field_name("type") else {
+            return false;
+        };
+        if !matches!(aggregate.kind(), "struct_specifier" | "union_specifier")
+            || aggregate.child_by_field_name("name").is_some()
+        {
+            return false;
+        }
+        let Some(body) = cpp_body_node(aggregate) else {
+            return false;
+        };
+
+        let mut cursor = node.walk();
+        let declarators = node
+            .children_by_field_name("declarator", &mut cursor)
+            .filter_map(|declarator| match classify_declarator(declarator) {
+                Some(DeclaratorKind::Variable(variable)) => Some(variable),
+                Some(DeclaratorKind::Function(_)) | None => None,
+            })
+            .collect::<Vec<_>>();
+        if declarators.is_empty() {
+            stack.push(CppWork::Container(CppContainer {
+                node: body,
+                scope: scope.clone(),
+            }));
+            return true;
+        }
+
+        for declarator in declarators {
+            let Some(name) = extract_variable_name(declarator, self.source) else {
+                continue;
+            };
+            self.visit_variable_declaration(node, declarator, scope, true, ancestry);
+            self.visit_named_class_like_shape(
+                aggregate,
+                name,
+                Some(body),
+                true,
+                None,
+                None,
+                scope,
+                stack,
+                ancestry,
+            );
+        }
+        true
     }
 
     fn visit_function_declaration<'tree>(
@@ -4292,7 +4370,8 @@ impl<'a> CppVisitor<'a> {
         stack: &mut Vec<CppWork<'tree>>,
         ancestry: &ParentIndex<'tree>,
     ) {
-        if let Some(type_node) = node.child_by_field_name("type")
+        let type_node = node.child_by_field_name("type");
+        if let Some(type_node) = type_node
             && matches!(
                 type_node.kind(),
                 "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
@@ -4324,7 +4403,36 @@ impl<'a> CppVisitor<'a> {
             "type_definition" => extract_typedef_alias_names(node, self.source),
             _ => Vec::new(),
         };
+        let anonymous_aggregate = if let (Some(type_node), [alias_name]) =
+            (type_node, alias_names.as_slice())
+            && matches!(type_node.kind(), "struct_specifier" | "union_specifier")
+            && type_node.child_by_field_name("name").is_none()
+        {
+            cpp_body_node(type_node).map(|body| (body, alias_name.clone()))
+        } else {
+            None
+        };
         self.add_type_aliases(node, scope, alias_names);
+        if let Some((body, alias_name)) = anonymous_aggregate {
+            // The typedef alias is also the only user-visible identity of an
+            // anonymous aggregate. Reuse it as the member owner instead of
+            // minting a second signatureless class with the same FQN. The
+            // latter makes forward lookup ambiguous when conditional aliases
+            // coexist and returns duplicate definitions even without guards.
+            let signature = normalize_cpp_whitespace(node_text(node, self.source));
+            let alias_unit = self.type_alias_unit(scope, alias_name, signature);
+            debug_assert!(self.parsed.contains_declaration(&alias_unit));
+            let mut nested_scope = scope.clone();
+            nested_scope.class_unit = Some(alias_unit);
+            nested_scope.template_signature = scope.template_signature.clone();
+            nested_scope.template_metadata = None;
+            nested_scope.declarations_are_fields = false;
+            nested_scope.recovered_specialization_member_scope = false;
+            stack.push(CppWork::Container(CppContainer {
+                node: body,
+                scope: nested_scope,
+            }));
+        }
     }
 
     fn add_type_aliases(&mut self, node: Node<'_>, scope: &ScopeInfo, alias_names: Vec<String>) {
@@ -4357,27 +4465,7 @@ impl<'a> CppVisitor<'a> {
             if alias_name.is_empty() || type_name.as_deref() == Some(alias_name.as_str()) {
                 continue;
             }
-            let short_name = if let Some(parent) = &scope.class_unit {
-                cpp_join_nested_short(parent.short_name(), &alias_name)
-            } else {
-                alias_name.clone()
-            };
-            let fq = cpp_leaf_fq(
-                &scope.package_name,
-                scope.class_unit.as_ref(),
-                &alias_name,
-                SegmentKind::Nested,
-                SegmentKind::Type,
-            );
-            let code_unit = CodeUnit::with_signature_and_fq(
-                self.file.clone(),
-                CodeUnitType::Class,
-                scope.package_name.clone(),
-                short_name,
-                Some(signature.clone()),
-                false,
-                fq,
-            );
+            let code_unit = self.type_alias_unit(scope, alias_name, signature.clone());
             // Declaration identity does not include the alias signature. Keep
             // each physical range so conditional aliases retain their guards.
             self.parsed
@@ -4397,6 +4485,35 @@ impl<'a> CppVisitor<'a> {
             }
             self.parsed.mark_type_alias(code_unit);
         }
+    }
+
+    fn type_alias_unit(
+        &self,
+        scope: &ScopeInfo,
+        alias_name: String,
+        signature: String,
+    ) -> CodeUnit {
+        let short_name = if let Some(parent) = &scope.class_unit {
+            cpp_join_nested_short(parent.short_name(), &alias_name)
+        } else {
+            alias_name.clone()
+        };
+        let fq = cpp_leaf_fq(
+            &scope.package_name,
+            scope.class_unit.as_ref(),
+            &alias_name,
+            SegmentKind::Nested,
+            SegmentKind::Type,
+        );
+        CodeUnit::with_signature_and_fq(
+            self.file.clone(),
+            CodeUnitType::Class,
+            scope.package_name.clone(),
+            short_name,
+            Some(signature),
+            false,
+            fq,
+        )
     }
 
     fn visit_macro(&mut self, node: Node<'_>) {
@@ -13693,26 +13810,53 @@ ABSL_NAMESPACE_END
         }
     }
 
-    /// Boundary: a tag that is forward-declared *and then* defined is a real
-    /// removal, and unlinking it still costs one pass over its owner's child
-    /// list. That residual is linear per redefined tag, not per declaration in
-    /// the file, and is recorded on the issue rather than pinned here.
+    /// Forward declarations followed by definitions are compacted as one
+    /// batch, without rescanning the shared namespace/top-level lists for each
+    /// tag. Definitions are intentionally visited in reverse order so the
+    /// assertion also pins eager remove-and-reappend ordering.
     #[test]
-    fn defining_an_aggregate_scans_nothing_it_did_not_declare() {
+    fn forward_declared_aggregates_are_replaced_without_sibling_scans() {
         for aggregates in [64usize, 512] {
-            let mut source = String::from("typedef unsigned long long u64;\n");
+            let mut source =
+                String::from("typedef unsigned long long u64;\nnamespace generated {\n");
             for index in 0..aggregates {
+                writeln!(source, "struct tag{index};").unwrap();
+            }
+            for index in (0..aggregates).rev() {
                 writeln!(
                     source,
                     "struct tag{index} {{\n\tu64 first;\n\tint second;\n}};"
                 )
                 .unwrap();
             }
+            source.push_str("}\n");
 
             start_code_unit_removal_scan_probe();
             let parsed = parse_cpp_declarations(&source, "vmlinux.h");
             let scanned = finish_code_unit_removal_scan_probe();
 
+            let expected_names: Vec<String> = (0..aggregates)
+                .rev()
+                .map(|index| format!("tag{index}"))
+                .collect();
+            let top_level_names: Vec<String> = parsed
+                .top_level_declarations
+                .iter()
+                .filter(|unit| unit.is_class() && unit.short_name().starts_with("tag"))
+                .map(|unit| unit.short_name().to_string())
+                .collect();
+            let namespace = parsed
+                .declarations()
+                .iter()
+                .find(|unit| {
+                    unit.kind() == CodeUnitType::Module && unit.short_name() == "generated"
+                })
+                .expect("generated namespace should be declared");
+            let child_names: Vec<String> = parsed.children[namespace]
+                .iter()
+                .filter(|unit| unit.is_class() && unit.short_name().starts_with("tag"))
+                .map(|unit| unit.short_name().to_string())
+                .collect();
             assert_eq!(
                 aggregates,
                 parsed
@@ -13722,10 +13866,11 @@ ABSL_NAMESPACE_END
                     .count(),
                 "every aggregate must still be declared at {aggregates} aggregates"
             );
+            assert_eq!(expected_names, top_level_names);
+            assert_eq!(expected_names, child_names);
             assert_eq!(
                 0, scanned,
-                "defining {aggregates} distinct aggregates removed nothing, so the removal step \
-                 must not have walked a single sibling or top-level declaration"
+                "replacing {aggregates} forward declarations must compact their shared lists once"
             );
         }
     }
@@ -14702,6 +14847,32 @@ struct Widget {
                     .iter()
                     .any(|unit| unit.is_class() && unit.fq_name() == "T"),
                 "{name}: {declarations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn c_anonymous_aggregate_members_keep_promoted_and_named_receiver_shapes() {
+        let source = "typedef struct { union { struct { struct socket_ops *ops; } sock; int other; }; } *PAL_HANDLE;\n";
+        let parsed = parse_cpp_declarations(source, "socket.c");
+        let declarations = parsed.declarations();
+        assert_eq!(
+            declarations
+                .iter()
+                .filter(|unit| unit.fq_name() == "PAL_HANDLE")
+                .count(),
+            1,
+            "the typedef alias is the anonymous aggregate owner: {declarations:#?}"
+        );
+        for expected in [
+            "PAL_HANDLE",
+            "PAL_HANDLE.sock",
+            "PAL_HANDLE$sock",
+            "PAL_HANDLE$sock.ops",
+        ] {
+            assert!(
+                declarations.iter().any(|unit| unit.fq_name() == expected),
+                "expected {expected}, got {declarations:?}"
             );
         }
     }

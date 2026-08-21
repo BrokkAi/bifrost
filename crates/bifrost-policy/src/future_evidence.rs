@@ -878,6 +878,101 @@ impl TaintFindingEvidence {
     }
 }
 
+/// Evidence for one policy-authored value-flow finding (#2436).
+///
+/// A flow finding is one origin/observation meeting proved by the same
+/// production interprocedural solver a taint finding uses, so it retains the
+/// same facts. The wrapper exists for two reasons a reader can check: the
+/// report names the analysis kind that produced the finding, and the
+/// serialized evidence uses provenance vocabulary rather than security
+/// vocabulary. The synthetic label, categories and source scenarios the flow
+/// lowering mints are constants of the analysis kind, so they are not
+/// published: publishing them would invite a reader to treat a correctness
+/// rule as a taint classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowFindingEvidence {
+    inner: TaintFindingEvidence,
+}
+
+impl FlowFindingEvidence {
+    pub(crate) const fn new(inner: TaintFindingEvidence) -> Self {
+        Self { inner }
+    }
+
+    /// The taint-shaped evidence this flow finding was projected from. Report
+    /// consumers that need the shared retained facts -- witness references,
+    /// truncation flags, the anchor -- read them through here.
+    pub const fn taint_shaped(&self) -> &TaintFindingEvidence {
+        &self.inner
+    }
+
+    pub const fn analysis_finding_id(&self) -> &AnalysisFindingId {
+        self.inner.analysis_finding_id()
+    }
+    pub const fn anchor(&self) -> &TaintFindingAnchor {
+        self.inner.anchor()
+    }
+    /// The observation event the tracked value reached.
+    pub const fn observation(&self) -> &AnalysisEventRef {
+        self.inner.sink()
+    }
+    pub const fn origin_endpoint(&self) -> &ResolvedEndpointIdentity {
+        self.inner.source_endpoint()
+    }
+    pub const fn observation_endpoint(&self) -> &ResolvedEndpointIdentity {
+        self.inner.sink_endpoint()
+    }
+    pub fn origin_display_name(&self) -> &str {
+        self.inner.source_display_name()
+    }
+    pub fn observation_display_name(&self) -> &str {
+        self.inner.sink_display_name()
+    }
+    pub fn origins(&self) -> &[TaintOriginEvidence] {
+        self.inner.origins()
+    }
+    pub const fn origins_truncated(&self) -> bool {
+        self.inner.origins_truncated()
+    }
+    pub fn witness_refs(&self) -> &[WitnessId] {
+        self.inner.witness_refs()
+    }
+    pub const fn witness_refs_truncated(&self) -> bool {
+        self.inner.witness_refs_truncated()
+    }
+    pub const fn projection_facts_hash(&self) -> TaintProjectionFactsHash {
+        self.inner.projection_facts_hash()
+    }
+}
+
+impl Serialize for FlowFindingEvidence {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("FlowFindingEvidence", 12)?;
+        state.serialize_field("analysis_finding_id", self.analysis_finding_id())?;
+        state.serialize_field("anchor", self.anchor())?;
+        state.serialize_field("observation", self.observation())?;
+        state.serialize_field("origin_endpoint", self.origin_endpoint())?;
+        state.serialize_field("observation_endpoint", self.observation_endpoint())?;
+        state.serialize_field("origin_display_name", self.origin_display_name())?;
+        state.serialize_field("observation_display_name", self.observation_display_name())?;
+        state.serialize_field("origins", self.origins())?;
+        state.serialize_field("origins_truncated", &self.origins_truncated())?;
+        state.serialize_field("witness_refs", self.witness_refs())?;
+        state.serialize_field("witness_refs_truncated", &self.witness_refs_truncated())?;
+        state.serialize_field("projection_facts_hash", &self.projection_facts_hash())?;
+        state.end()
+    }
+}
+
+impl RetainedSize for FlowFindingEvidence {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>().saturating_add(retained_extra(&self.inner))
+    }
+}
+
 impl RetainedSize for TaintFindingEvidence {
     fn retained_size(&self) -> usize {
         size_of::<Self>()

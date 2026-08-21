@@ -45,6 +45,10 @@ pub enum PolicyAnalysisKind {
     Taint,
     Typestate,
     Assertion,
+    /// Policy-authored generic bounded value flow (#2436). Neutral
+    /// provenance/correctness vocabulary over the same typed binding system
+    /// taint uses; it is not a security classification.
+    Flow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,19 +79,29 @@ impl AnalysisOwners {
     const TAINT_BIT: u8 = 2;
     const TYPESTATE_BIT: u8 = 4;
     const ASSERTION_BIT: u8 = 8;
+    const FLOW_BIT: u8 = 16;
 
     pub const NONE: Self = Self(0);
     pub const MATCH: Self = Self(Self::MATCH_BIT);
     pub const TAINT: Self = Self(Self::TAINT_BIT);
     pub const TYPESTATE: Self = Self(Self::TYPESTATE_BIT);
     pub const ASSERTION: Self = Self(Self::ASSERTION_BIT);
+    pub const FLOW: Self = Self(Self::FLOW_BIT);
     pub const TAINT_OR_TYPESTATE: Self = Self(Self::TAINT_BIT | Self::TYPESTATE_BIT);
+    pub const TAINT_OR_FLOW: Self = Self(Self::TAINT_BIT | Self::FLOW_BIT);
+    pub const TAINT_TYPESTATE_OR_FLOW: Self =
+        Self(Self::TAINT_BIT | Self::TYPESTATE_BIT | Self::FLOW_BIT);
     /// Every analysis kind. Membership is audited record by record: the
     /// vocabulary carrying this applicability is policy metadata, report
     /// retention, taxonomy classification, and CVSS evidence, none of which
     /// reads the analysis kind, so the assertion kind belongs in all of it.
-    pub const ALL: Self =
-        Self(Self::MATCH_BIT | Self::TAINT_BIT | Self::TYPESTATE_BIT | Self::ASSERTION_BIT);
+    pub const ALL: Self = Self(
+        Self::MATCH_BIT
+            | Self::TAINT_BIT
+            | Self::TYPESTATE_BIT
+            | Self::ASSERTION_BIT
+            | Self::FLOW_BIT,
+    );
 
     pub const fn contains(self, kind: PolicyAnalysisKind) -> bool {
         let bit = match kind {
@@ -95,6 +109,7 @@ impl AnalysisOwners {
             PolicyAnalysisKind::Taint => Self::TAINT_BIT,
             PolicyAnalysisKind::Typestate => Self::TYPESTATE_BIT,
             PolicyAnalysisKind::Assertion => Self::ASSERTION_BIT,
+            PolicyAnalysisKind::Flow => Self::FLOW_BIT,
         };
         self.0 & bit != 0
     }
@@ -114,6 +129,13 @@ impl OwnerApplicability {
     pub const POLICY_ASSERTION: Self = Self::new(DocumentOwners::POLICY, AnalysisOwners::ASSERTION);
     pub const POLICY_TAINT_OR_TYPESTATE: Self =
         Self::new(DocumentOwners::POLICY, AnalysisOwners::TAINT_OR_TYPESTATE);
+    pub const POLICY_FLOW: Self = Self::new(DocumentOwners::POLICY, AnalysisOwners::FLOW);
+    pub const POLICY_TAINT_OR_FLOW: Self =
+        Self::new(DocumentOwners::POLICY, AnalysisOwners::TAINT_OR_FLOW);
+    pub const POLICY_TAINT_TYPESTATE_OR_FLOW: Self = Self::new(
+        DocumentOwners::POLICY,
+        AnalysisOwners::TAINT_TYPESTATE_OR_FLOW,
+    );
     pub const ENDPOINT: Self = Self::new(DocumentOwners::ENDPOINT, AnalysisOwners::NONE);
     pub const BOTH: Self = Self::new(DocumentOwners::BOTH, AnalysisOwners::ALL);
 
@@ -217,7 +239,7 @@ macro_rules! policy_records {
 policy_records! {
     Policy { labels: ["policy"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(policy [:schema-version N] :id ID :name NAME :message MESSAGE :severity SEVERITY :analysis ANALYSIS ...)", description: "Define one executable static-analysis policy." }
     Endpoint { labels: ["endpoint"], layout: KeywordPairs, owner: OwnerApplicability::ENDPOINT, signature: "(endpoint [:schema-version N] :id ID :name NAME :display-name TEXT :role source|sink ...)", description: "Define one diagnostic-neutral reusable source or sink endpoint." }
-    Analysis { labels: ["analysis"], layout: Mixed, owner: OwnerApplicability::POLICY_ALL, signature: "(analysis :type match|taint|typestate|assertion ...)", description: "Select and configure exactly one policy analysis kind." }
+    Analysis { labels: ["analysis"], layout: Mixed, owner: OwnerApplicability::POLICY_ALL, signature: "(analysis :type match|taint|typestate|assertion|flow ...)", description: "Select and configure exactly one policy analysis kind." }
     Bind { labels: ["bind"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(bind :name NAME (:query SELECTOR | :from NAME :step STEP))", description: "Bind one named typed row relation from a CodeQuery or an earlier binding expansion." }
     Filter { labels: ["filter"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(filter :over NAME :where ((BINDING.FIELD OP VALUE)...))", description: "Narrow one named row relation to the rows that satisfy every listed typed predicate. The relation keeps its name and its columns; only its rows change." }
     Project { labels: ["project"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(project :name NEW :from NAME :columns (BINDING.FIELD|(BINDING.FIELD NEW-FIELD)...))", description: "Publish a new named row relation holding chosen, optionally renamed, columns of an existing one. The projected relation takes the place of the one it reads." }
@@ -253,7 +275,7 @@ policy_records! {
     Evidence { labels: ["evidence"], layout: KeywordPairs, owner: OwnerApplicability::BOTH, signature: "(evidence [:trust-boundary VALUE] [:system-entry VALUE])", description: "Record coherent source evidence; at least one field is required." }
     Report { labels: ["report"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(report [:witness WITNESS] [:witnesses-per-finding N] [:origins-per-finding N])", description: "Bound witness and origin retention for each finding." }
     Witness { labels: ["witness"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(witness [:max-steps N] [:max-bytes N])", description: "Bound the retained steps and encoded bytes of one witness." }
-    EndpointSet { labels: ["endpoint-set"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(endpoint-set [:include-sets [...]] [:include-matches [...]] [:entries [...]])", description: "Compose a typed taint endpoint set from catalogs, endpoint matches, and local entries." }
+    EndpointSet { labels: ["endpoint-set"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_FLOW, signature: "(endpoint-set [:include-sets [...]] [:include-matches [...]] [:entries [...]])", description: "Compose a typed endpoint set from catalogs, endpoint matches, and local entries. A flow analysis composes only local entries." }
     Catalog { labels: ["catalog"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(catalog :name ID :version N [:sha256 HEX])", description: "Reference an explicitly registered, optionally content-pinned taint catalog." }
     MatchDirectory { labels: ["match-directory"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: "(match-directory :path PATH :scope direct|recursive [:role source|sink] [:phase PHASE] :categories (any|all [...]) [:manifest-sha256 HEX])", description: "Select endpoint leaves transactionally from an explicit capability-rooted directory." }
     MatchEndpoints { labels: ["match-endpoints"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: "(match-endpoints :ids [ENDPOINT-ID...] [:role source|sink] [:phase PHASE])", description: "Select exact endpoint IDs already present in the immutable endpoint index." }
@@ -265,6 +287,9 @@ policy_records! {
     Source { labels: ["source"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(source :id ID :display-name TEXT :categories [...] :selector SELECTOR :bind PORT :labels [...] [:evidence EVIDENCE])", description: "Declare one policy-local taint source." }
     Sink { labels: ["sink"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(sink :id ID :display-name TEXT :categories [...] :selector SELECTOR :dangerous-operand PORT :accepts [...] [:tags [...]] [:impacts [...]])", description: "Declare one policy-local taint sink." }
     Sanitizer { labels: ["sanitizer"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(sanitizer :id ID :selector SELECTOR :input PORT :output PORT :removes [LABEL...])", description: "Declare one policy-local sanitizer transfer." }
+    Origin { labels: ["origin"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_FLOW, signature: "(origin :id ID :display-name TEXT :selector SELECTOR :bind PORT)", description: "Declare one value-flow origin: the site and typed port where the tracked value is established." }
+    Observation { labels: ["observation"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_FLOW, signature: "(observation :id ID :display-name TEXT :selector SELECTOR :observed-operand PORT)", description: "Declare one value-flow observation: the site and typed port that consumes the tracked value." }
+    Kill { labels: ["kill"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_FLOW, signature: "(kill :id ID :selector SELECTOR :input PORT :output PORT)", description: "Declare one value-flow kill: at this site the output port no longer carries the tracked value established at the input port." }
     TransformEntry { labels: ["transform"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(transform :id ID :selector SELECTOR :input PORT :output PORT [:removes [...]] [:adds [...]])", description: "Declare one policy-local label transform." }
     ExternalModel { labels: ["external-model"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(external-model :id ID :selector SELECTOR :transfers [TRANSFER...])", description: "Declare typed transfer behavior for one external API." }
     Transfer { labels: ["transfer"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(transfer :from PORT :to PORT :labels [LABEL...] :effect EFFECT)", description: "Move selected labels between two typed external-model ports." }
@@ -273,7 +298,7 @@ policy_records! {
     FindingCombination { labels: ["finding-combination"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT, signature: "(finding-combination :id ID :source PREDICATE :sink PREDICATE :message TEXT ...)", description: "Override generic presentation for one finite source/sink endpoint combination." }
     SubjectSet { labels: ["subject-set"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(subject-set [:include-matches [...]] [:entries [...]])", description: "Compose the values newly tracked by a typestate policy." }
     Subject { labels: ["subject"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(subject :id ID :selector SELECTOR :subject BINDING)", description: "Declare one policy-local typestate seed and its bound subject." }
-    CallModeling { labels: ["call-modeling"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: "(call-modeling :unmodeled paranoid|optimistic|require-model)", description: "Choose fallback semantics for call arms without an executable body or applicable model." }
+    CallModeling { labels: ["call-modeling"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TAINT_TYPESTATE_OR_FLOW, signature: "(call-modeling :unmodeled paranoid|optimistic|require-model)", description: "Choose fallback semantics for call arms without an executable body or applicable model." }
     Uncertainty { labels: ["uncertainty"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(uncertainty :escape inconclusive)", description: "Make escape capability gaps explicit." }
     Automaton { labels: ["automaton"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(automaton :states [...] :initial STATE :accepting-states [...] :error-states [...] :events [...] :transitions [...] [:terminal-expectations [...]])", description: "Define the public typestate states, events, transitions, and terminal obligations." }
     Event { labels: ["event"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_TYPESTATE, signature: "(event :id ID (:calls CALLS | :matches MATCH-SET | :on SEMANTIC-EVENT) ...)", description: "Define one direct-call, endpoint, or semantic typestate event." }
@@ -356,6 +381,12 @@ pub enum PolicyRecordContext {
     TaintSanitizers,
     TaintTransforms,
     TaintExternalModels,
+    /// Generic value-flow origin entries (#2436).
+    FlowOrigins,
+    /// Generic value-flow observation entries (#2436).
+    FlowObservations,
+    /// Generic value-flow kill entries (#2436).
+    FlowKills,
     /// The match set is the trigger of a typestate event or terminal
     /// expectation. In this context source `:role` and `:phase` are lifted
     /// into the typed trigger while `MatchDirectoryRef` retains only its
@@ -372,6 +403,9 @@ pub enum FieldContextApplicability {
     TaintTransformsOnly,
     TaintExternalModelsOnly,
     TaintSourceOrSinkOnly,
+    FlowOriginsOnly,
+    FlowObservationsOnly,
+    FlowKillsOnly,
     TypestateTriggerOnly,
 }
 
@@ -392,6 +426,11 @@ impl FieldContextApplicability {
                 context,
                 PolicyRecordContext::TaintSources | PolicyRecordContext::TaintSinks
             ),
+            Self::FlowOriginsOnly => matches!(context, PolicyRecordContext::FlowOrigins),
+            Self::FlowObservationsOnly => {
+                matches!(context, PolicyRecordContext::FlowObservations)
+            }
+            Self::FlowKillsOnly => matches!(context, PolicyRecordContext::FlowKills),
             Self::TypestateTriggerOnly => {
                 matches!(context, PolicyRecordContext::TypestateTrigger)
             }
@@ -556,6 +595,9 @@ macro_rules! value_shapes {
                     | Self::SourceEntries
                     | Self::SinkEntries
                     | Self::SanitizerEntries
+                    | Self::OriginEntries
+                    | Self::ObservationEntries
+                    | Self::KillEntries
                     | Self::TransformEntries
                     | Self::ExternalModelEntries
                     | Self::Transfers
@@ -662,6 +704,9 @@ macro_rules! value_shapes {
                     Self::SourceEntries => &[PolicyRecord::Source],
                     Self::SinkEntries => &[PolicyRecord::Sink],
                     Self::SanitizerEntries => &[PolicyRecord::Sanitizer],
+                    Self::OriginEntries => &[PolicyRecord::Origin],
+                    Self::ObservationEntries => &[PolicyRecord::Observation],
+                    Self::KillEntries => &[PolicyRecord::Kill],
                     Self::TransformEntries => &[PolicyRecord::TransformEntry],
                     Self::ExternalModelEntries => &[PolicyRecord::ExternalModel],
                     Self::Transfers => &[PolicyRecord::Transfer],
@@ -807,7 +852,7 @@ value_shapes! {
     Sha256 => "a lowercase 64-hex SHA-256 value",
     NonNegativeInteger => "a non-negative integer",
     PositiveInteger => "a positive integer",
-    AnalysisType => "match, taint, typestate, or assertion",
+    AnalysisType => "match, taint, typestate, assertion, or flow",
     CaptureName => "an RQL capture name bound by the subject selector",
     OccurrenceRole => "one occurrence role from the analyzer registry",
     ExpectedOccurrence => "declaration, reference, binding, or none",
@@ -897,6 +942,9 @@ value_shapes! {
     SourceEntries => "policy-local source records",
     SinkEntries => "policy-local sink records",
     SanitizerEntries => "policy-local sanitizer records",
+    OriginEntries => "policy-local origin records",
+    ObservationEntries => "policy-local observation records",
+    KillEntries => "policy-local kill records",
     TransformEntries => "policy-local transform records",
     ExternalModelEntries => "policy-local external-model records",
     Transfers => "transfer records",
@@ -1000,6 +1048,15 @@ macro_rules! policy_field_context {
     (TaintSourceOrSinkOnly) => {
         FieldContextApplicability::TaintSourceOrSinkOnly
     };
+    (FlowOriginsOnly) => {
+        FieldContextApplicability::FlowOriginsOnly
+    };
+    (FlowObservationsOnly) => {
+        FieldContextApplicability::FlowObservationsOnly
+    };
+    (FlowKillsOnly) => {
+        FieldContextApplicability::FlowKillsOnly
+    };
 }
 
 macro_rules! policy_child_context {
@@ -1043,18 +1100,21 @@ policy_fields! {
     EndpointTaint { record: Endpoint, labels: ["taint"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: EndpointSemantics, owner: OwnerApplicability::ENDPOINT, signature: ":taint (source-semantics ...)|(sink-semantics ...)", description: "Optionally attach role-compatible taint semantics." }
     EndpointSupersedes { record: Endpoint, labels: ["supersedes"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_64, shape: EndpointIds, owner: OwnerApplicability::ENDPOINT, signature: ":supersedes [ENDPOINT-ID...]", description: "Declare explicit same-event dominance edges." }
 
-    AnalysisType { record: Analysis, labels: ["type"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: AnalysisType, owner: OwnerApplicability::POLICY_ALL, signature: ":type match|taint|typestate|assertion", description: "Select the analysis variant; fields are never inferred from their presence." }
+    AnalysisType { record: Analysis, labels: ["type"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: AnalysisType, owner: OwnerApplicability::POLICY_ALL, signature: ":type match|taint|typestate|assertion|flow", description: "Select the analysis variant; fields are never inferred from their presence." }
     AnalysisSubject { record: Analysis, labels: ["subject"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":subject (rql ...)|(rql-file ...)", description: "Select the subject nodes each specialized assertion is evaluated at; required with :asserts." }
     AnalysisAsserts { record: Analysis, labels: ["asserts"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::sequence(1, 64), shape: AssertEntries, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":asserts [(assert ...)...]", description: "Declare specialized occurrence, resolution, route, or identity invariants; required with :subject." }
     AnalysisPlanEntries { record: Analysis, labels: [], placement: FieldPlacement::VariadicPositional, required: Optional, multiplicity: ValueMultiplicity::sequence(1, 64), shape: AssertionPlanEntries, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(bind|filter|project|join|group|assert ...)...", description: "Declare a bounded source-ordered relational assertion plan." }
     AnalysisSelector { record: Analysis, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_MATCH, signature: ":selector (rql ...)|(rql-file ...)", description: "Select positive location-bearing match results." }
-    AnalysisMode { record: Analysis, labels: ["mode"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintMode, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: ":mode may", description: "Select the schema-version-1 may analysis mode." }
-    AnalysisCallModeling { record: Analysis, labels: ["call-modeling"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: CallModelingSpec, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: ":call-modeling (call-modeling :unmodeled paranoid|optimistic|require-model)", description: "Choose fallback behavior for unmodeled calls; omission defaults to paranoid." }
+    AnalysisMode { record: Analysis, labels: ["mode"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintMode, owner: OwnerApplicability::POLICY_TAINT_TYPESTATE_OR_FLOW, signature: ":mode may", description: "Select the schema-version-1 may analysis mode." }
+    AnalysisCallModeling { record: Analysis, labels: ["call-modeling"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: CallModelingSpec, owner: OwnerApplicability::POLICY_TAINT_TYPESTATE_OR_FLOW, signature: ":call-modeling (call-modeling :unmodeled paranoid|optimistic|require-model)", description: "Choose fallback behavior for unmodeled calls; omission defaults to paranoid." }
     AnalysisSources { record: Analysis, labels: ["sources"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSources, signature: ":sources (endpoint-set ...)", description: "Compose the complete taint source set." }
     AnalysisSinks { record: Analysis, labels: ["sinks"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSinks, signature: ":sinks (endpoint-set ...)", description: "Compose the complete taint sink set." }
     AnalysisSanitizers { record: Analysis, labels: ["sanitizers"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintSanitizers, signature: ":sanitizers (endpoint-set ...)", description: "Compose optional sanitizer models; omission is empty." }
     AnalysisTransforms { record: Analysis, labels: ["transforms"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintTransforms, signature: ":transforms (endpoint-set ...)", description: "Compose optional label transforms; omission is empty." }
     AnalysisExternalModels { record: Analysis, labels: ["external-models"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_TAINT, child_context: TaintExternalModels, signature: ":external-models (endpoint-set ...)", description: "Compose optional external transfer models; omission is empty." }
+    AnalysisOrigins { record: Analysis, labels: ["origins"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_FLOW, child_context: FlowOrigins, signature: ":origins (endpoint-set :entries [(origin ...)...])", description: "Compose the complete value-flow origin set." }
+    AnalysisObservations { record: Analysis, labels: ["observations"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_FLOW, child_context: FlowObservations, signature: ":observations (endpoint-set :entries [(observation ...)...])", description: "Compose the complete value-flow observation set." }
+    AnalysisKills { record: Analysis, labels: ["kills"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: TaintEndpointSet, owner: OwnerApplicability::POLICY_FLOW, child_context: FlowKills, signature: ":kills (endpoint-set :entries [(kill ...)...])", description: "Compose optional value-flow kills; omission is empty." }
     AnalysisFindingCombinations { record: Analysis, labels: ["finding-combinations"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: FindingCombinations, owner: OwnerApplicability::POLICY_TAINT, signature: ":finding-combinations [(finding-combination ...)...]", description: "Declare bounded explicit presentation/classification precedence rules." }
     AnalysisSubjects { record: Analysis, labels: ["subjects"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: SubjectSet, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":subjects (subject-set ...)", description: "Compose values newly tracked by typestate." }
     AnalysisUncertainty { record: Analysis, labels: ["uncertainty"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: UncertaintySpec, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":uncertainty (uncertainty ...)", description: "Declare explicit handling for subjects that escape the analysis root." }
@@ -1121,6 +1181,9 @@ policy_fields! {
     EndpointSetSinkEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: SinkEntries, owner: OwnerApplicability::POLICY_TAINT, context: TaintSinksOnly, signature: ":entries [(sink ...)...]", description: "Add bounded policy-local sink entries." }
     EndpointSetSanitizerEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: SanitizerEntries, owner: OwnerApplicability::POLICY_TAINT, context: TaintSanitizersOnly, signature: ":entries [(sanitizer ...)...]", description: "Add bounded policy-local sanitizer entries." }
     EndpointSetTransformEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: TransformEntries, owner: OwnerApplicability::POLICY_TAINT, context: TaintTransformsOnly, signature: ":entries [(transform ...)...]", description: "Add bounded policy-local transform entries." }
+    EndpointSetOriginEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: OriginEntries, owner: OwnerApplicability::POLICY_FLOW, context: FlowOriginsOnly, signature: ":entries [(origin ...)...]", description: "Add bounded policy-local value-flow origin entries." }
+    EndpointSetObservationEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: ObservationEntries, owner: OwnerApplicability::POLICY_FLOW, context: FlowObservationsOnly, signature: ":entries [(observation ...)...]", description: "Add bounded policy-local value-flow observation entries." }
+    EndpointSetKillEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: KillEntries, owner: OwnerApplicability::POLICY_FLOW, context: FlowKillsOnly, signature: ":entries [(kill ...)...]", description: "Add bounded policy-local value-flow kill entries." }
     EndpointSetExternalModelEntries { record: EndpointSet, labels: ["entries"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_256, shape: ExternalModelEntries, owner: OwnerApplicability::POLICY_TAINT, context: TaintExternalModelsOnly, signature: ":entries [(external-model ...)...]", description: "Add bounded policy-local external-model entries." }
     CatalogName { record: Catalog, labels: ["name"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyId, owner: OwnerApplicability::POLICY_TAINT, signature: ":name \"catalog.id\"", description: "Name an explicitly registered catalog." }
     CatalogVersion { record: Catalog, labels: ["version"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PositiveInteger, owner: OwnerApplicability::POLICY_TAINT, signature: ":version N", description: "Select an exact positive catalog version." }
@@ -1159,6 +1222,18 @@ policy_fields! {
     SinkAccepts { record: Sink, labels: ["accepts"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_64, shape: TaintLabels, owner: OwnerApplicability::POLICY_TAINT, signature: ":accepts [LABEL...]", description: "Declare the non-empty labels accepted by the sink." }
     SinkTags { record: Sink, labels: ["tags"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_64, shape: TaintTags, owner: OwnerApplicability::POLICY_TAINT, signature: ":tags [TAG...]", description: "Attach exact sink tags." }
     SinkImpacts { record: Sink, labels: ["impacts"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SET_64, shape: TaintImpacts, owner: OwnerApplicability::POLICY_TAINT, signature: ":impacts [IMPACT...]", description: "Attach exact sink impacts." }
+    OriginId { record: Origin, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_FLOW, signature: ":id \"entry-id\"", description: "Set the policy-local origin identity." }
+    OriginDisplayName { record: Origin, labels: ["display-name"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: DisplayText, owner: OwnerApplicability::POLICY_FLOW, signature: ":display-name \"phrase\"", description: "Set the reported phrase for this origin." }
+    OriginSelector { record: Origin, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_FLOW, signature: ":selector SELECTOR", description: "Select the origin sites." }
+    OriginBind { record: Origin, labels: ["bind"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_FLOW, signature: ":bind PORT", description: "Bind the established value at each selected origin site." }
+    ObservationId { record: Observation, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_FLOW, signature: ":id \"entry-id\"", description: "Set the policy-local observation identity." }
+    ObservationDisplayName { record: Observation, labels: ["display-name"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: DisplayText, owner: OwnerApplicability::POLICY_FLOW, signature: ":display-name \"phrase\"", description: "Set the reported phrase for this observation." }
+    ObservationSelector { record: Observation, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_FLOW, signature: ":selector SELECTOR", description: "Select the observation sites." }
+    ObservationOperand { record: Observation, labels: ["observed-operand"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_FLOW, signature: ":observed-operand PORT", description: "Bind the operand whose value the observation consumes." }
+    KillId { record: Kill, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_FLOW, signature: ":id \"entry-id\"", description: "Set the policy-local kill identity." }
+    KillSelector { record: Kill, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_FLOW, signature: ":selector SELECTOR", description: "Select the kill sites." }
+    KillInput { record: Kill, labels: ["input"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_FLOW, signature: ":input PORT", description: "Bind the value the kill consumes." }
+    KillOutput { record: Kill, labels: ["output"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_FLOW, signature: ":output PORT", description: "Bind the value the kill establishes; it no longer carries the tracked provenance." }
     SanitizerId { record: Sanitizer, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_TAINT, signature: ":id \"entry-id\"", description: "Set the sanitizer identity." }
     SanitizerSelector { record: Sanitizer, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TAINT, signature: ":selector SELECTOR", description: "Select sanitizer calls or values." }
     SanitizerInput { record: Sanitizer, labels: ["input"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PolicyPort, owner: OwnerApplicability::POLICY_TAINT, signature: ":input PORT", description: "Bind the sanitizer input value." }
@@ -1194,7 +1269,7 @@ policy_fields! {
     SubjectId { record: Subject, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":id \"subject-id\"", description: "Set the policy-local subject identity." }
     SubjectSelector { record: Subject, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":selector SELECTOR", description: "Select values that begin typestate tracking." }
     SubjectBinding { record: Subject, labels: ["subject"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TypestateBinding, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":subject BINDING", description: "Bind the newly tracked value." }
-    CallModelingUnmodeled { record: CallModeling, labels: ["unmodeled"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: UnmodeledCallBehavior, owner: OwnerApplicability::POLICY_TAINT_OR_TYPESTATE, signature: ":unmodeled paranoid|optimistic|require-model", description: "Choose conservative propagation, preserve-only propagation, or abstention when no call model applies." }
+    CallModelingUnmodeled { record: CallModeling, labels: ["unmodeled"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: UnmodeledCallBehavior, owner: OwnerApplicability::POLICY_TAINT_TYPESTATE_OR_FLOW, signature: ":unmodeled paranoid|optimistic|require-model", description: "Choose conservative propagation, preserve-only propagation, or abstention when no call model applies." }
     UncertaintyEscape { record: Uncertainty, labels: ["escape"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: InconclusivePolicy, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":escape inconclusive", description: "Mark subjects escaping the analysis root as incomplete." }
     AutomatonStates { record: Automaton, labels: ["states"], placement: FieldPlacement::Keyword, required: Required, multiplicity: NON_EMPTY_SET_256, shape: StateIds, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":states [STATE...]", description: "Declare every typestate state." }
     AutomatonInitial { record: Automaton, labels: ["initial"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: StateId, owner: OwnerApplicability::POLICY_TYPESTATE, signature: ":initial STATE", description: "Select the declared initial state." }
@@ -1516,6 +1591,7 @@ atom_values! {
     AnalysisTaint { domain: AnalysisType, spellings: ["taint"], owner: OwnerApplicability::POLICY_TAINT, description: "Declare set-oriented taint propagation inputs." }
     AnalysisTypestate { domain: AnalysisType, spellings: ["typestate"], owner: OwnerApplicability::POLICY_TYPESTATE, description: "Declare endpoint-bound protocol tracking." }
     AnalysisAssertion { domain: AnalysisType, spellings: ["assertion"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Declare correlated occurrence invariants over captured AST nodes." }
+    AnalysisFlow { domain: AnalysisType, spellings: ["flow"], owner: OwnerApplicability::POLICY_FLOW, description: "Declare policy-authored generic bounded value flow." }
     RelationCanReach { domain: GeneratedRelation, spellings: ["can-reach"], owner: OwnerApplicability::POLICY_TAINT, description: "Render source display, can reach, and sink display after proven flow." }
     SeverityUnrated { domain: Severity, spellings: ["unrated"], owner: OwnerApplicability::POLICY_ALL, description: "Do not assign a fixed report level." }
     SeverityNote { domain: Severity, spellings: ["note"], owner: OwnerApplicability::POLICY_ALL, description: "Report at note level." }
@@ -1763,6 +1839,9 @@ mod tests {
                 PolicyRecordContext::TaintSanitizers,
                 PolicyRecordContext::TaintTransforms,
                 PolicyRecordContext::TaintExternalModels,
+                PolicyRecordContext::FlowOrigins,
+                PolicyRecordContext::FlowObservations,
+                PolicyRecordContext::FlowKills,
                 PolicyRecordContext::TypestateTrigger,
             ] {
                 let mut labels = HashSet::new();

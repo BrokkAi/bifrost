@@ -9,6 +9,7 @@ use crate::analyzer::lexical_definitions::{
 };
 use crate::analyzer::structural::FileFacts;
 use crate::analyzer::structural::resolution::BoundaryStatus;
+use crate::analyzer::usages::call_binding::{OrdinaryFormalSlots, canonical_parameter_name};
 use crate::analyzer::usages::get_definition::{
     CallSiteSyntax, CallSyntaxKind, CallTargetLookupOutcome, DefinitionLookupOutcome,
     DefinitionLookupRequest, DefinitionLookupStatus, ExactCallReference, ExactCallReferenceGap,
@@ -196,6 +197,22 @@ pub struct CallRelationResult {
 pub(crate) struct CallBindingCache {
     formals: HashMap<CodeUnit, Option<FormalParameterLayout>>,
     python_receiver_is_class: HashMap<(ProjectFile, usize, usize), Option<bool>>,
+}
+
+impl CallBindingCache {
+    /// The callable's syntax-derived formal parameter layout, read once per
+    /// declaration. Shared with the `call_binding` row producer so both read
+    /// one cache entry rather than re-parsing the declaring file twice.
+    pub(crate) fn formal_layout(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+    ) -> Option<FormalParameterLayout> {
+        self.formals
+            .entry(unit.clone())
+            .or_insert_with(|| formal_slots_for_unit(analyzer, unit))
+            .clone()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1306,12 +1323,7 @@ pub(crate) fn bind_call_site_arguments(
     let Some((formal_owner, constructor_binding)) = formal_owner_for_site(analyzer, site) else {
         return CallBindingStatus::Unavailable;
     };
-    let Some(layout) = cache
-        .formals
-        .entry(formal_owner.clone())
-        .or_insert_with(|| formal_slots_for_unit(analyzer, &formal_owner))
-        .clone()
-    else {
+    let Some(layout) = cache.formal_layout(analyzer, &formal_owner) else {
         return CallBindingStatus::Unavailable;
     };
     let Some(bind_first) = python_first_formal_is_bound(
@@ -1324,43 +1336,14 @@ pub(crate) fn bind_call_site_arguments(
     ) else {
         return CallBindingStatus::Unavailable;
     };
-    let mut ordinary_slots = layout
-        .slots
-        .iter()
-        .filter(|slot| !slot.receiver)
-        .collect::<Vec<_>>();
-    if bind_first && !ordinary_slots.is_empty() {
-        ordinary_slots.remove(0);
-    }
-    let ordinary_slots = ordinary_slots.into_iter().enumerate().collect::<Vec<_>>();
+    // The matching rule itself lives beside the `call_binding` rows so the
+    // production binding and the published rows can never be two computations
+    // that drift apart (issue #2438).
+    let ordinary_slots = OrdinaryFormalSlots::of(&layout, bind_first);
 
     for argument in &mut site.arguments {
         let slot =
-            if argument.spread {
-                None
-            } else if let Some(name) = &argument.name {
-                ordinary_slots
-                    .iter()
-                    .copied()
-                    .find(|(_, slot)| {
-                        slot.names
-                            .iter()
-                            .any(|candidate| names_match(candidate, name))
-                    })
-                    .or_else(|| {
-                        ordinary_slots.iter().copied().rev().find(|(_, slot)| {
-                            slot.variadic.is_some_and(|kind| kind.accepts_keyword())
-                        })
-                    })
-            } else {
-                argument.position.and_then(|position| {
-                    ordinary_slots.get(position).copied().or_else(|| {
-                        ordinary_slots.iter().copied().rev().find(|(_, slot)| {
-                            slot.variadic.is_some_and(|kind| kind.accepts_positional())
-                        })
-                    })
-                })
-            };
+            ordinary_slots.slot_for(argument.name.as_deref(), argument.position, argument.spread);
         argument.formal_index = slot.map(|(index, _)| index);
         argument.formal_name = slot
             .and_then(|(_, slot)| slot.names.first())
@@ -1467,16 +1450,6 @@ fn formal_slots_for_unit(
     let tree = parse_tree_for_language(unit.source(), language, &source)?;
     let range = analyzer.ranges_of(unit).into_iter().min_by_key(range_key)?;
     formal_parameter_slots(language, tree.root_node(), &source, &range)
-}
-
-fn names_match(formal: &str, argument: &str) -> bool {
-    formal == argument
-        || formal.strip_prefix('$') == Some(argument)
-        || argument.strip_prefix('$') == Some(formal)
-}
-
-fn canonical_parameter_name(name: &str) -> String {
-    name.strip_prefix('$').unwrap_or(name).to_owned()
 }
 
 pub fn nearest_call_relation_unit(

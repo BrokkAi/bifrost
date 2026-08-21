@@ -102,6 +102,18 @@ pub(crate) fn resolved_policy_to_json(
         (PolicyAnalysis::Taint { .. }, ResolvedPolicyAnalysisRef::Taint { spec }) => {
             resolved_taint_to_json(spec, selectors)?
         }
+        (PolicyAnalysis::Flow { .. }, ResolvedPolicyAnalysisRef::Taint { spec }) => {
+            // Flow resolves into the same taint-shaped model, so the resolved
+            // projection is the same function. Only the discriminator moves,
+            // which is what domain-separates a flow policy's semantic hash
+            // from a taint policy with an identical resolved model.
+            let mut value = resolved_taint_to_json(spec, selectors)?;
+            value
+                .as_object_mut()
+                .expect("the resolved taint-shaped projection is an object")
+                .insert("type".to_string(), json!("flow"));
+            value
+        }
         (PolicyAnalysis::Assertion { spec }, ResolvedPolicyAnalysisRef::Assertion) => {
             let mut value = super::canonical::policy_analysis_authored_json(&definition.analysis);
             if let Some(plan) = &spec.relational {
@@ -177,11 +189,13 @@ pub(crate) fn resolved_policy_to_json(
 pub(crate) fn loaded_policy_to_json(policy: &LoadedPolicy) -> Result<Value, LoadedModelError> {
     let analysis = match policy.definition().analysis {
         PolicyAnalysis::Match { .. } => ResolvedPolicyAnalysisRef::Match,
-        PolicyAnalysis::Taint { .. } => ResolvedPolicyAnalysisRef::Taint {
-            spec: policy
-                .resolved_taint()
-                .ok_or(LoadedModelError::ResolvedAnalysisMismatch)?,
-        },
+        PolicyAnalysis::Taint { .. } | PolicyAnalysis::Flow { .. } => {
+            ResolvedPolicyAnalysisRef::Taint {
+                spec: policy
+                    .resolved_taint()
+                    .ok_or(LoadedModelError::ResolvedAnalysisMismatch)?,
+            }
+        }
         PolicyAnalysis::Typestate { .. } => ResolvedPolicyAnalysisRef::Typestate {
             spec: policy
                 .resolved_typestate()

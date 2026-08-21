@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "pack_id": "acme.http-effects",
+  "version": "1.0.0",
+  "producer": { "name": "acme-platform", "version": "1.0.0" },
+  "language": "java",
+  "ecosystem": "maven",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "tests/fixtures/policy-substrate-p0",
+    "revision": "reviewed"
+  },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [
+    {
+      "id": "acme.http-effects.client",
+      "activation": [{ "configurations": ["acme.http-effects"] }],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "summary.acme-http-client.send",
+            "target": {
+              "path": "com/acme/AcmeHttpClient.java",
+              "symbol": "com.acme.AcmeHttpClient.send(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [
+              {
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": [],
+            "declared_effects": [
+              { "id": "acme.network_io", "timing": "immediate", "certainty": "definite" }
+            ]
+          },
+          {
+            "id": "summary.acme-http-client.send-later",
+            "target": {
+              "path": "com/acme/AcmeHttpClient.java",
+              "symbol": "com.acme.AcmeHttpClient.sendLater(java.lang.String)",
+              "has_receiver": true,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "transfers": [
+              {
+                "input": { "kind": "parameter", "ordinal": 0 },
+                "exit_kind": "normal",
+                "output": { "kind": "normal_return" }
+              }
+            ],
+            "effects": [],
+            "declared_effects": [
+              { "id": "acme.network_io", "timing": "deferred", "certainty": "definite" }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

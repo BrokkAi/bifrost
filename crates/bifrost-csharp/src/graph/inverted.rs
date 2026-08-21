@@ -27,11 +27,12 @@ use crate::graph::resolver::{
     extension_visibility_site_key, first_type_child, invocation_member_candidates_for_owner,
     is_member_variable_declaration, is_type_reference_node, nearest_member_candidates_for_owner,
     node_text, object_initializer_for_label, object_initializer_owner_type_node,
-    reference_type_text, resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner,
-    same_node, unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
-    usage_direct_base, usage_member_declared_type_fq_name,
-    usage_method_return_type_fq_name_for_arity, usage_relational_generic_call_has_type_argument,
-    usage_unqualified_value_member_shadows_type, usage_visible_extension_method_candidates,
+    reference_type_text, resolve_arity_free_type_fq_name_at, resolve_type_fq_name_at,
+    resolve_unqualified_method_group_for_owner, same_node, unqualified_member_has_local_binding,
+    unqualified_member_has_structured_shadow, usage_direct_base,
+    usage_member_declared_type_fq_name, usage_method_return_type_fq_name_for_arity,
+    usage_relational_generic_call_has_type_argument, usage_unqualified_value_member_shadows_type,
+    usage_visible_extension_method_candidates,
 };
 use crate::graph_support::CSharpSource;
 use crate::hierarchy;
@@ -337,10 +338,10 @@ fn record_reference(
         record_structured_type_candidate(receiver, token, true, ctx, bindings);
     }
     if let Some((operand, qualified_owner)) = csharp_nameof_type_candidates(node, ctx.source)
-        && !record_structured_type_candidate(operand, token, true, ctx, bindings)
+        && !record_arity_free_type_candidate(operand, token, ctx, bindings)
         && let Some(owner) = qualified_owner
     {
-        record_structured_type_candidate(owner, token, true, ctx, bindings);
+        record_arity_free_type_candidate(owner, token, ctx, bindings);
     }
     if !recovered_method_group
         && let Some(root) = csharp_type_reference_root(node)
@@ -570,21 +571,60 @@ fn record_structured_type_candidate(
     ctx: &mut CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> bool {
-    if reject_value_receiver {
-        let Some(leftmost) = csharp_type_leftmost_identifier(candidate) else {
-            return false;
-        };
-        if unqualified_value_shadows_type(leftmost, token, ctx, bindings) {
-            return false;
-        }
-    }
-    let reference = reference_type_text(candidate, ctx.source);
+    let Some(reference) =
+        structured_type_candidate_reference(candidate, token, reject_value_receiver, ctx, bindings)
+    else {
+        return false;
+    };
     if let Some(fqn) = ctx.resolve_type_fqn_at(token, &reference, candidate) {
         ctx.record(fqn, candidate);
         true
     } else {
         false
     }
+}
+
+fn record_arity_free_type_candidate(
+    candidate: Node<'_>,
+    token: QueryToken<'_>,
+    ctx: &mut CsScan<'_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> bool {
+    let Some(reference) =
+        structured_type_candidate_reference(candidate, token, true, ctx, bindings)
+    else {
+        return false;
+    };
+    if let Some(fqn) = resolve_arity_free_type_fq_name_at(
+        ctx.csharp,
+        token,
+        ctx.file,
+        &ctx.class_ranges,
+        &reference,
+        candidate,
+        ctx.source,
+    ) {
+        ctx.record(fqn, candidate);
+        true
+    } else {
+        false
+    }
+}
+
+fn structured_type_candidate_reference(
+    candidate: Node<'_>,
+    token: QueryToken<'_>,
+    reject_value_receiver: bool,
+    ctx: &CsScan<'_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    if reject_value_receiver {
+        let leftmost = csharp_type_leftmost_identifier(candidate)?;
+        if unqualified_value_shadows_type(leftmost, token, ctx, bindings) {
+            return None;
+        }
+    }
+    Some(reference_type_text(candidate, ctx.source))
 }
 
 fn unqualified_value_shadows_type(

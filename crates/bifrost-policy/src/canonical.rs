@@ -138,7 +138,7 @@ fn ensure_inline_local_policy(
             ensure_inline_selector(&spec.selector)?;
             HashSet::new()
         }
-        PolicyAnalysis::Taint { spec } => {
+        PolicyAnalysis::Taint { spec } | PolicyAnalysis::Flow { spec } => {
             let local_endpoint_ids = taint_local_endpoint_ids(spec);
             ensure_inline_local_taint(spec, &local_endpoint_ids)?;
             local_endpoint_ids
@@ -200,14 +200,15 @@ fn policy_selector_paths(definition: &PolicyDefinition) -> HashSet<String> {
         PolicyAnalysis::Match { .. } => {
             paths.insert("/analysis/selector".to_string());
         }
-        PolicyAnalysis::Taint { spec } => {
-            extend_taint_selector_paths(&mut paths, "sources", &spec.sources.entries);
-            extend_taint_selector_paths(&mut paths, "sinks", &spec.sinks.entries);
-            extend_taint_selector_paths(&mut paths, "sanitizers", &spec.sanitizers.entries);
-            extend_taint_selector_paths(&mut paths, "transforms", &spec.transforms.entries);
+        PolicyAnalysis::Taint { spec } | PolicyAnalysis::Flow { spec } => {
+            let segments = definition.analysis.set_segments();
+            extend_taint_selector_paths(&mut paths, segments.sources, &spec.sources.entries);
+            extend_taint_selector_paths(&mut paths, segments.sinks, &spec.sinks.entries);
+            extend_taint_selector_paths(&mut paths, segments.sanitizers, &spec.sanitizers.entries);
+            extend_taint_selector_paths(&mut paths, segments.transforms, &spec.transforms.entries);
             extend_taint_selector_paths(
                 &mut paths,
-                "external_models",
+                segments.external_models,
                 &spec.external_models.entries,
             );
         }
@@ -680,6 +681,48 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
                     spec.finding_combinations.iter(),
                     |left, right| left.id.cmp(&right.id),
                     finding_combination_to_json,
+                ),
+            );
+            Value::Object(object)
+        }
+        PolicyAnalysis::Flow { spec } => {
+            // The flow projection publishes only what a flow author wrote.
+            // The synthetic label and category the decoder mints are constants
+            // of the analysis kind, not authored facts, so leaving them out
+            // keeps the semantic hash sensitive to exactly the flow-relevant
+            // fields.
+            let mut object = tagged("flow");
+            insert(&mut object, "mode", json!(may_mode_label(spec.mode)));
+            insert(
+                &mut object,
+                "call_modeling",
+                call_modeling_to_json(spec.call_modeling),
+            );
+            insert(
+                &mut object,
+                "origins",
+                sorted_typed_values(
+                    spec.sources.entries.iter(),
+                    |left, right| left.id.cmp(&right.id),
+                    flow_origin_to_json,
+                ),
+            );
+            insert(
+                &mut object,
+                "observations",
+                sorted_typed_values(
+                    spec.sinks.entries.iter(),
+                    |left, right| left.id.cmp(&right.id),
+                    flow_observation_to_json,
+                ),
+            );
+            insert(
+                &mut object,
+                "kills",
+                sorted_typed_values(
+                    spec.sanitizers.entries.iter(),
+                    |left, right| left.id.cmp(&right.id),
+                    flow_kill_to_json,
                 ),
             );
             Value::Object(object)
@@ -1607,6 +1650,33 @@ fn taint_sink_to_json(sink: &TaintSinkSpec) -> Value {
     })
 }
 
+fn flow_origin_to_json(origin: &TaintSourceSpec) -> Value {
+    json!({
+        "id": origin.id.as_str(),
+        "display_name": origin.display_name,
+        "selector": selector_to_json(&origin.selector),
+        "bind": policy_port_to_json(&origin.bind),
+    })
+}
+
+fn flow_observation_to_json(observation: &TaintSinkSpec) -> Value {
+    json!({
+        "id": observation.id.as_str(),
+        "display_name": observation.display_name,
+        "selector": selector_to_json(&observation.selector),
+        "observed_operand": policy_port_to_json(&observation.dangerous_operand),
+    })
+}
+
+fn flow_kill_to_json(kill: &TaintSanitizerSpec) -> Value {
+    json!({
+        "id": kill.id.as_str(),
+        "selector": selector_to_json(&kill.selector),
+        "input": policy_port_to_json(&kill.input),
+        "output": policy_port_to_json(&kill.output),
+    })
+}
+
 fn taint_sanitizer_to_json(sanitizer: &TaintSanitizerSpec) -> Value {
     json!({
         "id": sanitizer.id.as_str(),
@@ -2295,6 +2365,7 @@ const fn policy_analysis_type_label(value: PolicyAnalysisType) -> &'static str {
         PolicyAnalysisType::Taint => "taint",
         PolicyAnalysisType::Typestate => "typestate",
         PolicyAnalysisType::Assertion => "assertion",
+        PolicyAnalysisType::Flow => "flow",
     }
 }
 

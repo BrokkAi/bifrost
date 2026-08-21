@@ -457,6 +457,7 @@ struct BoundedRubyLookupContext<'a, 'tree> {
     root: Node<'tree>,
     lexical_stack: Vec<String>,
     method_stack: Vec<RubyReceiverMode>,
+    receiver_context: Vec<RubyReceiverMode>,
     local_scopes: Vec<HashMap<Box<str>, Option<RubyReceiverType>>>,
     exits: Vec<BoundedRubyExit>,
     focus_start: usize,
@@ -477,6 +478,7 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
             root,
             lexical_stack: Vec::new(),
             method_stack: Vec::new(),
+            receiver_context: Vec::new(),
             local_scopes: vec![HashMap::default()],
             exits: Vec::new(),
             focus_start,
@@ -533,17 +535,23 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
         }
         match node.kind() {
             "class" | "module" => {
-                let Some(name) = node.child_by_field_name("name") else {
-                    return BoundedRubyWalkAction::Descend;
-                };
-                if let Some(owner) = self.resolve_constant_owner(name) {
-                    self.lexical_stack.push(owner);
-                    self.exits.push(BoundedRubyExit::Lexical);
-                    return BoundedRubyWalkAction::DescendWithExit;
+                let owner = node
+                    .child_by_field_name("name")
+                    .and_then(|name| self.resolve_constant_owner(name));
+                if let Some(owner) = owner.as_ref() {
+                    self.lexical_stack.push(owner.clone());
                 }
+                self.receiver_context.push(RubyReceiverMode::Instance);
+                self.exits.push(BoundedRubyExit::Type {
+                    has_lexical_owner: owner.is_some(),
+                });
+                return BoundedRubyWalkAction::DescendWithExit;
             }
             "method" | "singleton_method" => {
-                self.method_stack.push(ruby_method_receiver_mode(node));
+                self.method_stack.push(ruby_method_receiver_mode(
+                    node,
+                    self.receiver_context.last().copied(),
+                ));
                 self.local_scopes.push(HashMap::default());
                 self.seed_parameter_shadows(node);
                 self.exits.push(BoundedRubyExit::Method);
@@ -551,8 +559,9 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
             }
             "singleton_class" => {
                 self.method_stack.push(RubyReceiverMode::Class);
+                self.receiver_context.push(RubyReceiverMode::Class);
                 self.local_scopes.push(HashMap::default());
-                self.exits.push(BoundedRubyExit::Method);
+                self.exits.push(BoundedRubyExit::SingletonClass);
                 return BoundedRubyWalkAction::DescendWithExit;
             }
             "block" | "do_block" => {
@@ -570,10 +579,27 @@ impl<'a, 'tree> BoundedRubyLookupContext<'a, 'tree> {
 
     fn exit(&mut self) {
         match self.exits.pop() {
-            Some(BoundedRubyExit::Lexical) => {
-                self.lexical_stack.pop();
+            Some(BoundedRubyExit::Type { has_lexical_owner }) => {
+                assert!(
+                    matches!(
+                        self.receiver_context.pop(),
+                        Some(RubyReceiverMode::Instance)
+                    ),
+                    "type receiver context must match its exit"
+                );
+                if has_lexical_owner {
+                    self.lexical_stack.pop();
+                }
             }
             Some(BoundedRubyExit::Method) => {
+                self.method_stack.pop();
+                self.local_scopes.pop();
+            }
+            Some(BoundedRubyExit::SingletonClass) => {
+                assert!(
+                    matches!(self.receiver_context.pop(), Some(RubyReceiverMode::Class)),
+                    "singleton-class receiver context must match its exit"
+                );
                 self.method_stack.pop();
                 self.local_scopes.pop();
             }
@@ -905,8 +931,9 @@ enum BoundedRubyWalkAction {
 }
 
 enum BoundedRubyExit {
-    Lexical,
+    Type { has_lexical_owner: bool },
     Method,
+    SingletonClass,
     LocalScope,
 }
 
@@ -1543,6 +1570,7 @@ struct RubyLookupContext<'a> {
     locals: LocalInferenceEngine<String>,
     lexical_stack: Vec<String>,
     method_stack: Vec<RubyReceiverMode>,
+    receiver_context: Vec<RubyReceiverMode>,
     exits: Vec<RubyExit>,
     focus_start: usize,
 }
@@ -1565,6 +1593,7 @@ impl<'a> RubyLookupContext<'a> {
             locals: LocalInferenceEngine::new(LocalInferenceConfig::default()),
             lexical_stack: Vec::new(),
             method_stack: Vec::new(),
+            receiver_context: Vec::new(),
             exits: Vec::new(),
             focus_start,
         };
@@ -1618,23 +1647,31 @@ impl<'a> RubyLookupContext<'a> {
 
         match node.kind() {
             "class" | "module" => {
-                if let Some(owner) = self.type_owner(node) {
-                    self.lexical_stack.push(owner);
-                    self.exits.push(RubyExit::Lexical);
-                    return RubyWalkAction::DescendWithExit;
+                let owner = self.type_owner(node);
+                if let Some(owner) = owner.as_ref() {
+                    self.lexical_stack.push(owner.clone());
                 }
+                self.receiver_context.push(RubyReceiverMode::Instance);
+                self.exits.push(RubyExit::Type {
+                    has_lexical_owner: owner.is_some(),
+                });
+                return RubyWalkAction::DescendWithExit;
             }
             "method" | "singleton_method" => {
                 self.locals.enter_scope();
                 self.seed_parameter_shadows(node);
-                self.method_stack.push(ruby_method_receiver_mode(node));
+                self.method_stack.push(ruby_method_receiver_mode(
+                    node,
+                    self.receiver_context.last().copied(),
+                ));
                 self.exits.push(RubyExit::Method);
                 return RubyWalkAction::DescendWithExit;
             }
             "singleton_class" => {
                 self.locals.enter_scope();
                 self.method_stack.push(RubyReceiverMode::Class);
-                self.exits.push(RubyExit::Method);
+                self.receiver_context.push(RubyReceiverMode::Class);
+                self.exits.push(RubyExit::SingletonClass);
                 return RubyWalkAction::DescendWithExit;
             }
             "block" | "do_block" => {
@@ -1650,10 +1687,27 @@ impl<'a> RubyLookupContext<'a> {
 
     fn exit(&mut self) {
         match self.exits.pop() {
-            Some(RubyExit::Lexical) => {
-                self.lexical_stack.pop();
+            Some(RubyExit::Type { has_lexical_owner }) => {
+                assert!(
+                    matches!(
+                        self.receiver_context.pop(),
+                        Some(RubyReceiverMode::Instance)
+                    ),
+                    "type receiver context must match its exit"
+                );
+                if has_lexical_owner {
+                    self.lexical_stack.pop();
+                }
             }
             Some(RubyExit::Method) => {
+                self.method_stack.pop();
+                self.locals.exit_scope();
+            }
+            Some(RubyExit::SingletonClass) => {
+                assert!(
+                    matches!(self.receiver_context.pop(), Some(RubyReceiverMode::Class)),
+                    "singleton-class receiver context must match its exit"
+                );
                 self.method_stack.pop();
                 self.locals.exit_scope();
             }
@@ -1722,8 +1776,9 @@ enum RubyWalkAction {
 }
 
 enum RubyExit {
-    Lexical,
+    Type { has_lexical_owner: bool },
     Method,
+    SingletonClass,
     LocalScope,
 }
 

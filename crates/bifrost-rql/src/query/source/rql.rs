@@ -654,6 +654,9 @@ fn validate_wrapper(
         | RqlForm::CallShape
         | RqlForm::CallArgumentGroups
         | RqlForm::CallArguments
+        | RqlForm::CallBindings
+        | RqlForm::CallEffects
+        | RqlForm::ProcedureEffects
         | RqlForm::CallableSignature
         | RqlForm::SignatureParameters
         | RqlForm::CallableApplicability

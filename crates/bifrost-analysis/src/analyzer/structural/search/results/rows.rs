@@ -98,6 +98,9 @@ pub enum DetailedCodeQueryDomain {
     CallShape,
     CallArgumentGroup,
     CallArgument,
+    CallBinding,
+    CallEffect,
+    ProcedureEffect,
     CallableSignature,
     SignatureParameter,
     CallableApplicability,
@@ -144,6 +147,9 @@ pub const ALL_DETAILED_CODE_QUERY_DOMAINS: &[DetailedCodeQueryDomain] = &[
     DetailedCodeQueryDomain::CallShape,
     DetailedCodeQueryDomain::CallArgumentGroup,
     DetailedCodeQueryDomain::CallArgument,
+    DetailedCodeQueryDomain::CallBinding,
+    DetailedCodeQueryDomain::CallEffect,
+    DetailedCodeQueryDomain::ProcedureEffect,
     DetailedCodeQueryDomain::CallableSignature,
     DetailedCodeQueryDomain::SignatureParameter,
     DetailedCodeQueryDomain::CallableApplicability,
@@ -298,6 +304,9 @@ impl DetailedCodeQueryDomain {
             QueryValueKind::CallShape => Self::CallShape,
             QueryValueKind::CallArgumentGroup => Self::CallArgumentGroup,
             QueryValueKind::CallArgument => Self::CallArgument,
+            QueryValueKind::CallBinding => Self::CallBinding,
+            QueryValueKind::CallEffect => Self::CallEffect,
+            QueryValueKind::ProcedureEffect => Self::ProcedureEffect,
             QueryValueKind::CallableSignature => Self::CallableSignature,
             QueryValueKind::SignatureParameter => Self::SignatureParameter,
             QueryValueKind::CallableApplicability => Self::CallableApplicability,
@@ -347,6 +356,9 @@ impl DetailedCodeQueryDomain {
             Self::CallShape => "call_shape",
             Self::CallArgumentGroup => "call_argument_group",
             Self::CallArgument => "call_argument",
+            Self::CallBinding => "call_binding",
+            Self::CallEffect => "call_effect",
+            Self::ProcedureEffect => "procedure_effect",
             Self::CallableSignature => "callable_signature",
             Self::SignatureParameter => "signature_parameter",
             Self::CallableApplicability => "callable_applicability",
@@ -570,6 +582,84 @@ impl DetailedCodeQueryDomain {
                 CodeQueryRowField::required("argument_index", Scalar::Integer),
                 CodeQueryRowField::optional("name", Scalar::String),
                 CodeQueryRowField::required("spread", Scalar::Boolean),
+            ],
+            // Issue #2438. The complete addressable surface is declared now,
+            // including the columns only a later slice fills (`signature_id`
+            // for an overload set, `binding_kind` values beyond the positional
+            // family), so refining named, default, variadic and spread states
+            // adds rows rather than columns.
+            Self::CallBinding => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("site_id", Scalar::StableId),
+                CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                CodeQueryRowField::optional("group_id", Scalar::StableId),
+                CodeQueryRowField::optional("argument_id", Scalar::StableId),
+                CodeQueryRowField::optional("target_id", Scalar::DeclarationIdentity),
+                CodeQueryRowField::optional("signature_id", Scalar::StableId),
+                CodeQueryRowField::optional("actual_index", Scalar::Integer),
+                CodeQueryRowField::optional("actual_name", Scalar::String),
+                CodeQueryRowField::optional("formal_index", Scalar::Integer),
+                CodeQueryRowField::optional("formal_name", Scalar::String),
+                CodeQueryRowField::optional("binding_kind", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("mapping", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("reason", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("actual_count", Scalar::Integer),
+                CodeQueryRowField::required("bound_count", Scalar::Integer),
+                CodeQueryRowField::required("terminal", Scalar::Boolean),
+            ],
+            // Issue #2437. One row per (call site, dispatch arm, declared
+            // effect), plus the mandatory terminal row that states a site whose
+            // effects could not be established. `coverage` is the site's, so a
+            // single row is enough to reject an absence claim.
+            Self::CallEffect => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("site_id", Scalar::StableId),
+                CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                CodeQueryRowField::optional("target_id", Scalar::StableId),
+                CodeQueryRowField::optional("callee_id", Scalar::DeclarationIdentity),
+                CodeQueryRowField::optional("callee_symbol", Scalar::String),
+                CodeQueryRowField::optional("effect_id", Scalar::String),
+                CodeQueryRowField::required("classification", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("timing", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("certainty", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("proof", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("derivation", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("reason", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("pack_id", Scalar::String),
+                CodeQueryRowField::optional("model_id", Scalar::String),
+                CodeQueryRowField::optional("summary_id", Scalar::String),
+                CodeQueryRowField::required("arm_count", Scalar::Integer),
+                CodeQueryRowField::required("modeled_arm_count", Scalar::Integer),
+                CodeQueryRowField::required("terminal", Scalar::Boolean),
+            ],
+            // Issue #2437. One row per (procedure, effect id), plus the
+            // mandatory terminal row. The witness columns are a bounded,
+            // deterministic chain of `call_shape` site identities, so a policy
+            // reaches the exact direct effect by joining ids.
+            Self::ProcedureEffect => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("procedure_id", Scalar::DeclarationIdentity),
+                CodeQueryRowField::required("procedure_name", Scalar::String),
+                CodeQueryRowField::optional("effect_id", Scalar::String),
+                CodeQueryRowField::optional("classification", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("certainty", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("timing", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("depth", Scalar::Integer),
+                CodeQueryRowField::required("derivation", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("reason", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("witness_available", Scalar::Boolean),
+                CodeQueryRowField::required("witness_steps", Scalar::Integer),
+                CodeQueryRowField::optional("witness_site_id", Scalar::StableId),
+                CodeQueryRowField::optional("witness_effect_site_id", Scalar::StableId),
+                CodeQueryRowField::optional("witness_chain", Scalar::String),
+                CodeQueryRowField::required("witness_truncated", Scalar::Boolean),
+                CodeQueryRowField::optional("pack_id", Scalar::String),
+                CodeQueryRowField::optional("model_id", Scalar::String),
+                CodeQueryRowField::optional("summary_id", Scalar::String),
+                CodeQueryRowField::required("terminal", Scalar::Boolean),
             ],
             Self::CallableSignature => code_query_row_fields![
                 CodeQueryRowField::required("id", Scalar::StableId),
@@ -822,6 +912,9 @@ impl CodeQueryResultValue {
             Self::CallShape { value } => Some(value.range),
             Self::CallArgumentGroup { value } => Some(value.range),
             Self::CallArgument { value } => Some(value.range),
+            Self::CallBinding { value } => Some(value.range),
+            Self::CallEffect { value } => Some(value.range),
+            Self::ProcedureEffect { value } => Some(value.range),
             Self::CallableSignature { value } => Some(value.range),
             Self::SignatureParameter { value } => Some(value.range),
             Self::CallableApplicability { value } => Some(value.range),
@@ -865,6 +958,9 @@ impl CodeQueryResultValue {
             Self::CallShape { .. } => DetailedCodeQueryDomain::CallShape,
             Self::CallArgumentGroup { .. } => DetailedCodeQueryDomain::CallArgumentGroup,
             Self::CallArgument { .. } => DetailedCodeQueryDomain::CallArgument,
+            Self::CallBinding { .. } => DetailedCodeQueryDomain::CallBinding,
+            Self::CallEffect { .. } => DetailedCodeQueryDomain::CallEffect,
+            Self::ProcedureEffect { .. } => DetailedCodeQueryDomain::ProcedureEffect,
             Self::CallableSignature { .. } => DetailedCodeQueryDomain::CallableSignature,
             Self::SignatureParameter { .. } => DetailedCodeQueryDomain::SignatureParameter,
             Self::CallableApplicability { .. } => DetailedCodeQueryDomain::CallableApplicability,
@@ -1285,6 +1381,184 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::SignatureParameter { value }, "repeated") => {
             value.repeated.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::CallBinding { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::CallBinding { value }, "site_ast_id") => {
+            Some(Scalar::StableId(&value.site_ast_id))
+        }
+        (CodeQueryResultValue::CallBinding { value }, "group_id") => {
+            value.group_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "argument_id") => {
+            value.argument_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "target_id") => value
+            .target
+            .as_ref()
+            .and_then(|target| target.id.as_deref())
+            .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::CallBinding { value }, "signature_id") => {
+            value.signature_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "actual_index") => value
+            .actual_index
+            .map(|index| Scalar::Integer(index as u64)),
+        (CodeQueryResultValue::CallBinding { value }, "actual_name") => {
+            value.actual_name.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "formal_index") => value
+            .formal_index
+            .map(|index| Scalar::Integer(index as u64)),
+        (CodeQueryResultValue::CallBinding { value }, "formal_name") => {
+            value.formal_name.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "binding_kind") => {
+            value.binding_kind.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "mapping") => {
+            Some(Scalar::ConstrainedEnum(value.mapping))
+        }
+        (CodeQueryResultValue::CallBinding { value }, "reason") => {
+            value.reason.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::CallBinding { value }, "actual_count") => {
+            Some(Scalar::Integer(value.actual_count as u64))
+        }
+        (CodeQueryResultValue::CallBinding { value }, "bound_count") => {
+            Some(Scalar::Integer(value.bound_count as u64))
+        }
+        (CodeQueryResultValue::CallBinding { value }, "terminal") => {
+            Some(Scalar::Boolean(value.terminal))
+        }
+        (CodeQueryResultValue::CallEffect { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::CallEffect { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::CallEffect { value }, "site_ast_id") => {
+            Some(Scalar::StableId(&value.site_ast_id))
+        }
+        (CodeQueryResultValue::CallEffect { value }, "target_id") => {
+            value.target_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CallEffect { value }, "callee_id") => value
+            .callee
+            .as_ref()
+            .and_then(|callee| callee.id.as_deref())
+            .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::CallEffect { value }, "callee_symbol") => {
+            value.callee_symbol.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallEffect { value }, "effect_id") => {
+            value.effect_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallEffect { value }, "classification") => {
+            Some(Scalar::ConstrainedEnum(value.classification))
+        }
+        (CodeQueryResultValue::CallEffect { value }, "timing") => {
+            value.timing.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallEffect { value }, "certainty") => {
+            value.certainty.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallEffect { value }, "proof") => {
+            value.proof.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallEffect { value }, "derivation") => {
+            Some(Scalar::ConstrainedEnum(value.derivation))
+        }
+        (CodeQueryResultValue::CallEffect { value }, "reason") => {
+            value.reason.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallEffect { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::CallEffect { value }, "pack_id") => {
+            value.pack_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallEffect { value }, "model_id") => {
+            value.model_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallEffect { value }, "summary_id") => {
+            value.summary_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallEffect { value }, "arm_count") => {
+            Some(Scalar::Integer(value.arm_count as u64))
+        }
+        (CodeQueryResultValue::CallEffect { value }, "modeled_arm_count") => {
+            Some(Scalar::Integer(value.modeled_arm_count as u64))
+        }
+        (CodeQueryResultValue::CallEffect { value }, "terminal") => {
+            Some(Scalar::Boolean(value.terminal))
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "procedure_id") => {
+            Some(Scalar::DeclarationIdentity(&value.procedure_id))
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "procedure_name") => {
+            Some(Scalar::String(&value.procedure_name))
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "effect_id") => {
+            value.effect_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "classification") => {
+            value.classification.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "certainty") => {
+            value.certainty.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "timing") => {
+            value.timing.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "depth") => {
+            value.depth.map(|depth| Scalar::Integer(depth as u64))
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "derivation") => {
+            Some(Scalar::ConstrainedEnum(value.derivation))
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "reason") => {
+            value.reason.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "witness_available") => {
+            Some(Scalar::Boolean(value.witness_available))
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "witness_steps") => {
+            Some(Scalar::Integer(value.witness_steps as u64))
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "witness_site_id") => {
+            value.witness_site_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "witness_effect_site_id") => value
+            .witness_effect_site_id
+            .as_deref()
+            .map(Scalar::StableId),
+        (CodeQueryResultValue::ProcedureEffect { value }, "witness_chain") => {
+            value.witness_chain.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "witness_truncated") => {
+            Some(Scalar::Boolean(value.witness_truncated))
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "pack_id") => {
+            value.pack_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "model_id") => {
+            value.model_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "summary_id") => {
+            value.summary_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::ProcedureEffect { value }, "terminal") => {
+            Some(Scalar::Boolean(value.terminal))
         }
         (CodeQueryResultValue::CallArgument { value }, "spread") => {
             Some(Scalar::Boolean(value.spread))
@@ -1965,6 +2239,18 @@ pub enum DetailedCodeQueryKey {
         id: String,
         group_id: String,
     },
+    CallBinding {
+        id: String,
+        site_id: String,
+    },
+    CallEffect {
+        id: String,
+        site_id: String,
+    },
+    ProcedureEffect {
+        id: String,
+        procedure_id: String,
+    },
     CallableSignature {
         id: String,
         declaration_id: String,
@@ -2181,6 +2467,18 @@ impl DetailedCodeQueryResult {
                             DetailedCodeQueryKey::CallArgument { .. }
                         )
                         | (
+                            DetailedCodeQueryDomain::CallBinding,
+                            DetailedCodeQueryKey::CallBinding { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::CallEffect,
+                            DetailedCodeQueryKey::CallEffect { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::ProcedureEffect,
+                            DetailedCodeQueryKey::ProcedureEffect { .. }
+                        )
+                        | (
                             DetailedCodeQueryDomain::CallableSignature,
                             DetailedCodeQueryKey::CallableSignature { .. }
                         )
@@ -2386,6 +2684,9 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::CallShape { .. }
         | CodeQueryResultValue::CallArgumentGroup { .. }
         | CodeQueryResultValue::CallArgument { .. }
+        | CodeQueryResultValue::CallBinding { .. }
+        | CodeQueryResultValue::CallEffect { .. }
+        | CodeQueryResultValue::ProcedureEffect { .. }
         | CodeQueryResultValue::CallableSignature { .. }
         | CodeQueryResultValue::SignatureParameter { .. }
         | CodeQueryResultValue::CallableApplicability { .. }
@@ -2456,6 +2757,12 @@ fn assert_detailed_terminal_identities(
                 | DetailedCodeQueryDomain::CallShape
                 | DetailedCodeQueryDomain::CallArgumentGroup
                 | DetailedCodeQueryDomain::CallArgument
+                | DetailedCodeQueryDomain::CallBinding
+                // An effect row is identified by its own content-scoped digest
+                // over the site or procedure identity and the effect id, so it
+                // carries no semantic-artifact identity candidate (#2437).
+                | DetailedCodeQueryDomain::CallEffect
+                | DetailedCodeQueryDomain::ProcedureEffect
                 | DetailedCodeQueryDomain::CallableSignature
                 | DetailedCodeQueryDomain::SignatureParameter
                 | DetailedCodeQueryDomain::CallableApplicability
@@ -2531,6 +2838,9 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::CallShape { .. }
         | DetailedCodeQueryKey::CallArgumentGroup { .. }
         | DetailedCodeQueryKey::CallArgument { .. }
+        | DetailedCodeQueryKey::CallBinding { .. }
+        | DetailedCodeQueryKey::CallEffect { .. }
+        | DetailedCodeQueryKey::ProcedureEffect { .. }
         | DetailedCodeQueryKey::CallableSignature { .. }
         | DetailedCodeQueryKey::SignatureParameter { .. }
         | DetailedCodeQueryKey::CallableApplicability { .. }

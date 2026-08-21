@@ -450,6 +450,10 @@ pub struct ProcedureSemantics {
     source: SourceMappingId,
     evidence: EvidenceId,
     values: Box<[SemanticValue]>,
+    /// Structural ordinals for non-parameter values that share one source
+    /// locator and semantic role. Most syntax sites mint one value per role,
+    /// so the sparse payload is empty in the common case.
+    value_identity_ordinals: Box<[(ValueId, u32)]>,
     allocations: Box<[AllocationSite]>,
     memory_locations: Box<[MemoryLocation]>,
     captures: Box<[CaptureBinding]>,
@@ -477,6 +481,8 @@ impl ProcedureSemantics {
         let cfg =
             ControlFlowGraph::try_from_edges(parts.id, parts.points.len(), parts.control_edges)?;
         let (call_phase_points, call_result_sites) = index_call_phases(&parts.call_sites);
+        let value_identity_ordinals =
+            duplicate_value_ordinals(&parts.values, &parts.source_mappings);
         Ok(Self {
             id: parts.id,
             locator: parts.locator,
@@ -486,6 +492,7 @@ impl ProcedureSemantics {
             source: parts.source,
             evidence: parts.evidence,
             values: parts.values.into_boxed_slice(),
+            value_identity_ordinals,
             allocations: parts.allocations.into_boxed_slice(),
             memory_locations: parts.memory_locations.into_boxed_slice(),
             captures: parts.captures.into_boxed_slice(),
@@ -534,6 +541,31 @@ impl ProcedureSemantics {
 
     pub fn values(&self) -> &[SemanticValue] {
         &self.values
+    }
+
+    /// The structural disambiguator for a value-flow carrier at one source
+    /// locator and semantic role.
+    ///
+    /// Parameter ordinals are authored semantics. Other values need an
+    /// ordinal only when lowering legitimately specializes one syntax site
+    /// into multiple values, as cleanup/finally CFG expansion does. The
+    /// ordinal follows deterministic semantic row order and is stable across
+    /// immutable artifact re-materializations.
+    pub(crate) fn stable_value_ordinal(&self, id: ValueId) -> Option<u32> {
+        let value = self.value(id)?;
+        if let SemanticValueKind::Parameter { ordinal, .. } = value.kind {
+            return Some(ordinal);
+        }
+        self.value_identity_ordinals
+            .binary_search_by_key(&id, |(value, _)| *value)
+            .ok()
+            .map(|index| self.value_identity_ordinals[index].1)
+    }
+
+    /// Exact heap payload retained by the sparse value-identity index.
+    pub(crate) fn value_identity_index_retained_bytes(&self) -> u64 {
+        (self.value_identity_ordinals.len() as u64)
+            .saturating_mul(std::mem::size_of::<(ValueId, u32)>() as u64)
     }
 
     pub fn allocations(&self) -> &[AllocationSite] {
@@ -689,6 +721,93 @@ impl ProcedureSemantics {
 
     pub fn point(&self, id: ProgramPointId) -> Option<&ProgramPoint> {
         self.points.get(id.index())
+    }
+}
+
+fn duplicate_value_ordinals(
+    values: &[SemanticValue],
+    source_mappings: &[SourceMapping],
+) -> Box<[(ValueId, u32)]> {
+    duplicate_value_ordinals_by(values, |source| {
+        &source_mappings
+            .get(source.index())
+            .expect("validated semantic value source")
+            .locator
+    })
+}
+
+fn duplicate_value_ordinals_by<K>(
+    values: &[SemanticValue],
+    source_group: impl Fn(SourceMappingId) -> K,
+) -> Box<[(ValueId, u32)]>
+where
+    K: Copy + Eq + Hash,
+{
+    let mut totals = HashMap::<(K, &'static str), usize>::default();
+    for value in values {
+        if matches!(value.kind, SemanticValueKind::Parameter { .. }) {
+            continue;
+        }
+        *totals
+            .entry((source_group(value.source), value.kind.label()))
+            .or_default() += 1;
+    }
+
+    let mut seen = HashMap::<(K, &'static str), u32>::default();
+    values
+        .iter()
+        .filter_map(|value| {
+            if matches!(value.kind, SemanticValueKind::Parameter { .. }) {
+                return None;
+            }
+            let key = (source_group(value.source), value.kind.label());
+            if totals.get(&key).copied().unwrap_or_default() < 2 {
+                return None;
+            }
+            let ordinal = seen.entry(key).or_default();
+            let current = *ordinal;
+            *ordinal = ordinal
+                .checked_add(1)
+                .expect("one source role cannot mint more than u32::MAX semantic values");
+            Some((value.id, current))
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+#[cfg(test)]
+mod value_identity_tests {
+    use super::*;
+
+    fn value(id: u32, source: u32, kind: SemanticValueKind) -> SemanticValue {
+        SemanticValue {
+            id: ValueId::new(id),
+            kind,
+            source: SourceMappingId::new(source),
+            evidence: EvidenceId::new(0),
+        }
+    }
+
+    #[test]
+    fn duplicate_non_parameter_values_receive_sparse_structural_ordinals() {
+        let values = [
+            value(0, 0, SemanticValueKind::Exception),
+            value(1, 1, SemanticValueKind::Local),
+            value(2, 0, SemanticValueKind::Exception),
+            value(
+                3,
+                0,
+                SemanticValueKind::Parameter {
+                    ordinal: 7,
+                    multiplicity: FormalMultiplicity::One,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            duplicate_value_ordinals_by(&values, |_| 0_u32).as_ref(),
+            [(ValueId::new(0), 0), (ValueId::new(2), 1)]
+        );
     }
 }
 

@@ -776,47 +776,35 @@ struct RustUseBinding {
 
 fn collect_rust_use_bindings(root: Node<'_>, source: &str) -> Vec<RustUseBinding> {
     let mut bindings = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    let mut stack = vec![(root, None, None)];
+    while let Some((node, mod_range, scope_range)) = stack.pop() {
         if node.kind() == "use_declaration" {
             let imports = crate::imports::rust_imports_from_use_declaration(node, source);
             if !imports.is_empty() {
                 bindings.push(RustUseBinding {
                     imports,
-                    mod_range: enclosing_mod_item_range(node),
-                    scope_range: enclosing_visibility_scope_range(node),
+                    mod_range,
+                    scope_range,
                 });
             }
             continue;
         }
+        let child_mod_range = if node.kind() == "mod_item" {
+            Some((node.start_byte(), node.end_byte()))
+        } else {
+            mod_range
+        };
+        let child_scope_range = if lexical_scope_kind(node.kind()) {
+            Some((node.start_byte(), node.end_byte()))
+        } else {
+            scope_range
+        };
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
-            stack.push(child);
+            stack.push((child, child_mod_range, child_scope_range));
         }
     }
     bindings
-}
-
-fn enclosing_mod_item_range(node: Node<'_>) -> Option<(usize, usize)> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == "mod_item" {
-            return Some((parent.start_byte(), parent.end_byte()));
-        }
-        current = parent.parent();
-    }
-    None
-}
-
-fn enclosing_visibility_scope_range(node: Node<'_>) -> Option<(usize, usize)> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if lexical_scope_kind(parent.kind()) {
-            return Some((parent.start_byte(), parent.end_byte()));
-        }
-        current = parent.parent();
-    }
-    None
 }
 
 fn lexical_scope_kind(kind: &str) -> bool {

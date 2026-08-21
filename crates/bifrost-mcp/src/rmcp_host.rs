@@ -1674,12 +1674,11 @@ async fn run_tool_as_task(
         })
     });
     let output = tokio::select! {
-        output = &mut output => output.map_err(|error| {
-            TaskExit::Error(ErrorData::internal_error(
-                format!("MCP task execution panicked: {error}"),
-                None,
-            ))
-        })?,
+        // The analyzer observes the same deadline and can return its
+        // structured cancellation report when this timer becomes ready.
+        // Prefer expiry when both branches settle together so crossing the
+        // task TTL cannot race into a terminal `completed` result.
+        biased;
         () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
             cancellation.cancel();
             return Err(task_exit(
@@ -1689,7 +1688,13 @@ async fn run_tool_as_task(
                     None,
                 ),
             ));
-        }
+        },
+        output = &mut output => output.map_err(|error| {
+            TaskExit::Error(ErrorData::internal_error(
+                format!("MCP task execution panicked: {error}"),
+                None,
+            ))
+        })?,
     };
 
     // The result must never leak a scope the client revoked mid-run.

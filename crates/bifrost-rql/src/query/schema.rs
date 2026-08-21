@@ -442,7 +442,7 @@ query_step_ops! {
     ValueFlow { label: "value_flow", signature: "procedure -> flow_endpoint", description: "Run one registered diagnostic-neutral value-flow plan for the exact procedure root.", semantic: [Procedures, ValueFlow] }
     Taint { label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint] }
     Witness { label: "witness", signature: "typestate_finding|flow_endpoint -> typestate_witness|flow_witness", description: "Project bounded retained evidence from each typestate finding or reached flow endpoint without rerunning analysis." }
-    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis|call_shape|call_argument_group|call_argument|callable_signature|signature_parameter|callable_applicability|overload_selection|dispatch_outcome|dispatch_target|member_family|member_family_edge|state_event -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, receiver analyses, call-shape rows, callable-signature rows, callable-applicability rows, overload-selection rows, dispatch rows, method-family rows, or state-event rows to their workspace files." }
+    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis|call_shape|call_argument_group|call_argument|call_binding|call_effect|procedure_effect|callable_signature|signature_parameter|callable_applicability|overload_selection|dispatch_outcome|dispatch_target|member_family|member_family_edge|state_event -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, receiver analyses, call-shape rows, callable-signature rows, callable-applicability rows, overload-selection rows, dispatch rows, method-family rows, or state-event rows to their workspace files." }
     ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
     Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
@@ -465,6 +465,9 @@ query_step_ops! {
     CallShape { label: "call_shape", signature: "structural_match|call_site|occurrence -> call_shape", description: "Project the mandatory structured call-shape outcome row for each exact call site." }
     CallArgumentGroups { label: "call_argument_groups", signature: "call_shape -> call_argument_group", description: "Project the ordered argument-list group rows of each call shape." }
     CallArguments { label: "call_arguments", signature: "call_argument_group -> call_argument", description: "Project the ordered argument rows of each argument-list group." }
+    CallEffects { label: "call_effects", signature: "call_shape -> call_effect", description: "Project the direct effect rows of each call shape: one row per (dispatch arm, declared effect) for every callee an active semantic-model pack declares effects for, carrying the effect id, its execution timing, the certainty meet of the declaration and the dispatch proof, and the pack provenance. At least one row per call shape, so an unresolved, unmodeled or unsupported dispatch states that instead of answering empty. The callee set and its proof are the dispatch oracle's own answer; nothing is re-derived here.", semantic: [Procedures] }
+    ProcedureEffects { label: "procedure_effects", signature: "declaration -> procedure_effect", description: "Summarize the effects of each procedure over its reachable call graph: one row per (procedure, effect id), classified direct or transitive, with the hop count, the certainty and timing carried along the attributing chain, a bounded witness chain of call-site identities, and the coverage that says whether an absent effect is proven absent or merely unseen. At least one row per declaration. The walk is a bounded deterministic fixpoint over the same dispatch answers call_effects publishes.", semantic: [Procedures] }
+    CallBindings { label: "call_bindings", signature: "call_shape -> call_binding", description: "Project the normalized actual-to-formal binding rows of each call shape: one row per actual, carrying the call-shape argument identity it binds, the formal ordinal and name it was bound to, the binding kind, this row's mapping status, and the whole call's partition coverage. At least one row per call shape, so an unreadable shape, an unresolved or ambiguous callee, unrecorded formals, or a call that passes nothing each state that instead of answering empty. The callee is the one the production definition resolver binds; no overload is re-decided here." }
     CallableSignature { label: "callable_signature", signature: "declaration -> callable_signature", description: "Project the mandatory callable-signature rows of each declaration from the persisted signature contract: one row per persisted signature entry, so an overload set separates into one row per overload." }
     SignatureParameters { label: "signature_parameters", signature: "callable_signature -> signature_parameter", description: "Project the ordered declared parameter rows of each callable signature." }
     CallableApplicability { label: "callable_applicability", signature: "occurrence -> callable_applicability", description: "Project one applicability row per candidate callable the production resolver considered for each reference occurrence: the verdict, the typed callable rejection reason when inapplicable, the precedence tier, and whether the resolver bound it. A candidate the resolver refused stays visible with its reason, so a losing overload is evidence rather than an absence." }
@@ -644,6 +647,9 @@ macro_rules! rql_forms {
                     | Self::CallShape
                     | Self::CallArgumentGroups
                     | Self::CallArguments
+                    | Self::CallBindings
+                    | Self::CallEffects
+                    | Self::ProcedureEffects
                     | Self::CallableSignature
                     | Self::SignatureParameters
                     | Self::CallableApplicability
@@ -1067,6 +1073,30 @@ rql_forms! {
         signature: "(call-arguments query)",
         description: (QueryStepOp::CallArguments),
         step: CallArguments,
+    }
+    CallBindings {
+        labels: ["call-bindings", "call_bindings"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-bindings query)",
+        description: (QueryStepOp::CallBindings),
+        step: CallBindings,
+    }
+    CallEffects {
+        labels: ["call-effects", "call_effects"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(call-effects query)",
+        description: (QueryStepOp::CallEffects),
+        step: CallEffects,
+    }
+    ProcedureEffects {
+        labels: ["procedure-effects", "procedure_effects"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(procedure-effects query)",
+        description: (QueryStepOp::ProcedureEffects),
+        step: ProcedureEffects,
     }
     CallableSignature {
         labels: ["callable-signature", "callable_signature"],

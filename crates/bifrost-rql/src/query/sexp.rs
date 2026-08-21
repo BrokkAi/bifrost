@@ -742,6 +742,9 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::CallShape
         | RqlForm::CallArgumentGroups
         | RqlForm::CallArguments
+        | RqlForm::CallBindings
+        | RqlForm::CallEffects
+        | RqlForm::ProcedureEffects
         | RqlForm::CallableSignature
         | RqlForm::SignatureParameters
         | RqlForm::CallableApplicability
@@ -754,6 +757,9 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 RqlForm::CallShape => "call_shape",
                 RqlForm::CallArgumentGroups => "call_argument_groups",
                 RqlForm::CallArguments => "call_arguments",
+                RqlForm::CallBindings => "call_bindings",
+                RqlForm::CallEffects => "call_effects",
+                RqlForm::ProcedureEffects => "procedure_effects",
                 RqlForm::CallableSignature => "callable_signature",
                 RqlForm::SignatureParameters => "signature_parameters",
                 RqlForm::CallableApplicability => "callable_applicability",
@@ -1607,6 +1613,9 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::CallShape
         | RqlForm::CallArgumentGroups
         | RqlForm::CallArguments
+        | RqlForm::CallBindings
+        | RqlForm::CallEffects
+        | RqlForm::ProcedureEffects
         | RqlForm::CallableSignature
         | RqlForm::SignatureParameters
         | RqlForm::CallableApplicability

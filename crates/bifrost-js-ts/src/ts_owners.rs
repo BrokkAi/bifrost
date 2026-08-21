@@ -191,11 +191,11 @@ fn ts_receiver_owner_candidates_at_byte_with_resolution(
     );
     if candidates.is_empty() {
         candidates.extend(ts_receiver_owners_from_contextual_callback(
-            host, support, file, source, imports, aliases, scope, receiver, resolution,
+            host, support, file, source, root, imports, aliases, scope, receiver, resolution,
         ));
     }
     candidates.extend(ts_receiver_owners_from_local_bindings(
-        host, support, file, source, imports, aliases, scope, receiver, byte, 0, resolution,
+        host, support, file, source, root, imports, aliases, scope, receiver, byte, 0, resolution,
     ));
     sort_units(&mut candidates);
     candidates.dedup();
@@ -301,6 +301,7 @@ fn ts_receiver_owners_from_contextual_callback(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     scope: Node<'_>,
@@ -318,7 +319,7 @@ fn ts_receiver_owners_from_contextual_callback(
         return Vec::new();
     };
     let callees = ts_call_expression_callees(
-        host, support, file, source, imports, aliases, function, 0, resolution,
+        host, support, file, source, root, imports, aliases, function, 0, resolution,
     );
 
     let mut owners = Vec::new();
@@ -516,6 +517,7 @@ fn ts_receiver_owners_from_local_bindings(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     scope: Node<'_>,
@@ -533,6 +535,7 @@ fn ts_receiver_owners_from_local_bindings(
         support,
         file,
         source,
+        root,
         imports,
         aliases,
         scope,
@@ -552,6 +555,7 @@ fn ts_collect_receiver_owners_from_bindings(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     node: Node<'_>,
@@ -612,6 +616,7 @@ fn ts_collect_receiver_owners_from_bindings(
                     support,
                     file,
                     source,
+                    root,
                     imports,
                     aliases,
                     value,
@@ -636,6 +641,7 @@ fn ts_collect_receiver_owners_from_bindings(
                         support,
                         file,
                         source,
+                        root,
                         imports,
                         aliases,
                         value,
@@ -660,6 +666,7 @@ fn ts_expression_property_owners(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     expression: Node<'_>,
@@ -678,6 +685,7 @@ fn ts_expression_property_owners(
                     support,
                     file,
                     source,
+                    root,
                     imports,
                     aliases,
                     function,
@@ -698,6 +706,7 @@ fn ts_expression_property_owners(
                         support,
                         file,
                         source,
+                        root,
                         imports,
                         aliases,
                         child,
@@ -749,6 +758,7 @@ fn ts_expression_property_owners(
                             support,
                             file,
                             source,
+                            root,
                             imports,
                             aliases,
                             child,
@@ -816,6 +826,7 @@ pub fn ts_call_expression_callees(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     function: Node<'_>,
@@ -861,6 +872,7 @@ pub fn ts_call_expression_callees(
             support,
             file,
             source,
+            root,
             imports,
             aliases,
             object,
@@ -887,6 +899,7 @@ fn ts_expression_receiver_owners(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     expression: Node<'_>,
@@ -909,7 +922,7 @@ fn ts_expression_receiver_owners(
                 support,
                 file,
                 source,
-                root_node(expression),
+                root,
                 imports,
                 aliases,
                 receiver,
@@ -922,6 +935,7 @@ fn ts_expression_receiver_owners(
             support,
             file,
             source,
+            root,
             imports,
             aliases,
             expression,
@@ -929,13 +943,6 @@ fn ts_expression_receiver_owners(
             resolution,
         ),
     }
-}
-
-pub fn root_node(mut node: Node<'_>) -> Node<'_> {
-    while let Some(parent) = node.parent() {
-        node = parent;
-    }
-    node
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1477,6 +1484,7 @@ pub fn ts_function_return_property_owners(
             support,
             function.source(),
             &source,
+            tree.root_node(),
             &imports,
             aliases,
             node,
@@ -1522,6 +1530,7 @@ fn ts_collect_return_property_owners(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     source: &str,
+    root: Node<'_>,
     imports: &JsTsImportBinder,
     aliases: &AliasResolver,
     node: Node<'_>,
@@ -1557,6 +1566,7 @@ fn ts_collect_return_property_owners(
                     support,
                     file,
                     source,
+                    root,
                     imports,
                     aliases,
                     expression,

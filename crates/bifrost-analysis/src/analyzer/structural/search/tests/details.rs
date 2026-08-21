@@ -1129,6 +1129,105 @@ fn canonical_ast_keys_stay_within_the_stable_identity_limit() {
     assert_ne!(bounded_canonical_ast_key(&other).expect("other key"), key);
 }
 
+/// Assert that every field the registry declares for this row's domain
+/// projects, that its projected scalar has the declared type, and that a
+/// non-nullable field is never absent -- the schema/projector reconciliation
+/// that only a `debug_assert` inside `field()` performs today.
+fn assert_row_projects_its_whole_registered_surface(value: &CodeQueryResultValue) {
+    let row = value.row();
+    let domain = row.domain();
+    assert!(
+        !domain.row_fields().is_empty(),
+        "{} declares no addressable surface",
+        domain.label()
+    );
+    for field in domain.row_fields() {
+        let projected = row
+            .field(field.name)
+            .unwrap_or_else(|error| panic!("registered field must project: {error}"));
+        match projected {
+            Some(scalar) => assert_eq!(
+                scalar.scalar_type(),
+                field.scalar_type,
+                "{}.{} projected the wrong scalar type",
+                domain.label(),
+                field.name
+            ),
+            None => assert!(
+                field.nullable,
+                "{}.{} is required but projected no value",
+                domain.label(),
+                field.name
+            ),
+        }
+    }
+    assert!(
+        row.field("not_a_registered_field").is_err(),
+        "an unregistered field must be rejected, not silently absent"
+    );
+}
+
+/// Issue #2438. Both shapes of a `call_binding` row -- a bound actual/formal
+/// pair and the mandatory terminal row -- project their complete registered
+/// surface, beside the call-shape rows they join. The registry and the
+/// projector are otherwise reconciled only by a `debug_assert` that a row
+/// nobody projects never reaches.
+#[test]
+fn call_row_domains_project_every_registered_field_on_real_rows() {
+    let source = r#"class App {
+  static int helper(int first, int second) { return first + second; }
+  static int caller() { return helper(1, 2); }
+  static int missing(String text) { return text.length(); }
+}
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let file = ProjectFile::new(root.clone(), PathBuf::from("App.java"));
+    file.write(source).expect("write source");
+    let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+    let query = |callee: &str, steps: &[&str]| {
+        CodeQuery::from_json(&json!({
+            "match": { "kind": "call", "callee": { "name": callee } },
+            "steps": steps.iter().map(|op| json!({ "op": op })).collect::<Vec<_>>(),
+            "result_detail": "full"
+        }))
+        .expect("call query")
+    };
+
+    let bound = execute(
+        &analyzer,
+        &query("helper", &["call_shape", "call_bindings"]),
+    );
+    assert_eq!(bound.results.len(), 2, "{}", bound.render_text());
+    for item in &bound.results {
+        assert_eq!(
+            item.value.detailed_domain(),
+            DetailedCodeQueryDomain::CallBinding
+        );
+        assert_row_projects_its_whole_registered_surface(&item.value);
+    }
+
+    // The terminal shape of the same domain: an unresolvable callee.
+    let terminal = execute(
+        &analyzer,
+        &query("length", &["call_shape", "call_bindings"]),
+    );
+    assert_eq!(terminal.results.len(), 1, "{}", terminal.render_text());
+    assert_row_projects_its_whole_registered_surface(&terminal.results[0].value);
+
+    for steps in [
+        &["call_shape"][..],
+        &["call_shape", "call_argument_groups"][..],
+        &["call_shape", "call_argument_groups", "call_arguments"][..],
+    ] {
+        let result = execute(&analyzer, &query("helper", steps));
+        assert!(!result.results.is_empty(), "{}", result.render_text());
+        for item in &result.results {
+            assert_row_projects_its_whole_registered_surface(&item.value);
+        }
+    }
+}
+
 #[test]
 fn detailed_row_field_registry_covers_every_domain_without_duplicate_fields() {
     let mut labels = std::collections::HashSet::new();
@@ -1257,4 +1356,80 @@ fn occurrence_row_projection_does_not_invent_one_identity_for_ambiguous_targets(
         row.field("target_count").expect("registered field"),
         Some(CodeQueryRowScalarRef::Integer(2))
     );
+}
+
+/// Issue #2437. Both effect domains are mandatory-row domains: with no active
+/// semantic-model pack, every call site and every procedure still publishes one
+/// terminal row that states the derivation's status, and every required
+/// registered field projects on it. Zero rows can therefore never be read as
+/// "this call performs no effect".
+#[test]
+fn effect_row_domains_project_their_registered_surface_without_an_active_pack() {
+    let source = r#"class App {
+  static int helper(int first) { return first + 1; }
+  static int caller() { return helper(1); }
+}
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), PathBuf::from("App.java"))
+        .write(source)
+        .expect("write source");
+    let workspace = WorkspaceAnalyzer::build(
+        Arc::new(TestProject::new(root, Language::Java)),
+        AnalyzerConfig::default(),
+    );
+
+    let call_effects = execute_workspace(
+        &workspace,
+        &CodeQuery::from_json(&json!({
+            "match": { "kind": "call", "callee": { "name": "helper" } },
+            "steps": [{ "op": "call_shape" }, { "op": "call_effects" }],
+            "result_detail": "full"
+        }))
+        .expect("call-effect query"),
+    );
+    assert_eq!(
+        call_effects.results.len(),
+        1,
+        "{}",
+        call_effects.render_text()
+    );
+    let CodeQueryResultValue::CallEffect { value } = &call_effects.results[0].value else {
+        panic!(
+            "expected a call effect row, got {}",
+            call_effects.render_text()
+        )
+    };
+    assert!(value.terminal, "{value:#?}");
+    assert_eq!(value.derivation, "none");
+    assert_eq!(value.effect_id, None);
+    assert_row_projects_its_whole_registered_surface(&call_effects.results[0].value);
+
+    let procedure_effects = execute_workspace(
+        &workspace,
+        &CodeQuery::from_json(&json!({
+            "match": { "kind": "method", "name": "caller" },
+            "steps": [{ "op": "enclosing_decl" }, { "op": "procedure_effects" }],
+            "result_detail": "full"
+        }))
+        .expect("procedure-effect query"),
+    );
+    assert_eq!(
+        procedure_effects.results.len(),
+        1,
+        "{}",
+        procedure_effects.render_text()
+    );
+    let CodeQueryResultValue::ProcedureEffect { value } = &procedure_effects.results[0].value
+    else {
+        panic!(
+            "expected a procedure effect row, got {}",
+            procedure_effects.render_text()
+        )
+    };
+    assert!(value.terminal, "{value:#?}");
+    assert_eq!(value.derivation, "none");
+    assert_eq!(value.coverage, "exhaustive");
+    assert_row_projects_its_whole_registered_surface(&procedure_effects.results[0].value);
 }

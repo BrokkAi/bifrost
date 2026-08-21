@@ -75,10 +75,32 @@ pub struct PolicyDefinition {
 
 #[derive(Debug, Clone)]
 pub enum PolicyAnalysis {
-    Match { spec: MatchPolicySpec },
-    Taint { spec: TaintPolicySpec },
-    Typestate { spec: TypestatePolicySpec },
-    Assertion { spec: AssertionPolicySpec },
+    Match {
+        spec: MatchPolicySpec,
+    },
+    Taint {
+        spec: TaintPolicySpec,
+    },
+    Typestate {
+        spec: TypestatePolicySpec,
+    },
+    Assertion {
+        spec: AssertionPolicySpec,
+    },
+    /// Policy-authored generic bounded value flow (#2436).
+    ///
+    /// The authored records are neutral (`origin`, `observation`, `kill`) and
+    /// carry no security vocabulary, but the decoded model is the same typed
+    /// binding system taint uses, closed over one internal provenance label
+    /// ([`FLOW_INTERNAL_LABEL`]). That is the recorded milestone-6 decision:
+    /// compile onto the production taint batch machinery with a single label
+    /// rather than stand up a second solver client. Storing the lowered model
+    /// here -- rather than a parallel authored model plus a lowering step --
+    /// is what keeps composition, selector closure, precedence, and endpoint
+    /// dependency validation literally the same code for both kinds.
+    Flow {
+        spec: TaintPolicySpec,
+    },
 }
 
 impl PolicyAnalysis {
@@ -88,9 +110,70 @@ impl PolicyAnalysis {
             Self::Taint { .. } => PolicyAnalysisType::Taint,
             Self::Typestate { .. } => PolicyAnalysisType::Typestate,
             Self::Assertion { .. } => PolicyAnalysisType::Assertion,
+            Self::Flow { .. } => PolicyAnalysisType::Flow,
+        }
+    }
+
+    /// The taint-shaped model this analysis executes through, for the two
+    /// kinds that share the production taint pipeline.
+    pub const fn taint_shaped_spec(&self) -> Option<&TaintPolicySpec> {
+        match self {
+            Self::Taint { spec } | Self::Flow { spec } => Some(spec),
+            Self::Match { .. } | Self::Typestate { .. } | Self::Assertion { .. } => None,
+        }
+    }
+
+    /// The authoring segments this analysis publishes for the shared
+    /// taint-shaped entry sets.
+    pub const fn set_segments(&self) -> TaintSetSegments {
+        match self {
+            Self::Flow { .. } => FLOW_SET_SEGMENTS,
+            Self::Match { .. }
+            | Self::Taint { .. }
+            | Self::Typestate { .. }
+            | Self::Assertion { .. } => TAINT_SET_SEGMENTS,
         }
     }
 }
+
+/// The one internal provenance label every `analysis :type flow` policy is
+/// closed over. It is never authored and never rendered as a taint label; a
+/// flow policy tracks presence of the origin's value, not a classification.
+pub const FLOW_INTERNAL_LABEL: &str = "flow-value";
+
+/// The JSON-pointer segments the shared taint-shaped model publishes for its
+/// five entry sets. Taint and flow decode into the same typed model but must
+/// not share authoring vocabulary, so each kind names its own segments and
+/// every selector path, dependency origin, and canonical key follows them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaintSetSegments {
+    pub sources: &'static str,
+    pub sinks: &'static str,
+    pub sanitizers: &'static str,
+    pub transforms: &'static str,
+    pub external_models: &'static str,
+}
+
+pub const TAINT_SET_SEGMENTS: TaintSetSegments = TaintSetSegments {
+    sources: "sources",
+    sinks: "sinks",
+    sanitizers: "sanitizers",
+    transforms: "transforms",
+    external_models: "external_models",
+};
+
+pub const FLOW_SET_SEGMENTS: TaintSetSegments = TaintSetSegments {
+    sources: "origins",
+    sinks: "observations",
+    sanitizers: "kills",
+    transforms: "transforms",
+    external_models: "external_models",
+};
+
+/// The one internal category minted for flow origins and observations. Flow
+/// authoring has no category vocabulary; the constant exists because the
+/// shared endpoint model requires a non-empty category set.
+pub const FLOW_INTERNAL_CATEGORY: &str = "flow.value";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PolicyAnalysisType {
@@ -98,6 +181,7 @@ pub enum PolicyAnalysisType {
     Taint,
     Typestate,
     Assertion,
+    Flow,
 }
 
 impl PolicyAnalysisType {
@@ -107,6 +191,7 @@ impl PolicyAnalysisType {
             Self::Taint => "taint",
             Self::Typestate => "typestate",
             Self::Assertion => "assertion",
+            Self::Flow => "flow",
         }
     }
 }

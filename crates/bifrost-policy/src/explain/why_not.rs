@@ -17,7 +17,9 @@ use std::ops::Range;
 use brokk_bifrost_analysis::analyzer::semantic::{
     WorkspaceRelativePath, WorkspaceRelativePathError,
 };
-use brokk_bifrost_analysis::analyzer::structural::search::execute_code_query_detailed_eager_index;
+use brokk_bifrost_analysis::analyzer::structural::search::{
+    execute_code_query_detailed_eager_index, execute_code_query_detailed_eager_index_workspace,
+};
 use brokk_bifrost_analysis::analyzer::structural::{
     CodeQuery, CodeQueryCompletion, CodeQueryResultDetail,
 };
@@ -37,6 +39,49 @@ use super::model::{
 
 /// The selector path a match policy's one selector always occupies.
 const MATCH_SELECTOR_PATH: &str = "/analysis/selector";
+
+/// Explain why one explicit candidate is not reported, choosing the adapter
+/// from the loaded policy's analysis.
+///
+/// This is the entry point a host calls:
+///
+/// - a `match` policy answers through [`explain_match_candidate`];
+/// - an `assertion` policy that carries a relational row plan answers through
+///   the relational adapter, which decides per-binding row membership.
+///
+/// # Errors
+///
+/// - [`ExplainError::ExplanationAdapterUnavailable`] for a `taint`, `flow`, or
+///   `typestate` policy. The error names the families that *are* supported.
+/// - [`ExplainError::RelationalPlanUnavailable`] for an assertion policy whose
+///   assertions are the capture-oriented families rather than a row plan.
+/// - Everything the chosen adapter can return.
+pub fn explain_candidate(
+    policy: &LoadedPolicy,
+    context: &PolicyEvaluationContext<'_>,
+    candidate: &ExplanationCandidate,
+    budget: &PolicyBudget,
+    limits: &ExplanationLimits,
+) -> Result<PolicyExplanation, ExplainError> {
+    match &policy.definition().analysis {
+        PolicyAnalysis::Match { .. } => {
+            explain_match_candidate(policy, context, candidate, budget, limits)
+        }
+        PolicyAnalysis::Assertion { spec } => {
+            let plan = spec
+                .relational
+                .as_ref()
+                .ok_or(ExplainError::RelationalPlanUnavailable)?;
+            super::why_not_relational::explain_relational_candidate(
+                policy, plan, context, candidate, budget, limits,
+            )
+        }
+        other => Err(ExplainError::adapter_unavailable(
+            other.analysis_type(),
+            ExplanationQuestion::WhyNot,
+        )),
+    }
+}
 
 /// One explicit position a caller believes should have matched.
 ///
@@ -190,7 +235,10 @@ pub fn explain_match_candidate(
 ) -> Result<PolicyExplanation, ExplainError> {
     let analysis_type = policy.definition().analysis.analysis_type();
     if !matches!(policy.definition().analysis, PolicyAnalysis::Match { .. }) {
-        return Err(ExplainError::ExplanationAdapterUnavailable { analysis_type });
+        return Err(ExplainError::adapter_unavailable(
+            analysis_type,
+            ExplanationQuestion::WhyNot,
+        ));
     }
     let selector = policy
         .resolved_selectors()
@@ -203,7 +251,15 @@ pub fn explain_match_candidate(
         });
     }
 
-    let stages = run_prefixes(&selector.query, context, candidate, budget, limits);
+    let stages = run_prefixes(
+        &selector.query,
+        context,
+        candidate,
+        budget,
+        limits.max_prefix_executions(),
+        PrefixExecution::AnalyzerOnly,
+        budget.max_findings(),
+    );
     let root = candidate_root(candidate, &selector.query, stages);
     build_explanation(
         ExplanationQuestion::WhyNot,
@@ -220,9 +276,25 @@ pub fn explain_match_candidate(
     )
 }
 
+/// Which execution path a prefix query takes.
+///
+/// A faithful re-execution must use the same path the evaluator that produced
+/// the real verdict uses. The match evaluator reads the analyzer directly; the
+/// relational driver prefers the generation-bound workspace oracles when the
+/// evaluation context carries a workspace, because its row expansions need
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PrefixExecution {
+    /// Always execute against `context.analyzer`.
+    AnalyzerOnly,
+    /// Execute against `context.workspace` when there is one, and against
+    /// `context.analyzer` otherwise.
+    PreferWorkspace,
+}
+
 /// What one executed prefix concluded about the candidate.
 #[derive(Debug)]
-struct StageOutcome {
+pub(super) struct StageOutcome {
     label: String,
     outcome: ExplanationOutcome,
     actual: String,
@@ -230,24 +302,58 @@ struct StageOutcome {
     completion_label: Option<&'static str>,
 }
 
+impl StageOutcome {
+    pub(super) const fn outcome(&self) -> ExplanationOutcome {
+        self.outcome
+    }
+    pub(super) fn label(&self) -> &str {
+        &self.label
+    }
+}
+
 /// Every stage that ran, plus whether the prefix budget cut the walk short.
 #[derive(Debug)]
-struct StageWalk {
+pub(super) struct StageWalk {
     stages: Vec<StageOutcome>,
     prefixes_truncated: bool,
     omitted_prefixes: u64,
 }
 
-fn run_prefixes(
+impl StageWalk {
+    pub(super) const fn prefixes_truncated(&self) -> bool {
+        self.prefixes_truncated
+    }
+    pub(super) const fn omitted_prefixes(&self) -> u64 {
+        self.omitted_prefixes
+    }
+    /// How many prefix queries this walk actually executed, which is what a
+    /// caller charges against a shared execution budget.
+    pub(super) fn executed(&self) -> usize {
+        self.stages.len()
+    }
+    /// The first stage that did not retain the candidate, if any.
+    pub(super) fn decided(&self) -> Option<&StageOutcome> {
+        self.stages
+            .iter()
+            .find(|stage| stage.outcome != ExplanationOutcome::Satisfied)
+    }
+    pub(super) fn into_stages(self) -> Vec<StageOutcome> {
+        self.stages
+    }
+}
+
+pub(super) fn run_prefixes(
     selector: &CodeQuery,
     context: &PolicyEvaluationContext<'_>,
     candidate: &ExplanationCandidate,
     budget: &PolicyBudget,
-    limits: &ExplanationLimits,
+    max_executions: usize,
+    execution: PrefixExecution,
+    row_limit: usize,
 ) -> StageWalk {
     let step_count = selector.plan.steps.len();
     let wanted = step_count.saturating_add(1);
-    let executable = wanted.min(limits.max_prefix_executions());
+    let executable = wanted.min(max_executions);
     let mut stages = Vec::with_capacity(executable);
     let mut stopped_early = false;
 
@@ -258,11 +364,12 @@ fn run_prefixes(
         };
         let mut query = selector.clone();
         query.plan.steps.truncate(prefix);
-        // Author-controlled presentation is not policy semantics: the match
-        // evaluator forces full detail and the host finding budget, and a
-        // faithful re-execution must do the same.
+        // Author-controlled presentation is not policy semantics: the
+        // evaluator forces full detail and its own row bound, and a faithful
+        // re-execution must do the same. The bound differs per family, so the
+        // caller passes the one its evaluator uses.
         query.result_detail = CodeQueryResultDetail::Full;
-        query.limit = budget.max_findings();
+        query.limit = row_limit;
 
         if query.validate_steps().is_err() {
             stages.push(StageOutcome {
@@ -276,12 +383,22 @@ fn run_prefixes(
             break;
         }
 
-        let executed = execute_code_query_detailed_eager_index(
-            context.analyzer,
-            &query,
-            budget.query_limits(),
-            context.cancellation,
-        );
+        let executed = match (execution, context.workspace) {
+            (PrefixExecution::PreferWorkspace, Some(workspace)) => {
+                execute_code_query_detailed_eager_index_workspace(
+                    workspace,
+                    &query,
+                    budget.query_limits(),
+                    context.cancellation,
+                )
+            }
+            _ => execute_code_query_detailed_eager_index(
+                context.analyzer,
+                &query,
+                budget.query_limits(),
+                context.cancellation,
+            ),
+        };
         let completion = executed.result.completion();
         let covering = executed
             .evidence
@@ -397,15 +514,41 @@ const fn non_complete_label(completion: &CodeQueryCompletion) -> Option<&'static
     }
 }
 
+/// One executed prefix as an explanation node, with its query-completion child
+/// when the query was not exhaustive.
+pub(super) fn stage_node(stage: StageOutcome, candidate: &ExplanationCandidate) -> RawNode {
+    let completion_label = stage.completion_label;
+    let reasons = stage.reasons.clone();
+    let mut node = RawNode::new(
+        ExplanationNodeKind::SelectorStage,
+        stage.outcome,
+        stage.label,
+    )
+    .with_expected("a returned row covers the candidate")
+    .with_actual(stage.actual)
+    .with_location(Some(PolicySourceLocation::artifact(candidate.path.clone())))
+    .with_reasons(stage.reasons);
+    if let Some(completion_label) = completion_label {
+        node.push_child(
+            RawNode::new(
+                ExplanationNodeKind::CoverageObligation,
+                ExplanationOutcome::Unknown,
+                "query_completion",
+            )
+            .with_expected("an exhaustive query over the candidate's file")
+            .with_actual(completion_label)
+            .with_reasons(reasons),
+        );
+    }
+    node
+}
+
 fn candidate_root(
     candidate: &ExplanationCandidate,
     selector: &CodeQuery,
     walk: StageWalk,
 ) -> RawNode {
-    let decided = walk
-        .stages
-        .iter()
-        .find(|stage| stage.outcome != ExplanationOutcome::Satisfied);
+    let decided = walk.decided();
     let root_outcome = match decided {
         Some(stage) => stage.outcome,
         None if walk.prefixes_truncated => ExplanationOutcome::Unknown,
@@ -441,30 +584,7 @@ fn candidate_root(
     .with_source_truncation(walk.prefixes_truncated, walk.omitted_prefixes);
 
     for stage in walk.stages {
-        let completion_label = stage.completion_label;
-        let reasons = stage.reasons.clone();
-        let mut node = RawNode::new(
-            ExplanationNodeKind::SelectorStage,
-            stage.outcome,
-            stage.label,
-        )
-        .with_expected("a returned row covers the candidate")
-        .with_actual(stage.actual)
-        .with_location(Some(PolicySourceLocation::artifact(candidate.path.clone())))
-        .with_reasons(stage.reasons);
-        if let Some(completion_label) = completion_label {
-            node.push_child(
-                RawNode::new(
-                    ExplanationNodeKind::CoverageObligation,
-                    ExplanationOutcome::Unknown,
-                    "query_completion",
-                )
-                .with_expected("an exhaustive query over the candidate's file")
-                .with_actual(completion_label)
-                .with_reasons(reasons),
-            );
-        }
-        root.push_child(node);
+        root.push_child(stage_node(stage, candidate));
     }
     root
 }

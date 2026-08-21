@@ -1906,9 +1906,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let invoke = self.point(builder, node, Vec::new())?;
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
-        let callee = self.value(builder, invoke, SemanticValueKind::Callable)?;
+        // Keep transient callable/exception values anchored to the callable
+        // spelling. The whole call expression denotes `result`; giving all
+        // three values the whole-expression span makes source-level
+        // points-to queries observe internal call scaffolding as if it were
+        // the expression value.
+        let callable_anchor = node
+            .child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("type"))
+            .or_else(|| first_named_child(node))
+            .unwrap_or(node);
+        let callee = self.source_value(builder, callable_anchor, SemanticValueKind::Callable)?;
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
-        let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
+        let thrown = self.source_value(builder, callable_anchor, SemanticValueKind::Exception)?;
         let receiver_node = match node.kind() {
             "method_invocation" | "explicit_constructor_invocation" => {
                 node.child_by_field_name("object")

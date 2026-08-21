@@ -46,6 +46,7 @@ impl RubyFileScan<'_> {
             locals: LocalInferenceEngine::new(LocalInferenceConfig::default()),
             lexical_stack: Vec::new(),
             method_stack: Vec::new(),
+            receiver_context: Vec::new(),
             exits: Vec::new(),
         };
         walk_tree_iterative(
@@ -58,8 +59,9 @@ impl RubyFileScan<'_> {
 }
 
 enum RubyExit {
-    Lexical,
+    Type { has_lexical_owner: bool },
     Method,
+    SingletonClass,
     LocalScope,
 }
 
@@ -68,6 +70,7 @@ struct RubyWalkState<'a, 'b> {
     locals: LocalInferenceEngine<String>,
     lexical_stack: Vec<String>,
     method_stack: Vec<ReceiverMode>,
+    receiver_context: Vec<ReceiverMode>,
     exits: Vec<RubyExit>,
 }
 
@@ -76,24 +79,32 @@ impl RubyWalkState<'_, '_> {
         match node.kind() {
             "class" | "module" => {
                 self.record_superclass_reference(node);
-                if let Some(owner) = self.type_owner(node) {
-                    self.lexical_stack.push(owner);
-                    self.exits.push(RubyExit::Lexical);
-                    self.record_reference(node);
-                    return TreeWalkAction::DescendWithExit;
+                let owner = self.type_owner(node);
+                if let Some(owner) = owner.as_ref() {
+                    self.lexical_stack.push(owner.clone());
                 }
+                self.receiver_context.push(ReceiverMode::Instance);
+                self.exits.push(RubyExit::Type {
+                    has_lexical_owner: owner.is_some(),
+                });
+                self.record_reference(node);
+                return TreeWalkAction::DescendWithExit;
             }
             "method" | "singleton_method" => {
                 self.locals.enter_scope();
                 self.seed_parameter_shadows(node);
-                self.method_stack.push(method_receiver_mode(node));
+                self.method_stack.push(method_receiver_mode(
+                    node,
+                    self.receiver_context.last().copied(),
+                ));
                 self.exits.push(RubyExit::Method);
                 return TreeWalkAction::DescendWithExit;
             }
             "singleton_class" => {
                 self.locals.enter_scope();
                 self.method_stack.push(ReceiverMode::Class);
-                self.exits.push(RubyExit::Method);
+                self.receiver_context.push(ReceiverMode::Class);
+                self.exits.push(RubyExit::SingletonClass);
                 return TreeWalkAction::DescendWithExit;
             }
             "block" | "do_block" => {
@@ -110,10 +121,24 @@ impl RubyWalkState<'_, '_> {
 
     fn exit(&mut self) {
         match self.exits.pop() {
-            Some(RubyExit::Lexical) => {
-                self.lexical_stack.pop();
+            Some(RubyExit::Type { has_lexical_owner }) => {
+                assert!(
+                    matches!(self.receiver_context.pop(), Some(ReceiverMode::Instance)),
+                    "type receiver context must match its exit"
+                );
+                if has_lexical_owner {
+                    self.lexical_stack.pop();
+                }
             }
             Some(RubyExit::Method) => {
+                self.method_stack.pop();
+                self.locals.exit_scope();
+            }
+            Some(RubyExit::SingletonClass) => {
+                assert!(
+                    matches!(self.receiver_context.pop(), Some(ReceiverMode::Class)),
+                    "singleton-class receiver context must match its exit"
+                );
                 self.method_stack.pop();
                 self.locals.exit_scope();
             }

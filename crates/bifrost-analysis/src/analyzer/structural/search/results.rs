@@ -365,6 +365,18 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryCallShapeArgument>,
     },
+    CallBinding {
+        #[serde(flatten)]
+        value: Box<CodeQueryCallBinding>,
+    },
+    CallEffect {
+        #[serde(flatten)]
+        value: Box<CodeQueryCallEffect>,
+    },
+    ProcedureEffect {
+        #[serde(flatten)]
+        value: Box<CodeQueryProcedureEffect>,
+    },
     CallableSignature {
         #[serde(flatten)]
         value: Box<CodeQueryCallableSignature>,

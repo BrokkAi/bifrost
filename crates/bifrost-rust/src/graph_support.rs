@@ -1509,7 +1509,7 @@ pub fn resolve_module_files(
             Vec::new()
         };
     }
-    let Some(resolved_module) = (if rooted {
+    let Some(mut resolved_module) = (if rooted {
         resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
     } else {
         resolve_module_package(rust, token, importing_file, module_specifier)
@@ -1517,31 +1517,30 @@ pub fn resolve_module_files(
         return rust_module_files_from_path(importing_file, module_specifier);
     };
 
-    let mut files: Vec<_> = analyzed_files
-        .files_in_package(&resolved_module)
-        .cloned()
-        .collect();
-    // Only units that *are* the module's definition back it. A bodiless
-    // `mod svc;` item is a forwarder living in the declaring file, so
-    // extending with its source handed every consumer lib.rs alongside the
-    // real content file (#1342). An inline `mod svc { ... }` keeps its own
-    // file: there the declaring file genuinely is the defining file.
-    files.extend(
-        rust.definitions(&resolved_module)
-            .filter(|code_unit| {
-                code_unit.is_module()
-                    && !is_external_module_declaration(rust, token, code_unit)
-                    && (code_unit.source() == importing_file
-                        || is_visible_module_path(rust.code_units(), code_unit))
-            })
-            .map(|code_unit| code_unit.source().clone()),
-    );
+    let mut files = resolved_module_files(rust, token, importing_file, &resolved_module);
     files.extend(rust_module_files_from_path(
         importing_file,
         module_specifier,
     ));
     files.sort();
     files.dedup();
+
+    // A crate-root path can name a module re-exported by the crate facade
+    // rather than a physical child of that crate. `crate::api` in a facade
+    // that says `pub use engine::api` is one namespace with the physical
+    // `engine::api`; treating the path-derived `facade.api` spelling as final
+    // reports an indexed workspace target as an external boundary. Follow the
+    // crate root's structured export graph only after the ordinary physical
+    // route misses, so a real local module keeps Rust's normal precedence.
+    if rooted
+        && files.is_empty()
+        && let Some(exported_module) =
+            resolve_rooted_exported_module_package(rust, token, importing_file, module_specifier)
+    {
+        resolved_module = exported_module;
+        files = resolved_module_files(rust, token, importing_file, &resolved_module);
+    }
+
     // Path-derived Rust package names are shared by independent Cargo
     // examples, benches, and binaries. Rooted paths are crate-relative, so
     // only disambiguate when the package lookup actually collided: retain
@@ -1561,6 +1560,72 @@ pub fn resolve_module_files(
         return if shared.is_empty() { unknown } else { shared };
     }
     files
+}
+
+fn resolved_module_files(
+    rust: &dyn RustSource,
+    token: QueryToken<'_>,
+    importing_file: &ProjectFile,
+    resolved_module: &str,
+) -> Vec<ProjectFile> {
+    let analyzed_files = rust.package_file_index();
+    let mut files: Vec<_> = analyzed_files
+        .files_in_package(resolved_module)
+        .cloned()
+        .collect();
+    // Only units that *are* the module's definition back it. A bodiless
+    // `mod svc;` item is a forwarder living in the declaring file, so
+    // extending with its source handed every consumer lib.rs alongside the
+    // real content file (#1342). An inline `mod svc { ... }` keeps its own
+    // file: there the declaring file genuinely is the defining file.
+    files.extend(
+        rust.definitions(resolved_module)
+            .filter(|code_unit| {
+                code_unit.is_module()
+                    && !is_external_module_declaration(rust, token, code_unit)
+                    && (code_unit.source() == importing_file
+                        || is_visible_module_path(rust.code_units(), code_unit))
+            })
+            .map(|code_unit| code_unit.source().clone()),
+    );
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn resolve_rooted_exported_module_package(
+    rust: &dyn RustSource,
+    token: QueryToken<'_>,
+    importing_file: &ProjectFile,
+    module_specifier: &str,
+) -> Option<String> {
+    let segments = parse_symbol_path(Language::Rust, module_specifier);
+    let (root, nested) = segments.split_first()?;
+    if root != "crate" || nested.is_empty() {
+        return None;
+    }
+
+    let mut files = rust.cargo_routes().target_roots_for_file(importing_file);
+    if files.is_empty()
+        && rust.is_analyzed(importing_file)
+        && rust_package_name(importing_file) == rust_crate_root_package(importing_file)
+    {
+        files.push(importing_file.clone());
+    }
+    files.retain(|file| rust.is_analyzed(file));
+    files.sort();
+    files.dedup();
+
+    let mut package = None;
+    for segment in nested {
+        let resolved = forward_exported_module_fqn(rust, token, &files, segment)?;
+        files = resolved_module_files(rust, token, importing_file, &resolved);
+        if files.is_empty() {
+            return None;
+        }
+        package = Some(resolved);
+    }
+    package
 }
 
 /// Re-spell one rooted module prefix under a Cargo target's shared kind root.

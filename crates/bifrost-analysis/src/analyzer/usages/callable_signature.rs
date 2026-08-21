@@ -220,14 +220,14 @@ fn signature_row_id(declaration_id: &str, ordinal: usize) -> String {
 
 /// What the declaration is. The persisted constructor flag wins over the unit
 /// kind, because a constructor is a callable whose unit kind is `Function`;
-/// otherwise a callable with a structural owner is a method and one without is
-/// a free function.
+/// otherwise a callable owned by a type scope is a method and one owned by a
+/// package, module, or no scope is a free function.
 fn role_of(unit: &CodeUnit, metadata: Option<&SignatureMetadata>) -> DeclarationRole {
     match unit.kind() {
         CodeUnitType::Function => {
             if metadata.is_some_and(SignatureMetadata::callable_is_constructor) {
                 DeclarationRole::Constructor
-            } else if unit.owner_identifier().is_some() {
+            } else if unit.owner_is_type_scope() {
                 DeclarationRole::Method
             } else {
                 DeclarationRole::Function
@@ -265,7 +265,7 @@ fn receiver_contract_of(unit: &CodeUnit, metadata: &SignatureMetadata) -> Option
     if metadata.callable_is_static() {
         return Some(ReceiverContract::StaticOrCompanion);
     }
-    if unit.owner_identifier().is_some() {
+    if unit.owner_is_type_scope() {
         Some(ReceiverContract::Instance)
     } else {
         Some(ReceiverContract::None)
@@ -275,17 +275,19 @@ fn receiver_contract_of(unit: &CodeUnit, metadata: &SignatureMetadata) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
     use brokk_bifrost_core::analyzer::model::{ParameterMetadata, ProjectFile};
     use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 
     fn unit(owner: &str, name: &str) -> CodeUnit {
         let file = ProjectFile::new(std::env::temp_dir(), "Main.java");
-        let short_name = if owner.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{owner}.{name}")
-        };
-        CodeUnit::new(file, CodeUnitType::Function, "app", short_name)
+        let interner = segment_interner();
+        let mut fq = FqName::new();
+        if !owner.is_empty() {
+            fq.push(interner.intern(owner, SegmentKind::Type));
+        }
+        fq.push(interner.intern(name, SegmentKind::Member));
+        CodeUnit::from_fq(file, CodeUnitType::Function, fq, 0, None, false)
     }
 
     fn parameters(labels: &[&str]) -> Vec<ParameterMetadata> {

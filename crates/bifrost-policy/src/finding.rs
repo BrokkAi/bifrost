@@ -1,4 +1,4 @@
-//! Stable policy evaluation and schema-version-2 match-evidence report types.
+//! Stable policy evaluation and schema-version-5 match-evidence report types.
 //!
 //! This module deliberately contains no query-to-finding conversion.  The
 //! evaluator must combine a loaded policy, detailed analyzer evidence, and a
@@ -23,7 +23,7 @@ use super::finding_identity::{
     EvidenceRef, FindingIdentityStability, MatchFindingAnchor, MatchResultDomain, PolicyFindingId,
     StableSemanticIdentity, WitnessId,
 };
-use super::future_evidence::{TaintFindingEvidence, TypestateFindingEvidence};
+use super::future_evidence::{FlowFindingEvidence, TaintFindingEvidence, TypestateFindingEvidence};
 use super::identity::PolicySemanticHash;
 use super::retained::{RetainedSize, retained_extra};
 use super::scope::PolicyFindingScope;
@@ -42,6 +42,10 @@ const MAX_WITNESS_STEPS: usize = 1_024;
 const MAX_WITNESS_BYTES: u64 = 1024 * 1024;
 const MAX_WORK_METRICS: usize = 256;
 const MAX_CAPABILITIES: usize = 64;
+/// The byte cap on one obligation's rendered group key. Group keys are row
+/// scalars an author chose, so their combined text is unbounded in principle
+/// while every other obligation field is a validated identifier.
+const MAX_OBLIGATION_GROUP_KEY_BYTES: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -689,6 +693,7 @@ pub enum PolicyFindingEvidence {
     Taint { evidence: TaintFindingEvidence },
     Typestate { evidence: TypestateFindingEvidence },
     Assertion { evidence: AssertionFindingEvidence },
+    Flow { evidence: FlowFindingEvidence },
 }
 
 impl PolicyFindingEvidence {
@@ -698,6 +703,7 @@ impl PolicyFindingEvidence {
             Self::Taint { .. } => PolicyAnalysisType::Taint,
             Self::Typestate { .. } => PolicyAnalysisType::Typestate,
             Self::Assertion { .. } => PolicyAnalysisType::Assertion,
+            Self::Flow { .. } => PolicyAnalysisType::Flow,
         }
     }
 
@@ -707,6 +713,7 @@ impl PolicyFindingEvidence {
             Self::Taint { evidence } => evidence.anchor().stability(),
             Self::Typestate { evidence } => evidence.anchor().stability(),
             Self::Assertion { evidence } => evidence.anchor().stability(),
+            Self::Flow { evidence } => evidence.anchor().stability(),
         }
     }
 }
@@ -718,6 +725,7 @@ impl RetainedSize for PolicyFindingEvidence {
             Self::Taint { evidence } => retained_extra(evidence),
             Self::Typestate { evidence } => retained_extra(evidence),
             Self::Assertion { evidence } => retained_extra(evidence),
+            Self::Flow { evidence } => retained_extra(evidence),
         })
     }
 }
@@ -2130,7 +2138,7 @@ impl RetainedSize for PolicyFindingDiff {
     }
 }
 
-/// One normalized finding in the canonical schema-version-4 report model.
+/// One normalized finding in the canonical schema-version-5 report model.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PolicyFinding {
     id: PolicyFindingId,
@@ -2279,6 +2287,13 @@ impl PolicyFinding {
                 PolicyFindingId::from_match_anchor(&policy_id, evidence.anchor())
             }
             PolicyFindingEvidence::Taint { evidence } => {
+                PolicyFindingId::from_taint_anchor(&policy_id, evidence.anchor())
+            }
+            // A flow finding's identity is the same anchor digest: the anchor
+            // states the exact origin/observation meeting, and the policy id --
+            // which is in the digest -- already separates a flow policy from a
+            // taint policy.
+            PolicyFindingEvidence::Flow { evidence } => {
                 PolicyFindingId::from_taint_anchor(&policy_id, evidence.anchor())
             }
             PolicyFindingEvidence::Typestate { evidence } => {
@@ -2529,7 +2544,7 @@ impl PolicyFinding {
             PolicyFindingEvidence::Match { .. } => 0,
             PolicyFindingEvidence::Taint { evidence } => evidence.source_scenarios().len(),
             PolicyFindingEvidence::Typestate { evidence } => evidence.scenario_ids().len(),
-            PolicyFindingEvidence::Assertion { .. } => 0,
+            PolicyFindingEvidence::Flow { .. } | PolicyFindingEvidence::Assertion { .. } => 0,
         };
         if evidence_scenarios > scenario_cap
             || self.cvss.as_ref().is_some_and(|cvss| {
@@ -2721,6 +2736,134 @@ impl fmt::Display for PolicyFindingError {
 
 impl std::error::Error for PolicyFindingError {}
 
+/// Why one assertion could not publish the verdict its rows suggested.
+///
+/// This is the published spelling of the evaluator's typed obligation kind
+/// (`crate::relational::RelationalObligationKind`). The wire strings are a
+/// report contract: a renamed or added kind is a schema change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyObligationKind {
+    /// The verdict is a claim about rows that were not observed -- a clean
+    /// pass of an upper bound, or a violation of a lower bound. Only an
+    /// exhaustively covered derivation can support it.
+    AbsenceRequiresExhaustiveCoverage,
+    /// The contributing rows are not witness-sound, so the aggregate value
+    /// itself is not established and neither verdict may be published.
+    VerdictRequiresWitnessedRows,
+}
+
+impl PolicyObligationKind {
+    /// The wire spelling, which the human and SARIF renderers print verbatim
+    /// so one obligation reads the same in all three outputs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AbsenceRequiresExhaustiveCoverage => "absence_requires_exhaustive_coverage",
+            Self::VerdictRequiresWitnessedRows => "verdict_requires_witnessed_rows",
+        }
+    }
+}
+
+/// One negative-proof obligation a run could **not** meet.
+///
+/// A run lists unmet obligations only. A met obligation is never reported and
+/// there can be one per observed group key, so retaining them would be an
+/// unbounded list nothing reads (issue #2435). Because every obligation folds
+/// at least one typed reason into the run before this list is built, a
+/// non-empty list means the run published no verdict for at least one
+/// assertion -- which is why [`PolicyRun`] admits obligations only under an
+/// `Inconclusive` completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyObligation {
+    /// The authored assertion whose verdict is blocked.
+    assertion: String,
+    kind: PolicyObligationKind,
+    /// The authored group whose derived relation the assertion read.
+    group: String,
+    /// The group key the obligation is about, rendered the way the matching
+    /// diagnostic renders it. Absent when the obligation is about the group
+    /// relation as a whole rather than one observed group.
+    group_key: Option<String>,
+    reasons: Vec<PolicyIncompleteReason>,
+}
+
+impl PolicyObligation {
+    pub(crate) fn try_new(
+        assertion: &str,
+        kind: PolicyObligationKind,
+        group: &str,
+        group_key: Option<&str>,
+        mut reasons: Vec<PolicyIncompleteReason>,
+    ) -> Result<Self, ReportValueError> {
+        validate_report_identifier(assertion)?;
+        validate_report_identifier(group)?;
+        if reasons.len() > MAX_TYPED_REASONS {
+            return Err(ReportValueError::TooManyItems {
+                field: "obligation_reasons",
+                max_items: MAX_TYPED_REASONS,
+            });
+        }
+        reasons.sort();
+        reasons.dedup();
+        // An obligation with no reason would say a verdict was blocked without
+        // saying by what, which is the one thing this list exists to state.
+        if reasons.is_empty() {
+            return Err(ReportValueError::EmptyCollection {
+                field: "obligation_reasons",
+            });
+        }
+        tighten_vec(&mut reasons);
+        Ok(Self {
+            assertion: assertion.to_owned(),
+            kind,
+            group: group.to_owned(),
+            group_key: group_key.map(bound_obligation_group_key),
+            reasons,
+        })
+    }
+
+    pub fn assertion(&self) -> &str {
+        &self.assertion
+    }
+    pub const fn kind(&self) -> PolicyObligationKind {
+        self.kind
+    }
+    pub fn group(&self) -> &str {
+        &self.group
+    }
+    pub fn group_key(&self) -> Option<&str> {
+        self.group_key.as_deref()
+    }
+    pub fn reasons(&self) -> &[PolicyIncompleteReason] {
+        &self.reasons
+    }
+}
+
+impl RetainedSize for PolicyObligation {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.assertion.capacity())
+            .saturating_add(self.group.capacity())
+            .saturating_add(self.group_key.as_ref().map_or(0, String::capacity))
+            .saturating_add(retained_extra(&self.reasons))
+    }
+}
+
+/// Bound one obligation's rendered group key on a UTF-8 boundary.
+///
+/// The key is display text for a blocked verdict, not an identity: nothing
+/// joins on it, so an over-long key costs detail rather than the obligation.
+fn bound_obligation_group_key(value: &str) -> String {
+    if value.len() <= MAX_OBLIGATION_GROUP_KEY_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_OBLIGATION_GROUP_KEY_BYTES;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
 /// One policy's complete, incomplete, unsupported, or failed evaluation run.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PolicyRun {
@@ -2731,6 +2874,13 @@ pub struct PolicyRun {
     findings: Vec<PolicyFinding>,
     diagnostics: Vec<PolicyDiagnostic>,
     diagnostics_truncated: bool,
+    /// The negative-proof obligations this run could not meet, in the
+    /// evaluation's own deterministic order. Always serialized, so a reader
+    /// can tell "no obligation was unmet" from "this schema has no such
+    /// field".
+    obligations: Vec<PolicyObligation>,
+    obligations_truncated: bool,
+    omitted_obligations_lower_bound: u64,
     work: PolicyWorkReport,
     /// Authored identities that closed a residual dispatch arm when this run
     /// is `ProvenBySummary`. Empty for every other tier.
@@ -2804,6 +2954,11 @@ impl PolicyRun {
         if work.omitted_findings_lower_bound > 0 && completion.is_reliable() {
             return Err(PolicyRunError::OmittedFindingsRequireIncompleteRun);
         }
+        // A run is constructed without obligations and receives them through
+        // `set_obligations`, which applies the same rule. Stating it here too
+        // keeps the invariant with the constructor even though it is vacuous
+        // for an empty list.
+        validate_obligation_retention(&completion, &[], false, 0, budget)?;
         work.set_retention(
             u64::try_from(findings.len()).unwrap_or(u64::MAX),
             work.omitted_findings_lower_bound,
@@ -2817,6 +2972,9 @@ impl PolicyRun {
             findings,
             diagnostics,
             diagnostics_truncated,
+            obligations: Vec::new(),
+            obligations_truncated: false,
+            omitted_obligations_lower_bound: 0,
             work,
             authored_arm_closures: Vec::new(),
         };
@@ -2862,6 +3020,61 @@ impl PolicyRun {
     pub const fn diagnostics_truncated(&self) -> bool {
         self.diagnostics_truncated
     }
+
+    /// The unmet negative-proof obligations this run retained, in the
+    /// evaluation's order. Met obligations are never listed.
+    pub fn obligations(&self) -> &[PolicyObligation] {
+        &self.obligations
+    }
+    pub const fn obligations_truncated(&self) -> bool {
+        self.obligations_truncated
+    }
+    pub const fn omitted_obligations_lower_bound(&self) -> u64 {
+        self.omitted_obligations_lower_bound
+    }
+
+    /// Attach the run's unmet obligations.
+    ///
+    /// Separate from `try_new` because a relational run is assembled through
+    /// the shared retention ladder, which owns the constructor's argument
+    /// list. The invariants are the constructor's: the truncation pair must
+    /// agree, the list must fit the budget, and a non-empty list requires an
+    /// `Inconclusive` completion.
+    pub(crate) fn set_obligations(
+        &mut self,
+        obligations: &[PolicyObligation],
+        obligations_truncated: bool,
+        omitted_obligations_lower_bound: u64,
+        budget: &PolicyBudget,
+    ) -> Result<(), PolicyRunError> {
+        validate_obligation_retention(
+            &self.completion,
+            obligations,
+            obligations_truncated,
+            omitted_obligations_lower_bound,
+            budget,
+        )?;
+        let previous = std::mem::replace(&mut self.obligations, obligations.to_vec());
+        let previous_truncated =
+            std::mem::replace(&mut self.obligations_truncated, obligations_truncated);
+        let previous_omitted = std::mem::replace(
+            &mut self.omitted_obligations_lower_bound,
+            omitted_obligations_lower_bound,
+        );
+        tighten_vec(&mut self.obligations);
+        self.refresh_retained_bytes();
+        if self.retained_size() > budget.max_retained_report_bytes() {
+            self.obligations = previous;
+            self.obligations_truncated = previous_truncated;
+            self.omitted_obligations_lower_bound = previous_omitted;
+            self.refresh_retained_bytes();
+            return Err(PolicyRunError::RetainedReportBytesExceeded {
+                max: budget.max_retained_report_bytes(),
+            });
+        }
+        Ok(())
+    }
+
     pub const fn work(&self) -> &PolicyWorkReport {
         &self.work
     }
@@ -2919,6 +3132,13 @@ impl PolicyRun {
         if self.diagnostics_truncated && self.completion.is_reliable() {
             return Err(PolicyRunError::CompletionDoesNotReflectDiagnostics);
         }
+        validate_obligation_retention(
+            &self.completion,
+            &self.obligations,
+            self.obligations_truncated,
+            self.omitted_obligations_lower_bound,
+            budget,
+        )?;
         for finding in &self.findings {
             if finding.policy_id != self.policy_id
                 || finding.policy_hash != self.policy_hash
@@ -3003,9 +3223,44 @@ impl RetainedSize for PolicyRun {
             .saturating_add(retained_extra(&self.completion))
             .saturating_add(retained_extra(&self.findings))
             .saturating_add(retained_extra(&self.diagnostics))
+            .saturating_add(retained_extra(&self.obligations))
             .saturating_add(retained_extra(&self.work))
             .saturating_add(retained_extra(&self.authored_arm_closures))
     }
+}
+
+/// The rule that makes a false green unrepresentable: a run that lists a
+/// blocked verdict cannot also claim a reliable one.
+///
+/// `Inconclusive` and nothing weaker is required. Every obligation folds its
+/// typed reasons into the run's completion upstream, so an obligation on a
+/// `Complete` or `ProvenSubset` run would mean that fold was skipped. The
+/// stricter-than-`is_reliable` test also keeps obligations off a `Failed` or
+/// `Unsupported` run, which published no verdict to block.
+fn validate_obligation_retention(
+    completion: &PolicyRunCompletion,
+    obligations: &[PolicyObligation],
+    obligations_truncated: bool,
+    omitted_obligations_lower_bound: u64,
+    budget: &PolicyBudget,
+) -> Result<(), PolicyRunError> {
+    validate_truncation_pair(
+        "obligations",
+        obligations_truncated,
+        omitted_obligations_lower_bound,
+    )
+    .map_err(|_| PolicyRunError::InconsistentObligationTruncation)?;
+    if obligations.len() > budget.max_obligations_per_run() {
+        return Err(PolicyRunError::TooManyObligations {
+            max: budget.max_obligations_per_run(),
+        });
+    }
+    if (!obligations.is_empty() || obligations_truncated)
+        && !matches!(completion, PolicyRunCompletion::Inconclusive { .. })
+    {
+        return Err(PolicyRunError::ObligationsRequireInconclusiveRun);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3018,6 +3273,9 @@ pub enum PolicyRunError {
     CompletionDoesNotReflectDiagnostics,
     WeakFindingRequiresIncompleteRun,
     OmittedFindingsRequireIncompleteRun,
+    TooManyObligations { max: usize },
+    InconsistentObligationTruncation,
+    ObligationsRequireInconclusiveRun,
     FindingBudgetViolation,
     RetainedReportBytesExceeded { max: usize },
 }
@@ -3053,6 +3311,14 @@ impl fmt::Display for PolicyRunError {
             Self::OmittedFindingsRequireIncompleteRun => {
                 formatter.write_str("omitted findings require an incomplete run")
             }
+            Self::TooManyObligations { max } => {
+                write!(formatter, "policy run accepts at most {max} obligations")
+            }
+            Self::InconsistentObligationTruncation => formatter
+                .write_str("policy run obligation truncation flag and omitted count disagree"),
+            Self::ObligationsRequireInconclusiveRun => {
+                formatter.write_str("unmet obligations require an inconclusive run completion")
+            }
             Self::FindingBudgetViolation => {
                 formatter.write_str("a finding exceeds the original host budget")
             }
@@ -3083,6 +3349,10 @@ fn validate_primary_evidence_shape(
     let expected_path = match evidence {
         PolicyFindingEvidence::Match { evidence } => Some(evidence.anchor().path().as_str()),
         PolicyFindingEvidence::Taint { evidence } => evidence
+            .anchor()
+            .strong_fields()
+            .map(|anchor| anchor.sink_identity().path().as_str()),
+        PolicyFindingEvidence::Flow { evidence } => evidence
             .anchor()
             .strong_fields()
             .map(|anchor| anchor.sink_identity().path().as_str()),
@@ -3162,6 +3432,14 @@ fn validate_required_completeness_reasons(
                 required.push(FindingIncompleteReason::WitnessTruncated);
             }
         }
+        PolicyFindingEvidence::Flow { evidence } => {
+            if evidence.origins_truncated() {
+                required.push(FindingIncompleteReason::OriginsTruncated);
+            }
+            if evidence.witness_refs_truncated() {
+                required.push(FindingIncompleteReason::WitnessTruncated);
+            }
+        }
         PolicyFindingEvidence::Typestate { evidence } => {
             if evidence.scenarios_truncated() {
                 required.push(FindingIncompleteReason::TypestateScenariosTruncated);
@@ -3189,6 +3467,7 @@ fn append_witness_refs<'a>(evidence: &'a PolicyFindingEvidence, output: &mut Vec
     match evidence {
         PolicyFindingEvidence::Match { .. } | PolicyFindingEvidence::Assertion { .. } => {}
         PolicyFindingEvidence::Taint { evidence } => output.extend(evidence.witness_refs()),
+        PolicyFindingEvidence::Flow { evidence } => output.extend(evidence.witness_refs()),
         PolicyFindingEvidence::Typestate { evidence } => output.extend(evidence.witness_refs()),
     }
 }
@@ -3237,6 +3516,9 @@ fn validate_cvss_finding_join(
         PolicyFindingEvidence::Taint { evidence } => {
             super::future_evidence::taint_vulnerability_digest(evidence.anchor())
         }
+        PolicyFindingEvidence::Flow { evidence } => {
+            super::future_evidence::taint_vulnerability_digest(evidence.anchor())
+        }
         PolicyFindingEvidence::Typestate { evidence } => {
             super::future_evidence::typestate_vulnerability_digest(evidence.anchor())
         }
@@ -3262,6 +3544,7 @@ fn validate_cvss_finding_join(
             }
             PolicyFindingEvidence::Match { .. }
             | PolicyFindingEvidence::Typestate { .. }
+            | PolicyFindingEvidence::Flow { .. }
             | PolicyFindingEvidence::Assertion { .. } => {
                 if !variant.source_scenarios().is_empty()
                     || variant.source_scenarios_truncated()
@@ -3295,10 +3578,20 @@ fn distinct_evidence_ref_count(
     for location in related {
         refs.extend(location.evidence_refs());
     }
-    if let PolicyFindingEvidence::Taint { evidence } = evidence {
-        for origin in evidence.origins() {
-            refs.extend(origin.evidence_refs());
+    match evidence {
+        PolicyFindingEvidence::Taint { evidence } => {
+            for origin in evidence.origins() {
+                refs.extend(origin.evidence_refs());
+            }
         }
+        PolicyFindingEvidence::Flow { evidence } => {
+            for origin in evidence.origins() {
+                refs.extend(origin.evidence_refs());
+            }
+        }
+        PolicyFindingEvidence::Match { .. }
+        | PolicyFindingEvidence::Typestate { .. }
+        | PolicyFindingEvidence::Assertion { .. } => {}
     }
     if let Some(cvss) = cvss {
         cvss.append_evidence_refs(&mut refs);
@@ -3701,6 +3994,7 @@ fixed_report_retained_size!(
     PolicyWorkUnit,
     PolicyAnalysisType,
     FindingSeverity,
+    PolicyObligationKind,
 );
 
 impl Serialize for PolicyAnalysisType {
@@ -3713,6 +4007,7 @@ impl Serialize for PolicyAnalysisType {
             Self::Taint => "taint",
             Self::Typestate => "typestate",
             Self::Assertion => "assertion",
+            Self::Flow => "flow",
         })
     }
 }
@@ -4495,6 +4790,232 @@ mod tests {
         assert_eq!(
             run.validate_against_budget(&zero_steps).unwrap_err(),
             PolicyRunError::FindingBudgetViolation
+        );
+    }
+
+    /// Build one run at the given completion with no findings.
+    fn run_at(completion: PolicyRunCompletion) -> PolicyRun {
+        let loaded = loaded_match_policy();
+        PolicyRun::try_new(
+            loaded.definition().metadata.id.clone(),
+            loaded.semantic_hash(),
+            PolicyAnalysisType::Match,
+            completion,
+            Vec::new(),
+            Vec::new(),
+            false,
+            PolicyWorkReport::default(),
+            &PolicyBudget::default(),
+        )
+        .unwrap()
+    }
+
+    fn obligation() -> PolicyObligation {
+        PolicyObligation::try_new(
+            "by-site-winners",
+            PolicyObligationKind::AbsenceRequiresExhaustiveCoverage,
+            "by-site",
+            None,
+            vec![PolicyIncompleteReason::PipelineRowBudget],
+        )
+        .unwrap()
+    }
+
+    /// Issue #2435: a run that lists a blocked verdict cannot also claim a
+    /// reliable one. This is what keeps a false green unrepresentable in the
+    /// report model rather than only in the evaluator that fills it.
+    #[test]
+    fn obligations_require_an_inconclusive_run() {
+        let budget = PolicyBudget::default();
+        for completion in [
+            PolicyRunCompletion::Complete,
+            PolicyRunCompletion::ProvenBySummary,
+            PolicyRunCompletion::proven_subset(vec![
+                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+            ])
+            .unwrap(),
+            PolicyRunCompletion::failed(vec![PolicyFailureReason::InternalInvariant]).unwrap(),
+            PolicyRunCompletion::Unsupported {
+                capability: PolicyCapability::TaintEvaluation,
+            },
+        ] {
+            let mut run = run_at(completion.clone());
+            assert_eq!(
+                run.set_obligations(&[obligation()], false, 0, &budget)
+                    .unwrap_err(),
+                PolicyRunError::ObligationsRequireInconclusiveRun,
+                "completion {completion:?} must refuse an unmet obligation"
+            );
+            // Truncation alone is the same claim with the list elided.
+            assert_eq!(
+                run.set_obligations(&[], true, 1, &budget).unwrap_err(),
+                PolicyRunError::ObligationsRequireInconclusiveRun,
+            );
+            assert!(
+                run.obligations().is_empty(),
+                "a refused set changes nothing"
+            );
+            assert!(!run.obligations_truncated());
+        }
+
+        let mut run = run_at(
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PipelineRowBudget])
+                .unwrap(),
+        );
+        run.set_obligations(&[obligation()], false, 0, &budget)
+            .unwrap();
+        assert_eq!(run.obligations().len(), 1);
+        assert_eq!(
+            run.validate_against_budget(&budget),
+            Ok(()),
+            "a validated run re-validates"
+        );
+    }
+
+    /// The crate's truncation-pair convention: a flag and an omitted count
+    /// that disagree describe a report nobody can read honestly.
+    #[test]
+    fn obligation_truncation_flag_and_omitted_count_must_agree() {
+        let budget = PolicyBudget::default();
+        let mut run = run_at(
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PipelineRowBudget])
+                .unwrap(),
+        );
+        assert_eq!(
+            run.set_obligations(&[obligation()], true, 0, &budget)
+                .unwrap_err(),
+            PolicyRunError::InconsistentObligationTruncation
+        );
+        assert_eq!(
+            run.set_obligations(&[obligation()], false, 3, &budget)
+                .unwrap_err(),
+            PolicyRunError::InconsistentObligationTruncation
+        );
+        run.set_obligations(&[obligation()], true, 3, &budget)
+            .unwrap();
+        assert!(run.obligations_truncated());
+        assert_eq!(run.omitted_obligations_lower_bound(), 3);
+    }
+
+    #[test]
+    fn a_run_retains_at_most_the_budgeted_number_of_obligations() {
+        let budget = PolicyBudget::builder()
+            .with_max_obligations_per_run(1)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut run = run_at(
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PipelineRowBudget])
+                .unwrap(),
+        );
+        assert_eq!(
+            run.set_obligations(&[obligation(), obligation()], false, 0, &budget)
+                .unwrap_err(),
+            PolicyRunError::TooManyObligations { max: 1 }
+        );
+        run.set_obligations(&[obligation()], true, 1, &budget)
+            .unwrap();
+        assert_eq!(run.obligations().len(), 1);
+    }
+
+    /// The obligation's own value rules: identifiers, a stated reason, and a
+    /// group key bounded on a character boundary rather than a byte.
+    #[test]
+    fn obligation_values_are_validated_and_the_group_key_is_bounded() {
+        assert_eq!(
+            PolicyObligation::try_new(
+                "by-site-winners",
+                PolicyObligationKind::VerdictRequiresWitnessedRows,
+                "by-site",
+                None,
+                Vec::new(),
+            )
+            .unwrap_err(),
+            ReportValueError::EmptyCollection {
+                field: "obligation_reasons"
+            }
+        );
+        assert!(
+            PolicyObligation::try_new(
+                "Not An Identifier",
+                PolicyObligationKind::VerdictRequiresWitnessedRows,
+                "by-site",
+                None,
+                vec![PolicyIncompleteReason::Cancelled],
+            )
+            .is_err()
+        );
+
+        let key = "é".repeat(MAX_OBLIGATION_GROUP_KEY_BYTES);
+        let projected = PolicyObligation::try_new(
+            "by-site-winners",
+            PolicyObligationKind::VerdictRequiresWitnessedRows,
+            "by-site",
+            Some(&key),
+            vec![
+                PolicyIncompleteReason::Cancelled,
+                PolicyIncompleteReason::Cancelled,
+            ],
+        )
+        .unwrap();
+        let bounded = projected.group_key().unwrap();
+        assert!(bounded.len() <= MAX_OBLIGATION_GROUP_KEY_BYTES);
+        assert!(
+            key.starts_with(bounded),
+            "the key is a prefix, never re-encoded"
+        );
+        assert_eq!(
+            projected.reasons(),
+            [PolicyIncompleteReason::Cancelled],
+            "reasons are canonical"
+        );
+    }
+
+    /// The wire vocabulary is a published contract, so it is pinned here
+    /// rather than derived from the enum's Rust spelling at review time.
+    #[test]
+    fn obligation_kinds_serialize_as_stable_snake_case() {
+        for (kind, expected) in [
+            (
+                PolicyObligationKind::AbsenceRequiresExhaustiveCoverage,
+                "absence_requires_exhaustive_coverage",
+            ),
+            (
+                PolicyObligationKind::VerdictRequiresWitnessedRows,
+                "verdict_requires_witnessed_rows",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), json!(expected));
+            assert_eq!(kind.as_str(), expected);
+        }
+    }
+
+    /// The schema-5 run shape: the three obligation fields are always present,
+    /// so a reader distinguishes "nothing was blocked" from "this producer
+    /// does not report obligations".
+    #[test]
+    fn every_run_publishes_the_obligation_fields() {
+        let clean = serde_json::to_value(run_at(PolicyRunCompletion::Complete)).unwrap();
+        assert_eq!(clean["obligations"], json!([]));
+        assert_eq!(clean["obligations_truncated"], json!(false));
+        assert_eq!(clean["omitted_obligations_lower_bound"], json!(0));
+
+        let mut run = run_at(
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PipelineRowBudget])
+                .unwrap(),
+        );
+        run.set_obligations(&[obligation()], false, 0, &PolicyBudget::default())
+            .unwrap();
+        let blocked = serde_json::to_value(&run).unwrap();
+        assert_eq!(
+            blocked["obligations"],
+            json!([{
+                "assertion": "by-site-winners",
+                "kind": "absence_requires_exhaustive_coverage",
+                "group": "by-site",
+                "group_key": null,
+                "reasons": ["pipeline_row_budget"],
+            }])
         );
     }
 

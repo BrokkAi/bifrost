@@ -30,17 +30,22 @@
 //! This module is additive. Ordinary policy evaluation calls nothing here, and
 //! nothing here mutates analyzer or evaluator state.
 
+mod host;
 mod model;
 mod why;
+mod why_assertion;
 mod why_not;
+mod why_not_relational;
 
 #[cfg(test)]
 mod tests;
 
+pub use host::{ExplanationTarget, explain_loaded_policy, explain_policy_inputs};
 pub use model::{
     ExplainError, ExplanationBudgetLimit, ExplanationLimits, ExplanationNode, ExplanationNodeId,
     ExplanationNodeKind, ExplanationOutcome, ExplanationQuestion, ExplanationSubject,
     ExplanationTruncation, POLICY_EXPLANATION_FORMAT, PolicyExplanation,
+    WHY_ADAPTER_ANALYSIS_TYPES, WHY_NOT_ADAPTER_ANALYSIS_TYPES,
 };
-pub use why::explain_match_finding;
-pub use why_not::{ExplanationCandidate, explain_match_candidate};
+pub use why::{explain_finding, explain_match_finding};
+pub use why_not::{ExplanationCandidate, explain_candidate, explain_match_candidate};

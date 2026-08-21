@@ -1077,6 +1077,67 @@ pub struct MacroLocalBinding<'tree> {
     pub pointer_depth: i32,
 }
 
+/// Recover GLib's `g_autoptr(T) name = value` declaration from the CST shape
+/// produced by tree-sitter-cpp for C source. The grammar retains the macro
+/// invocation as the assignment's left operand and the declared name as one
+/// adjacent `ERROR(identifier)` node, so no macro text splitting is needed.
+fn recognized_c_macro_declarator_binding<'tree>(
+    statement: Node<'tree>,
+    source: &str,
+) -> Option<MacroLocalBinding<'tree>> {
+    let assignment = match statement.kind() {
+        "assignment_expression" => statement,
+        "expression_statement" if statement.named_child_count() == 1 => statement.named_child(0)?,
+        _ => return None,
+    };
+    if assignment.kind() != "assignment_expression" {
+        return None;
+    }
+    let call = assignment.child_by_field_name("left")?;
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let function = call.child_by_field_name("function")?;
+    if function.kind() != "identifier" || node_text(function, source) != "g_autoptr" {
+        return None;
+    }
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut actuals = argument_children(arguments);
+    let type_node = actuals.next()?;
+    if actuals.next().is_some()
+        || !matches!(
+            type_node.kind(),
+            "identifier"
+                | "type_identifier"
+                | "qualified_identifier"
+                | "scoped_type_identifier"
+                | "template_type"
+        )
+    {
+        return None;
+    }
+    let name_node = (0..assignment.named_child_count())
+        .filter_map(|index| assignment.named_child(index))
+        .filter(|child| child.kind() == "ERROR")
+        .filter_map(|error| {
+            (error.named_child_count() == 1)
+                .then(|| error.named_child(0))
+                .flatten()
+        })
+        .find(|node| node.kind() == "identifier")?;
+    let name = node_text(name_node, source).trim();
+    let type_name = node_text(type_node, source).trim();
+    if name.is_empty() || type_name.is_empty() {
+        return None;
+    }
+    Some(MacroLocalBinding {
+        name: name.to_string(),
+        type_name: type_name.to_string(),
+        type_node: Some(type_node),
+        pointer_depth: 1,
+    })
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct MacroBinding {
     source: ProjectFile,
@@ -1712,6 +1773,9 @@ impl<'a> VisibilityIndex<'a> {
     ) -> Option<MacroLocalBinding<'tree>> {
         if !is_c_source_file(file) {
             return None;
+        }
+        if let Some(binding) = recognized_c_macro_declarator_binding(statement, source) {
+            return Some(binding);
         }
         let call = match statement.kind() {
             "call_expression" => statement,
@@ -3593,6 +3657,46 @@ impl<'a> VisibilityIndex<'a> {
                             reference.start_byte(),
                         )
                     })
+            })
+    }
+
+    /// Whether a same-file callable declaration is nameable from `reference`
+    /// after deliberately relaxing declaration-before-reference ordering.
+    ///
+    /// Ordinary lookup still requires an earlier declaration. Definition
+    /// navigation for incomplete C translation units may recover a later
+    /// definition, but only when it is at file scope and its preprocessor
+    /// requirements hold at the call (#2404).
+    pub fn same_file_callable_guard_compatible_ignoring_order(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        candidate: &CodeUnit,
+        reference: Node<'_>,
+    ) -> bool {
+        if candidate.source() != file || !candidate.is_callable() {
+            return false;
+        }
+        let Some(prepared) = self.cpp.prepared_syntax(self.token, file) else {
+            return false;
+        };
+        let guards = OnceCell::new();
+        let context = CallableReferenceContext {
+            file,
+            position: Some(CallableReferencePosition {
+                prepared: prepared.as_ref(),
+                byte: reference.start_byte(),
+                guards: &guards,
+            }),
+        };
+        nameable_callable_declaration_nodes(analyzer, prepared.as_ref(), candidate)
+            .into_iter()
+            .any(|declaration| {
+                callable_preprocessor_context_is_visible_for_reference(
+                    declaration,
+                    prepared.source(),
+                    &context,
+                )
             })
     }
 
@@ -8320,6 +8424,9 @@ fn simple_preprocessor_expression_guard(
                 node_text(identifier, source).to_string(),
             ))
         }
+        "identifier" => Some(PreprocessorGuard::Boolean(BooleanGuardExpression::Truthy(
+            node_text(expression, source).to_string(),
+        ))),
         "unary_expression"
             if expression
                 .child_by_field_name("operator")
@@ -9378,14 +9485,20 @@ fn decode_field_declared_type_fact(
                 type_node.kind(),
                 "class_specifier" | "struct_specifier" | "union_specifier"
             ) {
-                type_node.child_by_field_name("name")?
+                type_node.child_by_field_name("name")
             } else {
-                type_node
+                Some(type_node)
             };
+            let type_text = declared_type.map_or_else(
+                || field.identifier().to_string(),
+                |declared_type| node_text(declared_type, &declaration).to_string(),
+            );
             return Some(DeclaredFieldTypeFact {
-                type_text: node_text(declared_type, &declaration).to_string(),
+                type_text,
                 indirection,
-                template_arguments: cpp_template_reference_arguments(declared_type, &declaration),
+                template_arguments: declared_type.and_then(|declared_type| {
+                    cpp_template_reference_arguments(declared_type, &declaration)
+                }),
             });
         }
         let mut cursor = node.walk();
@@ -13528,6 +13641,53 @@ mod tests {
             ],
         )));
         assert_eq!(preprocessor_guard_environment(node, source), Some(expected));
+    }
+
+    #[test]
+    fn bare_macro_guard_is_implied_by_a_stronger_conjunction() {
+        let source = "#if HAVE_ARM_NEON\nstatic int target(void) { return 1; }\n#endif\n#if HAVE_ARM_NEON && ENABLE_FAST_PATH\nint use(void) { return target(); }\n#endif\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("fixture tree");
+        let root = tree.root_node();
+        let definition_start = source.find("target(void)").expect("definition");
+        let reference_start = source.rfind("target()").expect("reference");
+        let definition = root
+            .descendant_for_byte_range(definition_start, definition_start + "target".len())
+            .expect("definition node");
+        let reference = root
+            .descendant_for_byte_range(reference_start, reference_start + "target".len())
+            .expect("reference node");
+        let required =
+            preprocessor_guard_environment(definition, source).expect("definition guard");
+        let active = preprocessor_guard_environment(reference, source).expect("reference guard");
+        assert!(guard_requirements_hold_at_reference(
+            &required,
+            Some(&active)
+        ));
+    }
+
+    #[test]
+    fn g_autoptr_assignment_shape_recovers_only_the_named_macro_declarator() {
+        let source = "g_autoptr(FuChunkArray) self = make_array();";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("fixture tree");
+        let statement = tree.root_node().named_child(0).expect("statement");
+        let binding =
+            recognized_c_macro_declarator_binding(statement, source).expect("g_autoptr binding");
+        assert_eq!(binding.name, "self");
+        assert_eq!(binding.type_name, "FuChunkArray");
+        assert_eq!(binding.pointer_depth, 1);
+
+        let near_miss = "holder(FuChunkArray) self = make_array();";
+        let tree = parser.parse(near_miss, None).expect("near-miss tree");
+        let statement = tree.root_node().named_child(0).expect("statement");
+        assert!(recognized_c_macro_declarator_binding(statement, near_miss).is_none());
     }
 
     #[test]

@@ -91,6 +91,18 @@ fn run_gc(
     let Some(claim) = try_claim_gc(db_path, force)? else {
         return Ok(GcOutcome::skipped(total_blob_count(db_path)?));
     };
+    match gitblob::has_network_promisor_remote(repo) {
+        Ok(true) => {
+            clear_gc_claim(db_path)?;
+            eprintln!("Bifrost cache GC skipped: repository uses a network-backed promisor remote");
+            return Ok(GcOutcome::skipped(total_blob_count(db_path)?));
+        }
+        Ok(false) => {}
+        Err(error) => {
+            clear_gc_claim(db_path)?;
+            return Err(format!("cache GC could not inspect Git remotes: {error}"));
+        }
+    }
     match sweep_with_claim(&claim, repo, workspace_root) {
         Ok(outcome) => Ok(outcome),
         Err(err) => {
@@ -567,6 +579,62 @@ mod tests {
             )
             .unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn gc_skips_network_promisor_repositories_and_releases_its_claim() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().canonicalize().unwrap();
+        let repo = gitblob::test_repo::init_repo(&repo_root);
+        std::fs::write(repo_root.join("tracked.txt"), "tracked\n").unwrap();
+        gitblob::test_repo::commit_all(&repo, "initial content");
+        repo.remote("origin", "https://example.invalid/repo.git")
+            .unwrap();
+        repo.config()
+            .unwrap()
+            .set_bool("remote.origin.promisor", true)
+            .unwrap();
+
+        let db_path = gitblob::cache_db_path(&repo_root);
+        let dead_oid = "3333333333333333333333333333333333333333";
+        {
+            let conn = cache_db::open_unified_connection(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO analysis_epochs(lang, epoch, generation) VALUES('go', 'a', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'go', 1)",
+                [dead_oid],
+            )
+            .unwrap();
+        }
+
+        let outcome = force_gc(&db_path, &repo, &repo_root).unwrap();
+        assert!(!outcome.ran, "network-backed GC must be skipped");
+
+        let conn = Connection::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1",
+                [dead_oid],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "a skipped sweep retains every candidate"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT gc_claim_until FROM cache_state WHERE id = 1",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+            0,
+            "the next eligible local sweep must not wait for a stale claim"
         );
     }
 }

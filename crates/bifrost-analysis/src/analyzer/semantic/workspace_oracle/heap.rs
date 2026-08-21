@@ -11,6 +11,7 @@ use super::common::{
     Interruption, WorkStager, dedup_evidence, evidence_handle, evidence_quality, internal_contract,
     value_handle,
 };
+use super::value_flow::constructor_allocation_identity_discharges_gap;
 use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AbstractObjectIdentity, AccessPath, AccessPathAtPoint,
     AccessPathRoot, AliasExclusivity, AliasExclusivityWitness, AliasQuery, AliasRelation,
@@ -849,6 +850,11 @@ fn resolve_objects(
                 })?;
                 if gap_impacts_heap(gap)
                     && traced_gap_affects_value(procedure, gap, state.value, staged, cancellation)?
+                    && !constructor_allocation_identity_discharges_gap(
+                        procedure.semantics(),
+                        gap,
+                        state.value,
+                    )
                 {
                     open = true;
                 }

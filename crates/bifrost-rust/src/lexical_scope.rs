@@ -312,11 +312,12 @@ pub fn visible_import_binders_with_scopes_in_tree(
     let mut imports = Vec::new();
     collect_visible_use_statements(root, reference_byte, &mut imports);
     let mut by_scope: HashMap<(usize, usize), ImportBinder> = HashMap::default();
-    for node in imports {
-        let scope =
-            enclosing_visibility_scope_range(node).unwrap_or((root.start_byte(), root.end_byte()));
+    for visible_use in imports {
+        let scope = visible_use
+            .scope_range
+            .unwrap_or((root.start_byte(), root.end_byte()));
         let binder = by_scope.entry(scope).or_default();
-        for import in rust_imports_from_use_declaration(node, source) {
+        for import in rust_imports_from_use_declaration(visible_use.node, source) {
             insert_rust_import_binding(binder, &import);
         }
     }
@@ -385,7 +386,7 @@ pub fn visible_import_binder_in_tree(
     collect_visible_use_statements(root, reference_byte, &mut imports);
     for import in imports
         .into_iter()
-        .flat_map(|node| rust_imports_from_use_declaration(node, source))
+        .flat_map(|visible_use| rust_imports_from_use_declaration(visible_use.node, source))
     {
         insert_rust_import_binding(&mut binder, &import);
     }
@@ -395,7 +396,7 @@ pub fn visible_import_binder_in_tree(
 fn collect_visible_use_statements<'tree>(
     root: Node<'tree>,
     reference_byte: usize,
-    out: &mut Vec<Node<'tree>>,
+    out: &mut Vec<VisibleUse<'tree>>,
 ) -> usize {
     // The reference's own enclosing `mod` item is invariant across every
     // candidate use declaration, and locating it walks down from the root.
@@ -408,16 +409,27 @@ fn collect_visible_use_statements<'tree>(
     // Imports inside sibling functions, blocks, impls, traits, and modules
     // cannot be visible and their subtrees may be skipped entirely.
     let mut visited = 0;
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
+    let mut stack = vec![(root, None, None)];
+    while let Some((node, mod_range, scope_range)) = stack.pop() {
         visited += 1;
         if node.kind() == "use_declaration" {
-            if use_statement_visible_at(node, reference_byte, reference_mod_range) {
-                out.push(node);
+            if use_statement_visible_at(reference_byte, reference_mod_range, mod_range, scope_range)
+            {
+                out.push(VisibleUse { node, scope_range });
             }
             continue;
         }
 
+        let child_mod_range = if node.kind() == "mod_item" {
+            Some((node.start_byte(), node.end_byte()))
+        } else {
+            mod_range
+        };
+        let child_scope_range = if lexical_scope_kind(node.kind()) {
+            Some((node.start_byte(), node.end_byte()))
+        } else {
+            scope_range
+        };
         let mut cursor = node.walk();
         let children = node
             .named_children(&mut cursor)
@@ -428,34 +440,34 @@ fn collect_visible_use_statements<'tree>(
         // Preserve the source-order traversal used by the former recursive
         // implementation so duplicate invalid imports retain deterministic
         // last-write behavior in the best-effort binder.
-        stack.extend(children.into_iter().rev());
+        stack.extend(
+            children
+                .into_iter()
+                .rev()
+                .map(|child| (child, child_mod_range, child_scope_range)),
+        );
     }
     visited
 }
 
+struct VisibleUse<'tree> {
+    node: Node<'tree>,
+    scope_range: Option<(usize, usize)>,
+}
+
 fn use_statement_visible_at(
-    node: Node<'_>,
     reference_byte: usize,
     reference_mod_range: Option<(usize, usize)>,
+    mod_range: Option<(usize, usize)>,
+    scope_range: Option<(usize, usize)>,
 ) -> bool {
-    if enclosing_mod_item_range(node) != reference_mod_range {
+    if mod_range != reference_mod_range {
         return false;
     }
-    let Some((start, end)) = enclosing_visibility_scope_range(node) else {
+    let Some((start, end)) = scope_range else {
         return true;
     };
     start <= reference_byte && reference_byte < end
-}
-
-fn enclosing_mod_item_range(node: Node<'_>) -> Option<(usize, usize)> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == "mod_item" {
-            return Some((parent.start_byte(), parent.end_byte()));
-        }
-        current = parent.parent();
-    }
-    None
 }
 
 pub fn enclosing_mod_item_range_at(node: Node<'_>, byte: usize) -> Option<(usize, usize)> {
@@ -478,17 +490,6 @@ pub fn enclosing_mod_item_range_at(node: Node<'_>, byte: usize) -> Option<(usize
         };
         current = child;
     }
-}
-
-pub fn enclosing_visibility_scope_range(node: Node<'_>) -> Option<(usize, usize)> {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if lexical_scope_kind(parent.kind()) {
-            return Some((parent.start_byte(), parent.end_byte()));
-        }
-        current = parent.parent();
-    }
-    None
 }
 
 fn lexical_scope_kind(kind: &str) -> bool {
@@ -545,14 +546,22 @@ impl RustLexicalScopeIndex {
             modules: Vec::new(),
             functions: Vec::new(),
         };
-        let mut stack = vec![(root, None, root.start_byte(), root.end_byte())];
-        while let Some((node, function, scope_start, scope_end)) = stack.pop() {
+        let mut stack = vec![(root, None, None, false, root.start_byte(), root.end_byte())];
+        while let Some((node, function, module, associated_type, scope_start, scope_end)) =
+            stack.pop()
+        {
             let mut child_function = function;
+            let mut child_module = module;
+            let child_associated_type = match node.kind() {
+                "impl_item" | "trait_item" => true,
+                "function_item" | "mod_item" | "source_file" => false,
+                _ => associated_type,
+            };
             let mut child_scope_start = scope_start;
             let mut child_scope_end = scope_end;
             match node.kind() {
                 "function_item" => {
-                    index.add_item_binding(node, scope_start, scope_end, source, function);
+                    index.add_item_binding(node, scope_start, scope_end, source, function, module);
                     let function_range = (node.start_byte(), node.end_byte());
                     index.functions.push(function_range);
                     child_function = Some(function_range);
@@ -613,13 +622,15 @@ impl RustLexicalScopeIndex {
                         );
                     }
                 }
-                "type_item" if !is_associated_type_item(node) => {
-                    index.add_item_binding(node, scope_start, scope_end, source, function);
+                "type_item" if !associated_type => {
+                    index.add_item_binding(node, scope_start, scope_end, source, function, module);
                 }
                 "struct_item" | "enum_item" | "trait_item" | "mod_item" => {
-                    index.add_item_binding(node, scope_start, scope_end, source, function);
+                    index.add_item_binding(node, scope_start, scope_end, source, function, module);
                     if node.kind() == "mod_item" {
-                        index.modules.push((node.start_byte(), node.end_byte()));
+                        let module_range = (node.start_byte(), node.end_byte());
+                        index.modules.push(module_range);
+                        child_module = Some(module_range);
                     }
                 }
                 _ => {}
@@ -627,12 +638,16 @@ impl RustLexicalScopeIndex {
 
             let mut cursor = node.walk();
             let children: Vec<_> = node.named_children(&mut cursor).collect();
-            stack.extend(
-                children
-                    .into_iter()
-                    .rev()
-                    .map(|child| (child, child_function, child_scope_start, child_scope_end)),
-            );
+            stack.extend(children.into_iter().rev().map(|child| {
+                (
+                    child,
+                    child_function,
+                    child_module,
+                    child_associated_type,
+                    child_scope_start,
+                    child_scope_end,
+                )
+            }));
         }
         index
     }
@@ -744,6 +759,7 @@ impl RustLexicalScopeIndex {
         end: usize,
         source: &str,
         function: Option<(usize, usize)>,
+        module: Option<(usize, usize)>,
     ) {
         let Some(name) = item.child_by_field_name("name") else {
             return;
@@ -758,21 +774,10 @@ impl RustLexicalScopeIndex {
             .push(ItemVisibility {
                 start,
                 end,
-                module: enclosing_mod_item_range(item),
+                module,
                 function,
             });
     }
-}
-
-fn is_associated_type_item(mut node: Node<'_>) -> bool {
-    while let Some(parent) = node.parent() {
-        match parent.kind() {
-            "impl_item" | "trait_item" => return true,
-            "function_item" | "mod_item" | "source_file" => return false,
-            _ => node = parent,
-        }
-    }
-    false
 }
 
 fn let_condition_visibility_end(mut node: Node<'_>) -> Option<usize> {
@@ -1139,7 +1144,7 @@ mod selected {
         let visited = collect_visible_use_statements(root, reference_byte, &mut imports);
         let snippets = imports
             .iter()
-            .map(|node| &source[node.byte_range()])
+            .map(|visible_use| &source[visible_use.node.byte_range()])
             .collect::<Vec<_>>();
 
         assert_eq!(

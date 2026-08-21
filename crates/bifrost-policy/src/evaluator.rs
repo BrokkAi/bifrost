@@ -113,7 +113,8 @@ use super::finding_identity::{
     PolicyFindingId, SourceScenarioId, SourceSliceHash, StableSemanticIdentity,
 };
 use super::future_evidence::{
-    FutureEvidenceError, TaintFindingEvidence, TypestateFindingEvidence, TypestateViolationEvidence,
+    FlowFindingEvidence, FutureEvidenceError, TaintFindingEvidence, TypestateFindingEvidence,
+    TypestateViolationEvidence,
 };
 use super::projection::{
     TaintProjectionAuthority, TaintProjectionBatch, TaintProjectionPayload,
@@ -479,12 +480,16 @@ impl PolicyEvaluator for DefaultPolicyEvaluator<'_> {
             PolicyAnalysis::Assertion { spec } => {
                 evaluate_assertion_policy(policy, spec, context, &host_budget)
             }
-            PolicyAnalysis::Taint { .. } => {
+            // Flow executes the production taint pipeline over the same
+            // resolved model with one internal label (#2436); only the run's
+            // analysis type and the finding evidence variant differ.
+            PolicyAnalysis::Taint { .. } | PolicyAnalysis::Flow { .. } => {
+                let analysis_type = policy.definition().analysis.analysis_type();
                 let Some(spec) = policy.resolved_taint() else {
                     return failed_policy_run(
                         policy,
-                        PolicyAnalysisType::Taint,
-                        "loaded taint policy is missing its resolved analysis specification",
+                        analysis_type,
+                        "loaded policy is missing its resolved taint-shaped analysis specification",
                         &host_budget,
                     );
                 };
@@ -495,7 +500,7 @@ impl PolicyEvaluator for DefaultPolicyEvaluator<'_> {
                             Err(_) => {
                                 return failed_policy_run(
                                     policy,
-                                    PolicyAnalysisType::Taint,
+                                    analysis_type,
                                     "taint projection authority could not be derived from the loaded policy",
                                     &host_budget,
                                 );
@@ -514,9 +519,9 @@ impl PolicyEvaluator for DefaultPolicyEvaluator<'_> {
                     }
                     None => unsupported_policy_run(
                         policy,
-                        PolicyAnalysisType::Taint,
+                        analysis_type,
                         PolicyCapability::TaintEvaluation,
-                        "taint policy evaluation requires an installed taint adapter",
+                        "taint-shaped policy evaluation requires an installed taint adapter",
                         &host_budget,
                     ),
                 }
@@ -1532,12 +1537,16 @@ fn assemble_taint_projection_batch(
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
 ) -> Result<PolicyRun, PolicyRunError> {
+    // Taint and flow share this assembly: one resolved model, one adapter,
+    // one projection authority. The sealed analysis type is what decides the
+    // run's kind and which evidence variant every finding carries (#2436).
+    let analysis_type = authority.analysis_type();
     let mut validated = match validate_taint_batch(authority, batch, budget) {
         Ok(validated) => validated,
         Err(_) => {
             return failed_policy_run(
                 policy,
-                PolicyAnalysisType::Taint,
+                analysis_type,
                 "taint adapter returned facts outside the sealed loaded-policy authority",
                 budget,
             );
@@ -1546,7 +1555,7 @@ fn assemble_taint_projection_batch(
     let Some(spec) = policy.resolved_taint() else {
         return failed_policy_run(
             policy,
-            PolicyAnalysisType::Taint,
+            analysis_type,
             "loaded taint policy lost its resolved specification during assembly",
             budget,
         );
@@ -1556,7 +1565,7 @@ fn assemble_taint_projection_batch(
         Err(_) => {
             return failed_policy_run_with_findings(
                 policy,
-                PolicyAnalysisType::Taint,
+                analysis_type,
                 Vec::new(),
                 "taint finding-combination precedence is ambiguous",
                 validated.work,
@@ -1577,7 +1586,7 @@ fn assemble_taint_projection_batch(
             Err(_) => {
                 return failed_policy_run_with_findings(
                     policy,
-                    PolicyAnalysisType::Taint,
+                    analysis_type,
                     findings,
                     "taint endpoint pair has no unique presentation winner",
                     validated.work,
@@ -1601,7 +1610,7 @@ fn assemble_taint_projection_batch(
             Err(_) => {
                 return failed_policy_run_with_findings(
                     policy,
-                    PolicyAnalysisType::Taint,
+                    analysis_type,
                     findings,
                     "taint classification could not be reduced from pair-local facts",
                     validated.work,
@@ -1624,7 +1633,7 @@ fn assemble_taint_projection_batch(
             Err(_) => {
                 return failed_policy_run_with_findings(
                     policy,
-                    PolicyAnalysisType::Taint,
+                    analysis_type,
                     findings,
                     "taint pair scenario identity could not be reconstructed",
                     validated.work,
@@ -1656,7 +1665,7 @@ fn assemble_taint_projection_batch(
             OrganizationalRiskReduction::Conflict => {
                 return failed_policy_run_with_reason(
                     policy,
-                    PolicyAnalysisType::Taint,
+                    analysis_type,
                     findings,
                     PolicyFailureReason::ConflictingOrganizationalRiskOverlay,
                     "applicable organizational-risk overlays have conflicting maximal assessments",
@@ -1735,7 +1744,7 @@ fn assemble_taint_projection_batch(
             Err(_) => {
                 return failed_policy_run_with_findings(
                     policy,
-                    PolicyAnalysisType::Taint,
+                    analysis_type,
                     findings,
                     "validated taint facts could not be sealed as finding evidence",
                     validated.work,
@@ -1779,7 +1788,7 @@ fn assemble_taint_projection_batch(
             Err(_) => {
                 return failed_policy_run_with_findings(
                     policy,
-                    PolicyAnalysisType::Taint,
+                    analysis_type,
                     findings,
                     "CVSS reduction rejected a validated taint projection",
                     validated.work,
@@ -1838,7 +1847,12 @@ fn assemble_taint_projection_batch(
             report.related,
             report.related_truncated,
             report.omitted_related_locations_lower_bound,
-            PolicyFindingEvidence::Taint { evidence },
+            match analysis_type {
+                PolicyAnalysisType::Flow => PolicyFindingEvidence::Flow {
+                    evidence: FlowFindingEvidence::new(evidence),
+                },
+                _ => PolicyFindingEvidence::Taint { evidence },
+            },
             omitted_evidence_refs_lower_bound > 0,
             omitted_evidence_refs_lower_bound,
             cvss,
@@ -1867,7 +1881,7 @@ fn assemble_taint_projection_batch(
             Ok(_) | Err(_) => {
                 return failed_policy_run_with_findings(
                     policy,
-                    PolicyAnalysisType::Taint,
+                    analysis_type,
                     findings,
                     "a validated taint projection could not be retained as a policy finding",
                     validated.work,
@@ -1878,7 +1892,7 @@ fn assemble_taint_projection_batch(
     }
     let mut run = finish_assembled_run(
         policy,
-        PolicyAnalysisType::Taint,
+        analysis_type,
         validated.completion,
         findings,
         validated.diagnostics,
@@ -2242,6 +2256,9 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::CallShape
             | QueryValueKind::CallArgumentGroup
             | QueryValueKind::CallArgument
+            | QueryValueKind::CallBinding
+            | QueryValueKind::CallEffect
+            | QueryValueKind::ProcedureEffect
             | QueryValueKind::CallableSignature
             | QueryValueKind::SignatureParameter
             | QueryValueKind::CallableApplicability
@@ -2785,6 +2802,12 @@ fn terminal_presentation(
         | CodeQueryResultValue::CallShape { .. }
         | CodeQueryResultValue::CallArgumentGroup { .. }
         | CodeQueryResultValue::CallArgument { .. }
+        | CodeQueryResultValue::CallBinding { .. }
+        // An effect row is an analysis projection over a call site or a
+        // procedure, so a finding anchors at the call-shape or declaration row
+        // it names rather than at the effect row itself (#2437).
+        | CodeQueryResultValue::CallEffect { .. }
+        | CodeQueryResultValue::ProcedureEffect { .. }
         // A callable-signature row describes a declaration's declared shape. It
         // is an analysis projection anchored at the declaration, not a
         // position a finding is reported at; the declaration row is.
@@ -3501,6 +3524,9 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::CallShape { .. } => "call_shape",
         CodeQueryResultRef::CallArgumentGroup { .. } => "call_argument_group",
         CodeQueryResultRef::CallArgument { .. } => "call_argument",
+        CodeQueryResultRef::CallBinding { .. } => "call_binding",
+        CodeQueryResultRef::CallEffect { .. } => "call_effect",
+        CodeQueryResultRef::ProcedureEffect { .. } => "procedure_effect",
         CodeQueryResultRef::CallableSignature { .. } => "callable_signature",
         CodeQueryResultRef::SignatureParameter { .. } => "signature_parameter",
         CodeQueryResultRef::CallableApplicability { .. } => "callable_applicability",
@@ -3543,6 +3569,9 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::CallShape { path, .. }
         | CodeQueryResultRef::CallArgumentGroup { path, .. }
         | CodeQueryResultRef::CallArgument { path, .. }
+        | CodeQueryResultRef::CallBinding { path, .. }
+        | CodeQueryResultRef::CallEffect { path, .. }
+        | CodeQueryResultRef::ProcedureEffect { path, .. }
         | CodeQueryResultRef::CallableSignature { path, .. }
         | CodeQueryResultRef::SignatureParameter { path, .. }
         | CodeQueryResultRef::CallableApplicability { path, .. }
@@ -3621,6 +3650,9 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::CallShape
         | DetailedCodeQueryDomain::CallArgumentGroup
         | DetailedCodeQueryDomain::CallArgument
+        | DetailedCodeQueryDomain::CallBinding
+        | DetailedCodeQueryDomain::CallEffect
+        | DetailedCodeQueryDomain::ProcedureEffect
         | DetailedCodeQueryDomain::CallableSignature
         | DetailedCodeQueryDomain::SignatureParameter
         | DetailedCodeQueryDomain::CallableApplicability
@@ -3831,9 +3863,15 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
         DetailedCodeQueryKey::ReceiverOutcome { id, site_id }
         | DetailedCodeQueryKey::ReceiverEvidence { id, site_id }
         | DetailedCodeQueryKey::CallShape { id, site_id }
-        | DetailedCodeQueryKey::CallArgumentGroup { id, site_id } => {
+        | DetailedCodeQueryKey::CallArgumentGroup { id, site_id }
+        | DetailedCodeQueryKey::CallBinding { id, site_id }
+        | DetailedCodeQueryKey::CallEffect { id, site_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, site_id.as_bytes());
+        }
+        DetailedCodeQueryKey::ProcedureEffect { id, procedure_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, procedure_id.as_bytes());
         }
         DetailedCodeQueryKey::CallableApplicability { id, site_ast_id }
         | DetailedCodeQueryKey::OverloadSelection { id, site_ast_id } => {
@@ -3942,6 +3980,9 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::CallShape => "call_shape",
         DetailedCodeQueryDomain::CallArgumentGroup => "call_argument_group",
         DetailedCodeQueryDomain::CallArgument => "call_argument",
+        DetailedCodeQueryDomain::CallBinding => "call_binding",
+        DetailedCodeQueryDomain::CallEffect => "call_effect",
+        DetailedCodeQueryDomain::ProcedureEffect => "procedure_effect",
         DetailedCodeQueryDomain::CallableSignature => "callable_signature",
         DetailedCodeQueryDomain::SignatureParameter => "signature_parameter",
         DetailedCodeQueryDomain::CallableApplicability => "callable_applicability",
@@ -4056,12 +4097,17 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::RewriteDomainUnsupported
         | CodeQueryDiagnosticCode::RewritePathDerivationIncomplete
         | CodeQueryDiagnosticCode::IdentityAxisUnsupported
-        | CodeQueryDiagnosticCode::PathDerivationIncomplete => {
+        | CodeQueryDiagnosticCode::PathDerivationIncomplete
+        // An effect derivation that could not establish every callee is a
+        // capability gap, not a budget one: the missing fact is a model or a
+        // resolution, and no larger bound would recover it (#2437).
+        | CodeQueryDiagnosticCode::EffectDerivationIncomplete => {
             PolicyIncompleteReason::CapabilityIncomplete
         }
         CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted
         | CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted
-        | CodeQueryDiagnosticCode::MaterializationRowBudgetExhausted => {
+        | CodeQueryDiagnosticCode::MaterializationRowBudgetExhausted
+        | CodeQueryDiagnosticCode::EffectBudgetExhausted => {
             PolicyIncompleteReason::PipelineRowBudget
         }
         CodeQueryDiagnosticCode::ReferenceSourceBytesTruncated => {

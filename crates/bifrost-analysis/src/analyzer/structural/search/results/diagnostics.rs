@@ -80,6 +80,8 @@ pub enum CodeQueryDiagnosticCode {
     RewritePathDerivationIncomplete,
     IdentityAxisUnsupported,
     PathDerivationIncomplete,
+    EffectDerivationIncomplete,
+    EffectBudgetExhausted,
     ResultLimitReached,
     BroadQuery,
 }
@@ -164,6 +166,8 @@ impl CodeQueryDiagnosticCode {
             Self::RewritePathDerivationIncomplete => "rewrite_path_derivation_incomplete",
             Self::IdentityAxisUnsupported => "identity_axis_unsupported",
             Self::PathDerivationIncomplete => "path_derivation_incomplete",
+            Self::EffectDerivationIncomplete => "effect_derivation_incomplete",
+            Self::EffectBudgetExhausted => "effect_budget_exhausted",
             Self::ResultLimitReached => "result_limit_reached",
             Self::BroadQuery => "broad_query",
         }

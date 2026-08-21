@@ -16,11 +16,11 @@ use crate::{
     FindingSeverity, OrganizationalRiskAssessment, PolicyAnalysisType, PolicyBaselineReview,
     PolicyDiagnostic, PolicyDiagnosticSeverity, PolicyDiffReview, PolicyDisplayRegion,
     PolicyEvaluationDate, PolicyFinding, PolicyFindingBaseline, PolicyFindingEvidence,
-    PolicyFindingSuppression, PolicyLevel, PolicyPackActivationReview, PolicyReportDiagnostic,
-    PolicyReportDocument, PolicyReportEvaluationContext, PolicyRuleDescriptor, PolicyRun,
-    PolicyRunCompletion, PolicySemanticHash, PolicySeveritySpec, PolicySourceLocation,
-    PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicyWorkReport, ProofMetadata,
-    RelatedPolicyLocation,
+    PolicyFindingSuppression, PolicyLevel, PolicyObligationKind, PolicyPackActivationReview,
+    PolicyReportDiagnostic, PolicyReportDocument, PolicyReportEvaluationContext,
+    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySemanticHash, PolicySeveritySpec,
+    PolicySourceLocation, PolicySuppressionPolicyHashState, PolicySuppressionReview,
+    PolicyWorkReport, ProofMetadata, RelatedPolicyLocation,
 };
 
 const SARIF_SCHEMA_URI: &str =
@@ -896,6 +896,7 @@ impl<'a> SarifNotification<'a> {
                 diagnostics_truncated: false,
                 omitted_diagnostics_lower_bound: 0,
                 authored_arm_closures: &[],
+                obligations: None,
             },
         }
     }
@@ -919,6 +920,7 @@ impl<'a> SarifNotification<'a> {
                 diagnostics_truncated: true,
                 omitted_diagnostics_lower_bound: report.omitted_diagnostics_lower_bound(),
                 authored_arm_closures: &[],
+                obligations: None,
             },
         }
     }
@@ -965,6 +967,7 @@ impl<'a> SarifNotification<'a> {
                 diagnostics_truncated: run.diagnostics_truncated(),
                 omitted_diagnostics_lower_bound: u64::from(run.diagnostics_truncated()),
                 authored_arm_closures: run.authored_arm_closures(),
+                obligations: SarifObligationSummary::from_run(run),
             },
         })
     }
@@ -997,6 +1000,53 @@ struct SarifNotificationProperties<'a> {
         skip_serializing_if = "slice_is_empty"
     )]
     authored_arm_closures: &'a [crate::AuthoredArmClosureEvidence],
+    /// Present only on a run that could not publish a verdict. The blocked
+    /// verdicts are run-level unreliability, not source findings, so SARIF
+    /// carries them here and mints no result entry for them.
+    #[serde(
+        rename = "bifrost.obligations",
+        skip_serializing_if = "Option::is_none"
+    )]
+    obligations: Option<SarifObligationSummary>,
+}
+
+/// The run-level census of unmet negative-proof obligations.
+///
+/// The count is the whole census; the kinds are the leading distinct kinds, in
+/// the evaluation's order, so a reader learns what sort of proof was missing
+/// without the notification carrying every obligation's text.
+#[derive(Serialize)]
+struct SarifObligationSummary {
+    count: u64,
+    kinds: Vec<&'static str>,
+    #[serde(skip_serializing_if = "is_false")]
+    truncated: bool,
+    #[serde(skip_serializing_if = "is_zero")]
+    omitted_lower_bound: u64,
+}
+
+/// How many distinct obligation kinds one notification names.
+const MAX_SARIF_OBLIGATION_KINDS: usize = 4;
+
+impl SarifObligationSummary {
+    fn from_run(run: &PolicyRun) -> Option<Self> {
+        if run.obligations().is_empty() && !run.obligations_truncated() {
+            return None;
+        }
+        let mut kinds: Vec<&'static str> = Vec::new();
+        for obligation in run.obligations() {
+            let label = PolicyObligationKind::as_str(obligation.kind());
+            if kinds.len() < MAX_SARIF_OBLIGATION_KINDS && !kinds.contains(&label) {
+                kinds.push(label);
+            }
+        }
+        Some(Self {
+            count: u64::try_from(run.obligations().len()).unwrap_or(u64::MAX),
+            kinds,
+            truncated: run.obligations_truncated(),
+            omitted_lower_bound: run.omitted_obligations_lower_bound(),
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -1238,6 +1288,10 @@ const fn slice_is_empty<T>(value: &[T]) -> bool {
 
 const fn is_false(value: &bool) -> bool {
     !*value
+}
+
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use brokk_bifrost_core::analyzer::model::{
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
-use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
+use brokk_bifrost_core::analyzer::tree_walk::{ParentIndex, WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Tree};
@@ -60,13 +60,16 @@ fn csharp_package_fq(package_name: &str) -> FqName {
 
 pub fn parse_csharp_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
     let mut parsed = ParsedFile::new(String::new());
-    collect_csharp_type_identifiers(tree.root_node(), source, &mut parsed.type_identifiers);
+    let root = tree.root_node();
+    collect_csharp_type_identifiers(root, source, &mut parsed.type_identifiers);
+    let ancestry = ParentIndex::new(root);
     let mut visitor = CSharpVisitor {
         file,
         source,
+        ancestry: &ancestry,
         parsed: &mut parsed,
     };
-    visitor.visit_container(tree.root_node(), "");
+    visitor.visit_container(root, "");
     parsed
 }
 
@@ -94,13 +97,14 @@ struct CSharpWork<'tree> {
     scope: CSharpScope,
 }
 
-struct CSharpVisitor<'a> {
-    file: &'a ProjectFile,
-    source: &'a str,
-    parsed: &'a mut ParsedFile,
+struct CSharpVisitor<'context, 'tree> {
+    file: &'context ProjectFile,
+    source: &'context str,
+    ancestry: &'context ParentIndex<'tree>,
+    parsed: &'context mut ParsedFile,
 }
 
-impl<'a> CSharpVisitor<'a> {
+impl CSharpVisitor<'_, '_> {
     fn visit_container(&mut self, node: Node<'_>, package_name: &str) {
         let mut stack = Vec::new();
         self.push_children(
@@ -346,12 +350,18 @@ impl<'a> CSharpVisitor<'a> {
         let signature = csharp_method_skeleton(node, self.source);
         self.parsed.add_signature_with_metadata(
             code_unit,
-            csharp_signature_metadata(signature, node, self.source, &scope.lexical_scope)
-                .with_callable_modifiers(
-                    csharp_has_modifier(self.source, node, "static"),
-                    false,
-                    csharp_declared_visibility(node, self.source, DeclaredVisibility::Private),
-                ),
+            csharp_signature_metadata(
+                signature,
+                node,
+                self.source,
+                &scope.lexical_scope,
+                self.ancestry,
+            )
+            .with_callable_modifiers(
+                csharp_has_modifier(self.source, node, "static"),
+                false,
+                csharp_declared_visibility(node, self.source, DeclaredVisibility::Private),
+            ),
         );
     }
 
@@ -409,13 +419,19 @@ impl<'a> CSharpVisitor<'a> {
         );
         self.parsed.add_signature_with_metadata(
             code_unit,
-            csharp_signature_metadata(signature, node, self.source, &scope.lexical_scope)
-                // No constructor is dynamically dispatched, which
-                // `csharp_callable_dispatch_extensibility` states for the
-                // explicit spelling by its node kind. This one's node is the
-                // type declaration, so an `abstract`/`virtual` modifier there
-                // would otherwise be read as the constructor's own.
-                .with_dispatch_extensibility(DispatchExtensibility::Closed),
+            csharp_signature_metadata(
+                signature,
+                node,
+                self.source,
+                &scope.lexical_scope,
+                self.ancestry,
+            )
+            // No constructor is dynamically dispatched, which
+            // `csharp_callable_dispatch_extensibility` states for the
+            // explicit spelling by its node kind. This one's node is the
+            // type declaration, so an `abstract`/`virtual` modifier there
+            // would otherwise be read as the constructor's own.
+            .with_dispatch_extensibility(DispatchExtensibility::Closed),
         );
     }
 
@@ -462,12 +478,18 @@ impl<'a> CSharpVisitor<'a> {
         let signature = csharp_constructor_skeleton(node, self.source);
         self.parsed.add_signature_with_metadata(
             code_unit,
-            csharp_signature_metadata(signature, node, self.source, &scope.lexical_scope)
-                .with_callable_modifiers(
-                    csharp_has_modifier(self.source, node, "static"),
-                    true,
-                    csharp_declared_visibility(node, self.source, DeclaredVisibility::Private),
-                ),
+            csharp_signature_metadata(
+                signature,
+                node,
+                self.source,
+                &scope.lexical_scope,
+                self.ancestry,
+            )
+            .with_callable_modifiers(
+                csharp_has_modifier(self.source, node, "static"),
+                true,
+                csharp_declared_visibility(node, self.source, DeclaredVisibility::Private),
+            ),
         );
     }
 
@@ -504,7 +526,13 @@ impl<'a> CSharpVisitor<'a> {
         let signature = csharp_property_signature(node, self.source);
         self.parsed.add_signature_with_metadata(
             code_unit,
-            csharp_dispatch_signature_metadata(signature, node, self.source, &scope.lexical_scope),
+            csharp_dispatch_signature_metadata(
+                signature,
+                node,
+                self.source,
+                &scope.lexical_scope,
+                self.ancestry,
+            ),
         );
     }
 
@@ -749,11 +777,12 @@ fn csharp_constructor_skeleton(node: Node<'_>, source: &str) -> String {
     csharp_method_skeleton(node, source)
 }
 
-fn csharp_dispatch_signature_metadata(
+fn csharp_dispatch_signature_metadata<'tree>(
     signature: String,
-    node: Node<'_>,
+    node: Node<'tree>,
     source: &str,
     lexical_scope: &[String],
+    ancestry: &ParentIndex<'tree>,
 ) -> SignatureMetadata {
     let return_type = csharp_declared_type_node(node);
     SignatureMetadata::new(signature, Vec::new())
@@ -769,6 +798,7 @@ fn csharp_dispatch_signature_metadata(
             source,
             node,
             crate::syntax::csharp_has_modifier(source, node, "static"),
+            ancestry,
         ))
 }
 
@@ -794,11 +824,12 @@ fn csharp_declared_visibility(
     default
 }
 
-fn csharp_signature_metadata(
+fn csharp_signature_metadata<'tree>(
     signature: String,
-    node: Node<'_>,
+    node: Node<'tree>,
     source: &str,
     lexical_scope: &[String],
+    ancestry: &ParentIndex<'tree>,
 ) -> SignatureMetadata {
     let callable_arity = csharp_callable_arity(node, source);
     let type_parameters = csharp_method_type_parameters(node, source);
@@ -873,6 +904,7 @@ fn csharp_signature_metadata(
         source,
         node,
         crate::syntax::csharp_has_modifier(source, node, "static"),
+        ancestry,
     ))
 }
 

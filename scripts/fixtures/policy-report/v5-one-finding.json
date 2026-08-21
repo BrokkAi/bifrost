@@ -2,7 +2,7 @@
   "policyRootUri": "file:///workspace",
   "reportRootUri": "file:///workspace",
   "report": {
-    "schema_version": 4,
+    "schema_version": 5,
     "evaluation": {
       "evaluation_date": "2026-07-27",
       "suppression_path": ".bifrost/suppressions.json",

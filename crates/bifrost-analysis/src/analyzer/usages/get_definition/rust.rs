@@ -8868,6 +8868,58 @@ pub fn dispatch() {
     }
 
     #[test]
+    fn issue_2324_crate_facade_module_reexport_resolves_to_physical_dependency() {
+        let source =
+            "pub use engine::api;\nuse crate::api::target;\n\npub fn call() { target(); }\n";
+        let fixture = AnalyzerFixture::new(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"engine\", \"facade\"]\nresolver = \"2\"\n",
+            ),
+            (
+                "engine/Cargo.toml",
+                "[package]\nname = \"engine\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("engine/src/lib.rs", "pub mod api;\n"),
+            ("engine/src/api.rs", "pub fn target() {}\n"),
+            (
+                "facade/Cargo.toml",
+                "[package]\nname = \"facade\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nengine = { path = \"../engine\" }\n",
+            ),
+            ("facade/src/lib.rs", source),
+        ]);
+        let scope = crate::analyzer::AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let file = ProjectFile::new(fixture.project_root(), "facade/src/lib.rs");
+        let tree = lexical_scope::parse_rust_tree(source).expect("Rust tree");
+        let site = site_for_last(source, &file, "target");
+
+        let outcome = resolve_rust_bounded(
+            fixture.analyzer.analyzer(),
+            scope.token(),
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("facade re-export lookup should complete");
+        };
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(
+            matches!(
+                value.definitions.as_slice(),
+                [definition]
+                    if definition.fq_name() == "engine.api.target"
+                        && rel_path_string(definition.source()) == "engine/src/api.rs"
+            ),
+            "{value:#?}"
+        );
+    }
+
+    #[test]
     fn bounded_definition_lookup_resolves_file_backed_super_import_prefix() {
         let source = r#"
 pub struct PlannerItem;

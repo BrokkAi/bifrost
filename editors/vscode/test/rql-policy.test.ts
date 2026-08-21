@@ -26,7 +26,7 @@ function response(completion: unknown = { type: "complete" }): unknown {
     policyRootUri: "file:///workspace/service-a",
     reportRootUri: "file:///workspace",
     report: {
-      schema_version: 4,
+      schema_version: 5,
       evaluation: {
         evaluation_date: "2026-07-27",
         suppression_path: ".bifrost/suppressions.json",
@@ -85,7 +85,7 @@ function runner(overrides: Partial<RqlPolicyRunner> = {}): RqlPolicyRunner {
 void test("accepts the canonical Rust schema-4 one-finding contract artifact", () => {
   const fixture = JSON.parse(
     readFileSync(
-      resolve(__dirname, "../../../../scripts/fixtures/policy-report/v4-one-finding.json"),
+      resolve(__dirname, "../../../../scripts/fixtures/policy-report/v5-one-finding.json"),
       "utf8"
     )
   ) as unknown;
@@ -94,7 +94,7 @@ void test("accepts the canonical Rust schema-4 one-finding contract artifact", (
   if (!isRqlPolicyResponse(fixture)) {
     return;
   }
-  assert.equal(fixture.report.schema_version, 4);
+  assert.equal(fixture.report.schema_version, 5);
   assert.equal(fixture.report.runs[0].findings.length, 1);
   assert.equal(fixture.report.runs[0].findings[0].primary.path, "app.ts");
 });
@@ -102,7 +102,7 @@ void test("accepts the canonical Rust schema-4 one-finding contract artifact", (
 void test("keeps the Java relay display rows in server order for the policy tree", () => {
   const fixture = JSON.parse(
     readFileSync(
-      resolve(__dirname, "../../../../scripts/fixtures/policy-report/v4-java-display-path.json"),
+      resolve(__dirname, "../../../../scripts/fixtures/policy-report/v5-java-display-path.json"),
       "utf8"
     )
   ) as unknown;
@@ -392,7 +392,7 @@ void test("rejects wrong documents and reports observed and supported schemas", 
   assert.equal(requests, 1);
   assert.equal(warnings.length, 1);
   assert.match(errors[0], /schema 99/);
-  assert.match(errors[0], /schema 4/);
+  assert.match(errors[0], /schema 5/);
 });
 
 void test("publishes only the newest run and preserves changes during execution", () => {

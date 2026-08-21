@@ -85,10 +85,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 mod applicability;
+mod call_binding;
 mod call_shape;
 mod callable_signature;
 mod dispatch;
 mod edges;
+mod effects;
 mod environment;
 mod execution;
 pub(crate) mod expansions;
@@ -106,8 +108,10 @@ mod render;
 use super::occurrence_rows::OccurrenceDerivationOptions;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use applicability::{CallableApplicabilityValue, OverloadSelectionValue};
+use call_binding::CallBindingValue;
 use callable_signature::{CallableSignatureValue, SignatureParameterValue};
 use dispatch::{DispatchSiteValue, DispatchTargetValue};
+use effects::{CallEffectValue, EffectTraversalCache, ProcedureEffectValue};
 use environment::{
     BindingKey, BindingValue, CandidateHopKey, CandidateHopValue, CandidateKey, CandidateValue,
     EnvironmentTraversalCache, ScopeKey, ScopeValue,
@@ -183,6 +187,8 @@ pub use results::ALL_DETAILED_CODE_QUERY_DOMAINS;
 pub use results::CodeQueryBinding;
 pub use results::CodeQueryCallArgument;
 pub use results::CodeQueryCallArgumentGroup;
+pub use results::CodeQueryCallBinding;
+pub use results::CodeQueryCallEffect;
 pub use results::CodeQueryCallShape;
 pub use results::CodeQueryCallShapeArgument;
 pub use results::CodeQueryCallSite;
@@ -233,6 +239,7 @@ pub use results::CodeQueryOccurrenceTarget;
 pub use results::CodeQueryOverloadSelection;
 pub use results::CodeQueryPathSegment;
 pub use results::CodeQueryProcedure;
+pub use results::CodeQueryProcedureEffect;
 pub use results::CodeQueryProgramPoint;
 pub use results::CodeQueryProgramPointBoundary;
 pub use results::CodeQueryProgramPointRef;
@@ -627,6 +634,9 @@ enum PipelineValue {
     CallShape(CallShapeValue),
     CallArgumentGroup(CallArgumentGroupValue),
     CallArgument(CallArgumentValue),
+    CallBinding(Box<CallBindingValue>),
+    CallEffect(Box<CallEffectValue>),
+    ProcedureEffect(Box<ProcedureEffectValue>),
     CallableSignature(Box<CallableSignatureValue>),
     SignatureParameter(Box<SignatureParameterValue>),
     CallableApplicability(Box<CallableApplicabilityValue>),
@@ -710,6 +720,9 @@ enum PipelineKey {
     CallShape(String),
     CallArgumentGroup(String),
     CallArgument(String),
+    CallBinding(String),
+    CallEffect(String),
+    ProcedureEffect(String),
     CallableSignature(String),
     SignatureParameter(String),
     CallableApplicability(String),
@@ -775,6 +788,9 @@ impl PipelineValue {
                     .id
                     .clone(),
             ),
+            Self::CallBinding(value) => PipelineKey::CallBinding(value.row().id.clone()),
+            Self::CallEffect(value) => PipelineKey::CallEffect(value.row().id.clone()),
+            Self::ProcedureEffect(value) => PipelineKey::ProcedureEffect(value.row().id.clone()),
             Self::CallableSignature(value) => {
                 PipelineKey::CallableSignature(value.report.signature.id.clone())
             }
@@ -1024,6 +1040,9 @@ enum PipelineTraceValue {
     CallShape(CallShapeValue),
     CallArgumentGroup(CallArgumentGroupValue),
     CallArgument(CallArgumentValue),
+    CallBinding(Box<CallBindingValue>),
+    CallEffect(Box<CallEffectValue>),
+    ProcedureEffect(Box<ProcedureEffectValue>),
     CallableSignature(Box<CallableSignatureValue>),
     SignatureParameter(Box<SignatureParameterValue>),
     CallableApplicability(Box<CallableApplicabilityValue>),
@@ -1073,6 +1092,7 @@ struct CallTraversalCache {
     reported_incoming: HashSet<CodeUnit>,
     reported_outgoing: HashSet<CodeUnit>,
     bindings: CallBindingCache,
+    effects: EffectTraversalCache,
 }
 
 #[derive(Debug, Clone)]
@@ -3223,6 +3243,57 @@ fn detailed_evidence_for_pipeline_value(
                 provenance: Vec::new(),
             }
         }
+        PipelineValue::CallBinding(value) => {
+            let row = value.row();
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::CallBinding,
+                key: DetailedCodeQueryKey::CallBinding {
+                    id: row.id.clone(),
+                    site_id: row.site_id.clone(),
+                },
+                file: value.file().clone(),
+                source_slice_sha256: None,
+                byte_span: Some(range_byte_span(row.range)),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::CallEffect(value) => {
+            let row = value.row();
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::CallEffect,
+                key: DetailedCodeQueryKey::CallEffect {
+                    id: row.id.clone(),
+                    site_id: row.site_id.clone(),
+                },
+                file: value.file().clone(),
+                source_slice_sha256: None,
+                byte_span: Some(range_byte_span(row.range)),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
+        PipelineValue::ProcedureEffect(value) => {
+            let row = value.row();
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::ProcedureEffect,
+                key: DetailedCodeQueryKey::ProcedureEffect {
+                    id: row.id.clone(),
+                    procedure_id: row.procedure_declaration_id.clone(),
+                },
+                file: value.file().clone(),
+                source_slice_sha256: None,
+                byte_span: Some(range_byte_span(value.subject.declaration.range)),
+                identities: DetailedCodeQueryProvenanceIdentities::None,
+                stable_owner_candidate: None,
+                provenance: Vec::new(),
+            }
+        }
         PipelineValue::CallableSignature(value) => DetailedCodeQueryEvidence {
             result_index,
             domain: DetailedCodeQueryDomain::CallableSignature,
@@ -3717,6 +3788,9 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::CallShape(value) => Some(&value.report.outcome.file),
         PipelineValue::CallArgumentGroup(value) => Some(&value.shape.report.outcome.file),
         PipelineValue::CallArgument(value) => Some(&value.shape.report.outcome.file),
+        PipelineValue::CallBinding(value) => Some(value.file()),
+        PipelineValue::CallEffect(value) => Some(value.file()),
+        PipelineValue::ProcedureEffect(value) => Some(value.file()),
         PipelineValue::Occurrence(value) => Some(value.file()),
         PipelineValue::MemberSelection(value) => Some(&value.occurrence.file),
         PipelineValue::LexicalScope(value) => Some(value.file()),
@@ -3845,6 +3919,18 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::CallArgument(value) => {
             files.insert(value.shape.report.outcome.file.clone());
         }
+        PipelineValue::CallBinding(value) => {
+            files.insert(value.file().clone());
+            if let Some(target) = &value.site.target {
+                files.insert(target.unit.source().clone());
+            }
+        }
+        PipelineValue::CallEffect(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::ProcedureEffect(value) => {
+            files.insert(value.file().clone());
+        }
         PipelineValue::CallableSignature(value) => {
             files.insert(value.file().clone());
         }
@@ -3943,6 +4029,18 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
         }
         PipelineTraceValue::CallArgument(value) => {
             files.insert(value.shape.report.outcome.file.clone());
+        }
+        PipelineTraceValue::CallBinding(value) => {
+            files.insert(value.file().clone());
+            if let Some(target) = &value.site.target {
+                files.insert(target.unit.source().clone());
+            }
+        }
+        PipelineTraceValue::CallEffect(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::ProcedureEffect(value) => {
+            files.insert(value.file().clone());
         }
         PipelineTraceValue::CallableSignature(value) => {
             files.insert(value.file().clone());
@@ -4241,6 +4339,45 @@ fn detailed_trace_provenance_ref(
                 },
                 &value.shape.report.outcome.file,
                 argument.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::CallBinding(value) => {
+            let row = value.row();
+            detailed_call_shape_provenance_ref(
+                DetailedCodeQueryDomain::CallBinding,
+                DetailedCodeQueryKey::CallBinding {
+                    id: row.id.clone(),
+                    site_id: row.site_id.clone(),
+                },
+                value.file(),
+                row.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::CallEffect(value) => {
+            let row = value.row();
+            detailed_call_shape_provenance_ref(
+                DetailedCodeQueryDomain::CallEffect,
+                DetailedCodeQueryKey::CallEffect {
+                    id: row.id.clone(),
+                    site_id: row.site_id.clone(),
+                },
+                value.file(),
+                row.range,
+                cache,
+            )
+        }
+        PipelineTraceValue::ProcedureEffect(value) => {
+            let row = value.row();
+            detailed_call_shape_provenance_ref(
+                DetailedCodeQueryDomain::ProcedureEffect,
+                DetailedCodeQueryKey::ProcedureEffect {
+                    id: row.id.clone(),
+                    procedure_id: row.procedure_declaration_id.clone(),
+                },
+                value.file(),
+                value.subject.declaration.range,
                 cache,
             )
         }
@@ -4977,6 +5114,11 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
             Some(PipelineTraceValue::CallArgumentGroup(value.clone()))
         }
         PipelineValue::CallArgument(value) => Some(PipelineTraceValue::CallArgument(value.clone())),
+        PipelineValue::CallBinding(value) => Some(PipelineTraceValue::CallBinding(value.clone())),
+        PipelineValue::CallEffect(value) => Some(PipelineTraceValue::CallEffect(value.clone())),
+        PipelineValue::ProcedureEffect(value) => {
+            Some(PipelineTraceValue::ProcedureEffect(value.clone()))
+        }
         PipelineValue::MemberSelection(value) => {
             Some(PipelineTraceValue::MemberSelection(value.clone()))
         }

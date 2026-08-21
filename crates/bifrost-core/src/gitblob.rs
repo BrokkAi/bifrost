@@ -13,7 +13,8 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
 use git2::{
-    AttrCheckFlags, AttrValue, IndexEntry, ObjectType, Oid, Repository, Status, StatusOptions,
+    AttrCheckFlags, AttrValue, ErrorCode, IndexEntry, ObjectType, Oid, Repository, Status,
+    StatusOptions,
 };
 use growable_bloom_filter::GrowableBloom;
 
@@ -471,9 +472,72 @@ pub fn read_blob(repo: &Repository, oid_hex: &str) -> Result<Vec<u8>> {
 const GC_BLOOM_FP_RATE: f64 = 0.05;
 const GC_BLOOM_EST_OIDS: usize = 1 << 19;
 
+/// Whether Git may lazily fetch missing objects from a promisor remote over a
+/// network transport.
+///
+/// Object enumeration is not a local operation in that repository shape:
+/// commands such as `rev-list --objects --all` may transparently fetch every
+/// absent historical object. Callers that cannot bound or cancel that work
+/// must decline it before spawning Git. Local-path promisors remain eligible
+/// because their object transfer is filesystem-bound like an ordinary local
+/// clone.
+pub fn has_network_promisor_remote(repo: &Repository) -> Result<bool> {
+    let config = repo.config().map_err(|error| error.to_string())?;
+    let mut remote_names: HashSet<String> = repo
+        .remotes()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect();
+    // A partially configured or hand-edited clone can retain the extension
+    // marker even if its remote no longer appears in `Repository::remotes`.
+    // Keep that state conservative rather than accidentally permitting a walk.
+    if let Ok(remote) = config.get_string("extensions.partialclone") {
+        remote_names.insert(remote);
+    }
+    for remote in remote_names {
+        let key = format!("remote.{remote}.promisor");
+        let promisor = match config.get_bool(&key) {
+            Ok(promisor) => promisor,
+            Err(error) if error.code() == ErrorCode::NotFound => false,
+            Err(error) => return Err(format!("reading `{key}`: {error}")),
+        };
+        if promisor && !remote_url_is_local(&config, &remote) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether a Git remote URL names a path handled by the local filesystem.
+/// Plain relative paths, absolute paths, tilde paths and `file:` URLs are
+/// local. Scheme URLs and scp-style `host:path` spellings are network-backed.
+/// A missing URL stays conservative.
+fn remote_url_is_local(config: &git2::Config, remote: &str) -> bool {
+    let Ok(url) = config.get_string(&format!("remote.{remote}.url")) else {
+        return false;
+    };
+    if url
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+        || Path::new(&url).is_absolute()
+        || url.starts_with('~')
+    {
+        return true;
+    }
+    !url.contains("://") && !url.contains(':')
+}
+
 /// A Bloom filter of every OID reachable from any ref or linked worktree HEAD,
 /// built by streaming `git rev-list --objects --all <worktree-heads...>`.
 pub fn reachable_bloom(repo: &Repository) -> Result<GrowableBloom> {
+    if has_network_promisor_remote(repo)? {
+        return Err(
+            "refusing to enumerate reachable objects from a network-backed promisor clone"
+                .to_string(),
+        );
+    }
     let workdir = workdir(repo)?;
     let mut args = vec![
         "rev-list".to_string(),
@@ -866,6 +930,73 @@ mod tests {
 
     fn hash_calls() -> usize {
         HASH_WORKING_FILE_CALLS.with(std::cell::Cell::get)
+    }
+
+    fn set_promisor_url(repo: &Repository, url: &str) {
+        if repo.find_remote("origin").is_ok() {
+            repo.remote_set_url("origin", url).unwrap();
+        } else {
+            repo.remote("origin", url).unwrap();
+        }
+        repo.config()
+            .unwrap()
+            .set_bool("remote.origin.promisor", true)
+            .unwrap();
+    }
+
+    #[test]
+    fn promisor_remote_detection_distinguishes_local_paths_from_network_transports() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+
+        for url in [
+            "https://example.invalid/repo.git",
+            "ssh://example.invalid/repo.git",
+            "git@example.invalid:repo.git",
+        ] {
+            set_promisor_url(&repo, url);
+            assert!(
+                has_network_promisor_remote(&repo).unwrap(),
+                "{url} is network-backed"
+            );
+        }
+        for url in [
+            "file:///tmp/source.git",
+            "../source.git",
+            "source.git",
+            "~/source.git",
+        ] {
+            set_promisor_url(&repo, url);
+            assert!(
+                !has_network_promisor_remote(&repo).unwrap(),
+                "{url} is a local-path remote"
+            );
+        }
+
+        let absolute = temp.path().join("source.git");
+        set_promisor_url(&repo, absolute.to_str().expect("UTF-8 temporary path"));
+        assert!(
+            !has_network_promisor_remote(&repo).unwrap(),
+            "an absolute local promisor path must remain eligible"
+        );
+
+        repo.config()
+            .unwrap()
+            .set_bool("remote.origin.promisor", false)
+            .unwrap();
+        repo.remote_set_url("origin", "https://example.invalid/repo.git")
+            .unwrap();
+        assert!(!has_network_promisor_remote(&repo).unwrap());
+    }
+
+    #[test]
+    fn reachable_bloom_refuses_network_promisor_enumeration_before_spawning_git() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        set_promisor_url(&repo, "https://example.invalid/repo.git");
+
+        let error = reachable_bloom(&repo).expect_err("network promisor walk must be refused");
+        assert!(error.contains("refusing to enumerate"), "{error}");
     }
 
     #[test]

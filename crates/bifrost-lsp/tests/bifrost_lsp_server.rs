@@ -1152,9 +1152,9 @@ export function leak_resource(): object {
         .unwrap_or_else(|| panic!("expected findings: {response}"));
     assert_eq!(findings.len(), 1, "{response}");
     assert_eq!(findings[0]["primary"]["path"], "app.ts");
-    assert_eq!(response["result"]["report"]["schema_version"], 4);
+    assert_eq!(response["result"]["report"]["schema_version"], 5);
     let editor_contract: Value = serde_json::from_str(include_str!(
-        "../../../scripts/fixtures/policy-report/v4-one-finding.json"
+        "../../../scripts/fixtures/policy-report/v5-one-finding.json"
     ))
     .expect("editor policy report contract fixture");
     assert_eq!(
@@ -1549,7 +1549,7 @@ fn bifrost_lsp_server_returns_the_ranked_java_policy_display_path() {
     );
 
     assert!(response["error"].is_null(), "{response}");
-    assert_eq!(response["result"]["report"]["schema_version"], 4);
+    assert_eq!(response["result"]["report"]["schema_version"], 5);
     let findings = response["result"]["report"]["runs"][0]["findings"]
         .as_array()
         .unwrap_or_else(|| panic!("expected findings: {response}"));

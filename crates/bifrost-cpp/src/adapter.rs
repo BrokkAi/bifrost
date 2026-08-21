@@ -80,6 +80,7 @@ pub fn parse_cpp_file_in_dialect(
     };
     visitor.visit_container(root, "", None, None, None, Vec::new());
     recover_quoted_includes(source, &mut parsed);
+    parsed.finalize_deferred_replacements();
 
     parsed
 }

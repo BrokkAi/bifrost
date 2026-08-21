@@ -494,11 +494,18 @@ impl PolicyRegistry {
                         Default::default(),
                     )
                 }
-                PolicyAnalysis::Taint { spec } => {
+                PolicyAnalysis::Taint { spec } | PolicyAnalysis::Flow { spec } => {
+                    // Flow and taint decode into one typed model, so one
+                    // composition path serves both. The only difference is the
+                    // JSON-pointer segments each kind publishes for its entry
+                    // sets, which keeps a flow policy's selector paths and
+                    // dependency origins free of taint vocabulary.
+                    let segments = definition.analysis.set_segments();
                     self.build_local_taint_inputs(
                         parsed,
                         &definition,
                         spec,
+                        segments,
                         &mut fixed_selectors,
                         &mut dependency_selectors,
                         &mut candidate_dependencies,
@@ -525,6 +532,7 @@ impl PolicyRegistry {
                     let composed = compose_taint_policy(
                         &definition.metadata.id,
                         spec,
+                        segments,
                         &self.catalogs,
                         &candidate_dependencies,
                         &match_inputs.manifests,
@@ -631,11 +639,13 @@ impl PolicyRegistry {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn build_local_taint_inputs(
         &self,
         parsed: &ParsedRqlpDocument,
         definition: &PolicyDefinition,
         spec: &TaintPolicySpec,
+        segments: TaintSetSegments,
         fixed_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         dependency_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         dependencies: &mut Vec<ResolvedEndpointDependency>,
@@ -643,7 +653,8 @@ impl PolicyRegistry {
     ) -> Result<(), PolicyRegistryError> {
         for source in &spec.sources.entries {
             let base = format!(
-                "/analysis/sources/entries/{}",
+                "/analysis/{}/entries/{}",
+                segments.sources,
                 pointer_segment(source.id.as_str())
             );
             let path = selector_path(format!("{base}/selector"))?;
@@ -678,7 +689,8 @@ impl PolicyRegistry {
         }
         for sink in &spec.sinks.entries {
             let base = format!(
-                "/analysis/sinks/entries/{}",
+                "/analysis/{}/entries/{}",
+                segments.sinks,
                 pointer_segment(sink.id.as_str())
             );
             let path = selector_path(format!("{base}/selector"))?;
@@ -714,7 +726,7 @@ impl PolicyRegistry {
         }
         self.resolve_local_auxiliary_selectors(
             parsed,
-            "sanitizers",
+            segments.sanitizers,
             spec.sanitizers
                 .entries
                 .iter()
@@ -724,7 +736,7 @@ impl PolicyRegistry {
         )?;
         self.resolve_local_auxiliary_selectors(
             parsed,
-            "transforms",
+            segments.transforms,
             spec.transforms
                 .entries
                 .iter()
@@ -734,7 +746,7 @@ impl PolicyRegistry {
         )?;
         self.resolve_local_auxiliary_selectors(
             parsed,
-            "external_models",
+            segments.external_models,
             spec.external_models
                 .entries
                 .iter()

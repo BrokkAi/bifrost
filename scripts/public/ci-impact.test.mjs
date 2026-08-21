@@ -184,7 +184,7 @@ test("public release contract fixtures retain their host and package checks", ()
     selected(
       classifyChangeSet({
         eventName: "pull_request",
-        changedPaths: ["scripts/fixtures/policy-report/v4-one-finding.json"],
+        changedPaths: ["scripts/fixtures/policy-report/v5-one-finding.json"],
       }),
     ),
     ["lsp_contract", "mcp_contract", "policy_pack", "rql_runtime", "rust", "vscode"],

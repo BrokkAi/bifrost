@@ -40,13 +40,3 @@ export function fakeGhEnv(dir, { routes = {}, workflowRun = 0, runWatch = 0 } = 
         .map((line) => line.split("\0").filter(Boolean)),
   };
 }
-
-/** Serve `files` (name -> contents) to the `curl` double in this directory. */
-export function fakeCurlEnv(dir, files) {
-  const served = path.join(dir, "served");
-  fs.mkdirSync(served, { recursive: true });
-  for (const [name, contents] of Object.entries(files)) {
-    fs.writeFileSync(path.join(served, name), contents);
-  }
-  return { FAKE_CURL_ASSETS: served };
-}

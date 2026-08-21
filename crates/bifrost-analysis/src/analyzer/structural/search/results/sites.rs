@@ -532,6 +532,232 @@ pub struct CodeQueryCallShapeArgument {
     pub spread: bool,
 }
 
+/// One normalized actual-to-formal binding of one exact call site (#2438).
+///
+/// The row bridges the two halves of Bifrost's call evidence: `site_id`,
+/// `group_id` and `argument_id` are the facts-arena call-shape identities, and
+/// `formal_index`/`formal_name` are what the shared formal-slot matcher bound
+/// the actual to. A policy therefore reaches "the actual passed to formal
+/// `timeout` of this exact callable" by joining ids, never by comparing ranges
+/// or callee text.
+///
+/// At least one row exists per call shape. `terminal` marks the row that states
+/// the call's status when no pair could be produced -- an unreadable shape, an
+/// unresolved or ambiguous callee, unrecorded formals, or a call that passes
+/// nothing at all. Zero rows is therefore never a claim that a call binds no
+/// argument.
+///
+/// `mapping` is this row's own certainty and `coverage` is the whole call's
+/// partition coverage, repeated on every row so one row alone is enough to
+/// reject an exact-set claim over the call's arguments.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryCallBinding {
+    pub id: String,
+    /// The owning `call_shape` row's site identity.
+    pub site_id: String,
+    /// The facts-arena AST identity of the call node, so a binding row joins an
+    /// occurrence or dispatch row without comparing positions.
+    pub site_ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    /// The actual's own span, or the whole call's span on a terminal row.
+    pub range: CodeQueryRange,
+    /// The `call_argument_group` row of the actual.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// The `call_argument` row of the actual. Absent on a terminal row and on
+    /// a defaulted formal, neither of which has a source actual.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argument_id: Option<String>,
+    /// The exact callee declaration the production resolver named, when the
+    /// workspace still indexes a range for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<CodeQueryDeclaration>,
+    /// The `callable_signature` row this binding selects, when the target
+    /// publishes exactly one signature entry. Absent for an overload set, which
+    /// this slice does not choose between.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature_id: Option<String>,
+    /// The actual's position inside its own argument-list group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_index: Option<usize>,
+    /// The parameter name written at the call site, when one was written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_name: Option<String>,
+    /// Zero-based position of the bound formal in the callable's ordinary
+    /// (non-receiver) parameter list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formal_index: Option<usize>,
+    /// The bound formal's canonical declared name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formal_name: Option<String>,
+    /// `positional`, `named`, `defaulted`, `variadic`, `spread`, `receiver`, or
+    /// `implicit`. Absent on a terminal row, which binds nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_kind: Option<&'static str>,
+    /// `exact`, `ambiguous`, `incomplete`, or `unsupported`.
+    pub mapping: &'static str,
+    /// The typed reason this row is not `exact`. An exact row states none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// The whole call's partition coverage: `exhaustive`, `partial`,
+    /// `unknown`, or `unsupported`.
+    pub coverage: &'static str,
+    /// Actual argument rows the call shape enumerated.
+    pub actual_count: usize,
+    /// Actuals bound to a formal with an exact mapping.
+    pub bound_count: usize,
+    pub terminal: bool,
+}
+
+/// One source-derived direct effect of one exact call site (#2437).
+///
+/// The row states that an activated semantic-model pack declares `effect_id`
+/// for the callee this call's dispatch answer named. Nothing about the effect
+/// is inferred from source text: `proof` and `coverage` are the dispatch
+/// oracle's own words, and `timing`, `certainty` and the pack provenance are
+/// the reviewed declaration's.
+///
+/// At least one row exists per call site. `terminal` marks the row that states
+/// the site's status when no declaration applies — a call whose callee nobody
+/// models, whose dispatch is open, or whose target identity could not be
+/// built. Zero rows is therefore never a claim that a call has no effect.
+///
+/// `coverage` is repeated on every row of the site, so one row alone is enough
+/// to reject an "this call performs no such effect" claim.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryCallEffect {
+    pub id: String,
+    /// The owning `call_shape` row's site identity.
+    pub site_id: String,
+    /// The facts-arena AST identity of the call node, so an effect row joins an
+    /// occurrence or dispatch row without comparing positions.
+    pub site_ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    /// Equal to `dispatch_target.target_id` for the arm this row came from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    /// The callee rendered as a workspace declaration, when the workspace
+    /// indexes one for the arm's target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callee: Option<CodeQueryDeclaration>,
+    /// The canonical modeled identity the declaration lookup used, spelled
+    /// `owner.member/arity[+recv]`. Absent when no identity could be built.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callee_symbol: Option<String>,
+    /// The namespaced effect the pack declares. Absent on a terminal row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effect_id: Option<String>,
+    /// Always `direct` on this domain; transitive attribution lives on
+    /// `procedure_effect`.
+    pub classification: &'static str,
+    /// `immediate`, `deferred`, or `unknown`, from the declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<&'static str>,
+    /// `definite` or `possible`: the meet of the declaration's own certainty
+    /// and the dispatch arm's proof.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certainty: Option<&'static str>,
+    /// `proven` or `unproven`, copied from the dispatch arm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof: Option<&'static str>,
+    /// `declared`, `none`, `incomplete`, or `unsupported`.
+    pub derivation: &'static str,
+    /// The typed reason the derivation is not exhaustive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// The site's effect coverage: `exhaustive`, `open`, `truncated`, or
+    /// `unsupported`.
+    pub coverage: &'static str,
+    /// The activated pack that published the declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+    /// The pack's own model identity for the record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// The compiled procedure summary the declaration rides on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_id: Option<String>,
+    /// Dispatch arms the site published.
+    pub arm_count: usize,
+    /// Arms a unique activated summary modeled.
+    pub modeled_arm_count: usize,
+    pub terminal: bool,
+}
+
+/// One effect attributed to one procedure, direct or transitive (#2437).
+///
+/// Computed by a bounded deterministic fixpoint over the procedure's reachable
+/// call graph, using the same dispatch answers `call_effect` publishes. The
+/// witness columns are the source-backed chain from this procedure to the exact
+/// call that carries the declared effect: `witness_site_id` is the first hop and
+/// `witness_effect_site_id` is the declaring call, and both are `call_shape`
+/// site identities, so a reader joins them to `call_effect` by id.
+///
+/// At least one row exists per procedure, so zero rows is never a claim that a
+/// procedure is effect-free. `coverage` states whether an absence of rows for a
+/// given effect is a proof or only a silence.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryProcedureEffect {
+    pub id: String,
+    /// Equal to the `declaration` domain's `id` for the same procedure.
+    pub procedure_id: String,
+    pub procedure_name: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    /// The namespaced effect. Absent on a terminal row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effect_id: Option<String>,
+    /// `direct` when the declaring procedure is this one or a callee written in
+    /// its own body, `transitive` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification: Option<&'static str>,
+    /// `definite` or `possible`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certainty: Option<&'static str>,
+    /// `immediate`, `deferred`, or `unknown`. A path through a deferred
+    /// declaration keeps the deferred timing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<&'static str>,
+    /// Call hops from this procedure to the declaring one. `0` means the pack
+    /// declares the effect on this procedure itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<usize>,
+    /// `declared`, `none`, `incomplete`, or `unsupported`.
+    pub derivation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// `exhaustive`, `open`, `truncated`, or `unsupported`, for the whole
+    /// reachable call graph of this procedure.
+    pub coverage: &'static str,
+    /// Whether a witness chain is retained for this row.
+    pub witness_available: bool,
+    /// Retained hops in the witness chain.
+    pub witness_steps: usize,
+    /// The `call_shape` site identity of the first hop out of this procedure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub witness_site_id: Option<String>,
+    /// The `call_shape` site identity of the call that carries the declared
+    /// effect, which joins `call_effect.site_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub witness_effect_site_id: Option<String>,
+    /// The bounded rendered chain, `caller -> ... -> declaring procedure`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub witness_chain: Option<String>,
+    /// Whether the chain hit the retained-step bound.
+    pub witness_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_id: Option<String>,
+    pub terminal: bool,
+}
+
 /// The mandatory row for one persisted signature entry of one declaration
 /// (#1478 M2).
 ///

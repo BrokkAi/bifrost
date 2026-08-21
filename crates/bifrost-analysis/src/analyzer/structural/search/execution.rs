@@ -1086,7 +1086,8 @@ pub(super) fn append_diagnostic_terminations(
             }
             CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted
             | CodeQueryDiagnosticCode::EnvironmentRowBudgetExhausted
-            | CodeQueryDiagnosticCode::MaterializationRowBudgetExhausted => {
+            | CodeQueryDiagnosticCode::MaterializationRowBudgetExhausted
+            | CodeQueryDiagnosticCode::EffectBudgetExhausted => {
                 Some(QueryOperatorTermination::AnalysisLimit)
             }
             CodeQueryDiagnosticCode::SemanticResultsOmitted
@@ -1126,7 +1127,8 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::FlowStateDerivationIncomplete
             | CodeQueryDiagnosticCode::RewriteDomainUnsupported
             | CodeQueryDiagnosticCode::RewritePathDerivationIncomplete
-            | CodeQueryDiagnosticCode::PathDerivationIncomplete => {
+            | CodeQueryDiagnosticCode::PathDerivationIncomplete
+            | CodeQueryDiagnosticCode::EffectDerivationIncomplete => {
                 Some(QueryOperatorTermination::AnalysisIncomplete)
             }
             CodeQueryDiagnosticCode::InvalidPlan

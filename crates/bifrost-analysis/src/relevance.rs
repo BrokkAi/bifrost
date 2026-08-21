@@ -18,6 +18,7 @@ use crate::compact_graph::CompactDirectedGraph;
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::gitblob;
 use git2::{Oid, Repository};
 use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
@@ -2561,34 +2562,9 @@ impl GitProjectContext {
     /// the same filesystem, so the walk remains disk-bound and the honest
     /// answer is the history itself, not `HistoryUnavailable`.
     fn has_network_promisor_remote(&self) -> bool {
-        let config = self
-            .repo
-            .config()
-            .expect("an opened repository exposes its configuration");
-        let remotes = self
-            .repo
-            .remotes()
-            .expect("an opened repository lists its remotes");
-        remotes.iter().flatten().any(|remote| {
-            config
-                .get_bool(&format!("remote.{remote}.promisor"))
-                .unwrap_or(false)
-                && !Self::remote_url_is_local(&config, remote)
-        })
-    }
-
-    /// Whether a remote's URL names the local filesystem. Git's local
-    /// transports are `file://` URLs and plain paths (absolute, or explicitly
-    /// relative with `./`/`../`). An scp-style `host:path` or any scheme URL
-    /// is network; a missing URL keeps the conservative network assumption.
-    fn remote_url_is_local(config: &git2::Config, remote: &str) -> bool {
-        let Ok(url) = config.get_string(&format!("remote.{remote}.url")) else {
-            return false;
-        };
-        url.starts_with("file://")
-            || Path::new(&url).is_absolute()
-            || url.starts_with("./")
-            || url.starts_with("../")
+        // Failure to inspect the clone is the same safety outcome as finding
+        // a network promisor: interactive history work must remain local.
+        gitblob::has_network_promisor_remote(&self.repo).unwrap_or(true)
     }
 
     fn parse_git_log_name_status(&self, output: &[u8]) -> Vec<CommitChange> {

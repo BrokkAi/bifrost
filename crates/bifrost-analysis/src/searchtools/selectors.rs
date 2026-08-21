@@ -399,6 +399,7 @@ impl DefinitionCandidateRenderCache {
         analyzer: &dyn IAnalyzer,
         target: &crate::analyzer::usages::get_definition::NavigationTarget,
     ) -> Option<(Range, Option<(usize, usize)>)> {
+        let _scope = profiling::scope("searchtools::definition_candidate.display_range");
         let Some(declaration_range) = target.declaration_range else {
             return self.display_range(analyzer, &target.code_unit);
         };
@@ -440,6 +441,7 @@ impl DefinitionCandidateRenderCache {
         identity_range: &Range,
         columns: Option<(usize, usize)>,
     ) -> DefinitionCandidate {
+        let _scope = profiling::scope("searchtools::definition_candidate.render");
         let (canonical_selector, occurrence_role) =
             self.identity_metadata(analyzer, token, unit, identity_range);
         let mut candidate = definition_candidate_from_range_base(analyzer, unit, range, columns);
@@ -527,6 +529,7 @@ fn definition_candidate_from_range_base(
     range: Range,
     columns: Option<(usize, usize)>,
 ) -> DefinitionCandidate {
+    let _scope = profiling::scope("searchtools::definition_candidate.base");
     let language = language_for_target(unit);
     let name = if language == Language::CSharp {
         crate::analyzer::common::display_identifier_for_target(unit)
@@ -542,10 +545,10 @@ fn definition_candidate_from_range_base(
         end_line: range.end_line,
         end_column: columns.map(|(_, end)| end),
         kind: code_unit_kind_name(unit.kind()).to_string(),
-        signature: unit
-            .signature()
-            .map(str::to_string)
-            .or_else(|| selector_signatures(analyzer, unit).into_iter().next()),
+        signature: unit.signature().map(str::to_string).or_else(|| {
+            let _scope = profiling::scope("searchtools::definition_candidate.signature");
+            selector_signatures(analyzer, unit).into_iter().next()
+        }),
         language: language_name(language),
         canonical_selector: None,
         occurrence_role: None,
