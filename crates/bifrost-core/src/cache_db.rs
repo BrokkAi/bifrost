@@ -30,7 +30,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 18;
 // Version 25 belonged to a rejected local relational-key experiment. Skipping
 // it prevents an old experimental v25 store from being mistaken for this
 // schema; the version sequence is intentionally monotonic, not contiguous.
-const CURRENT_MIGRATION_VERSION: i64 = 30;
+const CURRENT_MIGRATION_VERSION: i64 = 31;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -56,8 +56,10 @@ const RELATIONAL_DEFINITION_SET_VIEWS_SQL: &str =
 const RELATIONAL_FQ_AUTHORITY_SQL: &str = include_str!("../migrations/cache/0028-retire-fq2.sql");
 const REVERSE_IMPORT_LOOKUPS_SQL: &str =
     include_str!("../migrations/cache/0029-reverse-import-lookups.sql");
+const REFERENCE_IDENTIFIER_FACTS_SQL: &str =
+    include_str!("../migrations/cache/0030-reference-identifier-facts.sql");
 const RELATIONAL_DEFINITION_IDENTIFIER_VIEWS_SQL: &str =
-    include_str!("../migrations/cache/0030-relational-definition-identifier-views.sql");
+    include_str!("../migrations/cache/0031-relational-definition-identifier-views.sql");
 
 // Migration 0023 spells the signature-metadata byte cap as the literal 8388608,
 // because a checked-in SQL file cannot interpolate a Rust constant. The two must
@@ -78,7 +80,7 @@ struct CacheMigration {
     sql: &'static str,
 }
 
-const CACHE_MIGRATIONS: [CacheMigration; 12] = [
+const CACHE_MIGRATIONS: [CacheMigration; 13] = [
     CacheMigration {
         version: 18,
         sql: CURRENT_BASELINE_SQL,
@@ -125,6 +127,10 @@ const CACHE_MIGRATIONS: [CacheMigration; 12] = [
     },
     CacheMigration {
         version: 30,
+        sql: REFERENCE_IDENTIFIER_FACTS_SQL,
+    },
+    CacheMigration {
+        version: 31,
         sql: RELATIONAL_DEFINITION_IDENTIFIER_VIEWS_SQL,
     },
 ];
@@ -948,13 +954,22 @@ struct RecognizedForeignStore {
 const OPTIONAL_FACT_MANIFEST_AFTER_IMPORT_BINDINGS_SQL: &str =
     include_str!("../migrations/cache/bridges/0016-optional-fact-manifest-after-19.sql");
 
-const RECOGNIZED_FOREIGN_STORES: [RecognizedForeignStore; 1] = [RecognizedForeignStore {
-    declared_version: 18,
-    recognize: is_nlp_ft_import_bindings_store,
-    bridge_sql: OPTIONAL_FACT_MANIFEST_AFTER_IMPORT_BINDINGS_SQL,
-    equivalent_version: 19,
-    lineage: "bifrost-nlp-ft import-bindings-at-18",
-}];
+const RECOGNIZED_FOREIGN_STORES: [RecognizedForeignStore; 2] = [
+    RecognizedForeignStore {
+        declared_version: 18,
+        recognize: is_nlp_ft_import_bindings_store,
+        bridge_sql: OPTIONAL_FACT_MANIFEST_AFTER_IMPORT_BINDINGS_SQL,
+        equivalent_version: 19,
+        lineage: "bifrost-nlp-ft import-bindings-at-18",
+    },
+    RecognizedForeignStore {
+        declared_version: 30,
+        recognize: is_definition_identifier_views_v30_store,
+        bridge_sql: REFERENCE_IDENTIFIER_FACTS_SQL,
+        equivalent_version: 31,
+        lineage: "definition-identifier-views-at-30",
+    },
+];
 
 /// The `bifrost-nlp-ft` version 18 store: migration 19's `import_statements`
 /// is present, and migration 16's manifest table is not.
@@ -966,6 +981,20 @@ const RECOGNIZED_FOREIGN_STORES: [RecognizedForeignStore; 1] = [RecognizedForeig
 fn is_nlp_ft_import_bindings_store(conn: &Connection) -> Result<bool> {
     Ok(column_exists(conn, "import_statements", "is_wildcard")?
         && !table_exists(conn, "blob_optional_fact_manifest")?)
+}
+
+/// The short-lived master schema that assigned version 30 to the lean
+/// definition-identifier views while the reference-fact branch independently
+/// assigned the same version to its identifier relation migration.
+///
+/// The two views distinguish that lineage from the reference-fact v30 shape.
+/// Applying [`REFERENCE_IDENTIFIER_FACTS_SQL`] to it produces exactly this
+/// build's version 31 schema, without reparsing any blob.
+fn is_definition_identifier_views_v30_store(conn: &Connection) -> Result<bool> {
+    Ok(table_exists(conn, "type_identifiers")?
+        && !table_exists(conn, "reference_identifiers")?
+        && view_exists(conn, "live_stable_definition_identifiers")?
+        && view_exists(conn, "live_anchored_definition_identifiers")?)
 }
 
 /// Give the staged copy a version number that means what this build's
@@ -1743,6 +1772,15 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
         [table],
+        |row| row.get(0),
+    )
+    .map_err(|err| format!("cache DB SQLite error: {err}"))
+}
+
+fn view_exists(conn: &Connection, view: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'view' AND name = ?1)",
+        [view],
         |row| row.get(0),
     )
     .map_err(|err| format!("cache DB SQLite error: {err}"))
@@ -3813,6 +3851,18 @@ mod tests {
             .collect()
     }
 
+    /// The other schema that briefly shipped as version 30 while the
+    /// reference-fact migration was being developed in parallel.
+    fn definition_identifier_views_v30_migrations() -> Vec<CacheMigration> {
+        migrations_through(29)
+            .into_iter()
+            .chain(std::iter::once(CacheMigration {
+                version: 30,
+                sql: RELATIONAL_DEFINITION_IDENTIFIER_VIEWS_SQL,
+            }))
+            .collect()
+    }
+
     /// Undo what migration 16 did, so a fixture can stand where the
     /// `bifrost-nlp-ft` branch stood when it shipped its version 18.
     ///
@@ -3974,6 +4024,61 @@ mod tests {
         assert!(quick_check_is_ok(&conn).unwrap());
         assert_eq!(std::fs::read(&older).unwrap(), older_before);
         assert!(staged_leftovers(cache_dir).is_empty());
+    }
+
+    /// Both concurrent version-30 schemas retain their cache contents. This
+    /// branch's reference-fact shape takes the ordinary migration-31 path;
+    /// the definition-identifier-view shape is recognized, receives the
+    /// reference-fact bridge, and is adopted directly as version 31.
+    #[test]
+    fn both_version_30_lineages_are_carried_forward_without_reanalysis() {
+        for (label, migrations, is_foreign) in [
+            ("reference-facts", migrations_through(30), false),
+            (
+                "definition-identifier-views",
+                definition_identifier_views_v30_migrations(),
+                true,
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let cache_dir = temp.path();
+            let older = store_path(cache_dir, 30);
+            create_store_at(&older, &migrations, 30);
+            let expected = read_semantic_rows(&older);
+            let older_before = std::fs::read(&older).unwrap();
+            let older_conn = Connection::open(&older).unwrap();
+            assert_eq!(
+                is_definition_identifier_views_v30_store(&older_conn).unwrap(),
+                is_foreign,
+                "the lineage recognizer must distinguish {label}"
+            );
+            drop(older_conn);
+
+            let conn = open_unified_connection(&current_store_path(cache_dir)).unwrap();
+
+            assert_eq!(
+                cache_migration_version(&conn).unwrap(),
+                CURRENT_MIGRATION_VERSION,
+                "{label} must reach the current version"
+            );
+            assert_eq!(
+                semantic_rows(&conn),
+                expected,
+                "{label} must retain every cached semantic row"
+            );
+            assert_eq!(
+                schema_object_definitions(&conn).unwrap(),
+                *CURRENT_SCHEMA_OBJECTS,
+                "{label} must produce the canonical merged schema"
+            );
+            assert!(quick_check_is_ok(&conn).unwrap());
+            assert_eq!(
+                std::fs::read(&older).unwrap(),
+                older_before,
+                "{label} source store must remain untouched"
+            );
+            assert!(staged_leftovers(cache_dir).is_empty());
+        }
     }
 
     /// A `bifrost-nlp-ft` store declares version 18 while holding this build's

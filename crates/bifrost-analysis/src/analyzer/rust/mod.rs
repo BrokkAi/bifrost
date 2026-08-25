@@ -31,7 +31,6 @@ use crate::analyzer::languages::{
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::TypeRelation;
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_rust_bounded,
 };
@@ -1495,8 +1494,11 @@ impl LanguageSupport for RustSupport {
         UsageEcosystem::Rust
     }
 
-    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
-        &RUST_USAGE_STRATEGY
+    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
+        crate::analyzer::languages::ReferenceLanguagePlugin::new(
+            &RUST_USAGE_STRATEGY,
+            &RustEdgePass,
+        )
     }
 
     fn qualified_call_separator(&self) -> &'static str {
@@ -1510,10 +1512,6 @@ impl LanguageSupport for RustSupport {
         callee_text: &str,
     ) -> Option<String> {
         expand_rust_imported_external_callee(analyzer, file, callee_text)
-    }
-
-    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
-        Some(&RustEdgePass)
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -1569,7 +1567,7 @@ impl LanguageEdgePass for RustEdgePass {
             ctx.fqns,
             ctx.keep_file,
         )
-        .map(LanguageEdgeSites)
+        .map(LanguageEdgeSites::Fqn)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

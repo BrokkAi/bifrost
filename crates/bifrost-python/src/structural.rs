@@ -273,6 +273,10 @@ impl StructuralSpec for PythonStructuralSpec {
         Language::Python
     }
 
+    fn supports_boolean_literal_value(&self) -> bool {
+        true
+    }
+
     fn reference_edge_support(&self) -> &ReferenceEdgeSupport {
         &DEEP_REFERENCE_EDGE_SUPPORT
     }

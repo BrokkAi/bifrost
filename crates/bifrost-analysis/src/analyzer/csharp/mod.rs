@@ -51,7 +51,6 @@ use crate::analyzer::languages::{
     fqn_has_multiple_function_definitions,
 };
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::csharp_graph::{
     CSharpUsageGraphStrategy, build_csharp_usage_edge_weights, build_inbound_csharp_usage_edges,
     build_rooted_csharp_usage_edges,
@@ -1300,12 +1299,11 @@ impl LanguageSupport for CSharpSupport {
         UsageEcosystem::CSharp
     }
 
-    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
-        &CSHARP_USAGE_STRATEGY
-    }
-
-    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
-        Some(&CSharpEdgePass)
+    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
+        crate::analyzer::languages::ReferenceLanguagePlugin::new(
+            &CSHARP_USAGE_STRATEGY,
+            &CSharpEdgePass,
+        )
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -1343,7 +1341,7 @@ impl LanguageEdgePass for CSharpEdgePass {
         let scope = AnalyzerQueryScope::new(ctx.analyzer);
         let token = scope.token();
         build_rooted_csharp_usage_edges(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
-            .map(LanguageEdgeSites)
+            .map(LanguageEdgeSites::Fqn)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

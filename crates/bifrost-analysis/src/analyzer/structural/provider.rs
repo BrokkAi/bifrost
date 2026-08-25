@@ -163,6 +163,13 @@ pub trait StructuralFactProvider: Send + Sync {
 
     fn structural_supports_role(&self, role: Role) -> bool;
 
+    /// Whether exact normalized boolean-literal values are available. The
+    /// default is unsupported for external providers so exact-value queries
+    /// become incomplete instead of silently empty.
+    fn structural_supports_boolean_literal_value(&self) -> bool {
+        false
+    }
+
     /// Whether the adapter classifies `role` during fact extraction. Total by
     /// construction: an adapter that declares nothing supports nothing.
     fn structural_supports_occurrence_role(&self, role: OccurrenceRole) -> bool;
@@ -557,6 +564,12 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         self.adapter()
             .structural_spec()
             .is_some_and(|spec| spec.supports_role(role))
+    }
+
+    fn structural_supports_boolean_literal_value(&self) -> bool {
+        self.adapter()
+            .structural_spec()
+            .is_some_and(|spec| spec.supports_boolean_literal_value())
     }
 
     fn structural_supports_occurrence_role(&self, role: OccurrenceRole) -> bool {

@@ -89,35 +89,7 @@ pub fn scan_js_ts_target_usages(
     scan_scope: &UsageScanScope<'_>,
     language: Language,
 ) -> CandidateUsageHits {
-    let target_seed = target_seed_identifier(analyzer, target);
-    let owner_seed_allowed = is_static_member(target)
-        || !target.short_name().contains('.')
-        || analyzer.parent_of(target).is_some();
-    let exported_local_property =
-        exported_local_property_binding(analyzer, index, target, language);
-    let mut seeds = index.seeds_for_target(
-        target.source(),
-        &target_seed,
-        target.short_name(),
-        owner_seed_allowed,
-    );
-    if target.is_file_scope() {
-        // A namespace import binds the imported module object, not one named
-        // export. Give that object query a file-identity seed: namespace-edge
-        // matching uses the file and deliberately ignores the empty name,
-        // while named/default edges cannot match it. This also narrows the scan
-        // to actual importers instead of walking every candidate file (#2305).
-        seeds.insert((target.source().clone(), String::new()));
-    }
-    if let Some(binding) = &exported_local_property {
-        seeds.extend(
-            binding
-                .exported_names
-                .iter()
-                .cloned()
-                .map(|name| (target.source().clone(), name)),
-        );
-    }
+    let (seeds, exported_local_property) = target_seeds(analyzer, index, target, language);
     let scan_hits = if seeds.is_empty() {
         let mut scan_files: HashSet<ProjectFile> =
             scan_scope.candidate_files().iter().cloned().collect();
@@ -179,6 +151,59 @@ pub fn scan_js_ts_target_usages(
         hits,
         unproven_hits,
     }
+}
+
+pub fn js_ts_target_candidate_files(
+    analyzer: &dyn CodeUnitIndex,
+    index: &JsTsUsageIndex,
+    target: &CodeUnit,
+    language: Language,
+) -> HashSet<ProjectFile> {
+    let (seeds, _) = target_seeds(analyzer, index, target, language);
+    let mut files = index.importers_of_seeds(&seeds);
+    files.insert(target.source().clone());
+    files
+}
+
+fn target_seeds(
+    analyzer: &dyn CodeUnitIndex,
+    index: &JsTsUsageIndex,
+    target: &CodeUnit,
+    language: Language,
+) -> (
+    BTreeSet<(ProjectFile, String)>,
+    Option<ExportedLocalPropertyBinding>,
+) {
+    let target_seed = target_seed_identifier(analyzer, target);
+    let owner_seed_allowed = is_static_member(target)
+        || !target.short_name().contains('.')
+        || analyzer.parent_of(target).is_some();
+    let exported_local_property =
+        exported_local_property_binding(analyzer, index, target, language);
+    let mut seeds = index.seeds_for_target(
+        target.source(),
+        &target_seed,
+        target.short_name(),
+        owner_seed_allowed,
+    );
+    if target.is_file_scope() {
+        // A namespace import binds the imported module object, not one named
+        // export. Give that object query a file-identity seed: namespace-edge
+        // matching uses the file and deliberately ignores the empty name,
+        // while named/default edges cannot match it. This also narrows the scan
+        // to actual importers instead of walking every candidate file (#2305).
+        seeds.insert((target.source().clone(), String::new()));
+    }
+    if let Some(binding) = &exported_local_property {
+        seeds.extend(
+            binding
+                .exported_names
+                .iter()
+                .cloned()
+                .map(|name| (target.source().clone(), name)),
+        );
+    }
+    (seeds, exported_local_property)
 }
 
 fn target_seed_identifier(analyzer: &dyn CodeUnitIndex, target: &CodeUnit) -> String {

@@ -61,7 +61,7 @@ use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::kotlin_graph::shared::{KotlinEdgeResolver, KotlinQueryResolver};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 use brokk_bifrost_jvm::kotlin::graph::KotlinGraphSource;
@@ -258,20 +258,6 @@ impl GraphUsageAnalyzer for KotlinUsageGraphStrategy {
     }
 }
 
-impl UsageAnalyzer for KotlinUsageGraphStrategy {
-    fn find_usages(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
-        max_usages: usize,
-    ) -> FuzzyResult {
-        let scan_scope = UsageScanScope::new(candidate_files, false);
-        self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
-            .into_fuzzy_result()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,7 +287,7 @@ mod tests {
             .find(|unit| unit.fq_name() == "api.Service.run")
             .expect("fixture declares Service.run");
         let candidates = HashSet::from_iter([consumer]);
-        let scan_scope = UsageScanScope::new(&candidates, true);
+        let scan_scope = UsageScanScope::new(&candidates);
 
         let outcome = KotlinUsageGraphStrategy::new()
             .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scan_scope, 100)

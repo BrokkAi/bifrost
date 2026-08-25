@@ -24,7 +24,7 @@ use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::php_graph::shared::{PhpEdgeResolver, PhpQueryResolver};
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
-use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     AnalyzerDefinitionLookup, CodeUnit, DefinitionLanguageScope, FqName, IAnalyzer, Language,
     PhpAnalyzer, ProjectFile, RelationalBatchOutcome, RelationalCallableFact,
@@ -344,19 +344,5 @@ impl GraphUsageAnalyzer for PhpUsageGraphStrategy {
         };
 
         resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
-    }
-}
-
-impl UsageAnalyzer for PhpUsageGraphStrategy {
-    fn find_usages(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
-        max_usages: usize,
-    ) -> FuzzyResult {
-        let scan_scope = UsageScanScope::new(candidate_files, false);
-        self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
-            .into_fuzzy_result()
     }
 }

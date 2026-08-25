@@ -139,7 +139,7 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
-        let scan_scope = UsageScanScope::new(candidate_files, true);
+        let scan_scope = UsageScanScope::new(candidate_files);
         self.resolver.find_usages_with_visibility(
             self.analyzer,
             self.token,

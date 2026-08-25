@@ -2,35 +2,30 @@ use crate::analyzer::ProjectFile;
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 
-/// Files a usage query is allowed to scan.
+/// The exact files a usage query is allowed to scan.
 ///
-/// A non-authoritative scope is a candidate hint: strategies may add importers,
-/// definition files, or other structured files. An authoritative scope is a hard
-/// boundary from a caller-supplied `paths` filter: any internally-added files
-/// must already be present in `candidate_files`.
+/// Candidate expansion happens before this value is constructed. Once file
+/// and source-byte budgets have admitted the set, language code cannot add a
+/// target, importer, or convention-derived file behind the planner's back.
 pub struct UsageScanScope<'a> {
     candidate_files: &'a HashSet<ProjectFile>,
-    authoritative: bool,
     cancellation: Option<&'a CancellationToken>,
 }
 
 impl<'a> UsageScanScope<'a> {
-    pub fn new(candidate_files: &'a HashSet<ProjectFile>, authoritative: bool) -> Self {
+    pub fn new(candidate_files: &'a HashSet<ProjectFile>) -> Self {
         Self {
             candidate_files,
-            authoritative,
             cancellation: None,
         }
     }
 
     pub fn with_cancellation(
         candidate_files: &'a HashSet<ProjectFile>,
-        authoritative: bool,
         cancellation: &'a CancellationToken,
     ) -> Self {
         Self {
             candidate_files,
-            authoritative,
             cancellation: Some(cancellation),
         }
     }
@@ -39,12 +34,8 @@ impl<'a> UsageScanScope<'a> {
         self.candidate_files
     }
 
-    pub fn is_authoritative(&self) -> bool {
-        self.authoritative
-    }
-
     pub fn allows(&self, file: &ProjectFile) -> bool {
-        !self.authoritative || self.candidate_files.contains(file)
+        self.candidate_files.contains(file)
     }
 
     pub fn cancellation(&self) -> Option<&'a CancellationToken> {

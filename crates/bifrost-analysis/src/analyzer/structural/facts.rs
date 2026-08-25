@@ -40,7 +40,9 @@ use std::fmt;
 /// Version 8 makes TypeScript's bodiless callable declarations facts:
 /// `function_signature`, `method_signature`, and `abstract_method_signature`
 /// normalize as callables, so declaration-only stubs are addressable (#1658).
-pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 8;
+/// Version 9 records the exact language-neutral value of normalized boolean
+/// literals for the RQL `boolean_value` predicate (#2623).
+pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralSnapshotError(String);
@@ -68,6 +70,7 @@ struct SnapshotSpan {
 #[derive(Debug, Serialize, Deserialize)]
 struct SnapshotNode {
     kind: u8,
+    boolean_value: Option<bool>,
     construct: Option<String>,
     span: SnapshotSpan,
     parent: Option<u32>,
@@ -330,6 +333,9 @@ fn line_of_byte(line_starts: &[usize], byte: usize) -> usize {
 #[derive(Debug, Clone)]
 pub struct NormalizedNode {
     pub kind: NormalizedKind,
+    /// Exact language-neutral value for a boolean-literal fact. `None` for
+    /// every other kind and for adapters that do not support this axis.
+    pub boolean_value: Option<bool>,
     /// Grammar-backed source construct used by semantic generator rules.
     pub construct: Option<String>,
     pub range: Range,
@@ -388,6 +394,13 @@ impl FileFacts {
     ) -> Self {
         assert_eq!(roles.rows(), nodes.len());
         assert_eq!(occurrence_roles.rows(), nodes.len());
+        assert!(
+            nodes
+                .iter()
+                .all(|node| node.boolean_value.is_none()
+                    || node.kind == NormalizedKind::BooleanLiteral),
+            "only normalized boolean-literal facts may carry boolean values"
+        );
         let source_identity = ContentIdentity::hash_bytes(source.as_bytes());
         Self {
             source,
@@ -417,6 +430,7 @@ impl FileFacts {
             .map(|node| {
                 Ok(SnapshotNode {
                     kind: kind_code(node.kind),
+                    boolean_value: node.boolean_value,
                     construct: node.construct.clone(),
                     span: encode_span(node.span())?,
                     parent: node.parent,
@@ -541,8 +555,16 @@ impl FileFacts {
                     })
                 })
                 .transpose()?;
+            let kind = decode_kind(node.kind)?;
+            if node.boolean_value.is_some() && kind != NormalizedKind::BooleanLiteral {
+                return Err(StructuralSnapshotError::invalid(format!(
+                    "structural node {id} carries a boolean value for non-boolean kind {}",
+                    kind.label()
+                )));
+            }
             nodes.push(NormalizedNode {
-                kind: decode_kind(node.kind)?,
+                kind,
+                boolean_value: node.boolean_value,
                 construct: node.construct,
                 call_site,
                 range: Range {
@@ -734,6 +756,7 @@ mod tests {
     fn node() -> NormalizedNode {
         NormalizedNode {
             kind: NormalizedKind::Call,
+            boolean_value: None,
             construct: None,
             range: Range {
                 start_byte: 0,
@@ -753,6 +776,7 @@ mod tests {
         let nodes = vec![
             NormalizedNode {
                 kind: NormalizedKind::Call,
+                boolean_value: None,
                 construct: Some("fixture_call".to_owned()),
                 range: Range {
                     start_byte: 0,
@@ -770,6 +794,7 @@ mod tests {
             },
             NormalizedNode {
                 kind: NormalizedKind::Identifier,
+                boolean_value: None,
                 construct: None,
                 range: Range {
                     start_byte: 2,
@@ -927,7 +952,9 @@ mod tests {
 
     #[test]
     fn snapshot_round_trip_reconstructs_identical_hot_facts() {
-        let original = snapshot_fixture();
+        let mut original = snapshot_fixture();
+        original.nodes[1].kind = NormalizedKind::BooleanLiteral;
+        original.nodes[1].boolean_value = Some(true);
         let payload = original.encode_snapshot().unwrap();
         let decoded = FileFacts::decode_snapshot(original.source().to_owned(), &payload).unwrap();
 
@@ -935,6 +962,7 @@ mod tests {
         assert_eq!(decoded.nodes().len(), original.nodes().len());
         for (actual, expected) in decoded.nodes().iter().zip(original.nodes()) {
             assert_eq!(actual.kind, expected.kind);
+            assert_eq!(actual.boolean_value, expected.boolean_value);
             assert_eq!(actual.range, expected.range);
             assert_eq!(actual.parent, expected.parent);
             assert_eq!(actual.name, expected.name);
@@ -970,6 +998,7 @@ mod tests {
         let unknown_kind = StructuralFactsSnapshot {
             nodes: vec![SnapshotNode {
                 kind: u8::MAX,
+                boolean_value: None,
                 construct: None,
                 span: SnapshotSpan { start: 0, end: 1 },
                 parent: None,
@@ -986,9 +1015,31 @@ mod tests {
             FileFacts::decode_snapshot("x".to_owned(), &serialize_wire(&unknown_kind)).unwrap_err();
         assert!(error.to_string().contains("unknown structural kind code"));
 
+        let boolean_value_on_call = StructuralFactsSnapshot {
+            nodes: vec![SnapshotNode {
+                kind: kind_code(NormalizedKind::Call),
+                boolean_value: Some(true),
+                construct: None,
+                span: SnapshotSpan { start: 0, end: 1 },
+                parent: None,
+                name: None,
+                subtree_end: 1,
+                call_site: None,
+            }],
+            role_offsets: vec![0, 0],
+            roles: vec![],
+            occurrence_role_offsets: vec![0, 0],
+            occurrence_roles: vec![],
+        };
+        let error =
+            FileFacts::decode_snapshot("x".to_owned(), &serialize_wire(&boolean_value_on_call))
+                .unwrap_err();
+        assert!(error.to_string().contains("non-boolean kind call"));
+
         let corrupt_rows = StructuralFactsSnapshot {
             nodes: vec![SnapshotNode {
                 kind: kind_code(NormalizedKind::Call),
+                boolean_value: None,
                 construct: None,
                 span: SnapshotSpan { start: 0, end: 1 },
                 parent: None,
@@ -1031,6 +1082,7 @@ mod tests {
         let legacy = VersionOneSnapshot {
             nodes: vec![SnapshotNode {
                 kind: kind_code(NormalizedKind::Identifier),
+                boolean_value: None,
                 construct: None,
                 span: SnapshotSpan { start: 0, end: 1 },
                 parent: None,
@@ -1071,6 +1123,7 @@ mod tests {
         let pre_block = StructuralFactsSnapshot {
             nodes: vec![SnapshotNode {
                 kind: kind_code(NormalizedKind::Function),
+                boolean_value: None,
                 construct: None,
                 span: SnapshotSpan { start: 0, end: 13 },
                 parent: None,

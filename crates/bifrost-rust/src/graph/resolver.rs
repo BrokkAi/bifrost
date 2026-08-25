@@ -990,6 +990,11 @@ pub fn is_graph_visible_member_target(rust: &dyn RustFactSource, target: &CodeUn
         || is_trait_impl_member_target(rust, target, &owner)
 }
 
+pub fn is_graph_visible_member_owner(rust: &dyn RustFactSource, target: &CodeUnit) -> bool {
+    rust.parent_of(target)
+        .is_some_and(|owner| is_public_like_declaration(rust, &owner))
+}
+
 pub fn trait_member_for_impl_member(
     rust: &dyn RustFactSource,
     token: QueryToken<'_>,

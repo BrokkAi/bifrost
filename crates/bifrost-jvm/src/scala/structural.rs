@@ -349,6 +349,10 @@ impl StructuralSpec for ScalaStructuralSpec {
         Language::Scala
     }
 
+    fn supports_boolean_literal_value(&self) -> bool {
+        true
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         SCALA_KIND_TABLE
     }

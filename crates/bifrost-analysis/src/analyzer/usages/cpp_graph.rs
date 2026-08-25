@@ -27,7 +27,7 @@ use crate::analyzer::usages::cpp_graph::shared::{CppEdgeResolver, CppQueryResolv
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, CppAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 pub(in crate::analyzer::usages) use brokk_bifrost_cpp::call_match::cpp_split_top_level_commas;
@@ -386,20 +386,6 @@ impl GraphUsageAnalyzer for CppUsageGraphStrategy {
         };
 
         resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
-    }
-}
-
-impl UsageAnalyzer for CppUsageGraphStrategy {
-    fn find_usages(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
-        max_usages: usize,
-    ) -> FuzzyResult {
-        let scan_scope = UsageScanScope::new(candidate_files, false);
-        self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
-            .into_fuzzy_result()
     }
 }
 

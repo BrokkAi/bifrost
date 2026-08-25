@@ -37,7 +37,6 @@ use crate::analyzer::languages::{
     LanguageSupport, StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::common::analyzed_files_for_language;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_php_bounded,
@@ -754,12 +753,8 @@ impl LanguageSupport for PhpSupport {
         UsageEcosystem::Php
     }
 
-    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
-        &PHP_USAGE_STRATEGY
-    }
-
-    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
-        Some(&PhpEdgePass)
+    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
+        crate::analyzer::languages::ReferenceLanguagePlugin::new(&PHP_USAGE_STRATEGY, &PhpEdgePass)
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -815,7 +810,8 @@ impl LanguageEdgePass for PhpEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        build_rooted_php_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        build_rooted_php_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeSites::Fqn)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

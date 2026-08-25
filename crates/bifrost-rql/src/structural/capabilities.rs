@@ -18,6 +18,8 @@ use brokk_bifrost_rql::{CodeQuerySeed, OccurrenceFilter};
 pub(crate) enum QueryFeature {
     Kind(NormalizedKind),
     Role(Role),
+    /// Exact language-neutral value of a normalized boolean literal.
+    BooleanLiteralValue,
     /// Produced by [`QueryFeatures::for_occurrence_filter`]: the occurrence
     /// roles a query's `:class`/`:role` filter depends on being classified.
     OccurrenceRole(OccurrenceRole),
@@ -81,7 +83,12 @@ impl QueryFeatures {
             .referenced_kinds()
             .into_iter()
             .map(QueryFeature::Kind)
-            .chain(query.used_roles().into_iter().map(QueryFeature::Role));
+            .chain(query.used_roles().into_iter().map(QueryFeature::Role))
+            .chain(
+                query
+                    .constrains_boolean_value()
+                    .then_some(QueryFeature::BooleanLiteralValue),
+            );
         Self::new(features)
     }
 
@@ -118,6 +125,7 @@ impl QueryFeatures {
             match feature {
                 QueryFeature::Kind(kind) => unsupported.kinds.push(kind),
                 QueryFeature::Role(role) => unsupported.roles.push(role),
+                QueryFeature::BooleanLiteralValue => unsupported.boolean_literal_value = true,
                 QueryFeature::OccurrenceRole(role) => unsupported.occurrence_roles.push(role),
                 QueryFeature::EnvironmentAxis(axis) => unsupported.environment_axes.push(axis),
                 QueryFeature::MaterializationAxis(axis) => {
@@ -136,6 +144,7 @@ impl QueryFeatures {
 pub(crate) struct UnsupportedQueryFeatures {
     kinds: Vec<NormalizedKind>,
     roles: Vec<Role>,
+    boolean_literal_value: bool,
     occurrence_roles: Vec<OccurrenceRole>,
     environment_axes: Vec<EnvironmentAxis>,
     materialization_axes: Vec<MaterializationAxis>,
@@ -157,6 +166,12 @@ impl UnsupportedQueryFeatures {
             diagnostics.push(QueryCapabilityDiagnostic {
                 language,
                 unsupported: UnsupportedFeatureGroup::Roles(self.roles),
+            });
+        }
+        if self.boolean_literal_value {
+            diagnostics.push(QueryCapabilityDiagnostic {
+                language,
+                unsupported: UnsupportedFeatureGroup::BooleanLiteralValue,
             });
         }
         if !self.occurrence_roles.is_empty() {
@@ -224,6 +239,10 @@ impl QueryCapabilityDiagnostic {
                 self.language.config_label(),
                 labels(roles.iter().copied().map(Role::label))
             ),
+            UnsupportedFeatureGroup::BooleanLiteralValue => format!(
+                "structural adapter for {} does not support exact boolean-literal values",
+                self.language.config_label()
+            ),
             UnsupportedFeatureGroup::OccurrenceRoles(roles) => format!(
                 "structural adapter for {} does not support occurrence role(s): {}",
                 self.language.config_label(),
@@ -262,6 +281,7 @@ impl QueryCapabilityDiagnostic {
 enum UnsupportedFeatureGroup {
     Kinds(Vec<NormalizedKind>),
     Roles(Vec<Role>),
+    BooleanLiteralValue,
     OccurrenceRoles(Vec<OccurrenceRole>),
     EnvironmentAxes(Vec<EnvironmentAxis>),
     MaterializationAxes(Vec<MaterializationAxis>),
@@ -310,6 +330,27 @@ mod tests {
         assert_eq!(
             diagnostics[1].message(),
             "structural adapter for python does not support role(s): kwargs"
+        );
+    }
+
+    #[test]
+    fn unsupported_boolean_literal_values_have_an_explicit_diagnostic() {
+        let query = CodeQuery::from_json(&json!({
+            "match": {
+                "kind": "boolean_literal",
+                "boolean_value": true
+            }
+        }))
+        .expect("query should parse");
+
+        let diagnostics = QueryFeatures::for_query(query.seed().unwrap())
+            .unsupported_by(|feature| !matches!(feature, QueryFeature::BooleanLiteralValue))
+            .into_diagnostics(Language::Php);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].message(),
+            "structural adapter for php does not support exact boolean-literal values"
         );
     }
 

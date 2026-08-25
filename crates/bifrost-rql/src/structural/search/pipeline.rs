@@ -930,7 +930,10 @@ pub(super) fn apply_pipeline_step(
             ReceiverQueryService::from_workspace,
         )
     });
-    if query_step_requires_semantic(step) && semantic.is_none() {
+    if query_step_requires_semantic(step)
+        && semantic.is_none()
+        && !matches!(step, QueryStep::CallBindings)
+    {
         if !diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == CodeQueryDiagnosticCode::SemanticWorkspaceRequired)
@@ -962,12 +965,9 @@ pub(super) fn apply_pipeline_step(
             instrumentation.rows_visited = instrumentation.rows_visited.saturating_add(1);
         }
         if query_step_requires_semantic(step)
-            && !semantic_row_seed_generations_current(
-                semantic
-                    .as_mut()
-                    .expect("semantic context exists for semantic steps"),
-                &row,
-            )
+            && semantic
+                .as_mut()
+                .is_some_and(|semantic| !semantic_row_seed_generations_current(semantic, &row))
         {
             continue;
         }
@@ -1893,15 +1893,32 @@ pub(super) fn apply_pipeline_step(
                 )
             }
             (PipelineValue::CallShape(value), QueryStep::CallBindings) => {
+                if semantic.is_none()
+                    && !diagnostics.iter().any(|diagnostic| {
+                        diagnostic.code == CodeQueryDiagnosticCode::SemanticWorkspaceRequired
+                    })
+                {
+                    diagnostics.push(CodeQueryDiagnostic {
+                        code: CodeQueryDiagnosticCode::SemanticWorkspaceRequired,
+                        impact: CodeQueryDiagnosticImpact::Incomplete,
+                        branch: Vec::new(),
+                        language: "workspace",
+                        message:
+                            "call_bindings requires WorkspaceAnalyzer-backed dispatch services"
+                                .to_string(),
+                    });
+                }
                 let indexed = indexed_declarations
                     .as_deref_mut()
                     .expect("semantic declaration index exists");
                 call_binding::call_binding_expansions(
                     analyzer,
+                    semantic.as_mut(),
                     indexed,
                     &mut call_cache.bindings,
                     value,
                     cancellation,
+                    diagnostics,
                 )
             }
             (PipelineValue::File(file), QueryStep::OccurrencesIn(filter)) => {

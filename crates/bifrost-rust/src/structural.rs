@@ -390,6 +390,10 @@ impl StructuralSpec for RustStructuralSpec {
         Language::Rust
     }
 
+    fn supports_boolean_literal_value(&self) -> bool {
+        true
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         RUST_KIND_TABLE
     }

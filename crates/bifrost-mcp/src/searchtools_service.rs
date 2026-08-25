@@ -36,7 +36,7 @@ use crate::{
         POLICY_EXIT_UNRELIABLE, PolicyBaselineOptions, PolicyBaselineSource, PolicyEvaluationDate,
         PolicyEvaluationInput, PolicyEvaluationOptions, PolicyExplanation, PolicyFailOn,
         PolicyFindingId, PolicyId, PolicyNearMissRanking, PolicyReportDocument, PolicyScopeOptions,
-        PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource,
+        PolicyScopeSource, PolicyStageTiming, PolicySuppressionOptions, PolicySuppressionSource,
         built_in_policy_catalog, explain_policy_inputs, rank_policy_near_misses,
         workspace_snapshot_deadline_outcome_with_preflight,
     },
@@ -735,6 +735,11 @@ struct RunPolicyParams {
     #[serde(default)]
     fail_on: RunPolicyFailOn,
     diff_base: Option<String>,
+    /// Opt-in wall-clock stage attribution (#2611). When set, the result
+    /// carries a `stage_timings` sibling next to the canonical report; the
+    /// report itself stays byte-identical either way.
+    #[serde(default)]
+    include_stage_timings: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -764,6 +769,11 @@ impl From<RunPolicyFailOn> for PolicyFailOn {
 pub(crate) struct RunPolicyToolResult {
     status: &'static str,
     exit_status: u8,
+    /// Present only when the caller passed `include_stage_timings`, so a
+    /// result carrying timings is structurally distinguishable from one that
+    /// does not. The canonical `report` never changes shape either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage_timings: Option<Vec<PolicyStageTiming>>,
     report: PolicyReportDocument,
 }
 
@@ -782,6 +792,7 @@ struct DecodedRunPolicy {
     policy_inputs: Vec<PolicyEvaluationInput>,
     selected_policy_ids: Vec<PolicyId>,
     options: PolicyEvaluationOptions,
+    include_stage_timings: bool,
 }
 
 /// `explain_policy` arguments.
@@ -1714,6 +1725,7 @@ pub(crate) struct PreparedRunPolicy {
     suppression_preflight: Option<crate::policy::PolicySuppressionPreflight>,
     suppression_preflight_elapsed: Duration,
     snapshot_elapsed: Duration,
+    include_stage_timings: bool,
 }
 
 struct RunPolicySnapshotPreparation {
@@ -1724,6 +1736,7 @@ struct RunPolicySnapshotPreparation {
     selection_elapsed: Duration,
     suppression_preflight_elapsed: Duration,
     snapshot_started: Instant,
+    include_stage_timings: bool,
 }
 
 pub(crate) enum RunPolicyPreparation {
@@ -2134,6 +2147,7 @@ fn decode_run_policy_arguments(
         policy_inputs,
         selected_policy_ids,
         options,
+        include_stage_timings: params.include_stage_timings,
     })
 }
 
@@ -4833,6 +4847,9 @@ impl SearchToolsService {
             RunPolicyToolResult {
                 status: "unreliable",
                 exit_status: outcome.exit_status(),
+                stage_timings: decoded
+                    .include_stage_timings
+                    .then(|| outcome.stage_attribution().to_vec()),
                 report: outcome.into_report(),
             },
         )?))
@@ -4860,6 +4877,7 @@ impl SearchToolsService {
             policy_inputs,
             selected_policy_ids,
             options,
+            include_stage_timings,
         } = decoded;
         let (suppression_preflight, selection_elapsed, suppression_preflight_elapsed) =
             match supplied_preflight {
@@ -4895,6 +4913,7 @@ impl SearchToolsService {
                 selection_elapsed,
                 suppression_preflight_elapsed,
                 snapshot_started: Instant::now(),
+                include_stage_timings,
             };
             return self.prepare_run_policy_after_preflight(preparation, cancellation);
         }
@@ -4913,6 +4932,7 @@ impl SearchToolsService {
             RunPolicyToolResult {
                 status: "unreliable",
                 exit_status: outcome.exit_status(),
+                stage_timings: include_stage_timings.then(|| outcome.stage_attribution().to_vec()),
                 report: outcome.into_report(),
             },
         )))
@@ -4931,6 +4951,7 @@ impl SearchToolsService {
             selection_elapsed,
             suppression_preflight_elapsed,
             snapshot_started,
+            include_stage_timings,
         } = preparation;
         loop {
             let workspace_generation = self.workspace_generation();
@@ -4960,6 +4981,8 @@ impl SearchToolsService {
                     let result = RunPolicyToolResult {
                         status: "unreliable",
                         exit_status: outcome.exit_status(),
+                        stage_timings: include_stage_timings
+                            .then(|| outcome.stage_attribution().to_vec()),
                         report: outcome.into_report(),
                     };
                     return Ok(RunPolicyPreparation::Deadline(Box::new(result)));
@@ -4979,6 +5002,7 @@ impl SearchToolsService {
                 suppression_preflight: Some(suppression_preflight),
                 suppression_preflight_elapsed,
                 snapshot_elapsed: snapshot_started.elapsed(),
+                include_stage_timings,
             })));
         }
     }
@@ -5068,6 +5092,7 @@ impl SearchToolsService {
             suppression_preflight,
             suppression_preflight_elapsed,
             snapshot_elapsed,
+            include_stage_timings,
         } = prepared;
         let result = (|| {
             let _scope = profiling::scope("run_policy.evaluate_policy_inputs");
@@ -5106,6 +5131,7 @@ impl SearchToolsService {
             Self::structured_only(RunPolicyToolResult {
                 status,
                 exit_status,
+                stage_timings: include_stage_timings.then(|| outcome.stage_attribution().to_vec()),
                 report: outcome.into_report(),
             })
         })();

@@ -310,8 +310,15 @@ AND meta.import_statement_count = (
   WHERE statements.blob_oid = meta.blob_oid AND statements.lang = meta.lang
 )
 AND meta.type_identifier_count = (
-  SELECT COUNT(*) FROM type_identifiers AS identifiers
+  SELECT COUNT(*) FROM reference_identifiers AS identifiers
   WHERE identifiers.blob_oid = meta.blob_oid AND identifiers.lang = meta.lang
+)
+AND EXISTS (
+  SELECT 1 FROM blob_reference_fact_manifests AS reference_manifest
+  WHERE reference_manifest.blob_oid = meta.blob_oid
+    AND reference_manifest.lang = meta.lang
+    AND reference_manifest.epoch = 1
+    AND reference_manifest.identifier_count = meta.type_identifier_count
 )
 AND NOT EXISTS (
   SELECT 1 FROM code_units AS units
@@ -2955,6 +2962,44 @@ impl AnalyzerStore {
         Ok(matches)
     }
 
+    /// Return live workspace paths that contain one of the requested parsed
+    /// identifiers, without requiring the caller to enumerate the workspace
+    /// or construct a temporary active-blob relation first.
+    pub(crate) fn reverse_identifier_candidate_paths(
+        &self,
+        lang: &str,
+        generation: GenerationId,
+        identifiers: &HashSet<String>,
+        cancellation: &CancellationToken,
+    ) -> Result<HashSet<PathBuf>> {
+        if identifiers.is_empty() {
+            return Ok(HashSet::default());
+        }
+
+        let mut conn = self.active_read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        sync_reverse_reference_lookup_keys(
+            &tx,
+            &HashSet::default(),
+            &HashSet::default(),
+            identifiers,
+        )?;
+        let mut statement = tx.prepare_cached(REVERSE_IDENTIFIER_CANDIDATE_PATHS_SQL)?;
+        let mut rows = statement.query(params![lang, generation.0])?;
+        let mut paths = HashSet::default();
+        while let Some(row) = rows.next()? {
+            if cancellation.is_cancelled() {
+                return Ok(HashSet::default());
+            }
+            paths.insert(PathBuf::from(row.get::<_, String>(0)?));
+        }
+        drop(rows);
+        drop(statement);
+        tx.commit()?;
+        Ok(paths)
+    }
+
     pub(crate) fn hydrate_type_identifiers_by_key(
         &self,
         entries: &[(ProjectFile, Oid, String)],
@@ -4501,7 +4546,8 @@ impl AnalyzerStore {
             "import_lexical_scopes",
             "import_lexical_prefixes",
             "blob_meta",
-            "type_identifiers",
+            "reference_identifiers",
+            "blob_reference_fact_manifests",
             "ruby_method_dispatch_modes",
             "scala_traits",
         ] {
@@ -8110,7 +8156,7 @@ fn write_prepared_blob_rows_tx(
         }
     );
     insert_rows!(
-        "INSERT OR IGNORE INTO type_identifiers(blob_oid, lang, type_identifier) VALUES(?1, ?2, ?3)",
+        "INSERT OR IGNORE INTO reference_identifiers(blob_oid, lang, identifier) VALUES(?1, ?2, ?3)",
         &blob.type_identifiers,
         |stmt, row| {
             stmt.execute(params![oid, lang, row])?;
@@ -8138,6 +8184,20 @@ fn write_prepared_blob_rows_tx(
         }
     );
     insert_rust_fact_rows(tx, oid, lang, &blob.rust_facts)?;
+    tx.prepare_cached("INSERT OR IGNORE INTO reference_fact_epochs(lang, epoch) VALUES(?1, 1)")?
+        .execute([lang])?;
+    tx.prepare_cached(
+        "INSERT INTO blob_reference_fact_manifests(blob_oid, lang, epoch, identifier_count)
+         VALUES(?1, ?2, 1, ?3)
+         ON CONFLICT(blob_oid, lang) DO UPDATE SET
+           epoch = excluded.epoch,
+           identifier_count = excluded.identifier_count",
+    )?
+    .execute(params![
+        oid,
+        lang,
+        usize_to_i64(blob.type_identifiers.len())?
+    ])?;
     tx.prepare_cached(
         "INSERT OR IGNORE INTO blob_meta(
            blob_oid, lang, contains_tests, content_package, stored_unit_count,
@@ -9097,7 +9157,7 @@ fn read_summary_projection_meta(
 
 fn read_type_identifiers(conn: &Connection, oid: &str, lang: &str) -> Result<HashSet<String>> {
     let mut stmt = conn.prepare(
-        "SELECT type_identifier FROM type_identifiers
+        "SELECT identifier FROM reference_identifiers
          WHERE blob_oid = ?1 AND lang = ?2",
     )?;
     let rows = stmt.query_map(params![oid, lang], |row| row.get::<_, String>(0))?;
@@ -9254,10 +9314,10 @@ fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT blob_oid, type_identifier
-             FROM type_identifiers
+            "SELECT blob_oid, identifier
+             FROM reference_identifiers
              WHERE lang = ? AND blob_oid IN ({placeholders})
-             ORDER BY blob_oid, type_identifier"
+             ORDER BY blob_oid, identifier"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -10754,10 +10814,33 @@ const REVERSE_IMPORT_CANDIDATE_BLOBS_SQL: &str = "SELECT segments.blob_oid
 
 const REVERSE_TYPE_CANDIDATE_BLOBS_SQL: &str = "SELECT identifiers.blob_oid
      FROM temp.reverse_import_lookup_keys AS requested
-     CROSS JOIN type_identifiers AS identifiers
-       INDEXED BY idx_type_identifiers_by_identifier
-       ON identifiers.lang = ?1 AND identifiers.type_identifier = requested.value
+     CROSS JOIN reference_identifiers AS identifiers
+       INDEXED BY idx_reference_identifiers_by_identifier
+       ON identifiers.lang = ?1 AND identifiers.identifier = requested.value
+     JOIN blob_reference_fact_manifests AS reference_manifest
+       ON reference_manifest.blob_oid = identifiers.blob_oid
+      AND reference_manifest.lang = identifiers.lang
+     JOIN reference_fact_epochs AS reference_epoch
+       ON reference_epoch.lang = reference_manifest.lang
+      AND reference_epoch.epoch = reference_manifest.epoch
      JOIN temp.active_blob_oids AS active ON active.blob_oid = identifiers.blob_oid
+     WHERE requested.kind = 2";
+
+const REVERSE_IDENTIFIER_CANDIDATE_PATHS_SQL: &str = "SELECT files.rel_path
+     FROM temp.reverse_import_lookup_keys AS requested
+     CROSS JOIN reference_identifiers AS identifiers
+       INDEXED BY idx_reference_identifiers_by_identifier
+       ON identifiers.lang = ?1 AND identifiers.identifier = requested.value
+     JOIN blob_reference_fact_manifests AS reference_manifest
+       ON reference_manifest.blob_oid = identifiers.blob_oid
+      AND reference_manifest.lang = identifiers.lang
+     JOIN reference_fact_epochs AS reference_epoch
+       ON reference_epoch.lang = reference_manifest.lang
+      AND reference_epoch.epoch = reference_manifest.epoch
+     JOIN workspace_files AS files INDEXED BY idx_workspace_files_blob
+       ON files.lang = identifiers.lang
+      AND files.generation = ?2
+      AND files.blob_oid = identifiers.blob_oid
      WHERE requested.kind = 2";
 
 fn sync_reverse_reference_lookup_keys(
@@ -12103,7 +12186,7 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(payload)) FROM materialization_records
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
-           + COALESCE((SELECT SUM(length(CAST(type_identifier AS BLOB))) FROM type_identifiers
+           + COALESCE((SELECT SUM(length(CAST(identifier AS BLOB))) FROM reference_identifiers
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(payload)) FROM structural_facts_snapshots
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0) END
@@ -15232,7 +15315,8 @@ mod tests {
             "unit_supertypes",
             "unit_children",
             "import_statements",
-            "type_identifiers",
+            "reference_identifiers",
+            "blob_reference_fact_manifests",
             "blob_optional_fact_manifest",
         ];
         tables.extend(
@@ -16150,7 +16234,7 @@ mod tests {
             &python_file,
             "import_statements",
         );
-        for table in ["unit_supertypes", "type_identifiers"] {
+        for table in ["unit_supertypes", "reference_identifiers"] {
             assert_deleting_side_table_marks_incomplete(&JavaAdapter, "java", &java_file, table);
         }
         for table in ["scala_traits", "scala_exports"] {
@@ -17002,6 +17086,56 @@ mod tests {
         let oid = oid_for(state.source.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::javascript_epoch_before_callable_modifier_metadata();
+        let prior_generation = store
+            .ensure_language_epoch_value("javascript", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "javascript",
+                prior_generation,
+                &crate::analyzer::javascript::JavascriptAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "javascript").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(
+                Language::JavaScript,
+                &tree_sitter_javascript::LANGUAGE.into(),
+            )
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "javascript").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "javascript".to_string())])
+                .unwrap(),
+            vec![(oid, "javascript".to_string())]
+        );
+    }
+
+    /// #2593: `Receiver.#field = value` no longer mints a Field declaration.
+    /// A blob written under the prior epoch still carries the parentless
+    /// duplicate of the class field, and nothing in the row says it is stale,
+    /// so the salt is the only thing that retires it.
+    #[test]
+    fn js_private_name_assignment_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "pointers.js",
+            "class CurrentPointers {\n    static #pointerType = null;\n    static set(pointerType) { CurrentPointers.#pointerType = pointerType; }\n}\n",
+        );
+        let state = Arc::new(parse_state(
+            &crate::analyzer::javascript::JavascriptAdapter,
+            &file,
+        ));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::javascript_epoch_before_private_name_assignment_declarations();
         let prior_generation = store
             .ensure_language_epoch_value("javascript", &prior_epoch)
             .unwrap();
@@ -18211,7 +18345,7 @@ mod tests {
             "import_statements",
             "import_path_segments",
             "import_lexical_prefixes",
-            "type_identifiers",
+            "reference_identifiers",
         ] {
             assert!(
                 fallback_plan
@@ -20694,7 +20828,7 @@ mod tests {
         assert!(
             identifiers.iter().any(|detail| {
                 detail.contains(
-                    "SEARCH identifiers USING COVERING INDEX idx_type_identifiers_by_identifier",
+                    "SEARCH identifiers USING COVERING INDEX idx_reference_identifiers_by_identifier",
                 )
             }),
             "reverse type lookup must seek the requested identifier: {identifiers:#?}"
@@ -20703,7 +20837,37 @@ mod tests {
             identifiers
                 .iter()
                 .all(|detail| !detail.contains("SCAN identifiers")),
-            "reverse type lookup must not scan type_identifiers: {identifiers:#?}"
+            "reverse type lookup must not scan reference_identifiers: {identifiers:#?}"
+        );
+
+        let mut statement = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {REVERSE_IDENTIFIER_CANDIDATE_PATHS_SQL}"
+            ))
+            .unwrap();
+        let paths = statement
+            .query_map(params!["java", 1_i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            paths.iter().any(|detail| detail.contains(
+                "SEARCH identifiers USING COVERING INDEX idx_reference_identifiers_by_identifier"
+            )),
+            "reverse path lookup must seek the requested identifier: {paths:#?}"
+        );
+        assert!(
+            paths.iter().any(|detail| {
+                detail.contains("SEARCH files USING INDEX idx_workspace_files_blob")
+                    || detail.contains("SEARCH files USING COVERING INDEX idx_workspace_files_blob")
+            }),
+            "reverse path lookup must seek live workspace blobs: {paths:#?}"
+        );
+        assert!(
+            paths.iter().all(|detail| {
+                !detail.contains("SCAN identifiers") && !detail.contains("SCAN files")
+            }),
+            "reverse path lookup must not scan persisted facts: {paths:#?}"
         );
     }
 

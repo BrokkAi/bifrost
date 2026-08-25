@@ -2049,7 +2049,16 @@ pub(super) fn render_call_binding(
             .target
             .as_ref()
             .map(|target| render_declaration(analyzer, target, detail, cache)),
+        semantic_target_id: value.site.dispatch.target_id.clone(),
+        dispatch_outcome: value.site.dispatch.outcome,
+        dispatch_coverage: value.site.dispatch.coverage,
+        dispatch_proof: value.site.dispatch.proof,
+        dispatch_completeness: value.site.dispatch.completeness,
+        dispatch_target_count: value.site.dispatch.target_count,
+        dispatch_targets_truncated: value.site.dispatch.targets_truncated,
         signature_id: value.site.signature_id.clone(),
+        model_id: value.site.model_id.clone(),
+        pack_id: value.site.pack_id.clone(),
         actual_index: row.actual_index,
         actual_name: row.actual_name.clone(),
         formal_index: row.formal_index,
@@ -2433,6 +2442,7 @@ pub(super) fn provider_supports_feature(
     match feature {
         QueryFeature::Kind(kind) => provider.structural_supports_kind(kind),
         QueryFeature::Role(role) => provider.structural_supports_role(role),
+        QueryFeature::BooleanLiteralValue => provider.structural_supports_boolean_literal_value(),
         QueryFeature::OccurrenceRole(role) => provider.structural_supports_occurrence_role(role),
         QueryFeature::EnvironmentAxis(axis) => provider.structural_supports_environment_axis(axis),
         QueryFeature::MaterializationAxis(axis) => {

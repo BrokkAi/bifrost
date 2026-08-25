@@ -146,8 +146,21 @@ pub(crate) fn extract_file_facts_limited(
                         &call_site_context,
                     );
                     let fact_id = nodes.len() as u32;
+                    let boolean_value = if kind == NormalizedKind::BooleanLiteral {
+                        let value = spec.boolean_literal_value(node);
+                        assert!(
+                            !spec.supports_boolean_literal_value() || value.is_some(),
+                            "{} structural adapter declares boolean-literal value support but grammar node {} has no exact value",
+                            spec.language().config_label(),
+                            node.grammar_name()
+                        );
+                        value
+                    } else {
+                        None
+                    };
                     nodes.push(NormalizedNode {
                         kind,
+                        boolean_value,
                         construct: spec.generator_construct(node, kind).map(str::to_owned),
                         range: node_range(node),
                         parent: enclosing,
@@ -197,6 +210,7 @@ pub(crate) fn extract_file_facts_limited(
                         let embedded_id = nodes.len() as u32;
                         nodes.push(NormalizedNode {
                             kind: fact.kind,
+                            boolean_value: None,
                             construct: None,
                             range: fact.range,
                             parent: Some(fact_id),

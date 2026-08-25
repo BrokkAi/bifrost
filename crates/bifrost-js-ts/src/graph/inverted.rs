@@ -438,6 +438,15 @@ fn scoped_same_file_declarations(
         .collect();
     let mut grouped: HashMap<String, BTreeSet<UsageNodeKey>> = HashMap::default();
     for declaration in &declarations {
+        // A parentless `window.name`/`globalThis.name` declaration is not an
+        // ordinary same-file bare binding. It becomes reachable through
+        // `browser_globals` below only when the receiver and read are both
+        // lexically unbound. Keeping it in `same_file` would let that fallback
+        // bypass the binding check for imports, TDZ declarations, and hoisted
+        // `var` declarations.
+        if browser_global_property_shape(declaration).is_some() {
+            continue;
+        }
         let key = UsageNodeKey::new(declaration.source().clone(), declaration.fq_name());
         grouped
             .entry(declaration.identifier().to_string())
@@ -587,10 +596,11 @@ fn scoped_node_status(
     nodes: &HashSet<UsageNodeKey>,
     declarations: &HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
 ) -> BTreeMap<UsageNodeKey, JsTsScopedNodeStatus> {
+    let seed_index = ScopedDeclarationSeedIndex::new(declarations);
     nodes
         .iter()
         .map(|node| {
-            let seed_names = export_seed_names_for_node(declarations, node);
+            let seed_names = seed_index.names_for_node(node);
             let mut keys = BTreeSet::new();
             let mut ambiguous = false;
             for seed_name in &seed_names {
@@ -619,39 +629,81 @@ fn scoped_node_status(
         .collect()
 }
 
-fn export_seed_names_for_node(
-    declarations: &HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>,
-    node: &UsageNodeKey,
-) -> BTreeSet<String> {
-    let mut best_len = usize::MAX;
-    let mut out = BTreeSet::new();
-    for ((file, identifier), keys) in declarations {
-        if file != &node.file {
-            continue;
-        }
-        if keys
-            .iter()
-            .any(|key| node.fqn == key.fqn || node.fqn.starts_with(&format!("{}.", key.fqn)))
-        {
-            let len = keys
-                .iter()
-                .map(|key| key.fqn.len())
-                .min()
-                .unwrap_or(usize::MAX);
-            if len < best_len {
-                best_len = len;
-                out.clear();
-            }
-            if len == best_len {
-                out.insert(identifier.clone());
+#[derive(Default)]
+struct ScopedDeclarationSeedIndex {
+    by_file: HashMap<ProjectFile, DeclarationSeedTrie>,
+}
+
+impl ScopedDeclarationSeedIndex {
+    fn new(declarations: &HashMap<(ProjectFile, String), BTreeSet<UsageNodeKey>>) -> Self {
+        let mut index = Self::default();
+        for ((file, identifier), keys) in declarations {
+            let trie = index.by_file.entry(file.clone()).or_default();
+            for key in keys {
+                trie.insert(&key.fqn, identifier);
             }
         }
+        index
     }
 
-    if out.is_empty() {
-        out.insert(top_level_name(&node.fqn));
+    fn names_for_node(&self, node: &UsageNodeKey) -> BTreeSet<String> {
+        self.by_file
+            .get(&node.file)
+            .and_then(|trie| trie.shortest_prefix(&node.fqn))
+            .cloned()
+            .unwrap_or_else(|| BTreeSet::from([top_level_name(&node.fqn)]))
     }
-    out
+}
+
+struct DeclarationSeedTrie {
+    nodes: Vec<DeclarationSeedTrieNode>,
+}
+
+#[derive(Default)]
+struct DeclarationSeedTrieNode {
+    children: HashMap<u8, usize>,
+    identifiers: BTreeSet<String>,
+}
+
+impl Default for DeclarationSeedTrie {
+    fn default() -> Self {
+        Self {
+            nodes: vec![DeclarationSeedTrieNode::default()],
+        }
+    }
+}
+
+impl DeclarationSeedTrie {
+    fn insert(&mut self, fqn: &str, identifier: &str) {
+        let mut node_index = 0;
+        for byte in fqn.bytes() {
+            let next_index = if let Some(index) = self.nodes[node_index].children.get(&byte) {
+                *index
+            } else {
+                let index = self.nodes.len();
+                self.nodes.push(DeclarationSeedTrieNode::default());
+                self.nodes[node_index].children.insert(byte, index);
+                index
+            };
+            node_index = next_index;
+        }
+        self.nodes[node_index]
+            .identifiers
+            .insert(identifier.to_string());
+    }
+
+    fn shortest_prefix(&self, fqn: &str) -> Option<&BTreeSet<String>> {
+        let bytes = fqn.as_bytes();
+        let mut node_index = 0;
+        for (offset, byte) in bytes.iter().copied().enumerate() {
+            node_index = *self.nodes[node_index].children.get(&byte)?;
+            let at_boundary = offset + 1 == bytes.len() || bytes[offset + 1] == b'.';
+            if at_boundary && !self.nodes[node_index].identifiers.is_empty() {
+                return Some(&self.nodes[node_index].identifiers);
+            }
+        }
+        None
+    }
 }
 
 fn ambiguous_alias_for_node(
@@ -1529,5 +1581,24 @@ function use({ [COMPUTED]: [{ deep = DEFAULT } = FALLBACK], bound }, plain = DEF
         for read in ["COMPUTED", "DEFAULT", "FALLBACK"] {
             assert!(!locals.is_shadowed(read), "{read} must remain a read");
         }
+    }
+
+    #[test]
+    fn declaration_seed_trie_selects_the_shortest_exact_fqn_prefix() {
+        let mut trie = DeclarationSeedTrie::default();
+        trie.insert("Service", "Service");
+        trie.insert("Service.run", "run");
+        trie.insert("window.Promise", "Promise");
+        trie.insert("window.fetch", "fetch");
+
+        assert_eq!(
+            trie.shortest_prefix("Service.run.local"),
+            Some(&BTreeSet::from(["Service".to_string()]))
+        );
+        assert_eq!(
+            trie.shortest_prefix("window.Promise.then"),
+            Some(&BTreeSet::from(["Promise".to_string()]))
+        );
+        assert_eq!(trie.shortest_prefix("window.Headers"), None);
     }
 }

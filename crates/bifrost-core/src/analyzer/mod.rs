@@ -45,7 +45,7 @@ pub use definition_lookup::{
     RelationalDefinitionValue, RelationalFrontierOutcome, RelationalName, RelationalPointOutcome,
 };
 pub use model::{
-    CodeUnit, Language, PackageAnchor, ProjectFile, Range, SemanticAbsenceProof,
+    CodeUnit, DeclarationId, Language, PackageAnchor, ProjectFile, Range, SemanticAbsenceProof,
     SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
     SemanticDiagnosticOutcome, SemanticDiagnosticReport, SemanticDiagnosticReportStatus,
 };

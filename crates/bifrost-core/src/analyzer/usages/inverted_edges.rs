@@ -306,6 +306,19 @@ impl std::ops::AddAssign for UsageReferenceCounts {
 pub struct CallSite {
     pub path: String,
     pub line: usize,
+    /// Structured reference-token spans retained for exact endpoint joins.
+    /// The public graph still counts one site per `(path, line, caller)`.
+    pub spans: Vec<(usize, usize)>,
+    /// Exact targets retained by a language resolver before legacy graph-key
+    /// aggregation. Empty means the common consumer must resolve the spans.
+    pub exact_targets: Vec<CodeUnit>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UsageLineEvidence {
+    pub kind: UsageReferenceKind,
+    pub spans: Vec<(usize, usize)>,
+    pub exact_targets: Vec<CodeUnit>,
 }
 
 /// The identity of a usage-graph node, as seen by the edge engine. Implemented for
@@ -633,7 +646,7 @@ pub struct PerFileEdges<K = String> {
     /// `(caller, callee) -> distinct 1-based lines and their strongest observed
     /// kind`. A line remains one legacy site even if the scanner resolves the same
     /// declaration more than once on that line.
-    pub edge_lines: BTreeMap<(K, K), HashMap<usize, UsageReferenceKind>>,
+    pub edge_lines: BTreeMap<(K, K), HashMap<usize, UsageLineEvidence>>,
     /// `callee -> distinct call-site offsets` (for the cap).
     pub callsites: BTreeMap<K, HashSet<usize>>,
     /// `callee -> distinct unresolved structural member offsets`.
@@ -706,11 +719,49 @@ impl<K: NodeKey> PerFileEdges<K> {
         }
         // 1-based, matching `scan_usages` hit lines and node `start_line`.
         let line = find_line_index_for_offset(input.line_starts, start) + 1;
-        let line_kinds = self.edge_lines.entry((caller, callee)).or_default();
-        line_kinds
-            .entry(line)
-            .and_modify(|existing| *existing = (*existing).max(kind))
-            .or_insert(kind);
+        let line_evidence = self.edge_lines.entry((caller, callee)).or_default();
+        let evidence = line_evidence.entry(line).or_default();
+        evidence.kind = evidence.kind.max(kind);
+        if !evidence.spans.contains(&(start, end)) {
+            evidence.spans.push((start, end));
+        }
+    }
+
+    pub fn record_exact_kind(
+        &mut self,
+        input: &FileEdgeScanInput<'_, K>,
+        callee: CodeUnit,
+        kind: UsageReferenceKind,
+        start: usize,
+        end: usize,
+    ) {
+        let Some(caller) = input.enclosing(start, end).cloned() else {
+            return;
+        };
+        self.record_with_caller_exact_kind(input, caller, callee, kind, start, end);
+    }
+
+    pub fn record_with_caller_exact_kind(
+        &mut self,
+        input: &FileEdgeScanInput<'_, K>,
+        caller: K,
+        callee: CodeUnit,
+        kind: UsageReferenceKind,
+        start: usize,
+        end: usize,
+    ) {
+        let target = callee.clone();
+        let callee = K::from_unit(&callee);
+        self.record_with_caller_kind(input, caller.clone(), callee.clone(), kind, start, end);
+        let line = find_line_index_for_offset(input.line_starts, start) + 1;
+        if let Some(evidence) = self
+            .edge_lines
+            .get_mut(&(caller, callee))
+            .and_then(|lines| lines.get_mut(&line))
+            && !evidence.exact_targets.contains(&target)
+        {
+            evidence.exact_targets.push(target);
+        }
     }
 
     /// Record that a structured call/member site with terminal member `name`

@@ -20,7 +20,6 @@ use crate::analyzer::languages::{
     StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_go_bounded,
 };
@@ -850,12 +849,8 @@ impl LanguageSupport for GoSupport {
         UsageEcosystem::Go
     }
 
-    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
-        &GO_USAGE_STRATEGY
-    }
-
-    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
-        Some(&GoEdgePass)
+    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
+        crate::analyzer::languages::ReferenceLanguagePlugin::new(&GO_USAGE_STRATEGY, &GoEdgePass)
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -898,7 +893,7 @@ impl LanguageEdgePass for GoEdgePass {
             ctx.fqns,
             ctx.keep_file,
         )
-        .map(LanguageEdgeSites)
+        .map(LanguageEdgeSites::Fqn)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

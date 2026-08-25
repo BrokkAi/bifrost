@@ -43,7 +43,7 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::code_quality::dead_code_smells::{
     contains_java_visibility_modifier, declaration_header,
@@ -322,20 +322,6 @@ impl GraphUsageAnalyzer for CSharpUsageGraphStrategy {
         };
 
         resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
-    }
-}
-
-impl UsageAnalyzer for CSharpUsageGraphStrategy {
-    fn find_usages(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
-        max_usages: usize,
-    ) -> FuzzyResult {
-        let scan_scope = UsageScanScope::new(candidate_files, false);
-        self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
-            .into_fuzzy_result()
     }
 }
 

@@ -7553,21 +7553,25 @@ impl ScalaReferenceSink for ScalaEdgeSink<'_> {
                         sink.types.exact_companion_objects(sink.scala, &owner)
                     };
                     if let [companion] = companions.as_slice() {
-                        sink.edges.record_kind(
+                        sink.edges.record_exact_kind(
                             sink.input,
-                            companion.fq_name(),
+                            companion.clone(),
                             reference_kind,
                             start,
                             end,
                         );
                     }
                 }
-                let target = match target {
-                    ScalaResolvedReference::Exact(unit) => unit.fq_name(),
-                    ScalaResolvedReference::Logical(fqn) => fqn,
-                };
-                sink.edges
-                    .record_kind(sink.input, target, reference_kind, start, end);
+                match target {
+                    ScalaResolvedReference::Exact(unit) => {
+                        sink.edges
+                            .record_exact_kind(sink.input, unit, reference_kind, start, end)
+                    }
+                    ScalaResolvedReference::Logical(fqn) => {
+                        sink.edges
+                            .record_kind(sink.input, fqn, reference_kind, start, end);
+                    }
+                }
             },
         );
     }
@@ -7591,12 +7595,24 @@ impl ScalaReferenceSink for ScalaEdgeSink<'_> {
         {
             return;
         }
-        let target = match target {
-            ScalaResolvedReference::Exact(unit) => unit.fq_name(),
-            ScalaResolvedReference::Logical(fqn) => fqn,
-        };
-        self.edges
-            .record_with_caller_kind(self.input, caller, target, reference_kind, start, end);
+        match target {
+            ScalaResolvedReference::Exact(unit) => self.edges.record_with_caller_exact_kind(
+                self.input,
+                caller,
+                unit,
+                reference_kind,
+                start,
+                end,
+            ),
+            ScalaResolvedReference::Logical(fqn) => self.edges.record_with_caller_kind(
+                self.input,
+                caller,
+                fqn,
+                reference_kind,
+                start,
+                end,
+            ),
+        }
     }
 
     fn record_unproven_name(&mut self, name: &str, start: usize, end: usize) {

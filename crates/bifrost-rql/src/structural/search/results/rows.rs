@@ -906,7 +906,19 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("group_id", Scalar::StableId),
                     CodeQueryRowField::optional("argument_id", Scalar::StableId),
                     CodeQueryRowField::optional("target_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::optional("semantic_target_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("dispatch_outcome", value_domain::DISPATCH_OUTCOME),
+                    CodeQueryRowField::required_enum("dispatch_coverage", value_domain::CANDIDATE_COVERAGE),
+                    CodeQueryRowField::optional_enum("dispatch_proof", value_domain::EVIDENCE_PROOF),
+                    CodeQueryRowField::optional_enum(
+                        "dispatch_completeness",
+                        value_domain::EVIDENCE_COMPLETENESS,
+                    ),
+                    CodeQueryRowField::required("dispatch_target_count", Scalar::Integer),
+                    CodeQueryRowField::required("dispatch_targets_truncated", Scalar::Boolean),
                     CodeQueryRowField::optional("signature_id", Scalar::StableId),
+                    CodeQueryRowField::optional("model_id", Scalar::String),
+                    CodeQueryRowField::optional("pack_id", Scalar::String),
                     CodeQueryRowField::optional("actual_index", Scalar::Integer),
                     CodeQueryRowField::optional("actual_name", Scalar::String),
                     CodeQueryRowField::optional("formal_index", Scalar::Integer),
@@ -2031,8 +2043,35 @@ fn project_code_query_row_field<'a>(
             .as_ref()
             .and_then(|target| target.id.as_deref())
             .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::CallBinding { value }, "semantic_target_id") => {
+            value.semantic_target_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "dispatch_outcome") => {
+            Some(Scalar::ConstrainedEnum(value.dispatch_outcome))
+        }
+        (CodeQueryResultValue::CallBinding { value }, "dispatch_coverage") => {
+            Some(Scalar::ConstrainedEnum(value.dispatch_coverage))
+        }
+        (CodeQueryResultValue::CallBinding { value }, "dispatch_proof") => {
+            value.dispatch_proof.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "dispatch_completeness") => {
+            value.dispatch_completeness.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "dispatch_target_count") => {
+            Some(Scalar::Integer(value.dispatch_target_count as u64))
+        }
+        (CodeQueryResultValue::CallBinding { value }, "dispatch_targets_truncated") => {
+            Some(Scalar::Boolean(value.dispatch_targets_truncated))
+        }
         (CodeQueryResultValue::CallBinding { value }, "signature_id") => {
             value.signature_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "model_id") => {
+            value.model_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "pack_id") => {
+            value.pack_id.as_deref().map(Scalar::String)
         }
         (CodeQueryResultValue::CallBinding { value }, "actual_index") => value
             .actual_index

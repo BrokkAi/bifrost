@@ -121,6 +121,41 @@ pub trait StructuralSpec: Send + Sync + 'static {
         true
     }
 
+    /// Whether this adapter can state the exact language-neutral value of
+    /// every boolean-literal fact it extracts. The default is deliberately
+    /// unsupported so a third-party adapter cannot silently answer an exact
+    /// value query from kind alone.
+    fn supports_boolean_literal_value(&self) -> bool {
+        false
+    }
+
+    /// Exact value of a node normalized as [`NormalizedKind::BooleanLiteral`].
+    /// This default reads tree-sitter's underlying grammar symbol identity,
+    /// which remains structured even when a grammar aliases both tokens to a
+    /// common named `boolean_literal` node. For grammars that retain a named
+    /// wrapper, it reads that wrapper's sole non-extra child. It never reads
+    /// source text.
+    fn boolean_literal_value(&self, node: Node<'_>) -> Option<bool> {
+        fn value_of(symbol: &str) -> Option<bool> {
+            match symbol {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            }
+        }
+
+        if let Some(value) = value_of(node.grammar_name()) {
+            return Some(value);
+        }
+        let mut cursor = node.walk();
+        let mut children = node.children(&mut cursor).filter(|child| !child.is_extra());
+        let child = children.next()?;
+        if children.next().is_some() {
+            return None;
+        }
+        value_of(child.grammar_name())
+    }
+
     /// Which occurrence roles this adapter classifies during [`Self::extract`].
     ///
     /// Deliberately has no default: the table is total, so a default would let

@@ -1193,6 +1193,8 @@ impl Decoder {
                     PolicyRecord::Project,
                     PolicyRecord::Join,
                     PolicyRecord::Group,
+                    PolicyRecord::CallArgument,
+                    PolicyRecord::Call,
                     PolicyRecord::RowAssert,
                     PolicyRecord::RowAssertSelectedInWinningTier,
                 ],
@@ -1207,6 +1209,12 @@ impl Decoder {
                 }
                 PolicyRecord::Join => joins.push(decode_row_join(entry)?),
                 PolicyRecord::Group => groups.push(decode_row_group(entry)?),
+                PolicyRecord::CallArgument => {
+                    derivations.push(RowDerivation::Filter(decode_call_argument(entry)?));
+                }
+                PolicyRecord::Call => {
+                    derivations.push(RowDerivation::Filter(decode_call(entry)?));
+                }
                 PolicyRecord::RowAssert => assertions.push(decode_row_assertion(entry)?),
                 PolicyRecord::RowAssertSelectedInWinningTier => {
                     lower_selected_in_winning_tier(
@@ -4885,6 +4893,180 @@ fn decode_row_filter(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
     Ok(RowFilter { over, predicates })
 }
 
+/// Lower `(call-argument ...)` into the ordinary in-place row filter it
+/// abbreviates. The exact formal selector is only useful for a source actual,
+/// so the generated predicates also require the binding row's exact mapping,
+/// exhaustive call coverage, non-terminal status, and argument identity.
+fn decode_call_argument(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::CallArgument,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let over: RowBindingName =
+        parse_identifier(fields.required("over"), "call argument row binding name")?;
+    let formal_predicate = match (fields.get("formal-name"), fields.get("formal-index")) {
+        (Some(name), None) => RowPredicate {
+            field: RowFieldRef {
+                binding: over.clone(),
+                field: "formal_name".to_string(),
+            },
+            op: RowPredicateOp::Eq,
+            operand: RowPredicateOperand::Literal(RowLiteral::String(expect_string(
+                name,
+                "formal name",
+                MAX_HUMAN_NAME_BYTES,
+            )?)),
+        },
+        (None, Some(index)) => RowPredicate {
+            field: RowFieldRef {
+                binding: over.clone(),
+                field: "formal_index".to_string(),
+            },
+            op: RowPredicateOp::Eq,
+            operand: RowPredicateOperand::Literal(RowLiteral::Integer(
+                expect_u32(index, "formal index", true)?.into(),
+            )),
+        },
+        (None, None) => {
+            return Err(source_error(
+                "missing-call-argument-selector",
+                expr.range.clone(),
+                "call-argument requires exactly one of :formal-name or :formal-index",
+            ));
+        }
+        (Some(_), Some(index)) => {
+            return Err(source_error(
+                "conflicting-call-argument-selector",
+                index.range.clone(),
+                "call-argument :formal-name and :formal-index are mutually exclusive",
+            ));
+        }
+    };
+    let field = |name: &str| RowFieldRef {
+        binding: over.clone(),
+        field: name.to_string(),
+    };
+    Ok(RowFilter {
+        over: over.clone(),
+        predicates: vec![
+            formal_predicate,
+            RowPredicate {
+                field: field("mapping"),
+                op: RowPredicateOp::Eq,
+                operand: RowPredicateOperand::Literal(RowLiteral::ConstrainedEnum(
+                    "exact".to_string(),
+                )),
+            },
+            RowPredicate {
+                field: field("coverage"),
+                op: RowPredicateOp::Eq,
+                operand: RowPredicateOperand::Literal(RowLiteral::ConstrainedEnum(
+                    "exhaustive".to_string(),
+                )),
+            },
+            RowPredicate {
+                field: field("terminal"),
+                op: RowPredicateOp::Eq,
+                operand: RowPredicateOperand::Literal(RowLiteral::Boolean(false)),
+            },
+            RowPredicate {
+                field: field("argument_id"),
+                op: RowPredicateOp::IsNotNull,
+                operand: RowPredicateOperand::None,
+            },
+        ],
+    })
+}
+
+/// Lower `(call :over NAME :resolves-to MODEL_ID :proof exact)` into one
+/// ordinary in-place filter. `MODEL_ID` is compared with the row's stable
+/// semantic-model symbol identity; it is deliberately not a qualified name,
+/// display name, or source spelling. The proof keyword is authoring syntax,
+/// while the concrete dispatch predicates below are the executable contract.
+fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::Call,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let over: RowBindingName = parse_identifier(fields.required("over"), "call row binding name")?;
+    let model_id_expr = fields.required("resolves-to");
+    let model_id = match &model_id_expr.kind {
+        ExprKind::String(value) => {
+            if value.is_empty() || value.len() > MAX_HUMAN_NAME_BYTES {
+                return Err(source_error(
+                    "invalid-call-model-id",
+                    model_id_expr.range.clone(),
+                    format!(
+                        "call semantic-model symbol identity must contain from 1 through {MAX_HUMAN_NAME_BYTES} bytes"
+                    ),
+                ));
+            }
+            value.clone()
+        }
+        ExprKind::Symbol(value) if !value.is_empty() && value.len() <= MAX_HUMAN_NAME_BYTES => {
+            value.clone()
+        }
+        _ => {
+            return Err(source_error(
+                "invalid-call-model-id",
+                model_id_expr.range.clone(),
+                "call :resolves-to requires a stable semantic-model symbol identity",
+            ));
+        }
+    };
+    let proof_expr = fields.required("proof");
+    if expect_token(proof_expr, "call proof")? != "exact" {
+        return Err(source_error(
+            "unsupported-call-proof",
+            proof_expr.range.clone(),
+            "call currently accepts only :proof exact",
+        ));
+    }
+
+    let field = |name: &str| RowFieldRef {
+        binding: over.clone(),
+        field: name.to_string(),
+    };
+    let constrained = |name: &str, value: &str| RowPredicate {
+        field: field(name),
+        op: RowPredicateOp::Eq,
+        operand: RowPredicateOperand::Literal(RowLiteral::ConstrainedEnum(value.to_string())),
+    };
+    let not_null = |name: &str| RowPredicate {
+        field: field(name),
+        op: RowPredicateOp::IsNotNull,
+        operand: RowPredicateOperand::None,
+    };
+    Ok(RowFilter {
+        over: over.clone(),
+        predicates: vec![
+            RowPredicate {
+                field: field("model_id"),
+                op: RowPredicateOp::Eq,
+                operand: RowPredicateOperand::Literal(RowLiteral::String(model_id)),
+            },
+            not_null("semantic_target_id"),
+            not_null("signature_id"),
+            constrained("dispatch_outcome", "resolved"),
+            constrained("dispatch_coverage", "exhaustive"),
+            constrained("dispatch_proof", "proven"),
+            constrained("dispatch_completeness", "complete"),
+            RowPredicate {
+                field: field("dispatch_target_count"),
+                op: RowPredicateOp::Eq,
+                operand: RowPredicateOperand::Literal(RowLiteral::Integer(1)),
+            },
+            RowPredicate {
+                field: field("dispatch_targets_truncated"),
+                op: RowPredicateOp::Eq,
+                operand: RowPredicateOperand::Literal(RowLiteral::Boolean(false)),
+            },
+        ],
+    })
+}
+
 /// Decode one `(project :name NEW :from NAME :columns (...))` record.
 fn decode_row_projection(expr: &Expr) -> Result<RowProjection, PolicySourceError> {
     let fields = RecordCursor::parse(
@@ -6606,6 +6788,28 @@ mod tests {
         )
     }
 
+    fn call_argument_policy(entry: &str) -> String {
+        format!(
+            r#"(policy
+              :id "test.call-argument" :name "Call argument" :message "M" :severity warning
+              :analysis (analysis :type assertion
+                (bind :name args :query
+                  (rql (call-bindings (call-shape (call :callee "run")))))
+                {entry}))"#
+        )
+    }
+
+    fn exact_call_policy(entry: &str) -> String {
+        format!(
+            r#"(policy
+              :id "test.call" :name "Call" :message "M" :severity warning
+              :analysis (analysis :type assertion
+                (bind :name calls :query
+                  (rql (call-bindings (call-shape (call :callee "run")))))
+                {entry}))"#
+        )
+    }
+
     #[test]
     fn decodes_an_ordered_equal_aggregate_over_two_position_columns() {
         let parsed = parse(&ordered_equal_policy(
@@ -6687,6 +6891,224 @@ mod tests {
             "{}",
             help.description
         );
+    }
+
+    #[test]
+    fn call_argument_lowers_to_an_equivalent_typed_filter() {
+        let sugar = parse(&call_argument_policy(
+            r#"(call-argument :over args :formal-name "timeout")"#,
+        ))
+        .unwrap();
+        let hand_written = parse(&call_argument_policy(
+            r#"(filter :over args :where
+              ((args.formal_name eq "timeout")
+               (args.mapping eq exact)
+               (args.coverage eq exhaustive)
+               (args.terminal eq false)
+               (args.argument_id is-not-null)))"#,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_vec(&sugar.document.to_normalized_authored_json()).unwrap(),
+            serde_json::to_vec(&hand_written.document.to_normalized_authored_json()).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_vec(
+                &sugar
+                    .document
+                    .to_inline_local_canonical_semantic_json()
+                    .unwrap(),
+            )
+            .unwrap(),
+            serde_json::to_vec(
+                &hand_written
+                    .document
+                    .to_inline_local_canonical_semantic_json()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let RqlpDocument::Policy { definition } = sugar.document else {
+            panic!("expected policy")
+        };
+        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
+            panic!("expected assertion policy")
+        };
+        let plan = spec.relational.expect("relational plan");
+        assert_eq!(plan.derivations.len(), 1);
+        let RowDerivation::Filter(filter) = &plan.derivations[0] else {
+            panic!("call-argument must lower to a filter")
+        };
+        assert_eq!(filter.over.as_str(), "args");
+        assert_eq!(filter.predicates.len(), 5);
+        assert_eq!(filter.predicates[0].field.field, "formal_name");
+        assert!(matches!(
+            &filter.predicates[0].operand,
+            RowPredicateOperand::Literal(RowLiteral::String(value)) if value == "timeout"
+        ));
+        assert_eq!(filter.predicates[1].field.field, "mapping");
+        assert_eq!(filter.predicates[2].field.field, "coverage");
+        assert_eq!(filter.predicates[3].field.field, "terminal");
+        assert_eq!(filter.predicates[4].field.field, "argument_id");
+        assert_eq!(filter.predicates[4].op, RowPredicateOp::IsNotNull);
+    }
+
+    #[test]
+    fn call_argument_accepts_a_formal_index() {
+        let parsed = parse(&call_argument_policy(
+            r#"(call-argument :over args :formal-index 2)"#,
+        ))
+        .unwrap();
+        let RqlpDocument::Policy { definition } = parsed.document else {
+            panic!("expected policy")
+        };
+        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
+            panic!("expected assertion policy")
+        };
+        let plan = spec.relational.expect("relational plan");
+        let RowDerivation::Filter(filter) = &plan.derivations[0] else {
+            panic!("call-argument must lower to a filter")
+        };
+        assert!(matches!(
+            filter.predicates[0].operand,
+            RowPredicateOperand::Literal(RowLiteral::Integer(2))
+        ));
+    }
+
+    #[test]
+    fn call_argument_requires_exactly_one_formal_selector() {
+        let missing = parse(&call_argument_policy(r#"(call-argument :over args)"#)).unwrap_err();
+        assert_eq!(missing.diagnostic.code, "missing-call-argument-selector");
+
+        let conflicting = parse(&call_argument_policy(
+            r#"(call-argument :over args :formal-name "timeout" :formal-index 2)"#,
+        ))
+        .unwrap_err();
+        assert_eq!(
+            conflicting.diagnostic.code,
+            "conflicting-call-argument-selector"
+        );
+    }
+
+    #[test]
+    fn call_argument_vocabulary_is_registered_for_hover() {
+        let source = call_argument_policy(r#"(call-argument :over args :formal-index 2)"#);
+        let record_offset = source.find("(call-argument").unwrap() + 4;
+        let record_help = rqlp_source_help_at(&source, record_offset)
+            .expect("registered call-argument record has hover help");
+        assert_eq!(
+            record_help.signature,
+            "(call-argument :over NAME :formal-name \"NAME\") | (call-argument :over NAME :formal-index N)"
+        );
+        let field_help = rqlp_source_help_at(&source, source.find(":formal-index").unwrap() + 3)
+            .expect("registered formal-index field has hover help");
+        assert_eq!(field_help.signature, ":formal-index N");
+    }
+
+    #[test]
+    fn exact_call_lowers_to_an_equivalent_typed_filter() {
+        let sugar = parse(&exact_call_policy(
+            r#"(call :over calls :resolves-to member.widget.create :proof exact)"#,
+        ))
+        .unwrap();
+        let hand_written = parse(&exact_call_policy(
+            r#"(filter :over calls :where
+              ((calls.model_id eq "member.widget.create")
+               (calls.semantic_target_id is-not-null)
+               (calls.signature_id is-not-null)
+               (calls.dispatch_outcome eq resolved)
+               (calls.dispatch_coverage eq exhaustive)
+               (calls.dispatch_proof eq proven)
+               (calls.dispatch_completeness eq complete)
+               (calls.dispatch_target_count eq 1)
+               (calls.dispatch_targets_truncated eq false)))"#,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_vec(&sugar.document.to_normalized_authored_json()).unwrap(),
+            serde_json::to_vec(&hand_written.document.to_normalized_authored_json()).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_vec(
+                &sugar
+                    .document
+                    .to_inline_local_canonical_semantic_json()
+                    .unwrap(),
+            )
+            .unwrap(),
+            serde_json::to_vec(
+                &hand_written
+                    .document
+                    .to_inline_local_canonical_semantic_json()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let RqlpDocument::Policy { definition } = sugar.document else {
+            panic!("expected policy")
+        };
+        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
+            panic!("expected assertion policy")
+        };
+        let plan = spec.relational.expect("relational plan");
+        let RowDerivation::Filter(filter) = &plan.derivations[0] else {
+            panic!("call must lower to a filter")
+        };
+        assert_eq!(filter.over.as_str(), "calls");
+        assert_eq!(filter.predicates.len(), 9);
+        let fields: Vec<_> = filter
+            .predicates
+            .iter()
+            .map(|predicate| predicate.field.field.as_str())
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                "model_id",
+                "semantic_target_id",
+                "signature_id",
+                "dispatch_outcome",
+                "dispatch_coverage",
+                "dispatch_proof",
+                "dispatch_completeness",
+                "dispatch_target_count",
+                "dispatch_targets_truncated",
+            ]
+        );
+        assert!(matches!(
+            &filter.predicates[0].operand,
+            RowPredicateOperand::Literal(RowLiteral::String(value))
+                if value == "member.widget.create"
+        ));
+    }
+
+    #[test]
+    fn exact_call_rejects_a_weaker_proof() {
+        let error = parse(&exact_call_policy(
+            r#"(call :over calls :resolves-to member.widget.create :proof possible)"#,
+        ))
+        .unwrap_err();
+        assert_eq!(error.diagnostic.code, "unsupported-call-proof");
+    }
+
+    #[test]
+    fn exact_call_vocabulary_is_registered_for_hover() {
+        let source = exact_call_policy(
+            r#"(call :over calls :resolves-to member.widget.create :proof exact)"#,
+        );
+        let record_help = rqlp_source_help_at(&source, source.find("(call :over").unwrap() + 2)
+            .expect("registered call record has hover help");
+        assert_eq!(
+            record_help.signature,
+            "(call :over NAME :resolves-to MODEL_ID :proof exact)"
+        );
+        let field_help = rqlp_source_help_at(&source, source.find(":resolves-to").unwrap() + 3)
+            .expect("registered resolves-to field has hover help");
+        assert_eq!(field_help.signature, ":resolves-to MODEL_ID");
     }
 
     /// The Milestone 4 sugar: it must add no evaluation rule of its own, so

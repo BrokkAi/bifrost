@@ -1751,6 +1751,16 @@ fn js_member_assignment_target(
     if property.kind() == "computed_property_name" {
         return None;
     }
+    // `receiver.#name = value` is never a declaration site. A private name is
+    // only legal inside a class body that already declares it, so the field
+    // this writes to was already indexed with its exact class owner (#1926);
+    // minting a parentless unit here would duplicate it under a name that
+    // renders identically but carries different segment kinds. Declining also
+    // makes the recursion below reject a chain rooted through a private
+    // segment, such as `child.#out.length`.
+    if property.kind() == "private_property_identifier" {
+        return None;
+    }
     let (object_name, object_fq) = match object.kind() {
         "identifier" | "property_identifier" => {
             let object_name = node_text(object, source).trim().to_string();
@@ -2234,7 +2244,7 @@ mod callable_modifier_tests {
                         parsed
                             .signature_metadata
                             .keys()
-                            .map(|unit| unit.identifier().to_owned())
+                            .map(|unit| unit.short_name().to_owned())
                             .collect::<Vec<_>>()
                     )
                 });
@@ -2253,5 +2263,64 @@ mod callable_modifier_tests {
         assert_eq!(modifiers("build"), (true, false));
         assert_eq!(modifiers("render"), (false, false));
         assert_eq!(modifiers("constructor"), (false, true));
+    }
+}
+
+#[cfg(test)]
+mod private_field_assignment_tests {
+    use super::*;
+
+    /// #2593: `Receiver.#field = value` is a write, never a declaration. A
+    /// private name is only legal inside a class body that already declares
+    /// it, so the grammar has already indexed the field with its exact class
+    /// owner (#1926). Minting a second parentless Field from the assignment
+    /// gave two units that render identically but carry different FqName
+    /// segment kinds, so no lookup or usage query could tell them apart.
+    #[test]
+    fn private_name_assignment_through_named_receiver_declares_nothing() {
+        let source = "class CurrentPointers {\n  static #pointerType = null;\n  static #out = [];\n  static set(pointerType) {\n    CurrentPointers.#pointerType = pointerType;\n    CurrentPointers.#out.length = 0;\n  }\n}\n";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = ProjectFile::new(
+            temp.path().canonicalize().expect("canonical root"),
+            "pointers.js",
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .expect("JavaScript parser language");
+        let tree = parser
+            .parse(source, None)
+            .expect("parse JavaScript fixture");
+        let parsed = parse_javascript_file(&file, source, &tree);
+
+        let named = |name: &str| {
+            parsed
+                .ranges
+                .keys()
+                .chain(parsed.definition_lookup_units.iter())
+                .filter(|unit| unit.short_name() == name)
+                .count()
+        };
+
+        assert_eq!(
+            named("CurrentPointers.#pointerType"),
+            1,
+            "the class field is the only declaration of #pointerType; recorded {:?}",
+            parsed
+                .ranges
+                .keys()
+                .map(|unit| unit.short_name().to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            named("CurrentPointers.#out.length"),
+            0,
+            "a chain rooted through a private segment declares nothing; recorded {:?}",
+            parsed
+                .ranges
+                .keys()
+                .map(|unit| unit.short_name().to_owned())
+                .collect::<Vec<_>>()
+        );
     }
 }

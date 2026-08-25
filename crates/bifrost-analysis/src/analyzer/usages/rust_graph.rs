@@ -20,14 +20,15 @@ use crate::analyzer::usages::rust_graph::extractor::{
 };
 use crate::analyzer::usages::rust_graph::resolver::infer_graph_seeds_while;
 use crate::analyzer::usages::rust_graph::resolver::{
-    RustGraphSeedKind, canonical_usage_target, is_graph_visible_member_target, is_member_target,
-    local_impl_target_importer_files_while, trait_member_for_impl_member,
-    unresolved_external_frontier_specifiers,
+    RustGraphSeedKind, canonical_usage_target, is_graph_visible_member_owner,
+    is_graph_visible_member_target, is_member_target, local_impl_target_importer_files_while,
+    trait_member_for_impl_member, unresolved_external_frontier_specifiers,
 };
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, RustAnalyzer, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_rust::usage::usage_candidate_files_visible_to_binding_seeds_with_walks;
 use brokk_bifrost_rust::usage_walks::RustUsageWalks;
 use std::collections::BTreeSet;
@@ -93,7 +94,6 @@ struct PreparedRustTargetReady {
     graph_visible: bool,
     kind: RustGraphSeedKind,
     seeds: RustBindingSeeds,
-    protected_files: HashSet<ProjectFile>,
     planned_files: HashSet<ProjectFile>,
 }
 
@@ -110,26 +110,20 @@ struct PreparedRustTarget {
 pub(crate) struct PreparedRustUsageQuery {
     candidate_files: HashSet<ProjectFile>,
     targets: Vec<PreparedRustTarget>,
-    enforce_admitted_scope: bool,
 }
 
 impl PreparedRustUsageQuery {
+    #[cfg(test)]
     pub(crate) fn candidate_files(&self) -> &HashSet<ProjectFile> {
         &self.candidate_files
     }
 
-    fn prepare(
+    fn prepare_targets(
         rust: &RustAnalyzer,
         overloads: &[CodeUnit],
-        supplied_candidates: &HashSet<ProjectFile>,
-        authoritative: bool,
-        include_finder_augmentation: bool,
+        token: QueryToken<'_>,
         cancellation: &CancellationToken,
-    ) -> Option<Self> {
-        // The planning phase's request boundary; nested inside any
-        // caller-owned scope (issue #2414 step 3).
-        let scope = AnalyzerQueryScope::new(rust);
-        let token = scope.token();
+    ) -> Option<Vec<PreparedRustTarget>> {
         let keep_going = || !cancellation.is_cancelled();
         let mut canonical_targets = Vec::with_capacity(overloads.len());
         for overload in overloads {
@@ -139,7 +133,6 @@ impl PreparedRustUsageQuery {
             }
         }
 
-        let mut candidate_files = supplied_candidates.clone();
         let mut targets = Vec::with_capacity(canonical_targets.len());
         for target in canonical_targets {
             let member = is_member_target(rust, &target);
@@ -167,13 +160,6 @@ impl PreparedRustUsageQuery {
                 )
             });
             let graph_visible = !member || is_graph_visible_member_target(rust, &target);
-            let protected_files = if include_finder_augmentation {
-                let _scope = crate::profiling::scope("RustQueryResolver::usage_candidates");
-                usage_candidate_files_from_binding_seeds_while(rust, token, &seeds, &keep_going)?
-            } else {
-                HashSet::default()
-            };
-            candidate_files.extend(protected_files.iter().cloned());
             targets.push(PreparedRustTarget {
                 target,
                 ready: Some(PreparedRustTargetReady {
@@ -181,20 +167,29 @@ impl PreparedRustUsageQuery {
                     graph_visible,
                     kind: seed_result.kind,
                     seeds,
-                    protected_files,
                     planned_files: HashSet::default(),
                 }),
             });
         }
+        Some(targets)
+    }
 
+    fn prepare_for_discovery(
+        rust: &RustAnalyzer,
+        overloads: &[CodeUnit],
+        supplied_candidates: &HashSet<ProjectFile>,
+        cancellation: &CancellationToken,
+    ) -> Option<Self> {
+        // The planning phase's request boundary; nested inside any
+        // caller-owned scope (issue #2414 step 3).
+        let scope = AnalyzerQueryScope::new(rust);
+        let token = scope.token();
+        let mut targets = Self::prepare_targets(rust, overloads, token, cancellation)?;
+        let keep_going = || !cancellation.is_cancelled();
         // The outer finder admits the union, but each overload keeps its own
         // protected closure. Letting one overload inherit another's importers
         // makes every semantic scan wider without improving soundness.
-        let candidate_walks = if include_finder_augmentation {
-            Some(RustUsageWalks::new_while(rust, token, &keep_going)?)
-        } else {
-            None
-        };
+        let candidate_walks = RustUsageWalks::new_while(rust, token, &keep_going)?;
         let mut scoped_candidates = HashSet::default();
         let mut graph_candidates = HashSet::default();
         for prepared in &mut targets {
@@ -203,48 +198,41 @@ impl PreparedRustUsageQuery {
                 graph_visible,
                 kind,
                 seeds,
-                protected_files,
                 planned_files,
             }) = &mut prepared.ready
             else {
                 continue;
             };
-            if *member && *kind == RustGraphSeedKind::Export && !*graph_visible && !authoritative {
+            if *member
+                && *kind == RustGraphSeedKind::Export
+                && !*graph_visible
+                && is_graph_visible_member_owner(rust, &prepared.target)
+            {
                 continue;
             }
-            let mut planning_candidates = if let Some(walks) = candidate_walks.as_ref() {
-                let filtered = usage_candidate_files_visible_to_binding_seeds_with_walks(
+            let protected_files = {
+                let _scope = crate::profiling::scope("RustQueryResolver::usage_candidates");
+                usage_candidate_files_from_binding_seeds_while(rust, token, seeds, &keep_going)?
+            };
+            let mut planning_candidates =
+                usage_candidate_files_visible_to_binding_seeds_with_walks(
                     rust,
-                    walks,
+                    &candidate_walks,
                     supplied_candidates,
                     prepared.target.source(),
                     seeds,
                 )?;
-                scoped_candidates.extend(filtered.iter().cloned());
-                filtered
-            } else {
-                supplied_candidates.clone()
-            };
-            if include_finder_augmentation {
-                scoped_candidates.extend(protected_files.iter().cloned());
-            }
-            planning_candidates.extend(std::mem::take(protected_files));
-            let planning_scope = UsageScanScope::with_cancellation(
+            scoped_candidates.extend(planning_candidates.iter().cloned());
+            scoped_candidates.extend(protected_files.iter().cloned());
+            planning_candidates.extend(protected_files);
+            let mut target_files = effective_scan_files_from_prepared_candidates(
+                rust,
+                token,
                 &planning_candidates,
-                authoritative,
-                cancellation,
+                &prepared.target,
+                seeds,
+                Some(cancellation),
             );
-            let mut target_files = if include_finder_augmentation {
-                effective_scan_files_from_prepared_candidates(
-                    rust,
-                    token,
-                    &planning_scope,
-                    &prepared.target,
-                    seeds,
-                )
-            } else {
-                effective_scan_files(rust, token, &planning_scope, &prepared.target, seeds)
-            };
             if *kind == RustGraphSeedKind::LocalDeclaration {
                 target_files.extend(local_impl_target_importer_files_while(
                     rust,
@@ -257,15 +245,61 @@ impl PreparedRustUsageQuery {
             graph_candidates.extend(target_files.iter().cloned());
             *planned_files = target_files;
         }
-        if include_finder_augmentation {
-            candidate_files = scoped_candidates;
-        }
+        let mut candidate_files = scoped_candidates;
         candidate_files.extend(graph_candidates);
 
         Some(Self {
             candidate_files,
             targets,
-            enforce_admitted_scope: include_finder_augmentation,
+        })
+    }
+
+    fn prepare_in_scope(
+        rust: &RustAnalyzer,
+        overloads: &[CodeUnit],
+        supplied_candidates: &HashSet<ProjectFile>,
+        cancellation: &CancellationToken,
+    ) -> Option<Self> {
+        // The planning phase's request boundary; nested inside any
+        // caller-owned scope (issue #2414 step 3).
+        let scope = AnalyzerQueryScope::new(rust);
+        let token = scope.token();
+        let mut targets = Self::prepare_targets(rust, overloads, token, cancellation)?;
+        let keep_going = || !cancellation.is_cancelled();
+        let mut candidate_files = supplied_candidates.clone();
+        for prepared in &mut targets {
+            let Some(PreparedRustTargetReady {
+                kind,
+                seeds,
+                planned_files,
+                ..
+            }) = &mut prepared.ready
+            else {
+                continue;
+            };
+            let mut target_files = effective_scan_files(
+                rust,
+                token,
+                supplied_candidates,
+                &prepared.target,
+                seeds,
+                Some(cancellation),
+            );
+            if *kind == RustGraphSeedKind::LocalDeclaration {
+                target_files.extend(local_impl_target_importer_files_while(
+                    rust,
+                    token,
+                    &prepared.target,
+                    &keep_going,
+                )?);
+            }
+            keep_going().then_some(())?;
+            candidate_files.extend(target_files.iter().cloned());
+            *planned_files = target_files;
+        }
+        Some(Self {
+            candidate_files,
+            targets,
         })
     }
 }
@@ -312,28 +346,15 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
     ) -> GraphUsageOutcome {
         let fallback_cancellation = CancellationToken::default();
         let cancellation = scan_scope.cancellation().unwrap_or(&fallback_cancellation);
-        let Some(prepared) = PreparedRustUsageQuery::prepare(
+        let Some(prepared) = PreparedRustUsageQuery::prepare_in_scope(
             self.rust,
             overloads,
             scan_scope.candidate_files(),
-            scan_scope.is_authoritative(),
-            false,
             cancellation,
         ) else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
-        if let Some(cancellation) = scan_scope.cancellation() {
-            let expanded_scope = UsageScanScope::with_cancellation(
-                prepared.candidate_files(),
-                scan_scope.is_authoritative(),
-                cancellation,
-            );
-            self.find_prepared_usages(analyzer, &prepared, &expanded_scope, max_usages)
-        } else {
-            let expanded_scope =
-                UsageScanScope::new(prepared.candidate_files(), scan_scope.is_authoritative());
-            self.find_prepared_usages(analyzer, &prepared, &expanded_scope, max_usages)
-        }
+        self.find_prepared_usages(analyzer, &prepared, scan_scope, max_usages)
     }
 }
 
@@ -363,33 +384,21 @@ impl RustQueryResolver<'_> {
                 .expect("prepared Rust target must have retained state");
             let Some(PreparedRustTargetReady {
                 member,
-                graph_visible,
-                kind,
+                graph_visible: _,
+                kind: _,
                 seeds,
-                protected_files: _,
                 planned_files,
             }) = &prepared_target.ready
             else {
                 return Err(GraphFailureReason::NoGraphSeed("no graph seed resolved")
                     .diagnostic(target.fq_name(), RUST_STRATEGY));
             };
-            let scan_files = if prepared.enforce_admitted_scope {
-                planned_files
-                    .intersection(scan_scope.candidate_files())
-                    .cloned()
-                    .collect()
-            } else {
-                planned_files.clone()
-            };
+            let scan_files = planned_files
+                .intersection(scan_scope.candidate_files())
+                .cloned()
+                .collect();
 
             let (hits, unproven_hits) = if *member {
-                let private_authoritative_scope = scan_scope.is_authoritative();
-                if *kind == RustGraphSeedKind::Export
-                    && !*graph_visible
-                    && !private_authoritative_scope
-                {
-                    return Ok(CandidateUsageHits::default());
-                }
                 let scan_target = trait_member_for_impl_member(rust, token, target);
                 let scan_target = scan_target.as_ref().unwrap_or(target);
                 let result = scan_files_for_member_target(
@@ -554,7 +563,6 @@ impl GraphUsageAnalyzer for RustExportUsageGraphStrategy {
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
         candidate_files: &HashSet<ProjectFile>,
-        authoritative: bool,
         cancellation: &CancellationToken,
     ) -> Option<Box<dyn PreparedUsageQuery>> {
         let target = overloads.first()?;
@@ -562,12 +570,10 @@ impl GraphUsageAnalyzer for RustExportUsageGraphStrategy {
             return None;
         }
         let resolver = RustQueryResolver::try_new(analyzer)?;
-        PreparedRustUsageQuery::prepare(
+        PreparedRustUsageQuery::prepare_for_discovery(
             resolver.rust,
             overloads,
             candidate_files,
-            authoritative,
-            true,
             cancellation,
         )
         .map(|prepared| Box::new(prepared) as Box<dyn PreparedUsageQuery>)
@@ -604,20 +610,6 @@ impl GraphUsageAnalyzer for RustExportUsageGraphStrategy {
         };
 
         resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
-    }
-}
-
-impl UsageAnalyzer for RustExportUsageGraphStrategy {
-    fn find_usages(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
-        max_usages: usize,
-    ) -> FuzzyResult {
-        let scan_scope = UsageScanScope::new(candidate_files, false);
-        self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
-            .into_fuzzy_result()
     }
 }
 
@@ -683,7 +675,7 @@ mod tests {
         let candidates: HashSet<_> = [consumer].into_iter().collect();
 
         analyzer.reset_export_name_canonicalization_count_for_test();
-        let scope = UsageScanScope::new(&candidates, false);
+        let scope = UsageScanScope::new(&candidates);
         let outcome = RustExportUsageGraphStrategy::new()
             .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scope, 1000)
             .into_fuzzy_result();
@@ -732,7 +724,7 @@ mod tests {
         let candidates: HashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
 
         analyzer.reset_scanned_candidate_file_count_for_test();
-        let scope = UsageScanScope::new(&candidates, false);
+        let scope = UsageScanScope::new(&candidates);
         let outcome = RustExportUsageGraphStrategy::new()
             .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scope, 1000)
             .into_fuzzy_result();
@@ -785,7 +777,7 @@ mod tests {
             .test_hooks()
             .reset_definition_candidates_query_count_for_test();
         let candidates: HashSet<_> = [target_file].into_iter().collect();
-        let scope = UsageScanScope::new(&candidates, true);
+        let scope = UsageScanScope::new(&candidates);
 
         let outcome = RustExportUsageGraphStrategy::new()
             .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scope, 1000)
@@ -814,7 +806,7 @@ mod tests {
 
         analyzer.reset_export_name_canonicalization_count_for_test();
         let cancellation = CancellationToken::cancel_after_checks_for_test(4);
-        let scope = UsageScanScope::with_cancellation(&candidates, false, &cancellation);
+        let scope = UsageScanScope::with_cancellation(&candidates, &cancellation);
         let _ = RustExportUsageGraphStrategy::new().find_graph_usages(
             &analyzer,
             std::slice::from_ref(&target),
@@ -869,7 +861,7 @@ mod tests {
 
         analyzer.reset_scanned_candidate_file_count_for_test();
         let outcome = pool.install(|| {
-            let scope = UsageScanScope::new(&candidates, false);
+            let scope = UsageScanScope::new(&candidates);
             RustExportUsageGraphStrategy::new().find_graph_usages(
                 &analyzer,
                 std::slice::from_ref(&target),
@@ -900,7 +892,7 @@ mod tests {
             .find(|unit| unit.identifier() == "target")
             .expect("target declaration");
         let candidates: HashSet<_> = [file].into_iter().collect();
-        let scope = UsageScanScope::new(&candidates, true);
+        let scope = UsageScanScope::new(&candidates);
         let outcome = RustExportUsageGraphStrategy::new()
             .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scope, 0)
             .into_fuzzy_result();
@@ -961,12 +953,10 @@ mod tests {
         let alpha = declaration_named(&analyzer, &alpha_file, "target_alpha");
         let beta = declaration_named(&analyzer, &beta_file, "target_beta");
 
-        let prepared = PreparedRustUsageQuery::prepare(
+        let prepared = PreparedRustUsageQuery::prepare_for_discovery(
             &analyzer,
             &[alpha.clone(), beta.clone()],
             &HashSet::default(),
-            false,
-            true,
             &CancellationToken::new(),
         )
         .expect("prepared overload query");
@@ -1027,12 +1017,10 @@ mod tests {
             .into_iter()
             .collect();
 
-        let prepared = PreparedRustUsageQuery::prepare(
+        let prepared = PreparedRustUsageQuery::prepare_for_discovery(
             &analyzer,
             std::slice::from_ref(&target),
             &supplied,
-            false,
-            true,
             &CancellationToken::new(),
         )
         .expect("prepared private target");
@@ -1070,12 +1058,10 @@ mod tests {
 
         let cancellation = CancellationToken::cancel_after_checks_for_test(12);
         assert!(
-            PreparedRustUsageQuery::prepare(
+            PreparedRustUsageQuery::prepare_for_discovery(
                 &analyzer,
                 std::slice::from_ref(&target),
                 &HashSet::default(),
-                false,
-                true,
                 &cancellation,
             )
             .is_none(),
@@ -1089,12 +1075,10 @@ mod tests {
         // anything about this path.
         assert!(!analyzer.cargo_routes_ready_for_test());
 
-        let prepared = PreparedRustUsageQuery::prepare(
+        let prepared = PreparedRustUsageQuery::prepare_for_discovery(
             &analyzer,
             std::slice::from_ref(&target),
             &HashSet::default(),
-            false,
-            true,
             &CancellationToken::new(),
         )
         .expect("uncancelled preparation");

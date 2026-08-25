@@ -2,15 +2,14 @@
 //! parsing and resolution, the `autoload` constant edge collector, and the
 //! Gemfile-driven Zeitwerk conventions.
 //!
-//! The memoized products these build -- the autoload constant index, the five
-//! Zeitwerk cells, the reverse import index -- stay on `RubyAnalyzer` in
+//! The memoized products these build -- the autoload constant index, the
+//! Zeitwerk convention/visibility cells, and the reverse import index -- stay on `RubyAnalyzer` in
 //! `brokk-bifrost-analysis`; only the decisions that fill them live here.
 
 use crate::declarations::{extract_name_segments, parse_ruby_tree, ruby_node_text as node_text};
 use crate::graph_support::RubySource;
 use brokk_bifrost_core::analyzer::model::ImportInfo;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -317,49 +316,6 @@ pub fn is_zeitwerk_autoload_file(file: &ProjectFile) -> bool {
     !ZEITWERK_AUTOLOAD_EXCLUDED_APP_DIRS.contains(&app_dir)
 }
 
-pub fn collect_ruby_reference_identifiers<'a>(
-    source: &'a str,
-    root: Node<'_>,
-    mut sink: impl FnMut(&'a str),
-) {
-    walk_named_tree_preorder(root, true, |node| {
-        if let Some(method) = method_call_identifier(node, source) {
-            sink(method);
-        }
-        if let Some(constant) = constant_reference_identifier(node, source) {
-            sink(constant);
-        }
-        WalkControl::Continue
-    });
-}
-
-fn method_call_identifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    if node.kind() != "call" {
-        return None;
-    }
-    let method = node.child_by_field_name("method")?;
-    Some(ruby_node_text(method, source))
-}
-
-fn constant_reference_identifier<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    if node.kind() != "constant" {
-        return None;
-    }
-    if let Some(parent) = node.parent()
-        && matches!(parent.kind(), "class" | "module")
-    {
-        return None;
-    }
-    Some(ruby_node_text(node, source))
-}
-
-fn ruby_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or("")
-        .trim()
-}
-
 /// Project files this file pulls in via supported Ruby require forms.
 pub fn ruby_required_files(
     ruby: &dyn RubySource,
@@ -461,36 +417,6 @@ pub fn build_zeitwerk_autoload_code_units(ruby: &dyn RubySource) -> HashSet<Code
         }
     }
     units
-}
-
-/// The whole-workspace reference-identifier scan behind
-/// `zeitwerk_reference_files_for_identifier`.
-///
-/// This is a `read_source` + `parse_ruby_tree` +
-/// `collect_ruby_reference_identifiers` pass over every consumer file, and the
-/// analyzer runs it lazily from inside `RubyQueryResolver`'s post-budget scan-set
-/// augmentation. That timing is part of the augmentation contract even though no
-/// assertion pins it, so the `OnceLock` and its `get_or_init` call site stay on
-/// the analyzer; only the walk lives here.
-pub fn build_zeitwerk_reference_files(
-    ruby: &dyn RubySource,
-) -> HashMap<String, HashSet<ProjectFile>> {
-    let mut references: HashMap<String, HashSet<ProjectFile>> = HashMap::default();
-    for file in ruby.zeitwerk_consumer_files() {
-        let Ok(source) = ruby.project().read_source(file) else {
-            continue;
-        };
-        let Some(tree) = parse_ruby_tree(&source) else {
-            continue;
-        };
-        collect_ruby_reference_identifiers(&source, tree.root_node(), |identifier| {
-            references
-                .entry(identifier.to_string())
-                .or_default()
-                .insert(file.clone());
-        });
-    }
-    references
 }
 
 pub fn ruby_zeitwerk_visible_files_for<'a>(

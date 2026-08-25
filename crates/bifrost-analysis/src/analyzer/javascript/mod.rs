@@ -232,10 +232,6 @@ impl JavascriptAnalyzer {
         Self::new_with_config(project, AnalyzerConfig::default())
     }
 
-    pub(crate) fn prewarm_jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {
-        providers::prewarm_jsts_usage_index(self)
-    }
-
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
         let alias_resolver = Arc::new(AliasResolver::new(Arc::clone(&project)));

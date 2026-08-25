@@ -1637,6 +1637,7 @@ mod tests {
             vec![0, 11],
             vec![NormalizedNode {
                 kind: NormalizedKind::Class,
+                boolean_value: None,
                 construct: None,
                 range: Range {
                     start_byte: 0,
@@ -1675,6 +1676,7 @@ mod tests {
                     } else {
                         NormalizedKind::Function
                     },
+                    boolean_value: None,
                     construct: None,
                     range: Range {
                         start_byte,
@@ -2039,6 +2041,7 @@ mod tests {
             vec![0],
             vec![NormalizedNode {
                 kind: NormalizedKind::Class,
+                boolean_value: None,
                 construct: None,
                 range: Range {
                     start_byte: 0,

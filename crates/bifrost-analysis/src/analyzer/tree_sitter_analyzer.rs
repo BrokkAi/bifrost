@@ -6296,6 +6296,57 @@ where
         result
     }
 
+    /// Seed-directed identifier candidates from the persisted live workspace.
+    ///
+    /// Unlike [`Self::reverse_reference_candidates`], this entry point does
+    /// not need a caller-supplied file universe. It is the target-query path
+    /// for languages whose parsed identifier facts are already a conservative
+    /// reference prefilter.
+    pub(crate) fn reverse_identifier_candidates(
+        &self,
+        identifiers: &HashSet<String>,
+        cancellation: &CancellationToken,
+    ) -> HashSet<ProjectFile> {
+        let lang = self.adapter.language().config_label();
+        let Some(generation) = self.store_context.generations.get(lang).copied() else {
+            return self.all_files().into_iter().collect();
+        };
+        let paths = match self.store_context.store.reverse_identifier_candidate_paths(
+            lang,
+            generation,
+            identifiers,
+            cancellation,
+        ) {
+            Ok(paths) => paths,
+            Err(error) => {
+                self.record_store_error(error.context("looking up reverse identifier paths"));
+                return self.all_files().into_iter().collect();
+            }
+        };
+        if cancellation.is_cancelled() {
+            return HashSet::default();
+        }
+        let root = self.project.root();
+        let mut result = paths
+            .into_iter()
+            .map(|path| ProjectFile::new(root, path))
+            .collect::<HashSet<_>>();
+
+        // A failed persistence leaves the current facts only in memory. These
+        // entries are rare; inspect just that bounded dirty map so the SQL
+        // optimization cannot turn a transient write error into a false
+        // negative.
+        for (key, dirty) in self.state.dirty_snapshot() {
+            if cancellation.is_cancelled() {
+                return HashSet::default();
+            }
+            if !dirty.state.type_identifiers.is_disjoint(identifiers) {
+                result.insert(ProjectFile::new(root, key.rel_path));
+            }
+        }
+        result
+    }
+
     pub(crate) fn bulk_type_identifiers(
         &self,
         files: impl IntoIterator<Item = ProjectFile>,

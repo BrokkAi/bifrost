@@ -305,6 +305,10 @@ impl StructuralSpec for CSharpStructuralSpec {
         Language::CSharp
     }
 
+    fn supports_boolean_literal_value(&self) -> bool {
+        true
+    }
+
     fn parser_included_ranges(&self, source: &str) -> Option<Vec<tree_sitter::Range>> {
         crate::preprocessor::csharp_included_ranges(source)
     }

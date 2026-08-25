@@ -13,6 +13,48 @@ use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
+struct PlannedUsageQuery {
+    protected_candidates: HashSet<ProjectFile>,
+    supplemental_candidates: HashSet<ProjectFile>,
+}
+
+fn augment_usage_candidates(
+    analyzer: &dyn IAnalyzer,
+    overloads: &[CodeUnit],
+    base_candidates: &HashSet<ProjectFile>,
+    cancellation: &CancellationToken,
+) -> PlannedUsageQuery {
+    let mut protected_candidates = base_candidates.clone();
+    let mut supplemental_candidates = HashSet::default();
+    for target in overloads {
+        if let Some(augmentation) = candidate_augmentation(&CandidateCtx {
+            analyzer,
+            target,
+            cancellation,
+        }) {
+            protected_candidates.extend(augmentation.protected);
+            supplemental_candidates.extend(augmentation.supplemental);
+        }
+    }
+    PlannedUsageQuery {
+        protected_candidates,
+        supplemental_candidates,
+    }
+}
+
+pub(super) fn execute_graph_usage_query_in_scope(
+    strategy: &dyn GraphUsageAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    overloads: &[CodeUnit],
+    candidate_files: &HashSet<ProjectFile>,
+    max_usages: usize,
+) -> FuzzyResult {
+    let cancellation = CancellationToken::default();
+    let scan_scope = UsageScanScope::with_cancellation(candidate_files, &cancellation);
+    graph_strategy_find_usages(strategy, analyzer, overloads, &scan_scope, None, max_usages)
+        .into_fuzzy_result()
+}
+
 /// A caller-supplied candidate-file predicate. Borrowing (`'a`) rather than
 /// `'static`: `scan_usages`' filter classifies test files on demand against
 /// the live analyzer, instead of pre-classifying the whole workspace into an
@@ -47,8 +89,14 @@ pub struct CandidateFilesSample {
     pub omitted_count: usize,
 }
 
-/// Facade that wires a [`CandidateFileProvider`] together with language-specific usage
-/// dispatch for a single fuzzy lookup. The strategy chosen depends on the target's language:
+/// The common reference engine.
+///
+/// This type owns target-query planning, admission, cancellation, and language-plugin
+/// dispatch. Its canonical-edge file-scan entry point is implemented beside the
+/// canonical row model in `structural::reference_edges`. Languages provide semantic
+/// resolution hooks; they do not own request traversal or budgets.
+///
+/// The strategy chosen depends on the target's language:
 ///
 /// - JavaScript / TypeScript, Python, PHP, Rust, Java, Kotlin, C#, C++, Go, Ruby, and
 ///   Scala targets are routed to their graph strategy first.
@@ -57,7 +105,7 @@ pub struct CandidateFilesSample {
 /// - Targets without a graph strategy surface a structured unsupported-language failure.
 ///
 /// JDT-based Java analysis is intentionally omitted; bifrost is tree-sitter only.
-pub struct UsageFinder<'a> {
+pub struct ReferenceEngine<'a> {
     file_filter: Option<FileFilter<'a>>,
     /// The request's test-file exclusion on its own, when it asked to drop
     /// test files.
@@ -70,17 +118,15 @@ pub struct UsageFinder<'a> {
     /// type-hierarchy build from inverting classes the answer would throw
     /// away seconds later (#1748).
     excluded_test_files: Option<FileFilter<'a>>,
-    authoritative_scope: bool,
     cancellation: CancellationToken,
 }
 
-impl<'a> UsageFinder<'a> {
+impl<'a> ReferenceEngine<'a> {
     pub fn new() -> Self {
         let cancellation = CancellationToken::default();
         Self {
             file_filter: None,
             excluded_test_files: None,
-            authoritative_scope: false,
             cancellation,
         }
     }
@@ -88,6 +134,10 @@ impl<'a> UsageFinder<'a> {
     pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = cancellation;
         self
+    }
+
+    pub(crate) fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
     }
 
     pub fn with_file_filter<F>(mut self, filter: F) -> Self
@@ -112,11 +162,6 @@ impl<'a> UsageFinder<'a> {
         F: Fn(&ProjectFile) -> bool + Send + Sync + 'a,
     {
         self.excluded_test_files = Some(Box::new(excludes));
-        self
-    }
-
-    pub fn with_authoritative_scope(mut self, authoritative: bool) -> Self {
-        self.authoritative_scope = authoritative;
         self
     }
 
@@ -206,7 +251,6 @@ impl<'a> UsageFinder<'a> {
         };
         let _cand_scope = crate::profiling::scope("usages::candidate_discovery");
         let mut candidates = HashSet::default();
-        let mut supplemental = HashSet::default();
         for overload in overloads {
             match explicit_provider {
                 Some(provider) => candidates.extend(provider.find_candidates(overload, analyzer)),
@@ -216,32 +260,32 @@ impl<'a> UsageFinder<'a> {
                         analyzer,
                         &hierarchy_scope,
                     ));
-                    if let Some(augmentation) = candidate_augmentation(&CandidateCtx {
-                        analyzer,
-                        target: overload,
-                        cancellation: &self.cancellation,
-                    }) {
-                        candidates.extend(augmentation.protected);
-                        supplemental.extend(augmentation.supplemental);
-                    }
                 }
             }
             if self.cancellation.is_cancelled() {
                 return cancelled_query_result();
             }
         }
-        let prepared = if explicit_provider.is_none() {
-            language_support(language_for_target(target)).and_then(|support| {
-                support.usage_strategy().prepare_usage_query(
-                    analyzer,
-                    overloads,
-                    &candidates,
-                    self.authoritative_scope,
-                    &self.cancellation,
-                )
-            })
+        let strategy = language_support(language_for_target(target))
+            .map(|support| support.reference_plugin().target_strategy());
+        let provider_is_complete_scope =
+            explicit_provider.is_some_and(CandidateFileProvider::is_complete_scope);
+        let plan = if provider_is_complete_scope {
+            PlannedUsageQuery {
+                protected_candidates: candidates,
+                supplemental_candidates: HashSet::default(),
+            }
         } else {
+            augment_usage_candidates(analyzer, overloads, &candidates, &self.cancellation)
+        };
+        candidates = plan.protected_candidates;
+        let supplemental = plan.supplemental_candidates;
+        let prepared = if provider_is_complete_scope {
             None
+        } else {
+            strategy.and_then(|strategy| {
+                strategy.prepare_usage_query(analyzer, overloads, &candidates, &self.cancellation)
+            })
         };
         if let Some(prepared) = prepared.as_ref() {
             candidates.extend(prepared.candidate_files().iter().cloned());
@@ -295,11 +339,7 @@ impl<'a> UsageFinder<'a> {
 
         drop(_cand_scope);
         let mut graph_failure = None;
-        let scan_scope = UsageScanScope::with_cancellation(
-            &candidates,
-            self.authoritative_scope,
-            &self.cancellation,
-        );
+        let scan_scope = UsageScanScope::with_cancellation(&candidates, &self.cancellation);
         let _graph_scope = crate::profiling::scope("usages::graph_find_usages");
         let result = match graph_find_usages(
             language_for_target(target),
@@ -417,11 +457,15 @@ fn admit_candidates_by_source_bytes(
     (admitted, scanned_source_bytes, truncated, false)
 }
 
-impl Default for UsageFinder<'_> {
+impl Default for ReferenceEngine<'_> {
     fn default() -> Self {
         Self::new()
     }
 }
+
+/// Compatibility name for callers that still consume the fuzzy usage result.
+/// New reference-analysis code should name [`ReferenceEngine`].
+pub type UsageFinder<'a> = ReferenceEngine<'a>;
 
 fn truncate_candidates(
     candidates: HashSet<ProjectFile>,
@@ -513,7 +557,7 @@ fn graph_find_usages(
 ) -> GraphUsageOutcome {
     match language_support(language) {
         Some(support) => graph_strategy_find_usages(
-            support.usage_strategy(),
+            support.reference_plugin().target_strategy(),
             analyzer,
             overloads,
             scan_scope,

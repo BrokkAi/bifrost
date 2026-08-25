@@ -3,8 +3,9 @@
 Run [Bifrost](https://bifrost.brokk.ai) static-analysis policies in GitHub
 Actions and upload the SARIF report to GitHub code scanning. Findings appear
 as pull-request annotations, and the job gates on a strict exit-code
-contract: `0` is clean, `1` is findings at or above the `fail-on` threshold,
-and `2` is unreliable — a run that could not prove its own completeness and
+contract: `0` is clean, `1` is a policy gate failure (a finding at or above
+the `fail-on` threshold or an orphaned suppression decision), and `2` is
+unreliable — a run that could not prove its own completeness and
 must never be treated as clean.
 
 ## Quick start

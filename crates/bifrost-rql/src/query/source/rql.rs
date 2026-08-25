@@ -693,6 +693,7 @@ fn validate_wrapper(
         RqlForm::Name
         | RqlForm::NameRegex
         | RqlForm::TextRegex
+        | RqlForm::BooleanValue
         | RqlForm::Capture
         | RqlForm::Has
         | RqlForm::NotHas
@@ -1900,6 +1901,14 @@ fn validate_property_value(
         super::schema::ValueShape::Arity => {
             validate_arity_scalar(value, analysis);
         }
+        super::schema::ValueShape::Boolean => match &value.kind {
+            ExprKind::Symbol(label) if label == "true" || label == "false" => {}
+            _ => analysis.error(
+                value.range.clone(),
+                "wrong-value-shape",
+                "expected true or false",
+            ),
+        },
         super::schema::ValueShape::Pattern => validate_rql_pattern(value, &child, analysis),
         super::schema::ValueShape::PatternList
         | super::schema::ValueShape::PatternMap
@@ -1953,8 +1962,7 @@ fn validate_property_value(
         | super::schema::ValueShape::GenerationInputList
         | super::schema::ValueShape::ExportFormList
         | super::schema::ValueShape::ExportNameList
-        | super::schema::ValueShape::DeclarationOriginList
-        | super::schema::ValueShape::Boolean => {
+        | super::schema::ValueShape::DeclarationOriginList => {
             unreachable!("unsupported value shape for an RQL pattern property")
         }
     }
@@ -1965,6 +1973,7 @@ fn rql_property_path(path: &str, property: RqlProperty) -> String {
         RqlProperty::Name => "name",
         RqlProperty::NameRegex => "name.regex",
         RqlProperty::TextRegex => "text.regex",
+        RqlProperty::BooleanValue => "boolean_value",
         RqlProperty::Capture => "capture",
         RqlProperty::NotKind => "not_kind",
         RqlProperty::Arity => "arity",
@@ -1999,6 +2008,7 @@ fn validate_plain_string(property: RqlProperty, value: &Expr, analysis: &mut Ana
         RqlProperty::NameRegex
         | RqlProperty::TextRegex
         | RqlProperty::ParameterTypeRegex
+        | RqlProperty::BooleanValue
         | RqlProperty::NotKind
         | RqlProperty::Arity
         | RqlProperty::Visibility

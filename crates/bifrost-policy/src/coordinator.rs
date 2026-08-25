@@ -232,6 +232,14 @@ impl RetainedSize for PolicyEvaluationOptions {
 /// Complete canonical report plus the already precedence-resolved CLI status.
 pub struct PolicyBatchOutcome {
     report: PolicyReportDocument,
+    /// Out-of-band wall-clock stage attribution for this run.
+    ///
+    /// The canonical report stays byte-identical across successful
+    /// invocations, so successful runs never carry timings inside the
+    /// document (#2611). This side channel always holds the measured stage
+    /// timings; a consumer that wants attribution reads it explicitly and a
+    /// consumer that hashes, diffs, or baselines the report never sees it.
+    stage_attribution: Vec<PolicyStageTiming>,
     taint_findings: Vec<brokk_bifrost_rql::structural::CodeQueryTaintFinding>,
     taint_analysis_results: Vec<Arc<crate::ProductionTaintAnalysisResult>>,
     exit_status: u8,
@@ -248,12 +256,42 @@ impl PolicyBatchOutcome {
         self.report
     }
 
+    /// Wall-clock stage attribution measured for this run, sorted by stage.
+    ///
+    /// This is the explicit opt-in channel for timings: it is never part of
+    /// the canonical report, which stays byte-identical across successful
+    /// invocations. On a deadline outcome the report's `execution` block
+    /// carries the same stages, because there elapsed time is the reason the
+    /// run stopped.
+    pub fn stage_attribution(&self) -> &[PolicyStageTiming] {
+        &self.stage_attribution
+    }
+
     pub fn record_preparation_timings(
         &mut self,
         selection_elapsed: Duration,
         suppression_preflight_elapsed: Duration,
         snapshot_elapsed: Duration,
     ) {
+        for (stage, elapsed) in [
+            (PolicyExecutionStage::PolicySelection, selection_elapsed),
+            (
+                PolicyExecutionStage::SuppressionPreflight,
+                suppression_preflight_elapsed,
+            ),
+            (PolicyExecutionStage::WorkspaceSnapshot, snapshot_elapsed),
+        ] {
+            if self
+                .stage_attribution
+                .iter()
+                .any(|timing| timing.stage() == stage)
+            {
+                continue;
+            }
+            self.stage_attribution
+                .push(PolicyStageTiming::from_duration(stage, elapsed));
+        }
+        self.stage_attribution.sort_by_key(PolicyStageTiming::stage);
         let current = self.report.execution();
         if current.termination().is_none() {
             return;
@@ -642,7 +680,7 @@ pub fn suppression_preflight_failure_outcome(
         PolicyExecutionStage::ReportConstruction,
         report_started.elapsed(),
     );
-    let mut complete_stage_timings = vec![
+    let complete_stage_timings = vec![
         PolicyStageTiming::from_duration(PolicyExecutionStage::PolicySelection, selection_elapsed),
         PolicyStageTiming::from_duration(
             PolicyExecutionStage::SuppressionPreflight,
@@ -655,7 +693,7 @@ pub fn suppression_preflight_failure_outcome(
     });
     let complete_execution = PolicyExecutionMetadata::try_new(
         complete_total_elapsed_ms,
-        std::mem::take(&mut complete_stage_timings),
+        complete_stage_timings.clone(),
         None,
         None,
         None,
@@ -675,6 +713,7 @@ pub fn suppression_preflight_failure_outcome(
     );
     Ok(PolicyBatchOutcome {
         report,
+        stage_attribution: complete_stage_timings,
         taint_findings: Vec::new(),
         taint_analysis_results: Vec::new(),
         exit_status: POLICY_EXIT_UNRELIABLE,
@@ -783,6 +822,8 @@ fn deadline_before_evaluation_outcome(
     let total_elapsed_ms = stage_timings.iter().fold(0_u64, |total, timing| {
         total.saturating_add(timing.elapsed_ms())
     });
+    let mut stage_attribution = stage_timings.clone();
+    stage_attribution.sort_by_key(PolicyStageTiming::stage);
     let execution = PolicyExecutionMetadata::try_new(
         total_elapsed_ms,
         stage_timings,
@@ -819,6 +860,7 @@ fn deadline_before_evaluation_outcome(
     );
     Ok(PolicyBatchOutcome {
         report,
+        stage_attribution,
         taint_findings: Vec::new(),
         taint_analysis_results: Vec::new(),
         exit_status: POLICY_EXIT_UNRELIABLE,
@@ -2261,25 +2303,30 @@ fn evaluate_prepared_policy_inputs(
     if policy_deadline_reached(cancellation)? {
         deadline_stage.get_or_insert(PolicyExecutionStage::ReportConstruction);
     }
+    // The measured stages always leave through the outcome's side channel.
+    // They enter the canonical report only on a deadline, where elapsed time
+    // is the reason the run stopped; a successful report stays byte-identical
+    // across invocations (#2611).
+    let stage_attribution = vec![
+        PolicyStageTiming::from_duration(
+            PolicyExecutionStage::PolicyRegistration,
+            registration_elapsed,
+        ),
+        PolicyStageTiming::from_duration(
+            PolicyExecutionStage::PolicyPreparation,
+            preparation_elapsed,
+        ),
+        PolicyStageTiming::from_duration(
+            PolicyExecutionStage::PolicyEvaluation,
+            evaluation_elapsed,
+        ),
+        PolicyStageTiming::from_duration(
+            PolicyExecutionStage::ReportConstruction,
+            report_started.elapsed(),
+        ),
+    ];
     if let Some(terminal_stage) = deadline_stage {
-        let stage_timings = vec![
-            PolicyStageTiming::from_duration(
-                PolicyExecutionStage::PolicyRegistration,
-                registration_elapsed,
-            ),
-            PolicyStageTiming::from_duration(
-                PolicyExecutionStage::PolicyPreparation,
-                preparation_elapsed,
-            ),
-            PolicyStageTiming::from_duration(
-                PolicyExecutionStage::PolicyEvaluation,
-                evaluation_elapsed,
-            ),
-            PolicyStageTiming::from_duration(
-                PolicyExecutionStage::ReportConstruction,
-                report_started.elapsed(),
-            ),
-        ];
+        let stage_timings = stage_attribution.clone();
         let total_elapsed_ms = stage_timings.iter().fold(0_u64, |total, timing| {
             total.saturating_add(timing.elapsed_ms())
         });
@@ -2311,6 +2358,7 @@ fn evaluate_prepared_policy_inputs(
     let exit_status = report_exit_status(&report, threshold_exceeded);
     Ok(PolicyBatchOutcome {
         report,
+        stage_attribution,
         taint_findings,
         taint_analysis_results,
         exit_status,
@@ -3963,6 +4011,89 @@ mod tests {
         assert_eq!(
             outcome.report().runs()[0].findings()[0].primary().path(),
             "app.ts"
+        );
+    }
+
+    #[test]
+    fn successful_run_keeps_default_execution_and_attributes_stages_out_of_band() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("app.ts"), "export const value = 1;\n")
+            .expect("source fixture");
+        let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
+        let project: Arc<dyn Project> = Arc::new(project);
+        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
+
+        let mut outcome = evaluate_policy_source(
+            workspace.path(),
+            PolicySourceIdentity::new("policies/timings.rqlp"),
+            &match_policy("test.timings", "Timings"),
+            &analyzer,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
+            &evaluation_options(),
+            None,
+        )
+        .expect("successful policy report");
+
+        // The canonical report stays byte-stable: a successful run publishes
+        // the default execution block, with no timings and no termination.
+        assert_eq!(
+            outcome.report().execution(),
+            &PolicyExecutionMetadata::default()
+        );
+        assert_eq!(
+            outcome
+                .stage_attribution()
+                .iter()
+                .map(PolicyStageTiming::stage)
+                .collect::<Vec<_>>(),
+            vec![
+                PolicyExecutionStage::PolicyRegistration,
+                PolicyExecutionStage::PolicyPreparation,
+                PolicyExecutionStage::PolicyEvaluation,
+                PolicyExecutionStage::ReportConstruction,
+            ]
+        );
+
+        outcome.record_preparation_timings(
+            Duration::from_millis(3),
+            Duration::from_millis(5),
+            Duration::from_millis(7),
+        );
+        // Preparation stages augment only the side channel; the report still
+        // carries the default execution block.
+        assert_eq!(
+            outcome.report().execution(),
+            &PolicyExecutionMetadata::default()
+        );
+        assert_eq!(
+            outcome
+                .stage_attribution()
+                .iter()
+                .map(|timing| (timing.stage(), timing.elapsed_ms()))
+                .take(3)
+                .collect::<Vec<_>>(),
+            vec![
+                (PolicyExecutionStage::PolicySelection, 3),
+                (PolicyExecutionStage::SuppressionPreflight, 5),
+                (PolicyExecutionStage::WorkspaceSnapshot, 7),
+            ]
+        );
+        assert_eq!(
+            outcome
+                .stage_attribution()
+                .iter()
+                .map(PolicyStageTiming::stage)
+                .collect::<Vec<_>>(),
+            vec![
+                PolicyExecutionStage::PolicySelection,
+                PolicyExecutionStage::SuppressionPreflight,
+                PolicyExecutionStage::WorkspaceSnapshot,
+                PolicyExecutionStage::PolicyRegistration,
+                PolicyExecutionStage::PolicyPreparation,
+                PolicyExecutionStage::PolicyEvaluation,
+                PolicyExecutionStage::ReportConstruction,
+            ]
         );
     }
 

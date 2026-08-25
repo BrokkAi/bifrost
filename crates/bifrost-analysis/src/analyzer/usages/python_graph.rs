@@ -20,7 +20,7 @@ use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{
     CandidateUsageHits, GraphFailureReason, GraphUsageOutcome, union_candidate_usages,
 };
-use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer, resolve_analyzer,
 };
@@ -252,9 +252,7 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
             }
 
             let mut scan_files = graph.scan_files(candidate_files, target.source());
-            if scan_scope.is_authoritative() {
-                scan_files.retain(|file| scan_scope.allows(file));
-            }
+            scan_files.retain(|file| scan_scope.allows(file));
 
             let scan_result =
                 match crate::analyzer::relational_frontier::resolve_relational_frontier(
@@ -387,20 +385,6 @@ impl GraphUsageAnalyzer for PythonExportUsageGraphStrategy {
         };
 
         resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
-    }
-}
-
-impl UsageAnalyzer for PythonExportUsageGraphStrategy {
-    fn find_usages(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
-        max_usages: usize,
-    ) -> FuzzyResult {
-        let scan_scope = UsageScanScope::new(candidate_files, false);
-        self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
-            .into_fuzzy_result()
     }
 }
 

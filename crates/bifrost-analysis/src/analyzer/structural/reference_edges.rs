@@ -32,10 +32,10 @@ use super::occurrence_rows::{
 use super::occurrences::{ALL_OCCURRENCE_ROLES, OccurrenceClass, OccurrenceRole};
 use super::resolution::EnvironmentAxis;
 use crate::analyzer::usages::{
-    FuzzyResult, ReferenceHit, ReferenceKind, UsageFinder, UsageHit, UsageHitKind, UsageHitSurface,
-    UsageProof, UsageQueryCompletion,
+    FuzzyResult, ReferenceEngine, ReferenceHit, ReferenceKind, UsageHit, UsageHitKind,
+    UsageHitSurface, UsageProof, UsageQueryCompletion,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
+use crate::analyzer::{CodeUnit, DeclarationId, IAnalyzer, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 
@@ -94,6 +94,14 @@ pub fn reference_hits_for_target(
     result: FuzzyResult,
     target: &CodeUnit,
 ) -> (Vec<ReferenceHit>, bool) {
+    reference_hits_from_fuzzy_result(analyzer, result, std::slice::from_ref(target))
+}
+
+fn reference_hits_from_fuzzy_result(
+    analyzer: &dyn IAnalyzer,
+    result: FuzzyResult,
+    fallback_targets: &[CodeUnit],
+) -> (Vec<ReferenceHit>, bool) {
     match result {
         FuzzyResult::Success {
             hits_by_overload,
@@ -101,13 +109,21 @@ pub fn reference_hits_for_target(
             ..
         } => (
             hits_by_overload
-                .into_values()
-                .flatten()
-                .map(|hit| {
-                    reference_hit_for_target(analyzer, hit, target.clone(), UsageProof::Proven)
+                .into_iter()
+                .flat_map(|(target, hits)| {
+                    hits.into_iter().map(move |hit| {
+                        reference_hit_for_target(analyzer, hit, target.clone(), UsageProof::Proven)
+                    })
                 })
-                .chain(unproven_by_overload.into_values().flatten().map(|hit| {
-                    reference_hit_for_target(analyzer, hit, target.clone(), UsageProof::Unproven)
+                .chain(unproven_by_overload.into_iter().flat_map(|(target, hits)| {
+                    hits.into_iter().map(move |hit| {
+                        reference_hit_for_target(
+                            analyzer,
+                            hit,
+                            target.clone(),
+                            UsageProof::Unproven,
+                        )
+                    })
                 }))
                 .collect(),
             false,
@@ -116,19 +132,35 @@ pub fn reference_hits_for_target(
             hits_by_overload, ..
         } => (
             hits_by_overload
-                .into_values()
-                .flatten()
-                .map(|hit| {
-                    reference_hit_for_target(analyzer, hit, target.clone(), UsageProof::Unproven)
+                .into_iter()
+                .flat_map(|(target, hits)| {
+                    hits.into_iter().map(move |hit| {
+                        reference_hit_for_target(
+                            analyzer,
+                            hit,
+                            target.clone(),
+                            UsageProof::Unproven,
+                        )
+                    })
                 })
                 .collect(),
             false,
         ),
         FuzzyResult::TooManyCallsites {
             sample_hits, limit, ..
-        } => (
-            reference_hits_from_bounded_sample(analyzer, sample_hits, target.clone(), limit),
-            true,
+        } => fallback_targets.first().map_or_else(
+            || (Vec::new(), true),
+            |target| {
+                (
+                    reference_hits_from_bounded_sample(
+                        analyzer,
+                        sample_hits,
+                        target.clone(),
+                        limit,
+                    ),
+                    true,
+                )
+            },
         ),
         FuzzyResult::Failure { .. } => (Vec::new(), false),
     }
@@ -277,6 +309,14 @@ pub struct ReferenceEdgeRow {
 }
 
 impl ReferenceEdgeRow {
+    pub fn target_id(&self) -> DeclarationId {
+        self.target.declaration_id()
+    }
+
+    pub fn source_id(&self) -> Option<DeclarationId> {
+        self.site.enclosing.as_ref().map(CodeUnit::declaration_id)
+    }
+
     /// Whether this edge belongs to the given usage surface. Definition sites
     /// and import bindings are editor-visible but not external usages, exactly
     /// as on the usage-hit surface this delegates to.
@@ -362,6 +402,147 @@ pub struct EdgeDerivationResult {
     /// inverse projection, however complete it is, and vice versa.
     pub provenance: EdgeProvenance,
     pub generation: u64,
+}
+
+/// Work performed by one common-engine run. These counters are semantic cost
+/// accounting rather than timing: they stay useful in deterministic regressions
+/// and make an incomplete result explicit at the same boundary as its rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReferenceWork {
+    pub candidate_files: usize,
+    pub scanned_files: usize,
+    pub scanned_source_bytes: usize,
+    pub emitted_edges: usize,
+}
+
+/// Canonical output of either reference-engine workload.
+#[derive(Debug, Clone)]
+pub struct ReferenceRun {
+    pub edges: Vec<ReferenceEdgeRow>,
+    pub completeness: EdgeCompleteness,
+    pub generation: u64,
+    pub work: ReferenceWork,
+}
+
+impl<'a> ReferenceEngine<'a> {
+    /// Resolve references to exact declaration targets through the common
+    /// candidate-planning and admission pipeline, then project every overload
+    /// bucket into canonical edge rows without losing its target identity.
+    pub fn references_to_edges(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        targets: &[CodeUnit],
+        max_files: usize,
+        max_usages: usize,
+        max_source_bytes: Option<usize>,
+    ) -> ReferenceRun {
+        let query = self.query_with_provider_and_source_budget(
+            analyzer,
+            targets,
+            None,
+            max_files,
+            max_usages,
+            max_source_bytes,
+        );
+        let generation = analyzer.project().analysis_generation();
+        let mut reasons = match query.completion {
+            UsageQueryCompletion::Complete => Vec::new(),
+            UsageQueryCompletion::Cancelled => vec![EdgeIncompleteReason::Cancelled],
+            UsageQueryCompletion::CandidateFilesBudgetExhausted
+            | UsageQueryCompletion::SourceBytesBudgetExhausted => {
+                vec![EdgeIncompleteReason::UsageListingTruncated]
+            }
+        };
+        let candidate_files = query.candidate_files.len();
+        let scanned_source_bytes = query.scanned_source_bytes;
+        if let FuzzyResult::Failure {
+            reason_kind,
+            reason,
+            ..
+        } = &query.result
+        {
+            reasons.push(EdgeIncompleteReason::UsageAnalysisFailed {
+                reason_kind: reason_kind.clone(),
+                reason: reason.clone(),
+            });
+        }
+        let (hits, truncated) = reference_hits_from_fuzzy_result(analyzer, query.result, targets);
+        if truncated {
+            reasons.push(EdgeIncompleteReason::UsageListingTruncated);
+        }
+        let edges =
+            edge_rows_from_reference_hits(analyzer, hits, generation, Some(self.cancellation()));
+        let emitted_edges = edges.len();
+        ReferenceRun {
+            edges,
+            completeness: if reasons.is_empty() {
+                EdgeCompleteness::Complete
+            } else {
+                EdgeCompleteness::Incomplete { reasons }
+            },
+            generation,
+            work: ReferenceWork {
+                candidate_files,
+                scanned_files: candidate_files,
+                scanned_source_bytes,
+                emitted_edges,
+            },
+        }
+    }
+
+    /// Stream the explicitly selected files through the same canonical
+    /// occurrence-to-declaration relation. The input slice is the hard scope:
+    /// this method never discovers or opens another file as a scan unit.
+    pub fn scan_file_edges(&self, analyzer: &dyn IAnalyzer, files: &[ProjectFile]) -> ReferenceRun {
+        let generation = analyzer.project().analysis_generation();
+        let mut edges = Vec::new();
+        let mut reasons = Vec::new();
+        let mut scanned_files = 0usize;
+        let mut scanned_source_bytes = 0usize;
+        for file in files {
+            if self.cancellation().is_cancelled() {
+                reasons.push(EdgeIncompleteReason::Cancelled);
+                break;
+            }
+            scanned_files += 1;
+            scanned_source_bytes = scanned_source_bytes.saturating_add(
+                analyzer
+                    .indexed_source(file)
+                    .map_or(0, |source| source.len()),
+            );
+            match forward_edges_for_file(analyzer, file, self.cancellation()) {
+                Ok(result) => {
+                    edges.extend(result.edges);
+                    if let EdgeCompleteness::Incomplete {
+                        reasons: file_reasons,
+                    } = result.completeness
+                    {
+                        reasons.extend(file_reasons);
+                    }
+                }
+                Err(OccurrencesCancelled) => {
+                    reasons.push(EdgeIncompleteReason::Cancelled);
+                    break;
+                }
+            }
+        }
+        let emitted_edges = edges.len();
+        ReferenceRun {
+            edges,
+            completeness: if reasons.is_empty() {
+                EdgeCompleteness::Complete
+            } else {
+                EdgeCompleteness::Incomplete { reasons }
+            },
+            generation,
+            work: ReferenceWork {
+                candidate_files: files.len(),
+                scanned_files,
+                scanned_source_bytes,
+                emitted_edges,
+            },
+        }
+    }
 }
 
 impl EdgeDerivationResult {
@@ -608,7 +789,7 @@ impl SiteIdentityIndex {
 /// A `Vec` and not a set on purpose: two hits that disagree only on proof or
 /// kind are two rows here, where the usage-hit identity would collapse them.
 /// The disagreement is the data.
-fn edge_rows_from_reference_hits(
+pub(crate) fn edge_rows_from_reference_hits(
     analyzer: &dyn IAnalyzer,
     hits: impl IntoIterator<Item = ReferenceHit>,
     generation: u64,
@@ -768,41 +949,21 @@ pub fn inverse_edges_for_declaration(
         }
     }
 
-    let mut finder = UsageFinder::new();
+    let mut finder = ReferenceEngine::new();
     if let Some(cancellation) = cancellation {
         finder = finder.with_cancellation(cancellation.clone());
     }
-    let query = finder.query(
+    let run = finder.references_to_edges(
         analyzer,
         std::slice::from_ref(declaration),
         MAX_INVERSE_EDGE_FILES,
         MAX_INVERSE_EDGE_HITS,
+        None,
     );
-
-    let mut reasons = Vec::new();
-    match query.completion {
-        UsageQueryCompletion::Complete => {}
-        UsageQueryCompletion::Cancelled => reasons.push(EdgeIncompleteReason::Cancelled),
-        UsageQueryCompletion::CandidateFilesBudgetExhausted
-        | UsageQueryCompletion::SourceBytesBudgetExhausted => {
-            reasons.push(EdgeIncompleteReason::UsageListingTruncated);
-        }
-    }
-    if let crate::analyzer::usages::FuzzyResult::Failure {
-        reason_kind,
-        reason,
-        ..
-    } = &query.result
-    {
-        reasons.push(EdgeIncompleteReason::UsageAnalysisFailed {
-            reason_kind: reason_kind.clone(),
-            reason: reason.clone(),
-        });
-    }
-    let (hits, truncated) = reference_hits_for_target(analyzer, query.result, declaration);
-    if truncated {
-        reasons.push(EdgeIncompleteReason::UsageListingTruncated);
-    }
+    let mut reasons = match run.completeness {
+        EdgeCompleteness::Complete => Vec::new(),
+        EdgeCompleteness::Incomplete { reasons } => reasons,
+    };
     if supports_edge_axis(analyzer, file, EdgeAxis::OwnerClassification) != Some(true) {
         reasons.push(EdgeIncompleteReason::AxisUnsupported(
             EdgeAxis::OwnerClassification,
@@ -810,7 +971,7 @@ pub fn inverse_edges_for_declaration(
     }
 
     EdgeDerivationResult {
-        edges: edge_rows_from_reference_hits(analyzer, hits, generation, cancellation),
+        edges: run.edges,
         completeness: if reasons.is_empty() {
             EdgeCompleteness::Complete
         } else {
@@ -938,6 +1099,7 @@ pub fn forward_edges_for_file(
 mod tests {
     use super::*;
     use crate::analyzer::{AnalyzerConfig, Language, Project, TestProject, WorkspaceAnalyzer};
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -1049,6 +1211,83 @@ mod tests {
         assert_eq!(forward_call.site.ast_id, inverse_call.site.ast_id);
         assert_eq!(forward_call.owner_relation, inverse_call.owner_relation);
         assert_ne!(forward_call.owner_relation, OwnerRelation::Unknown);
+    }
+
+    #[test]
+    fn fuzzy_overload_buckets_keep_their_exact_edge_targets() {
+        let fixture = Fixture::new(
+            Language::Java,
+            &[(
+                "src/Overloads.java",
+                "package fixture; class Overloads { void call(int value) {} void call(String value) {} void caller() {} }",
+            )],
+        );
+        let analyzer = fixture.analyzer();
+        let mut overloads = analyzer
+            .all_declarations()
+            .filter(|unit| unit.fq_name().ends_with("Overloads.call"))
+            .collect::<Vec<_>>();
+        overloads.sort_by(|left, right| left.signature().cmp(&right.signature()));
+        assert_eq!(overloads.len(), 2);
+        let enclosing = fixture.declaration("Overloads.caller");
+        let hits_by_overload = overloads
+            .iter()
+            .enumerate()
+            .map(|(index, target)| {
+                (
+                    target.clone(),
+                    BTreeSet::from([UsageHit::new(
+                        fixture.files[0].clone(),
+                        1,
+                        index,
+                        index + 1,
+                        enclosing.clone(),
+                        1.0,
+                        "call",
+                    )]),
+                )
+            })
+            .collect();
+        let (hits, truncated) = reference_hits_from_fuzzy_result(
+            analyzer,
+            FuzzyResult::Success {
+                hits_by_overload,
+                unproven_by_overload: HashMap::default(),
+                unproven_total_by_overload: HashMap::default(),
+            },
+            &overloads,
+        );
+        assert!(!truncated);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits.into_iter()
+                .map(|hit| hit.resolved)
+                .collect::<BTreeSet<_>>(),
+            overloads.into_iter().collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn reference_engine_file_scan_never_expands_its_hard_scope() {
+        let fixture = Fixture::new(
+            Language::Java,
+            &[
+                ("src/Registry.java", JAVA_TARGET),
+                ("src/Startup.java", JAVA_CALLER),
+                (
+                    "src/Other.java",
+                    "package fixture; class Other { void unrelated() {} }",
+                ),
+            ],
+        );
+        let run = ReferenceEngine::new().scan_file_edges(fixture.analyzer(), &fixture.files[1..2]);
+        assert_eq!(run.work.candidate_files, 1);
+        assert_eq!(run.work.scanned_files, 1);
+        assert!(
+            run.edges
+                .iter()
+                .all(|edge| edge.site.file == fixture.files[1])
+        );
     }
 
     const JAVA_BASE: &str =
@@ -1274,10 +1513,12 @@ mod tests {
         assert_eq!(inverse_call.usage_kind, UsageHitKind::Reference);
     }
 
-    /// An adapter without a forward surface answers with a typed abstention,
-    /// never an empty complete set.
+    /// Kotlin's forward surface is supported, while its one uncovered
+    /// occurrence role remains an explicit completeness gap. Supported roles
+    /// retain their role-scoped completeness even when this fixture has no
+    /// reference sites.
     #[test]
-    fn a_language_without_forward_support_reports_the_axis_not_empty_rows() {
+    fn kotlin_forward_support_reports_only_its_uncovered_occurrence_role() {
         let fixture = Fixture::new(
             Language::Kotlin,
             &[(
@@ -1295,13 +1536,15 @@ mod tests {
         assert_eq!(
             result.completeness,
             EdgeCompleteness::Incomplete {
-                reasons: vec![EdgeIncompleteReason::AxisUnsupported(
-                    EdgeAxis::ForwardProjection
-                )]
+                reasons: vec![EdgeIncompleteReason::OccurrenceRowsIncomplete {
+                    uncovered_roles: vec![OccurrenceRole::PatternPosition]
+                }]
             }
         );
         assert!(!result.covers(EdgeAxis::ForwardProjection));
         assert!(!result.covers(EdgeAxis::InverseProjection));
+        assert!(result.covers_forward_role(OccurrenceRole::MemberPosition));
+        assert!(!result.covers_forward_role(OccurrenceRole::PatternPosition));
     }
 
     /// Two hits that disagree only on proof are two canonical rows. The

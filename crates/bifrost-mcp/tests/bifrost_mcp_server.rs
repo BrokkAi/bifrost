@@ -1068,6 +1068,12 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
         structured["report"]["execution"]["stage_timings"],
         json!([])
     );
+    // Stage attribution is an explicit opt-in sibling (#2611): by default the
+    // result carries no `stage_timings` key at all.
+    assert!(
+        structured.get("stage_timings").is_none(),
+        "timings must be requested explicitly: {baseline}"
+    );
     assert_eq!(
         structured["report"]["evaluation"]["evaluation_date"],
         evaluation_date
@@ -1075,6 +1081,54 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     assert_eq!(
         structured["report"]["runs"][0]["findings"][0]["primary"]["path"],
         "src/app.py"
+    );
+
+    let attributed = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "run_policy",
+                "arguments": {
+                    "policy_files": ["policies/dynamic-eval.rqlp"],
+                    "evaluation_date": evaluation_date,
+                    "fail_on": "warning",
+                    "include_stage_timings": true
+                }
+            }
+        }),
+    );
+    assert_eq!(attributed["result"]["isError"], false, "{attributed}");
+    let attributed = &attributed["result"]["structuredContent"];
+    // The canonical report is identical to the unattributed run's: requested
+    // timings ride beside it, never inside it.
+    assert_eq!(attributed["report"], expected_report, "{attributed}");
+    assert_eq!(
+        attributed["report"]["execution"]["stage_timings"],
+        json!([])
+    );
+    let attribution_stages = attributed["stage_timings"]
+        .as_array()
+        .expect("requested stage timings")
+        .iter()
+        .map(|timing| timing["stage"].as_str().expect("stage name").to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attribution_stages,
+        vec![
+            "policy_selection",
+            "suppression_preflight",
+            "workspace_snapshot",
+            "policy_registration",
+            "policy_preparation",
+            "policy_evaluation",
+            "report_construction",
+        ],
+        "{attributed}"
     );
 
     let policy_id = structured["report"]["rules"][0]["policy_id"].clone();

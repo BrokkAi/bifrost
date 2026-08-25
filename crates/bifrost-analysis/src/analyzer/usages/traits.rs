@@ -37,7 +37,7 @@ pub trait UsageAnalyzer: Send + Sync {
 }
 
 /// Graph-backed usage strategy that can distinguish fallback-safe gaps from terminal failures.
-pub(crate) trait GraphUsageAnalyzer: UsageAnalyzer {
+pub(crate) trait GraphUsageAnalyzer: Send + Sync {
     /// Prepare language-specific candidate and resolver state before generic
     /// file-count and source-byte admission. Most languages need no preparation.
     fn prepare_usage_query(
@@ -45,7 +45,6 @@ pub(crate) trait GraphUsageAnalyzer: UsageAnalyzer {
         _analyzer: &dyn IAnalyzer,
         _overloads: &[CodeUnit],
         _candidate_files: &HashSet<ProjectFile>,
-        _authoritative: bool,
         _cancellation: &CancellationToken,
     ) -> Option<Box<dyn PreparedUsageQuery>> {
         None
@@ -58,6 +57,27 @@ pub(crate) trait GraphUsageAnalyzer: UsageAnalyzer {
         scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome;
+}
+
+impl<T> UsageAnalyzer for T
+where
+    T: GraphUsageAnalyzer,
+{
+    fn find_usages(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        candidate_files: &HashSet<ProjectFile>,
+        max_usages: usize,
+    ) -> FuzzyResult {
+        super::finder::execute_graph_usage_query_in_scope(
+            self,
+            analyzer,
+            overloads,
+            candidate_files,
+            max_usages,
+        )
+    }
 }
 
 /// Per-language resolver for the `scan_usages` (query) path. Borrows the concrete
@@ -85,4 +105,13 @@ pub(crate) trait UsageQueryResolver<'a>: Sized {
 /// candidates is fine; missing real call sites is not.
 pub trait CandidateFileProvider: Send + Sync {
     fn find_candidates(&self, target: &CodeUnit, analyzer: &dyn IAnalyzer) -> HashSet<ProjectFile>;
+
+    /// Whether the returned files are the caller's complete execution scope.
+    ///
+    /// Discovery providers return false so language plugins can add structured
+    /// candidates such as Ruby autoload consumers. A path-scoped provider returns
+    /// true because scanning any file outside its result would violate the request.
+    fn is_complete_scope(&self) -> bool {
+        false
+    }
 }

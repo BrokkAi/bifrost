@@ -37,11 +37,10 @@ use crate::analyzer::languages::{
     LocalDeclarationVisibility, ReceiverFactsFactory, analyzable_file_count,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::inverted_edges::{NodeKey, UsageNodeKey};
 use crate::analyzer::usages::js_ts_graph::{
     JsTsExportUsageGraphStrategy, JsTsReceiverFacts, build_jsts_scoped_usage_edges,
-    build_rooted_jsts_usage_edges,
+    build_rooted_jsts_scoped_usage_edges,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
@@ -249,12 +248,11 @@ impl LanguageSupport for JavascriptSupport {
         UsageEcosystem::JavaScriptTypeScript
     }
 
-    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
-        &JS_TS_USAGE_STRATEGY
-    }
-
-    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
-        Some(&JsTsEdgePass)
+    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
+        crate::analyzer::languages::ReferenceLanguagePlugin::new(
+            &JS_TS_USAGE_STRATEGY,
+            &JsTsEdgePass,
+        )
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -363,12 +361,11 @@ impl LanguageSupport for TypescriptSupport {
         UsageEcosystem::JavaScriptTypeScript
     }
 
-    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
-        &JS_TS_USAGE_STRATEGY
-    }
-
-    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
-        Some(&JsTsEdgePass)
+    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
+        crate::analyzer::languages::ReferenceLanguagePlugin::new(
+            &JS_TS_USAGE_STRATEGY,
+            &JsTsEdgePass,
+        )
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -426,8 +423,13 @@ impl LanguageEdgePass for JsTsEdgePass {
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
         let scope = AnalyzerQueryScope::new(ctx.analyzer);
-        build_rooted_jsts_usage_edges(ctx.analyzer, scope.token(), ctx.fqns, ctx.keep_file)
-            .map(LanguageEdgeSites)
+        build_rooted_jsts_scoped_usage_edges(
+            ctx.analyzer,
+            scope.token(),
+            ctx.scoped_callers,
+            ctx.keep_file,
+        )
+        .map(LanguageEdgeSites::Scoped)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

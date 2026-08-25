@@ -1,6 +1,6 @@
 use crate::declarations::{RubyFieldScope, extract_name_path};
 use crate::graph::RubyGraphSource;
-use crate::graph_support::{RubySemanticFacts, RubySource};
+use crate::graph_support::RubySource;
 use crate::mixins::{ruby_forward_mixin_specs, ruby_forward_superclass_targets};
 use brokk_bifrost_core::analyzer::model::RubyMethodDispatchMode;
 use brokk_bifrost_core::analyzer::type_relations::TypeRelationKind;
@@ -129,7 +129,6 @@ pub struct ReceiverType {
 pub struct RubySemanticIndex<'a> {
     pub graph: RubyGraphSource<'a>,
     pub ruby: &'a dyn RubySource,
-    facts: Option<&'a RubySemanticFacts>,
     target: Option<CodeUnit>,
     forward_owner_facts: RefCell<HashMap<String, RubyForwardOwnerFacts>>,
     pub factory_return_cache: RefCell<HashMap<FactoryInferenceKey, Option<String>>>,
@@ -164,7 +163,6 @@ impl<'a> RubySemanticIndex<'a> {
         Self {
             graph,
             ruby,
-            facts: target.as_ref().map(|_| ruby.semantic_facts()),
             target,
             forward_owner_facts: RefCell::new(HashMap::default()),
             factory_return_cache: RefCell::new(HashMap::default()),
@@ -563,15 +561,6 @@ impl<'a> RubySemanticIndex<'a> {
         visible_files: &[ProjectFile],
         owner: &str,
     ) -> Vec<String> {
-        if let Some(facts) = self.facts {
-            let mut direct: Vec<String> = facts
-                .ancestors
-                .get(owner)
-                .map(|items| items.iter().cloned().collect())
-                .unwrap_or_default();
-            direct.sort();
-            return direct;
-        }
         self.forward_owner_facts(support, visible_files, owner)
             .ancestors
     }
@@ -633,15 +622,6 @@ impl<'a> RubySemanticIndex<'a> {
         owner: &str,
         kind: TypeRelationKind,
     ) -> Vec<String> {
-        if let Some(facts) = self.facts {
-            let index = match kind {
-                TypeRelationKind::MixinInclude => &facts.mixin_included_owners,
-                TypeRelationKind::MixinPrepend => &facts.mixin_prepended_owners,
-                TypeRelationKind::MixinExtend => &facts.mixin_class_owners,
-                _ => return Vec::new(),
-            };
-            return index.get(owner).cloned().unwrap_or_default();
-        }
         let facts = self.forward_owner_facts(support, visible_files, owner);
         match kind {
             TypeRelationKind::MixinInclude => facts.included,
@@ -651,38 +631,12 @@ impl<'a> RubySemanticIndex<'a> {
         }
     }
 
-    pub fn ancestor_lookup_order(&self, owner: &str) -> Vec<String> {
-        let Some(facts) = self.facts else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        let mut visited = HashSet::default();
-        let mut stack: Vec<String> = facts
-            .ancestors
-            .get(owner)
-            .map(|items| items.iter().cloned().collect())
-            .unwrap_or_default();
-        while let Some(candidate) = stack.pop() {
-            if !visited.insert(candidate.clone()) {
-                continue;
-            }
-            out.push(candidate.clone());
-            if let Some(next) = facts.ancestors.get(&candidate) {
-                stack.extend(next.iter().cloned());
-            }
-        }
-        out
-    }
-
     pub fn forward_ancestor_lookup_order(
         &self,
         support: &dyn BoundedDefinitionLookup,
         visible_files: &[ProjectFile],
         owner: &str,
     ) -> Vec<String> {
-        if self.facts.is_some() {
-            return self.ancestor_lookup_order(owner);
-        }
         let mut out = Vec::new();
         let mut visited = HashSet::default();
         let mut stack = self

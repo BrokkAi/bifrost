@@ -374,10 +374,11 @@ pub fn run_code_query_repl(root: PathBuf) -> Result<(), String> {
     let canonical_root = root
         .canonicalize()
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
-    let mut service = LazySearchService::new(canonical_root);
     if io::stdin().is_terminal() {
+        let mut service = LazySearchService::watching(canonical_root);
         run_interactive(&mut service)
     } else {
+        let mut service = LazySearchService::scripted(canonical_root);
         run_scripted(&mut service)
     }
 }
@@ -385,21 +386,29 @@ pub fn run_code_query_repl(root: PathBuf) -> Result<(), String> {
 struct LazySearchService {
     root: PathBuf,
     service: Option<SearchToolsService>,
+    initialize: fn(PathBuf) -> Result<SearchToolsService, String>,
 }
 
 impl LazySearchService {
-    fn new(root: PathBuf) -> Self {
+    fn watching(root: PathBuf) -> Self {
         Self {
             root,
             service: None,
+            initialize: SearchToolsService::new_without_semantic_index,
+        }
+    }
+
+    fn scripted(root: PathBuf) -> Self {
+        Self {
+            root,
+            service: None,
+            initialize: SearchToolsService::new_manual_persisted,
         }
     }
 
     fn get_or_init(&mut self) -> Result<&SearchToolsService, String> {
         if self.service.is_none() {
-            self.service = Some(SearchToolsService::new_without_semantic_index(
-                self.root.clone(),
-            )?);
+            self.service = Some((self.initialize)(self.root.clone())?);
         }
         Ok(self.service.as_ref().expect("service initialized"))
     }
@@ -2550,7 +2559,7 @@ mod tests {
     #[test]
     fn rune_ir_capture_does_not_initialize_lazy_search_service() {
         let mut session = ReplSession::new();
-        let mut service = LazySearchService::new(PathBuf::from("unused"));
+        let mut service = LazySearchService::scripted(PathBuf::from("unused"));
         process_line_with_lazy_service(&mut session, ":ir rust", &mut service).unwrap();
         process_line_with_lazy_service(&mut session, "fn demo() {}", &mut service).unwrap();
         let (_, output) =

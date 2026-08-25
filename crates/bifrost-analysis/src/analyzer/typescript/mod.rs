@@ -301,10 +301,6 @@ impl TypescriptAnalyzer {
         }
     }
 
-    pub(crate) fn prewarm_jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {
-        providers::prewarm_jsts_usage_index(self)
-    }
-
     pub(crate) fn new_with_config_store_context(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,

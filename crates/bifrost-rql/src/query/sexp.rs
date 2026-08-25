@@ -1189,6 +1189,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         RqlForm::Name
         | RqlForm::NameRegex
         | RqlForm::TextRegex
+        | RqlForm::BooleanValue
         | RqlForm::Capture
         | RqlForm::Has
         | RqlForm::NotHas
@@ -1522,6 +1523,15 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
             )
             .at(expr)?;
         }
+        RqlForm::BooleanValue => {
+            expect_len(expr, items, 2, "boolean-value")?;
+            insert_unique(
+                &mut object,
+                "boolean_value",
+                Value::Bool(boolean_arg(&items[1])?),
+            )
+            .at(expr)?;
+        }
         RqlForm::Capture => {
             expect_len(expr, items, 2, "capture")?;
             insert_unique(
@@ -1724,6 +1734,10 @@ fn insert_keyword(
             RqlProperty::TextRegex => {
                 insert_unique(object, "text", json!({ "regex": string_arg(value)? })).at(key_expr)
             }
+            RqlProperty::BooleanValue => {
+                insert_unique(object, "boolean_value", Value::Bool(boolean_arg(value)?))
+                    .at(key_expr)
+            }
             RqlProperty::Capture => {
                 insert_unique(object, "capture", Value::String(string_arg(value)?)).at(key_expr)
             }
@@ -1806,6 +1820,14 @@ fn single_role_value(expr: &Expr) -> LowerResult<Value> {
     match expr.as_string() {
         Some(value) => Ok(json!({ "name": value })),
         None => pattern_to_json(expr),
+    }
+}
+
+fn boolean_arg(expr: &Expr) -> LowerResult<bool> {
+    match &expr.kind {
+        ExprKind::Symbol(value) if value == "true" => Ok(true),
+        ExprKind::Symbol(value) if value == "false" => Ok(false),
+        _ => Err(lower_error(expr, "expected true or false")),
     }
 }
 

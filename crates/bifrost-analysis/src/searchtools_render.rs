@@ -492,6 +492,14 @@ impl RenderText for UsageGraphResult {
             self.nodes.len(),
             self.edges.len()
         )];
+        if !self.complete {
+            lines.push("Incomplete graph:".to_string());
+            lines.extend(
+                self.incomplete_reasons
+                    .iter()
+                    .map(|reason| format!("- {}: {}", reason.code, reason.message)),
+            );
+        }
         if !self.truncated_symbols.is_empty() {
             lines.push(format!(
                 "{} truncated symbol(s); re-call {} with narrower paths for call-site detail:",

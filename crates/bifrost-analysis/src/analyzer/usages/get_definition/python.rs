@@ -1536,7 +1536,15 @@ pub(super) fn resolve_python(
             if object_text.is_empty() || attribute_text.is_empty() {
                 return no_definition("no_reference_text", "Python attribute reference is blank");
             }
-            let object_shadowed = python_name_shadowed_at(object_text, object, source);
+            // Shadowing belongs to the root binding, not the rendered object
+            // chain. For `K.feature.DISK` the import binder is `K`; asking the
+            // lexical inventory about the non-binding spelling `K.feature`
+            // allowed a parameter named `K` to fall through to the namespace
+            // import route.
+            let (shadow_name, shadow_site) = python_attribute_root_identifier(object)
+                .map(|root| (python_slice(root, source), root))
+                .unwrap_or((object_text, object));
+            let object_shadowed = python_name_shadowed_at(shadow_name, shadow_site, source);
             if !object_shadowed && let Some(module) = ctx.namespace_module_for_node(object, source)
             {
                 return python_fqn_outcome(
@@ -3151,6 +3159,13 @@ fn python_name_shadowed_at(name: &str, reference: Node<'_>, source: &str) -> boo
         }
     }
     false
+}
+
+fn python_attribute_root_identifier(mut node: Node<'_>) -> Option<Node<'_>> {
+    while node.kind() == "attribute" {
+        node = node.child_by_field_name("object")?;
+    }
+    (node.kind() == "identifier").then_some(node)
 }
 
 fn python_is_non_reference_context(node: Node<'_>) -> bool {

@@ -1,11 +1,11 @@
 //! Compact exact-identity usage graph shared by relevance ranking and graph APIs.
 
 use super::common::{language_for_file, language_for_target};
-use super::inverted_edges::{UsageEdgeWeights, UsageNodeKey, UsageReferenceCounts};
+use super::inverted_edges::{UsageNodeKey, UsageReferenceCounts};
 use crate::analyzer::languages::{
     EdgeWeightScanCtx, LanguageEdgeWeights, LanguageSupport, edge_passes, language_support,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{CodeUnit, DeclarationId, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,9 +13,10 @@ use std::ffi::OsStr;
 
 /// The name universe a declaration's identity belongs to.
 ///
-/// One ecosystem is one candidate space: two declarations in the same
-/// ecosystem with the same fully-qualified name are the same node, and a
-/// reference resolved anywhere in the ecosystem can land on any of its nodes.
+/// One ecosystem is one candidate space: a reference resolved anywhere in the
+/// ecosystem can land on any declaration in it. Exact declaration identity is
+/// carried separately by [`WorkspaceUsageNodeKey::id`]; equal names never
+/// collapse overloads or duplicate declarations.
 ///
 /// Java, Scala, and Kotlin share a single `Jvm` ecosystem because they compile
 /// to one classpath and can name one another's types directly. Sharing the
@@ -67,6 +68,7 @@ impl UsageEcosystem {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct WorkspaceUsageNodeKey {
+    pub(crate) id: DeclarationId,
     pub(crate) ecosystem: UsageEcosystem,
     pub(crate) fqn: String,
     pub(crate) defining_file: Option<ProjectFile>,
@@ -76,17 +78,10 @@ impl WorkspaceUsageNodeKey {
     pub(crate) fn for_declaration(unit: &CodeUnit) -> Self {
         let ecosystem = UsageEcosystem::of(language_for_target(unit));
         Self {
+            id: unit.declaration_id(),
             ecosystem,
             fqn: unit.fq_name(),
             defining_file: ecosystem.is_module_scoped().then(|| unit.source().clone()),
-        }
-    }
-
-    fn package_scoped(ecosystem: UsageEcosystem, fqn: String) -> Self {
-        Self {
-            ecosystem,
-            fqn,
-            defining_file: None,
         }
     }
 }
@@ -97,6 +92,7 @@ pub(crate) struct WorkspaceUsageNode {
     pub(crate) primary: CodeUnit,
     pub(crate) primary_range: Option<Range>,
     pub(crate) declaration_files: Vec<ProjectFile>,
+    pub(crate) declaration_ids: Vec<DeclarationId>,
     pub(crate) truncated_inbound: Option<usize>,
     pub(crate) unproven_inbound: usize,
 }
@@ -131,8 +127,7 @@ impl WorkspaceUsageNode {
 
 pub(crate) struct WorkspaceUsageCatalog {
     pub(crate) nodes: Vec<WorkspaceUsageNode>,
-    indices: HashMap<WorkspaceUsageNodeKey, usize>,
-    fqns_by_ecosystem: HashMap<UsageEcosystem, HashSet<String>>,
+    indices_by_id: HashMap<DeclarationId, usize>,
 }
 
 impl WorkspaceUsageCatalog {
@@ -231,24 +226,40 @@ impl WorkspaceUsageCatalog {
         declarations: Vec<(CodeUnit, Option<Range>)>,
         cancellation: &CancellationToken,
     ) -> Option<Self> {
-        let mut grouped: BTreeMap<WorkspaceUsageNodeKey, Vec<(CodeUnit, Option<Range>)>> =
-            BTreeMap::new();
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+        struct GroupKey {
+            ecosystem: UsageEcosystem,
+            fqn: String,
+            kind: crate::analyzer::CodeUnitType,
+            signature: Option<String>,
+            exact_declaration: Option<DeclarationId>,
+        }
+
+        let mut grouped: BTreeMap<GroupKey, Vec<(CodeUnit, Option<Range>)>> = BTreeMap::new();
         for (unit, range) in declarations {
             if cancellation.is_cancelled() {
                 return None;
             }
             if is_graph_declaration(&unit) {
+                let ecosystem = UsageEcosystem::of(language_for_target(&unit));
+                let exact_declaration =
+                    (!matches!(ecosystem, UsageEcosystem::Cpp | UsageEcosystem::CSharp))
+                        .then(|| unit.declaration_id());
                 grouped
-                    .entry(WorkspaceUsageNodeKey::for_declaration(&unit))
+                    .entry(GroupKey {
+                        ecosystem,
+                        fqn: unit.fq_name(),
+                        kind: unit.kind(),
+                        signature: unit.signature().map(str::to_string),
+                        exact_declaration,
+                    })
                     .or_default()
                     .push((unit, range));
             }
         }
 
         let mut nodes = Vec::with_capacity(grouped.len());
-        let mut indices = HashMap::default();
-        let mut fqns_by_ecosystem: HashMap<UsageEcosystem, HashSet<String>> = HashMap::default();
-        for (key, mut declarations) in grouped {
+        for (_, mut declarations) in grouped {
             if cancellation.is_cancelled() {
                 return None;
             }
@@ -266,58 +277,44 @@ impl WorkspaceUsageCatalog {
                 .first()
                 .expect("catalog groups are never empty")
                 .clone();
+            let key = WorkspaceUsageNodeKey::for_declaration(&primary);
             let mut declaration_files: Vec<_> = declarations
                 .iter()
                 .map(|(unit, _)| unit.source().clone())
                 .collect();
             declaration_files.sort();
             declaration_files.dedup();
-            let index = nodes.len();
-            indices.insert(key.clone(), index);
-            fqns_by_ecosystem
-                .entry(key.ecosystem)
-                .or_default()
-                .insert(key.fqn.clone());
+            let mut declaration_ids = declarations
+                .iter()
+                .map(|(unit, _)| unit.declaration_id())
+                .collect::<Vec<_>>();
+            declaration_ids.sort();
+            declaration_ids.dedup();
             nodes.push(WorkspaceUsageNode {
                 key,
                 primary,
                 primary_range,
                 declaration_files,
+                declaration_ids,
                 truncated_inbound: None,
                 unproven_inbound: 0,
             });
         }
+        nodes.sort_by(|left, right| left.key.id.cmp(&right.key.id));
+        let mut indices_by_id = HashMap::default();
+        for (index, node) in nodes.iter().enumerate() {
+            for id in &node.declaration_ids {
+                let previous = indices_by_id.insert(id.clone(), index);
+                assert!(
+                    previous.is_none(),
+                    "one declaration ID belongs to one graph node"
+                );
+            }
+        }
         Some(Self {
             nodes,
-            indices,
-            fqns_by_ecosystem,
+            indices_by_id,
         })
-    }
-
-    /// Candidate nodes of a module-scoped ecosystem, in the `{file, fqn}` identity its
-    /// pass resolves against.
-    pub(crate) fn scoped_node_keys(&self, ecosystem: UsageEcosystem) -> HashSet<UsageNodeKey> {
-        debug_assert!(ecosystem.is_module_scoped());
-        self.nodes
-            .iter()
-            .filter(|node| node.key.ecosystem == ecosystem)
-            .map(|node| {
-                UsageNodeKey::new(
-                    node.key
-                        .defining_file
-                        .clone()
-                        .expect("module-scoped catalog keys carry a defining file"),
-                    node.key.fqn.clone(),
-                )
-            })
-            .collect()
-    }
-
-    pub(crate) fn fqns(&self, ecosystem: UsageEcosystem) -> &HashSet<String> {
-        static EMPTY: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
-        self.fqns_by_ecosystem
-            .get(&ecosystem)
-            .unwrap_or_else(|| EMPTY.get_or_init(HashSet::default))
     }
 
     #[cfg(test)]
@@ -341,8 +338,30 @@ impl WorkspaceUsageCatalog {
             .collect()
     }
 
-    fn index_of(&self, key: &WorkspaceUsageNodeKey) -> Option<usize> {
-        self.indices.get(key).copied()
+    pub(crate) fn index_for_id(&self, id: &DeclarationId) -> Option<usize> {
+        self.indices_by_id.get(id).copied()
+    }
+
+    fn indices_for_fqn(&self, ecosystem: UsageEcosystem, fqn: &str) -> Vec<usize> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.key.ecosystem == ecosystem && node.key.fqn == fqn)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn indices_for_scoped(&self, ecosystem: UsageEcosystem, key: &UsageNodeKey) -> Vec<usize> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                node.key.ecosystem == ecosystem
+                    && node.key.fqn == key.fqn
+                    && node.key.defining_file.as_ref() == Some(&key.file)
+            })
+            .map(|(index, _)| index)
+            .collect()
     }
 }
 
@@ -412,7 +431,7 @@ impl WorkspaceUsageRankingGraph {
                 WorkspaceUsageRankingNode {
                     primary_file: node.primary.source().clone(),
                     seed_files: node.declaration_files,
-                    incomplete: node.truncated_inbound.is_some(),
+                    incomplete: node.truncated_inbound.is_some() || node.unproven_inbound > 0,
                 }
             })
             .collect();
@@ -488,7 +507,6 @@ pub(crate) fn build_workspace_usage_graph_with_cancellation(
     let mut edges = Vec::new();
     #[cfg(test)]
     let mut resolved_ecosystems = Vec::new();
-
     let keep_file = |_: &ProjectFile| !cancellation.is_cancelled();
     for entry in edge_passes() {
         if !selected_ecosystems.contains(&entry.ecosystem) {
@@ -501,73 +519,49 @@ pub(crate) fn build_workspace_usage_graph_with_cancellation(
             "workspace_usage_graph::resolve_{}",
             entry.id.as_str()
         ));
-        // A module-scoped ecosystem keys its nodes by {file, fqn}; every other one keys
-        // by fqn alone. Which candidate set is non-empty decides whether the pass runs.
-        let scoped_nodes = if entry.ecosystem.is_module_scoped() {
-            catalog.scoped_node_keys(entry.ecosystem)
-        } else {
-            HashSet::default()
+        let fqns = catalog
+            .nodes
+            .iter()
+            .filter(|node| node.key.ecosystem == entry.ecosystem)
+            .map(|node| node.key.fqn.clone())
+            .collect::<HashSet<_>>();
+        let scoped_nodes = catalog
+            .nodes
+            .iter()
+            .filter(|node| node.key.ecosystem == entry.ecosystem)
+            .filter_map(|node| {
+                node.key
+                    .defining_file
+                    .clone()
+                    .map(|file| UsageNodeKey::new(file, node.key.fqn.clone()))
+            })
+            .collect::<HashSet<_>>();
+        if fqns.is_empty() {
+            continue;
+        }
+        #[cfg(test)]
+        resolved_ecosystems.push(entry.ecosystem);
+        let ctx = EdgeWeightScanCtx {
+            analyzer,
+            fqns: &fqns,
+            scoped_nodes: &scoped_nodes,
+            keep_file: &keep_file,
         };
-        let fqns = catalog.fqns(entry.ecosystem);
-        let candidates_present = if entry.ecosystem.is_module_scoped() {
-            !scoped_nodes.is_empty()
-        } else {
-            !fqns.is_empty()
-        };
-        if candidates_present {
-            #[cfg(test)]
-            resolved_ecosystems.push(entry.ecosystem);
-            let ctx = EdgeWeightScanCtx {
-                analyzer,
-                fqns,
-                scoped_nodes: &scoped_nodes,
-                keep_file: &keep_file,
-            };
-            match entry.pass.edge_weights(&ctx) {
-                Some(LanguageEdgeWeights::Fqn(result)) => {
-                    debug_assert!(
-                        !entry.ecosystem.is_module_scoped(),
-                        "{:?} is module scoped but its pass returned fqn-keyed weights",
-                        entry.ecosystem
-                    );
-                    record_weighted_edges(
-                        entry.ecosystem,
-                        result,
-                        &catalog,
-                        &mut nodes,
-                        &mut edges,
-                    );
-                }
-                Some(LanguageEdgeWeights::Scoped(result)) => {
-                    debug_assert!(
-                        entry.ecosystem.is_module_scoped(),
-                        "{:?} is not module scoped but its pass returned scoped weights",
-                        entry.ecosystem
-                    );
-                    record_scoped_weighted_edges(
-                        entry.ecosystem,
-                        result.edges,
-                        &catalog,
-                        &mut nodes,
-                        &mut edges,
-                    );
-                }
-                None => {}
+        match entry.pass.edge_weights(&ctx) {
+            Some(LanguageEdgeWeights::Fqn(result)) => {
+                record_fqn_weights_exact(entry.ecosystem, result, &catalog, &mut nodes, &mut edges)
             }
-        }
-        if cancellation.is_cancelled() {
-            return WorkspaceUsageGraphBuildOutcome::Cancelled;
+            Some(LanguageEdgeWeights::Scoped(result)) => record_scoped_weights_exact(
+                entry.ecosystem,
+                result.edges,
+                &catalog,
+                &mut nodes,
+                &mut edges,
+            ),
+            None => {}
         }
     }
-
-    if cancellation.is_cancelled() {
-        return WorkspaceUsageGraphBuildOutcome::Cancelled;
-    }
-
     edges.sort_by_key(|edge| (edge.from, edge.to));
-    // The JVM realm runs two builders over one ecosystem, so it would otherwise
-    // be recorded twice; this reports which ecosystems were resolved, not how
-    // many passes each took.
     #[cfg(test)]
     resolved_ecosystems.dedup();
     WorkspaceUsageGraphBuildOutcome::Complete(WorkspaceUsageGraph {
@@ -578,67 +572,76 @@ pub(crate) fn build_workspace_usage_graph_with_cancellation(
     })
 }
 
-fn record_scoped_weighted_edges(
+fn record_fqn_weights_exact(
     ecosystem: UsageEcosystem,
-    result: UsageEdgeWeights<UsageNodeKey>,
-    catalog: &WorkspaceUsageCatalog,
-    nodes: &mut [WorkspaceUsageNode],
-    edges: &mut Vec<WorkspaceUsageEdge>,
-) {
-    let convert = |key: UsageNodeKey| WorkspaceUsageNodeKey {
-        ecosystem,
-        fqn: key.fqn,
-        defining_file: Some(key.file),
-    };
-    for ((from, to), counts) in result.edges {
-        let (Some(from), Some(to)) = (
-            catalog.index_of(&convert(from)),
-            catalog.index_of(&convert(to)),
-        ) else {
-            continue;
-        };
-        edges.push(WorkspaceUsageEdge { from, to, counts });
-    }
-    for (key, total) in result.truncated {
-        if let Some(index) = catalog.index_of(&convert(key)) {
-            nodes[index].truncated_inbound = Some(total);
-        }
-    }
-    for (key, total) in result.unproven_inbound {
-        if let Some(index) = catalog.index_of(&convert(key)) {
-            nodes[index].unproven_inbound += total;
-        }
-    }
-}
-
-fn record_weighted_edges(
-    ecosystem: UsageEcosystem,
-    result: UsageEdgeWeights,
+    result: super::inverted_edges::UsageEdgeWeights,
     catalog: &WorkspaceUsageCatalog,
     nodes: &mut [WorkspaceUsageNode],
     edges: &mut Vec<WorkspaceUsageEdge>,
 ) {
     for ((from, to), counts) in result.edges {
-        let (Some(from), Some(to)) = (
-            catalog.index_of(&WorkspaceUsageNodeKey::package_scoped(ecosystem, from)),
-            catalog.index_of(&WorkspaceUsageNodeKey::package_scoped(ecosystem, to)),
-        ) else {
-            continue;
-        };
-        edges.push(WorkspaceUsageEdge { from, to, counts });
+        let from = catalog.indices_for_fqn(ecosystem, &from);
+        let to = catalog.indices_for_fqn(ecosystem, &to);
+        if let ([from], [to]) = (from.as_slice(), to.as_slice()) {
+            if from != to {
+                edges.push(WorkspaceUsageEdge {
+                    from: *from,
+                    to: *to,
+                    counts,
+                });
+            }
+        } else {
+            for to in to {
+                nodes[to].unproven_inbound =
+                    nodes[to].unproven_inbound.saturating_add(counts.total());
+            }
+        }
     }
     for (fqn, total) in result.truncated {
-        if let Some(index) =
-            catalog.index_of(&WorkspaceUsageNodeKey::package_scoped(ecosystem, fqn))
-        {
+        for index in catalog.indices_for_fqn(ecosystem, &fqn) {
             nodes[index].truncated_inbound = Some(total);
         }
     }
     for (fqn, total) in result.unproven_inbound {
-        if let Some(index) =
-            catalog.index_of(&WorkspaceUsageNodeKey::package_scoped(ecosystem, fqn))
-        {
-            nodes[index].unproven_inbound += total;
+        for index in catalog.indices_for_fqn(ecosystem, &fqn) {
+            nodes[index].unproven_inbound = nodes[index].unproven_inbound.saturating_add(total);
+        }
+    }
+}
+
+fn record_scoped_weights_exact(
+    ecosystem: UsageEcosystem,
+    result: super::inverted_edges::UsageEdgeWeights<UsageNodeKey>,
+    catalog: &WorkspaceUsageCatalog,
+    nodes: &mut [WorkspaceUsageNode],
+    edges: &mut Vec<WorkspaceUsageEdge>,
+) {
+    for ((from, to), counts) in result.edges {
+        let from = catalog.indices_for_scoped(ecosystem, &from);
+        let to = catalog.indices_for_scoped(ecosystem, &to);
+        if let ([from], [to]) = (from.as_slice(), to.as_slice()) {
+            if from != to {
+                edges.push(WorkspaceUsageEdge {
+                    from: *from,
+                    to: *to,
+                    counts,
+                });
+            }
+        } else {
+            for to in to {
+                nodes[to].unproven_inbound =
+                    nodes[to].unproven_inbound.saturating_add(counts.total());
+            }
+        }
+    }
+    for (key, total) in result.truncated {
+        for index in catalog.indices_for_scoped(ecosystem, &key) {
+            nodes[index].truncated_inbound = Some(total);
+        }
+    }
+    for (key, total) in result.unproven_inbound {
+        for index in catalog.indices_for_scoped(ecosystem, &key) {
+            nodes[index].unproven_inbound = nodes[index].unproven_inbound.saturating_add(total);
         }
     }
 }
@@ -718,7 +721,16 @@ mod tests {
                 graph.nodes[edge.from].key.fqn == "app.Caller.call"
                     && graph.nodes[edge.to].key.fqn == "app.Greeter"
             }),
-            "expected the Kotlin -> Java edge the shared realm exists to provide"
+            "expected the Kotlin -> Java edge the shared realm exists to provide; edges={:?}",
+            graph
+                .edges
+                .iter()
+                .map(|edge| (
+                    graph.nodes[edge.from].key.fqn.as_str(),
+                    graph.nodes[edge.to].key.fqn.as_str(),
+                    edge.counts,
+                ))
+                .collect::<Vec<_>>()
         );
     }
 }

@@ -18,14 +18,13 @@ mod tests;
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
-    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
-    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes,
+    BoundedReceiverQuery, CandidateAugmentation, CandidateCtx, DeadCodeBulkEdges,
+    DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport, EdgePassId,
+    EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights,
+    LanguageSupport, StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::TypeRelation;
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_ruby_bounded,
 };
@@ -89,7 +88,6 @@ pub struct RubyAnalyzer {
     zeitwerk_autoload_files: Arc<OnceLock<HashSet<ProjectFile>>>,
     zeitwerk_consumer_files: Arc<OnceLock<HashSet<ProjectFile>>>,
     zeitwerk_autoload_code_units: Arc<OnceLock<HashSet<CodeUnit>>>,
-    zeitwerk_reference_files: Arc<OnceLock<HashMap<String, HashSet<ProjectFile>>>>,
     #[allow(dead_code)]
     mixin_relations: Arc<OnceLock<Vec<TypeRelation>>>,
     semantic_facts: Arc<OnceLock<RubySemanticFacts>>,
@@ -149,7 +147,6 @@ impl RubyAnalyzer {
             zeitwerk_autoload_files: Arc::new(OnceLock::new()),
             zeitwerk_consumer_files: Arc::new(OnceLock::new()),
             zeitwerk_autoload_code_units: Arc::new(OnceLock::new()),
-            zeitwerk_reference_files: Arc::new(OnceLock::new()),
             mixin_relations: Arc::new(OnceLock::new()),
             semantic_facts: Arc::new(OnceLock::new()),
             types_by_identifier: Arc::new(OnceLock::new()),
@@ -161,6 +158,29 @@ impl RubyAnalyzer {
         P: Project + 'static,
     {
         Self::new(Arc::new(project))
+    }
+
+    /// Seed-directed Ruby reference candidates from persisted AST identifiers.
+    ///
+    /// Ruby records both method identifiers and constants. This lookup is only
+    /// admission evidence; the graph resolver still proves each returned site
+    /// from the syntax tree and receiver semantics.
+    pub(crate) fn reference_candidates_for_identifier(
+        &self,
+        identifier: &str,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> HashSet<ProjectFile> {
+        if identifier.is_empty() {
+            return HashSet::default();
+        }
+        let identifiers = HashSet::from_iter([identifier.to_string()]);
+        self.inner
+            .reverse_identifier_candidates(&identifiers, cancellation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn global_semantic_index_initialized_for_test(&self) -> bool {
+        self.semantic_facts.get().is_some()
     }
 
     pub(crate) fn declaration_candidates_by_identifier_limited(
@@ -700,12 +720,19 @@ impl LanguageSupport for RubySupport {
         UsageEcosystem::Ruby
     }
 
-    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
-        &RUBY_USAGE_STRATEGY
+    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
+        crate::analyzer::languages::ReferenceLanguagePlugin::new(
+            &RUBY_USAGE_STRATEGY,
+            &RubyEdgePass,
+        )
     }
 
-    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
-        Some(&RubyEdgePass)
+    fn candidate_augmentation(&self, ctx: &CandidateCtx<'_>) -> Option<CandidateAugmentation> {
+        let ruby = resolve_analyzer::<RubyAnalyzer>(ctx.analyzer)?;
+        let identifier = crate::analyzer::common::source_identifier_for_target(ctx.target);
+        let mut candidates = ruby.reference_candidates_for_identifier(identifier, ctx.cancellation);
+        candidates.insert(ctx.target.source().clone());
+        Some(CandidateAugmentation::protected(candidates))
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -740,7 +767,8 @@ impl LanguageEdgePass for RubyEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        build_rooted_ruby_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        build_rooted_ruby_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeSites::Fqn)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

@@ -39,6 +39,13 @@ fi
 # Tests must never download models or spawn semantic indexer threads.
 export BIFROST_SEMANTIC_INDEX=off
 
+# Let nextest own machine-wide parallelism. Each test process gets one worker
+# in Bifrost-owned and global rayon pools, while nextest runs one test per
+# available core. Callers running a deliberate parallelism test or benchmark
+# can still override either value explicitly.
+export BIFROST_PARALLELISM="${BIFROST_PARALLELISM:-1}"
+export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
+
 # Cargo can find a rustup-managed compiler while PATH finds a Homebrew rustdoc.
 # Pin both tools to one sysroot so their crate metadata remains compatible.
 if [ -z "${RUSTC:-}" ]; then

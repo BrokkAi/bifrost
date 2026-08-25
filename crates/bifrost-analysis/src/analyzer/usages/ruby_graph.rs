@@ -19,7 +19,7 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     AnalyzerDefinitionLookup, BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile,
     RubyAnalyzer, resolve_analyzer,
@@ -118,16 +118,13 @@ pub(crate) fn build_ruby_usage_edge_weights(
     Some(resolver.build_edge_weights(analyzer, nodes, keep_file))
 }
 
-/// Ruby's implementation of the shared query-path contract. Two divergences from the
-/// sibling resolvers are deliberate and load-bearing rather than oversights, so a later
-/// normalization pass must not quietly erase them:
+/// Ruby's implementation of the shared query-path contract.
 ///
-/// * the scan set is augmented *after* the caller's budget has already been enforced,
-///   with the target's own source and Zeitwerk's referring files (each still gated by
-///   `UsageScanScope::allows`), so an implicit-autoload reference survives a `max_files`
-///   or `max_source_bytes` truncation that would otherwise drop it;
-/// * cancellation returns the hits accumulated so far as a success, where the siblings
-///   discard partial work and return `FuzzyResult::empty_success`.
+/// Candidate planning is owned by [`UsageFinder`]. In particular, Zeitwerk
+/// references are admitted from the persisted identifier index before either
+/// budget runs; this resolver never expands its scan set after admission.
+/// Cancellation returns the hits accumulated so far as a success so a partial
+/// scan cannot be mistaken for proven absence.
 pub(crate) struct RubyQueryResolver<'a> {
     ruby: &'a RubyAnalyzer,
 }
@@ -174,19 +171,11 @@ impl RubyQueryResolver<'_> {
         };
 
         let semantic = RubySemanticIndex::build(graph, ruby, &spec);
-        let mut scan_files = scan_scope.candidate_files().clone();
-        if scan_scope.allows(target.source()) {
-            scan_files.insert(target.source().clone());
-        }
-        scan_files.extend(
-            ruby.zeitwerk_reference_files_for_identifier(&spec.member_name)
-                .into_iter()
-                .filter(|file| scan_scope.allows(file)),
-        );
+        let scan_files = scan_scope.candidate_files();
 
         let mut hits = BTreeSet::new();
         let mut unproven_hits = BTreeSet::new();
-        for file in &scan_files {
+        for file in scan_files {
             if scan_scope.is_cancelled() {
                 break;
             }
@@ -288,25 +277,11 @@ impl GraphUsageAnalyzer for RubyUsageGraphStrategy {
     }
 }
 
-impl UsageAnalyzer for RubyUsageGraphStrategy {
-    fn find_usages(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
-        max_usages: usize,
-    ) -> FuzzyResult {
-        let scan_scope = UsageScanScope::new(candidate_files, false);
-        self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
-            .into_fuzzy_result()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzer::usages::model::UsageAnalysisDiagnostic;
-    use crate::analyzer::{CodeUnitType, PythonAnalyzer, TestProject};
+    use crate::analyzer::{CodeUnitIndex, CodeUnitType, PythonAnalyzer, TestProject};
     use crate::cancellation::CancellationToken;
     use std::path::{Path, PathBuf};
 
@@ -381,7 +356,7 @@ mod tests {
         let (_temp, root) = zeitwerk_project();
         let analyzer = ruby_analyzer(&root);
         let candidates = HashSet::default();
-        let scope = UsageScanScope::new(&candidates, false);
+        let scope = UsageScanScope::new(&candidates);
         let strategy = RubyUsageGraphStrategy::new();
 
         let python_target = CodeUnit::new(
@@ -435,43 +410,35 @@ mod tests {
         );
     }
 
-    /// Scan-time augmentation: the target's own source and Zeitwerk's referring files
-    /// join the scan set after budget enforcement, so an empty candidate set still finds
-    /// the autoload reference. An authoritative scope is a hard boundary, and
-    /// `UsageScanScope::allows` gates both additions back out.
+    /// The shared planner admits Zeitwerk consumers from persisted identifier
+    /// facts before the budgets run. Ruby execution neither builds the old
+    /// whole-workspace reference map nor the global semantic inversion.
     #[test]
-    fn zeitwerk_and_target_source_join_the_scan_set_unless_the_scope_forbids_them() {
+    fn zeitwerk_candidates_are_planned_without_global_reference_indexes() {
         let (_temp, root) = zeitwerk_project();
         let analyzer = ruby_analyzer(&root);
         let user_file = ProjectFile::new(root.clone(), PathBuf::from("app/models/user.rb"));
         let target = declaration(&analyzer, &user_file, "build");
-        let strategy = RubyUsageGraphStrategy::new();
-        let empty = HashSet::default();
 
-        let augmented = strategy.find_graph_usages(
+        assert!(!analyzer.global_semantic_index_initialized_for_test());
+        let query = crate::analyzer::usages::UsageFinder::new().query(
             &analyzer,
             std::slice::from_ref(&target),
-            &UsageScanScope::new(&empty, false),
+            100,
             100,
         );
         assert!(
-            proven_hit_owners(&augmented)
+            query
+                .result
+                .all_hits()
                 .iter()
-                .any(|fq_name| fq_name.contains("show")),
-            "an empty candidate set must still reach the Zeitwerk referrer, got {:?}",
-            proven_hit_owners(&augmented)
-        );
-
-        let gated = strategy.find_graph_usages(
-            &analyzer,
-            std::slice::from_ref(&target),
-            &UsageScanScope::new(&empty, true),
-            100,
+                .any(|hit| hit.enclosing.fq_name().contains("show")),
+            "the indexed planner must admit the Zeitwerk referrer: {:?}",
+            query.result.all_hits()
         );
         assert!(
-            proven_hit_owners(&gated).is_empty(),
-            "an authoritative empty scope forbids both additions, got {:?}",
-            proven_hit_owners(&gated)
+            !analyzer.global_semantic_index_initialized_for_test(),
+            "a target query must not materialize the repository-wide Ruby semantic index"
         );
     }
 
@@ -510,12 +477,12 @@ mod tests {
         let user_file = ProjectFile::new(root.clone(), PathBuf::from("app/models/user.rb"));
         let target = declaration(&analyzer, &user_file, "build");
         let strategy = RubyUsageGraphStrategy::new();
-        let empty = HashSet::default();
+        let candidates = analyzer.analyzed_files().into_iter().collect();
 
         let complete = proven_hit_owners(&strategy.find_graph_usages(
             &analyzer,
             std::slice::from_ref(&target),
-            &UsageScanScope::new(&empty, false),
+            &UsageScanScope::new(&candidates),
             100,
         ))
         .len();
@@ -530,7 +497,7 @@ mod tests {
                 let outcome = strategy.find_graph_usages(
                     &analyzer,
                     std::slice::from_ref(&target),
-                    &UsageScanScope::with_cancellation(&empty, false, &cancellation),
+                    &UsageScanScope::with_cancellation(&candidates, &cancellation),
                     100,
                 );
                 let hits = proven_hit_owners(&outcome).len();
@@ -548,12 +515,12 @@ mod tests {
         let analyzer = ruby_analyzer(&root);
         let user_file = ProjectFile::new(root.clone(), PathBuf::from("app/models/user.rb"));
         let target = declaration(&analyzer, &user_file, "build");
-        let empty = HashSet::default();
+        let candidates = analyzer.analyzed_files().into_iter().collect();
 
         let outcome = RubyUsageGraphStrategy::new().find_graph_usages(
             &analyzer,
             std::slice::from_ref(&target),
-            &UsageScanScope::new(&empty, false),
+            &UsageScanScope::new(&candidates),
             0,
         );
         match outcome {

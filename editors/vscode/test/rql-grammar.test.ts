@@ -157,16 +157,27 @@ void test("tokenizes nested RQL structure, literals, and incomplete input", asyn
   assertScoped(tokens, "full", "constant.language.result-detail.bifrost-rql");
   assertScoped(tokens, "; trailing comment", "comment.line.semicolon.bifrost-rql");
   assertScoped(tokens, '"semi;colon"', "string.quoted.double.bifrost-rql");
+  assertScoped(tokens, "true", "constant.language.boolean.bifrost-rql");
+  assertScoped(tokens, "false", "constant.language.boolean.bifrost-rql");
   const unknown = tokens.find((candidate) =>
-    candidate.text.includes("custom_identifier :unexpected true false null 7")
+    candidate.text.includes("custom_identifier :unexpected")
   );
   assert.deepEqual(unknown?.scopes, [scopeName]);
 });
 
 void test("highlights registered underscore predicate aliases", async () => {
-  const tokens = tokenizeGrammar(await grammar(), "(not_has (call)) (not_kind class)");
+  const tokens = tokenizeGrammar(
+    await grammar(),
+    "(not_has (call)) (not_kind class) (boolean_value true) (boolean-value false) (boolean_literal :boolean_value true :boolean-value false)"
+  );
   assertScoped(tokens, "not_has", "support.function.predicate.bifrost-rql");
   assertScoped(tokens, "not_kind", "support.function.predicate.bifrost-rql");
+  assertScoped(tokens, "boolean_value", "support.function.predicate.bifrost-rql");
+  assertScoped(tokens, "boolean-value", "support.function.predicate.bifrost-rql");
+  assertScoped(tokens, ":boolean_value", "variable.parameter.role.bifrost-rql");
+  assertScoped(tokens, ":boolean-value", "variable.parameter.role.bifrost-rql");
+  assertScoped(tokens, "true", "constant.language.boolean.bifrost-rql");
+  assertScoped(tokens, "false", "constant.language.boolean.bifrost-rql");
 });
 
 void test("highlights explain and profile execution controls", async () => {

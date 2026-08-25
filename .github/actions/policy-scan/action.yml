@@ -1,8 +1,8 @@
 name: Bifrost Policy Scan
 # GitHub Marketplace refuses a listing whose description is 125 characters or
 # more, and this is the field it reads. The full exit-code contract -- 0 clean,
-# 1 findings at or above fail-on, 2 unreliable, and why unreliable must never
-# be read as clean -- lives in the README, which is the listing body.
+# 1 a policy gate failure, 2 unreliable, and why unreliable must never be read
+# as clean -- lives in the README, which is the listing body.
 description: >-
   Run Bifrost static-analysis policies, upload SARIF to code scanning, and fail
   closed when a scan is unreliable.
@@ -19,7 +19,7 @@ inputs:
       install and uses a release or debug `bifrost` binary from the checkout,
       otherwise the `bifrost` already on PATH.
     required: false
-    default: v0.10.6
+    default: v0.10.5
   policy-packs:
     description: Space-separated built-in pack IDs to run.
     required: false
@@ -262,8 +262,8 @@ runs:
             echo "Bifrost policy scan is clean."
             ;;
           1)
-            echo "::group::Bifrost policy findings at or above fail-on threshold"
-            if ! findings=$(jq -r --arg fail_on "${FAIL_ON}" '
+            echo "::group::Bifrost policy gate causes"
+            if ! causes=$(jq -r --arg fail_on "${FAIL_ON}" '
               def severity:
                 if . == "error" then 3
                 elif . == "warning" then 2
@@ -278,49 +278,42 @@ runs:
                 elif $fail_on == "note" then (.level | severity) >= 1
                 else true
                 end;
-              .runs[].results[]
-              | select((.properties["bifrost.diffDisposition"] // .baselineState // "new") == "new")
-              | select(((.suppressions // []) | map(select(.status != "accepted")) | length) > 0 or ((.suppressions // []) | length) == 0)
-              | select(gates)
-              | (.ruleId // .rule?.id // "unknown-rule") as $rule
-              | (.locations[0].physicalLocation // {}) as $location
-              | ($location.artifactLocation.uri // "<unknown-path>") as $path
-              | ($location.region.startLine // "?") as $line
-              | (.message.text // "<no-message>") as $message
-              | (.properties["bifrost.findingId"] // .partialFingerprints["bifrostFinding/v1"] // "") as $finding_id
-              | if $finding_id == ""
-                then "\($rule) \($path):\($line) \($message)"
-                else "\($rule) \($path):\($line) \($message) [finding: \($finding_id)]"
-                end
+              def finding_causes:
+                .runs[].results[]
+                | select((.properties["bifrost.diffDisposition"] // .baselineState // "new") == "new")
+                | select(((.suppressions // []) | map(select(.status != "accepted")) | length) > 0 or ((.suppressions // []) | length) == 0)
+                | select(gates)
+                | (.ruleId // .rule?.id // "unknown-rule") as $rule
+                | (.locations[0].physicalLocation // {}) as $location
+                | ($location.artifactLocation.uri // "<unknown-path>") as $path
+                | ($location.region.startLine // "?") as $line
+                | (.message.text // "<no-message>") as $message
+                | (.properties["bifrost.findingId"] // .partialFingerprints["bifrostFinding/v1"] // "") as $finding_id
+                | if $finding_id == ""
+                  then "finding: \($rule) \($path):\($line) \($message)"
+                  else "finding: \($rule) \($path):\($line) \($message) [finding: \($finding_id)]"
+                  end;
+              def suppression_causes:
+                .runs[].properties["bifrost.suppressionReviews"][]?
+                | select(.orphan_state == "orphaned")
+                | "orphaned suppression: \(.policy_id) [finding: \(.finding_id)]"
+                  + if ((.rekey_candidates // []) | length) == 0 then ""
+                    else " [re-key candidates: \(.rekey_candidates | join(", "))]"
+                    end;
+              [finding_causes, suppression_causes] | unique[]
             ' "${SARIF_PATH}"); then
               echo "::endgroup::"
-              echo "::error::unable to extract gating findings from ${SARIF_PATH}."
+              echo "::error::unable to extract policy gate causes from ${SARIF_PATH}."
               exit 1
             fi
-            if [ -n "${findings}" ]; then
-              printf '%s\n' "${findings}"
-              echo "::endgroup::"
-              echo "::error::Bifrost policy scan found findings at or above the fail-on threshold. See the code-scanning alerts or the SARIF report."
-              exit 1
+            if [ -n "${causes}" ]; then
+              printf '%s\n' "${causes}"
+            else
+              echo "::warning::exit 1 was reported, but no gating finding or orphaned suppression was retained in ${SARIF_PATH}"
             fi
-            if [ -z "${DIFF_BASE}" ]; then
-              echo "::endgroup::"
-              echo "::error::Bifrost returned status 1 without a diff-base; findings cannot be overridden as baseline-only."
-              exit 1
-            fi
-            if ! jq -e '
-              all(.runs[];
-                (.properties["bifrost.diffBaseline"] | type == "object")
-                and (.properties["bifrost.diffBaseline"].degraded == false)
-                and all(.invocations[]; .executionSuccessful == true)
-              )
-            ' "${SARIF_PATH}" >/dev/null; then
-              echo "::endgroup::"
-              echo "::error::Bifrost returned status 1 but the SARIF report does not prove a reliable diff-aware run."
-              exit 1
-            fi
-            echo "No new findings at or above fail-on '${FAIL_ON}' were emitted in ${SARIF_PATH}."
             echo "::endgroup::"
+            echo "::error::Bifrost policy scan reported a policy gate failure. See the gate causes above and the SARIF report."
+            exit 1
             ;;
           2)
             echo "::group::Bifrost policy report diagnostics"

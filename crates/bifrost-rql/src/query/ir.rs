@@ -1492,6 +1492,24 @@ impl CodeQuerySeed {
                 .as_ref()
                 .is_some_and(Pattern::constrains_callable_signature)
     }
+
+    /// Whether any pattern in this seed filters on an exact normalized
+    /// boolean-literal value.
+    pub fn constrains_boolean_value(&self) -> bool {
+        self.root.constrains_boolean_value()
+            || self
+                .inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_boolean_value)
+            || self
+                .inside_decl
+                .as_ref()
+                .is_some_and(Pattern::constrains_boolean_value)
+            || self
+                .not_inside
+                .as_ref()
+                .is_some_and(Pattern::constrains_boolean_value)
+    }
 }
 
 /// The source of values entering one typed pipeline suffix.
@@ -1906,6 +1924,9 @@ pub struct Pattern {
     pub not_kinds: Vec<NormalizedKind>,
     pub name: Option<StringPredicate>,
     pub text: Option<StringPredicate>,
+    /// Exact language-neutral value of a normalized boolean literal. This is
+    /// semantic fact data, not a symbol name or a source-text predicate.
+    pub boolean_value: Option<bool>,
     /// Constraint on the matched call's positional argument count. `None`
     /// leaves arity unconstrained. Meaningful on `call` facts, whose `args`
     /// role edges carry the count; a fact without argument edges has arity 0.
@@ -1948,6 +1969,7 @@ impl Pattern {
             && self.not_kinds.is_empty()
             && self.name.is_none()
             && self.text.is_none()
+            && self.boolean_value.is_none()
             && self.arity.is_none()
             && self.visibility.is_empty()
             && self.parameter_type.is_none()
@@ -2036,6 +2058,45 @@ impl Pattern {
         self.kwargs
             .iter()
             .any(|(_, pattern)| pattern.constrains_callable_signature())
+    }
+
+    /// Whether this pattern or any nested sub-pattern filters on the exact
+    /// normalized value of a boolean literal.
+    pub fn constrains_boolean_value(&self) -> bool {
+        if self.boolean_value.is_some() {
+            return true;
+        }
+        if self
+            .has
+            .as_deref()
+            .is_some_and(Self::constrains_boolean_value)
+            || self
+                .not_has
+                .as_deref()
+                .is_some_and(Self::constrains_boolean_value)
+        {
+            return true;
+        }
+        for &role in Role::single_target_roles() {
+            if self
+                .single_role_pattern(role)
+                .is_some_and(Self::constrains_boolean_value)
+            {
+                return true;
+            }
+        }
+        for &role in Role::list_target_roles() {
+            if self
+                .list_role_patterns(role)
+                .iter()
+                .any(Self::constrains_boolean_value)
+            {
+                return true;
+            }
+        }
+        self.kwargs
+            .iter()
+            .any(|(_, pattern)| pattern.constrains_boolean_value())
     }
 }
 

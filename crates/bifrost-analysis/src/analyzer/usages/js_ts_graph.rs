@@ -5,8 +5,7 @@
 //! [`brokk_bifrost_js_ts::graph`]. What stays here is everything that needs an
 //! analyzer handle:
 //!
-//! - the two `resolve_analyzer::<{Typescript,Javascript}Analyzer>` downcasts
-//!   ([`cached_jsts_index`], [`prewarm_cached_jsts_index`]) and the `JsTsHosts`
+//! - the analyzer downcasts behind [`cached_jsts_index`] and the `JsTsHosts`
 //!   view the whole-workspace builders are handed;
 //! - the inverted pass's fan-out -- `build_edge_output`, `build_edge_weights`,
 //!   `parse_and_collect` and `collect_file_edges`, which are analysis-owned --
@@ -23,6 +22,7 @@
 /// already use.
 pub(crate) use crate::analyzer::js_ts::receiver_facts::JsTsReceiverFacts;
 use crate::analyzer::usages::parsed_tree::ParseSpec;
+use brokk_bifrost_js_ts::graph::js_ts_target_candidate_files;
 pub(in crate::analyzer::usages) use brokk_bifrost_js_ts::graph::receiver_analysis::{
     JsTsReceiverFactProvider, JsTsReceiverSyntaxIndex, build_js_ts_receiver_syntax_index,
 };
@@ -32,24 +32,22 @@ pub(in crate::analyzer::usages) use brokk_bifrost_js_ts::graph::resolver::{
 };
 pub(in crate::analyzer::usages) use brokk_bifrost_js_ts::syntax::compute_import_binder as compute_jsts_import_binder;
 
-use crate::analyzer::js_ts::providers::resolve_js_ts_source;
+use crate::analyzer::js_ts::providers::{jsts_usage_index_for_parallel_scan, resolve_js_ts_source};
 use crate::analyzer::usages::common::analyzed_files_for_language;
 use crate::analyzer::usages::inverted_edges::{
-    CallSite, EdgeNodeDomain, JsTsScopedNodeStatus, JsTsScopedUsageEdges, UsageEdgeBuildOutput,
-    UsageEdgeWeights, UsageEdges, UsageNodeKey, build_edge_output, build_edge_weights,
-    collect_file_edges, parse_and_collect_with_domain,
+    CallSite, EdgeNodeDomain, JsTsScopedNodeStatus, JsTsScopedUsageEdges, UsageEdgeWeights,
+    UsageEdges, UsageNodeKey, build_edge_output, build_edge_weights, build_file_declarations,
+    collect_file_edges, collect_file_edges_with_domain,
 };
-use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{
     CandidateUsageHits, GraphFailureReason, GraphUsageOutcome, union_candidate_usages,
 };
 use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
 use crate::analyzer::usages::traits::{
-    GraphUsageAnalyzer, UsageAnalyzer, UsageQueryResolver, UsageScanScope,
+    GraphUsageAnalyzer, PreparedUsageQuery, UsageQueryResolver, UsageScanScope,
 };
 use crate::analyzer::{
-    AnalyzerQueryScope, CodeUnit, IAnalyzer, JavascriptAnalyzer, Language, ProjectFile, QueryScope,
-    QueryToken, TypescriptAnalyzer, resolve_analyzer,
+    AnalyzerQueryScope, CodeUnit, IAnalyzer, Language, ProjectFile, QueryScope, QueryToken,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
@@ -83,22 +81,97 @@ fn js_ts_hosts(analyzer: &dyn IAnalyzer) -> JsTsHosts<'_> {
     )
 }
 
-pub(crate) fn build_rooted_jsts_usage_edges<F>(
+/// Build rooted JS/TS usage sites without discarding module identity. The
+/// cross-dialect declaration/import preparation is shared with the ranking
+/// pass; only the common finalizer differs (locations here, kind counts there).
+pub(crate) fn build_rooted_jsts_scoped_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
-    callers: &HashSet<String>,
+    callers: &HashSet<UsageNodeKey>,
     keep_file: F,
-) -> Option<UsageEdges>
+) -> Option<UsageEdges<UsageNodeKey>>
 where
-    F: Fn(&ProjectFile) -> bool + Sync,
+    F: Fn(&ProjectFile) -> bool + Sync + Copy,
 {
-    let resolver = JsTsEdgeResolver::try_new(analyzer)?;
+    let hosts = js_ts_hosts(analyzer);
+    let mut cached_indices = Vec::new();
     for language in JS_TS_LANGUAGES {
-        if !analyzed_files_for_language(analyzer, language).is_empty() {
-            let _ = prewarm_cached_jsts_index(analyzer, language);
+        if let Some(index) =
+            resolve_js_ts_source(analyzer, language).map(jsts_usage_index_for_parallel_scan)
+        {
+            cached_indices.push(index);
         }
     }
-    Some(resolver.build_rooted_edges(analyzer, token, callers, keep_file))
+    let aliases = hosts.alias_resolver()?;
+    let combined_index = combine_jsts_usage_indices(
+        aliases,
+        cached_indices.iter().map(std::convert::AsRef::as_ref),
+    );
+    let prep = inverted::prepare_scoped_scan(analyzer, &combined_index, callers);
+    let mut edges: BTreeMap<(UsageNodeKey, UsageNodeKey), Vec<CallSite>> = BTreeMap::new();
+    let mut truncated: BTreeMap<UsageNodeKey, usize> = BTreeMap::new();
+    let mut unproven_inbound: BTreeMap<UsageNodeKey, usize> = BTreeMap::new();
+    let mut any = false;
+
+    for language in JS_TS_LANGUAGES {
+        let files = analyzed_files_for_language(analyzer, language);
+        if files.is_empty() {
+            continue;
+        }
+        any = true;
+        let Some(host) = hosts.get(language) else {
+            continue;
+        };
+        let result: UsageEdges<UsageNodeKey> = build_edge_output(&files, keep_file, |file| {
+            let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
+            let parsed = parse_tree_sitter_file(file, ParseSpec::whole(&parser_language))?;
+            let file_prep = inverted::prepare_scoped_file(
+                &prep,
+                analyzer,
+                file,
+                language,
+                parsed.tree.root_node(),
+                parsed.source.as_str(),
+            );
+            let declarations = build_file_declarations(analyzer, file);
+            Some(collect_file_edges_with_domain(
+                file,
+                EdgeNodeDomain::Rooted(callers),
+                &parsed,
+                declarations,
+                |input| {
+                    inverted::scan_scoped_file(
+                        host,
+                        token,
+                        &combined_index,
+                        &prep,
+                        file_prep,
+                        language,
+                        file,
+                        input,
+                    )
+                },
+            ))
+        });
+        for (key, sites) in result.edges {
+            edges.entry(key).or_default().extend(sites);
+        }
+        for (callee, total) in result.truncated {
+            *truncated.entry(callee).or_insert(0) += total;
+        }
+        for (callee, total) in result.unproven_inbound {
+            *unproven_inbound.entry(callee).or_insert(0) += total;
+        }
+    }
+    for sites in edges.values_mut() {
+        sites.sort();
+        sites.dedup();
+    }
+    any.then_some(UsageEdges {
+        edges,
+        truncated,
+        unproven_inbound,
+    })
 }
 
 /// Borrow the analyzer-cached [`JsTsUsageIndex`] for `language` off the concrete TS/JS
@@ -117,25 +190,51 @@ pub(crate) fn cached_jsts_index(
     resolve_js_ts_source(analyzer, language)?.usage_index(cancellation)
 }
 
-pub(in crate::analyzer::usages) fn prewarm_cached_jsts_index(
-    analyzer: &dyn IAnalyzer,
-    language: Language,
-) -> Option<Arc<JsTsUsageIndex>> {
-    match language {
-        Language::TypeScript => {
-            Some(resolve_analyzer::<TypescriptAnalyzer>(analyzer)?.prewarm_jsts_usage_index())
-        }
-        Language::JavaScript => {
-            Some(resolve_analyzer::<JavascriptAnalyzer>(analyzer)?.prewarm_jsts_usage_index())
-        }
-        _ => None,
-    }
-}
-
 /// JS/TS resolves usages off the project file set rather than a single concrete
 /// analyzer — it spans the TypeScript and JavaScript analyzers — so these resolvers
 /// hold no borrowed analyzer in this form.
 pub(crate) struct JsTsQueryResolver;
+
+struct PreparedJsTsUsageQuery {
+    candidate_files: HashSet<ProjectFile>,
+}
+
+impl PreparedUsageQuery for PreparedJsTsUsageQuery {
+    fn candidate_files(&self) -> &HashSet<ProjectFile> {
+        &self.candidate_files
+    }
+
+    fn find_graph_usages(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        scan_scope: &UsageScanScope<'_>,
+        max_usages: usize,
+    ) -> GraphUsageOutcome {
+        JsTsQueryResolver.find_usages(analyzer, overloads, scan_scope, max_usages)
+    }
+}
+
+fn plan_js_ts_usage_candidates(
+    analyzer: &dyn IAnalyzer,
+    overloads: &[CodeUnit],
+    supplied_candidates: &HashSet<ProjectFile>,
+    cancellation: &CancellationToken,
+) -> Option<PreparedJsTsUsageQuery> {
+    let mut candidate_files = supplied_candidates.clone();
+    for target in overloads {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let language = target_language(target);
+        let host = resolve_js_ts_source(analyzer, language)?;
+        let index = host.usage_index(Some(cancellation))?;
+        candidate_files.extend(js_ts_target_candidate_files(
+            analyzer, &index, target, language,
+        ));
+    }
+    Some(PreparedJsTsUsageQuery { candidate_files })
+}
 
 impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
     fn try_new(_analyzer: &'a dyn IAnalyzer) -> Option<Self> {
@@ -200,118 +299,6 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
     }
 }
 
-pub(crate) struct JsTsEdgeResolver;
-
-/// The whole-workspace `caller -> callee` scan behind this language's
-/// [`LanguageEdgePass`](crate::analyzer::languages::LanguageEdgePass): borrow the concrete
-/// analyzers once, then walk every file once and finalize into either site-bearing edges or
-/// reference-kind weights.
-impl JsTsEdgeResolver {
-    pub(crate) fn try_new(analyzer: &dyn IAnalyzer) -> Option<Self> {
-        let has_jsts = JS_TS_LANGUAGES
-            .iter()
-            .any(|language| !analyzed_files_for_language(analyzer, *language).is_empty());
-        has_jsts.then_some(Self)
-    }
-
-    pub(crate) fn build_rooted_edges<F>(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        token: QueryToken<'_>,
-        callers: &HashSet<String>,
-        keep_file: F,
-    ) -> UsageEdges
-    where
-        F: Fn(&ProjectFile) -> bool + Sync,
-    {
-        self.build_edges_with_domain(analyzer, token, EdgeNodeDomain::Rooted(callers), keep_file)
-    }
-
-    fn build_edges_with_domain<F>(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        token: QueryToken<'_>,
-        domain: EdgeNodeDomain<'_>,
-        keep_file: F,
-    ) -> UsageEdges
-    where
-        F: Fn(&ProjectFile) -> bool + Sync,
-    {
-        let hosts = js_ts_hosts(analyzer);
-        let mut edges: BTreeMap<(String, String), Vec<CallSite>> = BTreeMap::new();
-        let mut truncated: BTreeMap<String, usize> = BTreeMap::new();
-        let mut unproven_inbound: BTreeMap<String, usize> = BTreeMap::new();
-
-        for language in JS_TS_LANGUAGES {
-            if analyzed_files_for_language(analyzer, language).is_empty() {
-                continue;
-            }
-            let result: UsageEdges =
-                build_jsts_edges(analyzer, token, &hosts, language, domain, &keep_file);
-            for (key, sites) in result.edges {
-                edges.entry(key).or_default().extend(sites);
-            }
-            for (callee, total) in result.truncated {
-                *truncated.entry(callee).or_insert(0) += total;
-            }
-            for (callee, total) in result.unproven_inbound {
-                *unproven_inbound.entry(callee).or_insert(0) += total;
-            }
-        }
-
-        // TS and JS are distinct files, so per-language sites for a shared edge key
-        // never overlap; re-sort after concatenating the two runs for determinism.
-        for sites in edges.values_mut() {
-            sites.sort();
-        }
-
-        UsageEdges {
-            edges,
-            truncated,
-            unproven_inbound,
-        }
-    }
-}
-
-/// The non-scoped inverted pass for one dialect: the analysis-owned parallel
-/// fan-out over files, driving [`inverted::scan_file`] per file.
-fn build_jsts_edges<Output, F>(
-    analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
-    hosts: &JsTsHosts<'_>,
-    language: Language,
-    domain: EdgeNodeDomain<'_>,
-    keep_file: F,
-) -> Output
-where
-    Output: UsageEdgeBuildOutput<String> + Default,
-    F: Fn(&ProjectFile) -> bool + Sync,
-{
-    if tree_sitter_language_for(language).is_none() {
-        return Output::default();
-    }
-    let _index = cached_jsts_index(analyzer, language, None);
-    // Resolved once for the whole scan; the per-file receiver provider is on the
-    // JS/TS host. No analyzer for `language` means no JS/TS files to scan either.
-    let Some(host) = hosts.get(language) else {
-        return Output::default();
-    };
-    let files = analyzed_files_for_language(analyzer, language);
-    build_edge_output(&files, keep_file, |file| {
-        // The non-scoped scan needs only the file's own tree for its main binder +
-        // declaration pass. Receiver analysis can consult the analyzer-cached
-        // resolution index, so it is pre-materialized before this parallel scan.
-        let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
-        parse_and_collect_with_domain(
-            analyzer,
-            file,
-            domain,
-            ParseSpec::whole(&parser_language),
-            |input| inverted::scan_file(host, token, analyzer, language, file, input),
-        )
-    })
-}
-
 /// Build the whole JS/TS `caller -> callee` edge set using file-scoped node
 /// identity, so same-name exports in different files do not cross-match.
 pub(crate) fn build_jsts_scoped_usage_edges<F>(
@@ -332,7 +319,9 @@ where
 
     let mut cached_indices = Vec::new();
     for language in JS_TS_LANGUAGES {
-        if let Some(index) = cached_jsts_index(analyzer, language, None) {
+        if let Some(index) =
+            resolve_js_ts_source(analyzer, language).map(jsts_usage_index_for_parallel_scan)
+        {
             cached_indices.push(index);
         }
     }
@@ -462,6 +451,17 @@ impl JsTsExportUsageGraphStrategy {
 }
 
 impl GraphUsageAnalyzer for JsTsExportUsageGraphStrategy {
+    fn prepare_usage_query(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        overloads: &[CodeUnit],
+        candidate_files: &HashSet<ProjectFile>,
+        cancellation: &CancellationToken,
+    ) -> Option<Box<dyn PreparedUsageQuery>> {
+        plan_js_ts_usage_candidates(analyzer, overloads, candidate_files, cancellation)
+            .map(|prepared| Box::new(prepared) as Box<dyn PreparedUsageQuery>)
+    }
+
     fn find_graph_usages(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -480,19 +480,5 @@ impl GraphUsageAnalyzer for JsTsExportUsageGraphStrategy {
             );
         };
         resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
-    }
-}
-
-impl UsageAnalyzer for JsTsExportUsageGraphStrategy {
-    fn find_usages(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
-        max_usages: usize,
-    ) -> FuzzyResult {
-        let scan_scope = UsageScanScope::new(candidate_files, false);
-        self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
-            .into_fuzzy_result()
     }
 }

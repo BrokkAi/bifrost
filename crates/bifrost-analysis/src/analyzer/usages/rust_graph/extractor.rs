@@ -42,7 +42,6 @@ use crate::analyzer::usages::rust_graph::resolver::{
     resolve_rust_token_tree_paths, rust_token_path_segment_is_qualified,
     rust_unique_nominal_reference_namespace, token_tree_ancestor, trait_member_for_impl_member,
 };
-use crate::analyzer::usages::traits::UsageScanScope;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile, RustAnalyzer, RustReferenceContext,
     TypeHierarchyProvider,
@@ -76,16 +75,18 @@ use tree_sitter::{Node, Parser, Tree};
 pub(super) fn effective_scan_files(
     analyzer: &RustAnalyzer,
     token: QueryToken<'_>,
-    scan_scope: &UsageScanScope<'_>,
+    candidate_files: &HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: &RustBindingSeeds,
+    cancellation: Option<&CancellationToken>,
 ) -> HashSet<ProjectFile> {
     effective_scan_files_with_additional_importers(
         analyzer,
         token,
-        scan_scope,
+        candidate_files,
         target,
         seeds,
+        cancellation,
         || {
             if target.is_module() {
                 usage_importers(analyzer, token, seeds)
@@ -105,16 +106,18 @@ pub(super) fn effective_scan_files(
 pub(super) fn effective_scan_files_from_prepared_candidates(
     analyzer: &RustAnalyzer,
     token: QueryToken<'_>,
-    scan_scope: &UsageScanScope<'_>,
+    candidate_files: &HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: &RustBindingSeeds,
+    cancellation: Option<&CancellationToken>,
 ) -> HashSet<ProjectFile> {
     effective_scan_files_with_additional_importers(
         analyzer,
         token,
-        scan_scope,
+        candidate_files,
         target,
         seeds,
+        cancellation,
         HashSet::default,
     )
 }
@@ -122,13 +125,13 @@ pub(super) fn effective_scan_files_from_prepared_candidates(
 fn effective_scan_files_with_additional_importers(
     analyzer: &RustAnalyzer,
     token: QueryToken<'_>,
-    scan_scope: &UsageScanScope<'_>,
+    candidate_files: &HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: &RustBindingSeeds,
+    cancellation: Option<&CancellationToken>,
     additional_importers: impl FnOnce() -> HashSet<ProjectFile>,
 ) -> HashSet<ProjectFile> {
     let _scope = crate::profiling::scope("rust_graph::effective_scan_files");
-    let candidate_files = scan_scope.candidate_files();
     let analyzed = analyzer.get_analyzed_files();
     let seed_names: HashSet<&str> = seeds.candidate_names().collect();
     let mentioned_files = if target.is_module() {
@@ -151,9 +154,7 @@ fn effective_scan_files_with_additional_importers(
         .filter(|file| target.is_module() || mentioned_files.contains(*file))
         .cloned()
         .collect();
-    let include_files: HashSet<_> = if scan_scope.is_authoritative() {
-        HashSet::default()
-    } else {
+    let include_files: HashSet<_> = {
         let _scope = crate::profiling::scope("rust_graph::include_candidate_discovery");
         RustIncludeRoutes::new(analyzer, token)
             .all_included_files()
@@ -166,18 +167,13 @@ fn effective_scan_files_with_additional_importers(
 
     crate::profiling::note_with(|| {
         format!(
-            "rust_graph candidates supplied={} analyzed={} filtered={} includes={} authoritative={}",
+            "rust_graph candidates supplied={} analyzed={} filtered={} includes={}",
             candidate_files.len(),
             analyzed.len(),
             filtered_candidates.len(),
-            include_files.len(),
-            scan_scope.is_authoritative()
+            include_files.len()
         )
     });
-
-    if scan_scope.is_authoritative() {
-        return filtered_candidates;
-    }
 
     if !candidate_files.is_empty() && filtered_candidates.is_empty() {
         return std::iter::once(target.source().clone())
@@ -219,11 +215,11 @@ fn effective_scan_files_with_additional_importers(
         analyzed
             .into_iter()
             .filter(|file| {
-                if scan_scope.is_cancelled() {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
                     return false;
                 }
                 file.read_to_string().ok().is_some_and(|source| {
-                    if scan_scope.is_cancelled() {
+                    if cancellation.is_some_and(CancellationToken::is_cancelled) {
                         return false;
                     }
                     source.contains(target.identifier())

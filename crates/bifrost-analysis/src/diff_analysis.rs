@@ -2437,6 +2437,11 @@ fn rename_edges<'e>(
         edges
             .iter()
             .map(|edge| UsageGraphEdge {
+                // Diffing still keys moved symbols by their before/after names.
+                // Preserve the snapshot-local exact identities while rewriting
+                // only the display names used by that comparison.
+                from_id: edge.from_id.clone(),
+                to_id: edge.to_id.clone(),
                 from: renamed(&edge.from, &edge.language),
                 to: renamed(&edge.to, &edge.language),
                 language: edge.language.clone(),

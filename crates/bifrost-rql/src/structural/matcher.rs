@@ -295,6 +295,11 @@ fn eval_pattern_inner_with_name(
     {
         return false;
     }
+    if let Some(expected) = pattern.boolean_value
+        && fact.boolean_value != Some(expected)
+    {
+        return false;
+    }
     let roles = facts.roles(node);
 
     // Arity constrains the matched call's positional argument count, read
@@ -600,6 +605,7 @@ fn eval_span_only(
     // fail, while `not_kind` is vacuously satisfied (the target provably is
     // none of the normalized kinds).
     if !pattern.kinds.is_empty()
+        || pattern.boolean_value.is_some()
         || pattern.arity.is_some()
         || !pattern.visibility.is_empty()
         || pattern.parameter_type.is_some()

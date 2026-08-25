@@ -12,6 +12,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 
+use crate::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
 use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use crate::analyzer::structural::resolution::{BoundaryStatus, DeclaredVisibility};
 use crate::hash::{HashMap, HashSet};
@@ -2695,7 +2696,84 @@ impl RenderedCodeUnitName {
 #[derive(Clone)]
 pub struct CodeUnit(Arc<CodeUnitInner>);
 
+/// Stable, exact identity of one declaration in a workspace.
+///
+/// The digest contains only structured analyzer identity: language, normalized
+/// workspace-relative path, declaration kind, every FQ segment's kind and text,
+/// the package boundary, signature presence/value, and synthetic status. Absolute
+/// paths and process-local interner IDs never enter it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DeclarationId(String);
+
+impl DeclarationId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for DeclarationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 impl CodeUnit {
+    /// Compute this declaration's versioned, process-independent identity.
+    pub fn declaration_id(&self) -> DeclarationId {
+        let mut hasher = CanonicalHasher::new(b"bifrost.declaration.v1");
+        hasher.field(
+            "language",
+            self.source()
+                .declaration_language()
+                .config_label()
+                .as_bytes(),
+        );
+        let relative_path = self
+            .source()
+            .rel_path()
+            .to_string_lossy()
+            .replace('\\', "/");
+        hasher.field("path", relative_path.as_bytes());
+        let kind = match self.kind() {
+            CodeUnitType::Class => "class",
+            CodeUnitType::Function => "function",
+            CodeUnitType::Field => "field",
+            CodeUnitType::Module => "module",
+            CodeUnitType::Macro => "macro",
+            CodeUnitType::FileScope => "file_scope",
+        };
+        hasher.field("kind", kind.as_bytes());
+        let interner = segment_interner();
+        hasher.sequence("fq_segments", self.fq().segments(), |digest, segment| {
+            let (text, kind) = interner.resolve(*segment);
+            digest.field("segment_kind", kind.name().as_bytes());
+            digest.field("segment_text", text.as_bytes());
+        });
+        hasher.field(
+            "package_segment_count",
+            &u64::try_from(self.package_segment_count())
+                .expect("usize fits u64 on supported targets")
+                .to_be_bytes(),
+        );
+        match self.signature() {
+            Some(signature) => {
+                hasher.field("signature_present", b"true");
+                hasher.field("signature", signature.as_bytes());
+            }
+            None => hasher.field("signature_present", b"false"),
+        }
+        hasher.field(
+            "synthetic",
+            if self.is_synthetic() {
+                b"true"
+            } else {
+                b"false"
+            },
+        );
+        DeclarationId(format!("decl:v1:{}", lower_hex_string(&hasher.finish())))
+    }
+
     pub fn new(
         source: ProjectFile,
         kind: CodeUnitType,
@@ -4702,6 +4780,82 @@ mod owner_scope_tests {
         );
         assert_eq!(module_function.owner_identifier(), Some("app"));
         assert!(!module_function.owner_is_type_scope());
+    }
+}
+
+#[cfg(test)]
+mod declaration_id_tests {
+    use super::*;
+
+    fn root(name: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\{name}"))
+        } else {
+            PathBuf::from(format!("/{name}"))
+        }
+    }
+
+    #[test]
+    fn declaration_id_excludes_the_absolute_workspace_root() {
+        let left = CodeUnit::with_signature(
+            ProjectFile::new(root("workspace-a"), "src/Widget.java"),
+            CodeUnitType::Function,
+            "example.Widget",
+            "run",
+            Some("(int)".to_string()),
+            false,
+        );
+        let right = CodeUnit::with_signature(
+            ProjectFile::new(root("workspace-b"), "src/Widget.java"),
+            CodeUnitType::Function,
+            "example.Widget",
+            "run",
+            Some("(int)".to_string()),
+            false,
+        );
+        assert_eq!(left.declaration_id(), right.declaration_id());
+        assert!(left.declaration_id().as_str().starts_with("decl:v1:"));
+    }
+
+    #[test]
+    fn declaration_id_distinguishes_overloads_and_structured_segment_kinds() {
+        let file = ProjectFile::new(root("workspace"), "src/Widget.java");
+        let integer = CodeUnit::with_signature(
+            file.clone(),
+            CodeUnitType::Function,
+            "example.Widget",
+            "run",
+            Some("(int)".to_string()),
+            false,
+        );
+        let string = CodeUnit::with_signature(
+            file.clone(),
+            CodeUnitType::Function,
+            "example.Widget",
+            "run",
+            Some("(String)".to_string()),
+            false,
+        );
+        assert_ne!(integer.declaration_id(), string.declaration_id());
+
+        let interner = segment_interner();
+        let package_tail = FqName::new()
+            .with_pushed(interner.intern("example", SegmentKind::Package))
+            .with_pushed(interner.intern("Widget", SegmentKind::Package));
+        let type_tail = FqName::new()
+            .with_pushed(interner.intern("example", SegmentKind::Package))
+            .with_pushed(interner.intern("Widget", SegmentKind::Type));
+        let package_unit = CodeUnit::from_fq(
+            file.clone(),
+            CodeUnitType::Class,
+            package_tail,
+            1,
+            None,
+            false,
+        );
+        let type_unit = CodeUnit::from_fq(file, CodeUnitType::Class, type_tail, 1, None, false);
+        assert_eq!(package_unit.fq_name(), type_unit.fq_name());
+        assert_ne!(package_unit.declaration_id(), type_unit.declaration_id());
     }
 }
 

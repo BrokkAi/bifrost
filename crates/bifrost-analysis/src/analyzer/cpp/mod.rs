@@ -25,7 +25,6 @@ use crate::analyzer::languages::{
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::tree_sitter_analyzer::BulkFileStateSource;
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::cpp_graph::{
     CppDeadCodeBulkEligibility, CppUsageGraphStrategy, build_cpp_usage_edge_weights,
     build_cpp_usage_edges, build_rooted_cpp_usage_edges, dead_code_bulk_eligibility,
@@ -1800,12 +1799,8 @@ impl LanguageSupport for CppSupport {
         UsageEcosystem::Cpp
     }
 
-    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
-        &CPP_USAGE_STRATEGY
-    }
-
-    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
-        Some(&CppEdgePass)
+    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
+        crate::analyzer::languages::ReferenceLanguagePlugin::new(&CPP_USAGE_STRATEGY, &CppEdgePass)
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -1840,7 +1835,8 @@ impl LanguageEdgePass for CppEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        build_rooted_cpp_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        build_rooted_cpp_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeSites::Fqn)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

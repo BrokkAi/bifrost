@@ -34,7 +34,6 @@ use crate::analyzer::languages::{
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_scala_bounded,
 };
@@ -1972,12 +1971,11 @@ impl LanguageSupport for ScalaSupport {
         UsageEcosystem::Jvm
     }
 
-    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
-        &SCALA_USAGE_STRATEGY
-    }
-
-    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
-        Some(&ScalaEdgePass)
+    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
+        crate::analyzer::languages::ReferenceLanguagePlugin::new(
+            &SCALA_USAGE_STRATEGY,
+            &ScalaEdgePass,
+        )
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -2014,6 +2012,10 @@ impl LanguageEdgePass for ScalaEdgePass {
         EdgePassId::Scala
     }
 
+    fn permits_logical_family_targets(&self) -> bool {
+        true
+    }
+
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
         let scope = AnalyzerQueryScope::new(ctx.analyzer);
         let token = scope.token();
@@ -2023,7 +2025,7 @@ impl LanguageEdgePass for ScalaEdgePass {
             ctx.fqns,
             ctx.keep_file,
         )
-        .map(LanguageEdgeSites)
+        .map(LanguageEdgeSites::Fqn)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

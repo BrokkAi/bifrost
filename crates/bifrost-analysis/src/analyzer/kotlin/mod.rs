@@ -81,7 +81,6 @@ use crate::analyzer::languages::{
     fqn_has_multiple_function_definitions,
 };
 use crate::analyzer::pool_memo::{KeyedPoolSafeMemo, PoolSafeMemo};
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_kotlin_bounded,
 };
@@ -1061,12 +1060,11 @@ impl LanguageSupport for KotlinSupport {
         UsageEcosystem::Jvm
     }
 
-    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
-        &KOTLIN_USAGE_STRATEGY
-    }
-
-    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
-        Some(&KotlinEdgePass)
+    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
+        crate::analyzer::languages::ReferenceLanguagePlugin::new(
+            &KOTLIN_USAGE_STRATEGY,
+            &KotlinEdgePass,
+        )
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -1112,7 +1110,7 @@ impl LanguageEdgePass for KotlinEdgePass {
             ctx.fqns,
             ctx.keep_file,
         )
-        .map(LanguageEdgeSites)
+        .map(LanguageEdgeSites::Fqn)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

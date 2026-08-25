@@ -307,11 +307,12 @@ function runGate({ code, diffBase = "", report, rawReport, failOn = "warning" })
   }
 }
 
-function sarifReport({ results = [], diffBaseline, executionSuccessful = true, notifications = [] } = {}) {
+function sarifReport({ results = [], diffBaseline, suppressionReviews = [], executionSuccessful = true, notifications = [] } = {}) {
   const properties = {};
   if (diffBaseline !== undefined) {
     properties["bifrost.diffBaseline"] = diffBaseline;
   }
+  properties["bifrost.suppressionReviews"] = suppressionReviews;
   return {
     version: "2.1.0",
     runs: [{
@@ -335,18 +336,18 @@ function sarifFinding({ disposition = "new", ruleId = "policy.rule", pathName = 
   };
 }
 
-test("a reliable diff-aware baseline-only code 1 succeeds, but non-diff code 1 fails", () => {
+test("raw code 1 remains fail-closed when no retained finding explains it", () => {
   const report = sarifReport({
     diffBaseline: { baseRevision: "origin/master", degraded: false },
     results: [sarifFinding({ disposition: "persisting", message: "existing finding" })],
   });
   const baselineOnly = runGate({ code: 1, diffBase: "origin/master", report });
-  assert.equal(baselineOnly.status, 0, baselineOnly.stderr);
-  assert.match(baselineOnly.stdout, /No new findings at or above fail-on/u);
+  assert.equal(baselineOnly.status, 1);
+  assert.match(baselineOnly.stdout, /no gating finding or orphaned suppression was retained/u);
 
   const withoutDiff = runGate({ code: 1, report });
   assert.equal(withoutDiff.status, 1);
-  assert.match(withoutDiff.stdout, /without a diff-base/u);
+  assert.match(withoutDiff.stdout, /no gating finding or orphaned suppression was retained/u);
 
   const unreliable = runGate({
     code: 1,
@@ -358,7 +359,26 @@ test("a reliable diff-aware baseline-only code 1 succeeds, but non-diff code 1 f
     }),
   });
   assert.equal(unreliable.status, 1);
-  assert.match(unreliable.stdout, /does not prove a reliable diff-aware run/u);
+  assert.match(unreliable.stdout, /policy gate failure/u);
+});
+
+test("an orphaned suppression is printed and keeps code 1 failing", () => {
+  const result = runGate({
+    code: 1,
+    diffBase: "origin/master",
+    report: sarifReport({
+      diffBaseline: { baseRevision: "origin/master", degraded: false },
+      suppressionReviews: [{
+        policy_id: "policy.retry",
+        finding_id: "old-finding",
+        orphan_state: "orphaned",
+        rekey_candidates: ["new-finding"],
+      }],
+    }),
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /orphaned suppression: policy\.retry \[finding: old-finding\]/u);
+  assert.match(result.stdout, /re-key candidates: new-finding/u);
 });
 
 test("a new gating finding is printed and keeps code 1 failing", () => {
@@ -371,8 +391,8 @@ test("a new gating finding is printed and keeps code 1 failing", () => {
     }),
   });
   assert.equal(result.status, 1);
-  assert.match(result.stdout, /policy\.new src\/new\.py:12 new issue/u);
-  assert.match(result.stdout, /found findings at or above the fail-on threshold/u);
+  assert.match(result.stdout, /finding: policy\.new src\/new\.py:12 new issue/u);
+  assert.match(result.stdout, /policy gate failure/u);
 });
 
 test("an unreliable code 2 prints its SARIF diagnostic and fails", () => {

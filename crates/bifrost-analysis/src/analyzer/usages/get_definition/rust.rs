@@ -9969,43 +9969,56 @@ fn use_state() {
 
     #[test]
     fn bounded_receiver_typing_is_stack_safe_for_deep_reference_chains() {
-        const DEPTH: usize = 4_096;
-        let receiver = format!("{}Service {{}}", "&".repeat(DEPTH));
-        let source = format!(
-            "struct Service;\n\nimpl Service {{\n    fn run(&self) {{}}\n}}\n\nfn use_service() {{\n    ({receiver}).run();\n}}\n"
-        );
-        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
-        let scope = crate::analyzer::AnalyzerQueryScope::new(fixture.analyzer.analyzer());
-        let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
-        let site = site_for_last(&source, &file, "run");
-        let budget = ReceiverAnalysisBudget {
-            max_scope_nodes: 100_000,
-            ..ReceiverAnalysisBudget::default()
-        };
-        let outcome = resolve_rust_bounded(
-            fixture.analyzer.analyzer(),
-            scope.token(),
-            &file,
-            &source,
-            Some(&tree),
-            &site,
-            budget,
-            None,
-        );
+        std::thread::Builder::new()
+            .name("rust-deep-reference-receiver".to_string())
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                const DEPTH: usize = 1_024;
+                let receiver = format!("{}Service {{}}", "&".repeat(DEPTH));
+                let source = format!(
+                    "struct Service;\n\nimpl Service {{\n    fn run(&self) {{}}\n}}\n\nfn use_service() {{\n    ({receiver}).run();\n}}\n"
+                );
+                let fixture = AnalyzerFixture::new_for_language(
+                    Language::Rust,
+                    &[("src/lib.rs", &source)],
+                );
+                let scope = crate::analyzer::AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+                let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
+                let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
+                let site = site_for_last(&source, &file, "run");
+                let budget = ReceiverAnalysisBudget {
+                    max_scope_nodes: 100_000,
+                    ..ReceiverAnalysisBudget::default()
+                };
+                let outcome = resolve_rust_bounded(
+                    fixture.analyzer.analyzer(),
+                    scope.token(),
+                    &file,
+                    &source,
+                    Some(&tree),
+                    &site,
+                    budget,
+                    None,
+                );
 
-        let BoundedResolution::Complete { value, work } = outcome else {
-            panic!("deep reference chain should complete without exhausting the process stack");
-        };
-        assert!(work.scope_nodes > DEPTH, "{work:#?}");
-        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
-        assert!(
-            matches!(
-                value.definitions.as_slice(),
-                [definition] if definition.fq_name() == "Service.run"
-            ),
-            "{value:#?}"
-        );
+                let BoundedResolution::Complete { value, work } = outcome else {
+                    panic!(
+                        "deep reference chain should complete without exhausting the small stack"
+                    );
+                };
+                assert!(work.scope_nodes > DEPTH, "{work:#?}");
+                assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+                assert!(
+                    matches!(
+                        value.definitions.as_slice(),
+                        [definition] if definition.fq_name() == "Service.run"
+                    ),
+                    "{value:#?}"
+                );
+            })
+            .expect("spawn small-stack Rust receiver lookup")
+            .join()
+            .expect("deep Rust receiver lookup must not overflow its small stack");
     }
 
     #[test]

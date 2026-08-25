@@ -925,6 +925,9 @@ fn pattern_to_json(pattern: &Pattern) -> Value {
     if let Some(predicate) = &pattern.text {
         object.insert("text".to_string(), string_predicate_to_json(predicate));
     }
+    if let Some(value) = pattern.boolean_value {
+        object.insert("boolean_value".to_string(), Value::Bool(value));
+    }
     if let Some(arity) = &pattern.arity {
         object.insert("arity".to_string(), arity_to_json(arity));
     }

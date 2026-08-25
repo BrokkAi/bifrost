@@ -269,6 +269,22 @@ pub(crate) fn jsts_usage_index(host: &dyn JsTsMemoSource) -> Arc<JsTsUsageIndex>
     )
 }
 
+/// Prepare the usage index before a caller starts its own parallel file scan.
+///
+/// The ordinary accessor switches to a serial builder when invoked from a
+/// rayon worker, which is correct for an incidental nested lookup but turns a
+/// large workspace prewarm into a minute-scale serial bottleneck. A graph
+/// plugin calls this orchestration-specific entry point before its fan-out, so
+/// the memo can safely use the parallel builder without any scan task being
+/// able to re-enter the in-flight cell.
+pub(crate) fn jsts_usage_index_for_parallel_scan(host: &dyn JsTsMemoSource) -> Arc<JsTsUsageIndex> {
+    let language = host.language();
+    host.memo_caches().jsts_usage_index.get_or_build_parallel(
+        || build_jsts_usage_index(host, host.alias_resolver(), language, true),
+        || build_jsts_usage_index(host, host.alias_resolver(), language, false),
+    )
+}
+
 pub(crate) fn jsts_usage_index_with_cancellation(
     host: &dyn JsTsMemoSource,
     cancellation: &CancellationToken,
@@ -299,12 +315,4 @@ pub(crate) fn jsts_usage_index_with_cancellation(
             },
         )
         .ok()
-}
-
-pub(crate) fn prewarm_jsts_usage_index(host: &dyn JsTsMemoSource) -> Arc<JsTsUsageIndex> {
-    let language = host.language();
-    host.memo_caches().jsts_usage_index.get_or_build_parallel(
-        || build_jsts_usage_index(host, host.alias_resolver(), language, true),
-        || build_jsts_usage_index(host, host.alias_resolver(), language, false),
-    )
 }

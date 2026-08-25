@@ -479,7 +479,7 @@ query_step_ops! {
     CallArguments { label: "call_arguments", signature: "call_argument_group -> call_argument", description: "Project the ordered argument rows of each argument-list group." }
     CallEffects { label: "call_effects", signature: "call_shape -> call_effect", description: "Project the direct effect rows of each call shape: one row per (dispatch arm, declared effect) for every callee an active semantic-model pack declares effects for, carrying the effect id, its execution timing, the certainty meet of the declaration and the dispatch proof, and the pack provenance. At least one row per call shape, so an unresolved, unmodeled or unsupported dispatch states that instead of answering empty. The callee set and its proof are the dispatch oracle's own answer; nothing is re-derived here.", semantic: [Procedures] }
     ProcedureEffects { label: "procedure_effects", signature: "declaration -> procedure_effect", description: "Summarize the effects of each procedure over its reachable call graph: one row per (procedure, effect id), classified direct or transitive, with the hop count, the certainty and timing carried along the attributing chain, a bounded witness chain of call-site identities, and the coverage that says whether an absent effect is proven absent or merely unseen. At least one row per declaration. The walk is a bounded deterministic fixpoint over the same dispatch answers call_effects publishes.", semantic: [Procedures] }
-    CallBindings { label: "call_bindings", signature: "call_shape -> call_binding", description: "Project the normalized actual-to-formal binding rows of each call shape: one row per written actual, carrying the call-shape argument identity it binds, the formal ordinal and name it was bound to, the binding kind, this row's mapping status, and the whole call's partition coverage. Beside them, a row for each fact no written actual accounts for: the receiver the call is made against, an argument the language supplies with no syntax, and a formal that no actual passed but whose declaration carries a default. Coverage describes the written actuals alone. At least one row per call shape, so an unreadable shape, an unresolved or ambiguous callee, unrecorded formals, or a call that binds nothing each state that instead of answering empty. The callee is the one the production definition resolver binds; no overload is re-decided here." }
+    CallBindings { label: "call_bindings", signature: "call_shape -> call_binding", description: "Project the normalized actual-to-formal binding rows of each call shape: one row per written actual, carrying the call-shape argument identity it binds, the formal ordinal and name it was bound to, the binding kind, this row's mapping status, and the whole call's partition coverage. Beside them, a row for each fact no written actual accounts for: the receiver the call is made against, an argument the language supplies with no syntax, and a formal that no actual passed but whose declaration carries a default. Coverage describes the written actuals alone. The semantic dispatch identity, proof, completeness, and candidate coverage are carried from the same bounded dispatch answer as dispatch_targets; a source declaration is only an optional materialized view. At least one row per call shape, so an unreadable shape, an unresolved or ambiguous callee, unrecorded formals, or a call that binds nothing each state that instead of answering empty. The callee is the one the production definition resolver binds; no overload is re-decided here.", semantic: [Procedures, Dispatch] }
     CallableSignature { label: "callable_signature", signature: "declaration -> callable_signature", description: "Project the mandatory callable-signature rows of each declaration from the persisted signature contract: one row per persisted signature entry, so an overload set separates into one row per overload." }
     SignatureParameters { label: "signature_parameters", signature: "callable_signature -> signature_parameter", description: "Project the ordered declared parameter rows of each callable signature." }
     CallableApplicability { label: "callable_applicability", signature: "occurrence -> callable_applicability", description: "Project one applicability row per candidate callable the production resolver considered for each reference occurrence: the verdict, the typed callable rejection reason when inapplicable, the precedence tier, and whether the resolver bound it. A candidate the resolver refused stays visible with its reason, so a losing overload is evidence rather than an absence." }
@@ -740,6 +740,7 @@ macro_rules! rql_forms {
                     Self::Name => Some(RqlProperty::Name),
                     Self::NameRegex => Some(RqlProperty::NameRegex),
                     Self::TextRegex => Some(RqlProperty::TextRegex),
+                    Self::BooleanValue => Some(RqlProperty::BooleanValue),
                     Self::Capture => Some(RqlProperty::Capture),
                     Self::Has => Some(RqlProperty::Has),
                     Self::NotHas => Some(RqlProperty::NotHas),
@@ -1534,6 +1535,13 @@ rql_forms! {
         signature: "(text/regex \"pattern\")",
         description: "Match a node's source text with a regular expression.",
     }
+    BooleanValue {
+        labels: ["boolean-value", "boolean_value"],
+        class: Predicate,
+        shape: Boolean,
+        signature: "(boolean-value true|false)",
+        description: "Match a boolean literal by its normalized language-neutral value.",
+    }
     Capture {
         labels: ["capture"],
         class: Predicate,
@@ -1667,6 +1675,12 @@ rql_properties! {
         shape: RegexString,
         signature: ":text/regex \"pattern\"",
         description: "Match source text with a regular expression.",
+    }
+    BooleanValue {
+        labels: ["boolean-value", "boolean_value"],
+        shape: Boolean,
+        signature: ":boolean-value true|false",
+        description: "Match a boolean literal by its normalized language-neutral value.",
     }
     Capture {
         labels: ["capture"],
@@ -2381,6 +2395,7 @@ json_fields! {
     NotKind { label: "not_kind", shape: KindList, signature: "\"not_kind\": \"kind\" | [\"kinds\", ...]", description: "Exclude one or more normalized node kinds." }
     Name { label: "name", shape: StringPredicate, signature: "\"name\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match the node's normalized name." }
     Text { label: "text", shape: RegexPredicate, signature: "\"text\": { \"regex\": \"pattern\" }", description: "Match the node's source text with a regular expression." }
+    BooleanValue { label: "boolean_value", shape: Boolean, signature: "\"boolean_value\": true | false", description: "Match a boolean literal by its normalized language-neutral value." }
     Capture { label: "capture", shape: String, signature: "\"capture\": \"label\"", description: "Capture the matching node under a result label." }
     Arity { label: "arity", shape: Arity, signature: "\"arity\": count | { \"min\": count, \"max\": count }", description: "Match a call by its positional argument count: an exact count, or inclusive min/max bounds." }
     Visibility { label: "visibility", shape: DeclaredVisibilityList, signature: "\"visibility\": \"public\" | [\"public\", \"protected\", ...]", description: "Match a callable declaration by the visibility its adapter recorded from modifiers." }

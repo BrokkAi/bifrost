@@ -39,11 +39,11 @@
 
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
-    attach_role_with_derived_name, attach_terminal_callee, first_named_child,
+    attach_role_with_derived_name, attach_terminal_callee, field_name_in_parent, first_named_child,
 };
 use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::edges::{
-    INVERSE_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
+    DEEP_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
 use brokk_bifrost_core::analyzer::structural::facts::Span;
 use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
@@ -51,7 +51,7 @@ use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationMaterializationSupport, NO_MATERIALIZATION_SUPPORT,
 };
 use brokk_bifrost_core::analyzer::structural::occurrences::{
-    NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport,
+    OccurrenceRole, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
     CALLABLE_APPLICABILITY_ONLY_SUPPORT, LexicalEnvironmentSupport,
@@ -74,6 +74,18 @@ use crate::kotlin::syntax::{
 pub struct KotlinStructuralSpec;
 
 pub static KOTLIN_STRUCTURAL_SPEC: KotlinStructuralSpec = KotlinStructuralSpec;
+
+static KOTLIN_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupport::NONE
+    .supported(OccurrenceRole::DeclarationName)
+    .supported(OccurrenceRole::Binder)
+    .supported(OccurrenceRole::LabelOrKey)
+    .supported(OccurrenceRole::TypeOperand)
+    .supported(OccurrenceRole::PathSegment)
+    .supported(OccurrenceRole::ImportAlias)
+    .supported(OccurrenceRole::ImportTarget)
+    .supported(OccurrenceRole::ReceiverPosition)
+    .supported(OccurrenceRole::MemberPosition)
+    .supported(OccurrenceRole::ValueReference);
 
 pub const KOTLIN_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     // calls
@@ -240,6 +252,72 @@ fn is_numeric_literal_node(node: Node<'_>) -> bool {
             | "long_literal"
             | "unsigned_literal"
     )
+}
+
+fn contains(outer: Node<'_>, inner: Node<'_>) -> bool {
+    outer.start_byte() <= inner.start_byte() && inner.end_byte() <= outer.end_byte()
+}
+
+/// Classify one Kotlin identifier from its structured AST position.
+///
+/// Kotlin's grammar exposes few named fields, so this deliberately shares the
+/// same positional helpers as definition navigation and the graph resolver.
+/// Qualified import and type paths classify each segment exactly once; member
+/// and receiver positions are derived from the navigation expression shape.
+fn kotlin_occurrence_role(node: Node<'_>) -> Option<OccurrenceRole> {
+    if !matches!(node.kind(), "simple_identifier" | "type_identifier") {
+        return None;
+    }
+
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "import_header" => {
+                let segments = kotlin_import_header_segments(parent);
+                let position = segments.iter().position(|segment| *segment == node)?;
+                return Some(if position + 1 == segments.len() {
+                    OccurrenceRole::ImportTarget
+                } else {
+                    OccurrenceRole::PathSegment
+                });
+            }
+            "import_alias" => return Some(OccurrenceRole::ImportAlias),
+            "user_type" => {
+                let segments = kotlin_user_type_segments(parent);
+                let position = segments.iter().position(|segment| *segment == node)?;
+                return Some(if position + 1 == segments.len() {
+                    OccurrenceRole::TypeOperand
+                } else {
+                    OccurrenceRole::PathSegment
+                });
+            }
+            "navigation_suffix" => return Some(OccurrenceRole::MemberPosition),
+            "navigation_expression" => {
+                if kotlin_navigation_receiver(parent)
+                    .is_some_and(|receiver| contains(receiver, node))
+                {
+                    return Some(OccurrenceRole::ReceiverPosition);
+                }
+            }
+            "value_argument" if kotlin_named_argument_label(parent, node) => {
+                return Some(OccurrenceRole::LabelOrKey);
+            }
+            "class_declaration" | "object_declaration" | "function_declaration"
+                if field_name_in_parent(parent, current) == Some("name") =>
+            {
+                return Some(OccurrenceRole::DeclarationName);
+            }
+            "variable_declaration"
+            | "function_value_parameter"
+            | "parameter"
+            | "catch_block"
+            | "for_statement" => return Some(OccurrenceRole::Binder),
+            "call_expression" | "constructor_invocation" | "infix_expression" => break,
+            _ => {}
+        }
+        current = parent;
+    }
+    Some(OccurrenceRole::ValueReference)
 }
 
 /// Whether a `prefix_expression` is the sign of a numeric literal (`-3`,
@@ -422,6 +500,10 @@ impl StructuralSpec for KotlinStructuralSpec {
         Language::Kotlin
     }
 
+    fn supports_boolean_literal_value(&self) -> bool {
+        true
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         KOTLIN_KIND_TABLE
     }
@@ -473,11 +555,8 @@ impl StructuralSpec for KotlinStructuralSpec {
                 .any(|(_, fact_kind)| fact_kind.satisfies(kind))
     }
 
-    /// Kotlin has not learned occurrence-role classification yet (#1473).
-    /// The empty table is the honest answer: queries and assertions that ask
-    /// for an occurrence role here report incomplete rather than clean-empty.
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
-        &NO_OCCURRENCE_ROLE_SUPPORT
+        &KOTLIN_OCCURRENCE_ROLE_SUPPORT
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
@@ -492,7 +571,7 @@ impl StructuralSpec for KotlinStructuralSpec {
     }
 
     fn reference_edge_support(&self) -> &ReferenceEdgeSupport {
-        &INVERSE_REFERENCE_EDGE_SUPPORT
+        &DEEP_REFERENCE_EDGE_SUPPORT
     }
 
     fn identity_route_support(&self) -> &IdentityRouteSupport {
@@ -500,6 +579,9 @@ impl StructuralSpec for KotlinStructuralSpec {
     }
 
     fn extract(&self, node: Node<'_>, kind: NormalizedKind, sink: &mut RoleSink<'_>) {
+        if let Some(role) = kotlin_occurrence_role(node) {
+            sink.occurrence_role(node, role);
+        }
         match kind {
             NormalizedKind::Call => {
                 if node.kind() == "infix_expression" {

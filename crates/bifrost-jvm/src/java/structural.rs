@@ -356,6 +356,10 @@ impl StructuralSpec for JavaStructuralSpec {
         Language::Java
     }
 
+    fn supports_boolean_literal_value(&self) -> bool {
+        true
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         JAVA_KIND_TABLE
     }

@@ -27,6 +27,13 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 [profile.default.junit]
 path = "junit.xml"
 
+# Start the real-process repository corpus checks before the short unit tests
+# so their analyzer/server setup overlaps the rest of the run instead of
+# becoming a serial tail. They still reserve only the default single slot.
+[[profile.default.overrides]]
+filter = 'test(/^lsp_repository_corpus::/) | test(/^mcp_repository_corpus::/) | test(/^bifrost_benchmark_run::/) | test(/^scratch_cache_isolation::/)'
+priority = 100
+
 # temp_storage_scripts asserts live-PID / open-directory / age semantics of
 # real spawned processes. Under whole-box saturation its holder process can be
 # starved and its "young" fixtures age past thresholds (observed once at load

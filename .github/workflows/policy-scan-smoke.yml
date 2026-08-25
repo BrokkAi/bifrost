@@ -37,13 +37,10 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            runner: "runs-on=${{ github.run_id }}-${{ github.run_attempt }}-policy-smoke-linux/runner=2cpu-linux-x64/ram=8/volume=60gb/extras=s3-cache"
+            runner: ubuntu-latest
           - os: windows-latest
             runner: windows-latest
     steps:
-      - uses: runs-on/action@46910bf61b41721b0579f237e186afb35477007a # v2.3.0
-        if: startsWith(matrix.runner, 'runs-on=')
-
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
@@ -151,3 +148,58 @@ jobs:
           set -euo pipefail
           test "${OUTCOME}" = failure || { echo "::error::planted fixture step outcome is ${OUTCOME}, expected failure"; exit 1; }
           test "${CODE}" = 1 || { echo "::error::planted fixture exit code is ${CODE}, expected 1"; exit 1; }
+
+      # Leg C: an accepted decision whose finding disappeared is an orphaned
+      # suppression. It is a distinct exit-1 cause and must remain visible as
+      # such even when the report contains no gating finding.
+      - name: Write the orphaned suppression fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p smoke-fixture/orphan/.bifrost
+          cp smoke-fixture/clean/main.py smoke-fixture/orphan/main.py
+          jq '
+            .runs[0].results[0] as $finding
+            | {
+                schema_version: 1,
+                suppressions: [{
+                  policy_id: $finding.ruleId,
+                  finding_id: $finding.properties["bifrost.findingId"],
+                  path: $finding.locations[0].physicalLocation.artifactLocation.uri,
+                  identity_stability: $finding.properties["bifrost.identityStability"],
+                  status: "accepted",
+                  reason: "Policy action orphan-gate smoke fixture",
+                  policy_hash_at_acceptance: $finding.properties["bifrost.policyHash"],
+                  accepted_by: "policy-action-smoke",
+                  accepted_at: "2026-08-25",
+                  expires_at: null
+                }]
+              }
+          ' smoke-fixture/finding/finding.sarif > smoke-fixture/orphan/.bifrost/suppressions.json
+
+      - name: Scan the orphaned suppression fixture
+        id: orphan
+        continue-on-error: true
+        uses: ./.github/actions/policy-scan
+        with:
+          version: local
+          working-directory: smoke-fixture/orphan
+          sarif-file: orphan.sarif
+          upload: 'false'
+          cache: 'false'
+
+      - name: Assert the orphan gate failed
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.orphan.outcome }}
+          CODE: ${{ steps.orphan.outputs.exit-code }}
+          SARIF_FILE: ${{ steps.orphan.outputs.sarif-file }}
+        run: |
+          set -euo pipefail
+          test "${OUTCOME}" = failure || { echo "::error::orphan fixture step outcome is ${OUTCOME}, expected failure"; exit 1; }
+          test "${CODE}" = 1 || { echo "::error::orphan fixture exit code is ${CODE}, expected 1"; exit 1; }
+          jq -e '
+            [.runs[]?.properties["bifrost.suppressionReviews"][]?
+              | select(.orphan_state == "orphaned")]
+            | length == 1
+          ' "${SARIF_FILE}" >/dev/null

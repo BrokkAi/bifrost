@@ -465,9 +465,14 @@ pub(crate) fn merge_and_cap<K: NodeKey>(per_file: Vec<PerFileEdges<K>>) -> Usage
     for file in per_file {
         for (key, lines) in file.edge_lines {
             let sites = edge_sites.entry(key).or_default();
-            sites.extend(lines.into_keys().map(|line| CallSite {
-                path: file.path.clone(),
-                line,
+            sites.extend(lines.into_iter().map(|(line, mut evidence)| {
+                evidence.spans.sort_unstable();
+                CallSite {
+                    path: file.path.clone(),
+                    line,
+                    spans: evidence.spans,
+                    exact_targets: evidence.exact_targets,
+                }
             }));
         }
         for (callee, sites) in file.callsites {
@@ -508,8 +513,8 @@ pub(crate) fn merge_weights_and_cap<K: NodeKey>(
     for file in per_file {
         for (key, lines) in file.edge_lines {
             let counts = edge_weights.entry(key).or_default();
-            for kind in lines.into_values() {
-                counts.record(kind);
+            for evidence in lines.into_values() {
+                counts.record(evidence.kind);
             }
         }
         for (callee, sites) in file.callsites {
@@ -665,7 +670,14 @@ mod tests {
             .edge_lines
             .entry((caller.to_string(), callee.to_string()))
             .or_default()
-            .insert(line, UsageReferenceKind::Other);
+            .insert(
+                line,
+                brokk_bifrost_core::analyzer::usages::inverted_edges::UsageLineEvidence {
+                    kind: UsageReferenceKind::Other,
+                    spans: vec![(line, line + 1)],
+                    exact_targets: Vec::new(),
+                },
+            );
         edges
     }
 
@@ -690,10 +702,14 @@ mod tests {
                 CallSite {
                     path: "a.rs".to_string(),
                     line: 5,
+                    spans: vec![(5, 6)],
+                    exact_targets: Vec::new(),
                 },
                 CallSite {
                     path: "b.rs".to_string(),
                     line: 5,
+                    spans: vec![(5, 6)],
+                    exact_targets: Vec::new(),
                 },
             ],
         );
@@ -740,7 +756,14 @@ mod tests {
             .edge_lines
             .get_mut(&("caller".to_string(), "callee".to_string()))
             .unwrap()
-            .insert(5, UsageReferenceKind::Call);
+            .insert(
+                5,
+                brokk_bifrost_core::analyzer::usages::inverted_edges::UsageLineEvidence {
+                    kind: UsageReferenceKind::Call,
+                    spans: vec![(5, 6)],
+                    exact_targets: Vec::new(),
+                },
+            );
 
         let merged = merge_weights_and_cap(vec![per_file]);
         assert_eq!(
@@ -770,7 +793,14 @@ mod tests {
                 .edge_lines
                 .entry(("caller".to_string(), "callee".to_string()))
                 .or_default()
-                .insert(index + 1, UsageReferenceKind::Other);
+                .insert(
+                    index + 1,
+                    brokk_bifrost_core::analyzer::usages::inverted_edges::UsageLineEvidence {
+                        kind: UsageReferenceKind::Other,
+                        spans: vec![(index, index + 1)],
+                        exact_targets: Vec::new(),
+                    },
+                );
             per_file
                 .callsites
                 .entry("callee".to_string())
@@ -788,7 +818,14 @@ mod tests {
                 .edge_lines
                 .entry(("caller".to_string(), "callee".to_string()))
                 .or_default()
-                .insert(index + 1, UsageReferenceKind::Other);
+                .insert(
+                    index + 1,
+                    brokk_bifrost_core::analyzer::usages::inverted_edges::UsageLineEvidence {
+                        kind: UsageReferenceKind::Other,
+                        spans: vec![(index, index + 1)],
+                        exact_targets: Vec::new(),
+                    },
+                );
             weight_file
                 .callsites
                 .entry("callee".to_string())

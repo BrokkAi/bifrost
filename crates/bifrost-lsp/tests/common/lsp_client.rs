@@ -520,6 +520,10 @@ fn lsp_command(root: &Path) -> (Command, TempDir) {
         .arg(root)
         .arg("--server")
         .arg("lsp")
+        // Every client owns a brand-new cache directory that is deleted with
+        // the subprocess. Sweeping Git reachability cannot reclaim anything
+        // from it, and the dedicated cache-GC tests cover the enabled path.
+        .env("BIFROST_CACHE_GC", "off")
         .env(
             brokk_bifrost_analysis::gitblob::CACHE_DIR_ENV,
             cache_dir.path(),

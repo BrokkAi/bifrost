@@ -1213,11 +1213,22 @@ fn call_row_domains_project_every_registered_field_on_real_rows() {
         &query("helper", &["call_shape", "call_bindings"]),
     );
     assert_eq!(bound.results.len(), 2, "{}", bound.render_text());
+    assert!(
+        matches!(bound.completion(), CodeQueryCompletion::Incomplete { .. }),
+        "analyzer-only bindings lack exact dispatch evidence: {}",
+        bound.render_text()
+    );
     for item in &bound.results {
         assert_eq!(
             item.value.detailed_domain(),
             DetailedCodeQueryDomain::CallBinding
         );
+        let CodeQueryResultValue::CallBinding { value } = &item.value else {
+            unreachable!("domain assertion above established a call binding")
+        };
+        assert_eq!(value.dispatch_outcome, "unknown");
+        assert_eq!(value.dispatch_coverage, "open");
+        assert!(value.semantic_target_id.is_none());
         assert_row_projects_its_whole_registered_surface(&item.value);
     }
 

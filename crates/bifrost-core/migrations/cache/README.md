@@ -60,3 +60,10 @@ structured import segments and type identifiers. Seed-directed relevance
 queries intersect these indexes with their connection-local live blob set, so
 they do not hydrate every file in a large workspace or admit historical blobs
 from the shared content cache.
+
+Migration `0030-reference-identifier-facts.sql` renames the cross-language
+identifier relation to match its actual use in reference planning and adds an
+independent epoch/count manifest. Epoch 1 has exactly the old row semantics,
+so the migration carries every complete blob forward in SQL. A later extractor
+epoch can selectively reconcile stale live blobs without invalidating stored
+declarations, semantic chunks, or vectors.

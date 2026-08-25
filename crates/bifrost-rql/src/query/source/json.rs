@@ -306,6 +306,15 @@ fn validate_json_pattern(value: &spanned::Value, path: &str, analysis: &mut Anal
                 PatternField::Text => {
                     validate_string_predicate(child, &child_path, false, analysis)
                 }
+                PatternField::BooleanValue => {
+                    if spanned_to_json(child).as_bool().is_none() {
+                        analysis.error(
+                            child.range(),
+                            "wrong-value-shape",
+                            "boolean_value must be true or false",
+                        );
+                    }
+                }
                 PatternField::Arity => validate_json_arity(child, &child_path, analysis),
                 PatternField::Visibility => {
                     reject_json_callable_signature(

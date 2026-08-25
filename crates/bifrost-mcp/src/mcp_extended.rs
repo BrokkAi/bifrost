@@ -1112,6 +1112,11 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "minLength": 1,
                         "maxLength": MAX_RUN_POLICY_DIFF_BASE_BYTES,
                         "description": "Optional git revision to diff against: the same policies also evaluate that commit's content, each finding is classified new or persisting, and only new findings gate. Any revision git rev-parse accepts."
+                    },
+                    "include_stage_timings": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, the result carries a `stage_timings` sibling with wall-clock per-stage attribution (selection, suppression preflight, workspace snapshot, registration, preparation, evaluation, report construction). Timings are non-deterministic by nature and are delivered beside the canonical report, which stays byte-identical across invocations either way."
                     }
                 },
                 "required": ["evaluation_date"],
@@ -2027,6 +2032,14 @@ mod tests {
         assert_eq!(
             schema["properties"]["diff_base"]["maxLength"],
             MAX_RUN_POLICY_DIFF_BASE_BYTES
+        );
+        assert_eq!(
+            schema["properties"]["include_stage_timings"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            schema["properties"]["include_stage_timings"]["default"],
+            false
         );
     }
 }

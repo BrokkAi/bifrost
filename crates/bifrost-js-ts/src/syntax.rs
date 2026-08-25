@@ -1674,6 +1674,19 @@ relay();
     }
 
     #[test]
+    fn static_member_property_accepts_a_terminal_private_name() {
+        let source = "this.#value;";
+        let tree = parse_javascript(source);
+        let member = find_node(tree.root_node(), source, "this.#value");
+
+        let (name_node, name) =
+            static_member_property(member, source).expect("private property name");
+        assert_eq!(name, "#value");
+        assert_eq!(slice(name_node, source), "#value");
+        assert!(static_member_receiver(member, source).is_none());
+    }
+
+    #[test]
     fn lexical_binding_index_tracks_for_of_and_single_arrow_parameters() {
         let source = r#"
 function render(tasks) {
@@ -1765,6 +1778,32 @@ function render(tasks) {
             bindings.binding_scope_at("task", loop_use),
             bindings.binding_scope_at("task", later_use)
         );
+    }
+
+    #[test]
+    fn lexical_binding_index_tracks_default_imports() {
+        let source = "import window from \"./shim.js\";\nwindow.Promise = value;";
+        let tree = parse_javascript(source);
+        let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let use_byte = source.rfind("window.Promise").expect("window use");
+
+        assert!(bindings.is_program_binding_at("window", use_byte, tree.root_node()));
+    }
+
+    #[test]
+    fn lexical_binding_index_hoists_var_to_the_function_scope() {
+        let source = r#"
+function read() {
+  const before = typeof Promise;
+  var Promise;
+  return before;
+}
+"#;
+        let tree = parse_javascript(source);
+        let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let use_byte = source.find("Promise;").expect("Promise read");
+
+        assert!(bindings.is_bound_at("Promise", use_byte));
     }
 
     #[test]

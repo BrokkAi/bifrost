@@ -141,10 +141,9 @@ impl SegmentKind {
         }
     }
 
-    /// Stable, human-readable name for the kind. Used by the debug/test-only
-    /// `CodeUnit::fq_segments_debug` cross-check so a test can compare kinds
-    /// without the (crate-private) `SegmentKind` type leaking into `tests/`.
-    #[cfg(any(test, debug_assertions))]
+    /// Stable, human-readable name for the kind. Declaration identities persist
+    /// this spelling, while the debug/test `CodeUnit::fq_segments_debug`
+    /// cross-check also exposes it without leaking `SegmentKind` into tests.
     pub const fn name(self) -> &'static str {
         match self {
             SegmentKind::Path => "Path",

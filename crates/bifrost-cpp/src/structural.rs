@@ -308,6 +308,10 @@ impl StructuralSpec for CppStructuralSpec {
         Language::Cpp
     }
 
+    fn supports_boolean_literal_value(&self) -> bool {
+        true
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         CPP_KIND_TABLE
     }

@@ -212,11 +212,12 @@ impl RubyWalkState<'_, '_> {
         };
         match scope {
             RubyFieldScope::ClassVariable => {
+                let visible_files = self.scan.visible_files.iter().cloned().collect::<Vec<_>>();
                 owner == target_owner
                     || self
                         .scan
                         .semantic
-                        .ancestor_lookup_order(owner)
+                        .forward_ancestor_lookup_order(self.scan.support, &visible_files, owner)
                         .iter()
                         .any(|ancestor| ancestor == target_owner)
             }

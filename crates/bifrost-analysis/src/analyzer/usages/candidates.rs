@@ -620,6 +620,10 @@ impl CandidateFileProvider for ExplicitCandidateProvider {
             .cloned()
             .collect()
     }
+
+    fn is_complete_scope(&self) -> bool {
+        true
+    }
 }
 
 /// Combinator that returns the graph provider's results, or falls back to the text provider

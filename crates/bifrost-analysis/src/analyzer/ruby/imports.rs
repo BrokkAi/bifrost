@@ -5,19 +5,13 @@
 //! cells, the reverse-import `PoolSafeMemo`, the two moka caches -- and the
 //! `get_or_init` call sites that fill it.
 //!
-//! `zeitwerk_reference_files_for_identifier` in particular keeps its lazy
-//! trigger here on purpose: `RubyQueryResolver`'s post-budget scan-set
-//! augmentation is what first forces the whole-workspace reference scan, and
-//! that timing is part of the augmentation contract even though no assertion
-//! pins it.
-
 use super::*;
 use crate::analyzer::ImportInfo;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_ruby::imports::{
     build_autoload_constant_files, build_zeitwerk_autoload_code_units,
-    build_zeitwerk_autoload_files, build_zeitwerk_consumer_files, build_zeitwerk_reference_files,
+    build_zeitwerk_autoload_files, build_zeitwerk_consumer_files,
     detect_zeitwerk_autoload_conventions, ruby_effective_imported_code_units,
     ruby_imported_files_from_infos, ruby_required_files, ruby_transitive_referencing_files_of,
 };
@@ -37,25 +31,6 @@ impl RubyAnalyzer {
     pub(crate) fn zeitwerk_autoload_files(&self) -> &HashSet<ProjectFile> {
         self.zeitwerk_autoload_files
             .get_or_init(|| build_zeitwerk_autoload_files(self))
-    }
-
-    pub(crate) fn zeitwerk_reference_files_for_identifier(
-        &self,
-        identifier: &str,
-    ) -> HashSet<ProjectFile> {
-        if identifier.is_empty() {
-            return HashSet::default();
-        }
-        self.zeitwerk_reference_files()
-            .get(identifier)
-            .into_iter()
-            .flat_map(|files| files.iter().cloned())
-            .collect()
-    }
-
-    fn zeitwerk_reference_files(&self) -> &HashMap<String, HashSet<ProjectFile>> {
-        self.zeitwerk_reference_files
-            .get_or_init(|| build_zeitwerk_reference_files(self))
     }
 
     pub(super) fn build_reverse_import_index(

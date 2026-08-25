@@ -17,6 +17,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::num::NonZeroUsize;
 use std::sync::{Mutex, OnceLock};
 
+use brokk_bifrost_analysis::AnalyzerConfig;
 use rayon::prelude::*;
 use rusqlite::Connection;
 
@@ -58,13 +59,18 @@ const VECTOR_SCAN_SQL: &str = "SELECT vector_hash, vector FROM semantic_vectors"
 ///
 /// Eight threads is enough: the measured single-threaded floor for reading the
 /// whole vector table is 0.84 s, so the scan is fetch-bound long before the
-/// scoring threads are.
+/// scoring threads are. The analyzer parallelism setting remains an upper bound
+/// so batch consumers can prevent this dedicated pool from defeating their
+/// process-wide concurrency budget.
 fn scan_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = std::thread::available_parallelism()
+        let machine_threads = std::thread::available_parallelism()
             .map(NonZeroUsize::get)
-            .unwrap_or(1)
+            .unwrap_or(1);
+        let threads = AnalyzerConfig::default()
+            .parallelism()
+            .min(machine_threads)
             .min(8);
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)

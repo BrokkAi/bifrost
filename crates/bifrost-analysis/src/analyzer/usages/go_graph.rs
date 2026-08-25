@@ -22,7 +22,7 @@ use crate::analyzer::usages::model::{FuzzyResult, UsageAnalysisDiagnostic};
 use crate::analyzer::usages::outcome::{
     CandidateUsageHits, GraphFailureReason, GraphUsageOutcome, union_candidate_usages,
 };
-use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
@@ -352,9 +352,7 @@ fn scan_candidate_with_graph(
     }
 
     let mut scan_files = graph.scan_files(candidate_files, target, &target_spec);
-    if scan_scope.is_authoritative() {
-        scan_files.retain(|file| scan_scope.allows(file));
-    }
+    scan_files.retain(|file| scan_scope.allows(file));
     let scan_result = scan_files_for_target(
         analyzer,
         graph,
@@ -373,18 +371,4 @@ fn scan_candidate_with_graph(
             .filter(|hit| &hit.enclosing != target)
             .collect(),
     })
-}
-
-impl UsageAnalyzer for GoUsageGraphStrategy {
-    fn find_usages(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
-        max_usages: usize,
-    ) -> FuzzyResult {
-        let scan_scope = UsageScanScope::new(candidate_files, false);
-        self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
-            .into_fuzzy_result()
-    }
 }

@@ -266,6 +266,16 @@ pub enum CallBindingTarget {
         layout: FormalParameterLayout,
         receiver: CallReceiverBinding,
     },
+    /// The callee is an exact structured target outside the source workspace.
+    ///
+    /// A model-backed target can still publish a complete formal layout, but
+    /// it has no source [`CodeUnit`] to render or join. Keeping this case
+    /// separate from [`Self::Resolved`] prevents callers from manufacturing a
+    /// source declaration merely to reuse the shared binder.
+    ResolvedExternal {
+        layout: FormalParameterLayout,
+        receiver: CallReceiverBinding,
+    },
     /// The callee resolves, but nothing recorded its formal parameter list.
     FormalsUnrecorded { unit: CodeUnit },
     /// The callee reference named several declarations.
@@ -378,7 +388,8 @@ pub fn call_binding_report(
             unit,
             layout,
             receiver,
-        } => (unit, layout, receiver),
+        } => (Some(unit), layout, receiver),
+        CallBindingTarget::ResolvedExternal { layout, receiver } => (None, layout, receiver),
         CallBindingTarget::FormalsUnrecorded { unit } => {
             return base(
                 Some(unit),
@@ -575,7 +586,7 @@ pub fn call_binding_report(
             None,
         ));
     }
-    base(Some(unit), coverage, actual_count, bound_count, rows)
+    base(unit, coverage, actual_count, bound_count, rows)
 }
 
 /// The row for the receiver expression a call is written against, when the
@@ -791,6 +802,7 @@ pub(crate) fn canonical_parameter_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::lexical_definitions::FormalVariadicKind;
     use crate::analyzer::structural::extract::extract_file_facts;
     use crate::analyzer::structural::{FileFacts, NormalizedKind};
     use crate::analyzer::usages::call_shape::call_shape_for_call;
@@ -1095,6 +1107,56 @@ mod tests {
         assert_eq!(report.actual_count, 1);
         assert_eq!(report.bound_count, 1);
         assert_eq!(report.coverage, CallBindingCoverage::Exhaustive);
+    }
+
+    /// A complete external/model layout uses the same matcher as a source
+    /// declaration but deliberately has no source target to render. Optional
+    /// and variadic formals remain ordinary binding facts, not model-specific
+    /// approximations.
+    #[test]
+    fn an_external_layout_binds_defaults_and_variadics_without_a_source_target() {
+        let source = "class App { static void run() { target(1); target(1, 2, 3); } }";
+        let facts = java_facts(source);
+        let first_shape = shape_for(source, &facts, "target(1)");
+        let mut default_layout = layout(&["a", "b", "rest"]);
+        default_layout.slots[1].default_range = Some(first_shape.outcome.range);
+        default_layout.slots[2].variadic = Some(FormalVariadicKind::Positional);
+        let defaulted = call_binding_report(
+            &file("Main.java"),
+            &first_shape,
+            CallBindingTarget::ResolvedExternal {
+                layout: default_layout,
+                receiver: CallReceiverBinding::Absent,
+            },
+        );
+
+        assert!(defaulted.target.is_none());
+        assert_eq!(defaulted.coverage, CallBindingCoverage::Exhaustive);
+        assert_eq!(defaulted.rows[0].mapping, CallBindingMapping::Exact);
+        assert_eq!(
+            defaulted.rows[1].binding_kind,
+            Some(CallBindingKind::Defaulted)
+        );
+        assert_eq!(defaulted.rows[1].formal_name.as_deref(), Some("b"));
+
+        let variadic_shape = shape_for(source, &facts, "target(1, 2, 3)");
+        let mut variadic_layout = layout(&["a", "rest"]);
+        variadic_layout.slots[1].variadic = Some(FormalVariadicKind::Positional);
+        let variadic = call_binding_report(
+            &file("Main.java"),
+            &variadic_shape,
+            CallBindingTarget::ResolvedExternal {
+                layout: variadic_layout,
+                receiver: CallReceiverBinding::Absent,
+            },
+        );
+
+        assert!(variadic.target.is_none());
+        assert_eq!(variadic.coverage, CallBindingCoverage::Exhaustive);
+        assert!(variadic.rows.iter().any(|row| {
+            row.binding_kind == Some(CallBindingKind::Variadic)
+                && row.mapping == CallBindingMapping::Exact
+        }));
     }
 
     /// Row identities are a function of the site and the argument row, never

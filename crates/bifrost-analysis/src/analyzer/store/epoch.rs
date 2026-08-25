@@ -574,16 +574,34 @@ mod query_content_tests {
 // changed. Rows persisted before it deserialize as "nobody read the modifiers",
 // so `receiver_contract_of` reports no contract and every JS/TS procedure
 // summary stays inert on a warm workspace with no error raised anywhere.
+// Salt bumped again (#2593): a `receiver.#name = value` assignment no longer
+// mints a Field declaration. A private name is only legal inside a class body
+// that already declares it, so those rows were parentless duplicates of the
+// field #1926 already indexes under its class; chains rooted through a private
+// segment (`child.#out.length`) are gone too. Only JavaScript's salt moves:
+// the walk that changed is the JavaScript assignment walk, and the TypeScript
+// walk indexes assigned fields only through a `this` receiver, which never
+// accepted a private name. Rows persisted before the bump still carry the
+// duplicate declarations.
 lang_epoch!(
     JavaScript,
     "javascript",
     "treesitter/javascript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;structured-class-field-properties-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;js-ts-callable-modifier-metadata-2026-08"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;structured-class-field-properties-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;js-ts-callable-modifier-metadata-2026-08;js-private-name-assignment-is-not-a-declaration-2026-08"
 );
 
 #[cfg(test)]
 pub(super) fn javascript_epoch_before_callable_modifier_metadata() -> String {
     let prior = salt_before_bump(JavaScript::SALT, "js-ts-callable-modifier-metadata-2026-08");
+    compute_epoch::<JavaScript>(&tree_sitter_javascript::LANGUAGE.into(), prior)
+}
+
+#[cfg(test)]
+pub(super) fn javascript_epoch_before_private_name_assignment_declarations() -> String {
+    let prior = salt_before_bump(
+        JavaScript::SALT,
+        "js-private-name-assignment-is-not-a-declaration-2026-08",
+    );
     compute_epoch::<JavaScript>(&tree_sitter_javascript::LANGUAGE.into(), prior)
 }
 // TS salt bumped again (#1167): `is_simple_ts_initializer` now includes

@@ -570,15 +570,42 @@ pub struct CodeQueryCallBinding {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub argument_id: Option<String>,
     /// The exact callee declaration the production resolver named, when the
-    /// workspace still indexes a range for it.
+    /// workspace still indexes a range for it. This remains the source
+    /// declaration identity used by source joins.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<CodeQueryDeclaration>,
+    /// The canonical #2438 semantic target identity when the sole dispatch
+    /// arm is proven to be the same materialized source declaration named by
+    /// the binding resolver, or the same unique complete model symbol selected
+    /// from an unmaterialized external arm. Open and ambiguous answers remain
+    /// unset rather than inventing or comparing names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_target_id: Option<String>,
+    /// The dispatch oracle's outcome for this call range.
+    pub dispatch_outcome: &'static str,
+    /// The dispatch oracle's candidate-set coverage.
+    pub dispatch_coverage: &'static str,
+    /// The sole arm's proof and completeness, when one compatible arm exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_proof: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_completeness: Option<&'static str>,
+    /// Retained dispatch arms and whether the oracle hit its target bound.
+    pub dispatch_target_count: usize,
+    pub dispatch_targets_truncated: bool,
     /// The `callable_signature` row this binding selects: the target's only
     /// published entry, or the entry of a multi-entry set whose declared arity
     /// accepts this call. Absent when entries with different parameter lists
     /// both accept it, which is a selection nobody made.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature_id: Option<String>,
+    /// Stable identity of the model symbol that supplied an external target,
+    /// when this row is model-backed rather than source-materialized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// Activated semantic-pack provenance for a model-backed target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
     /// The actual's position inside its own argument-list group.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actual_index: Option<usize>,

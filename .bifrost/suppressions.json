@@ -75,18 +75,6 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "5e10e580c936887ca9f0000734dee7e5d1b8601099a969f07ba540f28274942d",
-      "path": "crates/bifrost-mcp/src/searchtools_service.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
-      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-05",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "f12287edac77c4a41d87881ee258fb88642e6d418bf0948939940c74c1372a46",
       "path": "tools/rename-eval/e2e_corpus.py",
       "identity_stability": "strong",
@@ -327,7 +315,7 @@
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "672fe0666a27b12d59248b1a2aba9ffa24cfebbce574a7f3c55fdb1d1c7e7642",
+      "finding_id": "c0e9526d5357c4c6c86b98a6c88955dbe3bba6b11f091374672516b1e861bd11",
       "path": "crates/bifrost-analysis/src/analyzer/tree_sitter_analyzer.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -363,7 +351,7 @@
     },
     {
       "policy_id": "bifrost.performance.sleep-in-loop",
-      "finding_id": "ccbb7473c29730e9b91da63037e31c9e85af2f42f0eb6a2bd977650b218f5696",
+      "finding_id": "af0fa2cf8c555aaa710a052448a85973280d6a18851163b8422bdbcb411cd4d0",
       "path": "crates/bifrost-analysis/src/analyzer/tree_sitter_analyzer.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -371,6 +359,18 @@
       "policy_hash_at_acceptance": "b0319247b09cacb3e1b43e0b3809f7b2ba6858a5522ba6de7bf3a7b8212901ad",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sleep-in-loop",
+      "finding_id": "cf1a641aa741ff2a9c74bfd80101e2841d00d0da8a483b121f77df63db073401",
+      "path": "crates/bifrost-analysis/src/analyzer/tree_sitter_analyzer.rs",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Deliberate retry/backoff or poll-until-deadline loop; the sleep is the mechanism, not a defect.",
+      "policy_hash_at_acceptance": "b0319247b09cacb3e1b43e0b3809f7b2ba6858a5522ba6de7bf3a7b8212901ad",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-25",
       "expires_at": null
     },
     {
@@ -483,7 +483,7 @@
     },
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
-      "finding_id": "db3a69197c80657cd993744f627dc6b9f704195ba9f58f89492a7b73abaa69ef",
+      "finding_id": "e2c1cc71f227d4296b76bf4cd244fbe952cd7064a91d4a41a921f70fa73bc32a",
       "path": "crates/bifrost-analysis/src/analyzer/usages/get_definition/scala.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -495,7 +495,7 @@
     },
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
-      "finding_id": "29a8ef68a9897a11ec3f6be3b943d5348ed28f05e1357a0c3c9551dcbe5389dc",
+      "finding_id": "c7e20992b8809b2f51eb490d6e2f5ed26e98182c0a3620dbb119f418dcda2d06",
       "path": "crates/bifrost-analysis/src/analyzer/reference_candidates.rs",
       "identity_stability": "strong",
       "status": "accepted",
@@ -507,7 +507,7 @@
     },
     {
       "policy_id": "bifrost.performance.loop-invariant-sort",
-      "finding_id": "94fbed1c56d9568dc2e7bbb0327ab7dc59311c413bac694c6a6136fa3ce01611",
+      "finding_id": "0ba73b3f031edc8dc071d6381406231263c82d1f12f119dabde22fced9ac9e9c",
       "path": "crates/bifrost-analysis/src/analyzer/reference_candidates.rs",
       "identity_stability": "strong",
       "status": "accepted",

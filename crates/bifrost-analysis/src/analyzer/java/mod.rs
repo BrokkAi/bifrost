@@ -22,7 +22,6 @@ use crate::analyzer::languages::{
     overloaded_function_fqns, package_fq_name,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::java_graph::{
     JavaDeadCodeBulkEligibility, JavaUsageGraphStrategy, build_java_usage_edge_weights,
     build_java_usage_edges, build_rooted_java_usage_edges, dead_code_bulk_eligibility,
@@ -1112,8 +1111,11 @@ impl LanguageSupport for JavaSupport {
         UsageEcosystem::Jvm
     }
 
-    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
-        &JAVA_USAGE_STRATEGY
+    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
+        crate::analyzer::languages::ReferenceLanguagePlugin::new(
+            &JAVA_USAGE_STRATEGY,
+            &JavaEdgePass,
+        )
     }
 
     fn expand_imported_external_callee(
@@ -1130,10 +1132,6 @@ impl LanguageSupport for JavaSupport {
             file,
             callee_text,
         )
-    }
-
-    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
-        Some(&JavaEdgePass)
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -1167,7 +1165,8 @@ impl LanguageEdgePass for JavaEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        build_rooted_java_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        build_rooted_java_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeSites::Fqn)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

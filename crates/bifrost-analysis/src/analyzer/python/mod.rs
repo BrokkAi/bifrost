@@ -37,7 +37,6 @@ use crate::analyzer::languages::{
     fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_python_bounded,
 };
@@ -971,12 +970,11 @@ impl LanguageSupport for PythonSupport {
         UsageEcosystem::Python
     }
 
-    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
-        &PYTHON_USAGE_STRATEGY
-    }
-
-    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
-        Some(&PythonEdgePass)
+    fn reference_plugin(&self) -> crate::analyzer::languages::ReferenceLanguagePlugin {
+        crate::analyzer::languages::ReferenceLanguagePlugin::new(
+            &PYTHON_USAGE_STRATEGY,
+            &PythonEdgePass,
+        )
     }
 
     fn dead_code(&self) -> DeadCodeSupport {
@@ -1025,7 +1023,7 @@ impl LanguageEdgePass for PythonEdgePass {
             ctx.fqns,
             ctx.keep_file,
         )
-        .map(LanguageEdgeSites)
+        .map(LanguageEdgeSites::Fqn)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

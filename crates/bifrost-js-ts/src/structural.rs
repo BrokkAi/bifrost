@@ -444,6 +444,10 @@ impl StructuralSpec for JsTsStructuralSpec {
         self.language
     }
 
+    fn supports_boolean_literal_value(&self) -> bool {
+        true
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         match self.language {
             Language::JavaScript => JS_KIND_TABLE,

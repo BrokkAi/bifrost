@@ -1752,6 +1752,7 @@ struct PatternFields<'a> {
     not_kind: Option<&'a Value>,
     name: Option<&'a Value>,
     text: Option<&'a Value>,
+    boolean_value: Option<&'a Value>,
     arity: Option<&'a Value>,
     visibility: Option<&'a Value>,
     parameter_type: Option<&'a Value>,
@@ -1773,6 +1774,7 @@ fn collect_pattern_fields<'a>(
                 PatternField::NotKind => fields.not_kind = Some(value),
                 PatternField::Name => fields.name = Some(value),
                 PatternField::Text => fields.text = Some(value),
+                PatternField::BooleanValue => fields.boolean_value = Some(value),
                 PatternField::Arity => fields.arity = Some(value),
                 PatternField::Visibility => fields.visibility = Some(value),
                 PatternField::ParameterType => fields.parameter_type = Some(value),
@@ -1833,6 +1835,18 @@ fn decode_pattern(
         .map(|value| decode_string_predicate(value, &child_path(path, "text"), false))
         .transpose()?;
 
+    let boolean_value = fields
+        .boolean_value
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                QueryError::new(
+                    child_path(path, "boolean_value"),
+                    "expected a boolean literal",
+                )
+            })
+        })
+        .transpose()?;
+
     let arity = fields
         .arity
         .map(|value| decode_arity_constraint(value, &child_path(path, "arity")))
@@ -1879,6 +1893,7 @@ fn decode_pattern(
         not_kinds,
         name,
         text,
+        boolean_value,
         arity,
         visibility,
         parameter_type,

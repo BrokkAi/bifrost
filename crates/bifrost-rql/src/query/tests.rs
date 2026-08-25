@@ -420,6 +420,46 @@ fn parses_receiver_kwargs_and_regex_predicates() {
 }
 
 #[test]
+fn boolean_literal_values_parse_and_canonicalize_across_json_and_rql() {
+    let json_query = parse_ok(json!({
+        "match": { "kind": "boolean_literal", "boolean_value": true }
+    }));
+    assert_eq!(json_query.seed().unwrap().root.boolean_value, Some(true));
+    assert_eq!(
+        json_query.to_canonical_json()["match"]["boolean_value"],
+        json!(true)
+    );
+
+    for source in [
+        "(boolean_literal :boolean-value true)",
+        "(boolean_literal :boolean_value true)",
+        "(boolean_literal (boolean-value true))",
+        "(boolean_literal (boolean_value true))",
+    ] {
+        let rql = CodeQuery::from_sexp(source).expect("boolean-value RQL should lower");
+        assert_eq!(rql.to_canonical_json(), json_query.to_canonical_json());
+    }
+
+    let false_query = CodeQuery::from_sexp("(boolean_literal (boolean-value false))")
+        .expect("false boolean-value RQL should lower");
+    assert_eq!(
+        false_query.to_canonical_json()["match"]["boolean_value"],
+        json!(false)
+    );
+
+    for invalid in [
+        json!({ "match": { "kind": "boolean_literal", "boolean_value": 1 } }),
+        json!({ "match": { "kind": "boolean_literal", "boolean_value": "true" } }),
+    ] {
+        let error = error_of(invalid);
+        assert_eq!(error.path, "match.boolean_value");
+        assert_eq!(error.message, "expected a boolean literal");
+    }
+    assert!(CodeQuery::from_sexp("(boolean_literal :boolean-value 1)").is_err());
+    assert!(CodeQuery::from_sexp("(boolean_literal (boolean-value \"true\"))").is_err());
+}
+
+#[test]
 fn parses_result_detail_mode() {
     let query = parse_ok(json!({
         "match": { "kind": "call" },

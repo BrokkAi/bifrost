@@ -17,7 +17,7 @@ use crate::analyzer::usages::inverted_edges::{EdgeNodeDomain, UsageEdgeWeights, 
 use crate::analyzer::usages::java_graph::shared::{JavaEdgeResolver, JavaQueryResolver};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 use brokk_bifrost_jvm::java::graph::JavaGraphSource;
@@ -339,20 +339,6 @@ impl GraphUsageAnalyzer for JavaUsageGraphStrategy {
     }
 }
 
-impl UsageAnalyzer for JavaUsageGraphStrategy {
-    fn find_usages(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
-        max_usages: usize,
-    ) -> FuzzyResult {
-        let scan_scope = UsageScanScope::new(candidate_files, false);
-        self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
-            .into_fuzzy_result()
-    }
-}
-
 /// Collect hits on a Java target from Scala source, when the workspace has a
 /// Scala analyzer to read Scala's own imports and declarations with.
 ///
@@ -621,7 +607,7 @@ mod relational_inverted_tests {
             .find(|unit| unit.fq_name() == "api.Service.run")
             .expect("fixture declares Service.run");
         let candidates = HashSet::from_iter([consumer]);
-        let scope = UsageScanScope::new(&candidates, true);
+        let scope = UsageScanScope::new(&candidates);
 
         let outcome = JavaUsageGraphStrategy::new()
             .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scope, 100)
@@ -669,7 +655,7 @@ mod relational_inverted_tests {
             .into_iter()
             .find(|unit| unit.fq_name() == "api.Service.run")
             .expect("fixture declares Service.run");
-        let scope = UsageScanScope::new(&candidates, true);
+        let scope = UsageScanScope::new(&candidates);
         analyzer.reset_hierarchy_query_counts_for_test();
         let before = analyzer.relational_batch_reader_checkouts_for_test();
 

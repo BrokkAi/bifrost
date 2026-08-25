@@ -92,16 +92,9 @@ pub(crate) trait LanguageSupport: Send + Sync {
         None
     }
 
-    /// Graph-backed usage strategy driving the `UsageFinder` query path.
-    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer;
-
-    /// The whole-workspace edge pass serving this language, or `None` when the
-    /// language contributes no workspace edges at all. Languages served by one
-    /// resolver return the *same* pass: JavaScript and TypeScript share one, while
-    /// Java, Scala and Kotlin return three distinct passes inside one ecosystem.
-    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
-        None
-    }
+    /// The one reference-analysis plugin serving both target-directed and
+    /// whole-workspace workloads for this language.
+    fn reference_plugin(&self) -> ReferenceLanguagePlugin;
 
     /// This language's analyzer inside `analyzer`, viewed as a forward-query provider.
     /// Each support owns the downcast to its own concrete analyzer; `None` means the
@@ -219,8 +212,8 @@ pub(crate) trait LanguageSupport: Send + Sync {
     }
 
     /// Candidate files this language contributes to a usage query beyond the generic
-    /// import-graph and text-search routes. Consulted on the default route only: an
-    /// explicit candidate provider is the caller's whole answer and is never augmented.
+    /// import-graph and text-search routes. Consulted for default discovery and incomplete
+    /// seed providers; a complete execution-scope provider is never augmented.
     fn candidate_augmentation(&self, _ctx: &CandidateCtx<'_>) -> Option<CandidateAugmentation> {
         None
     }
@@ -467,6 +460,13 @@ impl EdgePassId {
 pub(crate) trait LanguageEdgePass: Send + Sync {
     fn id(&self) -> EdgePassId;
 
+    /// Whether an FQN-only edge can be a proven relation to a logical callable
+    /// family even when no single physical overload is selected. Consumers
+    /// retain every candidate endpoint and report the non-exact relation.
+    fn permits_logical_family_targets(&self) -> bool {
+        false
+    }
+
     /// Location-bearing edges for the `usage_graph` consumer. `None` when the workspace
     /// does not analyze this pass's languages; the consumer records nothing and reports
     /// no diagnostic.
@@ -477,9 +477,46 @@ pub(crate) trait LanguageEdgePass: Send + Sync {
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights>;
 }
 
-/// Location-bearing edges, always fqn-keyed. Unlike [`LanguageEdgeWeights`] this needs no
-/// enum: every language, JS/TS included, produces one shape on the sites path.
-pub(crate) struct LanguageEdgeSites(pub(crate) UsageEdges);
+/// One language family's semantic hooks behind [`ReferenceEngine`](crate::analyzer::usages::ReferenceEngine).
+///
+/// Planning, admission, traversal, cancellation, completeness and canonical
+/// row formatting belong to the engine. This descriptor is deliberately only
+/// the semantic plug point. Keeping the target resolver and file scanner in
+/// one registered value prevents the two workloads from being wired through
+/// unrelated registry paths again.
+#[derive(Clone, Copy)]
+pub(crate) struct ReferenceLanguagePlugin {
+    strategy: &'static dyn GraphUsageAnalyzer,
+    edge_pass: Option<&'static dyn LanguageEdgePass>,
+}
+
+impl ReferenceLanguagePlugin {
+    pub(crate) const fn new(
+        strategy: &'static dyn GraphUsageAnalyzer,
+        edge_pass: &'static dyn LanguageEdgePass,
+    ) -> Self {
+        Self {
+            strategy,
+            edge_pass: Some(edge_pass),
+        }
+    }
+
+    pub(crate) const fn target_strategy(self) -> &'static dyn GraphUsageAnalyzer {
+        self.strategy
+    }
+
+    pub(crate) const fn edge_pass(self) -> Option<&'static dyn LanguageEdgePass> {
+        self.edge_pass
+    }
+}
+
+/// Location-bearing edges in the node identity native to the language family.
+/// Package-scoped languages use an FQN; module-scoped JS/TS retains the source
+/// file so same-named exports never collapse at the plugin boundary.
+pub(crate) enum LanguageEdgeSites {
+    Fqn(UsageEdges),
+    Scoped(UsageEdges<UsageNodeKey>),
+}
 
 /// Reference-kind counts in this pass's node identity. JS/TS keys by `{file, fqn}` because
 /// same-named exports in different modules are different declarations; every other pass
@@ -494,6 +531,7 @@ pub(crate) enum LanguageEdgeWeights {
 pub(crate) struct EdgeSiteScanCtx<'a> {
     pub(crate) analyzer: &'a dyn IAnalyzer,
     pub(crate) fqns: &'a HashSet<String>,
+    pub(crate) scoped_callers: &'a HashSet<UsageNodeKey>,
     pub(crate) keep_file: &'a (dyn Fn(&ProjectFile) -> bool + Sync),
 }
 
@@ -526,7 +564,11 @@ pub(crate) fn edge_passes() -> Vec<EdgePassEntry> {
         let mut entry: Option<EdgePassEntry> = None;
         for language in Language::ANALYZABLE {
             let support = language_support(language).expect("analyzable languages are registered");
-            let Some(pass) = support.edge_pass().filter(|pass| pass.id() == id) else {
+            let Some(pass) = support
+                .reference_plugin()
+                .edge_pass()
+                .filter(|pass| pass.id() == id)
+            else {
                 continue;
             };
             match &entry {
@@ -993,6 +1035,7 @@ Kotlin     | Jvm                  | Kotlin | .   | yes      | Kotlin | yes  | - 
                 format!("{language:?}"),
                 format!("{:?}", support.ecosystem()),
                 support
+                    .reference_plugin()
                     .edge_pass()
                     .map_or_else(|| "-".to_string(), |pass| format!("{:?}", pass.id())),
                 support.package_separator(),
@@ -1065,6 +1108,7 @@ Kotlin     | Jvm                  | Kotlin | .   | yes      | Kotlin | yes  | - 
 
     fn edge_pass_id_of(language: Language) -> EdgePassId {
         support_of(language)
+            .reference_plugin()
             .edge_pass()
             .unwrap_or_else(|| panic!("{language:?} must have an edge pass"))
             .id()

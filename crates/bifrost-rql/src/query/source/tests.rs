@@ -318,6 +318,54 @@ fn help_covers_forms_properties_roles_kinds_and_values() {
 }
 
 #[test]
+fn boolean_value_help_suggestions_and_validation_ranges_are_schema_driven() {
+    for (source, token) in [
+        ("(boolean_literal :boolean-value true)", ":boolean-value"),
+        ("(boolean_literal (boolean-value false))", "boolean-value"),
+        (
+            r#"{"match":{"kind":"boolean_literal","boolean_value":true}}"#,
+            r#""boolean_value""#,
+        ),
+    ] {
+        assert!(
+            validate_query_source(source).is_empty(),
+            "{source}: {:#?}",
+            validate_query_source(source)
+        );
+        let offset = source.find(token).expect("help token");
+        let help = query_source_help_at(source, offset).expect("boolean value help");
+        assert_eq!(&source[help.range], token);
+        assert!(help.description.contains("language-neutral"));
+    }
+
+    for (source, invalid) in [
+        ("(boolean_literal :boolean-value 1)", "1"),
+        ("(boolean_literal (boolean-value \"true\"))", r#""true""#),
+        (
+            r#"{"match":{"kind":"boolean_literal","boolean_value":"true"}}"#,
+            r#""true""#,
+        ),
+    ] {
+        let diagnostic = validate_query_source(source)
+            .into_iter()
+            .find(|diagnostic| diagnostic.code == "wrong-value-shape")
+            .unwrap_or_else(|| panic!("missing boolean shape diagnostic for {source}"));
+        assert_eq!(&source[diagnostic.range], invalid);
+    }
+
+    for source in [
+        "(boolean_literal :boolean-vlue true)",
+        r#"{"match":{"kind":"boolean_literal","boolean_vlue":true}}"#,
+    ] {
+        let diagnostic = validate_query_source(source)
+            .into_iter()
+            .find(|diagnostic| diagnostic.message.contains("Did you mean"))
+            .unwrap_or_else(|| panic!("missing boolean_value suggestion for {source}"));
+        assert!(diagnostic.message.contains("boolean"));
+    }
+}
+
+#[test]
 fn typed_pipeline_help_and_json_diagnostics_use_shared_schema() {
     let rql = "(file-of (enclosing-decl (call)))";
     for token in ["file-of", "enclosing-decl"] {

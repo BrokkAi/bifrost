@@ -212,6 +212,10 @@ impl StructuralSpec for GoStructuralSpec {
         Language::Go
     }
 
+    fn supports_boolean_literal_value(&self) -> bool {
+        true
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         GO_KIND_TABLE
     }
